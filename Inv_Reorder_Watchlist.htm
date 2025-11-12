@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    {% Template Inventory_Watch_List %}
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inventory Reorder Monitor</title>
+    <style>
+        table.dataTable {
+            width: 100% !important;
+            table-layout: fixed;
+        }
+        table.dataTable thead th.dt-center,
+        table.dataTable thead td.dt-center {
+            text-align: center;
+        }
+        table.dataTable tbody td.dt-center {
+            text-align: center;
+        }
+        table.dataTable tbody td {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+    </style>
+</head>
+<body>
+    <div class="overflowHidden" style="position: relative; height: 100%; width: 100%">
+        <div id="headerContainer" style="float: left;">
+            <h1>Inventory Reorder Monitor</h1>
+        </div>
+        <div id="bodyContainer">
+            <div id="body">
+
+            <table id=report-table class='display' style='width:100%'></table>
+            </div>
+        </div>
+    </div>
+    <script>
+    let partNum = '$PART{Part|%|General}';
+    if (!partNum || partNum == '' || partNum == -1 || partNum == 'EFT') {
+        partNum = '%';
+    }
+    
+    let vendorId = '$VEND{Vendor|%|General}';
+    vendorId == -1 ? (vendorId = '%') : true;
+    if (!vendorId || vendorId == '' || vendorId == '%') {
+        vendorId = '%';
+    }
+    
+    
+    let locationGroupId = '$LG{Location_Group|%|General}';
+    locationGroupId == -1 ? (locationGroupId = '%') : true;
+    let user = JSON.parse(getUser());
+    let currentUser = user.id;
+    
+    let dataset;
+    
+    function monitor() {
+      function getData() {
+        let query = `SELECT
+          COALESCE((SELECT (sysvalue) * 1000 FROM sysproperties WHERE syskey = 'Refresh Rate'),300000) as refresh,
+          part.id as partid,
+          part.num as partnum,
+          part.description as partdescription,
+          COALESCE(vendor.name,'No Default Vendor') as vendorname,
+          COALESCE(locationgroup.name,'Company Wide') as locationgroup,
+          coalesce(uom.code,'') as uom,
+          partreorder.reorderpoint as reorderpoint,
+          partreorder.orderuptolevel as orderuptolevel,
+          
+          @avail:= coalesce(IF(coalesce(qtyonhand.qty,0) - coalesce(qtyallocated.qty,0) - coalesce(qtynotavailable.qty,0) + coalesce(qtydropship.qty,0) < 0,0,coalesce(qtyonhand.qty,0) - coalesce(qtyallocated.qty,0) - coalesce(qtynotavailable.qty,0) + coalesce(qtydropship.qty,0))) as avail,
+    
+          @onhand:=(CASE WHEN partreorder.locationgroupid IS NOT NULL THEN coalesce(qtyonhand.qty,0) ELSE coalesce(totals.qtyonhand, 0) END) as onhand,
+          @available:=(CASE WHEN partreorder.locationgroupid IS NOT NULL THEN coalesce(@avail,0) ELSE coalesce(totals.qtyavailable, 0) END) as available,
+          @committed:=(CASE WHEN partreorder.locationgroupid IS NOT NULL THEN coalesce(qtycommitted.qty,0) ELSE coalesce((SELECT sum(qty) FROM qtycommitted qtyc WHERE qtyc.partid = part.id GROUP BY partid),0) END) as committed,
+          @allocated:=(CASE WHEN partreorder.locationgroupid IS NOT NULL THEN coalesce(qtyallocated.qty,0) ELSE coalesce(totals.qtyallocated, 0) END) as allocated,
+          @notavailable:=(CASE WHEN partreorder.locationgroupid IS NOT NULL THEN coalesce(qtynotavailable.qty,0) ELSE coalesce(totals.qtynotavailable, 0) END) as 'not available',
+          @onorder:=(CASE WHEN partreorder.locationgroupid IS NOT NULL THEN coalesce(qtyonorder.qty,0) ELSE coalesce(totals.qtyonorder, 0) END) as 'on order',
+    
+          @threshold:= partreorder.reorderpoint + (0.2 * (partreorder.orderuptolevel - partreorder.reorderpoint)) as threshold,
+    
+          GREATEST(0, partreorder.orderuptolevel - (@available - @committed)) as recommendedorderqty,
+          
+          ROUND(
+            ((@available - partreorder.reorderpoint) / (partreorder.orderuptolevel - partreorder.reorderpoint)) * 100,
+            1
+          ) as capacitypct,
+    
+         (CASE 
+              WHEN COALESCE(@available,0) > partreorder.orderuptolevel THEN 'fb10'
+              WHEN COALESCE(@available,0) < partreorder.reorderpoint THEN 'fb40'
+              WHEN COALESCE(@available,0) >= partreorder.reorderpoint AND COALESCE(@available,0) <= @threshold THEN 'fb30'
+              WHEN COALESCE(@available,0) > @threshold AND COALESCE(@available,0) <= partreorder.orderuptolevel THEN 'fb20'
+              ELSE 'fb20'
+          END) as state,
+          (CASE 
+            WHEN COALESCE(@available,0) > partreorder.orderuptolevel THEN '4-Overstocked'
+            WHEN COALESCE(@available,0) < partreorder.reorderpoint THEN '1-Critical'
+            WHEN COALESCE(@available,0) >= partreorder.reorderpoint AND COALESCE(@available,0) <= @threshold THEN '2-Alert'
+            WHEN COALESCE(@available,0) > @threshold AND COALESCE(@available,0) <= partreorder.orderuptolevel THEN '3-Good'
+            ELSE '3-Good'
+        END) as statetext
+    
+        FROM partreorder
+    
+          INNER JOIN part ON partreorder.partid = part.id
+          INNER JOIN uom ON part.uomid = uom.id
+          LEFT OUTER JOIN vendorparts ON (part.id = vendorparts.partid AND vendorparts.defaultflag = 1)
+          LEFT OUTER JOIN vendor ON vendorparts.vendorid = vendor.id
+          LEFT OUTER JOIN locationgroup ON partreorder.locationgroupid = locationgroup.id
+          left outer join qtyonhand on (part.id = qtyonhand.partid and locationgroup.id = qtyonhand.locationgroupid)
+          left outer join qtycommitted on (part.id = qtycommitted.partid and locationgroup.id = qtycommitted.locationgroupid)
+          left outer join qtyallocated on (part.id = qtyallocated.partid and locationgroup.id = qtyallocated.locationgroupid)
+          left outer join qtyonorder on (part.id = qtyonorder.partid and locationgroup.id = qtyonorder.locationgroupid)
+          left outer join qtynotavailable on (part.id = qtynotavailable.partid and locationgroup.id = qtynotavailable.locationgroupid)
+          left outer join qtydropship on (part.id = qtydropship.partid and locationgroup.id = qtydropship.locationgroupid)
+          left outer join (select coalesce(sum(qti.qtyonhand),0) as qtyonhand,
+                      coalesce(sum(qti.qtyallocated),0) as qtyallocated,
+                      coalesce(sum(qti.qtyonorder),0) as qtyonorder,
+                      if(coalesce((sum(qti.qtyonhand) - sum(qti.qtyallocated) - sum(qti.qtynotavailable) + sum(qti.qtydropship)),0) < 0,0,coalesce((sum(qti.qtyonhand) - sum(qti.qtyallocated) - sum(qti.qtynotavailable) + sum(qti.qtydropship)),0)) as qtyavailable,                  coalesce(sum(qti.qtynotavailable),0) as qtynotavailable,
+                      coalesce(sum(qti.qtydropship),0) as qtydropship, qti.partid
+                  from qtyinventorytotals qti
+                  group by qti.partid) as totals on part.id = totals.partid
+                  
+        WHERE part.id LIKE '${partNum}'
+                AND COALESCE(locationgroup.id,'') LIKE '${locationGroupId}'
+                AND ('${vendorId}' = '%' OR vendor.id = '${vendorId}')
+                AND partreorder.reorderpoint IS NOT NULL
+                AND partreorder.orderuptolevel IS NOT NULL
+                AND partreorder.reorderpoint > 0
+                AND partreorder.orderuptolevel > 0
+        ORDER BY 
+                CASE WHEN vendor.name IS NULL THEN 1 ELSE 0 END,
+                vendor.name,
+                state DESC,
+                part.num`;
+    
+        console.log(query);
+        let dataset = JSON.parse(runQuery(query));
+        console.log(dataset);
+        return dataset;
+      }
+    
+      function drawTable() {
+        dataset = getData();
+    
+        // Insert vendor header rows
+        let groupedData = [];
+        let currentVendor = null;
+        
+        
+        let vendorFilter = $('#vendorFilter').val()?.toLowerCase() || '';
+        groupedData = groupedData.filter(row => {
+          if (row.isVendorHeader) return true;
+          return row.vendorname?.toLowerCase().includes(vendorFilter);
+        });
+    
+        
+        dataset.forEach(function(row) {
+          if (row.vendorname !== currentVendor) {
+            currentVendor = row.vendorname;
+            groupedData.push({
+              isVendorHeader: true,
+              vendorname: currentVendor
+            });
+          }
+          groupedData.push(row);
+        });
+    
+        let table = $('#report-table');
+        table.empty();
+        
+        $(window).on('resize scroll', function() {
+          table.columns.adjust();
+        });
+        
+        table.DataTable({
+          dom: 'B<"clear">lfrtip',
+          data: groupedData,
+          ordering: false,
+          autoWidth: false,
+          pageLength: 100,
+          columns: [
+            {
+              title: '',
+              data: 'vendorname',
+              defaultContent: '',
+              width: '1%',
+              render: function(data, type, row) {
+                if (row.isVendorHeader) return data;
+                return '';
+              },
+              createdCell: function(td, cellData, rowData, row, col) {
+                if (rowData.isVendorHeader) {
+                  $(td).attr('colspan', 15);
+                  $(td).css({
+                    'background-color': '#e8e8e8',
+                    'font-weight': 'bold',
+                    'padding': '8px 10px',
+                    'font-size': '13px',
+                    'border-top': '2px solid #ccc'
+                  });
+                  $(td).html('&#x1F4E6; ' + rowData.vendorname);
+                  $(td).nextAll().remove();
+                } else {
+                  $(td).css({
+                    'padding': '2px',
+                    'width': '1%',
+                    'max-width': '10px'
+                  });
+                }
+              }
+            },
+            {
+              title: 'State',
+              data: 'statetext',
+              defaultContent: '',
+              className: 'stateText dt-center',
+              width: '4%',
+              createdCell: function(td, cellData, rowData, row, col) {
+                if (rowData.isVendorHeader) return;
+                let statecircle = document.createElement('div');
+                console.log(statecircle);
+                statecircle.setAttribute('partid', rowData.partid);
+                td.append(statecircle);
+                statecircle.classList.add(rowData.state);
+                statecircle.classList.add('dot');
+                // Add inline colors for all states to ensure they display
+                if (rowData.state === 'fb40') {
+                  statecircle.style.backgroundColor = 'red';
+                } else if (rowData.state === 'fb30') {
+                  statecircle.style.backgroundColor = 'orange';
+                } else if (rowData.state === 'fb20') {
+                  statecircle.style.backgroundColor = 'green';
+                } else if (rowData.state === 'fb10') {
+                  statecircle.style.backgroundColor = 'blue';
+                }
+              }
+            },
+            { 
+              title: 'Capacity %', 
+              data: 'capacitypct',
+              defaultContent: '',
+              className: 'dt-center',
+              width: '8%',
+              render: function(data, type, row) {
+                if (row.isVendorHeader) return '';
+                if (type === 'display') {
+                  if (row.state === 'fb10' || data > 100) {
+                    return '<span style="color: blue; font-weight: bold;">Overstocked</span>';
+                  }
+                  let color = data < 0 ? 'red' : (data <= 20 ? 'orange' : 'green');
+                  return '<span style="color: ' + color + ';">' + data + '%</span>';
+                }
+                return data;
+              }
+            },
+            { 
+              title: 'Part Number', 
+              data: 'partnum',
+              defaultContent: '',
+              width: '8%',
+              render: function(data, type, row) {
+                if (row.isVendorHeader) return '';
+                if (type === 'display') {
+                  return '<strong>' + data + '</strong>';
+                }
+                return data;
+              }
+            },
+            { 
+              title: 'Part Description', 
+              data: 'partdescription',
+              defaultContent: '',
+              width: '15%',
+              render: function(data, type, row) {
+                if (row.isVendorHeader) return '';
+                if (type === 'display') {
+                  return '<strong>' + data + '</strong>';
+                }
+                return data;
+              }
+            },
+            { title: 'UOM', data: 'uom', defaultContent: '', width: '4%', className: 'dt-center' },
+            { title: 'On Hand', data: 'onhand', defaultContent: '', width: '6%', className: 'dt-center' },
+            { 
+                      title: 'Qty to Order', 
+                      data: 'recommendedorderqty',
+                      defaultContent: '',
+                      width: '8%',
+                      className: 'dt-center',
+                      render: function(data, type, row) {
+                        if (row.isVendorHeader) return '';
+                        if (type === 'display' && data > 0) {
+                          return '<strong>' + data + '</strong>';
+                        }
+                        return data;
+                      }
+                    },
+            { title: 'Reorder Point', data: 'reorderpoint', defaultContent: '', width: '6%', className: 'dt-center' },
+            { title: 'Order Up To', data: 'orderuptolevel', defaultContent: '', width: '6%', className: 'dt-center' },
+            { title: 'Available', data: 'available', defaultContent: '', width: '6%', className: 'dt-center' },
+            { title: 'Committed', data: 'committed', defaultContent: '', width: '6%', className: 'dt-center' },
+            { title: 'Allocated', data: 'allocated', defaultContent: '', width: '6%', className: 'dt-center' },
+            { title: 'Not Available', data: 'not available', defaultContent: '', width: '6%', className: 'dt-center' },
+            { title: 'On Order', data: 'on order', defaultContent: '', width: '6%', className: 'dt-center' }
+          ],
+          fixedHeader: true,
+          colReorder: false,
+          pagingType: 'simple',
+          responsive: false,
+          deferRender: true,
+          buttons: ['csv'],
+          language: {
+            paginate: {
+              previous: 'PREV',
+              next: 'NEXT'
+            }
+          }
+        });
+      }
+    
+      function refreshTable() {
+        console.time('refreshRate');
+        let table = $('#report-table').DataTable();
+        dataset = getData();
+        
+        
+        
+    
+        
+        // Insert vendor header rows
+        let groupedData = [];
+        let currentVendor = null;
+        
+        dataset.forEach(function(row) {
+          if (row.vendorname !== currentVendor) {
+            currentVendor = row.vendorname;
+            groupedData.push({
+              isVendorHeader: true,
+              vendorname: currentVendor
+            });
+          }
+          groupedData.push(row);
+        });
+        
+        table.clear();
+        
+        
+    
+        table.rows.add(groupedData);
+        table.draw(false);
+        console.timeEnd('refreshRate');
+        setTimeout(refreshTable, dataset[0].refresh);
+      }
+    
+      drawTable();
+      $(".dt-buttons").addClass( "csv-button-margin" );
+      console.log(dataset[0].refresh);
+      setTimeout(refreshTable, dataset[0].refresh);
+    }
+    
+    $(document).ready(function() {
+      monitor();
+    });
+    const displayHeader = $CHECK{Display_header|true};
+    
+    let headerContainer = document.getElementById('headerContainer');
+    displayHeader ? headerContainer.style.display = 'block' : headerContainer.style.display = 'none';
+
+    </script>
+</body>
+</html>
