@@ -49,10 +49,32 @@
         }
         .item-row {
             display: grid;
-            grid-template-columns: 1fr 150px 100px 50px;
+            grid-template-columns: 1fr 200px 150px 100px 50px;
             gap: 10px;
             margin-bottom: 10px;
             align-items: center;
+        }
+        .locationgroup-selector {
+            margin-bottom: 30px;
+            padding: 20px;
+            background-color: #e7f5ff;
+            border: 2px solid #4dabf7;
+            border-radius: 6px;
+        }
+        .locationgroup-selector h3 {
+            margin-top: 0;
+            color: #1971c2;
+            font-size: 16px;
+        }
+        .locationgroup-selector select {
+            width: 100%;
+            max-width: 400px;
+            padding: 10px;
+            border: 1px solid #4dabf7;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: bold;
+            background-color: white;
         }
         .item-row label {
             font-weight: bold;
@@ -207,6 +229,13 @@
     <div class="container">
         <h1>Cycle Count Helper</h1>
 
+        <div class="locationgroup-selector">
+            <h3>📍 Location Group Filter</h3>
+            <select id="locationGroupSelector" onchange="onLocationGroupChange()">
+                <option value="">-- Select Location Group --</option>
+            </select>
+        </div>
+
         <div class="section out">
             <h2>🔻 Items to Adjust OUT</h2>
             <div id="outItems">
@@ -255,29 +284,85 @@
     let outItemCounter = 0;
     let inItemCounter = 0;
     let parts = [];
+    let locationGroups = [];
+    let selectedLocationGroupId = null;
     let user = JSON.parse(getUser());
     let currentUser = user.id;
 
-    // Load parts list
+    // Load location groups
+    function loadLocationGroups() {
+        try {
+            let query = `SELECT id, name FROM locationgroup WHERE activeflag = 1 ORDER BY name`;
+            locationGroups = JSON.parse(runQuery(query));
+
+            let selector = document.getElementById('locationGroupSelector');
+            selector.innerHTML = '<option value="">-- Select Location Group --</option>';
+            locationGroups.forEach(function(lg) {
+                selector.innerHTML += '<option value="' + lg.id + '">' + lg.name + '</option>';
+            });
+
+            // Default select location group id 1
+            selector.value = '1';
+            selectedLocationGroupId = 1;
+            loadParts();
+
+            // Add initial rows
+            addOutItem();
+            addInItem();
+        } catch(e) {
+            console.error('Error loading location groups:', e);
+            alert('Error loading location groups: ' + e.message);
+        }
+    }
+
+    // Handle location group change
+    function onLocationGroupChange() {
+        let selector = document.getElementById('locationGroupSelector');
+        selectedLocationGroupId = selector.value ? parseInt(selector.value) : null;
+
+        // Clear existing items
+        document.getElementById('outItems').innerHTML = '';
+        document.getElementById('inItems').innerHTML = '';
+        outItemCounter = 0;
+        inItemCounter = 0;
+
+        // Reload parts for selected location group
+        if (selectedLocationGroupId) {
+            loadParts();
+            addOutItem();
+            addInItem();
+        } else {
+            parts = [];
+        }
+        updatePreview();
+    }
+
+    // Load parts list filtered by location group
     function loadParts() {
         try {
-            console.log('Loading parts...');
-            let query = `SELECT
+            if (!selectedLocationGroupId) {
+                parts = [];
+                return;
+            }
+
+            console.log('Loading parts for location group:', selectedLocationGroupId);
+            // Only show parts that have inventory in the selected location group
+            let query = `SELECT DISTINCT
                 part.num as partnum,
                 part.description as partdescription,
                 part.id as partid,
                 uom.code as uom
             FROM part
             INNER JOIN uom ON part.uomid = uom.id
+            INNER JOIN qtyonhand qoh ON part.id = qoh.partid
             WHERE part.activeflag = 1
+            AND qoh.locationgroupid = ${selectedLocationGroupId}
+            AND qoh.qty > 0
             ORDER BY part.num`;
 
             console.log('Parts query:', query);
             parts = JSON.parse(runQuery(query));
-            console.log('Loaded ' + parts.length + ' parts');
-            if (parts.length === 0) {
-                alert('Warning: No active parts found in the database!');
-            }
+            console.log('Loaded ' + parts.length + ' parts with inventory in location group');
         } catch(e) {
             console.error('Error loading parts:', e);
             alert('Error loading parts: ' + e.message);
@@ -295,6 +380,73 @@
         return options;
     }
 
+    // Load locations with stock for a specific part
+    function loadLocationsForPart(partNum, locationSelectId, type) {
+        try {
+            if (!partNum || !selectedLocationGroupId) return;
+
+            let query = `SELECT DISTINCT
+                loc.id as locationid,
+                loc.name as locationname,
+                CASE
+                    WHEN COALESCE(lg.name, '') != '' AND COALESCE(loc.name, '') != '' THEN CONCAT(lg.name, '-', loc.name)
+                    WHEN COALESCE(lg.name, '') != '' THEN lg.name
+                    WHEN COALESCE(loc.name, '') != '' THEN loc.name
+                    ELSE 'Unknown Location'
+                END as location,
+                qoh.qty
+            FROM part
+            INNER JOIN qtyonhand qoh ON part.id = qoh.partid
+            LEFT JOIN locationgroup lg ON qoh.locationgroupid = lg.id
+            LEFT JOIN location loc ON qoh.locationid = loc.id
+            WHERE part.num = '${partNum}'
+            AND qoh.locationgroupid = ${selectedLocationGroupId}
+            AND qoh.qty > 0
+            ORDER BY qoh.qty DESC`;
+
+            let locations = JSON.parse(runQuery(query));
+
+            // Get default location for this part
+            let defaultQuery = `SELECT
+                CASE
+                    WHEN COALESCE(lg.name, '') != '' AND COALESCE(loc.name, '') != '' THEN CONCAT(lg.name, '-', loc.name)
+                    WHEN COALESCE(lg.name, '') != '' THEN lg.name
+                    WHEN COALESCE(loc.name, '') != '' THEN loc.name
+                    ELSE ''
+                END as location
+            FROM part
+            LEFT JOIN defaultlocation dl ON part.id = dl.partid
+            LEFT JOIN locationgroup lg ON dl.locationgroupid = lg.id
+            LEFT JOIN location loc ON dl.locationid = loc.id
+            WHERE part.num = '${partNum}'
+            AND dl.locationgroupid = ${selectedLocationGroupId}`;
+
+            let defaultResult = JSON.parse(runQuery(defaultQuery));
+            let defaultLocation = (defaultResult && defaultResult.length > 0) ? defaultResult[0].location : '';
+
+            let locationSelect = document.getElementById(locationSelectId);
+            locationSelect.innerHTML = '<option value="">-- Select Location --</option>';
+
+            if (locations && locations.length > 0) {
+                locations.forEach(function(loc) {
+                    locationSelect.innerHTML += '<option value="' + loc.location + '">' + loc.location + ' (Qty: ' + loc.qty + ')</option>';
+                });
+
+                // Select default location if it exists in the list
+                if (defaultLocation && locationSelect.querySelector('option[value="' + defaultLocation + '"]')) {
+                    locationSelect.value = defaultLocation;
+                } else if (locations.length > 0) {
+                    // Otherwise select first location
+                    locationSelect.value = locations[0].location;
+                }
+            }
+
+            updatePreview();
+        } catch(e) {
+            console.error('Error loading locations for part:', e);
+        }
+    }
+
     // Add OUT item row
     function addOutItem() {
         outItemCounter++;
@@ -305,13 +457,19 @@
         row.innerHTML = `
             <div>
                 <label>Part Number</label>
-                <select onchange="updateUOM(this, 'out-qty-${outItemCounter}'); updatePreview();">
+                <select id="out-part-${outItemCounter}" onchange="onPartSelected(this, 'out', ${outItemCounter})">
                     ${createPartOptions()}
                 </select>
             </div>
             <div>
+                <label>Location</label>
+                <select id="out-loc-${outItemCounter}" onchange="updatePreview()">
+                    <option value="">-- Select Part First --</option>
+                </select>
+            </div>
+            <div>
                 <label>Quantity to Remove</label>
-                <input type="number" id="out-qty-${outItemCounter}" min="0" step="1" placeholder="Qty" oninput="updatePreview()" />
+                <input type="number" id="out-qty-${outItemCounter}" min="0" step="1" value="" placeholder="Qty" oninput="updatePreview()" />
             </div>
             <div>
                 <label>UOM</label>
@@ -335,13 +493,19 @@
         row.innerHTML = `
             <div>
                 <label>Part Number</label>
-                <select onchange="updateUOM(this, 'in-qty-${inItemCounter}'); updatePreview();">
+                <select id="in-part-${inItemCounter}" onchange="onPartSelected(this, 'in', ${inItemCounter})">
                     ${createPartOptions()}
                 </select>
             </div>
             <div>
+                <label>Location</label>
+                <select id="in-loc-${inItemCounter}" onchange="updatePreview()">
+                    <option value="">-- Select Part First --</option>
+                </select>
+            </div>
+            <div>
                 <label>Quantity to Add</label>
-                <input type="number" id="in-qty-${inItemCounter}" min="0" step="1" placeholder="Qty" oninput="updatePreview()" />
+                <input type="number" id="in-qty-${inItemCounter}" min="0" step="1" value="" placeholder="Qty" oninput="updatePreview()" />
             </div>
             <div>
                 <label>UOM</label>
@@ -355,14 +519,30 @@
         container.appendChild(row);
     }
 
-    // Update UOM when part is selected
-    function updateUOM(selectElement, qtyId) {
+    // Handle part selection
+    function onPartSelected(selectElement, type, counter) {
         let selectedOption = selectElement.options[selectElement.selectedIndex];
+        let partNum = selectElement.value;
         let uom = selectedOption.getAttribute('data-uom') || '';
-        let uomInput = selectElement.closest('.item-row').querySelector('input[type="text"]');
+
+        // Update UOM
+        let uomInput = document.getElementById(type + '-uom-' + counter);
         if (uomInput) {
             uomInput.value = uom;
         }
+
+        // Set quantity to 1
+        let qtyInput = document.getElementById(type + '-qty-' + counter);
+        if (qtyInput && partNum) {
+            qtyInput.value = '1';
+        }
+
+        // Load locations for this part
+        if (partNum) {
+            loadLocationsForPart(partNum, type + '-loc-' + counter, type);
+        }
+
+        updatePreview();
     }
 
     // Remove item row
@@ -482,18 +662,20 @@
             console.log('Metadata:', metadata);
 
         // Collect OUT items
-        let outPartNumbers = [];
         let outItems = [];
         document.getElementById('outItems').querySelectorAll('.item-row').forEach(function(row) {
-            let select = row.querySelector('select');
+            let selects = row.querySelectorAll('select');
+            let partSelect = selects[0];  // First select is part
+            let locationSelect = selects[1];  // Second select is location
             let qtyInput = row.querySelector('input[type="number"]');
-            let partNum = select.value;
+            let partNum = partSelect.value;
+            let location = locationSelect.value;
             let qty = parseFloat(qtyInput.value) || 0;
 
-            if (partNum && qty > 0) {
-                outPartNumbers.push(partNum);
+            if (partNum && qty > 0 && location) {
                 outItems.push({
                     partnum: partNum,
+                    location: location,
                     qty: qty,
                     uom: row.querySelector('input[type="text"]').value
                 });
@@ -501,105 +683,60 @@
         });
 
         // Collect IN items
-        let inPartNumbers = [];
         let inItems = [];
         document.getElementById('inItems').querySelectorAll('.item-row').forEach(function(row) {
-            let select = row.querySelector('select');
+            let selects = row.querySelectorAll('select');
+            let partSelect = selects[0];  // First select is part
+            let locationSelect = selects[1];  // Second select is location
             let qtyInput = row.querySelector('input[type="number"]');
-            let partNum = select.value;
+            let partNum = partSelect.value;
+            let location = locationSelect.value;
             let qty = parseFloat(qtyInput.value) || 0;
 
-            if (partNum && qty > 0) {
-                inPartNumbers.push(partNum);
+            if (partNum && qty > 0 && location) {
                 inItems.push({
                     partnum: partNum,
+                    location: location,
                     qty: qty,
                     uom: row.querySelector('input[type="text"]').value
                 });
             }
         });
 
-        if (outPartNumbers.length === 0 && inPartNumbers.length === 0) {
+        if (outItems.length === 0 && inItems.length === 0) {
             previewContainer.innerHTML = '<div class="empty-preview">Add items above to see preview</div>';
             return;
         }
 
-        // Get location info
-        console.log('Getting location info for OUT:', outPartNumbers);
-        console.log('Getting location info for IN:', inPartNumbers);
-
-        let outLocations = getLocationInfo(outPartNumbers, 'OUT');
-        let inLocations = getLocationInfo(inPartNumbers, 'IN');
-
-        console.log('OUT locations:', outLocations);
-        console.log('IN locations:', inLocations);
-
-        // Build preview data
+        // Build preview data directly from items (location already selected in dropdown)
         let previewData = [];
 
         // Build OUT entries
         outItems.forEach(function(item) {
-            let locInfo = outLocations.find(l => l.partnum === item.partnum);
-            if (locInfo) {
-                previewData.push({
-                    PartNumber: item.partnum,
-                    Location: locInfo.location,
-                    Qty: -Math.abs(item.qty),
-                    UOM: item.uom,
-                    Date: metadata.date,
-                    Note: metadata.note,
-                    Customer: metadata.customer,
-                    type: 'OUT'
-                });
-            } else {
-                console.warn('No inventory location found for OUT item:', item.partnum);
-                // Add entry with warning message
-                previewData.push({
-                    PartNumber: item.partnum,
-                    Location: '⚠️ NO INVENTORY ON HAND',
-                    Qty: -Math.abs(item.qty),
-                    UOM: item.uom,
-                    Date: metadata.date,
-                    Note: metadata.note,
-                    Customer: metadata.customer,
-                    type: 'OUT'
-                });
-            }
+            previewData.push({
+                PartNumber: item.partnum,
+                Location: item.location,
+                Qty: -Math.abs(item.qty),
+                UOM: item.uom,
+                Date: metadata.date,
+                Note: metadata.note,
+                Customer: metadata.customer,
+                type: 'OUT'
+            });
         });
 
         // Build IN entries
         inItems.forEach(function(item) {
-            let locInfo = inLocations.find(l => l.partnum === item.partnum);
-            if (locInfo) {
-                // Check if location is "No Location Set" and warn user
-                let location = locInfo.location;
-                if (location === 'No Location Set' || location === '' || location === '-') {
-                    location = '⚠️ NO DEFAULT LOCATION SET';
-                }
-                previewData.push({
-                    PartNumber: item.partnum,
-                    Location: location,
-                    Qty: Math.abs(item.qty),
-                    UOM: item.uom,
-                    Date: metadata.date,
-                    Note: metadata.note,
-                    Customer: metadata.customer,
-                    type: 'IN'
-                });
-            } else {
-                console.warn('No default location found for IN item:', item.partnum);
-                // Add entry with warning message
-                previewData.push({
-                    PartNumber: item.partnum,
-                    Location: '⚠️ NO DEFAULT LOCATION SET',
-                    Qty: Math.abs(item.qty),
-                    UOM: item.uom,
-                    Date: metadata.date,
-                    Note: metadata.note,
-                    Customer: metadata.customer,
-                    type: 'IN'
-                });
-            }
+            previewData.push({
+                PartNumber: item.partnum,
+                Location: item.location,
+                Qty: Math.abs(item.qty),
+                UOM: item.uom,
+                Date: metadata.date,
+                Note: metadata.note,
+                Customer: metadata.customer,
+                type: 'IN'
+            });
         });
 
         if (previewData.length === 0) {
@@ -656,18 +793,20 @@
             };
 
         // Collect OUT items
-        let outPartNumbers = [];
         let outItems = [];
         document.getElementById('outItems').querySelectorAll('.item-row').forEach(function(row) {
-            let select = row.querySelector('select');
+            let selects = row.querySelectorAll('select');
+            let partSelect = selects[0];  // First select is part
+            let locationSelect = selects[1];  // Second select is location
             let qtyInput = row.querySelector('input[type="number"]');
-            let partNum = select.value;
+            let partNum = partSelect.value;
+            let location = locationSelect.value;
             let qty = parseFloat(qtyInput.value) || 0;
 
-            if (partNum && qty > 0) {
-                outPartNumbers.push(partNum);
+            if (partNum && qty > 0 && location) {
                 outItems.push({
                     partnum: partNum,
+                    location: location,
                     qty: qty,
                     uom: row.querySelector('input[type="text"]').value
                 });
@@ -675,105 +814,62 @@
         });
 
         // Collect IN items
-        let inPartNumbers = [];
         let inItems = [];
         document.getElementById('inItems').querySelectorAll('.item-row').forEach(function(row) {
-            let select = row.querySelector('select');
+            let selects = row.querySelectorAll('select');
+            let partSelect = selects[0];  // First select is part
+            let locationSelect = selects[1];  // Second select is location
             let qtyInput = row.querySelector('input[type="number"]');
-            let partNum = select.value;
+            let partNum = partSelect.value;
+            let location = locationSelect.value;
             let qty = parseFloat(qtyInput.value) || 0;
 
-            if (partNum && qty > 0) {
-                inPartNumbers.push(partNum);
+            if (partNum && qty > 0 && location) {
                 inItems.push({
                     partnum: partNum,
+                    location: location,
                     qty: qty,
                     uom: row.querySelector('input[type="text"]').value
                 });
             }
         });
 
-        if (outPartNumbers.length === 0 && inPartNumbers.length === 0) {
+        if (outItems.length === 0 && inItems.length === 0) {
             alert('Please add at least one item to adjust.');
             console.log('No items to export');
             return;
         }
 
-        alert('Found ' + outPartNumbers.length + ' OUT items and ' + inPartNumbers.length + ' IN items');
+        alert('Found ' + outItems.length + ' OUT items and ' + inItems.length + ' IN items');
         console.log('OUT items:', outItems);
         console.log('IN items:', inItems);
 
-        // Get location info
-        console.log('Fetching location info...');
-        alert('Fetching location info from database...');
-        let outLocations = getLocationInfo(outPartNumbers, 'OUT');
-        let inLocations = getLocationInfo(inPartNumbers, 'IN');
-
-        console.log('OUT locations:', outLocations);
-        console.log('IN locations:', inLocations);
-        alert('Found ' + outLocations.length + ' OUT locations and ' + inLocations.length + ' IN locations');
-
-        // Build OUT entries (negative quantities)
+        // Build OUT entries (negative quantities) - location already selected in dropdown
         outItems.forEach(function(item) {
-            let locInfo = outLocations.find(l => l.partnum === item.partnum);
-            if (locInfo) {
-                csvData.push({
-                    PartNumber: item.partnum,
-                    Location: locInfo.location,
-                    Qty: -Math.abs(item.qty), // Negative for OUT
-                    UOM: item.uom,
-                    Date: metadata.date,
-                    Note: metadata.note,
-                    Customer: metadata.customer
-                });
-                console.log('Added OUT entry:', item.partnum, 'at', locInfo.location);
-            } else {
-                console.warn('No inventory location found for OUT item:', item.partnum);
-                // Add entry with warning message
-                csvData.push({
-                    PartNumber: item.partnum,
-                    Location: '⚠️ NO INVENTORY ON HAND',
-                    Qty: -Math.abs(item.qty), // Negative for OUT
-                    UOM: item.uom,
-                    Date: metadata.date,
-                    Note: metadata.note,
-                    Customer: metadata.customer
-                });
-            }
+            csvData.push({
+                PartNumber: item.partnum,
+                Location: item.location,
+                Qty: -Math.abs(item.qty), // Negative for OUT
+                UOM: item.uom,
+                Date: metadata.date,
+                Note: metadata.note,
+                Customer: metadata.customer
+            });
+            console.log('Added OUT entry:', item.partnum, 'at', item.location);
         });
 
-        // Build IN entries (positive quantities)
+        // Build IN entries (positive quantities) - location already selected in dropdown
         inItems.forEach(function(item) {
-            let locInfo = inLocations.find(l => l.partnum === item.partnum);
-            if (locInfo) {
-                // Check if location is "No Location Set" and warn user
-                let location = locInfo.location;
-                if (location === 'No Location Set' || location === '' || location === '-') {
-                    location = '⚠️ NO DEFAULT LOCATION SET';
-                }
-                csvData.push({
-                    PartNumber: item.partnum,
-                    Location: location,
-                    Qty: Math.abs(item.qty), // Positive for IN
-                    UOM: item.uom,
-                    Date: metadata.date,
-                    Note: metadata.note,
-                    Customer: metadata.customer
-                });
-                console.log('Added IN entry:', item.partnum, 'at', location);
-            } else {
-                console.warn('No default location found for IN item:', item.partnum);
-                // Add entry with warning message
-                csvData.push({
-                    PartNumber: item.partnum,
-                    Location: '⚠️ NO DEFAULT LOCATION SET',
-                    Qty: Math.abs(item.qty), // Positive for IN
-                    UOM: item.uom,
-                    Date: metadata.date,
-                    Note: metadata.note,
-                    Customer: metadata.customer
-                });
-            }
+            csvData.push({
+                PartNumber: item.partnum,
+                Location: item.location,
+                Qty: Math.abs(item.qty), // Positive for IN
+                UOM: item.uom,
+                Date: metadata.date,
+                Note: metadata.note,
+                Customer: metadata.customer
+            });
+            console.log('Added IN entry:', item.partnum, 'at', item.location);
         });
 
         if (csvData.length === 0) {
@@ -827,12 +923,11 @@
 
     // Initialize
     window.onload = function() {
-        loadParts();
         // Set default date to today
         document.getElementById('cycleDate').valueAsDate = new Date();
-        // Add one row to each section to start
-        addOutItem();
-        addInItem();
+        // Load location groups (this will auto-select id=1 and load parts)
+        loadLocationGroups();
+        // Note: Initial rows will be added after location group is loaded
     };
     </script>
 </body>
