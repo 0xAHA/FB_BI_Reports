@@ -3,6 +3,14 @@
 ## Overview
 This tool reads a JSON configuration file to automatically populate inventory adjustments for disassembling products into their component parts.
 
+## File Location
+The tool reads from a hardcoded file path:
+```
+C:\Program Files\Fishbowl\server\reports\Custom\Assembly.json
+```
+
+Place your `Assembly.json` file in this location before using the tool.
+
 ## JSON Structure
 
 ```json
@@ -49,7 +57,7 @@ This tool reads a JSON configuration file to automatically populate inventory ad
 
 ## How It Works
 
-1. **Upload JSON**: Click "Load JSON File" button and select your configuration file
+1. **Load JSON**: Click "Load Assembly.json" button to load from the hardcoded path
 2. **Auto-Population**:
    - Products are added to IN items (Add Inventory section)
    - Kit components are added to OUT items (Cycle Count section)
