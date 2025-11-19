@@ -270,6 +270,70 @@
         .cost-value {
             font-family: monospace;
         }
+        /* Searchable autocomplete styles */
+        .autocomplete-container {
+            position: relative;
+            width: 100%;
+        }
+        .autocomplete-input {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-size: 14px;
+            box-sizing: border-box;
+        }
+        .autocomplete-input:focus {
+            outline: none;
+            border-color: #4dabf7;
+            box-shadow: 0 0 0 3px rgba(77, 171, 247, 0.1);
+        }
+        .autocomplete-dropdown {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            max-height: 250px;
+            overflow-y: auto;
+            background: white;
+            border: 1px solid #4dabf7;
+            border-top: none;
+            border-radius: 0 0 4px 4px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            z-index: 1000;
+            display: none;
+        }
+        .autocomplete-dropdown.show {
+            display: block;
+        }
+        .autocomplete-item {
+            padding: 8px 12px;
+            cursor: pointer;
+            font-size: 13px;
+            border-bottom: 1px solid #f1f3f5;
+        }
+        .autocomplete-item:last-child {
+            border-bottom: none;
+        }
+        .autocomplete-item:hover,
+        .autocomplete-item.highlighted {
+            background-color: #e7f5ff;
+        }
+        .autocomplete-item .part-num {
+            font-weight: bold;
+            color: #1971c2;
+        }
+        .autocomplete-item .part-desc {
+            color: #666;
+            font-size: 12px;
+            margin-left: 8px;
+        }
+        .autocomplete-no-results {
+            padding: 12px;
+            color: #868e96;
+            font-style: italic;
+            text-align: center;
+        }
     </style>
 </head>
 <body>
@@ -356,7 +420,8 @@
     <script>
     let outItemCounter = 0;
     let inItemCounter = 0;
-    let parts = [];
+    let partsWithStock = [];  // For OUT items - only parts with inventory
+    let allParts = [];        // For IN items - all active parts
     let locationGroups = [];
     let selectedLocationGroupId = null;
     let user = JSON.parse(getUser());
@@ -414,13 +479,15 @@
     function loadParts() {
         try {
             if (!selectedLocationGroupId) {
-                parts = [];
+                partsWithStock = [];
+                allParts = [];
                 return;
             }
 
             console.log('Loading parts for location group:', selectedLocationGroupId);
-            // Get parts with inventory and their average cost
-            let query = `SELECT DISTINCT
+
+            // Get parts WITH inventory (for OUT items)
+            let queryWithStock = `SELECT DISTINCT
                 part.num as partnum,
                 part.description as partdescription,
                 part.id as partid,
@@ -435,33 +502,232 @@
             AND qoh.qty > 0
             ORDER BY part.num`;
 
-            console.log('Parts query:', query);
-            let result = runQuery(query);
-            parts = result ? JSON.parse(result) : [];
+            let resultWithStock = runQuery(queryWithStock);
+            partsWithStock = resultWithStock ? JSON.parse(resultWithStock) : [];
 
-            // Ensure parts is always an array
-            if (!parts) {
-                parts = [];
-            } else if (!Array.isArray(parts)) {
-                parts = [parts];
+            // Ensure partsWithStock is always an array
+            if (!partsWithStock) {
+                partsWithStock = [];
+            } else if (!Array.isArray(partsWithStock)) {
+                partsWithStock = [partsWithStock];
             }
 
-            console.log('Loaded ' + parts.length + ' parts with inventory in location group');
+            console.log('Loaded ' + partsWithStock.length + ' parts with inventory in location group');
+
+            // Get ALL active parts (for IN items - no stock requirement)
+            let queryAllParts = `SELECT DISTINCT
+                part.num as partnum,
+                part.description as partdescription,
+                part.id as partid,
+                uom.code as uom,
+                COALESCE(pc.avgcost, 0) as avgcost
+            FROM part
+            INNER JOIN uom ON part.uomid = uom.id
+            LEFT JOIN partcost pc ON part.id = pc.partid
+            WHERE part.activeflag = 1
+            ORDER BY part.num`;
+
+            let resultAllParts = runQuery(queryAllParts);
+            allParts = resultAllParts ? JSON.parse(resultAllParts) : [];
+
+            // Ensure allParts is always an array
+            if (!allParts) {
+                allParts = [];
+            } else if (!Array.isArray(allParts)) {
+                allParts = [allParts];
+            }
+
+            console.log('Loaded ' + allParts.length + ' total active parts');
         } catch(e) {
             console.error('Error loading parts:', e);
             alert('Error loading parts: ' + e.message);
-            parts = [];
+            partsWithStock = [];
+            allParts = [];
         }
     }
 
-    // Create part dropdown options
-    function createPartOptions() {
-        let options = '<option value="">-- Select Part --</option>';
-        parts.forEach(function(part) {
-            options += '<option value="' + part.partnum + '" data-uom="' + part.uom + '" data-avgcost="' + part.avgcost + '" data-description="' + part.partdescription + '">' +
-                       part.partnum + ' - ' + part.partdescription + '</option>';
+    // Create autocomplete HTML for part selection
+    function createPartAutocomplete(inputId, type) {
+        return `
+            <div class="autocomplete-container">
+                <input type="text"
+                    id="${inputId}"
+                    class="autocomplete-input"
+                    placeholder="Type to search parts..."
+                    autocomplete="off"
+                    data-partnum=""
+                    data-uom=""
+                    data-avgcost="0"
+                    data-description=""
+                />
+                <div id="${inputId}-dropdown" class="autocomplete-dropdown"></div>
+            </div>
+        `;
+    }
+
+    // Initialize autocomplete for a part input
+    function initPartAutocomplete(inputId, type, counter) {
+        let input = document.getElementById(inputId);
+        let dropdown = document.getElementById(inputId + '-dropdown');
+        let partsList = type === 'out' ? partsWithStock : allParts;
+        let highlightedIndex = -1;
+
+        // Filter and show dropdown
+        function showDropdown(filter) {
+            let filtered = partsList.filter(function(part) {
+                let searchText = (part.partnum + ' ' + part.partdescription).toLowerCase();
+                return searchText.includes(filter.toLowerCase());
+            });
+
+            if (filtered.length === 0) {
+                dropdown.innerHTML = '<div class="autocomplete-no-results">No parts found</div>';
+            } else {
+                // Limit to first 50 results for performance
+                let limited = filtered.slice(0, 50);
+                dropdown.innerHTML = limited.map(function(part, index) {
+                    return '<div class="autocomplete-item" data-index="' + index + '" data-partnum="' + part.partnum + '" data-uom="' + part.uom + '" data-avgcost="' + part.avgcost + '" data-description="' + part.partdescription + '">' +
+                        '<span class="part-num">' + part.partnum + '</span>' +
+                        '<span class="part-desc">' + part.partdescription + '</span>' +
+                    '</div>';
+                }).join('');
+
+                if (filtered.length > 50) {
+                    dropdown.innerHTML += '<div class="autocomplete-no-results">Showing first 50 of ' + filtered.length + ' results. Type more to filter.</div>';
+                }
+            }
+
+            dropdown.classList.add('show');
+            highlightedIndex = -1;
+        }
+
+        // Hide dropdown
+        function hideDropdown() {
+            dropdown.classList.remove('show');
+            highlightedIndex = -1;
+        }
+
+        // Select a part
+        function selectPart(partnum, uom, avgcost, description) {
+            input.value = partnum + ' - ' + description;
+            input.setAttribute('data-partnum', partnum);
+            input.setAttribute('data-uom', uom);
+            input.setAttribute('data-avgcost', avgcost);
+            input.setAttribute('data-description', description);
+            hideDropdown();
+            onPartSelectedFromAutocomplete(type, counter, partnum, uom, avgcost, description);
+        }
+
+        // Update highlight
+        function updateHighlight() {
+            let items = dropdown.querySelectorAll('.autocomplete-item');
+            items.forEach(function(item, index) {
+                if (index === highlightedIndex) {
+                    item.classList.add('highlighted');
+                    item.scrollIntoView({ block: 'nearest' });
+                } else {
+                    item.classList.remove('highlighted');
+                }
+            });
+        }
+
+        // Input event handlers
+        input.addEventListener('input', function() {
+            let value = this.value.trim();
+            if (value.length >= 1) {
+                showDropdown(value);
+            } else {
+                showDropdown('');
+            }
         });
-        return options;
+
+        input.addEventListener('focus', function() {
+            showDropdown(this.value.trim());
+        });
+
+        input.addEventListener('blur', function() {
+            // Delay to allow click on dropdown item
+            setTimeout(hideDropdown, 200);
+        });
+
+        input.addEventListener('keydown', function(e) {
+            let items = dropdown.querySelectorAll('.autocomplete-item');
+
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                if (highlightedIndex < items.length - 1) {
+                    highlightedIndex++;
+                    updateHighlight();
+                }
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                if (highlightedIndex > 0) {
+                    highlightedIndex--;
+                    updateHighlight();
+                }
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                if (highlightedIndex >= 0 && items[highlightedIndex]) {
+                    let item = items[highlightedIndex];
+                    selectPart(
+                        item.getAttribute('data-partnum'),
+                        item.getAttribute('data-uom'),
+                        item.getAttribute('data-avgcost'),
+                        item.getAttribute('data-description')
+                    );
+                }
+            } else if (e.key === 'Escape') {
+                hideDropdown();
+            }
+        });
+
+        // Click handler for dropdown items
+        dropdown.addEventListener('click', function(e) {
+            let item = e.target.closest('.autocomplete-item');
+            if (item) {
+                selectPart(
+                    item.getAttribute('data-partnum'),
+                    item.getAttribute('data-uom'),
+                    item.getAttribute('data-avgcost'),
+                    item.getAttribute('data-description')
+                );
+            }
+        });
+    }
+
+    // Handle part selection from autocomplete
+    function onPartSelectedFromAutocomplete(type, counter, partNum, uom, avgCost, description) {
+        // Update UOM
+        let uomInput = document.getElementById(type + '-uom-' + counter);
+        if (uomInput) {
+            uomInput.value = uom;
+        }
+
+        // Update Cost
+        let costInput = document.getElementById(type + '-cost-' + counter);
+        if (costInput) {
+            if (type === 'out') {
+                // For OUT items, cost is readonly display
+                costInput.value = '$' + parseFloat(avgCost).toFixed(2);
+            } else {
+                // For IN items, cost is editable number input
+                costInput.value = parseFloat(avgCost).toFixed(2);
+                // Store original average cost for comparison
+                costInput.setAttribute('data-original-cost', parseFloat(avgCost).toFixed(2));
+            }
+        }
+
+        // Set quantity to 1
+        let qtyInput = document.getElementById(type + '-qty-' + counter);
+        if (qtyInput && partNum) {
+            qtyInput.value = '1';
+        }
+
+        // Load locations for this part
+        if (partNum) {
+            loadLocationsForPart(partNum, type + '-loc-' + counter, type);
+        }
+
+        updatePreview();
     }
 
     // Load locations with stock for a specific part
@@ -590,9 +856,7 @@
         row.innerHTML = `
             <div>
                 <label>Part Number</label>
-                <select id="out-part-${outItemCounter}" onchange="onPartSelected(this, 'out', ${outItemCounter})">
-                    ${createPartOptions()}
-                </select>
+                ${createPartAutocomplete('out-part-' + outItemCounter, 'out')}
             </div>
             <div>
                 <label>Location</label>
@@ -618,6 +882,8 @@
             </div>
         `;
         container.appendChild(row);
+        // Initialize autocomplete for this row
+        initPartAutocomplete('out-part-' + outItemCounter, 'out', outItemCounter);
     }
 
     // Add IN item row
@@ -630,9 +896,7 @@
         row.innerHTML = `
             <div>
                 <label>Part Number</label>
-                <select id="in-part-${inItemCounter}" onchange="onPartSelected(this, 'in', ${inItemCounter})">
-                    ${createPartOptions()}
-                </select>
+                ${createPartAutocomplete('in-part-' + inItemCounter, 'in')}
             </div>
             <div>
                 <label>Location</label>
@@ -658,48 +922,10 @@
             </div>
         `;
         container.appendChild(row);
+        // Initialize autocomplete for this row
+        initPartAutocomplete('in-part-' + inItemCounter, 'in', inItemCounter);
     }
 
-    // Handle part selection
-    function onPartSelected(selectElement, type, counter) {
-        let selectedOption = selectElement.options[selectElement.selectedIndex];
-        let partNum = selectElement.value;
-        let uom = selectedOption.getAttribute('data-uom') || '';
-        let avgCost = selectedOption.getAttribute('data-avgcost') || '0';
-
-        // Update UOM
-        let uomInput = document.getElementById(type + '-uom-' + counter);
-        if (uomInput) {
-            uomInput.value = uom;
-        }
-
-        // Update Cost
-        let costInput = document.getElementById(type + '-cost-' + counter);
-        if (costInput) {
-            if (type === 'out') {
-                // For OUT items, cost is readonly display
-                costInput.value = '$' + parseFloat(avgCost).toFixed(2);
-            } else {
-                // For IN items, cost is editable number input
-                costInput.value = parseFloat(avgCost).toFixed(2);
-                // Store original average cost for comparison
-                costInput.setAttribute('data-original-cost', parseFloat(avgCost).toFixed(2));
-            }
-        }
-
-        // Set quantity to 1
-        let qtyInput = document.getElementById(type + '-qty-' + counter);
-        if (qtyInput && partNum) {
-            qtyInput.value = '1';
-        }
-
-        // Load locations for this part
-        if (partNum) {
-            loadLocationsForPart(partNum, type + '-loc-' + counter, type);
-        }
-
-        updatePreview();
-    }
 
     // Remove item row
     function removeItem(rowId) {
@@ -716,13 +942,11 @@
             // Collect OUT items to calculate total OUT cost
             let outItems = [];
             document.getElementById('outItems').querySelectorAll('.item-row').forEach(function(row) {
-                let selects = row.querySelectorAll('select');
-                let partSelect = selects[0];
+                let partInput = row.querySelector('.autocomplete-input');
                 let qtyInput = row.querySelector('input[type="number"]');
-                let partNum = partSelect.value;
+                let partNum = partInput.getAttribute('data-partnum') || '';
                 let qty = parseFloat(qtyInput.value) || 0;
-                let selectedOption = partSelect.options[partSelect.selectedIndex];
-                let avgCost = parseFloat(selectedOption.getAttribute('data-avgcost')) || 0;
+                let avgCost = parseFloat(partInput.getAttribute('data-avgcost')) || 0;
 
                 if (partNum && qty > 0) {
                     outItems.push({
@@ -735,13 +959,13 @@
             // Collect IN items with their row IDs to update later
             let inItemsData = [];
             document.getElementById('inItems').querySelectorAll('.item-row').forEach(function(row) {
-                let selects = row.querySelectorAll('select');
-                let partSelect = selects[0];
+                let partInput = row.querySelector('.autocomplete-input');
+                let locationSelect = row.querySelector('select');
                 let inputs = row.querySelectorAll('input[type="number"]');
                 let qtyInput = inputs[0];
                 let costInput = inputs[1];
-                let partNum = partSelect.value;
-                let location = selects[1].value;
+                let partNum = partInput.getAttribute('data-partnum') || '';
+                let location = locationSelect.value;
                 let qty = parseFloat(qtyInput.value) || 0;
                 let cost = parseFloat(costInput.value) || 0;
 
@@ -815,26 +1039,23 @@
             // Collect OUT items
             let outItems = [];
             document.getElementById('outItems').querySelectorAll('.item-row').forEach(function(row) {
-                let selects = row.querySelectorAll('select');
-                let partSelect = selects[0];
-                let locationSelect = selects[1];
+                let partInput = row.querySelector('.autocomplete-input');
+                let locationSelect = row.querySelector('select');
                 let qtyInput = row.querySelector('input[type="number"]');
-                let costInput = row.querySelector('input[type="text"]:not([readonly])') || row.querySelectorAll('input[type="text"]')[0];
-                let partNum = partSelect.value;
+                let partNum = partInput.getAttribute('data-partnum') || '';
                 let location = locationSelect.value;
                 let qty = parseFloat(qtyInput.value) || 0;
 
-                let selectedOption = partSelect.options[partSelect.selectedIndex];
-                let avgCost = parseFloat(selectedOption.getAttribute('data-avgcost')) || 0;
+                let avgCost = parseFloat(partInput.getAttribute('data-avgcost')) || 0;
 
                 if (partNum && qty > 0 && location) {
                     outItems.push({
                         partnum: partNum,
-                        description: selectedOption.getAttribute('data-description') || '',
+                        description: partInput.getAttribute('data-description') || '',
                         location: location,
                         qty: qty,
                         avgcost: avgCost,
-                        uom: selectedOption.getAttribute('data-uom') || ''
+                        uom: partInput.getAttribute('data-uom') || ''
                     });
                 }
             });
@@ -842,29 +1063,26 @@
             // Collect IN items
             let inItems = [];
             document.getElementById('inItems').querySelectorAll('.item-row').forEach(function(row) {
-                let selects = row.querySelectorAll('select');
-                let partSelect = selects[0];
-                let locationSelect = selects[1];
+                let partInput = row.querySelector('.autocomplete-input');
+                let locationSelect = row.querySelector('select');
                 let inputs = row.querySelectorAll('input[type="number"]');
                 let qtyInput = inputs[0];  // First number input is quantity
                 let costInput = inputs[1]; // Second number input is cost
-                let partNum = partSelect.value;
+                let partNum = partInput.getAttribute('data-partnum') || '';
                 let location = locationSelect.value;
                 let qty = parseFloat(qtyInput.value) || 0;
                 let cost = parseFloat(costInput.value) || 0;
                 let originalCost = parseFloat(costInput.getAttribute('data-original-cost')) || 0;
 
-                let selectedOption = partSelect.options[partSelect.selectedIndex];
-
                 if (partNum && qty > 0 && location) {
                     inItems.push({
                         partnum: partNum,
-                        description: selectedOption.getAttribute('data-description') || '',
+                        description: partInput.getAttribute('data-description') || '',
                         location: location,
                         qty: qty,
                         avgcost: cost,  // Use the editable cost value
                         originalCost: originalCost,  // Store original average cost
-                        uom: selectedOption.getAttribute('data-uom') || ''
+                        uom: partInput.getAttribute('data-uom') || ''
                     });
                 }
             });
@@ -974,22 +1192,19 @@
             // Collect OUT items
             let outItems = [];
             document.getElementById('outItems').querySelectorAll('.item-row').forEach(function(row) {
-                let selects = row.querySelectorAll('select');
-                let partSelect = selects[0];
-                let locationSelect = selects[1];
+                let partInput = row.querySelector('.autocomplete-input');
+                let locationSelect = row.querySelector('select');
                 let qtyInput = row.querySelector('input[type="number"]');
-                let partNum = partSelect.value;
+                let partNum = partInput.getAttribute('data-partnum') || '';
                 let location = locationSelect.value;
                 let qty = parseFloat(qtyInput.value) || 0;
-
-                let selectedOption = partSelect.options[partSelect.selectedIndex];
 
                 if (partNum && qty > 0 && location) {
                     outItems.push({
                         partnum: partNum,
                         location: location,
                         qty: qty,
-                        uom: selectedOption.getAttribute('data-uom') || ''
+                        uom: partInput.getAttribute('data-uom') || ''
                     });
                 }
             });
@@ -1084,29 +1299,26 @@
             // Collect IN items
             let inItems = [];
             document.getElementById('inItems').querySelectorAll('.item-row').forEach(function(row) {
-                let selects = row.querySelectorAll('select');
-                let partSelect = selects[0];
-                let locationSelect = selects[1];
+                let partInput = row.querySelector('.autocomplete-input');
+                let locationSelect = row.querySelector('select');
                 let inputs = row.querySelectorAll('input[type="number"]');
                 let qtyInput = inputs[0];  // First number input is quantity
                 let costInput = inputs[1]; // Second number input is cost
-                let partNum = partSelect.value;
+                let partNum = partInput.getAttribute('data-partnum') || '';
                 let location = locationSelect.value;
                 let qty = parseFloat(qtyInput.value) || 0;
                 let cost = parseFloat(costInput.value) || 0;
                 let originalCost = parseFloat(costInput.getAttribute('data-original-cost')) || 0;
 
-                let selectedOption = partSelect.options[partSelect.selectedIndex];
-
                 if (partNum && qty > 0 && location) {
                     inItems.push({
                         partnum: partNum,
-                        description: selectedOption.getAttribute('data-description') || '',
+                        description: partInput.getAttribute('data-description') || '',
                         location: location,
                         qty: qty,
                         avgcost: cost,  // Use the editable cost value
                         originalCost: originalCost,  // Store original average cost
-                        uom: selectedOption.getAttribute('data-uom') || ''
+                        uom: partInput.getAttribute('data-uom') || ''
                     });
                 }
             });
