@@ -412,8 +412,11 @@
         </div>
 
         <div style="display: flex; gap: 10px; justify-content: center; margin-top: 30px;">
-            <button class="export-btn" onclick="exportCycleCount()" id="exportCycleBtn" style="margin: 0;">Export Cycle Count CSV</button>
-            <button class="export-btn" onclick="exportAddInventory()" id="exportAddInvBtn" style="margin: 0;">Export Add Inventory CSV</button>
+            <button class="export-btn" onclick="importToFishbowl()" id="importBtn" style="margin: 0; background-color: #228be6; font-size: 18px; padding: 15px 40px;">Import to Fishbowl</button>
+        </div>
+
+        <div id="importStatus" style="margin-top: 15px; text-align: center; display: none;">
+            <div id="importMessage" style="padding: 15px; border-radius: 6px; font-weight: bold;"></div>
         </div>
     </div>
 
@@ -1207,6 +1210,265 @@
         } catch(e) {
             console.error('Error in updatePreview:', e);
             alert('Error updating preview: ' + e.message);
+        }
+    }
+
+    // Show import status message
+    function showImportStatus(message, isSuccess) {
+        let statusDiv = document.getElementById('importStatus');
+        let messageDiv = document.getElementById('importMessage');
+
+        messageDiv.textContent = message;
+        messageDiv.style.backgroundColor = isSuccess ? '#d3f9d8' : '#ffe3e3';
+        messageDiv.style.color = isSuccess ? '#2b8a3e' : '#c92a2a';
+        messageDiv.style.border = '2px solid ' + (isSuccess ? '#51cf66' : '#ff6b6b');
+
+        statusDiv.style.display = 'block';
+
+        // Auto-hide after 10 seconds
+        setTimeout(function() {
+            statusDiv.style.display = 'none';
+        }, 10000);
+    }
+
+    // Import to Fishbowl via API
+    function importToFishbowl() {
+        try {
+            let metadata = {
+                date: document.getElementById('adjustmentDate').value || '',
+                qbclass: document.getElementById('qbclass').value || '',
+                note: document.getElementById('note').value || ''
+            };
+
+            // Collect OUT items for Cycle Count
+            let outItems = [];
+            document.getElementById('outItems').querySelectorAll('.item-row').forEach(function(row) {
+                let partInput = row.querySelector('.autocomplete-input');
+                let locationSelect = row.querySelector('select');
+                let qtyInput = row.querySelector('input[type="number"]');
+                let partNum = partInput.getAttribute('data-partnum') || '';
+                let location = locationSelect.value;
+                let qty = parseFloat(qtyInput.value) || 0;
+
+                if (partNum && qty > 0 && location) {
+                    outItems.push({
+                        partnum: partNum,
+                        location: location,
+                        qty: qty,
+                        uom: partInput.getAttribute('data-uom') || ''
+                    });
+                }
+            });
+
+            // Collect IN items for Add Inventory
+            let inItems = [];
+            document.getElementById('inItems').querySelectorAll('.item-row').forEach(function(row) {
+                let partInput = row.querySelector('.autocomplete-input');
+                let locationSelect = row.querySelector('select');
+                let inputs = row.querySelectorAll('input[type="number"]');
+                let qtyInput = inputs[0];
+                let costInput = inputs[1];
+                let partNum = partInput.getAttribute('data-partnum') || '';
+                let location = locationSelect.value;
+                let qty = parseFloat(qtyInput.value) || 0;
+                let cost = parseFloat(costInput.value) || 0;
+
+                if (partNum && qty > 0 && location) {
+                    inItems.push({
+                        partnum: partNum,
+                        description: partInput.getAttribute('data-description') || '',
+                        location: location,
+                        qty: qty,
+                        cost: cost,
+                        uom: partInput.getAttribute('data-uom') || ''
+                    });
+                }
+            });
+
+            if (outItems.length === 0 && inItems.length === 0) {
+                alert('No items to import. Please add items to remove or add.');
+                return;
+            }
+
+            // Disable button during import
+            let importBtn = document.getElementById('importBtn');
+            importBtn.disabled = true;
+            importBtn.textContent = 'Importing...';
+
+            let results = [];
+            let errors = [];
+
+            // Import Cycle Count (OUT items) first
+            if (outItems.length > 0) {
+                try {
+                    // Build cycle count rows - need to query current qty and calculate new count
+                    let cycleCountRows = [
+                        '"PartNumber","Location","Qty","UOM","Date","Note","Customer"'
+                    ];
+
+                    outItems.forEach(function(item) {
+                        let locationParts = item.location.split('-');
+                        let locationGroupName = locationParts[0];
+                        let locationName = locationParts.length > 1 ? locationParts[1] : '';
+
+                        // Query current quantity
+                        let qtyQuery = `SELECT SUM(qoh.qty) as currentqty
+                        FROM part
+                        INNER JOIN QOHVIEW qoh ON part.id = qoh.partid
+                        INNER JOIN locationgroup lg ON qoh.locationgroupid = lg.id
+                        LEFT JOIN location loc ON qoh.locationid = loc.id
+                        WHERE part.num = '${item.partnum}'
+                        AND lg.name = '${locationGroupName}'`;
+
+                        if (locationName) {
+                            qtyQuery += ` AND loc.name = '${locationName}'`;
+                        }
+
+                        let qtyResult = runQuery(qtyQuery);
+                        let qtyData = JSON.parse(qtyResult);
+
+                        if (Array.isArray(qtyData) && qtyData.length > 0) {
+                            qtyData = qtyData[0];
+                        }
+
+                        let currentQty = (qtyData && qtyData.currentqty !== null && qtyData.currentqty !== undefined) ? parseFloat(qtyData.currentqty) : 0;
+                        let actualCount = currentQty - item.qty;
+
+                        cycleCountRows.push(
+                            '"' + item.partnum + '",' +
+                            '"' + item.location + '",' +
+                            actualCount + ',' +
+                            '"' + item.uom + '",' +
+                            '"' + metadata.date + '",' +
+                            '"' + metadata.note + '",' +
+                            '""'
+                        );
+                    });
+
+                    // Build API request for Cycle Count import
+                    let cycleCountRequest = {
+                        "FbiJson": {
+                            "Ticket": {
+                                "Key": ""
+                            },
+                            "FbiMsgsRq": {
+                                "ImportRq": {
+                                    "Type": "ImportCycleCount",
+                                    "Rows": {
+                                        "Row": cycleCountRows
+                                    }
+                                }
+                            }
+                        }
+                    };
+
+                    let cycleCountResponse = doApiRequest(JSON.stringify(cycleCountRequest));
+                    let cycleCountResult = JSON.parse(cycleCountResponse);
+
+                    if (cycleCountResult && cycleCountResult.FbiJson && cycleCountResult.FbiJson.FbiMsgsRs &&
+                        cycleCountResult.FbiJson.FbiMsgsRs.ImportRs &&
+                        cycleCountResult.FbiJson.FbiMsgsRs.ImportRs.statusCode === 1000) {
+                        results.push('Cycle Count: ' + outItems.length + ' items imported successfully');
+                    } else {
+                        let errorMsg = 'Cycle Count import failed';
+                        if (cycleCountResult && cycleCountResult.FbiJson && cycleCountResult.FbiJson.FbiMsgsRs &&
+                            cycleCountResult.FbiJson.FbiMsgsRs.ImportRs && cycleCountResult.FbiJson.FbiMsgsRs.ImportRs.statusMessage) {
+                            errorMsg += ': ' + cycleCountResult.FbiJson.FbiMsgsRs.ImportRs.statusMessage;
+                        }
+                        errors.push(errorMsg);
+                    }
+                } catch (e) {
+                    errors.push('Cycle Count import error: ' + e.message);
+                }
+            }
+
+            // Import Add Inventory (IN items)
+            if (inItems.length > 0) {
+                try {
+                    // Build add inventory rows
+                    let addInventoryRows = [
+                        '"PartNumber","PartDescription","Location","Qty","UOM","Cost","QBClass","Date","Note"'
+                    ];
+
+                    inItems.forEach(function(item) {
+                        addInventoryRows.push(
+                            '"' + item.partnum + '",' +
+                            '"' + item.description + '",' +
+                            '"' + item.location + '",' +
+                            item.qty + ',' +
+                            '"' + item.uom + '",' +
+                            item.cost.toFixed(2) + ',' +
+                            '"' + metadata.qbclass + '",' +
+                            '"' + metadata.date + '",' +
+                            '"' + metadata.note + '"'
+                        );
+                    });
+
+                    // Build API request for Add Inventory import
+                    let addInventoryRequest = {
+                        "FbiJson": {
+                            "Ticket": {
+                                "Key": ""
+                            },
+                            "FbiMsgsRq": {
+                                "ImportRq": {
+                                    "Type": "ImportAddInventory",
+                                    "Rows": {
+                                        "Row": addInventoryRows
+                                    }
+                                }
+                            }
+                        }
+                    };
+
+                    let addInventoryResponse = doApiRequest(JSON.stringify(addInventoryRequest));
+                    let addInventoryResult = JSON.parse(addInventoryResponse);
+
+                    if (addInventoryResult && addInventoryResult.FbiJson && addInventoryResult.FbiJson.FbiMsgsRs &&
+                        addInventoryResult.FbiJson.FbiMsgsRs.ImportRs &&
+                        addInventoryResult.FbiJson.FbiMsgsRs.ImportRs.statusCode === 1000) {
+                        results.push('Add Inventory: ' + inItems.length + ' items imported successfully');
+                    } else {
+                        let errorMsg = 'Add Inventory import failed';
+                        if (addInventoryResult && addInventoryResult.FbiJson && addInventoryResult.FbiJson.FbiMsgsRs &&
+                            addInventoryResult.FbiJson.FbiMsgsRs.ImportRs && addInventoryResult.FbiJson.FbiMsgsRs.ImportRs.statusMessage) {
+                            errorMsg += ': ' + addInventoryResult.FbiJson.FbiMsgsRs.ImportRs.statusMessage;
+                        }
+                        errors.push(errorMsg);
+                    }
+                } catch (e) {
+                    errors.push('Add Inventory import error: ' + e.message);
+                }
+            }
+
+            // Re-enable button
+            importBtn.disabled = false;
+            importBtn.textContent = 'Import to Fishbowl';
+
+            // Show results
+            if (errors.length === 0) {
+                showImportStatus(results.join(' | '), true);
+
+                // Clear items after successful import
+                document.getElementById('outItems').innerHTML = '';
+                document.getElementById('inItems').innerHTML = '';
+                outItemCounter = 0;
+                inItemCounter = 0;
+                addOutItem();
+                addInItem();
+                updatePreview();
+            } else {
+                showImportStatus(errors.join(' | '), false);
+            }
+
+        } catch(e) {
+            console.error('Error in importToFishbowl:', e);
+            alert('Import failed: ' + e.message);
+
+            // Re-enable button on error
+            let importBtn = document.getElementById('importBtn');
+            importBtn.disabled = false;
+            importBtn.textContent = 'Import to Fishbowl';
         }
     }
 
