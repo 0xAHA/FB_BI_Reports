@@ -688,14 +688,33 @@
 
         <!-- Export Section (hidden until ready) -->
         <div class="export-section hidden" id="exportSection">
-            <h4>📥 Export for Fishbowl Import</h4>
-            <p class="text-muted mb-3">Generate CSV files ready for Fishbowl import</p>
-            <button class="btn btn-success export-btn" onclick="exportPartImport()" id="exportPartsBtn">
-                <i class="bi bi-download"></i> Download Part Import CSV
-            </button>
-            <button class="btn btn-primary export-btn" onclick="exportBOMImport()" id="exportBOMBtn">
-                <i class="bi bi-download"></i> Download BOM Import CSV
-            </button>
+            <h4>📥 Export & Import to Fishbowl</h4>
+            <p class="text-muted mb-3">Download CSV files or import directly to Fishbowl</p>
+
+            <div class="row">
+                <div class="col-md-6">
+                    <h6 class="text-secondary mb-2">CSV Export (Manual Import)</h6>
+                    <button class="btn btn-outline-success export-btn w-100 mb-2" onclick="exportPartImport()">
+                        <i class="bi bi-download"></i> Download Part Import CSV
+                    </button>
+                    <button class="btn btn-outline-primary export-btn w-100" onclick="exportBOMImport()">
+                        <i class="bi bi-download"></i> Download BOM Import CSV
+                    </button>
+                </div>
+                <div class="col-md-6">
+                    <h6 class="text-secondary mb-2">Direct API Import</h6>
+                    <button class="btn btn-success export-btn w-100 mb-2" onclick="importPartsToFishbowl()">
+                        <i class="bi bi-cloud-upload-fill"></i> Import Parts to Fishbowl
+                    </button>
+                    <button class="btn btn-primary export-btn w-100" onclick="importBOMsToFishbowl()">
+                        <i class="bi bi-cloud-upload-fill"></i> Import BOMs to Fishbowl
+                    </button>
+                </div>
+            </div>
+
+            <div class="alert alert-info mt-3 mb-0" style="font-size: 12px;">
+                <i class="bi bi-info-circle-fill"></i> <strong>Tip:</strong> Import Parts first, then import BOMs. BOMs require all parts to exist in Fishbowl.
+            </div>
         </div>
 
         <!-- Messages/Alerts Section -->
@@ -1682,6 +1701,246 @@
             });
 
             return data;
+        }
+
+        // API Import Functions
+        function importPartsToFishbowl() {
+            debugLog('info', 'Starting direct Part import to Fishbowl...');
+
+            if (partsToCreate.length === 0) {
+                showMessage('No parts to import', 'warning');
+                return;
+            }
+
+            try {
+                // Build CSV rows for Part/Product/Vendor Pricing import
+                const headers = ['Flag', 'PartNumber', 'PartDescription', 'PartType', 'UOM', 'ABCCODE', 'Active'];
+                const rows = [];
+
+                // Header row
+                rows.push(headers.map(h => `"${h}"`).join(','));
+
+                // Data rows
+                for (const part of partsToCreate) {
+                    const row = [
+                        'Part', // Flag
+                        part.partNumber || '',
+                        part.description || '',
+                        config.createAsInventory ? 'Inventory' : (part.type || 'Inventory'),
+                        part.uom || 'ea',
+                        'B', // Default ABC code
+                        'true' // Active
+                    ];
+                    rows.push(row.map(v => `"${v}"`).join(','));
+                }
+
+                // Build API request payload
+                const payload = {
+                    "ImportRq": {
+                        "Type": "ImportPartProductAndVendorPricing",
+                        "Rows": {
+                            "Row": rows
+                        }
+                    }
+                };
+
+                debugLog('info', `Importing ${partsToCreate.length} parts to Fishbowl...`);
+                debugLog('info', 'Import payload preview (first 3 rows)', rows.slice(0, 3));
+
+                showMessage(`Importing ${partsToCreate.length} parts to Fishbowl...`, 'info');
+                showProgress('Importing parts to Fishbowl...', 50);
+
+                // Call the Fishbowl API
+                const response = runApiRequest('ImportRq', JSON.stringify(payload));
+                debugLog('info', 'Part import response received', response);
+
+                hideProgress();
+
+                if (!response) {
+                    showMessage('Part import failed: No response from API', 'danger');
+                    debugLog('error', 'Part import failed: No response from API');
+                    return;
+                }
+
+                // Parse response
+                const result = typeof response === 'string' ? JSON.parse(response) : response;
+                debugLog('success', 'Part import response parsed', result);
+
+                // Check for errors in response
+                if (result && result.ImportRs) {
+                    const importRs = result.ImportRs;
+
+                    if (importRs.statusCode === '1000') {
+                        // Success
+                        showMessage(`✓ Successfully imported ${partsToCreate.length} parts to Fishbowl!`, 'success');
+                        debugLog('success', `Part import successful - ${partsToCreate.length} parts created`);
+
+                        // Update UI to show parts were imported
+                        updatePartsStatus('imported');
+                    } else {
+                        // Error
+                        const errorMsg = importRs.statusMessage || 'Unknown error';
+                        showMessage(`Part import failed: ${errorMsg}`, 'danger');
+                        debugLog('error', 'Part import failed', importRs);
+                    }
+                } else {
+                    showMessage('Unexpected response format from API', 'warning');
+                    debugLog('warning', 'Unexpected response format', result);
+                }
+
+            } catch (error) {
+                hideProgress();
+                debugLog('error', 'Error during Part import', error.toString());
+                showMessage('Error importing parts: ' + error.message, 'danger');
+            }
+        }
+
+        function importBOMsToFishbowl() {
+            debugLog('info', 'Starting direct BOM import to Fishbowl...');
+
+            if (bomsToCreate.length === 0) {
+                showMessage('No BOMs to import', 'warning');
+                return;
+            }
+
+            // Check if mappings are configured
+            if (!fieldMappings || !fieldMappings.bomLevel || !fieldMappings.itemLevel) {
+                showMessage('Please configure field mappings first', 'warning');
+                debugLog('warning', 'Field mappings not configured');
+                return;
+            }
+
+            // Check if headers are loaded
+            if (!bomLevelHeaders.length || !itemLevelHeaders.length) {
+                showMessage('Please retrieve BOM import headers first', 'warning');
+                return;
+            }
+
+            try {
+                const rows = [];
+
+                // Row 1: BOM-level headers (exactly as from API)
+                rows.push(bomLevelHeaders.map(h => `"${h}"`).join(','));
+
+                // Row 2: Item-level headers (exactly as from API)
+                rows.push(itemLevelHeaders.map(h => `"${h}"`).join(','));
+
+                // Generate BOM rows
+                for (const bom of bomsToCreate) {
+                    debugLog('info', `Adding BOM to import: ${bom.partNumber}`);
+
+                    // BOM-level row (Flag = "BOM")
+                    const bomRow = generateBOMRow(bom);
+                    rows.push(bomRow);
+
+                    // Item-level rows (Flag = "Item") for each component
+                    for (const item of bom.items) {
+                        const itemRow = generateItemRow(bom, item);
+                        rows.push(itemRow);
+                    }
+                }
+
+                // Build API request payload
+                const payload = {
+                    "ImportRq": {
+                        "Type": "ImportBillOfMaterials",
+                        "Rows": {
+                            "Row": rows
+                        }
+                    }
+                };
+
+                debugLog('info', `Importing ${bomsToCreate.length} BOMs to Fishbowl...`);
+                debugLog('info', 'Import payload preview (first 5 rows)', rows.slice(0, 5));
+
+                showMessage(`Importing ${bomsToCreate.length} BOMs to Fishbowl...`, 'info');
+                showProgress('Importing BOMs to Fishbowl...', 50);
+
+                // Call the Fishbowl API
+                const response = runApiRequest('ImportRq', JSON.stringify(payload));
+                debugLog('info', 'BOM import response received', response);
+
+                hideProgress();
+
+                if (!response) {
+                    showMessage('BOM import failed: No response from API', 'danger');
+                    debugLog('error', 'BOM import failed: No response from API');
+                    return;
+                }
+
+                // Parse response
+                const result = typeof response === 'string' ? JSON.parse(response) : response;
+                debugLog('success', 'BOM import response parsed', result);
+
+                // Check for errors in response
+                if (result && result.ImportRs) {
+                    const importRs = result.ImportRs;
+
+                    if (importRs.statusCode === '1000') {
+                        // Success
+                        showMessage(`✓ Successfully imported ${bomsToCreate.length} BOMs to Fishbowl!`, 'success');
+                        debugLog('success', `BOM import successful - ${bomsToCreate.length} BOMs created`);
+
+                        // Update UI to show BOMs were imported
+                        updateBOMsStatus('imported');
+                    } else {
+                        // Error
+                        const errorMsg = importRs.statusMessage || 'Unknown error';
+                        showMessage(`BOM import failed: ${errorMsg}`, 'danger');
+                        debugLog('error', 'BOM import failed', importRs);
+                    }
+                } else {
+                    showMessage('Unexpected response format from API', 'warning');
+                    debugLog('warning', 'Unexpected response format', result);
+                }
+
+            } catch (error) {
+                hideProgress();
+                debugLog('error', 'Error during BOM import', error.toString());
+                showMessage('Error importing BOMs: ' + error.message, 'danger');
+            }
+        }
+
+        // Update parts table status
+        function updatePartsStatus(status) {
+            const tbody = document.getElementById('partsTableBody');
+            const rows = tbody.getElementsByTagName('tr');
+
+            for (const row of rows) {
+                const statusCell = row.cells[3];
+                if (status === 'imported') {
+                    statusCell.innerHTML = '<span class="badge bg-success">Imported</span>';
+                }
+            }
+        }
+
+        // Update BOMs table status
+        function updateBOMsStatus(status) {
+            const tbody = document.getElementById('bomsTableBody');
+            const rows = tbody.getElementsByTagName('tr');
+
+            for (const row of rows) {
+                const statusCell = row.cells[4];
+                if (status === 'imported') {
+                    statusCell.innerHTML = '<span class="badge bg-success">Imported</span>';
+                }
+            }
+        }
+
+        // Show/hide progress indicator
+        function showProgress(message, percent) {
+            const progressSection = document.getElementById('progressSection');
+            const progressText = document.getElementById('progressText');
+            const progressBar = document.getElementById('progressBar');
+
+            progressText.textContent = message;
+            progressBar.style.width = percent + '%';
+            progressSection.classList.remove('hidden');
+        }
+
+        function hideProgress() {
+            const progressSection = document.getElementById('progressSection');
+            progressSection.classList.add('hidden');
         }
 
         function downloadCSV(csvContent, filename) {
