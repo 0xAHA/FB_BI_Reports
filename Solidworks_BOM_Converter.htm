@@ -991,18 +991,13 @@
 
             const uniqueParts = new Map();
             const bomStructure = [];
-            let currentBOM = null;
+            const bomsByLevel = new Map(); // Track BOMs by their level
 
-            for (const item of bomItems) {
-                // Parse level (e.g., "1", "1.1", "1.1.1")
+            // First pass: identify all unique parts and potential BOMs
+            for (let i = 0; i < bomItems.length; i++) {
+                const item = bomItems[i];
                 const levelParts = item.level.split('.');
                 const depth = levelParts.length;
-
-                debugLog('info', `Processing item: ${item.level} - ${item.partNumber}`, {
-                    level: item.level,
-                    depth,
-                    partNumber: item.partNumber
-                });
 
                 // Track unique parts
                 if (item.partNumber && !uniqueParts.has(item.partNumber)) {
@@ -1014,28 +1009,83 @@
                     });
                 }
 
-                // Identify BOMs (items with children)
-                // For now, we'll do a simple analysis
-                // A BOM is typically a top-level item or an assembly/sub-assembly
+                // Check if this item has children (is a BOM parent)
+                const hasChildren = i < bomItems.length - 1 &&
+                    bomItems[i + 1].level.startsWith(item.level + '.');
+
+                if (hasChildren) {
+                    // This is a BOM/assembly
+                    const bom = {
+                        level: item.level,
+                        partNumber: item.partNumber,
+                        description: item.description,
+                        items: [],
+                        isStage: depth > 1 // Sub-assemblies are stages
+                    };
+                    bomsByLevel.set(item.level, bom);
+                    bomStructure.push(bom);
+                }
+            }
+
+            // Second pass: assign items to their parent BOMs
+            for (const item of bomItems) {
+                const levelParts = item.level.split('.');
+
+                // Find the parent BOM (one level up)
+                if (levelParts.length > 1) {
+                    const parentLevel = levelParts.slice(0, -1).join('.');
+                    const parentBOM = bomsByLevel.get(parentLevel);
+
+                    if (parentBOM) {
+                        // This item belongs to the parent BOM
+                        parentBOM.items.push(item);
+                    }
+                }
             }
 
             partsToCreate = Array.from(uniqueParts.values());
+            bomsToCreate = bomStructure;
+
             debugLog('success', `Identified ${partsToCreate.length} unique parts`, partsToCreate.slice(0, 5));
+            debugLog('success', `Identified ${bomsToCreate.length} BOMs/assemblies`, bomsToCreate);
 
             updateStats({
                 total: bomItems.length,
                 parts: partsToCreate.length,
                 newParts: partsToCreate.length, // Will be refined later
-                boms: 0, // Will be calculated
+                boms: bomsToCreate.length,
                 warnings: 0,
                 errors: 0
             });
 
-            // Show parts section
+            // Show parts section and BOMs section
             displayPartsToCreate();
+            displayBOMsToCreate();
 
             // Show field mapping button
             document.getElementById('mappingButtonSection').classList.remove('hidden');
+        }
+
+        // Display BOMs to create in table
+        function displayBOMsToCreate() {
+            const tbody = document.getElementById('bomsTableBody');
+            tbody.innerHTML = '';
+
+            for (const bom of bomsToCreate) {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${bom.partNumber}</td>
+                    <td>${bom.partNumber}</td>
+                    <td>${bom.items.length}</td>
+                    <td>${bom.isStage ? '<span class="badge bg-info">Stage</span>' : '<span class="badge bg-primary">Main</span>'}</td>
+                    <td><span class="badge bg-warning">To Create</span></td>
+                `;
+                tbody.appendChild(row);
+            }
+
+            if (bomsToCreate.length > 0) {
+                document.getElementById('bomsSection').classList.remove('hidden');
+            }
         }
 
         // Field Mapping Functions
@@ -1250,13 +1300,232 @@
 
         // Export functions
         function exportPartImport() {
-            showMessage('Part export not yet implemented', 'warning');
-            // TODO: Generate PPP format CSV for part creation
+            debugLog('info', 'Starting Part Import CSV export...');
+
+            if (partsToCreate.length === 0) {
+                showMessage('No parts to export', 'warning');
+                return;
+            }
+
+            try {
+                // PPP Import format: Flag, PartNumber, PartDescription, PartType, etc.
+                // For now, we'll create a basic part import with minimal fields
+                const headers = ['Flag', 'PartNumber', 'PartDescription', 'PartType', 'UOM', 'ABCCODE', 'Active'];
+                const rows = [];
+
+                // Header row
+                rows.push(headers.map(h => `"${h}"`).join(','));
+
+                // Data rows
+                for (const part of partsToCreate) {
+                    const row = [
+                        'Part', // Flag
+                        part.partNumber || '',
+                        part.description || '',
+                        config.createAsInventory ? 'Inventory' : (part.type || 'Inventory'),
+                        part.uom || 'ea',
+                        'B', // Default ABC code
+                        'true' // Active
+                    ];
+                    rows.push(row.map(v => `"${v}"`).join(','));
+                }
+
+                const csvContent = rows.join('\n');
+                debugLog('success', `Generated Part Import CSV with ${partsToCreate.length} parts`);
+
+                downloadCSV(csvContent, 'parts_import.csv');
+                showMessage(`Exported ${partsToCreate.length} parts successfully`, 'success');
+
+            } catch (error) {
+                debugLog('error', 'Error generating Part Import CSV', error.toString());
+                showMessage('Error generating Part Import CSV: ' + error.message, 'danger');
+            }
         }
 
         function exportBOMImport() {
-            showMessage('BOM export not yet implemented', 'warning');
-            // TODO: Generate Fishbowl BOM import CSV
+            debugLog('info', 'Starting BOM Import CSV export...');
+
+            if (bomsToCreate.length === 0) {
+                showMessage('No BOMs to export', 'warning');
+                return;
+            }
+
+            // Check if mappings are configured
+            if (!fieldMappings || !fieldMappings.bomLevel || !fieldMappings.itemLevel) {
+                showMessage('Please configure field mappings first', 'warning');
+                debugLog('warning', 'Field mappings not configured');
+                return;
+            }
+
+            // Check if headers are loaded
+            if (!bomLevelHeaders.length || !itemLevelHeaders.length) {
+                showMessage('Please retrieve BOM import headers first', 'warning');
+                return;
+            }
+
+            try {
+                const rows = [];
+
+                // Row 1: BOM-level headers (exactly as from API)
+                rows.push(bomLevelHeaders.map(h => `"${h}"`).join(','));
+
+                // Row 2: Item-level headers (exactly as from API)
+                rows.push(itemLevelHeaders.map(h => `"${h}"`).join(','));
+
+                // Generate BOM rows
+                for (const bom of bomsToCreate) {
+                    debugLog('info', `Generating BOM for: ${bom.partNumber}`);
+
+                    // BOM-level row (Flag = "BOM")
+                    const bomRow = generateBOMRow(bom);
+                    rows.push(bomRow);
+
+                    // Item-level rows (Flag = "Item") for each component
+                    for (const item of bom.items) {
+                        const itemRow = generateItemRow(bom, item);
+                        rows.push(itemRow);
+                    }
+                }
+
+                const csvContent = rows.join('\n');
+                debugLog('success', `Generated BOM Import CSV with ${bomsToCreate.length} BOMs`);
+                debugLog('info', 'CSV Preview (first 500 chars)', csvContent.substring(0, 500));
+
+                downloadCSV(csvContent, 'bom_import.csv');
+                showMessage(`Exported ${bomsToCreate.length} BOMs successfully`, 'success');
+
+            } catch (error) {
+                debugLog('error', 'Error generating BOM Import CSV', error.toString());
+                showMessage('Error generating BOM Import CSV: ' + error.message, 'danger');
+            }
+        }
+
+        function generateBOMRow(bom) {
+            const row = [];
+
+            // For each BOM-level header, get the value from mappings
+            for (const header of bomLevelHeaders) {
+                if (header === 'Flag') {
+                    row.push('"BOM"');
+                } else {
+                    // Check if we have a mapping for this field
+                    const solidworksColumn = fieldMappings.bomLevel[header];
+                    let value = '';
+
+                    if (solidworksColumn) {
+                        // Get the value from the BOM data using the mapped column
+                        if (header === 'Number' || header === 'Description') {
+                            // Use the BOM's part number or description
+                            if (header === 'Number') value = bom.partNumber || '';
+                            if (header === 'Description') value = bom.description || '';
+                        }
+                    }
+
+                    // Default values for common fields
+                    if (header === 'Active' && !value) value = 'true';
+
+                    row.push(`"${value}"`);
+                }
+            }
+
+            return row.join(',');
+        }
+
+        function generateItemRow(bom, item) {
+            const row = [];
+
+            // Get the original CSV row data for this item
+            const itemData = getItemData(item);
+
+            // For each Item-level header, get the value from mappings
+            for (const header of itemLevelHeaders) {
+                if (header === 'Flag') {
+                    row.push('"Item"');
+                } else {
+                    // Check if we have a mapping for this field
+                    const solidworksColumn = fieldMappings.itemLevel[header];
+                    let value = '';
+
+                    if (solidworksColumn && itemData) {
+                        // Get the value from the item data using the mapped column
+                        value = itemData[solidworksColumn] || '';
+                    } else {
+                        // Use direct item properties
+                        if (header === 'Part') value = item.partNumber || '';
+                        if (header === 'Quantity') value = item.quantity || '1';
+                        if (header === 'UOM') value = item.uom || 'ea';
+                        if (header === 'Description') value = item.description || '';
+                        if (header === 'Type') value = item.type || 'Raw Good';
+                    }
+
+                    // Default values
+                    if (header === 'IsVariableQuantity' && !value) value = 'false';
+                    if (header === 'MinQuantity' && !value) value = '0';
+                    if (header === 'MaxQuantity' && !value) value = '0';
+                    if (header === 'IsGroupDefault' && !value) value = 'true';
+                    if (header === 'PriceAdjustment' && !value) value = '0.00';
+                    if (header === 'IsOneTimeItem' && !value) value = 'false';
+                    if (header === 'ConfigurationSortOrder' && !value) value = '1';
+
+                    // Check if this item is a stage (sub-assembly)
+                    if (header === 'IsStage') {
+                        // Check if this item has a BOM of its own
+                        const hasOwnBOM = bomsToCreate.find(b => b.partNumber === item.partNumber);
+                        value = hasOwnBOM ? 'true' : 'false';
+                    }
+
+                    if (header === 'StageBOMNumber' && value === 'true') {
+                        value = item.partNumber; // Reference the stage BOM by part number
+                    }
+
+                    row.push(`"${value}"`);
+                }
+            }
+
+            return row.join(',');
+        }
+
+        function getItemData(item) {
+            // Find the original row data from solidworksData
+            const foundItem = solidworksData.find(d => d.level === item.level && d.partNumber === item.partNumber);
+            if (!foundItem) return null;
+
+            // Create a map of column name to value
+            const data = {};
+            solidworksColumns.forEach((col, index) => {
+                // Store the data using column names
+                if (col === 'LEVEL') data[col] = foundItem.level;
+                if (col === 'Description') data[col] = foundItem.description;
+                if (col === 'PGE P/N#') data[col] = foundItem.partNumber;
+                if (col === 'Ordering type') data[col] = foundItem.type;
+                if (col === 'Qty') data[col] = foundItem.quantity;
+                if (col === 'uom') data[col] = foundItem.uom;
+            });
+
+            return data;
+        }
+
+        function downloadCSV(csvContent, filename) {
+            debugLog('info', `Downloading CSV file: ${filename}`);
+
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+
+            if (link.download !== undefined) {
+                const url = URL.createObjectURL(blob);
+                link.setAttribute('href', url);
+                link.setAttribute('download', filename);
+                link.style.visibility = 'hidden';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(url);
+
+                debugLog('success', `CSV file downloaded: ${filename}`);
+            } else {
+                showMessage('Download not supported in this browser', 'danger');
+                debugLog('error', 'Download not supported');
+            }
         }
 
         // Utility functions
