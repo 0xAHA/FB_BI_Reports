@@ -60,6 +60,20 @@
             fill: var(--fb-danger) !important; /* Red for scheduling conflicts */
         }
 
+        /* MO header rows */
+        .bar-wrapper.mo-header .bar {
+            fill: var(--fb-gray-300) !important;
+            stroke: var(--fb-gray-600);
+            stroke-width: 2;
+            opacity: 0.5;
+        }
+
+        .bar-wrapper.mo-header .bar-label {
+            fill: var(--fb-gray-900) !important;
+            font-weight: 700;
+            font-size: 13px;
+        }
+
         /* Gantt bar labels */
         .bar-wrapper .bar-label {
             fill: white;
@@ -565,6 +579,12 @@
                 <div class="legend-color" style="background-color: var(--fb-danger);"></div>
                 <span><strong style="color: var(--fb-danger);">Conflict!</strong> <span id="conflictCount">(0)</span></span>
             </div>
+            <div class="legend-item" style="margin-left: auto;">
+                <label class="form-check-label" style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer;">
+                    <input class="form-check-input" type="checkbox" id="shiftDependentWOs" style="margin: 0;">
+                    <span style="font-size: 0.875rem;">Shift dependent WOs when dragging</span>
+                </label>
+            </div>
         </div>
 
         <!-- Gantt Chart Container -->
@@ -627,6 +647,7 @@ let ganttChart = null;
 let allWorkOrders = [];
 let filteredWorkOrders = [];
 let stagingDependencies = [];
+let manufacturingOrders = []; // MO finished goods data for headers
 
 // ============================================
 // Debug Logging Functions
@@ -799,6 +820,29 @@ function loadWorkOrders() {
             AND current_mo.id = staging_mo.id
     `;
 
+    // Get MO finished goods info for headers
+    const moQuery = `
+        SELECT DISTINCT
+            mo.num AS mo_num,
+            mo.id AS mo_id,
+            part.num AS part_num,
+            moitem.description AS description,
+            moitem.qtytofulfill AS qty
+        FROM mo
+        LEFT JOIN moitem ON moitem.moid = mo.id
+        LEFT JOIN part ON moitem.partid = part.id
+        WHERE moitem.typeid = 50
+            AND moitem.parentid IS NULL
+            AND mo.id IN (
+                SELECT DISTINCT mo.id
+                FROM wo
+                LEFT JOIN moitem ON wo.moitemid = moitem.id
+                LEFT JOIN mo ON moitem.moid = mo.id
+                WHERE wo.num IS NOT NULL AND wo.statusid IN (10, 30, 40)
+            )
+        ORDER BY mo.num
+    `;
+
     try {
         debugLog('info', 'Starting to load work orders...');
 
@@ -820,6 +864,12 @@ function loadWorkOrders() {
         } else {
             debugLog('info', `Dependency examples: ${stagingDependencies.slice(0, 3).map(d => `${d.staging_wo_num}→${d.wo_num}`).join(', ')}`);
         }
+
+        // Load MO finished goods for headers
+        debugLog('info', 'Loading MO finished goods...');
+        const moResults = JSON.parse(runQuery(moQuery));
+        manufacturingOrders = moResults;
+        debugLog('success', `Loaded ${manufacturingOrders.length} MO finished goods`);
 
         // Populate MO filter dropdown
         populateMOFilter(woResults);
@@ -920,6 +970,14 @@ function renderGanttChart() {
                 console.log('Progress changed:', task, progress);
             },
             on_date_change: function(task, start, end) {
+                // Don't allow dragging MO header rows
+                if (task.is_mo_header) {
+                    debugLog('warning', 'MO headers cannot be dragged - please drag individual WOs');
+                    showToast('MO headers cannot be dragged. Please drag individual WO bars instead.', 'warning', false);
+                    renderGanttChart(); // Reset chart to revert the change
+                    return;
+                }
+
                 console.log('Date changed:', task.wo_num, 'from', task.start, 'to', start);
                 updateWODates(task, start, end);
             },
@@ -1078,47 +1136,87 @@ function transformToGanttFormat(workOrders) {
     const woIdMap = new Map();
     const woTaskMap = new Map();
 
+    // Group WOs by MO
+    const wosByMO = {};
     workOrders.forEach(wo => {
-        // Calculate start and end dates
-        let startDate = wo.date_scheduled_start || wo.date_scheduled;
-        let endDate = wo.date_scheduled;
+        if (!wosByMO[wo.mo_num]) {
+            wosByMO[wo.mo_num] = [];
+        }
+        wosByMO[wo.mo_num].push(wo);
+    });
 
-        // If no end date or same as start, add duration
-        if (!endDate || endDate === startDate) {
-            const start = moment(startDate);
-            const durationHours = wo.estimated_duration / 60 || 1;
-            endDate = start.add(durationHours, 'hours').format('YYYY-MM-DD');
+    // Process each MO group
+    Object.keys(wosByMO).sort().forEach(moNum => {
+        const wosInMO = wosByMO[moNum];
+
+        // Find MO finished good info for header
+        const moInfo = manufacturingOrders.find(mo => mo.mo_num === moNum);
+
+        if (moInfo) {
+            // Calculate MO date range from all WOs in this MO
+            const allDates = wosInMO.map(wo => moment(wo.date_scheduled_start || wo.date_scheduled));
+            const minDate = moment.min(allDates);
+            const maxDates = wosInMO.map(wo => moment(wo.date_scheduled));
+            const maxDate = moment.max(maxDates);
+
+            // Create MO header row
+            const moHeader = {
+                id: `mo_${moInfo.mo_id}`,
+                name: `<strong>${moNum}: ${moInfo.part_num}</strong> - ${moInfo.description} (Qty: ${moInfo.qty})`,
+                start: minDate.format('YYYY-MM-DD'),
+                end: maxDate.format('YYYY-MM-DD'),
+                progress: 0,
+                dependencies: [],
+                custom_class: 'mo-header',
+                is_mo_header: true,
+                mo_num: moNum
+            };
+            tasks.push(moHeader);
         }
 
-        // Ensure valid dates
-        if (!startDate) startDate = moment().format('YYYY-MM-DD');
-        if (!endDate) endDate = moment(startDate).add(1, 'day').format('YYYY-MM-DD');
+        // Add WO tasks for this MO
+        wosInMO.forEach(wo => {
+            // Calculate start and end dates
+            let startDate = wo.date_scheduled_start || wo.date_scheduled;
+            let endDate = wo.date_scheduled;
 
-        const task = {
-            id: `wo_${wo.wo_id}`,
-            name: `${wo.wo_num} - ${wo.mo_num}`,
-            start: startDate,
-            end: endDate,
-            progress: wo.wo_status === 40 ? 100 : (wo.wo_status === 30 ? 50 : 0),
-            dependencies: [],
-            custom_class: `status-${wo.wo_status_name.toLowerCase()}`,
-            // Custom data for popup and conflict detection
-            wo_num: wo.wo_num,
-            wo_id: wo.wo_id,
-            mo_num: wo.mo_num,
-            status_name: wo.wo_status_name,
-            description: wo.description,
-            duration: wo.estimated_duration,
-            qty_target: wo.qty_target,
-            _start_date: startDate,
-            _end_date: endDate
-        };
+            // If no end date or same as start, add duration
+            if (!endDate || endDate === startDate) {
+                const start = moment(startDate);
+                const durationHours = wo.estimated_duration / 60 || 1;
+                endDate = start.add(durationHours, 'hours').format('YYYY-MM-DD');
+            }
 
-        // Map WO ID to task for dependency linking
-        woIdMap.set(wo.wo_id, `wo_${wo.wo_id}`);
-        woTaskMap.set(wo.wo_id, task);
+            // Ensure valid dates
+            if (!startDate) startDate = moment().format('YYYY-MM-DD');
+            if (!endDate) endDate = moment(startDate).add(1, 'day').format('YYYY-MM-DD');
 
-        tasks.push(task);
+            const task = {
+                id: `wo_${wo.wo_id}`,
+                name: `  ${wo.wo_num}`,  // Indent WOs under MO header
+                start: startDate,
+                end: endDate,
+                progress: wo.wo_status === 40 ? 100 : (wo.wo_status === 30 ? 50 : 0),
+                dependencies: [],
+                custom_class: `status-${wo.wo_status_name.toLowerCase()}`,
+                // Custom data for popup and conflict detection
+                wo_num: wo.wo_num,
+                wo_id: wo.wo_id,
+                mo_num: wo.mo_num,
+                status_name: wo.wo_status_name,
+                description: wo.description,
+                duration: wo.estimated_duration,
+                qty_target: wo.qty_target,
+                _start_date: startDate,
+                _end_date: endDate
+            };
+
+            // Map WO ID to task for dependency linking
+            woIdMap.set(wo.wo_id, `wo_${wo.wo_id}`);
+            woTaskMap.set(wo.wo_id, task);
+
+            tasks.push(task);
+        });
     });
 
     // Second pass: link staging dependencies and detect conflicts
