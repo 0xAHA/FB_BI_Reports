@@ -182,6 +182,13 @@
             background-color: var(--fb-success);
         }
 
+        /* Shift Deps button - green when active */
+        #shiftDependentWOs:checked + label {
+            background-color: var(--fb-success) !important;
+            border-color: var(--fb-success) !important;
+            color: white !important;
+        }
+
         /* Header styling */
         .page-header {
             background: linear-gradient(135deg, var(--fb-primary), var(--fb-primary-light));
@@ -536,6 +543,16 @@
                         <option value="Week">Week</option>
                         <option value="Month">Month</option>
                     </select>
+                </div>
+
+                <div class="mb-3">
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" role="switch" id="allowSameDayStart" checked>
+                        <label class="form-check-label" for="allowSameDayStart" style="cursor: pointer; font-size: 0.875rem;">
+                            Allow same-day starts
+                        </label>
+                    </div>
+                    <small class="text-muted">When enabled, a WO can start on the same day its dependency finishes (no conflict). When disabled, dependencies must finish before the day the WO starts.</small>
                 </div>
             </div>
 
@@ -1203,8 +1220,41 @@ function renderGanttChart() {
     const sortDirection = document.getElementById('sortDirection').value;
     const timeScale = document.getElementById('timeScale').value;
 
+    // Group WOs by MO to check for old fulfilled MOs
+    const wosByMO = {};
+    allWorkOrders.forEach(wo => {
+        if (!wosByMO[wo.mo_num]) {
+            wosByMO[wo.mo_num] = [];
+        }
+        wosByMO[wo.mo_num].push(wo);
+    });
+
+    // Identify old fulfilled MOs to filter out
+    const oldFulfilledMOs = new Set();
+    const threeMonthsAgo = moment().subtract(3, 'months');
+
+    Object.keys(wosByMO).forEach(moNum => {
+        const wos = wosByMO[moNum];
+        // Check if ALL WOs in this MO are fulfilled
+        const allFulfilled = wos.every(wo => wo.wo_status === 40);
+
+        if (allFulfilled) {
+            // Check if MO end date is more than 3 months old
+            const endDates = wos.map(wo => moment(wo.date_scheduled));
+            const moEndDate = moment.max(endDates);
+
+            if (moEndDate.isBefore(threeMonthsAgo)) {
+                oldFulfilledMOs.add(moNum);
+                debugLog('info', `Filtering out old fulfilled MO: ${moNum} (ended ${moEndDate.format('YYYY-MM-DD')})`);
+            }
+        }
+    });
+
     // Filter work orders
     filteredWorkOrders = allWorkOrders.filter(wo => {
+        // Filter out old fulfilled MOs
+        if (oldFulfilledMOs.has(wo.mo_num)) return false;
+
         // MO filter
         if (selectedMO !== 'all' && wo.mo_num !== selectedMO) return false;
 
@@ -1328,20 +1378,37 @@ function renderGanttChart() {
                 const duration = task.duration || 0;
                 const conflictWarning = task.has_conflict ? '<br><span style="color: var(--fb-danger); font-weight: bold;">⚠️ SCHEDULING CONFLICT!</span>' : '';
 
-                return `
-                    <div class="popup-wrapper">
-                        <div class="title">${task.name}${conflictWarning}</div>
-                        <div class="subtitle">
-                            <strong>Status:</strong> ${task.status_name}<br>
-                            <strong>MO:</strong> ${task.mo_num}<br>
-                            <strong>Start:</strong> ${start}<br>
-                            <strong>End:</strong> ${end}<br>
-                            <strong>Duration:</strong> ${duration} min<br>
-                            ${task.qty_target ? `<strong>Qty:</strong> ${task.qty_target}<br>` : ''}
-                            ${task.description ? `<strong>Desc:</strong> ${task.description}` : ''}
+                if (task.is_mo_header) {
+                    // MO header popup
+                    return `
+                        <div class="popup-wrapper">
+                            <div class="title">MO ${task.mo_num}${task.part_num ? ': ' + task.part_num : ''}</div>
+                            <div class="subtitle">
+                                <strong>Status:</strong> ${task.status_name || 'Mixed'}<br>
+                                <strong>Start:</strong> ${start}<br>
+                                <strong>End:</strong> ${end}<br>
+                                ${task.qty_target ? `<strong>Qty:</strong> ${task.qty_target}<br>` : ''}
+                                ${task.description ? `<strong>Desc:</strong> ${task.description}` : ''}
+                            </div>
                         </div>
-                    </div>
-                `;
+                    `;
+                } else {
+                    // WO task popup
+                    return `
+                        <div class="popup-wrapper">
+                            <div class="title">${task.name}${conflictWarning}</div>
+                            <div class="subtitle">
+                                <strong>Status:</strong> ${task.status_name}<br>
+                                <strong>MO:</strong> ${task.mo_num}<br>
+                                <strong>Start:</strong> ${start}<br>
+                                <strong>End:</strong> ${end}<br>
+                                <strong>Duration:</strong> ${duration} min<br>
+                                ${task.qty_target ? `<strong>Qty:</strong> ${task.qty_target}<br>` : ''}
+                                ${task.description ? `<strong>Desc:</strong> ${task.description}` : ''}
+                            </div>
+                        </div>
+                    `;
+                }
             },
             on_click: function(task) {
                 // If clicking MO header, toggle collapse/expand
@@ -1396,6 +1463,7 @@ function scrollToToday() {
 // ============================================
 function scrollToStartDate() {
     // Wait for Gantt chart to be fully rendered
+    // Increased timeout for larger charts with many MOs
     setTimeout(() => {
         debugLog('info', 'scrollToStartDate() called');
 
@@ -1410,10 +1478,13 @@ function scrollToStartDate() {
         const ganttContainer = document.querySelector('.gantt-container');
         const ganttElement = document.querySelector('#ganttChart .gantt');
         if (!ganttContainer || !ganttElement) {
-            debugLog('warning', 'Gantt container or element not found', {
+            debugLog('warning', 'Gantt container or element not found - will retry', {
                 hasContainer: !!ganttContainer,
                 hasElement: !!ganttElement
             });
+
+            // Retry after another delay if elements not found
+            setTimeout(() => scrollToStartDate(), 500);
             return;
         }
 
@@ -1423,7 +1494,9 @@ function scrollToStartDate() {
         // Try to find a date header to calculate position
         const dateHeaders = document.querySelectorAll('.grid-header');
         if (dateHeaders.length === 0) {
-            debugLog('warning', 'No date headers found - cannot calculate scroll position');
+            debugLog('warning', 'No date headers found - will retry');
+            // Retry after another delay
+            setTimeout(() => scrollToStartDate(), 500);
             return;
         }
 
@@ -1549,7 +1622,7 @@ function scrollToStartDate() {
         ganttContainer.scrollLeft = finalScrollPosition;
 
         debugLog('success', `✓ Scrolled gantt to ${targetDate.format('YYYY-MM-DD')} (position: ${finalScrollPosition.toFixed(0)}px)`);
-    }, 300);
+    }, 800); // Increased timeout for larger charts
 }
 
 // ============================================
@@ -2015,9 +2088,18 @@ function transformToGanttFormat(workOrders) {
             // Create MO header row with collapse/expand icon
             const isCollapsed = collapsedMOs.has(moNum);
             const chevronIcon = isCollapsed ? '▶' : '▼';
+
+            // Build MO name - if part_num exists, include it; otherwise just show MO number
+            let moName;
+            if (moInfo.part_num) {
+                moName = `${chevronIcon} <strong>MO ${moNum}: ${moInfo.part_num}</strong> - ${moInfo.description} (Qty: ${moInfo.qty})`;
+            } else {
+                moName = `${chevronIcon} <strong>MO ${moNum}</strong> - ${moInfo.description} (Qty: ${moInfo.qty})`;
+            }
+
             const moHeader = {
                 id: `mo_${moInfo.mo_id}`,
-                name: `${chevronIcon} <strong>${moNum}: ${moInfo.part_num}</strong> - ${moInfo.description} (Qty: ${moInfo.qty})`,
+                name: moName,
                 start: minDate.format('YYYY-MM-DD'),
                 end: maxDate.format('YYYY-MM-DD'),
                 progress: 0,
@@ -2025,7 +2107,11 @@ function transformToGanttFormat(workOrders) {
                 custom_class: moStatusClass,
                 is_mo_header: true,
                 mo_num: moNum,
-                mo_id: moInfo.mo_id
+                mo_id: moInfo.mo_id,
+                status_name: moStatusName, // Add status name for popup
+                part_num: moInfo.part_num,
+                description: moInfo.description,
+                qty_target: moInfo.qty
             };
             tasks.push(moHeader);
         }
@@ -2148,14 +2234,24 @@ function transformToGanttFormat(workOrders) {
                     depIds.push(woIdMap.get(dep.staging_wo_id));
                     totalDepsLinked++;
 
-                    // Conflict detection: staging WO finishes after current WO starts
+                    // Conflict detection: check if staging WO finishes after (or on same day as) current WO starts
                     const stagingFinish = moment(dep.staging_wo_finish);
                     const currentStart = moment(task._start_date);
+                    const allowSameDay = document.getElementById('allowSameDayStart').checked;
 
-                    if (stagingFinish.isAfter(currentStart)) {
+                    let isConflict = false;
+                    if (allowSameDay) {
+                        // Only conflict if dependency finishes AFTER the start day (not same day)
+                        isConflict = stagingFinish.isAfter(currentStart, 'day');
+                    } else {
+                        // Conflict if dependency finishes on same day or after
+                        isConflict = stagingFinish.isSameOrAfter(currentStart, 'day');
+                    }
+
+                    if (isConflict) {
                         hasConflict = true;
                         totalConflicts++;
-                        debugLog('warning', `CONFLICT: ${task.wo_num} starts ${task._start_date} but depends on ${dep.staging_wo_num} which finishes ${dep.staging_wo_finish}`);
+                        debugLog('warning', `CONFLICT: ${task.wo_num} starts ${task._start_date} but depends on ${dep.staging_wo_num} which finishes ${dep.staging_wo_finish} (allowSameDay: ${allowSameDay})`);
                     }
                 } else {
                     debugLog('warning', `Dependency staging WO ID ${dep.staging_wo_id} not found in woIdMap for task ${task.wo_num}`);
@@ -2215,21 +2311,32 @@ function applyConflictArrowStyling(tasks) {
         // Key: "sourceWoId_targetWoId", Value: true if conflict
         const conflictingDeps = new Map();
 
-        tasks.forEach(task => {
-            if (!task.wo_id || !task._start_date) return;
+        const allowSameDay = document.getElementById('allowSameDayStart').checked;
 
-            const targetStart = moment(task._start_date);
+        tasks.forEach(task => {
+            if (!task.wo_id || !task.start) return;
+
+            const targetStart = moment(task.start);
 
             // Check each dependency of this task
             const deps = stagingDependencies.filter(dep => dep.wo_id === task.wo_id);
             deps.forEach(dep => {
                 const sourceFinish = moment(dep.staging_wo_finish);
 
-                // This specific dependency causes a conflict if source finishes after target starts
-                if (sourceFinish.isAfter(targetStart)) {
+                // Check if this dependency causes a conflict based on allowSameDay setting
+                let isConflict = false;
+                if (allowSameDay) {
+                    // Only conflict if dependency finishes AFTER the start day (not same day)
+                    isConflict = sourceFinish.isAfter(targetStart, 'day');
+                } else {
+                    // Conflict if dependency finishes on same day or after
+                    isConflict = sourceFinish.isSameOrAfter(targetStart, 'day');
+                }
+
+                if (isConflict) {
                     const depKey = `${dep.staging_wo_id}_${task.wo_id}`;
                     conflictingDeps.set(depKey, true);
-                    debugLog('info', `Conflict dependency: ${dep.staging_wo_num} → ${task.wo_num} (${dep.staging_wo_num} finishes ${dep.staging_wo_finish}, ${task.wo_num} starts ${task._start_date})`);
+                    debugLog('info', `Conflict dependency: ${dep.staging_wo_num} → ${task.wo_num} (${dep.staging_wo_num} finishes ${dep.staging_wo_finish}, ${task.wo_num} starts ${task.start}, allowSameDay: ${allowSameDay})`);
                 }
             });
         });
