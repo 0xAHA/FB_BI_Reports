@@ -97,6 +97,11 @@
             font-size: 12px;
         }
 
+        /* Hide progress slider (purple overlay) */
+        .bar-progress {
+            display: none !important;
+        }
+
         /* Dependency arrows */
         .arrow {
             stroke: var(--fb-gray-600);
@@ -655,7 +660,7 @@
                         <i class="bi bi-x-circle"></i>
                     </button>
                 </div>
-                <div class="btn-group" role="group" aria-label="Undo/Redo">
+                <div class="btn-group" role="group" aria-label="Actions">
                     <button id="undoBtn" class="btn btn-sm btn-outline-secondary" disabled title="Undo last change (Ctrl+Z)">
                         <i class="bi bi-arrow-counterclockwise"></i>
                         <span id="undoCount" style="display: none;">(0)</span>
@@ -664,11 +669,14 @@
                         <i class="bi bi-arrow-clockwise"></i>
                         <span id="redoCount" style="display: none;">(0)</span>
                     </button>
+                    <button id="todayBtn" class="btn btn-sm btn-outline-primary" title="Scroll to today's date">
+                        <i class="bi bi-calendar-day"></i> Today
+                    </button>
                 </div>
-                <div class="form-check form-switch">
-                    <input class="form-check-input" type="checkbox" role="switch" id="shiftDependentWOs">
-                    <label class="form-check-label" for="shiftDependentWOs" style="cursor: pointer; font-size: 0.875rem;">
-                        Shift dependent WOs when dragging
+                <div class="btn-group btn-group-sm" role="group" aria-label="Shift toggle">
+                    <input type="checkbox" class="btn-check" id="shiftDependentWOs" autocomplete="off">
+                    <label class="btn btn-outline-secondary" for="shiftDependentWOs" title="When enabled, dragging a WO will shift all dependent WOs by the same amount">
+                        <i class="bi bi-arrow-down-up"></i> Shift Deps
                     </label>
                 </div>
             </div>
@@ -875,6 +883,11 @@ document.addEventListener('DOMContentLoaded', function() {
         if (e.key === 'Enter') {
             searchWO();
         }
+    });
+
+    // Today button
+    document.getElementById('todayBtn').addEventListener('click', function() {
+        scrollToToday();
     });
 
     debugLog('success', 'Initialization complete - ready to load work orders');
@@ -1140,6 +1153,11 @@ function resetWOSearch() {
 
     // Re-render to show all WOs
     renderGanttChart();
+
+    // Scroll to today after rendering
+    setTimeout(() => {
+        scrollToToday();
+    }, 400);
 }
 
 // ============================================
@@ -1360,6 +1378,20 @@ function renderGanttChart() {
 }
 
 // ============================================
+// Scroll to Today
+// ============================================
+function scrollToToday() {
+    // Set the dateStart input to today
+    const today = moment().format('YYYY-MM-DD');
+    document.getElementById('dateStart').value = today;
+
+    debugLog('info', `Setting start date to today: ${today}`);
+
+    // Call scrollToStartDate to do the actual scrolling
+    scrollToStartDate();
+}
+
+// ============================================
 // Scroll Gantt to Start Date
 // ============================================
 function scrollToStartDate() {
@@ -1428,14 +1460,23 @@ function scrollToStartDate() {
         let firstDate;
         try {
             if (timeScale === 'Day') {
-                firstDate = moment(headerText, ['DD MMM', 'DD MMMM', 'D MMM', 'D MMMM']);
+                // Try multiple formats for day view
+                firstDate = moment(headerText, ['DD MMM', 'DD MMMM', 'D MMM', 'D MMMM', 'DD', 'D'], true);
+
+                // If it parsed as just a day number, add current month/year
+                if (firstDate.isValid() && !headerText.match(/[a-zA-Z]/)) {
+                    firstDate.month(targetDate.month());
+                    firstDate.year(targetDate.year());
+                    debugLog('info', `Parsed day number ${headerText}, set to ${firstDate.format('YYYY-MM-DD')}`);
+                }
             } else if (timeScale === 'Week') {
-                firstDate = moment(headerText, ['DD MMM', 'DD MMMM']);
+                firstDate = moment(headerText, ['DD MMM', 'DD MMMM', 'D MMM', 'D MMMM'], true);
             } else {
-                firstDate = moment(headerText, ['MMM YYYY', 'MMMM YYYY']);
+                firstDate = moment(headerText, ['MMM YYYY', 'MMMM YYYY', 'MMM', 'MMMM'], true);
             }
-            // Set the year to current year if not specified
-            if (!headerText.includes(moment().year())) {
+
+            // Set the year to current year if not specified and date doesn't include year
+            if (firstDate.isValid() && !headerText.includes(moment().year().toString())) {
                 firstDate.year(moment().year());
             }
         } catch (e) {
@@ -2170,88 +2211,119 @@ function applyStatusStyling() {
 function applyConflictArrowStyling(tasks) {
     // Wait for DOM to update
     setTimeout(() => {
-        // Get all conflict task IDs
-        const conflictTasks = tasks.filter(t => t.has_conflict);
+        // Build a map of dependency conflicts
+        // Key: "sourceWoId_targetWoId", Value: true if conflict
+        const conflictingDeps = new Map();
 
-        if (conflictTasks.length === 0) {
-            debugLog('info', 'No conflict tasks found - skipping arrow styling');
+        tasks.forEach(task => {
+            if (!task.wo_id || !task._start_date) return;
+
+            const targetStart = moment(task._start_date);
+
+            // Check each dependency of this task
+            const deps = stagingDependencies.filter(dep => dep.wo_id === task.wo_id);
+            deps.forEach(dep => {
+                const sourceFinish = moment(dep.staging_wo_finish);
+
+                // This specific dependency causes a conflict if source finishes after target starts
+                if (sourceFinish.isAfter(targetStart)) {
+                    const depKey = `${dep.staging_wo_id}_${task.wo_id}`;
+                    conflictingDeps.set(depKey, true);
+                    debugLog('info', `Conflict dependency: ${dep.staging_wo_num} → ${task.wo_num} (${dep.staging_wo_num} finishes ${dep.staging_wo_finish}, ${task.wo_num} starts ${task._start_date})`);
+                }
+            });
+        });
+
+        if (conflictingDeps.size === 0) {
+            debugLog('info', 'No conflicting dependencies found - skipping arrow styling');
             return;
         }
 
-        debugLog('info', `Applying conflict styling to arrows pointing to ${conflictTasks.length} conflict tasks`);
+        debugLog('info', `Found ${conflictingDeps.size} conflicting dependencies`);
 
-        // Debug: Check if arrows exist at all - try multiple selectors
-        const arrowsByClass = document.querySelectorAll('.arrow');
-        const arrowsByTag = document.querySelectorAll('path.arrow');
+        // Get all potential arrows
         const allPaths = document.querySelectorAll('#ganttChart svg path');
-
-        debugLog('info', `Arrow detection:`, {
-            byClass: arrowsByClass.length,
-            byPathArrow: arrowsByTag.length,
-            allPaths: allPaths.length
-        });
-
-        // Since Frappe Gantt doesn't use .arrow class consistently, use all paths
-        // Arrows are typically thin paths with specific stroke colors
         const allArrows = Array.from(allPaths).filter(path => {
             const stroke = path.getAttribute('stroke') || window.getComputedStyle(path).stroke;
             const strokeWidth = parseFloat(path.getAttribute('stroke-width') || window.getComputedStyle(path).strokeWidth);
-            // Arrows typically have stroke-width between 1-2 and are not bars (bars are filled)
             return strokeWidth > 0 && strokeWidth < 3 && stroke !== 'none';
         });
 
-        debugLog('info', `Filtered ${allArrows.length} potential arrow paths from ${allPaths.length} total paths`);
+        debugLog('info', `Checking ${allArrows.length} potential arrow paths`);
 
-        // For each conflict task, find arrows pointing to it
-        conflictTasks.forEach(task => {
-            // Find the bar element for this task
-            const barWrapper = document.querySelector(`.bar-wrapper[data-id="${task.id}"]`);
-            if (!barWrapper) return;
+        let conflictArrowsMarked = 0;
 
-            // Get the bar's vertical position (row)
-            const barY = barWrapper.getAttribute('data-row');
+        // For each arrow, determine source and target WOs and check if it's a conflicting dependency
+        allArrows.forEach(arrow => {
+            const arrowPath = arrow.getAttribute('d');
+            if (!arrowPath) return;
 
-            // Check all potential arrow paths
-            allArrows.forEach(arrow => {
-                // Check if this arrow points to the conflict task
-                // Frappe Gantt creates arrows with data attributes or we can check the path
-                const arrowPath = arrow.getAttribute('d');
-                if (!arrowPath) return;
+            // Parse path to get start and end points
+            const pathCommands = arrowPath.match(/[ML]\s*[\d.-]+\s*[\d.-]+/g);
+            if (!pathCommands || pathCommands.length < 2) return;
 
-                // Parse the path to get the end point
-                const pathCommands = arrowPath.match(/[ML]\s*[\d.-]+\s*[\d.-]+/g);
-                if (!pathCommands || pathCommands.length === 0) return;
+            // Get first and last commands
+            const firstCommand = pathCommands[0];
+            const lastCommand = pathCommands[pathCommands.length - 1];
 
-                // Get the last command (arrow end point)
-                const lastCommand = pathCommands[pathCommands.length - 1];
-                const coords = lastCommand.match(/[\d.-]+/g);
-                if (!coords || coords.length < 2) return;
+            const startCoords = firstCommand.match(/[\d.-]+/g);
+            const endCoords = lastCommand.match(/[\d.-]+/g);
 
-                const endX = parseFloat(coords[0]);
-                const endY = parseFloat(coords[1]);
+            if (!startCoords || startCoords.length < 2 || !endCoords || endCoords.length < 2) return;
 
-                // Get the conflict task bar's position
+            const startX = parseFloat(startCoords[0]);
+            const startY = parseFloat(startCoords[1]);
+            const endX = parseFloat(endCoords[0]);
+            const endY = parseFloat(endCoords[1]);
+
+            // Find which tasks these coordinates match
+            let sourceTask = null;
+            let targetTask = null;
+
+            tasks.forEach(task => {
+                const barWrapper = document.querySelector(`.bar-wrapper[data-id="${task.id}"]`);
+                if (!barWrapper) return;
+
                 const barElement = barWrapper.querySelector('.bar');
                 if (!barElement) return;
 
                 const barX = parseFloat(barElement.getAttribute('x'));
-                const barYPos = parseFloat(barElement.getAttribute('y'));
+                const barY = parseFloat(barElement.getAttribute('y'));
                 const barWidth = parseFloat(barElement.getAttribute('width'));
                 const barHeight = parseFloat(barElement.getAttribute('height'));
 
-                // Check if arrow ends at or near this conflict task's bar
-                // Allow some tolerance for positioning
-                const xDiff = Math.abs(endX - barX);
-                const yDiff = Math.abs(endY - (barYPos + barHeight / 2));
+                // Check if arrow starts near this bar (source dependency)
+                const startXDiff = Math.abs(startX - (barX + barWidth));
+                const startYDiff = Math.abs(startY - (barY + barHeight / 2));
 
-                if (xDiff < 50 && yDiff < 30) {
+                if (startXDiff < 50 && startYDiff < 30) {
+                    sourceTask = task;
+                }
+
+                // Check if arrow ends near this bar (target task)
+                const endXDiff = Math.abs(endX - barX);
+                const endYDiff = Math.abs(endY - (barY + barHeight / 2));
+
+                if (endXDiff < 50 && endYDiff < 30) {
+                    targetTask = task;
+                }
+            });
+
+            // If we found both source and target, check if this dependency conflicts
+            if (sourceTask && targetTask && sourceTask.wo_id && targetTask.wo_id) {
+                const depKey = `${sourceTask.wo_id}_${targetTask.wo_id}`;
+
+                if (conflictingDeps.has(depKey)) {
                     arrow.classList.add('conflict-arrow');
                     arrow.style.stroke = 'var(--fb-danger)';
                     arrow.style.strokeWidth = '2.5';
-                    debugLog('info', `✓ Marked arrow as conflict for task ${task.wo_num} (xDiff: ${xDiff.toFixed(1)}, yDiff: ${yDiff.toFixed(1)})`);
+                    conflictArrowsMarked++;
+                    debugLog('info', `✓ Marked conflict arrow: ${sourceTask.wo_num} → ${targetTask.wo_num}`);
                 }
-            });
+            }
         });
+
+        debugLog('success', `Marked ${conflictArrowsMarked} conflict arrows out of ${allArrows.length} total arrows`);
     }, 200);
 }
 
