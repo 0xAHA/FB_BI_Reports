@@ -1937,6 +1937,11 @@ function handleWOMove(item, callback) {
     const newStart = moment(item.start).format('YYYY-MM-DD');
     const newEnd = moment(item.end).format('YYYY-MM-DD');
 
+    // Save old dates BEFORE updating (needed for shift calculation)
+    const movedWO = filteredWorkOrders.find(wo => wo.wo_id === woId);
+    const oldStart = movedWO ? movedWO.date_scheduled_start : null;
+    const oldEnd = movedWO ? movedWO.date_scheduled : null;
+
     // Update the underlying data arrays FIRST
     const updateWODates = (wo) => {
         if (wo.wo_id === woId) {
@@ -1979,7 +1984,7 @@ function handleWOMove(item, callback) {
 
     // If shift deps enabled, shift dependent WOs
     if (document.getElementById('shiftDependentWOs').classList.contains('active')) {
-        shiftDependentWOs(item, woId);
+        shiftDependentWOs(item, woId, oldStart, oldEnd);
     }
 
     // Just update conflicts without full rebuild
@@ -1991,9 +1996,89 @@ function handleWOUpdate(item, callback) {
     handleWOMove(item, callback);
 }
 
-function shiftDependentWOs(movedItem, movedWoId) {
-    // TODO: Implement shifting logic
-    debugLog('info', 'Shift dependent WOs feature - to be implemented');
+function shiftDependentWOs(movedItem, movedWoId, oldStartDate = null, oldEndDate = null) {
+    debugLog('info', `Shifting dependent WOs for WO ID ${movedWoId}...`);
+
+    // Calculate the time delta (how much the WO was moved)
+    // Use passed old dates if available, otherwise use current data
+    const oldStart = oldStartDate ? moment(oldStartDate) : moment(movedItem.start);
+    const newStart = moment(movedItem.start);
+    const oldEnd = oldEndDate ? moment(oldEndDate) : moment(movedItem.end);
+    const newEnd = moment(movedItem.end);
+
+    const startDelta = newStart.diff(oldStart, 'days');
+    const endDelta = newEnd.diff(oldEnd, 'days');
+
+    debugLog('info', `WO moved by ${startDelta} days (start) and ${endDelta} days (end)`);
+
+    // Find all WOs that depend on this WO (WOs where this WO is the staging WO)
+    const dependentWOs = stagingDependencies
+        .filter(dep => dep.staging_wo_id === movedWoId)
+        .map(dep => dep.wo_id);
+
+    if (dependentWOs.length === 0) {
+        debugLog('info', 'No dependent WOs to shift');
+        return;
+    }
+
+    debugLog('info', `Found ${dependentWOs.length} dependent WOs to shift`);
+
+    // Shift each dependent WO
+    const itemsToUpdate = [];
+    dependentWOs.forEach(depWoId => {
+        const depWO = filteredWorkOrders.find(wo => wo.wo_id === depWoId);
+        if (!depWO) return;
+
+        // Save old dates for this dependent WO before shifting
+        const depOldStart = depWO.date_scheduled_start;
+        const depOldEnd = depWO.date_scheduled;
+
+        // Calculate new dates
+        const newDepStart = moment(depWO.date_scheduled_start).add(startDelta, 'days').format('YYYY-MM-DD');
+        const newDepEnd = moment(depWO.date_scheduled).add(endDelta, 'days').format('YYYY-MM-DD');
+
+        debugLog('info', `Shifting WO ${depWO.wo_num}: ${depOldStart} → ${newDepStart}`);
+
+        // Update the data arrays
+        const updateWODates = (wo) => {
+            if (wo.wo_id === depWoId) {
+                wo.date_scheduled_start = newDepStart;
+                wo.date_scheduled = newDepEnd;
+            }
+            return wo;
+        };
+
+        allWorkOrders = allWorkOrders.map(updateWODates);
+        filteredWorkOrders = filteredWorkOrders.map(updateWODates);
+
+        // Update staging dependencies
+        stagingDependencies = stagingDependencies.map(dep => {
+            if (dep.staging_wo_id === depWoId) {
+                dep.staging_wo_finish = newDepEnd;
+            }
+            if (dep.wo_id === depWoId) {
+                dep.wo_start = newDepStart;
+            }
+            return dep;
+        });
+
+        // Find the timeline item and update it
+        const timelineItem = timeline.itemsData.get(`wo_${depWoId}`);
+        if (timelineItem) {
+            timelineItem.start = newDepStart;
+            timelineItem.end = newDepEnd;
+            itemsToUpdate.push(timelineItem);
+        }
+
+        // Recursively shift dependents of this WO
+        shiftDependentWOs({ start: newDepStart, end: newDepEnd }, depWoId, depOldStart, depOldEnd);
+    });
+
+    // Update all shifted items in the timeline at once
+    if (itemsToUpdate.length > 0) {
+        timeline.itemsData.update(itemsToUpdate);
+        debugLog('success', `Shifted ${itemsToUpdate.length} dependent WOs`);
+    }
 }
 
 function updateConflictHighlighting() {
