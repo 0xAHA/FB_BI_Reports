@@ -555,6 +555,16 @@
                     </div>
                     <small class="text-muted">When enabled, dragging a WO will shift all dependent WOs by the same amount.</small>
                 </div>
+
+                <div class="mb-3">
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" role="switch" id="skipWeekendsOffcanvas" checked>
+                        <label class="form-check-label" for="skipWeekendsOffcanvas" style="cursor: pointer; font-size: 0.875rem;">
+                            Skip weekends when scheduling
+                        </label>
+                    </div>
+                    <small class="text-muted">When enabled, WOs cannot be scheduled on weekends (Sat/Sun). Dragging will snap to weekdays.</small>
+                </div>
             </div>
 
             <div class="d-grid gap-2">
@@ -1316,6 +1326,25 @@ function lightenColor(hex, percent) {
     }).join('');
 }
 
+function skipWeekends(date) {
+    const skipWeekendsEnabled = document.getElementById('skipWeekendsOffcanvas').checked;
+    if (!skipWeekendsEnabled) return date;
+
+    const m = moment(date);
+    const dayOfWeek = m.day();
+
+    // If Saturday (6), move to Monday (+2 days)
+    if (dayOfWeek === 6) {
+        return m.add(2, 'days').toDate();
+    }
+    // If Sunday (0), move to Monday (+1 day)
+    if (dayOfWeek === 0) {
+        return m.add(1, 'day').toDate();
+    }
+
+    return date;
+}
+
 // ============================================
 // Build Groups Based on View Mode
 // ============================================
@@ -1611,10 +1640,11 @@ function initTimeline() {
         selectable: true,
         multiselect: false,
 
-        // Snap to day boundaries for cleaner interactions
+        // Snap to day boundaries for cleaner interactions, skip weekends if enabled
         snap: function(date, scale, step) {
             const day = 24 * 60 * 60 * 1000;
-            return new Date(Math.round(date / day) * day);
+            const snappedDate = new Date(Math.round(date / day) * day);
+            return skipWeekends(snappedDate);
         },
 
         // Orientation
@@ -1828,24 +1858,26 @@ function applyCategoryColors() {
             const color = group.categoryColor;
 
             // Left-hand labels
-            document
-                .querySelectorAll(`.vis-label[data-groupid="${group.id}"]`)
-                .forEach(el => {
-                    el.style.backgroundColor = color;
-                });
+            const labels = document.querySelectorAll(`.vis-label[data-groupid="${group.id}"]`);
+            debugLog('info', `Found ${labels.length} label elements for ${group.id}`);
+            labels.forEach(el => {
+                el.style.backgroundColor = color;
+                debugLog('info', `Set label backgroundColor to ${color}, computed: ${window.getComputedStyle(el).backgroundColor}`);
+            });
 
             // Right-hand background rows
-            document
-                .querySelectorAll(`.vis-panel.vis-background .vis-group[data-groupid="${group.id}"]`)
-                .forEach(el => {
-                    el.style.backgroundColor = color;
-                });
+            const bgRows = document.querySelectorAll(`.vis-panel.vis-background .vis-group[data-groupid="${group.id}"]`);
+            debugLog('info', `Found ${bgRows.length} background row elements for ${group.id}`);
+            bgRows.forEach(el => {
+                el.style.backgroundColor = color;
+                debugLog('info', `Set background backgroundColor to ${color}, computed: ${window.getComputedStyle(el).backgroundColor}`);
+            });
 
             debugLog('info', `Applied color ${color} to ${group.id}`);
         });
 
         debugLog('success', 'Category colors applied');
-    }, 0);
+    }, 100); // Increased timeout to ensure DOM is ready
 }
 
 // ============================================
@@ -2150,27 +2182,51 @@ function shiftDependentWOs(movedItem, movedWoId, oldStartDate = null, oldEndDate
 
     debugLog('info', `Found ${dependentWOs.length} dependent WOs to shift`);
 
-    // Shift each dependent WO
+    // Shift each dependent WO (only if it would cause a conflict)
     const itemsToUpdate = [];
+    const allowSameDay = document.getElementById('allowSameDayStart').classList.contains('active');
+
     dependentWOs.forEach(depWoId => {
         const depWO = filteredWorkOrders.find(wo => wo.wo_id === depWoId);
         if (!depWO) return;
+
+        // Check if this WO would have a conflict with the moved WO
+        const stagingFinish = moment(newEnd);
+        const currentStart = moment(depWO.date_scheduled_start);
+
+        let wouldConflict = false;
+        if (allowSameDay) {
+            wouldConflict = stagingFinish.isAfter(currentStart, 'day');
+        } else {
+            wouldConflict = stagingFinish.isSameOrAfter(currentStart, 'day');
+        }
+
+        // Only shift if it would cause a conflict
+        if (!wouldConflict) {
+            debugLog('info', `Skipping WO ${depWO.wo_num} - no conflict`);
+            return;
+        }
 
         // Save old dates for this dependent WO before shifting
         const depOldStart = depWO.date_scheduled_start;
         const depOldEnd = depWO.date_scheduled;
 
-        // Calculate new dates
-        const newDepStart = moment(depWO.date_scheduled_start).add(startDelta, 'days').format('YYYY-MM-DD');
-        const newDepEnd = moment(depWO.date_scheduled).add(endDelta, 'days').format('YYYY-MM-DD');
+        // Calculate new dates and skip weekends
+        let newDepStart = moment(depWO.date_scheduled_start).add(startDelta, 'days').toDate();
+        newDepStart = skipWeekends(newDepStart);
+        const newDepStartStr = moment(newDepStart).format('YYYY-MM-DD');
 
-        debugLog('info', `Shifting WO ${depWO.wo_num}: ${depOldStart} → ${newDepStart}`);
+        let newDepEnd = moment(depWO.date_scheduled).add(endDelta, 'days').toDate();
+        newDepEnd = skipWeekends(newDepEnd);
+        const newDepEndStr = moment(newDepEnd).format('YYYY-MM-DD');
+
+        debugLog('info', `Shifting WO ${depWO.wo_num}: ${depOldStart} → ${newDepStartStr} (conflict detected)`);
 
         // Update the data arrays
         const updateWODates = (wo) => {
             if (wo.wo_id === depWoId) {
-                wo.date_scheduled_start = newDepStart;
-                wo.date_scheduled = newDepEnd;
+                wo.date_scheduled_start = newDepStartStr;
+                wo.date_scheduled = newDepEndStr;
             }
             return wo;
         };
@@ -2181,10 +2237,10 @@ function shiftDependentWOs(movedItem, movedWoId, oldStartDate = null, oldEndDate
         // Update staging dependencies
         stagingDependencies = stagingDependencies.map(dep => {
             if (dep.staging_wo_id === depWoId) {
-                dep.staging_wo_finish = newDepEnd;
+                dep.staging_wo_finish = newDepEndStr;
             }
             if (dep.wo_id === depWoId) {
-                dep.wo_start = newDepStart;
+                dep.wo_start = newDepStartStr;
             }
             return dep;
         });
@@ -2192,13 +2248,13 @@ function shiftDependentWOs(movedItem, movedWoId, oldStartDate = null, oldEndDate
         // Find the timeline item and update it
         const timelineItem = timeline.itemsData.get(`wo_${depWoId}`);
         if (timelineItem) {
-            timelineItem.start = newDepStart;
-            timelineItem.end = newDepEnd;
+            timelineItem.start = newDepStartStr;
+            timelineItem.end = newDepEndStr;
             itemsToUpdate.push(timelineItem);
         }
 
         // Recursively shift dependents of this WO
-        shiftDependentWOs({ start: newDepStart, end: newDepEnd }, depWoId, depOldStart, depOldEnd);
+        shiftDependentWOs({ start: newDepStartStr, end: newDepEndStr }, depWoId, depOldStart, depOldEnd);
     });
 
     // Update all shifted items in the timeline at once
