@@ -1601,6 +1601,31 @@ function getWOsForCategoryAndDay(categoryId, weekStart, dayOfWeek) {
     return wosOnDay;
 }
 
+function getWOsForCategoryInWeek(categoryId, weekStart) {
+    const weekEnd = weekStart.clone().add(6, 'days').endOf('day');
+
+    // Filter WOs for this category that overlap this week
+    const wosInWeek = allWorkOrders
+        .filter(wo => {
+            if (wo.calcategory_id !== categoryId) return false;
+            if (wo.wo_status === 40) return false; // Skip fulfilled
+
+            const woStart = moment(wo.date_scheduled_start).startOf('day');
+            const woEnd = moment(wo.date_scheduled).startOf('day');
+
+            // Check if WO overlaps with this week
+            return woStart.isSameOrBefore(weekEnd) && woEnd.isSameOrAfter(weekStart);
+        })
+        // Sort by start date (earliest first), then by end date
+        .sort((a, b) => {
+            const startDiff = moment(a.date_scheduled_start).diff(moment(b.date_scheduled_start));
+            if (startDiff !== 0) return startDiff;
+            return moment(a.date_scheduled).diff(moment(b.date_scheduled));
+        });
+
+    return wosInWeek;
+}
+
 function buildCapacityTable(weekStart) {
     const table = document.getElementById('capacity-table');
     table.innerHTML = '';
@@ -1647,56 +1672,117 @@ function buildCapacityTable(weekStart) {
 function buildCategoryRows(category, weekStart) {
     const fragment = document.createDocumentFragment();
 
-    // WO row with stacked WO bars
-    const woRow = document.createElement('tr');
-    woRow.className = 'wo-row';
-    woRow.dataset.categoryId = category.id;
+    // Get all WOs for this category that overlap this week
+    const wosInWeek = getWOsForCategoryInWeek(category.id, weekStart);
 
-    // Category name cell (first cell of WO row)
-    const nameCell = document.createElement('td');
-    nameCell.className = 'category-name-cell';
-    nameCell.rowSpan = 2; // WO + Usage rows
-    const lightColor = lightenColor(category.color.replace('#', ''), 70); // Lighter background
-    nameCell.style.backgroundColor = lightColor; // Apply background to cell, not div
-    nameCell.innerHTML = `
-        <div class="category-name" style="color: ${category.color}">
-            ${category.name}
-        </div>
-        <button class="btn btn-sm btn-outline-primary adjust-capacity-btn"
-                onclick="showCapacityAdjustModal(${category.id})">
-            <i class="bi bi-gear"></i> Adjust
-        </button>
-    `;
-    woRow.appendChild(nameCell);
+    // Calculate rowspan for category name cell (1 row per WO + 1 usage row)
+    const totalRows = wosInWeek.length + 1;
+    const lightColor = lightenColor(category.color.replace('#', ''), 70);
 
-    for (let day = 0; day < 7; day++) {
-        const isWeekend = day === 5 || day === 6;
+    // Create one row per WO
+    wosInWeek.forEach((wo, index) => {
+        const woRow = document.createElement('tr');
+        woRow.className = 'wo-row';
+        woRow.dataset.categoryId = category.id;
+        woRow.dataset.woNum = wo.wo_num;
+
+        // Category name cell only on first WO row
+        if (index === 0) {
+            const nameCell = document.createElement('td');
+            nameCell.className = 'category-name-cell';
+            nameCell.rowSpan = totalRows;
+            nameCell.style.backgroundColor = lightColor;
+            nameCell.innerHTML = `
+                <div class="category-name" style="color: ${category.color}">
+                    ${category.name}
+                </div>
+                <button class="btn btn-sm btn-outline-primary adjust-capacity-btn"
+                        onclick="showCapacityAdjustModal(${category.id})">
+                    <i class="bi bi-gear"></i> Adjust
+                </button>
+            `;
+            woRow.appendChild(nameCell);
+        }
+
+        // Calculate WO start and end within this week
+        const woStart = moment(wo.date_scheduled_start).startOf('day');
+        const woEnd = moment(wo.date_scheduled).startOf('day');
+        const weekEnd = weekStart.clone().add(6, 'days').endOf('day');
+
+        // Clip to week boundaries
+        const visibleStart = moment.max(woStart, weekStart);
+        const visibleEnd = moment.min(woEnd, weekEnd);
+
+        // Calculate day indices (0 = Monday, 6 = Sunday)
+        const startDay = visibleStart.diff(weekStart, 'days');
+        const endDay = visibleEnd.diff(weekStart, 'days');
+        const colspan = endDay - startDay + 1;
+
+        // Add empty cells before WO start
+        for (let day = 0; day < startDay; day++) {
+            const emptyCell = document.createElement('td');
+            const isWeekend = day === 5 || day === 6;
+            emptyCell.className = isWeekend ? 'wo-cell weekend' : 'wo-cell';
+            emptyCell.dataset.categoryId = category.id;
+            emptyCell.dataset.day = day;
+            emptyCell.ondrop = dropWOInCapacity;
+            emptyCell.ondragover = allowDrop;
+            woRow.appendChild(emptyCell);
+        }
+
+        // Add WO cell with colspan
         const woCell = document.createElement('td');
-        woCell.className = isWeekend ? 'wo-cell weekend' : 'wo-cell';
+        woCell.colSpan = colspan;
+        const startsOnWeekend = startDay === 5 || startDay === 6;
+        woCell.className = startsOnWeekend ? 'wo-cell weekend' : 'wo-cell';
         woCell.dataset.categoryId = category.id;
-        woCell.dataset.day = day;
+        woCell.dataset.startDay = startDay;
+        woCell.dataset.endDay = endDay;
         woCell.ondrop = dropWOInCapacity;
         woCell.ondragover = allowDrop;
 
-        // Get all WOs for this category on this day
-        const wosOnDay = getWOsForCategoryAndDay(category.id, weekStart, day);
-
-        // Create WO bars - they will be stacked by flexbox
-        wosOnDay.forEach(woData => {
-            const woBar = createWOBar(woData, weekStart, day);
-            if (woBar) {
-                woCell.appendChild(woBar);
-            }
-        });
-
+        // Create WO bar content
+        const woBar = createWOBarForCell(wo, weekStart, woStart, woEnd);
+        woCell.appendChild(woBar);
         woRow.appendChild(woCell);
-    }
-    fragment.appendChild(woRow);
 
-    // Usage row
+        // Add empty cells after WO end
+        for (let day = endDay + 1; day < 7; day++) {
+            const emptyCell = document.createElement('td');
+            const isWeekend = day === 5 || day === 6;
+            emptyCell.className = isWeekend ? 'wo-cell weekend' : 'wo-cell';
+            emptyCell.dataset.categoryId = category.id;
+            emptyCell.dataset.day = day;
+            emptyCell.ondrop = dropWOInCapacity;
+            emptyCell.ondragover = allowDrop;
+            woRow.appendChild(emptyCell);
+        }
+
+        fragment.appendChild(woRow);
+    });
+
+    // Usage row - always 7 cells
     const usageRow = document.createElement('tr');
     usageRow.className = 'usage-row';
     usageRow.dataset.categoryId = category.id;
+
+    // If no WOs, add category name cell here
+    if (wosInWeek.length === 0) {
+        const nameCell = document.createElement('td');
+        nameCell.className = 'category-name-cell';
+        nameCell.rowSpan = 1;
+        nameCell.style.backgroundColor = lightColor;
+        nameCell.innerHTML = `
+            <div class="category-name" style="color: ${category.color}">
+                ${category.name}
+            </div>
+            <button class="btn btn-sm btn-outline-primary adjust-capacity-btn"
+                    onclick="showCapacityAdjustModal(${category.id})">
+                <i class="bi bi-gear"></i> Adjust
+            </button>
+        `;
+        usageRow.appendChild(nameCell);
+    }
 
     for (let day = 0; day < 7; day++) {
         const isWeekend = day === 5 || day === 6;
@@ -1712,27 +1798,15 @@ function buildCategoryRows(category, weekStart) {
     return fragment;
 }
 
-function createWOBar(woData, weekStart, dayOfWeek) {
-    const wo = woData.wo;
-    const woStart = moment(wo.date_scheduled_start).startOf('day');
-    const woEnd = moment(wo.date_scheduled).startOf('day');
+function createWOBarForCell(wo, weekStart, woStart, woEnd) {
+    const bar = document.createElement('div');
     const weekEnd = weekStart.clone().add(6, 'days').endOf('day');
 
-    // Calculate which days this WO spans in current week
+    // Calculate start and end day indices within the week
     const visibleStart = moment.max(woStart, weekStart);
     const visibleEnd = moment.min(woEnd, weekEnd);
-
     const startDay = visibleStart.diff(weekStart, 'days');
     const endDay = visibleEnd.diff(weekStart, 'days');
-
-    // Only render bar once on first day (bars are stacked vertically, not horizontally)
-    const shouldRenderBar = dayOfWeek === startDay;
-
-    if (!shouldRenderBar) {
-        return null; // Don't render on continuation days
-    }
-
-    const bar = document.createElement('div');
 
     // Apply status classes matching timeline view
     let statusClass = '';
@@ -1764,15 +1838,17 @@ function createWOBar(woData, weekStart, dayOfWeek) {
         suffix = ' →';
     }
 
-    // Label
+    // Label - show daily hours if available
+    const dailyHours = wo.daily_hours || (wo.total_hours / Math.max(1, wo.date_range_days)) || 0;
     bar.innerHTML = `
         <span class="wo-bar-label">
-            ${prefix}WO#${wo.wo_num} - ${woData.hours.toFixed(1)}hrs/day${suffix}
+            ${prefix}WO#${wo.wo_num} - ${dailyHours.toFixed(1)}hrs/day${suffix}
         </span>
     `;
 
     // Tooltip
-    bar.title = `WO#${wo.wo_num}\n${wo.wo_status_name}\nTotal: ${wo.total_hours.toFixed(1)}hrs\nDaily: ${wo.daily_hours.toFixed(1)}hrs\n${woStart.format('MMM D')} - ${woEnd.format('MMM D')}\nDouble-click to open`;
+    const totalHours = wo.total_hours || 0;
+    bar.title = `WO#${wo.wo_num}\n${wo.wo_status_name}\nTotal: ${totalHours.toFixed(1)}hrs\nDaily: ${dailyHours.toFixed(1)}hrs\n${woStart.format('MMM D')} - ${woEnd.format('MMM D')}\nDouble-click to open`;
 
     return bar;
 }
@@ -2026,9 +2102,6 @@ function changeCapacityDay(direction) {
     } else {
         currentCapacityWeek = currentCapacityWeek.clone().add(1, 'day');
     }
-
-    // Ensure we're still starting on a Monday
-    currentCapacityWeek = currentCapacityWeek.clone().startOf('isoWeek');
 
     buildCapacityTable(currentCapacityWeek);
 }
