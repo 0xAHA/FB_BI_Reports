@@ -1391,24 +1391,10 @@ function renderGanttChart() {
             .attr('rx', 4);
     }
 
-    // Group labels - hide for MO view (row numbers), show for category view
+    // Group labels - use HTML overlay for category view, add MO headers for MO view
     const labelsOverlay = document.getElementById('categoryLabelsOverlay');
     if (viewMode === 'category') {
-        svg.selectAll('.group-label')
-            .data(groups)
-            .enter()
-            .append('text')
-            .attr('class', 'group-label')
-            .attr('x', margin.left - 10)
-            .attr('y', d => yScale(d.id) + yScale.bandwidth() / 2)
-            .attr('text-anchor', 'end')
-            .attr('alignment-baseline', 'middle')
-            .attr('font-size', '13px')
-            .attr('font-weight', '600')
-            .attr('fill', '#1e293b')
-            .text(d => d.name);
-
-        // Create sticky HTML labels overlay
+        // Create sticky HTML labels overlay (no SVG labels needed)
         labelsOverlay.style.display = 'block';
         labelsOverlay.innerHTML = '';
         groups.forEach(group => {
@@ -1435,6 +1421,79 @@ function renderGanttChart() {
         });
     } else {
         labelsOverlay.style.display = 'none';
+    }
+
+    // MO Header Tiles (in MO view only) - drawn BEFORE WO bars
+    if (viewMode === 'mo') {
+        // Get all unique MOs from the WOs
+        const moNums = [...new Set(filteredWorkOrders.map(wo => wo.mo_num))].sort();
+
+        moNums.forEach(moNum => {
+            const moWOs = filteredWorkOrders.filter(wo => wo.mo_num === moNum);
+            if (moWOs.length === 0) return;
+
+            // Find MO data for qty and BOM
+            const moData = manufacturingOrders.find(mo => mo.mo_num === moNum);
+
+            // Find earliest start and latest end across all WOs in this MO
+            const starts = moWOs.map(wo => moment(wo.date_scheduled_start));
+            const ends = moWOs.map(wo => moment(wo.date_scheduled));
+            const moStart = moment.min(starts);
+
+            // Use MO scheduled date if available, otherwise use latest WO end
+            let moEnd;
+            let hasConflict = false;
+            if (moData && moData.mo_date_scheduled) {
+                moEnd = moment(moData.mo_date_scheduled);
+                // Check if any WO finishes after MO scheduled date
+                moWOs.forEach(wo => {
+                    if (moment(wo.date_scheduled).isAfter(moEnd)) {
+                        hasConflict = true;
+                        conflicts.add(wo.wo_id);
+                    }
+                });
+            } else {
+                moEnd = moment.max(ends);
+            }
+
+            // Find which row this MO's WOs are in (find the first WO's row)
+            const firstWO = moWOs[0];
+            const rowGroup = groups.find(g => g.wos.some(wo => wo.wo_id === firstWO.wo_id));
+            if (!rowGroup) return;
+
+            const moX = xScale(moStart.toDate());
+            const moWidth = Math.max(20, xScale(moEnd.toDate()) - moX);
+            const moY = yScale(rowGroup.id) - 30; // 30px above the row
+            const moHeight = 22;
+
+            // MO header bar - red if conflict, dark grey otherwise
+            svg.append('rect')
+                .attr('class', 'mo-header')
+                .attr('x', moX)
+                .attr('y', moY)
+                .attr('width', moWidth)
+                .attr('height', moHeight)
+                .attr('rx', 4)
+                .attr('fill', hasConflict ? '#ef4444' : '#334155')
+                .attr('stroke', hasConflict ? '#dc2626' : '#1e293b')
+                .attr('stroke-width', 1.5)
+                .style('opacity', 0.9);
+
+            // MO label with qty and BOM
+            const bomInfo = moData ? `${moData.bom_num || 'N/A'} x ${moData.qty || '?'}` : '';
+            const labelText = `MO ${moNum}${hasConflict ? ' ⚠' : ''} (${bomInfo})`;
+
+            svg.append('text')
+                .attr('x', moX + moWidth / 2)
+                .attr('y', moY + moHeight / 2)
+                .attr('text-anchor', 'middle')
+                .attr('alignment-baseline', 'middle')
+                .attr('font-size', '11px')
+                .attr('font-weight', '700')
+                .attr('fill', '#ffffff')
+                .attr('pointer-events', 'none')
+                .text(labelText);
+        });
     }
 
     // Month header background
@@ -1536,7 +1595,7 @@ function renderGanttChart() {
 
             const colors = statusColors[wo.wo_status] || statusColors[10];
 
-            // Bar
+            // Bar with tooltip
             const bar = svg.append('rect')
                 .attr('class', 'wo-bar')
                 .attr('x', x)
@@ -1551,6 +1610,20 @@ function renderGanttChart() {
                 .attr('data-wo-num', wo.wo_num)
                 .style('filter', 'drop-shadow(0 2px 4px rgba(0,0,0,0.1))')
                 .style('cursor', 'move');
+
+            // Add tooltip with BOM, Qty, dates, and category
+            const statusName = wo.wo_status === 10 ? 'Entered' : wo.wo_status === 30 ? 'Started' : wo.wo_status === 40 ? 'Fulfilled' : 'Unknown';
+            const moData = manufacturingOrders.find(mo => mo.mo_num === wo.mo_num);
+            const bomInfo = moData ? `${moData.bom_num || 'N/A'} x ${moData.qty || wo.qty_target || '?'}` : 'N/A';
+            const tooltipText = `WO ${wo.wo_num}
+MO ${wo.mo_num}
+Category: ${wo.category_name || 'Uncategorized'}
+BOM: ${bomInfo}
+Status: ${statusName}
+Start: ${start.format('YYYY-MM-DD HH:mm')}
+Finish: ${end.format('YYYY-MM-DD HH:mm')}`;
+
+            bar.append('title').text(tooltipText);
 
             // Add drag behavior
             let isDragging = false;
@@ -1776,13 +1849,17 @@ function renderGanttChart() {
 
             if (!sourceWO || !targetWO) return;
 
-            const sourceGroup = viewMode === 'mo'
-                ? groups.find(g => g.id === sourceWO.mo_num)
-                : groups.find(g => g.id === sourceWO.category_name);
-
-            const targetGroup = viewMode === 'mo'
-                ? groups.find(g => g.id === targetWO.mo_num)
-                : groups.find(g => g.id === targetWO.category_name);
+            // Find groups differently based on view mode
+            let sourceGroup, targetGroup;
+            if (viewMode === 'mo') {
+                // In MO view, find the row that contains this WO
+                sourceGroup = groups.find(g => g.wos.some(wo => wo.wo_id === sourceWO.wo_id));
+                targetGroup = groups.find(g => g.wos.some(wo => wo.wo_id === targetWO.wo_id));
+            } else {
+                // In category view, group by category name
+                sourceGroup = groups.find(g => g.id === sourceWO.category_name);
+                targetGroup = groups.find(g => g.id === targetWO.category_name);
+            }
 
             if (!sourceGroup || !targetGroup) return;
 
