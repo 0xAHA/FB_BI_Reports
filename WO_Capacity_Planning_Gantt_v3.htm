@@ -547,57 +547,203 @@ function toggleSidebar() {
 }
 
 // ============================================
+// FISHBOWL API FUNCTIONS
+// ============================================
+function runQuery(sqlQuery) {
+    // Check if Fishbowl's runQuery function is available
+    if (typeof window.runQuery === 'function') {
+        return window.runQuery(sqlQuery);
+    } else if (window.parent && typeof window.parent.runQuery === 'function') {
+        return window.parent.runQuery(sqlQuery);
+    }
+    throw new Error('Fishbowl runQuery function not available');
+}
+
+function runApiRequest(requestType, jsonRequest) {
+    // Check if Fishbowl's runApiRequest function is available
+    if (typeof window.runApiRequest === 'function') {
+        return window.runApiRequest(requestType, jsonRequest);
+    } else if (window.parent && typeof window.parent.runApiRequest === 'function') {
+        return window.parent.runApiRequest(requestType, jsonRequest);
+    }
+    throw new Error('Fishbowl runApiRequest function not available');
+}
+
+// ============================================
 // DATA LOADING (Fishbowl API)
 // ============================================
 async function loadWorkOrders() {
     debugLog('info', 'Loading work orders from Fishbowl...');
     document.getElementById('refreshBtn').style.opacity = '0.5';
 
-    try {
-        // Simulate Fishbowl API call (replace with actual implementation)
-        const query = `
-            SELECT
-                wo.id AS wo_id,
-                wo.num AS wo_num,
-                wo.statusId AS wo_status,
-                status.name AS wo_status_name,
-                wo.dateScheduledToStart AS date_scheduled_start,
-                wo.dateScheduled AS date_scheduled,
-                wo.dateFinished AS date_finished,
-                mo.num AS mo_num,
-                mo.dateScheduled AS mo_date_scheduled,
-                cat.name AS category_name,
-                cat.color AS category_color,
-                wo.qtyTarget AS qty_target
-            FROM wo
-            JOIN status ON wo.statusId = status.id
-            LEFT JOIN mo ON wo.moId = mo.id
-            LEFT JOIN part ON wo.partId = part.id
-            LEFT JOIN manufacturingcategory cat ON part.partTypeId = cat.id
-            WHERE wo.statusId IN (10, 20, 30, 40)
-            ORDER BY wo.dateScheduledToStart ASC
-        `;
+    const woQuery = `
+        SELECT
+            mo.num AS mo_num,
+            mo.id AS mo_id,
+            wo.id AS wo_id,
+            wo.num AS wo_num,
+            wo.statusid AS wo_status,
+            CASE wo.statusid
+                WHEN 10 THEN 'Entered'
+                WHEN 30 THEN 'In Progress'
+                WHEN 40 THEN 'Fulfilled'
+                ELSE 'Unknown'
+            END AS wo_status_name,
+            moitem.description AS description,
+            COALESCE(bom.estimatedDuration, 0) * COALESCE(wo.qtyTarget, 0) AS estimated_duration,
+            COALESCE(wo.datescheduled, moitem.datescheduled) AS date_scheduled,
+            COALESCE(wo.datescheduledtostart, moitem.datescheduledtostart) AS date_scheduled_start,
+            wo.datefinished AS date_finished,
+            COALESCE(calcat.name, 'Uncategorized') AS calendar_category,
+            COALESCE(calcat.color, 'CCCCCC') AS category_color,
+            COALESCE(calcat.id, 0) AS calcategory_id,
+            wo.qtyTarget AS qty_target,
+            COALESCE(bom.estimatedDuration, 0) AS bom_duration_minutes,
+            (SELECT part.num FROM woitem
+             LEFT JOIN part ON woitem.partid = part.id
+             WHERE woitem.woid = wo.id AND woitem.typeid = 10
+             LIMIT 1) AS part_num,
+            (SELECT SUM(
+                CASE
+                    WHEN bomitem.uomid = (SELECT id FROM uom WHERE name = 'Hour' LIMIT 1) THEN
+                        COALESCE(bomitem.quantity, 0)
+                    WHEN EXISTS (
+                        SELECT 1 FROM uomconversion
+                        WHERE fromuomid = bomitem.uomid
+                        AND touomid = (SELECT id FROM uom WHERE name = 'Hour' LIMIT 1)
+                    ) THEN
+                        COALESCE(bomitem.quantity, 0) * (
+                            SELECT (multiply / factor)
+                            FROM uomconversion
+                            WHERE fromuomid = bomitem.uomid
+                            AND touomid = (SELECT id FROM uom WHERE name = 'Hour' LIMIT 1)
+                            LIMIT 1
+                        )
+                    WHEN EXISTS (
+                        SELECT 1 FROM uomconversion
+                        WHERE fromuomid = (SELECT id FROM uom WHERE name = 'Hour' LIMIT 1)
+                        AND touomid = bomitem.uomid
+                    ) THEN
+                        COALESCE(bomitem.quantity, 0) / (
+                            SELECT (multiply / factor)
+                            FROM uomconversion
+                            WHERE fromuomid = (SELECT id FROM uom WHERE name = 'Hour' LIMIT 1)
+                            AND touomid = bomitem.uomid
+                            LIMIT 1
+                        )
+                    ELSE 0
+                END
+            )
+            FROM bomitem
+            INNER JOIN part ON bomitem.partid = part.id
+            WHERE bomitem.bomid = bom.id
+            AND part.typeid = 21) AS labor_hours_from_bom
+        FROM wo
+        LEFT JOIN moitem ON wo.moitemid = moitem.id
+        LEFT JOIN mo ON moitem.moid = mo.id
+        LEFT JOIN bom ON moitem.bomid = bom.id
+        LEFT JOIN calcategory AS calcat ON wo.calcategoryid = calcat.id
+        WHERE wo.num IS NOT NULL
+            AND wo.statusid IN (10, 30, 40)
+            AND moitem.typeid = 50
+        ORDER BY mo.num, wo.num
+    `;
 
-        // Mock data for now
-        allWorkOrders = generateMockData();
+    const depQuery = `
+        SELECT DISTINCT
+            wo.id AS wo_id,
+            wo.num AS wo_num,
+            staging_wo.id AS staging_wo_id,
+            staging_wo.num AS staging_wo_num,
+            COALESCE(staging_wo.datescheduled, staging_moitem.datescheduled) AS staging_wo_finish,
+            COALESCE(wo.datescheduledtostart, current_moitem.datescheduledtostart) AS wo_start,
+            part.num AS part_num
+        FROM wo
+        LEFT JOIN moitem AS current_moitem ON wo.moitemid = current_moitem.id
+        LEFT JOIN mo AS current_mo ON current_moitem.moid = current_mo.id
+        LEFT JOIN woitem ON woitem.woid = wo.id AND woitem.typeid = 20
+        LEFT JOIN part ON woitem.partid = part.id
+        LEFT JOIN woitem AS staging_woitem ON staging_woitem.partid = part.id AND staging_woitem.typeid = 10
+        LEFT JOIN wo AS staging_wo ON staging_woitem.woid = staging_wo.id
+        LEFT JOIN moitem AS staging_moitem ON staging_wo.moitemid = staging_moitem.id
+        LEFT JOIN mo AS staging_mo ON staging_moitem.moid = staging_mo.id
+        WHERE wo.num IS NOT NULL
+            AND wo.statusid IN (10, 30, 40)
+            AND staging_wo.num IS NOT NULL
+            AND staging_wo.id != wo.id
+            AND current_mo.id = staging_mo.id
+    `;
+
+    const moQuery = `
+        SELECT DISTINCT
+            mo.num AS mo_num,
+            mo.id AS mo_id,
+            mo.statusid AS mo_status,
+            mo.datescheduled AS mo_date_scheduled,
+            part.num AS part_num,
+            moitem.description AS description,
+            moitem.qtytofulfill AS qty,
+            bom.num AS bom_num
+        FROM mo
+        LEFT JOIN moitem ON moitem.moid = mo.id
+        LEFT JOIN part ON moitem.partid = part.id
+        LEFT JOIN bom ON moitem.bomid = bom.id
+        WHERE moitem.typeid = 50
+            AND moitem.parentid IS NULL
+            AND mo.id IN (
+                SELECT DISTINCT mo.id
+                FROM wo
+                LEFT JOIN moitem ON wo.moitemid = moitem.id
+                LEFT JOIN mo ON moitem.moid = mo.id
+                WHERE wo.num IS NOT NULL AND wo.statusid IN (10, 30, 40)
+            )
+        ORDER BY mo.num
+    `;
+
+    try {
+        debugLog('info', 'Starting to load work orders...');
+
+        // Try to load from Fishbowl
+        let woResults, depResults, moResults;
+        try {
+            woResults = JSON.parse(runQuery(woQuery));
+            allWorkOrders = processWorkOrdersWithHours(woResults);
+            debugLog('success', `Loaded ${allWorkOrders.length} work orders from Fishbowl`);
+
+            depResults = JSON.parse(runQuery(depQuery));
+            stagingDependencies = depResults;
+            debugLog('success', `Loaded ${stagingDependencies.length} staging dependencies`);
+
+            moResults = JSON.parse(runQuery(moQuery));
+            manufacturingOrders = moResults;
+            debugLog('success', `Loaded ${manufacturingOrders.length} MO finished goods`);
+
+        } catch (fbError) {
+            debugLog('warn', 'Fishbowl not available, using mock data', fbError.message);
+            allWorkOrders = generateMockData();
+            stagingDependencies = [];
+            manufacturingOrders = [...new Set(allWorkOrders.map(wo => wo.mo_num))].map(mo => ({ mo_num: mo }));
+        }
 
         // Extract unique MOs and categories
         const uniqueMOs = [...new Set(allWorkOrders.map(wo => wo.mo_num))].sort();
-        manufacturingOrders = uniqueMOs.map(mo => ({ mo_num: mo }));
+        manufacturingOrders = uniqueMOs.map(mo => {
+            const existing = manufacturingOrders.find(m => m.mo_num === mo);
+            return existing || { mo_num: mo };
+        });
 
         const catMap = new Map();
         allWorkOrders.forEach(wo => {
-            if (wo.category_name && !catMap.has(wo.category_name)) {
-                catMap.set(wo.category_name, {
-                    name: wo.category_name,
-                    color: wo.category_color || '#6366f1'
+            const catName = wo.calendar_category || wo.category_name || 'Uncategorized';
+            if (!catMap.has(catName)) {
+                catMap.set(catName, {
+                    id: wo.calcategory_id || 0,
+                    name: catName,
+                    color: wo.category_color ? '#' + wo.category_color : '#6366f1'
                 });
             }
         });
         categories = Array.from(catMap.values());
-
-        // Load dependencies (mock)
-        stagingDependencies = [];
 
         filteredWorkOrders = [...allWorkOrders];
 
@@ -611,6 +757,135 @@ async function loadWorkOrders() {
         showToast('Failed to load data: ' + error.message, 'error');
     } finally {
         document.getElementById('refreshBtn').style.opacity = '1';
+    }
+}
+
+// ============================================
+// DATA PROCESSING FUNCTIONS
+// ============================================
+function processWorkOrdersWithHours(workOrders) {
+    return workOrders.map(wo => {
+        const totalHours = calculateWOHours(wo);
+        const dailyHours = calculateDailyHours(wo, totalHours);
+
+        return {
+            ...wo,
+            total_hours: totalHours,
+            daily_hours: dailyHours,
+            date_range_days: moment(wo.date_scheduled).diff(
+                moment(wo.date_scheduled_start),
+                'days'
+            ) + 1
+        };
+    });
+}
+
+function calculateWOHours(wo) {
+    let totalHours = 0;
+
+    // Priority 1: BOM estimated duration (convert minutes to hours)
+    if (wo.bom_duration_minutes && wo.bom_duration_minutes > 0) {
+        totalHours = (wo.bom_duration_minutes / 60) * wo.qty_target;
+        debugLog('info', `WO ${wo.wo_num}: Using BOM duration ${wo.bom_duration_minutes}min * ${wo.qty_target}qty = ${totalHours.toFixed(2)}hrs`);
+    }
+    // Priority 2: Labor hours from BOM parts (already in hours)
+    else if (wo.labor_hours_from_bom && wo.labor_hours_from_bom > 0) {
+        totalHours = wo.labor_hours_from_bom * wo.qty_target;
+        debugLog('info', `WO ${wo.wo_num}: Using labor parts ${wo.labor_hours_from_bom}hrs * ${wo.qty_target}qty = ${totalHours.toFixed(2)}hrs`);
+    }
+    // Priority 3: Default fallback (1 hour per day)
+    else {
+        const dateRange = moment(wo.date_scheduled).diff(
+            moment(wo.date_scheduled_start),
+            'days'
+        ) + 1;
+        totalHours = Math.max(1, dateRange) * 1; // 1 hour per day, minimum 1 hour
+        debugLog('warn', `WO ${wo.wo_num}: No BOM data found, using fallback ${totalHours}hrs (1hr/day * ${dateRange}days)`);
+    }
+
+    return Math.max(0, totalHours); // Ensure non-negative
+}
+
+function calculateDailyHours(wo, totalHours) {
+    const startDate = moment(wo.date_scheduled_start);
+    const endDate = moment(wo.date_scheduled);
+    const days = endDate.diff(startDate, 'days') + 1;
+
+    if (days <= 0) return [];
+
+    const hoursPerDay = totalHours / days;
+    const dailyHours = [];
+
+    for (let i = 0; i < days; i++) {
+        const currentDate = startDate.clone().add(i, 'days');
+        dailyHours.push({
+            date: currentDate.format('YYYY-MM-DD'),
+            hours: hoursPerDay
+        });
+    }
+
+    return dailyHours;
+}
+
+// ============================================
+// SAVE WO DATES
+// ============================================
+async function saveWODates(woNum, newStartDate, newEndDate) {
+    debugLog('info', `Saving WO ${woNum} dates: ${newStartDate} to ${newEndDate}`);
+
+    try {
+        // Get the full WO record from Fishbowl
+        const woRequest = {
+            GetWorkOrderRq: {
+                WorkOrderNumber: woNum
+            }
+        };
+
+        const woResponse = JSON.parse(runApiRequest('GetWorkOrderRq', JSON.stringify(woRequest)));
+
+        if (woResponse.GetWorkOrderRs && woResponse.GetWorkOrderRs.statusCode === 1000 && woResponse.GetWorkOrderRs.WO) {
+            const wo = woResponse.GetWorkOrderRs.WO;
+
+            // Update the dates
+            wo.DateScheduledToStart = newStartDate;
+            wo.DateScheduled = newEndDate;
+
+            // Also update WO items if they exist
+            if (wo.WOItems && wo.WOItems.WOItem) {
+                const items = Array.isArray(wo.WOItems.WOItem) ? wo.WOItems.WOItem : [wo.WOItems.WOItem];
+                items.forEach(item => {
+                    item.DateScheduled = newStartDate;
+                });
+            }
+
+            // Save the updated WO
+            const saveRequest = {
+                SaveWorkOrderRq: {
+                    WO: wo
+                }
+            };
+
+            const saveResponse = JSON.parse(runApiRequest('SaveWorkOrderRq', JSON.stringify(saveRequest)));
+
+            if (saveResponse.SaveWorkOrderRs && saveResponse.SaveWorkOrderRs.statusCode === 1000) {
+                debugLog('success', `WO ${woNum} updated successfully`);
+                showToast(`WO ${woNum} dates updated successfully`, 'success');
+
+                // Reload data to reflect changes
+                await loadWorkOrders();
+                return true;
+            } else {
+                const errorMsg = saveResponse.SaveWorkOrderRs ? saveResponse.SaveWorkOrderRs.statusMessage : 'Unknown error';
+                throw new Error('Failed to save WO: ' + errorMsg);
+            }
+        } else {
+            const errorMsg = woResponse.GetWorkOrderRs ? woResponse.GetWorkOrderRs.statusMessage : 'Failed to retrieve WO';
+            throw new Error('Failed to get WO: ' + errorMsg);
+        }
+    } catch (error) {
+        debugLog('error', `Failed to save WO ${woNum}`, error);
+        showToast(`Failed to save WO: ${error.message}`, 'error', 5000);
+        return false;
     }
 }
 
