@@ -1236,17 +1236,44 @@ function renderGanttChart() {
     const dayWidth = ganttScale;
     const days = moment(ganttEndDate).diff(ganttStartDate, 'days') + 1;
     const width = days * dayWidth + margin.left + margin.right;
-    const rowHeight = viewMode === 'mo' ? 70 : 50; // More space for MO view to fit MO headers
+    const rowHeight = 50; // Consistent height for all views
 
     // Build groups based on view mode
     let groups = [];
     if (viewMode === 'mo') {
-        const moNums = [...new Set(filteredWorkOrders.map(wo => wo.mo_num))].sort();
-        groups = moNums.map(mo => ({
-            id: mo,
-            name: mo,
-            wos: filteredWorkOrders.filter(wo => wo.mo_num === mo)
-        }));
+        // Pack WOs into rows efficiently (multiple MOs per row when dates don't overlap)
+        const sortedWOs = [...filteredWorkOrders].sort((a, b) =>
+            moment(a.date_scheduled_start).valueOf() - moment(b.date_scheduled_start).valueOf()
+        );
+
+        const rows = [];
+        sortedWOs.forEach(wo => {
+            // Find first row where this WO doesn't overlap
+            let placed = false;
+            for (let row of rows) {
+                const overlaps = row.wos.some(existingWO => {
+                    const woStart = moment(wo.date_scheduled_start);
+                    const woEnd = moment(wo.date_scheduled);
+                    const existingStart = moment(existingWO.date_scheduled_start);
+                    const existingEnd = moment(existingWO.date_scheduled);
+                    return woStart.isBefore(existingEnd) && woEnd.isAfter(existingStart);
+                });
+
+                if (!overlaps) {
+                    row.wos.push(wo);
+                    placed = true;
+                    break;
+                }
+            }
+
+            // If no row found, create new row
+            if (!placed) {
+                rows.push({ id: `row_${rows.length}`, name: `Row ${rows.length + 1}`, wos: [wo] });
+            }
+        });
+
+        groups = rows;
+        debugLog('info', `MO view: Packed ${sortedWOs.length} WOs into ${groups.length} rows`);
     } else {
         // Category view - group by category_name (already normalized in processWorkOrdersWithHours)
         const catNames = [...new Set(filteredWorkOrders.map(wo => wo.category_name))].sort();
@@ -1340,81 +1367,39 @@ function renderGanttChart() {
         currentDay.add(1, 'day');
     }
 
-    // Group labels
-    svg.selectAll('.group-label')
-        .data(groups)
-        .enter()
-        .append('text')
-        .attr('class', 'group-label')
-        .attr('x', margin.left - 10)
-        .attr('y', d => yScale(d.id) + yScale.bandwidth() / 2)
-        .attr('text-anchor', 'end')
-        .attr('alignment-baseline', 'middle')
-        .attr('font-size', '13px')
-        .attr('font-weight', '600')
-        .attr('fill', '#334155')
-        .text(d => d.name);
+    // Group labels with colored backgrounds for category view
+    if (viewMode === 'category') {
+        svg.selectAll('.group-label-bg')
+            .data(groups)
+            .enter()
+            .append('rect')
+            .attr('class', 'group-label-bg')
+            .attr('x', 0)
+            .attr('y', d => yScale(d.id))
+            .attr('width', margin.left - 15)
+            .attr('height', yScale.bandwidth())
+            .attr('fill', d => d.color || '#6366f1')
+            .attr('fill-opacity', 0.15)
+            .attr('stroke', d => d.color || '#6366f1')
+            .attr('stroke-width', 2)
+            .attr('rx', 4);
+    }
 
-    // MO Header Bars (in MO view only)
-    if (viewMode === 'mo') {
-        groups.forEach(group => {
-            if (group.wos.length === 0) return;
-
-            // Find MO data
-            const moData = manufacturingOrders.find(mo => mo.mo_num === group.name);
-
-            // Find earliest WO start
-            const starts = group.wos.map(wo => moment(wo.date_scheduled_start));
-            const moStart = moment.min(starts);
-
-            // Use MO scheduled date as end (from MO table), or fallback to latest WO end
-            let moEnd;
-            let hasConflict = false;
-            if (moData && moData.mo_date_scheduled) {
-                moEnd = moment(moData.mo_date_scheduled);
-                // Check if any WO finishes after MO scheduled date
-                group.wos.forEach(wo => {
-                    if (moment(wo.date_scheduled).isAfter(moEnd)) {
-                        hasConflict = true;
-                        conflicts.add(wo.wo_id);
-                    }
-                });
-            } else {
-                // Fallback: use latest WO end if no MO date available
-                const ends = group.wos.map(wo => moment(wo.date_scheduled));
-                moEnd = moment.max(ends);
-            }
-
-            const moX = xScale(moStart.toDate());
-            const moWidth = Math.max(20, xScale(moEnd.toDate()) - moX);
-            const moY = yScale(group.id);
-            const moHeight = 20;
-
-            // MO header bar - red if conflict
-            svg.append('rect')
-                .attr('class', 'mo-header')
-                .attr('x', moX)
-                .attr('y', moY - 25)
-                .attr('width', moWidth)
-                .attr('height', moHeight)
-                .attr('rx', 4)
-                .attr('fill', hasConflict ? '#ef4444' : '#334155')
-                .attr('stroke', hasConflict ? '#dc2626' : '#1e293b')
-                .attr('stroke-width', 1.5)
-                .style('opacity', 0.9);
-
-            // MO label
-            svg.append('text')
-                .attr('x', moX + moWidth / 2)
-                .attr('y', moY - 15)
-                .attr('text-anchor', 'middle')
-                .attr('alignment-baseline', 'middle')
-                .attr('font-size', '11px')
-                .attr('font-weight', '700')
-                .attr('fill', '#ffffff')
-                .attr('pointer-events', 'none')
-                .text(`MO ${group.name}${hasConflict ? ' ⚠' : ''}`);
-        });
+    // Group labels - hide for MO view (row numbers), show for category view
+    if (viewMode === 'category') {
+        svg.selectAll('.group-label')
+            .data(groups)
+            .enter()
+            .append('text')
+            .attr('class', 'group-label')
+            .attr('x', margin.left - 10)
+            .attr('y', d => yScale(d.id) + yScale.bandwidth() / 2)
+            .attr('text-anchor', 'end')
+            .attr('alignment-baseline', 'middle')
+            .attr('font-size', '13px')
+            .attr('font-weight', '600')
+            .attr('fill', '#1e293b')
+            .text(d => d.name);
     }
 
     // Month header background
@@ -1634,7 +1619,8 @@ function renderGanttChart() {
                 }
             });
 
-            // Label
+            // Label - show MO number in MO view
+            const labelText = viewMode === 'mo' ? `MO ${wo.mo_num} - ${wo.wo_num}` : wo.wo_num;
             const label = svg.append('text')
                 .attr('x', x + 8)
                 .attr('y', y + barHeight / 2)
@@ -1643,7 +1629,7 @@ function renderGanttChart() {
                 .attr('font-weight', '600')
                 .attr('fill', wo.wo_status === 30 ? '#ffffff' : '#334155')
                 .attr('pointer-events', 'none')
-                .text(wo.wo_num);
+                .text(labelText);
 
             // Left resize handle
             const handleWidth = 8;
