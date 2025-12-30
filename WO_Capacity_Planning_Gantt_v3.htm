@@ -1172,6 +1172,9 @@ function renderCurrentView() {
 function renderGanttChart() {
     debugLog('info', `Rendering ${viewMode} Gantt chart...`);
 
+    // Clear conflicts
+    conflicts.clear();
+
     const svg = d3.select('#ganttSvg');
     svg.selectAll('*').remove();
 
@@ -1297,6 +1300,49 @@ function renderGanttChart() {
         .attr('fill', '#334155')
         .text(d => d.name);
 
+    // MO Header Bars (in MO view only)
+    if (viewMode === 'mo') {
+        groups.forEach(group => {
+            if (group.wos.length === 0) return;
+
+            // Find earliest start and latest end across all WOs in this MO
+            const starts = group.wos.map(wo => moment(wo.date_scheduled_start));
+            const ends = group.wos.map(wo => moment(wo.date_scheduled));
+            const moStart = moment.min(starts);
+            const moEnd = moment.max(ends);
+
+            const moX = xScale(moStart.toDate());
+            const moWidth = Math.max(20, xScale(moEnd.toDate()) - moX);
+            const moY = yScale(group.id);
+            const moHeight = 20;
+
+            // MO header bar
+            svg.append('rect')
+                .attr('class', 'mo-header')
+                .attr('x', moX)
+                .attr('y', moY - 25)
+                .attr('width', moWidth)
+                .attr('height', moHeight)
+                .attr('rx', 4)
+                .attr('fill', '#334155')
+                .attr('stroke', '#1e293b')
+                .attr('stroke-width', 1.5)
+                .style('opacity', 0.9);
+
+            // MO label
+            svg.append('text')
+                .attr('x', moX + moWidth / 2)
+                .attr('y', moY - 15)
+                .attr('text-anchor', 'middle')
+                .attr('alignment-baseline', 'middle')
+                .attr('font-size', '11px')
+                .attr('font-weight', '700')
+                .attr('fill', '#ffffff')
+                .attr('pointer-events', 'none')
+                .text(`MO ${group.name}`);
+        });
+    }
+
     // Month header background
     const monthHeaderGroup = svg.append('g');
     let currentMonth = ganttStartDate.clone().startOf('month');
@@ -1408,8 +1454,90 @@ function renderGanttChart() {
                 .attr('stroke', colors.stroke)
                 .attr('stroke-width', 2)
                 .attr('data-wo-id', wo.wo_id)
+                .attr('data-wo-num', wo.wo_num)
                 .style('filter', 'drop-shadow(0 2px 4px rgba(0,0,0,0.1))')
                 .style('cursor', 'move');
+
+            // Add drag behavior
+            const drag = d3.drag()
+                .on('start', function(event) {
+                    d3.select(this)
+                        .classed('dragging', true)
+                        .style('opacity', 0.6);
+
+                    undoStack.push(captureState());
+                    if (undoStack.length > MAX_UNDO_STACK) {
+                        undoStack.shift();
+                    }
+                    redoStack = [];
+                    updateUndoRedoButtons();
+                })
+                .on('drag', function(event) {
+                    const newX = Math.max(margin.left, event.x);
+                    d3.select(this).attr('x', newX);
+
+                    // Update label position
+                    d3.select(this.nextSibling).attr('x', newX + 8);
+                })
+                .on('end', function(event) {
+                    d3.select(this)
+                        .classed('dragging', false)
+                        .style('opacity', 1);
+
+                    const newX = Math.max(margin.left, event.x);
+                    const newStartDate = xScale.invert(newX);
+                    let newStart = moment(newStartDate).startOf('day');
+
+                    // Skip weekends if enabled
+                    if (skipWeekends) {
+                        while (newStart.day() === 0 || newStart.day() === 6) {
+                            newStart.add(1, 'day');
+                        }
+                    }
+
+                    // Calculate duration and new end date
+                    const duration = moment(wo.date_scheduled).diff(moment(wo.date_scheduled_start), 'days');
+                    let newEnd = newStart.clone().add(duration, 'days');
+
+                    // Skip weekends for end date if enabled
+                    if (skipWeekends) {
+                        let daysToAdd = duration;
+                        let current = newStart.clone();
+                        while (daysToAdd > 0) {
+                            current.add(1, 'day');
+                            if (current.day() !== 0 && current.day() !== 6) {
+                                daysToAdd--;
+                            }
+                        }
+                        newEnd = current;
+                    }
+
+                    const woNum = d3.select(this).attr('data-wo-num');
+                    debugLog('info', `Dropped WO ${woNum}: ${newStart.format('YYYY-MM-DD')} to ${newEnd.format('YYYY-MM-DD')}`);
+
+                    // Update in Fishbowl
+                    saveWODates(woNum, newStart.format('YYYY-MM-DD'), newEnd.format('YYYY-MM-DD'));
+                });
+
+            bar.call(drag);
+
+            // Double-click to open MO in Fishbowl
+            bar.on('dblclick', function() {
+                const moNum = wo.mo_num;
+                debugLog('info', `Opening MO ${moNum} in Fishbowl...`);
+                try {
+                    if (typeof openMO === 'function') {
+                        openMO(moNum);
+                        showToast(`Opening MO ${moNum}`, 'info');
+                    } else {
+                        debugLog('warn', 'openMO function not available in Fishbowl');
+                        showToast('Cannot open MO - not running in Fishbowl', 'error');
+                    }
+                } catch (error) {
+                    debugLog('error', 'Error opening MO:', error);
+                    showToast('Error opening MO: ' + error.message, 'error');
+                }
+            });
 
             // Label
             svg.append('text')
@@ -1424,7 +1552,102 @@ function renderGanttChart() {
         });
     });
 
-    debugLog('success', `Gantt chart rendered with ${filteredWorkOrders.length} WOs`);
+    // Dependency Arrows
+    if (showArrows && stagingDependencies.length > 0) {
+        const arrowGroup = svg.append('g').attr('class', 'arrows');
+
+        stagingDependencies.forEach(dep => {
+            // Find the WO bars for source and target
+            const sourceWO = filteredWorkOrders.find(wo => wo.wo_id === dep.staging_wo_id);
+            const targetWO = filteredWorkOrders.find(wo => wo.wo_id === dep.wo_id);
+
+            if (!sourceWO || !targetWO) return;
+
+            const sourceGroup = viewMode === 'mo'
+                ? groups.find(g => g.id === sourceWO.mo_num)
+                : groups.find(g => g.id === sourceWO.category_name);
+
+            const targetGroup = viewMode === 'mo'
+                ? groups.find(g => g.id === targetWO.mo_num)
+                : groups.find(g => g.id === targetWO.category_name);
+
+            if (!sourceGroup || !targetGroup) return;
+
+            // Calculate positions
+            const sourceEnd = xScale(moment(sourceWO.date_scheduled).toDate());
+            const sourceY = yScale(sourceGroup.id) + yScale.bandwidth() / 2;
+
+            const targetStart = xScale(moment(targetWO.date_scheduled_start).toDate());
+            const targetY = yScale(targetGroup.id) + yScale.bandwidth() / 2;
+
+            // Check for conflict (source finishes after target starts)
+            const isConflict = moment(sourceWO.date_scheduled).isAfter(moment(targetWO.date_scheduled_start));
+            const arrowColor = isConflict ? '#ef4444' : '#64748b';
+
+            // Draw arrow path
+            const midX = (sourceEnd + targetStart) / 2;
+            const path = `M ${sourceEnd},${sourceY}
+                         L ${midX},${sourceY}
+                         L ${midX},${targetY}
+                         L ${targetStart},${targetY}`;
+
+            arrowGroup.append('path')
+                .attr('d', path)
+                .attr('stroke', arrowColor)
+                .attr('stroke-width', 2)
+                .attr('fill', 'none')
+                .attr('marker-end', `url(#arrow-${isConflict ? 'conflict' : 'normal'})`)
+                .attr('opacity', 0.7)
+                .attr('class', isConflict ? 'dependency-arrow conflict' : 'dependency-arrow');
+
+            // Track conflicts
+            if (isConflict) {
+                conflicts.add(dep.wo_id);
+                conflicts.add(dep.staging_wo_id);
+            }
+        });
+
+        // Define arrow markers
+        const defs = svg.append('defs');
+
+        // Normal arrow
+        defs.append('marker')
+            .attr('id', 'arrow-normal')
+            .attr('viewBox', '0 0 10 10')
+            .attr('refX', 9)
+            .attr('refY', 5)
+            .attr('markerWidth', 6)
+            .attr('markerHeight', 6)
+            .attr('orient', 'auto')
+            .append('path')
+            .attr('d', 'M 0 0 L 10 5 L 0 10 z')
+            .attr('fill', '#64748b');
+
+        // Conflict arrow
+        defs.append('marker')
+            .attr('id', 'arrow-conflict')
+            .attr('viewBox', '0 0 10 10')
+            .attr('refX', 9)
+            .attr('refY', 5)
+            .attr('markerWidth', 6)
+            .attr('markerHeight', 6)
+            .attr('orient', 'auto')
+            .append('path')
+            .attr('d', 'M 0 0 L 10 5 L 0 10 z')
+            .attr('fill', '#ef4444');
+
+        // Highlight conflicted WO bars
+        svg.selectAll('.wo-bar').each(function() {
+            const woId = parseInt(d3.select(this).attr('data-wo-id'));
+            if (conflicts.has(woId)) {
+                d3.select(this)
+                    .attr('stroke', '#ef4444')
+                    .attr('stroke-width', 3);
+            }
+        });
+    }
+
+    debugLog('success', `Gantt chart rendered with ${filteredWorkOrders.length} WOs, ${stagingDependencies.length} dependencies, ${conflicts.size} conflicts`);
 }
 
 // ============================================
