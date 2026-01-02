@@ -2686,6 +2686,105 @@ function updateUndoRedoButtons() {
 }
 
 // ============================================
+// SETTINGS PERSISTENCE
+// ============================================
+function gatherSettings() {
+    // Compile all settings into a single object
+    return {
+        version: '1.0',
+        capacitySettings: capacitySettings,
+        ganttScale: ganttScale,
+        skipWeekends: skipWeekends,
+        showArrows: showArrows,
+        calendarExpanded: calendarExpanded,
+        collapsedMOs: Array.from(collapsedMOs), // Convert Set to Array for JSON
+        savedAt: new Date().toISOString()
+    };
+}
+
+function applySettings(settings) {
+    // Apply loaded settings to global variables
+    if (!settings || !settings.version) {
+        debugLog('warn', 'Invalid settings object, using defaults');
+        return false;
+    }
+
+    try {
+        if (settings.capacitySettings) {
+            capacitySettings = settings.capacitySettings;
+        }
+        if (typeof settings.ganttScale === 'number') {
+            ganttScale = settings.ganttScale;
+        }
+        if (typeof settings.skipWeekends === 'boolean') {
+            skipWeekends = settings.skipWeekends;
+        }
+        if (typeof settings.showArrows === 'boolean') {
+            showArrows = settings.showArrows;
+        }
+        if (typeof settings.calendarExpanded === 'boolean') {
+            calendarExpanded = settings.calendarExpanded;
+        }
+        if (Array.isArray(settings.collapsedMOs)) {
+            collapsedMOs = new Set(settings.collapsedMOs);
+        }
+
+        debugLog('success', `Settings loaded from ${settings.savedAt || 'unknown date'}`);
+        return true;
+    } catch (error) {
+        debugLog('error', 'Error applying settings:', error);
+        return false;
+    }
+}
+
+function saveSettingsToDatabase() {
+    // Save settings to database via part.details field
+    const settings = gatherSettings();
+    const settingsJson = JSON.stringify(settings, null, 2);
+
+    const updateQuery = `
+        UPDATE part
+        SET details = '${settingsJson.replace(/'/g, "''")}'
+        WHERE num = '_settingsCapacityPlanner'
+    `;
+
+    try {
+        runQuery(updateQuery);
+        debugLog('success', 'Settings saved to database');
+        showToast('Settings saved successfully', 'success');
+        return true;
+    } catch (error) {
+        debugLog('error', 'Failed to save settings:', error);
+        showToast('Failed to save settings', 'error');
+        return false;
+    }
+}
+
+function loadSettingsFromDatabase() {
+    // Load settings from database via part.details field
+    const selectQuery = `
+        SELECT details
+        FROM part
+        WHERE num = '_settingsCapacityPlanner'
+        LIMIT 1
+    `;
+
+    try {
+        const result = JSON.parse(runQuery(selectQuery));
+        if (result && result.length > 0 && result[0].details) {
+            const settings = JSON.parse(result[0].details);
+            return applySettings(settings);
+        } else {
+            debugLog('info', 'No saved settings found in database');
+            return false;
+        }
+    } catch (error) {
+        debugLog('warn', 'Could not load settings from database:', error);
+        return false;
+    }
+}
+
+// ============================================
 // FILTERS
 // ============================================
 document.getElementById('moFilter').addEventListener('change', (e) => {
@@ -3074,7 +3173,13 @@ function renderCapacityWOs(category, weekStart, numWeeks = 1) {
         const visibleEnd = moment.min(woEnd, viewEnd);
 
         const x = xScale(visibleStart.toDate());
-        const barWidth = xScale(visibleEnd.toDate()) - x;
+
+        // For end position, we need the RIGHT edge of the day, not the left edge
+        const endDayIndex = moment(visibleEnd).diff(weekStart, 'days');
+        const xEnd = (endDayIndex >= 0 && endDayIndex < dayPositions.length)
+            ? dayPositions[endDayIndex] + dayWidths[endDayIndex]
+            : xScale(visibleEnd.toDate());
+        const barWidth = xEnd - x;
 
         // Add padding so tiles don't touch cell edges
         const horizontalPadding = 4;
@@ -3365,6 +3470,40 @@ function buildMonthCalendar() {
     const totalDays = calendarEnd.diff(calendarStart, 'days') + 1;
     const numWeeks = Math.ceil(totalDays / 7);
 
+    // Pre-calculate max lanes per week row for dynamic height
+    const maxLanesPerWeek = new Array(numWeeks).fill(0);
+
+    // Get all WOs for this month and pack them
+    const calendarEndForWOs = calendarStart.clone().add(totalDays, 'days');
+    const wosInMonth = [];
+    filteredWorkOrders.forEach(wo => {
+        const woStart = moment(wo.date_scheduled_start).startOf('day');
+        const woEnd = moment(wo.date_scheduled).endOf('day');
+        if (woStart.isBefore(calendarEndForWOs) && woEnd.isAfter(calendarStart)) {
+            wosInMonth.push(wo);
+        }
+    });
+    packWOsIntoLanes(wosInMonth);
+
+    // Calculate max lanes for each week
+    wosInMonth.forEach(wo => {
+        const woStart = moment(wo.date_scheduled_start).startOf('day');
+        const woEnd = moment(wo.date_scheduled).endOf('day');
+        const startDayIndex = Math.max(0, woStart.diff(calendarStart, 'days'));
+        const endDayIndex = Math.min(totalDays - 1, woEnd.diff(calendarStart, 'days'));
+
+        if (startDayIndex < totalDays && endDayIndex >= 0) {
+            const startRow = Math.floor(startDayIndex / 7);
+            const endRow = Math.floor(endDayIndex / 7);
+
+            // Only count single-row WOs for now
+            if (startRow === endRow && startRow < numWeeks) {
+                const lane = wo._lane || 0;
+                maxLanesPerWeek[startRow] = Math.max(maxLanesPerWeek[startRow], lane + 1);
+            }
+        }
+    });
+
     // Create table structure
     const table = document.createElement('table');
     table.className = 'w-full border-collapse';
@@ -3389,10 +3528,14 @@ function buildMonthCalendar() {
     for (let week = 0; week < numWeeks; week++) {
         const row = document.createElement('tr');
 
+        // Calculate dynamic height: 24px for header + 18px per lane, minimum 80px
+        const numLanes = maxLanesPerWeek[week] || 0;
+        const dynamicHeight = Math.max(80, 24 + (numLanes * 18) + 10); // +10px bottom padding
+
         for (let day = 0; day < 7; day++) {
             const cell = document.createElement('td');
             cell.className = 'border border-slate-200 p-0 align-top relative cursor-pointer hover:bg-slate-50 transition-colors';
-            cell.style.height = '80px';
+            cell.style.height = `${dynamicHeight}px`;
             cell.style.minWidth = '100px';
 
             const isCurrentMonth = currentDay.month() === monthStart.month();
@@ -3579,6 +3722,11 @@ window.addEventListener('DOMContentLoaded', () => {
     ganttEndDate = moment().startOf('isoWeek').add(14, 'days');
 
     debugLog('info', 'Application starting...');
+
+    // Load saved settings from database (if available)
+    loadSettingsFromDatabase();
+
+    // Load work orders
     loadWorkOrders();
 });
 </script>
