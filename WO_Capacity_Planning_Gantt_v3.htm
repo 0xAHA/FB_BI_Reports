@@ -3546,6 +3546,71 @@ function renderCapacityWOs(category, weekStart, numWeeks = 1) {
             }
         });
 
+        // Add drag behavior
+        const dragBehavior = d3.drag()
+            .on('start', function(event) {
+                d3.select(this)
+                    .attr('opacity', 0.5)
+                    .attr('stroke-width', 3);
+                hideWOTooltip();
+            })
+            .on('drag', function(event) {
+                // Move the bar with the mouse
+                const newX = parseFloat(d3.select(this).attr('x')) + event.dx;
+                const newY = parseFloat(d3.select(this).attr('y')) + event.dy;
+                d3.select(this).attr('x', newX).attr('y', newY);
+            })
+            .on('end', function(event) {
+                d3.select(this)
+                    .attr('opacity', 1)
+                    .attr('stroke-width', 2);
+
+                // Get the final position
+                const finalX = parseFloat(d3.select(this).attr('x'));
+                const finalY = parseFloat(d3.select(this).attr('y'));
+
+                // Calculate which day based on X position
+                let targetDay = null;
+                for (let i = 0; i < dayPositions.length; i++) {
+                    const dayX = dayPositions[i];
+                    const dayW = dayWidths[i];
+                    if (finalX >= dayX && finalX < dayX + dayW) {
+                        targetDay = weekStart.clone().add(i, 'days');
+                        break;
+                    }
+                }
+
+                // Calculate which category based on Y position
+                let targetCategory = null;
+                const table = document.getElementById('capacityTable');
+                const tbody = table.querySelector('tbody');
+                const categoryRows = tbody.querySelectorAll('tr:nth-child(odd)'); // Odd rows are category WO rows
+
+                categoryRows.forEach((row, idx) => {
+                    const svgCell = row.querySelector('td:last-child');
+                    if (svgCell) {
+                        const svgElement = svgCell.querySelector('svg');
+                        if (svgElement) {
+                            const rect = svgElement.getBoundingClientRect();
+                            const mouseY = event.sourceEvent.clientY;
+                            if (mouseY >= rect.top && mouseY <= rect.bottom) {
+                                targetCategory = capacitySettings.categories[idx];
+                            }
+                        }
+                    }
+                });
+
+                // Handle the drop
+                if (targetDay || targetCategory) {
+                    handleCapacityWODrop(wo, targetDay, targetCategory, weekStart);
+                } else {
+                    // Snap back to original position
+                    renderCurrentView();
+                }
+            });
+
+        bar.call(dragBehavior);
+
         // WO label - show WO number and total hours
         const labelText = `WO ${wo.wo_num} (${totalHours.toFixed(1)}h)`;
         svg.append('text')
@@ -3769,6 +3834,85 @@ function scrollCapacityToWeek(weekStart) {
     }
 }
 
+function handleCalendarWODrop(dragData, dropDateStr) {
+    // Find the WO in allWorkOrders
+    const wo = allWorkOrders.find(w => w.wo_id === dragData.wo_id);
+    if (!wo) {
+        debugLog('error', `WO ${dragData.wo_num} not found in allWorkOrders`);
+        return;
+    }
+
+    // Calculate the date shift
+    const originalStart = moment(dragData.originalStart);
+    const originalEnd = moment(dragData.originalEnd);
+    const dropDate = moment(dropDateStr);
+    const daysDiff = dropDate.diff(originalStart, 'days');
+
+    if (daysDiff === 0) {
+        debugLog('info', `WO ${dragData.wo_num} dropped on same date, no change needed`);
+        return;
+    }
+
+    // Calculate new dates
+    const newStart = originalStart.clone().add(daysDiff, 'days');
+    const newEnd = originalEnd.clone().add(daysDiff, 'days');
+
+    debugLog('info', `Moving WO ${dragData.wo_num} by ${daysDiff} days: ${originalStart.format('YYYY-MM-DD')} → ${newStart.format('YYYY-MM-DD')}`);
+
+    // Update the WO dates
+    wo.date_scheduled_start = newStart.format('YYYY-MM-DD HH:mm:ss');
+    wo.date_scheduled = newEnd.format('YYYY-MM-DD HH:mm:ss');
+
+    // Save to database
+    saveWorkOrder(wo);
+
+    // Refresh views
+    renderCurrentView();
+}
+
+function handleCapacityWODrop(wo, targetDay, targetCategory, currentWeekStart) {
+    let hasChanges = false;
+    const changes = [];
+
+    // Handle date change
+    if (targetDay) {
+        const originalStart = moment(wo.date_scheduled_start);
+        const originalEnd = moment(wo.date_scheduled);
+        const daysDiff = targetDay.diff(originalStart.startOf('day'), 'days');
+
+        if (daysDiff !== 0) {
+            const newStart = originalStart.clone().add(daysDiff, 'days');
+            const newEnd = originalEnd.clone().add(daysDiff, 'days');
+
+            wo.date_scheduled_start = newStart.format('YYYY-MM-DD HH:mm:ss');
+            wo.date_scheduled = newEnd.format('YYYY-MM-DD HH:mm:ss');
+
+            changes.push(`date: ${originalStart.format('YYYY-MM-DD')} → ${newStart.format('YYYY-MM-DD')}`);
+            hasChanges = true;
+        }
+    }
+
+    // Handle category change
+    if (targetCategory && targetCategory.id !== wo.calcategory_id) {
+        const oldCategoryName = wo.category_name || 'Uncategorized';
+        wo.calcategory_id = targetCategory.id;
+        wo.category_name = targetCategory.name;
+        wo.category_color = targetCategory.color.replace('#', '');
+
+        changes.push(`category: ${oldCategoryName} → ${targetCategory.name}`);
+        hasChanges = true;
+    }
+
+    if (hasChanges) {
+        debugLog('info', `Moving WO ${wo.wo_num}: ${changes.join(', ')}`);
+        saveWorkOrder(wo);
+        renderCurrentView();
+    } else {
+        debugLog('info', `WO ${wo.wo_num} dropped with no changes`);
+        renderCurrentView(); // Still refresh to snap back to original position
+    }
+}
+
 function buildMonthCalendar() {
     const container = document.getElementById('monthCalendar');
     if (!container) return;
@@ -3893,6 +4037,43 @@ function buildMonthCalendar() {
                 scrollCapacityToWeek(weekStart);
             });
 
+            // Add drop zone handlers for drag and drop
+            cell.setAttribute('data-calendar-date', clickDay.format('YYYY-MM-DD'));
+
+            cell.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'move';
+                cell.style.backgroundColor = '#e0e7ff'; // indigo-100
+            });
+
+            cell.addEventListener('dragleave', (e) => {
+                if (isWeekend) {
+                    cell.style.backgroundColor = '';
+                } else {
+                    cell.querySelector('div').style.backgroundColor = isCurrentMonth ? '#ffffff' : '';
+                }
+            });
+
+            cell.addEventListener('drop', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+
+                // Reset background
+                if (isWeekend) {
+                    cell.style.backgroundColor = '';
+                } else {
+                    cell.querySelector('div').style.backgroundColor = isCurrentMonth ? '#ffffff' : '';
+                }
+
+                try {
+                    const dragData = JSON.parse(e.dataTransfer.getData('text/plain'));
+                    const dropDate = clickDay.format('YYYY-MM-DD');
+                    handleCalendarWODrop(dragData, dropDate);
+                } catch (error) {
+                    debugLog('error', 'Error handling calendar WO drop:', error);
+                }
+            });
+
             // Add red border if over capacity
             if (isOverCapacity) {
                 cell.style.borderColor = '#ef4444';
@@ -3965,7 +4146,12 @@ function renderCalendarWOs(table, calendarStart) {
 
         // Create WO bar as absolute positioned element within the row
         const woBar = document.createElement('div');
-        woBar.className = 'absolute rounded px-1 py-0.5 text-xs font-medium cursor-pointer hover:opacity-80 transition-opacity border';
+        woBar.className = 'absolute rounded px-1 py-0.5 text-xs font-medium cursor-move hover:opacity-80 transition-opacity border';
+        woBar.draggable = true;
+        woBar.setAttribute('data-wo-id', wo.wo_id);
+        woBar.setAttribute('data-wo-num', wo.wo_num);
+        woBar.setAttribute('data-wo-start', wo.date_scheduled_start);
+        woBar.setAttribute('data-wo-end', wo.date_scheduled);
 
         // Calculate position based on cell positions within the row
         const rowWidth = row.offsetWidth;
@@ -4009,6 +4195,22 @@ function renderCalendarWOs(table, calendarStart) {
         });
         woBar.addEventListener('mousemove', (e) => {
             showWOTooltip(e, calendarTooltipHTML);
+        });
+
+        // Drag and drop handlers
+        woBar.addEventListener('dragstart', (e) => {
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', JSON.stringify({
+                wo_id: wo.wo_id,
+                wo_num: wo.wo_num,
+                originalStart: wo.date_scheduled_start,
+                originalEnd: wo.date_scheduled
+            }));
+            woBar.style.opacity = '0.5';
+        });
+
+        woBar.addEventListener('dragend', (e) => {
+            woBar.style.opacity = '1';
         });
 
         // Click handler - scroll to week
