@@ -2028,18 +2028,19 @@ function renderGanttChart() {
         groups.forEach(group => {
             if (group.type === 'mo-header') {
                 // Calculate MO bar span (earliest start to latest end of all WOs)
-                const starts = group.wos.map(wo => moment(wo.date_scheduled_start));
-                const ends = group.wos.map(wo => moment(wo.date_scheduled));
+                const starts = group.wos.map(wo => moment(wo.date_scheduled_start).startOf('day'));
+                const ends = group.wos.map(wo => moment(wo.date_scheduled).startOf('day'));
                 const moStart = moment.min(starts);
 
                 // Check for conflicts with MO scheduled date
                 const moData = manufacturingOrders.find(mo => mo.mo_num === group.moNum);
+                const bomInfo = moData ? `${moData.bom_num || 'N/A'} x ${moData.qty || '?'}` : '';
                 let moEnd;
                 let hasConflict = false;
                 if (moData && moData.mo_date_scheduled) {
-                    moEnd = moment(moData.mo_date_scheduled);
+                    moEnd = moment(moData.mo_date_scheduled).startOf('day');
                     group.wos.forEach(wo => {
-                        if (moment(wo.date_scheduled).isAfter(moEnd)) {
+                        if (moment(wo.date_scheduled).startOf('day').isAfter(moEnd)) {
                             hasConflict = true;
                             conflicts.add(wo.wo_id);
                         }
@@ -2048,8 +2049,11 @@ function renderGanttChart() {
                     moEnd = moment.max(ends);
                 }
 
-                const moX = xScale(moStart.toDate());
-                const moWidth = Math.max(20, xScale(moEnd.toDate()) - moX);
+                // MO tiles span full days with visual margin
+                const margin = dayWidth * 0.08;
+                const moX = xScale(moStart.toDate()) + margin;
+                const moEndX = xScale(moEnd.clone().add(1, 'day').toDate()) - margin;
+                const moWidth = Math.max(20, moEndX - moX);
                 const groupY = yScale(group.id);
                 const rowHeight = yScale.bandwidth();
 
@@ -2057,8 +2061,8 @@ function renderGanttChart() {
                 const moHeight = 35;
                 const moY = groupY + (rowHeight - moHeight) / 2; // Center vertically in row
 
-                // MO header bar - orange/amber for MOs, red if conflict (no click handler - use fixed left label)
-                svg.append('rect')
+                // MO header bar - orange/amber for MOs, red if conflict
+                const moBar = svg.append('rect')
                     .attr('class', 'mo-header-bar')
                     .attr('x', moX)
                     .attr('y', moY)
@@ -2071,11 +2075,25 @@ function renderGanttChart() {
                     .attr('data-mo-num', group.moNum)
                     .style('filter', 'drop-shadow(0 2px 4px rgba(0,0,0,0.1))');
 
-                // MO label - two line format matching capacity planning
-                // Line 1: MO number
-                // Line 2: BOM info
-                const bomInfo = moData ? `${moData.bom_num || 'N/A'} x ${moData.qty || '?'}` : '';
+                // Add MO tooltip
+                const moTooltipHTML = `
+                    <div><span class="wo-tooltip-label">MO:</span><span class="wo-tooltip-value">${group.moNum}</span></div>
+                    <div><span class="wo-tooltip-label">BOM:</span><span class="wo-tooltip-value">${bomInfo}</span></div>
+                    <div><span class="wo-tooltip-label">Start:</span><span class="wo-tooltip-value">${moStart.format('YYYY-MM-DD')}</span></div>
+                    <div><span class="wo-tooltip-label">Scheduled Finish:</span><span class="wo-tooltip-value">${moEnd.format('YYYY-MM-DD')}</span></div>
+                    <div><span class="wo-tooltip-label">WO Count:</span><span class="wo-tooltip-value">${group.wos.length}</span></div>
+                    ${hasConflict ? '<div><span class="wo-tooltip-label">Status:</span><span class="wo-tooltip-value" style="color: #ef4444;">⚠ Conflict - WOs exceed MO date</span></div>' : ''}
+                `;
 
+                moBar.on('mouseover', function(event) {
+                    showWOTooltip(event, moTooltipHTML);
+                }).on('mouseout', function() {
+                    hideWOTooltip();
+                }).on('mousemove', function(event) {
+                    showWOTooltip(event, moTooltipHTML);
+                });
+
+                // MO label - two line format matching capacity planning
                 const moLabel = svg.append('text')
                     .attr('x', moX + 10)
                     .attr('y', moY + moHeight / 2)
@@ -2188,26 +2206,44 @@ function renderGanttChart() {
         if (group.type === 'mo-header') return;
 
         group.wos.forEach(wo => {
-            const start = moment(wo.date_scheduled_start);
-            const end = moment(wo.date_scheduled);
+            const start = moment(wo.date_scheduled_start).startOf('day');
+            const end = moment(wo.date_scheduled).startOf('day');
 
-            // Smart positioning: offset bars to prevent same-day overlaps
-            const dayGap = dayWidth * 0.15; // 15% of day width for gap
-            let xStart = xScale(start.toDate());
-            let xEnd = xScale(end.toDate());
+            // Visual margin for better appearance
+            const margin = dayWidth * 0.08; // 8% margin on each side
 
-            // If start is at beginning of day (midnight), shift right to create gap
-            if (start.hours() === 0 && start.minutes() === 0) {
-                xStart += dayGap;
+            // Default: span from start of day to end of day with margins
+            let startX = xScale(start.toDate()) + margin;
+            let endX = xScale(end.clone().add(1, 'day').toDate()) - margin;
+
+            // Check for same-day dependencies
+            const stagingDep = stagingDependencies.find(d => d.wo_id === wo.wo_id);
+            const dependentDep = stagingDependencies.find(d => d.staging_wo_id === wo.wo_id);
+
+            if (stagingDep) {
+                const stagingWO = filteredWorkOrders.find(w => w.wo_id === stagingDep.staging_wo_id);
+                if (stagingWO) {
+                    const stagingEnd = moment(stagingWO.date_scheduled).startOf('day');
+                    // If staging WO ends same day this WO starts, position from midday
+                    if (stagingEnd.isSame(start, 'day')) {
+                        startX = xScale(start.toDate()) + dayWidth / 2 + margin;
+                    }
+                }
             }
 
-            // If end is at beginning of day (midnight = end of previous day), shift left to create gap
-            if (end.hours() === 0 && end.minutes() === 0) {
-                xEnd -= dayGap;
+            if (dependentDep) {
+                const dependentWO = filteredWorkOrders.find(w => w.wo_id === dependentDep.wo_id);
+                if (dependentWO) {
+                    const dependentStart = moment(dependentWO.date_scheduled_start).startOf('day');
+                    // If dependent WO starts same day this WO ends, position to midday
+                    if (dependentStart.isSame(end, 'day')) {
+                        endX = xScale(end.toDate()) + dayWidth / 2 - margin;
+                    }
+                }
             }
 
-            const x = xStart;
-            const barWidth = Math.max(10, xEnd - xStart);
+            const x = startX;
+            const barWidth = Math.max(10, endX - startX);
 
             // Calculate y position and bar height - match capacity planning sizing (35px bars)
             let y, barHeight;
@@ -3239,7 +3275,11 @@ function buildCapacityTable(weekStart) {
     // Build header
     const thead = document.createElement('thead');
     const headerRow = document.createElement('tr');
-    headerRow.innerHTML = '<th class="sticky left-0 bg-slate-100 z-10 px-2 py-3 text-center text-sm font-bold text-slate-700 border-b-2 border-r-2 border-slate-300 w-20" style="writing-mode: vertical-rl; text-orientation: mixed;">Category</th>';
+    headerRow.innerHTML = `<th class="sticky left-0 bg-slate-100 z-10 px-2 py-2 text-center text-sm font-bold text-slate-700 border-b-2 border-r-2 border-slate-300 w-20">
+        <svg class="w-5 h-5 mx-auto text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"></path>
+        </svg>
+    </th>`;
 
     const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
     for (let day = 0; day < numDays; day++) {
