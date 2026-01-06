@@ -474,13 +474,7 @@
                         </svg>
                         Average Order Value
                     </h3>
-                    <div id="aovMetric" class="text-center">
-                        <div class="text-5xl font-bold text-indigo-600 mb-2">-</div>
-                        <div class="text-sm text-slate-500 mb-4">Current Period</div>
-                        <div id="aovComparison" class="hidden text-sm text-slate-600">
-                            <span class="font-semibold">Previous:</span> <span id="aovPrevious">-</span>
-                        </div>
-                    </div>
+                    <div id="aovMetric" style="height: 280px;"></div>
                 </div>
 
                 <!-- Average Days to Ship -->
@@ -1262,13 +1256,15 @@
             return JSON.parse(runQuery(query));
         }
 
-        // Average Order Value
+        // Average Order Value - Monthly
         function getAverageOrderValue() {
-            const currentConditions = buildOrderLevelFilterConditions();
-            const currentQuery = `
+            const conditions = buildOrderLevelFilterConditions();
+            const query = `
                 SELECT
-                    COALESCE(AVG(So.TotalPrice), 0) as avg_order_value,
-                    COUNT(DISTINCT So.Id) as order_count
+                    DATE_FORMAT(PostSo.PostDate, '%Y-%m-01') as month,
+                    AVG(So.TotalPrice) as avg_order_value,
+                    COUNT(DISTINCT So.Id) as order_count,
+                    SUM(So.TotalPrice) as total_revenue
                 FROM PostSo
                 JOIN So ON So.Id = PostSo.SoId
                 JOIN Customer ON Customer.Id = So.CustomerId
@@ -1279,37 +1275,12 @@
                     ORDER BY AccountGroupRelation.AccountId ASC
                     LIMIT 1
                 )
-                ${currentConditions}
+                ${conditions}
+                GROUP BY DATE_FORMAT(PostSo.PostDate, '%Y-%m-01')
+                ORDER BY month ASC
             `;
 
-            const currentData = JSON.parse(runQuery(currentQuery));
-
-            // Get previous period if comparison is enabled
-            if (document.getElementById('comparisonToggle').checked) {
-                const prevConditions = buildOrderLevelFilterConditions(true);
-                const prevQuery = `
-                    SELECT
-                        COALESCE(AVG(So.TotalPrice), 0) as avg_order_value
-                    FROM PostSo
-                    JOIN So ON So.Id = PostSo.SoId
-                    JOIN Customer ON Customer.Id = So.CustomerId
-                    LEFT JOIN AccountGroup ON AccountGroup.Id = (
-                        SELECT AccountGroupRelation.GroupId
-                        FROM AccountGroupRelation
-                        WHERE AccountGroupRelation.AccountId = Customer.AccountId
-                        ORDER BY AccountGroupRelation.AccountId ASC
-                        LIMIT 1
-                    )
-                    ${prevConditions}
-                `;
-                const prevData = JSON.parse(runQuery(prevQuery));
-                return {
-                    current: currentData[0],
-                    previous: prevData[0]
-                };
-            }
-
-            return currentData[0];
+            return JSON.parse(runQuery(query));
         }
 
         // New vs Repeat Customers
@@ -2841,23 +2812,72 @@
         }
 
         function renderAverageOrderValue(data) {
-            const hasPrevious = data.current !== undefined;
-            const currentData = hasPrevious ? data.current : data;
-            const aov = parseFloat(currentData.avg_order_value || 0);
+            const container = document.getElementById('aovMetric');
+            container.innerHTML = '';
 
-            document.querySelector('#aovMetric .text-5xl').textContent = `$${aov.toLocaleString('en-US', {maximumFractionDigits: 0})}`;
-
-            if (hasPrevious && data.previous) {
-                const prevAov = parseFloat(data.previous.avg_order_value || 0);
-                const change = ((aov - prevAov) / prevAov * 100).toFixed(1);
-                const isPositive = change >= 0;
-
-                document.getElementById('aovComparison').classList.remove('hidden');
-                document.getElementById('aovPrevious').textContent = `$${prevAov.toLocaleString('en-US', {maximumFractionDigits: 0})} (${isPositive ? '+' : ''}${change}%)`;
-                document.getElementById('aovPrevious').className = isPositive ? 'text-green-600' : 'text-red-600';
-            } else {
-                document.getElementById('aovComparison').classList.add('hidden');
+            if (!data || data.length === 0) {
+                container.innerHTML = '<div class="text-center text-slate-400 py-8">No data available</div>';
+                return;
             }
+
+            const width = container.clientWidth;
+            const height = 280;
+            const margin = { top: 20, right: 20, bottom: 60, left: 60 };
+
+            const svg = d3.select(container)
+                .append('svg')
+                .attr('width', width)
+                .attr('height', height);
+
+            const x = d3.scaleBand()
+                .domain(data.map(d => d.month))
+                .range([margin.left, width - margin.right])
+                .padding(0.2);
+
+            const y = d3.scaleLinear()
+                .domain([0, d3.max(data, d => d.avg_order_value)])
+                .nice()
+                .range([height - margin.bottom, margin.top]);
+
+            // Bars
+            svg.selectAll('rect')
+                .data(data)
+                .enter()
+                .append('rect')
+                .attr('x', d => x(d.month))
+                .attr('y', d => y(d.avg_order_value))
+                .attr('width', x.bandwidth())
+                .attr('height', d => height - margin.bottom - y(d.avg_order_value))
+                .attr('fill', '#2d9cdb')
+                .on('mouseover', function(event, d) {
+                    d3.select(this).style('opacity', 0.7);
+                    showTooltip(event, `
+                        <strong>${moment(d.month).format('MMM YYYY')}</strong><br>
+                        Avg Order Value: $${parseFloat(d.avg_order_value).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}<br>
+                        Orders: ${d.order_count}<br>
+                        Total Revenue: $${parseFloat(d.total_revenue).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+                    `);
+                })
+                .on('mouseout', function() {
+                    d3.select(this).style('opacity', 1);
+                    hideTooltip();
+                });
+
+            // X Axis
+            svg.append('g')
+                .attr('transform', `translate(0, ${height - margin.bottom})`)
+                .attr('class', 'axis')
+                .call(d3.axisBottom(x).tickFormat(d => moment(d).format('MMM YY')))
+                .selectAll('text')
+                .attr('transform', 'rotate(-45)')
+                .style('text-anchor', 'end')
+                .style('font-size', '10px');
+
+            // Y Axis
+            svg.append('g')
+                .attr('transform', `translate(${margin.left}, 0)`)
+                .attr('class', 'axis')
+                .call(d3.axisLeft(y).tickFormat(d => '$' + (d / 1000).toFixed(0) + 'k'));
         }
 
         function renderNewVsRepeatChart(data) {
