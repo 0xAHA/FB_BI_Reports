@@ -1116,16 +1116,24 @@
                 ORDER BY fullName
             `;
             debugLog('Loading sales people with query: ' + amQuery, 'info');
-            const accountManagers = JSON.parse(runQuery(amQuery));
-            debugLog(`Loaded ${accountManagers.length} sales people`, 'info');
-            const amSelector = document.getElementById('accountManagerFilter');
-            amSelector.innerHTML = '<option value="%">All Sales People</option>';
-            accountManagers.forEach(am => {
-                if (am.userName) {
-                    const displayName = am.fullName || am.userName;
-                    amSelector.innerHTML += `<option value="${am.userName}">${displayName}</option>`;
+            try {
+                const result = runQuery(amQuery);
+                debugLog('Sales people query result: ' + result, 'info');
+                const accountManagers = JSON.parse(result);
+                debugLog(`Loaded ${accountManagers ? accountManagers.length : 0} sales people`, 'info');
+                const amSelector = document.getElementById('accountManagerFilter');
+                amSelector.innerHTML = '<option value="%">All Sales People</option>';
+                if (accountManagers && accountManagers.length > 0) {
+                    accountManagers.forEach(am => {
+                        if (am.userName) {
+                            const displayName = am.fullName || am.userName;
+                            amSelector.innerHTML += `<option value="${am.userName}">${displayName}</option>`;
+                        }
+                    });
                 }
-            });
+            } catch (error) {
+                debugLog(`ERROR loading sales people: ${error.message}`, 'error');
+            }
 
             // Load Product Categories
             const pcQuery = `
@@ -1508,7 +1516,7 @@
                     SELECT
                         So.salesman as userName,
                         COALESCE(
-                            CONCAT(SysUser.FirstName, ' ', SysUser.LastName),
+                            CONCAT(SalesUser.FirstName, ' ', SalesUser.LastName),
                             So.salesman
                         ) as fullName,
                         COUNT(DISTINCT So.Id) as order_count,
@@ -1516,7 +1524,7 @@
                     FROM PostSo
                     JOIN So ON So.Id = PostSo.SoId
                     JOIN Customer ON Customer.Id = So.CustomerId
-                    LEFT JOIN SysUser ON SysUser.userName = So.salesman
+                    LEFT JOIN SysUser AS SalesUser ON SalesUser.userName = So.salesman
                     LEFT JOIN AccountGroup ON AccountGroup.Id = (
                         SELECT AccountGroupRelation.GroupId
                         FROM AccountGroupRelation
@@ -1526,14 +1534,17 @@
                     )
                     ${conditions}
                     AND So.salesman IS NOT NULL AND So.salesman != ''
-                    GROUP BY So.salesman, SysUser.FirstName, SysUser.LastName
+                    GROUP BY So.salesman, SalesUser.FirstName, SalesUser.LastName
                     ORDER BY order_count DESC
                     LIMIT 10
                 `;
                 debugLog('Orders per Salesperson query: ' + query, 'info');
                 const result = JSON.parse(runQuery(query));
-                debugLog(`Orders per Salesperson returned ${result.length} rows`, 'info');
-                return result;
+                debugLog(`Orders per Salesperson returned ${result ? result.length : 0} rows`, 'info');
+                if (result && result.length > 0) {
+                    debugLog('First row: ' + JSON.stringify(result[0]), 'info');
+                }
+                return result || [];
             } catch (error) {
                 debugLog(`ERROR in getOrdersPerSalesperson: ${error.message}`, 'error');
                 return [];
@@ -3203,7 +3214,7 @@
             const container = document.getElementById('slowMovingChart');
             container.innerHTML = '';
 
-            if (!data || data.length === 0) {
+            if (!data || !Array.isArray(data) || data.length === 0) {
                 container.innerHTML = '<div class="text-center text-slate-400 py-8">No slow-moving inventory found</div>';
                 return;
             }
@@ -3345,6 +3356,12 @@
                 return;
             }
 
+            // Calculate on-time percentage for each month
+            const dataWithPercent = data.map(d => ({
+                ...d,
+                on_time_percent: d.order_count > 0 ? (d.on_time_count / d.order_count * 100) : 0
+            }));
+
             const width = container.clientWidth;
             const height = 280;
             const margin = { top: 20, right: 20, bottom: 60, left: 60 };
@@ -3354,43 +3371,57 @@
                 .attr('width', width)
                 .attr('height', height);
 
-            const x = d3.scaleBand()
-                .domain(data.map(d => d.month))
+            // X scale - convert to point scale for line chart
+            const x = d3.scalePoint()
+                .domain(dataWithPercent.map(d => d.month))
                 .range([margin.left, width - margin.right])
-                .padding(0.2);
+                .padding(0.5);
 
+            // Y scale - 0 to 100 for percentage
             const y = d3.scaleLinear()
-                .domain([0, d3.max(data, d => d.avg_days_to_complete)])
-                .nice()
+                .domain([0, 100])
                 .range([height - margin.bottom, margin.top]);
 
-            // Bars with color coding (green if < 7 days, yellow if 7-14, red if > 14)
-            svg.selectAll('rect')
-                .data(data)
+            // Line generator
+            const line = d3.line()
+                .x(d => x(d.month))
+                .y(d => y(d.on_time_percent))
+                .curve(d3.curveMonotoneX);
+
+            // Draw line
+            svg.append('path')
+                .datum(dataWithPercent)
+                .attr('fill', 'none')
+                .attr('stroke', '#2d9cdb')
+                .attr('stroke-width', 2)
+                .attr('d', line);
+
+            // Draw dots
+            svg.selectAll('circle')
+                .data(dataWithPercent)
                 .enter()
-                .append('rect')
-                .attr('x', d => x(d.month))
-                .attr('y', d => y(d.avg_days_to_complete))
-                .attr('width', x.bandwidth())
-                .attr('height', d => height - margin.bottom - y(d.avg_days_to_complete))
+                .append('circle')
+                .attr('cx', d => x(d.month))
+                .attr('cy', d => y(d.on_time_percent))
+                .attr('r', 4)
                 .attr('fill', d => {
-                    const days = d.avg_days_to_complete;
-                    if (days < 7) return '#10b981';
-                    if (days < 14) return '#f59e0b';
+                    const percent = d.on_time_percent;
+                    if (percent >= 90) return '#10b981';
+                    if (percent >= 70) return '#f59e0b';
                     return '#ef4444';
                 })
+                .style('cursor', 'pointer')
                 .on('mouseover', function(event, d) {
-                    d3.select(this).style('opacity', 0.7);
-                    const onTimePercent = d.order_count > 0 ? (d.on_time_count / d.order_count * 100).toFixed(1) : 0;
+                    d3.select(this).attr('r', 6);
                     showTooltip(event, `
                         <strong>${moment(d.month).format('MMM YYYY')}</strong><br>
-                        Avg Days: ${parseFloat(d.avg_days_to_complete).toFixed(1)}<br>
-                        Orders: ${d.order_count}<br>
-                        On-Time: ${onTimePercent}% (${d.on_time_count}/${d.order_count})
+                        On-Time: ${d.on_time_percent.toFixed(1)}%<br>
+                        Delivered On-Time: ${d.on_time_count}/${d.order_count}<br>
+                        Avg Days: ${parseFloat(d.avg_days_to_complete).toFixed(1)}
                     `);
                 })
                 .on('mouseout', function() {
-                    d3.select(this).style('opacity', 1);
+                    d3.select(this).attr('r', 4);
                     hideTooltip();
                 });
 
@@ -3408,7 +3439,18 @@
             svg.append('g')
                 .attr('transform', `translate(${margin.left}, 0)`)
                 .attr('class', 'axis')
-                .call(d3.axisLeft(y).tickFormat(d => d + ' days'));
+                .call(d3.axisLeft(y).tickFormat(d => d + '%'));
+
+            // Add reference line at 90%
+            svg.append('line')
+                .attr('x1', margin.left)
+                .attr('x2', width - margin.right)
+                .attr('y1', y(90))
+                .attr('y2', y(90))
+                .attr('stroke', '#10b981')
+                .attr('stroke-width', 1)
+                .attr('stroke-dasharray', '4,4')
+                .attr('opacity', 0.5);
         }
 
         // ============================================
@@ -3587,13 +3629,15 @@
 
                         // Format based on type
                         if (col.type === 'currency') {
-                            value = '$' + parseFloat(value || 0).toLocaleString('en-US', {minimumFractionDigits: 2});
+                            value = '$' + parseFloat(value || 0).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
                         } else if (col.type === 'number') {
                             value = parseFloat(value || 0).toLocaleString('en-US');
                         } else if (col.type === 'percent') {
                             value = (parseFloat(value || 0) * 100).toFixed(1) + '%';
                         } else if (col.type === 'date') {
-                            value = moment(value).format('MMM D, YYYY');
+                            value = moment(value).format('MM/DD/YYYY');
+                        } else if (col.format) {
+                            value = col.format(value);
                         }
 
                         // Color coding for margin
@@ -4348,6 +4392,11 @@
                 `;
 
                 const customers = JSON.parse(runQuery(query));
+
+                if (!customers || !Array.isArray(customers)) {
+                    debugLog('No customer data returned for drill-down', 'warning');
+                    return;
+                }
 
                 // Filter by customer type
                 const filteredData = customers.filter(c => {
