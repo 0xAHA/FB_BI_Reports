@@ -484,7 +484,7 @@
                             <path d="M9 17a2 2 0 11-4 0 2 2 0 014 0zM19 17a2 2 0 11-4 0 2 2 0 014 0z"></path>
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16V6a1 1 0 00-1-1H4a1 1 0 00-1 1v10a1 1 0 001 1h1m8-1a1 1 0 01-1 1H9m4-1V8a1 1 0 011-1h2.586a1 1 0 01.707.293l3.414 3.414a1 1 0 01.293.707V16a1 1 0 01-1 1h-1m-6-1a1 1 0 001 1h1M5 17a2 2 0 104 0m-4 0a2 2 0 114 0m6 0a2 2 0 104 0m-4 0a2 2 0 114 0"></path>
                         </svg>
-                        Avg Days to Ship
+                        DIFOT (Delivery Performance)
                     </h3>
                     <div id="avgDaysMetric" class="text-center">
                         <div class="text-5xl font-bold text-indigo-600 mb-2">-</div>
@@ -1418,47 +1418,56 @@
 
         // Slow-Moving Inventory
         function getSlowMovingInventory() {
-            const conditions = buildFilterConditions();
-            const { start, end } = getDateRange();
-            const daysDiff = moment(end).diff(moment(start), 'days') || 1;
+            try {
+                const conditions = buildFilterConditions();
+                const { start, end } = getDateRange();
+                const daysDiff = moment(end).diff(moment(start), 'days') || 1;
 
-            const query = `
-                SELECT
-                    Product.Num as product_num,
-                    Product.Description as product_name,
-                    COALESCE(SUM(PostSoItem.Qty), 0) as qty_sold,
-                    COALESCE(SUM(PostSoItem.Qty), 0) / ${daysDiff} as daily_velocity,
-                    (
-                        SELECT SUM(PartTracking.Qty)
-                        FROM PartTracking
-                        WHERE PartTracking.PartId = Product.Id
-                    ) as qty_on_hand,
-                    (
-                        SELECT SUM(PartTracking.Qty)
-                        FROM PartTracking
-                        WHERE PartTracking.PartId = Product.Id
-                    ) / NULLIF(COALESCE(SUM(PostSoItem.Qty), 0) / ${daysDiff}, 0) as days_of_supply
-                FROM Product
-                LEFT JOIN PostSoItem ON PostSoItem.ProductId = Product.Id
-                LEFT JOIN SoItem ON SoItem.Id = PostSoItem.SoItemId
-                LEFT JOIN So ON So.Id = SoItem.SoId
-                LEFT JOIN PostSo ON PostSo.SoId = So.Id
-                LEFT JOIN Customer ON Customer.Id = So.CustomerId
-                LEFT JOIN AccountGroup ON AccountGroup.Id = (
-                    SELECT AccountGroupRelation.GroupId
-                    FROM AccountGroupRelation
-                    WHERE AccountGroupRelation.AccountId = Customer.AccountId
-                    ORDER BY AccountGroupRelation.AccountId ASC
-                    LIMIT 1
-                )
-                ${conditions.replace('WHERE', 'WHERE (PostSo.PostDate IS NULL OR (')}${conditions.includes('WHERE') ? '))' : ''}
-                GROUP BY Product.Id, Product.Num, Product.Description
-                HAVING qty_on_hand > 0 AND daily_velocity < 1
-                ORDER BY days_of_supply DESC
-                LIMIT 20
-            `;
-            debugLog('Slow-Moving Inventory query: ' + query, 'info');
-            return JSON.parse(runQuery(query));
+                // Get products with sales data
+                const query = `
+                    SELECT
+                        Product.Num as product_num,
+                        Product.Description as product_name,
+                        COALESCE(SUM(CASE WHEN PostSo.PostDate IS NOT NULL THEN PostSoItem.Qty ELSE 0 END), 0) as qty_sold,
+                        COALESCE(SUM(CASE WHEN PostSo.PostDate IS NOT NULL THEN PostSoItem.Qty ELSE 0 END), 0) / ${daysDiff} as daily_velocity,
+                        (
+                            SELECT SUM(PartTracking.Qty)
+                            FROM PartTracking
+                            WHERE PartTracking.PartId = Product.Id
+                        ) as qty_on_hand,
+                        (
+                            SELECT SUM(PartTracking.Qty)
+                            FROM PartTracking
+                            WHERE PartTracking.PartId = Product.Id
+                        ) / NULLIF(COALESCE(SUM(CASE WHEN PostSo.PostDate IS NOT NULL THEN PostSoItem.Qty ELSE 0 END), 0) / ${daysDiff}, 0) as days_of_supply
+                    FROM Product
+                    LEFT JOIN PostSoItem ON PostSoItem.ProductId = Product.Id
+                    LEFT JOIN SoItem ON SoItem.Id = PostSoItem.SoItemId AND SoItem.typeId NOT IN (30,40)
+                    LEFT JOIN So ON So.Id = SoItem.SoId
+                    LEFT JOIN PostSo ON PostSo.SoId = So.Id AND ${getDateCondition()}
+                    LEFT JOIN Customer ON Customer.Id = So.CustomerId
+                    LEFT JOIN ProductTree ON ProductTree.Id = Product.ProductTreeId
+                    LEFT JOIN AccountGroup ON AccountGroup.Id = (
+                        SELECT AccountGroupRelation.GroupId
+                        FROM AccountGroupRelation
+                        WHERE AccountGroupRelation.AccountId = Customer.AccountId
+                        ORDER BY AccountGroupRelation.AccountId ASC
+                        LIMIT 1
+                    )
+                    WHERE 1=1
+                    GROUP BY Product.Id, Product.Num, Product.Description
+                    HAVING qty_on_hand > 0 AND daily_velocity < 1
+                    ORDER BY days_of_supply DESC
+                    LIMIT 20
+                `;
+                debugLog('Slow-Moving Inventory query: ' + query, 'info');
+                const result = JSON.parse(runQuery(query));
+                debugLog(`Slow-Moving Inventory returned ${result.length} rows`, 'info');
+                return result;
+            } catch (error) {
+                debugLog(`ERROR in getSlowMovingInventory: ${error.message}`, 'error');
+                return [];
+            }
         }
 
         // Product Mix Analysis (Revenue by Category over Time)
@@ -1493,69 +1502,55 @@
 
         // Sales Orders per Salesperson
         function getOrdersPerSalesperson() {
-            const conditions = buildOrderLevelFilterConditions();
-            const query = `
-                SELECT
-                    So.salesman as userName,
-                    COALESCE(
-                        CONCAT(SysUser.FirstName, ' ', SysUser.LastName),
-                        So.salesman
-                    ) as fullName,
-                    COUNT(DISTINCT So.Id) as order_count,
-                    SUM(So.TotalPrice) as total_revenue
-                FROM PostSo
-                JOIN So ON So.Id = PostSo.SoId
-                JOIN Customer ON Customer.Id = So.CustomerId
-                LEFT JOIN SysUser ON SysUser.userName = So.salesman
-                LEFT JOIN AccountGroup ON AccountGroup.Id = (
-                    SELECT AccountGroupRelation.GroupId
-                    FROM AccountGroupRelation
-                    WHERE AccountGroupRelation.AccountId = Customer.AccountId
-                    ORDER BY AccountGroupRelation.AccountId ASC
-                    LIMIT 1
-                )
-                ${conditions}
-                AND So.salesman IS NOT NULL AND So.salesman != ''
-                GROUP BY So.salesman, SysUser.FirstName, SysUser.LastName
-                ORDER BY order_count DESC
-                LIMIT 10
-            `;
-            debugLog('Orders per Salesperson query: ' + query, 'info');
-            return JSON.parse(runQuery(query));
-        }
-
-        // Average Days to Ship
-        function getAvgDaysToShip() {
-            const currentConditions = buildOrderLevelFilterConditions();
-            const currentQuery = `
-                SELECT
-                    AVG(DATEDIFF(Ship.ShipDate, So.DateCreated)) as avg_days
-                FROM PostSo
-                JOIN So ON So.Id = PostSo.SoId
-                JOIN Ship ON Ship.SoId = So.Id
-                JOIN Customer ON Customer.Id = So.CustomerId
-                LEFT JOIN AccountGroup ON AccountGroup.Id = (
-                    SELECT AccountGroupRelation.GroupId
-                    FROM AccountGroupRelation
-                    WHERE AccountGroupRelation.AccountId = Customer.AccountId
-                    ORDER BY AccountGroupRelation.AccountId ASC
-                    LIMIT 1
-                )
-                ${currentConditions}
-                AND Ship.ShipDate IS NOT NULL
-            `;
-
-            const currentData = JSON.parse(runQuery(currentQuery));
-
-            // Get previous period if comparison is enabled
-            if (document.getElementById('comparisonToggle').checked) {
-                const prevConditions = buildOrderLevelFilterConditions(true);
-                const prevQuery = `
+            try {
+                const conditions = buildOrderLevelFilterConditions();
+                const query = `
                     SELECT
-                        AVG(DATEDIFF(Ship.ShipDate, So.DateCreated)) as avg_days
+                        So.salesman as userName,
+                        COALESCE(
+                            CONCAT(SysUser.FirstName, ' ', SysUser.LastName),
+                            So.salesman
+                        ) as fullName,
+                        COUNT(DISTINCT So.Id) as order_count,
+                        SUM(So.TotalPrice) as total_revenue
                     FROM PostSo
                     JOIN So ON So.Id = PostSo.SoId
-                    JOIN Ship ON Ship.SoId = So.Id
+                    JOIN Customer ON Customer.Id = So.CustomerId
+                    LEFT JOIN SysUser ON SysUser.userName = So.salesman
+                    LEFT JOIN AccountGroup ON AccountGroup.Id = (
+                        SELECT AccountGroupRelation.GroupId
+                        FROM AccountGroupRelation
+                        WHERE AccountGroupRelation.AccountId = Customer.AccountId
+                        ORDER BY AccountGroupRelation.AccountId ASC
+                        LIMIT 1
+                    )
+                    ${conditions}
+                    AND So.salesman IS NOT NULL AND So.salesman != ''
+                    GROUP BY So.salesman, SysUser.FirstName, SysUser.LastName
+                    ORDER BY order_count DESC
+                    LIMIT 10
+                `;
+                debugLog('Orders per Salesperson query: ' + query, 'info');
+                const result = JSON.parse(runQuery(query));
+                debugLog(`Orders per Salesperson returned ${result.length} rows`, 'info');
+                return result;
+            } catch (error) {
+                debugLog(`ERROR in getOrdersPerSalesperson: ${error.message}`, 'error');
+                return [];
+            }
+        }
+
+        // DIFOT (Delivery In Full On Time) - Monthly Trend
+        function getAvgDaysToShip() {
+            try {
+                const conditions = buildOrderLevelFilterConditions();
+                const query = `
+                    SELECT
+                        DATE_FORMAT(So.dateIssued, '%Y-%m-01') as month,
+                        AVG(DATEDIFF(So.dateCompleted, So.dateIssued)) as avg_days_to_complete,
+                        COUNT(DISTINCT So.Id) as order_count,
+                        SUM(CASE WHEN So.dateCompleted <= So.dateFirstShip THEN 1 ELSE 0 END) as on_time_count
+                    FROM So
                     JOIN Customer ON Customer.Id = So.CustomerId
                     LEFT JOIN AccountGroup ON AccountGroup.Id = (
                         SELECT AccountGroupRelation.GroupId
@@ -1564,17 +1559,22 @@
                         ORDER BY AccountGroupRelation.AccountId ASC
                         LIMIT 1
                     )
-                    ${prevConditions}
-                    AND Ship.ShipDate IS NOT NULL
+                    JOIN PostSo ON PostSo.SoId = So.Id
+                    WHERE ${getDateCondition()}
+                        AND So.dateIssued IS NOT NULL
+                        AND So.dateCompleted IS NOT NULL
+                        ${conditions.includes('AND') ? conditions.substring(conditions.indexOf('AND')) : ''}
+                    GROUP BY DATE_FORMAT(So.dateIssued, '%Y-%m-01')
+                    ORDER BY month ASC
                 `;
-                const prevData = JSON.parse(runQuery(prevQuery));
-                return {
-                    current: currentData[0],
-                    previous: prevData[0]
-                };
+                debugLog('DIFOT query: ' + query, 'info');
+                const result = JSON.parse(runQuery(query));
+                debugLog(`DIFOT returned ${result.length} rows`, 'info');
+                return result;
+            } catch (error) {
+                debugLog(`ERROR in getAvgDaysToShip: ${error.message}`, 'error');
+                return [];
             }
-
-            return currentData[0];
         }
 
         // ============================================
@@ -2888,11 +2888,16 @@
                 .style('text-anchor', 'end')
                 .style('font-size', '10px');
 
-            // Y Axis
+            // Y Axis with smart formatting
+            const maxValue = d3.max(data, d => d.avg_order_value);
+            const yAxisFormat = maxValue >= 10000
+                ? d => '$' + (d / 1000).toFixed(0) + 'k'
+                : d => '$' + d.toFixed(0);
+
             svg.append('g')
                 .attr('transform', `translate(${margin.left}, 0)`)
                 .attr('class', 'axis')
-                .call(d3.axisLeft(y).tickFormat(d => '$' + (d / 1000).toFixed(0) + 'k'));
+                .call(d3.axisLeft(y).tickFormat(yAxisFormat));
         }
 
         function renderNewVsRepeatChart(data) {
@@ -3332,23 +3337,78 @@
         }
 
         function renderAvgDaysToShip(data) {
-            const hasPrevious = data.current !== undefined;
-            const currentData = hasPrevious ? data.current : data;
-            const avgDays = parseFloat(currentData.avg_days || 0);
+            const container = document.getElementById('avgDaysMetric');
+            container.innerHTML = '';
 
-            document.querySelector('#avgDaysMetric .text-5xl').textContent = avgDays.toFixed(1);
-
-            if (hasPrevious && data.previous) {
-                const prevDays = parseFloat(data.previous.avg_days || 0);
-                const change = ((avgDays - prevDays) / prevDays * 100).toFixed(1);
-                const isImprovement = avgDays < prevDays;
-
-                document.getElementById('avgDaysComparison').classList.remove('hidden');
-                document.getElementById('avgDaysPrevious').textContent = `${prevDays.toFixed(1)} (${isImprovement ? '' : '+'}${change}%)`;
-                document.getElementById('avgDaysPrevious').className = isImprovement ? 'text-green-600' : 'text-red-600';
-            } else {
-                document.getElementById('avgDaysComparison').classList.add('hidden');
+            if (!data || data.length === 0) {
+                container.innerHTML = '<div class="text-center text-slate-400 py-8">No data available</div>';
+                return;
             }
+
+            const width = container.clientWidth;
+            const height = 280;
+            const margin = { top: 20, right: 20, bottom: 60, left: 60 };
+
+            const svg = d3.select(container)
+                .append('svg')
+                .attr('width', width)
+                .attr('height', height);
+
+            const x = d3.scaleBand()
+                .domain(data.map(d => d.month))
+                .range([margin.left, width - margin.right])
+                .padding(0.2);
+
+            const y = d3.scaleLinear()
+                .domain([0, d3.max(data, d => d.avg_days_to_complete)])
+                .nice()
+                .range([height - margin.bottom, margin.top]);
+
+            // Bars with color coding (green if < 7 days, yellow if 7-14, red if > 14)
+            svg.selectAll('rect')
+                .data(data)
+                .enter()
+                .append('rect')
+                .attr('x', d => x(d.month))
+                .attr('y', d => y(d.avg_days_to_complete))
+                .attr('width', x.bandwidth())
+                .attr('height', d => height - margin.bottom - y(d.avg_days_to_complete))
+                .attr('fill', d => {
+                    const days = d.avg_days_to_complete;
+                    if (days < 7) return '#10b981';
+                    if (days < 14) return '#f59e0b';
+                    return '#ef4444';
+                })
+                .on('mouseover', function(event, d) {
+                    d3.select(this).style('opacity', 0.7);
+                    const onTimePercent = d.order_count > 0 ? (d.on_time_count / d.order_count * 100).toFixed(1) : 0;
+                    showTooltip(event, `
+                        <strong>${moment(d.month).format('MMM YYYY')}</strong><br>
+                        Avg Days: ${parseFloat(d.avg_days_to_complete).toFixed(1)}<br>
+                        Orders: ${d.order_count}<br>
+                        On-Time: ${onTimePercent}% (${d.on_time_count}/${d.order_count})
+                    `);
+                })
+                .on('mouseout', function() {
+                    d3.select(this).style('opacity', 1);
+                    hideTooltip();
+                });
+
+            // X Axis
+            svg.append('g')
+                .attr('transform', `translate(0, ${height - margin.bottom})`)
+                .attr('class', 'axis')
+                .call(d3.axisBottom(x).tickFormat(d => moment(d).format('MMM YY')))
+                .selectAll('text')
+                .attr('transform', 'rotate(-45)')
+                .style('text-anchor', 'end')
+                .style('font-size', '10px');
+
+            // Y Axis
+            svg.append('g')
+                .attr('transform', `translate(${margin.left}, 0)`)
+                .attr('class', 'axis')
+                .call(d3.axisLeft(y).tickFormat(d => d + ' days'));
         }
 
         // ============================================
