@@ -221,6 +221,13 @@
                         </div>
                         <input type="checkbox" id="shiftDependentWOsToggle" class="w-5 h-5 flex-shrink-0 text-indigo-600 rounded">
                     </label>
+                    <label class="flex items-center justify-between p-4 bg-slate-50 rounded-xl cursor-pointer hover:bg-slate-100 transition-colors">
+                        <div>
+                            <div class="text-sm font-medium text-slate-700">Skip Weekends When Scheduling</div>
+                            <div class="text-xs text-slate-500 mt-1">When dragging or resizing WOs, automatically skip weekends to land on weekdays</div>
+                        </div>
+                        <input type="checkbox" id="skipWeekendsToggle" class="w-5 h-5 flex-shrink-0 text-indigo-600 rounded">
+                    </label>
                 </div>
 
                 <div class="space-y-4">
@@ -492,6 +499,17 @@
                                 </button>
                             </div>
 
+                            <!-- Status Filter -->
+                            <div class="flex items-center gap-1 bg-slate-50 px-2 py-1.5 rounded-lg border border-slate-200">
+                                <select id="statusFilter" class="bg-transparent border-none text-xs font-semibold text-slate-600 outline-none cursor-pointer">
+                                    <option value="all">All Statuses</option>
+                                    <option value="10">Entered</option>
+                                    <option value="30">Started</option>
+                                    <option value="40">Fulfilled</option>
+                                    <option value="conflict">Conflicts</option>
+                                </select>
+                            </div>
+
                             <!-- Toggle Buttons -->
                             <div class="flex items-center gap-1 bg-slate-50 px-2 py-1.5 rounded-lg border border-slate-200">
                                 <button id="toggleArrowsBtn" onclick="toggleArrows()" class="p-1 hover:bg-white rounded transition-colors" title="Show/Hide Dependency Arrows">
@@ -665,11 +683,13 @@ let ganttEndDate = null; // Will be initialized in DOMContentLoaded
 // Settings
 let allowSameDayStarts = false;
 let shiftDependentWOs = false; // When dragging a WO in gantt view, shift dependent WOs relatively
+let skipWeekends = false; // When dragging/resizing WOs in gantt view, skip weekends to land on weekdays
 let showArrows = true;
 let dateFormat = 'DD/MM/YYYY'; // 'DD/MM/YYYY' or 'MM/DD/YYYY'
 let calendarColorMode = 'status'; // 'status' or 'category'
 let showCompletedWOs = true; // Show completed WOs in capacity planning and calendar views
 let scrollToDateAfterRender = null; // Used to scroll to a specific date after render completes
+let activeStatusFilter = null; // Track current status filter (null, '10', '30', '40', 'conflict')
 
 // Debug Console
 let debugLogInitialized = false;
@@ -1768,6 +1788,34 @@ function sortWOsByDependencies(wos) {
 }
 
 // ============================================
+// SKIP WEEKENDS HELPER
+// ============================================
+function applySkipWeekends(date) {
+    if (!skipWeekends) {
+        return date;
+    }
+
+    const m = moment(date);
+    const dayOfWeek = m.day();
+    const originalDate = m.format('YYYY-MM-DD');
+
+    // If Saturday (6), move to Monday (+2 days)
+    if (dayOfWeek === 6) {
+        const newDate = m.add(2, 'days').toDate();
+        debugLog('info', `Skip weekends: ${originalDate} (Sat) → ${moment(newDate).format('YYYY-MM-DD')} (Mon)`);
+        return newDate;
+    }
+    // If Sunday (0), move to Monday (+1 day)
+    if (dayOfWeek === 0) {
+        const newDate = m.add(1, 'day').toDate();
+        debugLog('info', `Skip weekends: ${originalDate} (Sun) → ${moment(newDate).format('YYYY-MM-DD')} (Mon)`);
+        return newDate;
+    }
+
+    return date;
+}
+
+// ============================================
 // CUSTOM D3 GANTT CHART
 // ============================================
 function renderGanttChart() {
@@ -1776,10 +1824,27 @@ function renderGanttChart() {
     // Clear conflicts
     conflicts.clear();
 
+    // Apply status filter
+    let displayedWorkOrders = filteredWorkOrders;
+    if (activeStatusFilter !== null) {
+        if (activeStatusFilter === 'conflict') {
+            // Show only WOs that are in staging dependencies
+            const conflictWOIds = new Set();
+            stagingDependencies.forEach(dep => {
+                conflictWOIds.add(dep.wo_id);
+                conflictWOIds.add(dep.staging_wo_id);
+            });
+            displayedWorkOrders = filteredWorkOrders.filter(wo => conflictWOIds.has(wo.wo_id));
+        } else {
+            displayedWorkOrders = filteredWorkOrders.filter(wo => wo.wo_status === parseInt(activeStatusFilter));
+        }
+        debugLog('info', `Status filter active: ${activeStatusFilter}, showing ${displayedWorkOrders.length}/${filteredWorkOrders.length} WOs`);
+    }
+
     const svg = d3.select('#ganttSvg');
     svg.selectAll('*').remove();
 
-    if (filteredWorkOrders.length === 0) {
+    if (displayedWorkOrders.length === 0) {
         svg.append('text')
             .attr('x', '50%')
             .attr('y', 100)
@@ -1800,10 +1865,10 @@ function renderGanttChart() {
     let groups = [];
     if (viewMode === 'mo') {
         // Hierarchical view: Each MO gets a header row + WO child rows
-        const moNums = [...new Set(filteredWorkOrders.map(wo => wo.mo_num))].sort((a, b) => a - b);
+        const moNums = [...new Set(displayedWorkOrders.map(wo => wo.mo_num))].sort((a, b) => a - b);
 
         moNums.forEach(moNum => {
-            const moWOs = filteredWorkOrders.filter(wo => wo.mo_num === moNum);
+            const moWOs = displayedWorkOrders.filter(wo => wo.mo_num === moNum);
 
             // Sort WOs by staging dependencies for natural workflow order
             const sortedMoWOs = sortWOsByDependencies(moWOs);
@@ -1838,10 +1903,10 @@ function renderGanttChart() {
         debugLog('info', `MO view: ${moNums.length} MOs, ${groups.filter(g => g.type === 'wo-row').length} WO rows visible`);
     } else {
         // Category view - group by category_name with lane packing for overlapping WOs
-        const catNames = [...new Set(filteredWorkOrders.map(wo => wo.category_name))].sort();
+        const catNames = [...new Set(displayedWorkOrders.map(wo => wo.category_name))].sort();
         groups = catNames.map(cat => {
-            const wo = filteredWorkOrders.find(wo => wo.category_name === cat);
-            const categoryWOs = filteredWorkOrders.filter(wo => wo.category_name === cat);
+            const wo = displayedWorkOrders.find(wo => wo.category_name === cat);
+            const categoryWOs = displayedWorkOrders.filter(wo => wo.category_name === cat);
             const laneCount = packWOsIntoLanes(categoryWOs);
 
             return {
@@ -2449,9 +2514,15 @@ function renderGanttChart() {
                     const newStartDate = xScale.invert(newX);
                     let newStart = moment(newStartDate).startOf('day');
 
+                    // Apply skip weekends if enabled
+                    newStart = moment(applySkipWeekends(newStart.toDate()));
+
                     // Calculate duration and new end date
                     const duration = moment(wo.date_scheduled).diff(moment(wo.date_scheduled_start), 'days');
                     let newEnd = newStart.clone().add(duration, 'days');
+
+                    // Apply skip weekends to end date as well
+                    newEnd = moment(applySkipWeekends(newEnd.toDate()));
 
                     const woNum = d3.select(this).attr('data-wo-num');
                     debugLog('info', `Dropped WO ${woNum}: ${newStart.format('YYYY-MM-DD')} to ${newEnd.format('YYYY-MM-DD')}`);
@@ -2469,8 +2540,12 @@ function renderGanttChart() {
                             for (const relation of dependentRelations) {
                                 const dependentWO = allWorkOrders.find(w => w.wo_id === relation.wo_id);
                                 if (dependentWO) {
-                                    const depStart = moment(dependentWO.date_scheduled_start).add(daysDiff, 'days');
-                                    const depEnd = moment(dependentWO.date_scheduled).add(daysDiff, 'days');
+                                    let depStart = moment(dependentWO.date_scheduled_start).add(daysDiff, 'days');
+                                    let depEnd = moment(dependentWO.date_scheduled).add(daysDiff, 'days');
+
+                                    // Apply skip weekends to dependent WOs as well
+                                    depStart = moment(applySkipWeekends(depStart.toDate()));
+                                    depEnd = moment(applySkipWeekends(depEnd.toDate()));
 
                                     debugLog('info', `Shifting dependent WO ${dependentWO.wo_num} by ${daysDiff} days: ${depStart.format('YYYY-MM-DD')} to ${depEnd.format('YYYY-MM-DD')}`);
                                     await saveWODates(dependentWO.wo_num, depStart.format('YYYY-MM-DD'), depEnd.format('YYYY-MM-DD'));
@@ -3084,6 +3159,7 @@ function gatherSettings() {
         showArrows: showArrows,
         allowSameDayStarts: allowSameDayStarts,
         shiftDependentWOs: shiftDependentWOs,
+        skipWeekends: skipWeekends,
         dateFormat: dateFormat,
         calendarColorMode: calendarColorMode,
         showCompletedWOs: showCompletedWOs,
@@ -3131,6 +3207,12 @@ function applySettings(settings) {
             const shiftDependentWOsCheckbox = document.getElementById('shiftDependentWOsToggle');
             if (shiftDependentWOsCheckbox) shiftDependentWOsCheckbox.checked = shiftDependentWOs;
         }
+        if (typeof settings.skipWeekends === 'boolean') {
+            skipWeekends = settings.skipWeekends;
+            // Update UI checkbox
+            const skipWeekendsCheckbox = document.getElementById('skipWeekendsToggle');
+            if (skipWeekendsCheckbox) skipWeekendsCheckbox.checked = skipWeekends;
+        }
         if (settings.dateFormat && (settings.dateFormat === 'DD/MM/YYYY' || settings.dateFormat === 'MM/DD/YYYY')) {
             dateFormat = settings.dateFormat;
             // Update UI select
@@ -3166,6 +3248,9 @@ function applySettings(settings) {
 
         const shiftDependentWOsCheckbox = document.getElementById('shiftDependentWOsToggle');
         if (shiftDependentWOsCheckbox) shiftDependentWOsCheckbox.checked = shiftDependentWOs;
+
+        const skipWeekendsCheckbox = document.getElementById('skipWeekendsToggle');
+        if (skipWeekendsCheckbox) skipWeekendsCheckbox.checked = skipWeekends;
 
         debugLog('success', `Settings loaded from ${settings.savedAt || 'unknown date'}`);
 
@@ -3387,6 +3472,30 @@ function initializeEventListeners() {
             saveSettingsToDatabase();  // Auto-save when toggled
         });
         debugLog('info', '✓ shiftDependentWOsToggle event listener attached');
+    }
+
+    const skipWeekendsToggle = document.getElementById('skipWeekendsToggle');
+    if (skipWeekendsToggle) {
+        skipWeekendsToggle.addEventListener('change', (e) => {
+            skipWeekends = e.target.checked;
+            saveSettingsToDatabase();  // Auto-save when toggled
+        });
+        debugLog('info', '✓ skipWeekendsToggle event listener attached');
+    }
+
+    const statusFilter = document.getElementById('statusFilter');
+    if (statusFilter) {
+        statusFilter.addEventListener('change', (e) => {
+            const status = e.target.value;
+            if (status === 'all') {
+                activeStatusFilter = null;
+            } else {
+                activeStatusFilter = status;
+            }
+            debugLog('info', `Status filter changed to: ${activeStatusFilter || 'all'}`);
+            renderGanttChart();
+        });
+        debugLog('info', '✓ statusFilter event listener attached');
     }
 
     const showArrowsToggle = document.getElementById('showArrowsToggle');
