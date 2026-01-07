@@ -418,15 +418,251 @@
             loadDashboard();
         });
 
-        // Placeholder functions - will be implemented in next chunks
-        function loadFilters() {
-            console.log('Loading filters...');
-            // TODO: Implement filter loading
+        // ============================================
+        // Date Helper Functions
+        // ============================================
+        function getDateCondition() {
+            if (customStartDate && customEndDate) {
+                return `postpo.postdate BETWEEN '${customStartDate}' AND '${customEndDate}'`;
+            }
+
+            const rangeValue = document.getElementById('dateRangeFilter').value;
+
+            if (rangeValue === 'this_quarter') {
+                const dates = getQuarterDates(0);
+                return `postpo.postdate BETWEEN '${dates.start}' AND '${dates.end}'`;
+            } else if (rangeValue === 'last_quarter') {
+                const dates = getQuarterDates(1);
+                return `postpo.postdate BETWEEN '${dates.start}' AND '${dates.end}'`;
+            } else if (rangeValue === 'current_fy') {
+                const dates = getFYDates(0);
+                return `postpo.postdate BETWEEN '${dates.start}' AND '${dates.end}'`;
+            } else if (rangeValue === 'last_fy') {
+                const dates = getFYDates(1);
+                return `postpo.postdate BETWEEN '${dates.start}' AND '${dates.end}'`;
+            }
+
+            const days = parseInt(rangeValue) || 90;
+            return `postpo.postdate >= DATE_SUB(CURDATE(), INTERVAL ${days} DAY)`;
         }
 
+        function getQuarterDates(quartersAgo) {
+            const now = moment();
+            const quarter = now.quarter() - quartersAgo;
+            const year = now.year() - Math.floor((now.quarter() - quartersAgo - 1) / 4);
+            const targetQuarter = ((quarter - 1 + 4) % 4) + 1;
+
+            const start = moment().year(year).quarter(targetQuarter).startOf('quarter').format('YYYY-MM-DD');
+            const end = moment().year(year).quarter(targetQuarter).endOf('quarter').format('YYYY-MM-DD');
+
+            return { start, end };
+        }
+
+        function getFYDates(yearsAgo) {
+            const fyStartMonth = 6; // July (0-indexed = 6)
+            const now = moment();
+            const currentMonth = now.month();
+
+            let fyYear = now.year() - yearsAgo;
+            if (currentMonth < fyStartMonth) {
+                fyYear -= 1;
+            }
+
+            const start = moment().year(fyYear).month(fyStartMonth).date(1).format('YYYY-MM-DD');
+            const end = moment().year(fyYear + 1).month(fyStartMonth).date(1).subtract(1, 'day').format('YYYY-MM-DD');
+
+            return { start, end };
+        }
+
+        // ============================================
+        // Filter Building Functions
+        // ============================================
+        function buildFilterConditions() {
+            const vendor = document.getElementById('vendorFilter').value;
+            const productCategory = document.getElementById('productCategoryFilter').value;
+            const abcCode = document.getElementById('abcCodeFilter').value;
+            const location = document.getElementById('locationFilter').value;
+
+            let conditions = `WHERE ${getDateCondition()}`;
+
+            if (vendor !== '%') {
+                conditions += ` AND vendor.id = ${parseInt(vendor)}`;
+            }
+            if (productCategory !== '%') {
+                conditions += ` AND ProductTree.Name = '${escapeSQL(productCategory)}'`;
+            }
+            if (abcCode !== '%') {
+                conditions += ` AND part.abcCode = '${escapeSQL(abcCode)}'`;
+            }
+            if (location !== '%') {
+                conditions += ` AND locationgroup.id = ${parseInt(location)}`;
+            }
+
+            return conditions;
+        }
+
+        // ============================================
+        // Filter Loading Functions
+        // ============================================
+        function loadFilters() {
+            debugLog('Loading filter dropdowns...', 'info');
+
+            // Load Vendors
+            const vendorQuery = `
+                SELECT DISTINCT vendor.id, vendor.name
+                FROM po
+                JOIN vendor ON vendor.id = po.vendorid
+                WHERE vendor.activeFlag = 1
+                ORDER BY vendor.name
+            `;
+            try {
+                const vendors = JSON.parse(runQuery(vendorQuery));
+                const vendorSelector = document.getElementById('vendorFilter');
+                vendorSelector.innerHTML = '<option value="%">All Vendors</option>';
+                vendors.forEach(v => {
+                    vendorSelector.innerHTML += `<option value="${v.id}">${v.name}</option>`;
+                });
+                debugLog(`Loaded ${vendors.length} vendors`, 'success');
+            } catch (error) {
+                debugLog('Error loading vendors: ' + error, 'error');
+            }
+
+            // Load Product Categories
+            const categoryQuery = `
+                SELECT DISTINCT ProductTree.Name as name
+                FROM part
+                LEFT JOIN ProductToTree ON ProductToTree.ProductId = part.Id
+                LEFT JOIN ProductTree ON ProductTree.Id = ProductToTree.ProductTreeId
+                WHERE ProductTree.Name IS NOT NULL
+                ORDER BY ProductTree.Name
+            `;
+            try {
+                const categories = JSON.parse(runQuery(categoryQuery));
+                const categorySelector = document.getElementById('productCategoryFilter');
+                categorySelector.innerHTML = '<option value="%">All Categories</option>';
+                categories.forEach(c => {
+                    if (c.name) categorySelector.innerHTML += `<option value="${c.name}">${c.name}</option>`;
+                });
+                debugLog(`Loaded ${categories.length} categories`, 'success');
+            } catch (error) {
+                debugLog('Error loading categories: ' + error, 'error');
+            }
+
+            // Load Location Groups
+            const locationQuery = `
+                SELECT DISTINCT locationgroup.id, locationgroup.name
+                FROM locationgroup
+                WHERE locationgroup.activeFlag = 1
+                ORDER BY locationgroup.name
+            `;
+            try {
+                const locations = JSON.parse(runQuery(locationQuery));
+                const locationSelector = document.getElementById('locationFilter');
+                locationSelector.innerHTML = '<option value="%">All Locations</option>';
+                locations.forEach(l => {
+                    locationSelector.innerHTML += `<option value="${l.id}">${l.name}</option>`;
+                });
+                debugLog(`Loaded ${locations.length} locations`, 'success');
+            } catch (error) {
+                debugLog('Error loading locations: ' + error, 'error');
+            }
+        }
+
+        // ============================================
+        // KPI Metrics Query
+        // ============================================
+        function getKPIMetrics() {
+            const conditions = buildFilterConditions();
+            const query = `
+                SELECT
+                    SUM(postpoitem.postedtotalcost) as total_spend,
+                    COUNT(DISTINCT po.num) as po_count,
+                    AVG(po_totals.po_total) as avg_po_value
+                FROM postpoitem
+                JOIN postpo ON postpoitem.postpoid = postpo.id
+                JOIN poitem ON postpoitem.poitemid = poitem.id
+                LEFT JOIN part ON poitem.partid = part.id
+                LEFT JOIN ProductToTree ON ProductToTree.ProductId = part.Id
+                LEFT JOIN ProductTree ON ProductTree.Id = ProductToTree.ProductTreeId
+                JOIN po ON poitem.poid = po.id
+                JOIN vendor ON po.vendorid = vendor.id
+                JOIN locationgroup ON po.locationgroupid = locationgroup.id
+                LEFT JOIN (
+                    SELECT
+                        po.id as po_id,
+                        SUM(postpoitem.postedtotalcost) as po_total
+                    FROM postpoitem
+                    JOIN postpo ON postpoitem.postpoid = postpo.id
+                    JOIN poitem ON postpoitem.poitemid = poitem.id
+                    JOIN po ON poitem.poid = po.id
+                    GROUP BY po.id
+                ) as po_totals ON po_totals.po_id = po.id
+                ${conditions}
+            `;
+
+            debugLog('KPI Query: ' + query, 'info');
+            return JSON.parse(runQuery(query));
+        }
+
+        // ============================================
+        // Main Dashboard Loading Function
+        // ============================================
         function loadDashboard() {
-            console.log('Loading dashboard...');
-            // TODO: Implement dashboard loading
+            debugLog('Loading dashboard data...', 'info');
+            const loading = document.getElementById('loadingOverlay');
+            loading.style.display = 'flex';
+
+            try {
+                // Load KPIs
+                const kpiData = getKPIMetrics();
+                updateKPIs(kpiData);
+
+                debugLog('Dashboard loaded successfully', 'success');
+            } catch (error) {
+                console.error('Error loading dashboard:', error);
+                alert('Error loading purchasing data. Please check console for details.');
+            } finally {
+                loading.style.display = 'none';
+                updateDateRangeDisplay();
+            }
+        }
+
+        // ============================================
+        // KPI Display Update
+        // ============================================
+        function updateKPIs(data) {
+            if (!data || data.length === 0) return;
+
+            const metrics = data[0];
+            const kpiCardsContainer = document.getElementById('kpiCards');
+
+            const totalSpend = '$' + parseFloat(metrics.total_spend || 0).toLocaleString('en-US', {minimumFractionDigits: 0, maximumFractionDigits: 0});
+            const poCount = (metrics.po_count || 0).toLocaleString();
+            const avgPOValue = '$' + parseFloat(metrics.avg_po_value || 0).toLocaleString('en-US', {minimumFractionDigits: 0, maximumFractionDigits: 0});
+
+            kpiCardsContainer.innerHTML = `
+                <div class="flex items-center gap-2 px-3 py-2 bg-blue-50 border border-blue-200 rounded-lg">
+                    <svg class="w-4 h-4 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                    </svg>
+                    <span class="text-xs font-semibold text-slate-600">Total Spend:</span>
+                    <span class="text-sm font-bold text-slate-900">${totalSpend}</span>
+                </div>
+                <div class="flex items-center gap-2 px-3 py-2 bg-emerald-50 border border-emerald-200 rounded-lg">
+                    <svg class="w-4 h-4 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
+                    </svg>
+                    <span class="text-xs font-semibold text-slate-600">POs Received:</span>
+                    <span class="text-sm font-bold text-slate-900">${poCount}</span>
+                </div>
+                <div class="flex items-center gap-2 px-3 py-2 bg-purple-50 border border-purple-200 rounded-lg">
+                    <svg class="w-4 h-4 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z"></path>
+                    </svg>
+                    <span class="text-xs font-semibold text-slate-600">Avg PO:</span>
+                    <span class="text-sm font-bold text-slate-900">${avgPOValue}</span>
+                </div>
+            `;
         }
 
         function clearAllFilters() {
