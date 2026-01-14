@@ -1035,6 +1035,7 @@ function loadWorkOrders() {
             mo.id AS mo_id,
             mo.statusid AS mo_status,
             mo.datescheduled AS mo_date_scheduled,
+            mo.soid AS so_id,
             part.num AS part_num,
             moitem.description AS description,
             moitem.qtytofulfill AS qty,
@@ -1075,6 +1076,61 @@ function loadWorkOrders() {
         const moResults = JSON.parse(runQuery(moQuery));
         manufacturingOrders = moResults;
         debugLog('success', `Loaded ${manufacturingOrders.length} MO finished goods`);
+
+        // Load SO data (for MOs that have sales orders)
+        const soQuery = `
+            SELECT
+                so.id AS so_id,
+                so.num AS so_num,
+                so.customerid AS customer_id,
+                so.customerpo AS customer_po
+            FROM so
+            WHERE so.id IN (
+                SELECT DISTINCT mo.soid
+                FROM mo
+                WHERE mo.soid IS NOT NULL
+                AND mo.statusid NOT IN (60, 70, 80)
+            )
+        `;
+        const soResults = JSON.parse(runQuery(soQuery));
+        const salesOrders = new Map(soResults.map(so => [so.so_id, so]));
+        debugLog('success', `Loaded ${soResults.length} sales orders`);
+
+        // Load customer data
+        const customerQuery = `
+            SELECT
+                customer.id AS customer_id,
+                customer.name AS customer_name
+            FROM customer
+            WHERE customer.id IN (
+                SELECT DISTINCT so.customerid
+                FROM so
+                WHERE so.id IN (
+                    SELECT DISTINCT mo.soid
+                    FROM mo
+                    WHERE mo.soid IS NOT NULL
+                    AND mo.statusid NOT IN (60, 70, 80)
+                )
+            )
+        `;
+        const customerResults = JSON.parse(runQuery(customerQuery));
+        const customers = new Map(customerResults.map(c => [c.customer_id, c]));
+        debugLog('success', `Loaded ${customerResults.length} customers`);
+
+        // Attach SO and customer data to MOs
+        manufacturingOrders.forEach(mo => {
+            if (mo.so_id) {
+                const so = salesOrders.get(mo.so_id);
+                if (so) {
+                    mo.so_num = so.so_num;
+                    mo.customer_po = so.customer_po || '-';
+                    const customer = customers.get(so.customer_id);
+                    if (customer) {
+                        mo.customer_name = customer.customer_name;
+                    }
+                }
+            }
+        });
 
         // Extract unique MOs and categories
         const uniqueMOs = [...new Set(allWorkOrders.map(wo => wo.mo_num))].sort();
@@ -2262,8 +2318,19 @@ function renderGanttChart() {
                     .style('filter', 'drop-shadow(0 2px 4px rgba(0,0,0,0.1))');
 
                 // Add MO tooltip
+                const moData = manufacturingOrders.find(mo => mo.mo_num === group.moNum);
+                let soInfoHTML = '';
+                if (moData && moData.so_id) {
+                    soInfoHTML = `
+                        <div><span class="wo-tooltip-label">SO:</span><span class="wo-tooltip-value">${moData.so_num || '-'}</span></div>
+                        <div><span class="wo-tooltip-label">Customer:</span><span class="wo-tooltip-value">${moData.customer_name || '-'}</span></div>
+                        <div><span class="wo-tooltip-label">Customer PO:</span><span class="wo-tooltip-value">${moData.customer_po || '-'}</span></div>
+                    `;
+                }
+
                 const moTooltipHTML = `
                     <div><span class="wo-tooltip-label">MO:</span><span class="wo-tooltip-value">${group.moNum}</span></div>
+                    ${soInfoHTML}
                     <div><span class="wo-tooltip-label">BOM:</span><span class="wo-tooltip-value">${bomInfo}</span></div>
                     <div><span class="wo-tooltip-label">Start:</span><span class="wo-tooltip-value">${formatDate(moStart)}</span></div>
                     <div><span class="wo-tooltip-label">Scheduled Finish:</span><span class="wo-tooltip-value">${formatDate(moEnd)}</span></div>
@@ -4364,6 +4431,15 @@ function renderCapacityWOs(category, weekStart, numWeeks = 1) {
 
                     // Only show hours if there's enough space (at least 30px)
                     if (visibleDayWidth >= 30) {
+                        // Determine hours to display (0 for weekends if skip weekends is enabled)
+                        let displayHours = hoursPerDay;
+                        if (skipWeekends) {
+                            const dayOfWeek = currentDay.day();
+                            if (dayOfWeek === 0 || dayOfWeek === 6) {
+                                displayHours = 0;
+                            }
+                        }
+
                         // Center the hours text within the visible portion
                         svg.append('text')
                             .attr('x', visibleDayStart + visibleDayWidth / 2)
@@ -4372,7 +4448,7 @@ function renderCapacityWOs(category, weekStart, numWeeks = 1) {
                             .attr('fill', '#64748b')
                             .attr('text-anchor', 'middle')
                             .attr('pointer-events', 'none')
-                            .text(`${hoursPerDay.toFixed(2)}h`);
+                            .text(`${displayHours.toFixed(2)}h`);
                     }
                 }
             }
