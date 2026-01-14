@@ -4,6 +4,51 @@
 
 This collection of BI reports provides real-time visibility into Fishbowl operations through interactive HTML dashboards. Each report runs in JxBrowser and queries the Fishbowl database directly to display current status of orders, work orders, and inventory movements.
 
+## Installation
+
+### Prerequisites
+
+Before installing the dashboard reports, create the following properties in **Setup > Property** and set their values to `false`:
+
+| Property Name | Default Value | Purpose |
+|---------------|---------------|---------|
+| `BI_SHOW_DEBUG` | `false` | Enable/disable debug console for troubleshooting |
+| `BI_SO_SHOW_ESTIMATE` | `false` | Show/hide estimate-related sales order data |
+| `BI_PO_SHOW_BID_REQUEST` | `false` | Show/hide bid request purchase orders |
+
+### Installation Steps
+
+1. **Save Report Files**
+   - Save all `.json` report files to a local folder on your computer
+
+2. **Import Reports**
+   - Open Fishbowl and navigate to **BI Editor**
+   - Click the **Import** button
+   - Select **ALL** `.json` files at once:
+     - `Open Work Orders-Page.json`
+     - `Open Transfer Orders-Page.json`
+     - `Open Sales Orders-Page.json`
+     - `Open RMA Orders-Page.json`
+     - `Open Purchase Orders-Page.json`
+     - `Items to be Shipped-Page.json`
+     - `Items to be Received-Page.json`
+     - `Items to be Picked-Page.json`
+
+3. **Publish Reports**
+   - Ensure the **Publish** checkbox is ticked
+   - Select appropriate access rights for your user groups (View, Edit Settings)
+   - Click **OK** to complete the import
+
+4. **Enable Dashboard Gadgets**
+   - Open each imported report in the BI Report window
+   - Go to the **Details** tab
+   - Check the **Dashboard Gadget** option
+   - Click **Save**
+
+5. **Access Reports**
+   - All reports will now be available as Dashboard Gadgets in the BI Report list
+   - Add them to your Fishbowl dashboard for quick access
+
 ## Available Reports
 
 ### Order Management
@@ -58,8 +103,7 @@ Hover over indicators to see detailed counts of full/partial/none items.
 
 #### Reordering
 - Drag column headers to reorder columns
-- Column order is saved to browser localStorage
-- Persists between sessions
+- **Note**: Column order cannot be saved in Fishbowl and will revert to default layout when the report is reloaded
 
 #### Responsive Widths
 - Tables use dynamic column sizing to prevent horizontal scrollbars
@@ -158,6 +202,27 @@ Reports automatically filter to show only records for location groups assigned t
 ### Custom Date Formats
 Reports respect Fishbowl's DateFormatShort setting from custom fields. Default is dd/MM/yyyy if not specified.
 
+## Known Limitations
+
+### Column Order Persistence
+- Column reordering via drag-and-drop is functional during a session
+- However, column order cannot be saved in Fishbowl's JxBrowser environment (localStorage not supported)
+- Columns will reset to their default order when the report is refreshed or reopened
+
+### Clickable Links
+- **Pick and Receive links do not work** - This is a Fishbowl limitation/bug
+- The following clickable links work correctly:
+  - Sales Order numbers → Opens Sales Order module
+  - Purchase Order numbers → Opens Purchase Order module
+  - Work Order numbers → Opens Work Order module
+  - Transfer Order numbers → Opens Transfer Order module
+  - RMA numbers → Opens RMA module
+
+### Multi-Location Access
+- Reports only display records for location groups assigned to the current user
+- Users without location group assignments may see no data
+- This is enforced via the UserToLG table relationship
+
 ## Technical Details
 
 ### Data Source
@@ -168,7 +233,7 @@ Reports respect Fishbowl's DateFormatShort setting from custom fields. Default i
 ### Browser Compatibility
 - Designed for JxBrowser within Fishbowl
 - Uses modern CSS (flexbox, grid) and JavaScript (ES6)
-- Requires browser localStorage for column order persistence
+- Note: Browser localStorage is not available in Fishbowl's JxBrowser implementation
 
 ### Performance
 - Complex SQL queries with joins and subqueries
@@ -176,9 +241,21 @@ Reports respect Fishbowl's DateFormatShort setting from custom fields. Default i
 - Schedule status calculated client-side in JavaScript
 
 ### Customization
-Custom Fishbowl fields referenced:
-- `DateFormatShort` - Date display format
-- `BI_SHOW_DEBUG` - Enable debug console
+
+#### Custom Fishbowl Properties
+Reports reference the following custom properties from **Setup > Property**:
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DateFormatShort` | String | `dd/MM/yyyy` | Date display format used throughout reports |
+| `BI_SHOW_DEBUG` | Boolean | `false` | Enable debug console showing SQL queries, counts, and errors |
+| `BI_SO_SHOW_ESTIMATE` | Boolean | `false` | Show/hide estimate-related data in Sales Orders report |
+| `BI_PO_SHOW_BID_REQUEST` | Boolean | `false` | Show/hide bid request orders in Purchase Orders report |
+
+#### Report File Format
+- Reports are distributed as `.json` files for import into Fishbowl BI Editor
+- Each JSON file contains the HTML/CSS/JavaScript code for the dashboard
+- Files are generated from source `.htm` files via an external conversion process
 
 ## Support
 
