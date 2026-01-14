@@ -69,20 +69,20 @@ Before installing the dashboard reports, create the following properties in **Se
 
 All reports display schedule status using color-coded clock icons:
 
-- **🔴 Red** - Past due (scheduled date has passed)
-- **🟠 Orange** - Due today (scheduled for current date)
-- **🔵 Blue** - Due this week (scheduled within current calendar week)
+- <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> **Red Clock** - Past due (scheduled date has passed)
+- <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> **Orange Clock** - Due today (scheduled for current date)
+- <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#2d9cdb" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> **Blue Clock** - Due this week (scheduled within current calendar week)
 - **No indicator** - Future date beyond current week
 
 ### Availability Status Indicators
 
 Reports with inventory items (Picks, RMAs) show availability:
 
-- **🟢 Green Circle** - All items fully available
-- **🟠 Orange Circle** - Partial availability (mixed stock levels)
-- **🔴 Red Circle** - No items available
-- **🔒 Padlock** - All items committed
-- **⚪ Gray Circle** - No pending items
+- <svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="#10b981" stroke="#059669" stroke-width="2"/></svg> **Green Circle** - All items fully available
+- <svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="#fff3cd" stroke="#b8860b" stroke-width="2"/></svg> **Orange Circle** - Partial availability (mixed stock levels)
+- <svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="#ef4444" stroke="#dc2626" stroke-width="2"/></svg> **Red Circle** - No items available
+- <svg width="16" height="16" viewBox="0 0 16 16" fill="#f59e0b"><path fill-rule="evenodd" d="M5 6.5V4.5a3 3 0 1 1 6 0V6.5h1.5V4.5a4.5 4.5 0 0 0-9 0V6.5H5zM2.5 8A1.5 1.5 0 0 1 4 6.5h8A1.5 1.5 0 0 1 13.5 8v5.5a1.5 1.5 0 0 1-1.5 1.5H4a1.5 1.5 0 0 1-1.5-1.5V8zm10 0a.5.5 0 0 0-.5-.5H4a.5.5 0 0 0-.5.5v5.5a.5.5 0 0 0 .5.5h8a.5.5 0 0 0 .5-.5V8z"/></svg> **Padlock** - All items committed
+- <svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="#9ca3af" stroke="#6b7280" stroke-width="2"/></svg> **Gray Circle** - No pending items
 
 Hover over indicators to see detailed counts of full/partial/none items.
 
