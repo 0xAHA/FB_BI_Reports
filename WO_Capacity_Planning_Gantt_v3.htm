@@ -1,4 +1,9 @@
 <!DOCTYPE html>
+<!--
+    Commit: 98ef2b9
+    Updated: 2026-01-16 16:00:00 AEDT (UTC+10)
+    Changes: Added Customer PO to MO tooltips, View by WO#/BOM# dropdown for calendar/capacity tiles
+-->
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -598,6 +603,12 @@
                                         <option value="category">Color by Category</option>
                                     </select>
                                 </div>
+                                <div class="ml-2 border-l border-slate-300 pl-2">
+                                    <select id="viewByModeSelect" onchange="toggleViewByMode()" class="px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                                        <option value="wo_num">View by WO#</option>
+                                        <option value="bom_num">View by BOM#</option>
+                                    </select>
+                                </div>
                             </div>
                         </div>
                         <div id="monthCalendar" class="relative" style="min-height: 400px; margin-left: 82px;">
@@ -644,7 +655,7 @@
                 </div>
 
                 <!-- Debug Console -->
-                <div class="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+                <div id="debugConsoleContainer" class="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden" style="display: none;">
                     <button onclick="toggleDebugConsole()" class="w-full px-6 py-3 flex items-center justify-between hover:bg-slate-50 transition-colors">
                         <div class="flex items-center gap-2">
                             <svg class="w-4 h-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -653,12 +664,12 @@
                             <span class="text-sm font-semibold text-slate-700">Debug Console</span>
                             <span class="text-xs text-slate-400 font-normal">Auto-scrolls to latest entry</span>
                         </div>
-                        <svg id="debugChevron" class="w-5 h-5 text-slate-400 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <svg id="debugChevron" class="w-5 h-5 text-slate-400 transition-transform rotate-180" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
                         </svg>
                     </button>
 
-                    <div id="debugContent" class="hidden border-t border-slate-200">
+                    <div id="debugContent" class="border-t border-slate-200">
                         <div class="bg-slate-900 px-4 py-2 flex items-center justify-between">
                             <span class="text-xs text-slate-400 font-mono">Fishbowl Connection Diagnostics</span>
                             <button onclick="clearDebugLog()" class="text-xs text-slate-400 hover:text-white transition-colors">
@@ -675,6 +686,13 @@
     </div>
 
 <script>
+// ============================================
+// DEBUG MODE CONFIGURATION
+// ============================================
+// Check if debug mode should be enabled via Fishbowl property
+const BI_SHOW_DEBUG_PROP = typeof getProperty === 'function' ? getProperty('BI_SHOW_DEBUG', 'false') : 'false';
+const DEBUG_MODE = BI_SHOW_DEBUG_PROP === 'true' || BI_SHOW_DEBUG_PROP === true;
+
 // ============================================
 // GLOBAL VARIABLES
 // ============================================
@@ -707,6 +725,7 @@ let skipWeekends = false; // When dragging/resizing WOs in gantt view, skip week
 let showArrows = true;
 let dateFormat = 'DD/MM/YYYY'; // 'DD/MM/YYYY' or 'MM/DD/YYYY'
 let calendarColorMode = 'status'; // 'status' or 'category'
+let viewByMode = 'wo_num'; // 'wo_num' or 'bom_num' - controls label display in calendar and capacity tiles
 let showCompletedWOs = true; // Show completed WOs in capacity planning and calendar views
 let scrollToDateAfterRender = null; // Used to scroll to a specific date after render completes
 let activeStatusFilters = new Set(['10', '30', '40', 'conflict']); // Track current status filters (multi-select)
@@ -772,6 +791,9 @@ function formatDate(momentObj, includeTime = false) {
 }
 
 function debugLog(type, message, ...args) {
+    // Only log if DEBUG_MODE is enabled
+    if (!DEBUG_MODE) return;
+
     const timestamp = moment().format('HH:mm:ss.SSS');
     const prefix = `[${timestamp}] [${type.toUpperCase()}]`;
     console.log(prefix, message, ...args);
@@ -952,6 +974,7 @@ function loadWorkOrders() {
             COALESCE(calcat.id, 0) AS calcategory_id,
             wo.qtyTarget AS qty_target,
             COALESCE(bom.estimatedDuration, 0) AS bom_duration_minutes,
+            bom.num AS bom_num,
             (SELECT part.num FROM woitem
              LEFT JOIN part ON woitem.partid = part.id
              WHERE woitem.woid = wo.id AND woitem.typeid = 10
@@ -1038,11 +1061,17 @@ function loadWorkOrders() {
             part.num AS part_num,
             moitem.description AS description,
             moitem.qtytofulfill AS qty,
-            bom.num AS bom_num
+            bom.num AS bom_num,
+            so.num AS so_num,
+            so.customerpo AS customer_po,
+            customer.name AS customer_name
         FROM mo
         LEFT JOIN moitem ON moitem.moid = mo.id
         LEFT JOIN part ON moitem.partid = part.id
         LEFT JOIN bom ON moitem.bomid = bom.id
+        LEFT JOIN soitem ON moitem.soitemid = soitem.id
+        LEFT JOIN so ON soitem.soid = so.id
+        LEFT JOIN customer ON so.customerid = customer.id
         WHERE moitem.typeid = 50
             AND moitem.parentid IS NULL
             AND mo.statusid NOT IN (60, 70, 80)
@@ -1462,6 +1491,7 @@ function updateKPIs() {
     let dependencyConflicts = 0;
     let stagingConflicts = 0;
     let sameDayConflicts = 0;
+    const stagingIssueMOs = new Map(); // Track conflict count per MO number
 
     debugLog('info', `Checking ${stagingDependencies.length} staging dependencies, allowSameDayStarts=${allowSameDayStarts}`);
 
@@ -1487,6 +1517,9 @@ function updateKPIs() {
             if (isConflict) {
                 stagingConflicts++;
                 dependencyConflicts++;
+                // Count conflicts per MO
+                const moNum = dependentWO.mo_num;
+                stagingIssueMOs.set(moNum, (stagingIssueMOs.get(moNum) || 0) + 1);
                 debugLog('warn', `Staging dependency conflict: ${stagingWO.wo_num} ends ${stagingEnd.format('YYYY-MM-DD')} vs ${dependentWO.wo_num} starts ${dependentStart.format('YYYY-MM-DD')}`);
             }
         }
@@ -1508,6 +1541,8 @@ function updateKPIs() {
                     if (startDates[startDate]) {
                         sameDayConflicts++;
                         dependencyConflicts++;
+                        const moNum = wo.mo_num;
+                        stagingIssueMOs.set(moNum, (stagingIssueMOs.get(moNum) || 0) + 1);
                         debugLog('warn', `Same-day start conflict in MO: ${wo.wo_num} starts ${startDate}`);
                     } else {
                         startDates[startDate] = true;
@@ -1524,6 +1559,7 @@ function updateKPIs() {
     const daysToCheck = 90;
     const today = moment();
     const categoryDaysWithIssues = new Set();
+    const capacityIssueDetails = []; // Track category-date pairs with usage/capacity for tooltip
 
     debugLog('info', `Checking capacity for ${capacitySettings.categories.length} categories over ${daysToCheck} days`);
 
@@ -1548,6 +1584,13 @@ function updateKPIs() {
                     if (!categoryDaysWithIssues.has(issueKey)) {
                         categoryDaysWithIssues.add(issueKey);
                         capacityIssues++;
+                        // Track details for tooltip
+                        capacityIssueDetails.push({
+                            category: cat.name,
+                            date: checkDay.format('YYYY-MM-DD'),
+                            usage: usage,
+                            capacity: capacity
+                        });
                         debugLog('warn', `Capacity issue on ${checkDay.format('YYYY-MM-DD')}: ${cat.name} has ${usage.toFixed(2)}hrs usage but only ${capacity}hrs capacity`);
                     }
                 }
@@ -1602,13 +1645,34 @@ function updateKPIs() {
             title: 'Staging Issues',
             value: dependencyConflicts,
             color: 'rose',
-            icon: `<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>`
+            icon: `<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>`,
+            tooltipHTML: stagingIssueMOs.size > 0
+                ? '<div style="font-weight: 600; margin-bottom: 0.5rem;">MO Numbers with Conflicts:</div>' +
+                  '<div style="color: #ffffff;">' +
+                  Array.from(stagingIssueMOs.keys())
+                      .sort((a, b) => a - b)
+                      .map(moNum => `MO ${moNum}`)
+                      .join(', ') +
+                  '</div>'
+                : null
         },
         {
             title: 'Capacity Issues',
             value: capacityIssues,
             color: 'amber', // Changed from orange to amber to avoid confusion with Started WOs
-            icon: `<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 17h8m0 0V9m0 8l-8-8-4 4-6-6"></path>`
+            icon: `<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 17h8m0 0V9m0 8l-8-8-4 4-6-6"></path>`,
+            tooltipHTML: capacityIssueDetails.length > 0
+                ? '<div style="font-weight: 600; margin-bottom: 0.5rem;">Capacity Overages:</div>' +
+                  capacityIssueDetails
+                    .sort((a, b) => a.date.localeCompare(b.date) || a.category.localeCompare(b.category))
+                    .map(issue => {
+                        const dateStr = moment(issue.date).format('MMM DD');
+                        const usageStr = issue.usage ? `${issue.usage.toFixed(1)}h` : 'N/A';
+                        const capacityStr = issue.capacity ? `${issue.capacity}h` : 'N/A';
+                        return `<div><span class="wo-tooltip-label">${dateStr} - ${issue.category}:</span><span class="wo-tooltip-value">${usageStr}/${capacityStr}</span></div>`;
+                    })
+                    .join('')
+                : null
         }
     ];
 
@@ -1622,7 +1686,7 @@ function updateKPIs() {
     };
 
     container.innerHTML = kpis.map(kpi => `
-        <div class="bg-white rounded-md px-2 py-1.5 shadow-sm border border-slate-300 flex flex-col gap-1 flex-1 min-w-0">
+        <div class="kpi-tile bg-white rounded-md px-2 py-1.5 shadow-sm border border-slate-300 flex flex-col gap-1 flex-1 min-w-0">
             <p class="text-slate-600 text-[10px] font-bold uppercase tracking-wide truncate">${kpi.title}</p>
             <div class="flex items-center gap-1.5">
                 <div class="${colorClasses[kpi.color]} p-1 rounded flex-shrink-0">
@@ -1634,6 +1698,19 @@ function updateKPIs() {
             </div>
         </div>
     `).join('');
+
+    // Add event handlers for tooltips
+    kpis.forEach((kpi, index) => {
+        if (kpi.tooltipHTML) {
+            const tile = container.querySelectorAll('.kpi-tile')[index];
+            if (tile) {
+                tile.style.cursor = 'pointer';
+                tile.addEventListener('mouseover', (e) => showWOTooltip(e, kpi.tooltipHTML));
+                tile.addEventListener('mouseout', () => hideWOTooltip());
+                tile.addEventListener('mousemove', (e) => showWOTooltip(e, kpi.tooltipHTML));
+            }
+        }
+    });
 }
 
 // ============================================
@@ -1904,7 +1981,7 @@ function renderGanttChart() {
     const dayWidth = ganttScale;
     const days = moment(ganttEndDate).diff(ganttStartDate, 'days') + 1;
     const width = days * dayWidth + margin.left + margin.right;
-    const rowHeight = 50; // Consistent height for all views
+    const rowHeight = 25; // Reduced to minimize space around 20px tiles
 
     // Build groups based on view mode
     let groups = [];
@@ -2137,8 +2214,36 @@ function renderGanttChart() {
                     color: #1e293b;
                     cursor: ${isMOHeader ? 'pointer' : 'default'};
                     pointer-events: ${isMOHeader ? 'auto' : 'none'};
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    white-space: nowrap;
                 `;
                 labelDiv.textContent = labelText;
+
+                // Add tooltip for MO headers with detailed info
+                if (isMOHeader) {
+                    const moData = manufacturingOrders.find(mo => mo.mo_num === group.moNum);
+                    if (moData) {
+                        const moScheduledDate = moData.mo_date_scheduled ? formatDate(moment(moData.mo_date_scheduled)) : 'N/A';
+                        const bomInfo = moData.part_num ? `${moData.part_num} x ${moData.qty || '?'}` : 'N/A';
+                        let tooltipText = `MO ${group.moNum}\nBOM: ${bomInfo}`;
+                        if (moData.so_num && moData.so_num.trim() !== '') {
+                            tooltipText += `\nSO: ${moData.so_num}`;
+                        }
+                        if (moData.customer_name && moData.customer_name.trim() !== '') {
+                            tooltipText += `\nCustomer: ${moData.customer_name}`;
+                        }
+                        if (moData.customer_po && moData.customer_po.trim() !== '') {
+                            tooltipText += `\nCustomer PO: ${moData.customer_po}`;
+                        }
+                        tooltipText += `\nScheduled: ${moScheduledDate}\nWO Count: ${group.wos.length}`;
+                        labelDiv.title = tooltipText;
+                    } else {
+                        labelDiv.title = labelText;
+                    }
+                } else {
+                    labelDiv.title = labelText;
+                }
 
                 // Add click handlers for MO headers
                 if (isMOHeader) {
@@ -2243,8 +2348,8 @@ function renderGanttChart() {
                 const groupY = yScale(group.id);
                 const rowHeight = yScale.bandwidth();
 
-                // Match WO tile sizing - 35px bar height
-                const moHeight = 35;
+                // Match calendar tile sizing - 20px bar height
+                const moHeight = 20;
                 const moY = groupY + (rowHeight - moHeight) / 2; // Center vertically in row
 
                 // MO header bar - orange/amber for MOs, red if conflict
@@ -2262,14 +2367,23 @@ function renderGanttChart() {
                     .style('filter', 'drop-shadow(0 2px 4px rgba(0,0,0,0.1))');
 
                 // Add MO tooltip
-                const moTooltipHTML = `
-                    <div><span class="wo-tooltip-label">MO:</span><span class="wo-tooltip-value">${group.moNum}</span></div>
-                    <div><span class="wo-tooltip-label">BOM:</span><span class="wo-tooltip-value">${bomInfo}</span></div>
-                    <div><span class="wo-tooltip-label">Start:</span><span class="wo-tooltip-value">${formatDate(moStart)}</span></div>
-                    <div><span class="wo-tooltip-label">Scheduled Finish:</span><span class="wo-tooltip-value">${formatDate(moEnd)}</span></div>
-                    <div><span class="wo-tooltip-label">WO Count:</span><span class="wo-tooltip-value">${group.wos.length}</span></div>
-                    ${hasConflict ? '<div><span class="wo-tooltip-label">Status:</span><span class="wo-tooltip-value" style="color: #ef4444;">⚠ Conflict - WOs exceed MO date</span></div>' : ''}
-                `;
+                let moTooltipHTML = '<div><span class="wo-tooltip-label">MO:</span><span class="wo-tooltip-value">' + group.moNum + '</span></div>';
+                moTooltipHTML += '<div><span class="wo-tooltip-label">BOM:</span><span class="wo-tooltip-value">' + bomInfo + '</span></div>';
+                if (moData && moData.so_num && moData.so_num.trim() !== '') {
+                    moTooltipHTML += '<div><span class="wo-tooltip-label">SO:</span><span class="wo-tooltip-value">' + moData.so_num + '</span></div>';
+                }
+                if (moData && moData.customer_name && moData.customer_name.trim() !== '') {
+                    moTooltipHTML += '<div><span class="wo-tooltip-label">Customer:</span><span class="wo-tooltip-value">' + moData.customer_name + '</span></div>';
+                }
+                if (moData && moData.customer_po && moData.customer_po.trim() !== '') {
+                    moTooltipHTML += '<div><span class="wo-tooltip-label">Customer PO:</span><span class="wo-tooltip-value">' + moData.customer_po + '</span></div>';
+                }
+                moTooltipHTML += '<div><span class="wo-tooltip-label">Start:</span><span class="wo-tooltip-value">' + formatDate(moStart) + '</span></div>';
+                moTooltipHTML += '<div><span class="wo-tooltip-label">Scheduled Finish:</span><span class="wo-tooltip-value">' + formatDate(moEnd) + '</span></div>';
+                moTooltipHTML += '<div><span class="wo-tooltip-label">WO Count:</span><span class="wo-tooltip-value">' + group.wos.length + '</span></div>';
+                if (hasConflict) {
+                    moTooltipHTML += '<div><span class="wo-tooltip-label">Status:</span><span class="wo-tooltip-value" style="color: #ef4444;">⚠ Conflict - WOs exceed MO date</span></div>';
+                }
 
                 moBar.on('mouseover', function(event) {
                     showWOTooltip(event, moTooltipHTML);
@@ -2279,29 +2393,16 @@ function renderGanttChart() {
                     showWOTooltip(event, moTooltipHTML);
                 });
 
-                // MO label - two line format matching capacity planning
-                const moLabel = svg.append('text')
+                // MO label - single line format: "MO 5 - FG2100 x 3"
+                const moLabelText = `MO ${group.moNum} - ${bomInfo}${hasConflict ? ' ⚠' : ''}`;
+                svg.append('text')
                     .attr('x', moX + 10)
-                    .attr('y', moY + moHeight / 2)
-                    .attr('font-size', '12px')  // Slightly larger for gantt view
+                    .attr('y', moY + moHeight / 2 + 4)  // Vertically center
+                    .attr('font-size', '11px')
                     .attr('font-weight', '600')
-                    .attr('fill', '#1e293b')  // Consistent slate-800
-                    .attr('pointer-events', 'none');
-
-                // First line: MO number
-                moLabel.append('tspan')
-                    .attr('x', moX + 10)
-                    .attr('dy', '-0.2em')  // Reduced offset for top padding
-                    .text(`MO ${group.moNum}${hasConflict ? ' ⚠' : ''}`);
-
-                // Second line: BOM info
-                moLabel.append('tspan')
-                    .attr('x', moX + 10)
-                    .attr('dy', '1.2em')
-                    .attr('font-size', '10px')  // Slightly larger for gantt view
-                    .attr('font-weight', '400')
-                    .attr('fill', '#64748b')  // Consistent slate-500
-                    .text(bomInfo);
+                    .attr('fill', '#1e293b')
+                    .attr('pointer-events', 'none')
+                    .text(moLabelText);
             }
         });
     }
@@ -2437,12 +2538,12 @@ function renderGanttChart() {
                 const groupY = yScale(group.id);
                 const laneHeight = 40; // Match capacity planning lane spacing
                 y = groupY + (wo._lane * laneHeight) + 2.5; // 2.5px padding for centering
-                barHeight = 35; // Match capacity planning bar height
+                barHeight = 20; // Match calendar tile height
             } else {
-                // MO view: center 35px bar within 50px row
+                // MO view: center 20px bar within row
                 const groupY = yScale(group.id);
                 const rowHeight = yScale.bandwidth(group.id);
-                barHeight = 35; // Match capacity planning bar height
+                barHeight = 20; // Match calendar tile height
                 y = groupY + (rowHeight - barHeight) / 2; // Center vertically in row
             }
 
@@ -2489,18 +2590,20 @@ function renderGanttChart() {
             // Add arrow highlighting on hover
             bar.on('mouseenter', function() {
                 const woId = wo.wo_id;
-                // Find and highlight all arrows originating from this WO
+                // Find and highlight all arrows connected to this WO (source or target)
                 svg.selectAll('.dependency-arrow')
                     .filter(function() {
-                        return parseInt(d3.select(this).attr('data-source-wo-id')) === woId;
+                        const sourceId = parseInt(d3.select(this).attr('data-source-wo-id'));
+                        const targetId = parseInt(d3.select(this).attr('data-target-wo-id'));
+                        return sourceId === woId || targetId === woId;
                     })
-                    .attr('stroke-width', 3)
-                    .attr('opacity', 1);
+                    .attr('stroke-width', 2.5)
+                    .attr('opacity', 0.9);
             }).on('mouseleave', function() {
-                // Reset all arrows to normal state
+                // Reset all arrows to light state
                 svg.selectAll('.dependency-arrow')
-                    .attr('stroke-width', 2)
-                    .attr('opacity', 0.7);
+                    .attr('stroke-width', 1.5)
+                    .attr('opacity', 0.25);
             });
 
             // Add drag behavior
@@ -2527,10 +2630,9 @@ function renderGanttChart() {
                         const newX = Math.max(margin.left, event.x);
                         d3.select(this).attr('x', newX);
 
-                        // Update label position (both parent text and tspan children)
+                        // Update label position
                         const labelElement = d3.select(this.nextSibling);
                         labelElement.attr('x', newX + 8);
-                        labelElement.selectAll('tspan').attr('x', newX + 8);
                     }
                 })
                 .on('end', async function(event) {
@@ -2543,7 +2645,6 @@ function renderGanttChart() {
                         d3.select(this).attr('x', x);
                         const labelElement = d3.select(this.nextSibling);
                         labelElement.attr('x', x + 8);
-                        labelElement.selectAll('tspan').attr('x', x + 8);
                         return;
                     }
 
@@ -2619,31 +2720,16 @@ function renderGanttChart() {
                 }
             });
 
-            // Label - two line format matching capacity planning
-            // Line 1: WO number
-            // Line 2: BOM info (no brackets)
+            // Label - single line format: "WO 5:001 - FG2100 x 3"
+            const labelText = `WO ${wo.wo_num} - ${bomInfo}`;
             const label = svg.append('text')
                 .attr('x', x + 8)
-                .attr('y', y + barHeight / 2)
-                .attr('font-size', '12px')  // Slightly larger for gantt view
+                .attr('y', y + barHeight / 2 + 4)  // Vertically center
+                .attr('font-size', '11px')
                 .attr('font-weight', '600')
-                .attr('fill', '#1e293b')  // Consistent slate-800 for all tiles
-                .attr('pointer-events', 'none');
-
-            // First line: WO number
-            label.append('tspan')
-                .attr('x', x + 8)
-                .attr('dy', '-0.2em')  // Reduced offset for top padding
-                .text(`WO ${wo.wo_num}`);
-
-            // Second line: BOM info
-            label.append('tspan')
-                .attr('x', x + 8)
-                .attr('dy', '1.2em')
-                .attr('font-size', '10px')  // Slightly larger for gantt view
-                .attr('font-weight', '400')
-                .attr('fill', '#64748b')  // Consistent slate-500 for all tiles
-                .text(bomInfo);
+                .attr('fill', '#1e293b')
+                .attr('pointer-events', 'none')
+                .text(labelText);
 
             // Left resize handle
             const handleWidth = 8;
@@ -2667,7 +2753,6 @@ function renderGanttChart() {
                     bar.attr('x', newX).attr('width', newWidth);
                     d3.select(this).attr('x', newX);
                     label.attr('x', newX + 8);
-                    label.selectAll('tspan').attr('x', newX + 8);
                 })
                 .on('end', async function(event) {
                     d3.select(this).style('fill', 'transparent');
@@ -2799,7 +2884,7 @@ function renderGanttChart() {
 
             // Calculate Y position accounting for lanes and bar sizes
             let sourceY, targetY;
-            const barHeight = 35; // Consistent across all views
+            const barHeight = 20; // Match calendar tile height
 
             if (viewMode === 'category' && sourceWO._lane !== undefined) {
                 const groupY = yScale(sourceGroup.id);
@@ -2859,12 +2944,13 @@ function renderGanttChart() {
             arrowGroup.append('path')
                 .attr('d', path)
                 .attr('stroke', arrowColor)
-                .attr('stroke-width', 2)
+                .attr('stroke-width', 1.5)
                 .attr('fill', 'none')
                 .attr('marker-end', `url(#arrow-${isConflict ? 'conflict' : 'normal'})`)
-                .attr('opacity', 0.7)
+                .attr('opacity', 0.25)  // Lighter by default
                 .attr('class', isConflict ? 'dependency-arrow conflict' : 'dependency-arrow')
-                .attr('data-source-wo-id', dep.staging_wo_id); // Track which WO this arrow originates from
+                .attr('data-source-wo-id', dep.staging_wo_id)
+                .attr('data-target-wo-id', dep.wo_id);  // Track both source and target
 
             // Track conflicts
             if (isConflict) {
@@ -3207,6 +3293,7 @@ function gatherSettings() {
         skipWeekends: skipWeekends,
         dateFormat: dateFormat,
         calendarColorMode: calendarColorMode,
+        viewByMode: viewByMode,
         showCompletedWOs: showCompletedWOs,
         calendarExpanded: calendarExpanded,
         collapsedMOs: Array.from(collapsedMOs), // Convert Set to Array for JSON
@@ -3269,6 +3356,12 @@ function applySettings(settings) {
             // Update UI select
             const calendarColorModeSelect = document.getElementById('calendarColorModeSelect');
             if (calendarColorModeSelect) calendarColorModeSelect.value = calendarColorMode;
+        }
+        if (settings.viewByMode && (settings.viewByMode === 'wo_num' || settings.viewByMode === 'bom_num')) {
+            viewByMode = settings.viewByMode;
+            // Update UI select
+            const viewByModeSelect = document.getElementById('viewByModeSelect');
+            if (viewByModeSelect) viewByModeSelect.value = viewByMode;
         }
         if (typeof settings.showCompletedWOs === 'boolean') {
             showCompletedWOs = settings.showCompletedWOs;
@@ -4046,7 +4139,7 @@ function renderCapacityWOs(category, weekStart, numWeeks = 1) {
 
         const lane = wo._lane || 0;
         const y = 10 + (lane * 40);
-        const barHeight = 35;
+        const barHeight = 35; // Keep larger for capacity view (has 2 lines of text)
 
         // Calculate total hours and hours per day
         const laborHoursPerUnit = parseFloat(wo.labor_hours_from_bom) || 0;
@@ -4332,8 +4425,11 @@ function renderCapacityWOs(category, weekStart, numWeeks = 1) {
 
         bar.call(dragBehavior);
 
-        // WO label - show WO number and total hours
-        const labelText = `WO ${wo.wo_num} (${totalHours.toFixed(2)}h)`;
+        // WO label - show WO number or BOM number (based on viewByMode) and total hours
+        const woLabel = getWOLabel(wo, 17); // Truncate to 17 chars for capacity tiles
+        const labelText = viewByMode === 'bom_num'
+            ? `${woLabel} (${totalHours.toFixed(2)}h)`
+            : `WO ${woLabel} (${totalHours.toFixed(2)}h)`;
         svg.append('text')
             .attr('x', paddedX + 6)
             .attr('y', y + barHeight / 2 - 4)
@@ -4553,6 +4649,31 @@ function toggleCalendarColorMode() {
     buildMonthCalendar();
     saveSettingsToDatabase();
     debugLog('info', `Calendar color mode changed to: ${calendarColorMode}`);
+}
+
+function toggleViewByMode() {
+    const select = document.getElementById('viewByModeSelect');
+    viewByMode = select.value;
+    buildMonthCalendar();
+    buildCapacityTable(currentCapacityWeek);
+    saveSettingsToDatabase();
+    debugLog('info', `View by mode changed to: ${viewByMode}`);
+}
+
+function getWOLabel(wo, maxLength = null) {
+    if (viewByMode === 'bom_num') {
+        const bomNum = wo.bom_num || 'N/A';
+        const qty = wo.qty_target || '?';
+        let label = `${bomNum} x${qty}`;
+        // Truncate if needed
+        if (maxLength && label.length > maxLength) {
+            label = label.substring(0, maxLength - 1) + '…';
+        }
+        return label;
+    } else {
+        // Default: WO number
+        return wo.wo_num;
+    }
 }
 
 function scrollCapacityToWeek(weekStart) {
@@ -4936,7 +5057,9 @@ function renderCalendarWOs(table, calendarStart) {
             const colors = WO_STATUS_COLORS[wo.wo_status] || WO_STATUS_COLORS[10];
             woBar.className += ` ${colors.bg} ${colors.border} ${colors.text}`;
         }
-        woBar.textContent = `WO ${wo.wo_num}`;
+        // Use view mode setting to determine label
+        const woLabel = getWOLabel(wo, 12); // Truncate to 12 chars for calendar tiles
+        woBar.textContent = viewByMode === 'bom_num' ? woLabel : `WO ${woLabel}`;
 
         // Custom CSS tooltip
         const laborHoursPerUnit = parseFloat(wo.labor_hours_from_bom) || 0;
@@ -5011,7 +5134,18 @@ window.addEventListener('DOMContentLoaded', () => {
     ganttStartDate = moment().startOf('isoWeek');
     ganttEndDate = moment().startOf('isoWeek').add(14, 'days');
 
+    // Show debug console if DEBUG_MODE is enabled
+    if (DEBUG_MODE) {
+        const debugConsoleContainer = document.getElementById('debugConsoleContainer');
+        if (debugConsoleContainer) {
+            debugConsoleContainer.style.display = 'block';
+        }
+    }
+
     debugLog('info', 'Application starting...');
+    if (DEBUG_MODE) {
+        debugLog('info', 'Debug mode enabled via BI_SHOW_DEBUG property');
+    }
 
     // Initialize event listeners for UI controls
     initializeEventListeners();
