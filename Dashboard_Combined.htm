@@ -284,6 +284,31 @@
             color: #155724;
         }
 
+        .status-entered {
+            background: #fff3cd;
+            color: #856404;
+        }
+
+        .status-committed {
+            background: #cce5ff;
+            color: #004085;
+        }
+
+        .status-picked {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .status-packed {
+            background: #c3e6cb;
+            color: #0f5132;
+        }
+
+        .status-shipped {
+            background: #e2e8f0;
+            color: #475569;
+        }
+
         /* Order Links */
         .order-link {
             color: #2d9cdb;
@@ -760,18 +785,27 @@ window.ReportSO = (function() {
             const query =
                 "SELECT " +
                 "    So.Id AS id, " +
-                "    So.Num AS num, " +
-                "    So.CustomerPO AS customerPO, " +
-                "    So.DateIssued AS dateIssued, " +
-                "    So.DateFirstShip AS dateFirstShip, " +
-                "    Customer.Name AS customerName, " +
-                "    SoStatus.Name AS statusName " +
+                "    MAX(So.Num) AS num, " +
+                "    MAX(So.CustomerPO) AS customerPO, " +
+                "    MAX(So.DateIssued) AS dateIssued, " +
+                "    MAX(So.DateFirstShip) AS dateFirstShip, " +
+                "    MAX(Customer.Name) AS customerName, " +
+                "    MAX(SoStatus.Name) AS statusName, " +
+                "    GROUP_CONCAT(DISTINCT CASE WHEN Pick.Num IS NOT NULL THEN CONCAT(Pick.Num, ':', COALESCE(PickStatus.Id, 0), ':', COALESCE(PickStatus.Name, 'None')) END ORDER BY Pick.Num SEPARATOR '|') AS pickInfo, " +
+                "    GROUP_CONCAT(DISTINCT CASE WHEN Ship.Num IS NOT NULL THEN CONCAT(Ship.Num, ':', COALESCE(ShipStatus.Id, 0), ':', COALESCE(ShipStatus.Name, 'None')) END ORDER BY Ship.Num SEPARATOR '|') AS shipInfo " +
                 "FROM So " +
                 "LEFT JOIN Customer ON So.CustomerId = Customer.Id " +
                 "LEFT JOIN SoStatus ON So.StatusId = SoStatus.Id " +
+                "LEFT JOIN SoItem ON SoItem.SoId = So.Id " +
+                "LEFT JOIN PickItem ON PickItem.SoItemId = SoItem.Id " +
+                "LEFT JOIN Pick ON Pick.Id = PickItem.PickId " +
+                "LEFT JOIN PickStatus ON Pick.StatusId = PickStatus.Id " +
+                "LEFT JOIN Ship ON Ship.SoId = So.Id " +
+                "LEFT JOIN ShipStatus ON Ship.StatusId = ShipStatus.Id " +
                 "INNER JOIN UserToLG ON So.LocationGroupId = UserToLG.LocationGroupId AND UserToLG.UserId = " + userId + " " +
                 "WHERE SoStatus.Name IN ('Estimate', 'In Progress', 'Issued') " +
-                "ORDER BY So.DateIssued DESC";
+                "GROUP BY So.Id " +
+                "ORDER BY MAX(So.DateIssued) DESC";
 
             DashboardCommon.debugLog('Executing SQL query...', 'query', 'SO');
 
@@ -887,6 +921,140 @@ window.ReportSO = (function() {
     }
 
     /**
+     * Map pick status names to user-friendly display names
+     * @param {string} pickStatusName - Original pick status name
+     * @returns {string} User-friendly status name
+     */
+    function mapPickStatusToDisplay(pickStatusName) {
+        if (pickStatusName === 'Entered') return 'To Pick';
+        if (pickStatusName === 'Started') return 'Picking';
+        return pickStatusName;
+    }
+
+    /**
+     * Calculate display status based on pick and ship progression
+     * @param {object} row - Data row with pickInfo and shipInfo
+     * @returns {object} {displayStatus, tooltip, isPartial}
+     */
+    function calculatePickShipStatus(row) {
+        const pickInfo = row.pickinfo || '';
+        const shipInfo = row.shipinfo || '';
+
+        // If no pick info, return original SO status
+        if (!pickInfo || pickInfo === 'null') {
+            return {
+                displayStatus: row.statusname,
+                tooltip: row.statusname,
+                isPartial: false
+            };
+        }
+
+        // Parse pick information: "pickNum:statusId:statusName|pickNum2:statusId2:statusName2"
+        const picks = pickInfo.split('|').map(function(p) {
+            const parts = p.split(':');
+            return {
+                num: parts[0],
+                statusId: parseInt(parts[1]),
+                statusName: parts[2]
+            };
+        }).filter(function(p) {
+            return p.num && p.statusId > 0; // Filter out null/empty picks
+        });
+
+        // Parse ship information
+        const ships = shipInfo && shipInfo !== 'null' ? shipInfo.split('|').map(function(s) {
+            const parts = s.split(':');
+            return {
+                num: parts[0],
+                statusId: parseInt(parts[1]),
+                statusName: parts[2]
+            };
+        }).filter(function(s) {
+            return s.num && s.statusId > 0; // Filter out null/empty ships
+        }) : [];
+
+        // Build tooltip
+        let tooltipParts = [];
+        if (picks.length > 0) {
+            tooltipParts.push('Picks:');
+            picks.forEach(function(p) {
+                tooltipParts.push('  Pick ' + p.num + ': ' + p.statusName);
+            });
+        }
+        if (ships.length > 0) {
+            tooltipParts.push('Shipments:');
+            ships.forEach(function(s) {
+                tooltipParts.push('  Ship ' + s.num + ': ' + s.statusName);
+            });
+        }
+        const tooltip = tooltipParts.join('\n');
+
+        // No picks found
+        if (picks.length === 0) {
+            return {
+                displayStatus: row.statusname,
+                tooltip: tooltip || row.statusname,
+                isPartial: false
+            };
+        }
+
+        // Check if all picks are Finished (statusId = 40)
+        const allPicksFinished = picks.every(function(p) {
+            return p.statusId === 40;
+        });
+
+        if (allPicksFinished) {
+            // All picks finished, check ship status
+            if (ships.length > 0) {
+                // Find the most advanced ship status
+                const maxShipStatus = Math.max.apply(Math, ships.map(function(s) { return s.statusId; }));
+
+                if (maxShipStatus === 30) {
+                    return { displayStatus: 'Shipped', tooltip: tooltip, isPartial: false };
+                } else if (maxShipStatus === 20) {
+                    return { displayStatus: 'Packed', tooltip: tooltip, isPartial: false };
+                } else if (maxShipStatus === 10) {
+                    return { displayStatus: 'Picked', tooltip: tooltip, isPartial: false };
+                }
+            } else {
+                // Picks finished but no ship yet - show "Picked"
+                return { displayStatus: 'Picked', tooltip: tooltip, isPartial: false };
+            }
+        }
+
+        // Not all picks finished - find the incomplete pick with lowest status
+        const incompletePicks = picks.filter(function(p) {
+            return p.statusId < 40;
+        });
+
+        if (incompletePicks.length > 0) {
+            // Find the pick with the lowest status (most behind)
+            const minStatus = Math.min.apply(Math, incompletePicks.map(function(p) { return p.statusId; }));
+            const incompletePickStatus = incompletePicks.find(function(p) {
+                return p.statusId === minStatus;
+            }).statusName;
+
+            // Map to user-friendly display name
+            const displayName = mapPickStatusToDisplay(incompletePickStatus);
+
+            // Show with asterisk to indicate partial
+            const isPartial = picks.length > 1;
+            return {
+                displayStatus: displayName + (isPartial ? ' *' : ''),
+                tooltip: tooltip,
+                isPartial: isPartial
+            };
+        }
+
+        // Fallback to SO status
+        return {
+            displayStatus: row.statusname,
+            tooltip: tooltip || row.statusname,
+            isPartial: false
+        };
+    }
+
+    /**
      * Create cell content for a column
      * @param {object} row - Data row
      * @param {string} column - Column name
@@ -896,15 +1064,30 @@ window.ReportSO = (function() {
         const td = document.createElement('td');
 
         if (column === 'statusname') {
+            // Calculate pick/ship progression status
+            const statusInfo = calculatePickShipStatus(row);
+            const displayStatus = statusInfo.displayStatus;
+            const tooltip = statusInfo.tooltip;
+
             let statusClass = 'status-badge';
-            if (row.statusname === 'Estimate') statusClass += ' status-estimate';
-            else if (row.statusname === 'In Progress') statusClass += ' status-inprogress';
-            else if (row.statusname === 'Issued') statusClass += ' status-issued';
+
+            // Apply CSS classes based on display status
+            const statusLower = displayStatus.toLowerCase().replace(' *', '');
+            if (statusLower === 'estimate') statusClass += ' status-estimate';
+            else if (statusLower === 'in progress') statusClass += ' status-inprogress';
+            else if (statusLower === 'issued') statusClass += ' status-issued';
+            else if (statusLower === 'entered' || statusLower === 'to pick') statusClass += ' status-entered';
+            else if (statusLower === 'started' || statusLower === 'picking') statusClass += ' status-started';
+            else if (statusLower === 'committed') statusClass += ' status-committed';
+            else if (statusLower === 'finished' || statusLower === 'picked') statusClass += ' status-picked';
+            else if (statusLower === 'packed') statusClass += ' status-packed';
+            else if (statusLower === 'shipped') statusClass += ' status-shipped';
+
             const badge = document.createElement('span');
             badge.className = statusClass;
-            badge.textContent = row.statusname || '';
+            badge.textContent = displayStatus || '';
             td.appendChild(badge);
-            td.title = row.statusname || '';
+            td.title = tooltip || displayStatus || '';
         } else if (column === 'scheduleindicator') {
             const scheduleStatus = DashboardCommon.getScheduleStatus(row.datefirstship);
             return DashboardCommon.createScheduleIndicator(scheduleStatus, row.datefirstship);
@@ -1759,6 +1942,7 @@ window.ReportRMA = (function() {
                 "    RmaItem.typeId AS typeId, " +
                 "    RmaItem.issueId AS issueId, " +
                 "    RmaItemType.Name AS typeName, " +
+                "    CustomListItem.Name AS issueName, " +
                 "    RmaItem.productId AS productId, " +
                 "    Product.num AS productNum, " +
                 "    RmaItem.qty AS qty " +
@@ -1767,6 +1951,7 @@ window.ReportRMA = (function() {
                 "LEFT JOIN Customer ON Rma.customerId = Customer.id " +
                 "LEFT JOIN RmaItem ON Rma.id = RmaItem.rmaId " +
                 "LEFT JOIN RmaItemType ON RmaItem.typeId = RmaItemType.Id " +
+                "LEFT JOIN CustomListItem ON RmaItem.issueId = CustomListItem.id AND CustomListItem.listId = 2 " +
                 "LEFT JOIN Product ON RmaItem.productId = Product.id " +
                 "INNER JOIN UserToLG ON Rma.locationGroupId = UserToLG.LocationGroupId AND UserToLG.UserId = " + userId + " " +
                 "WHERE Rma.statusId = 10 " +
@@ -1785,12 +1970,6 @@ window.ReportRMA = (function() {
                 const row = result[i];
                 const key = row.rmaid + '_' + row.typeid + '_' + row.issueid;
 
-                // Map issueId to issue name
-                let issueName = '';
-                if (row.issueid === null || row.issueid === undefined) issueName = '-';
-                else if (row.issueid === 2) issueName = 'DOA';
-                else if (row.issueid === 3) issueName = 'Warranty';
-
                 if (!grouped[key]) {
                     grouped[key] = {
                         rmaid: row.rmaid,
@@ -1803,7 +1982,7 @@ window.ReportRMA = (function() {
                         typename: row.typename,
                         type: row.typename || '',
                         issueid: row.issueid,
-                        issue: issueName,
+                        issue: row.issuename || '-',
                         products: [],
                         totalQty: 0
                     };
