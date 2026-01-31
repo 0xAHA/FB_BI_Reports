@@ -497,6 +497,10 @@
         let customStartDate = null;
         let customEndDate = null;
 
+        // Financial Year start month (1-12, default 7 = July)
+        // Configure via Fishbowl property: BI_FY_START_MONTH
+        const FY_START_MONTH = parseInt(getProperty('BI_FY_START_MONTH', '7')) || 7;
+
         // Color palette for charts
         const colorPalette = [
             '#2d9cdb', '#3b82f6', '#10b981', '#f59e0b', '#ef4444',
@@ -562,31 +566,49 @@
         }
 
         function getQuarterDates(quartersAgo) {
+            // Use moment's built-in quarter handling for proper year rollover
             const now = moment();
-            const quarter = now.quarter() - quartersAgo;
-            const year = now.year() - Math.floor((now.quarter() - quartersAgo - 1) / 4);
-            const targetQuarter = ((quarter - 1 + 4) % 4) + 1;
+            const currentQuarterStart = moment(now).startOf('quarter');
+            const targetQuarterStart = moment(currentQuarterStart).subtract(quartersAgo, 'quarters');
 
-            const start = moment().year(year).quarter(targetQuarter).startOf('quarter').format('YYYY-MM-DD');
-            const end = moment().year(year).quarter(targetQuarter).endOf('quarter').format('YYYY-MM-DD');
+            const start = targetQuarterStart.startOf('quarter').format('YYYY-MM-DD');
+            const end = moment(targetQuarterStart).endOf('quarter').format('YYYY-MM-DD');
 
             return { start, end };
         }
 
         function getFYDates(yearsAgo) {
-            const fyStartMonth = 6; // July (0-indexed = 6)
+            // Financial Year: Configurable via BI_FY_START_MONTH property (1-12)
+            // Default: July (7) to June (6) - Australian/UK financial year
             const now = moment();
-            const currentMonth = now.month();
+            const currentMonth = now.month() + 1; // Convert 0-11 to 1-12
+            const currentYear = now.year();
 
-            let fyYear = now.year() - yearsAgo;
-            if (currentMonth < fyStartMonth) {
-                fyYear -= 1;
+            // FY_START_MONTH is 1-12 (e.g., 7 = July, 10 = October, 1 = January)
+            const fyStartMonth = Math.max(1, Math.min(12, FY_START_MONTH));
+
+            // Determine which FY we're currently in
+            let fyStartYear = currentMonth >= fyStartMonth ? currentYear : currentYear - 1;
+            fyStartYear -= yearsAgo;
+
+            // Calculate end month and year
+            let fyEndMonth, fyEndYear;
+            if (fyStartMonth === 1) {
+                // January start = calendar year (Jan-Dec)
+                fyEndMonth = 12;
+                fyEndYear = fyStartYear;
+            } else {
+                fyEndMonth = fyStartMonth - 1;
+                fyEndYear = fyStartYear + 1;
             }
 
-            const start = moment().year(fyYear).month(fyStartMonth).date(1).format('YYYY-MM-DD');
-            const end = moment().year(fyYear + 1).month(fyStartMonth).date(1).subtract(1, 'day').format('YYYY-MM-DD');
+            // Get the last day of the end month
+            const endDate = moment([fyEndYear, fyEndMonth - 1, 1]).endOf('month');
 
-            return { start, end };
+            return {
+                start: `${fyStartYear}-${String(fyStartMonth).padStart(2, '0')}-01`,
+                end: endDate.format('YYYY-MM-DD')
+            };
         }
 
         // ============================================
@@ -2313,14 +2335,23 @@
                 return `<tr class="${rowClass}" ${rowClick} data-row-index="${rowIndex}">` +
                     currentDrilldownColumns.map(col => {
                         let value = row[col.key];
+                        let colorClass = '';
+                        const numericValue = parseFloat(value || 0);
 
                         // Format based on type
                         if (col.type === 'currency') {
-                            value = '$' + parseFloat(value || 0).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                            const isNegative = numericValue < 0;
+                            const absValue = Math.abs(numericValue);
+                            const formatted = '$' + absValue.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                            value = isNegative ? '-' + formatted : formatted;
+                            // Red text for negative currency values
+                            if (isNegative) colorClass = 'text-red-600 font-semibold';
                         } else if (col.type === 'number') {
-                            value = parseFloat(value || 0).toLocaleString('en-US');
+                            value = numericValue.toLocaleString('en-US');
                         } else if (col.type === 'percent') {
-                            value = (parseFloat(value || 0) * 100).toFixed(1) + '%';
+                            value = (numericValue * 100).toFixed(1) + '%';
+                            // Red text for negative percentages
+                            if (numericValue < 0) colorClass = 'text-red-600 font-semibold';
                         } else if (col.type === 'date') {
                             value = moment(value).format('D MMM YYYY');
                         } else if (col.format) {
@@ -2332,7 +2363,7 @@
                             value = `<a href="#" class="order-link" onclick="event.stopPropagation(); openPurchaseOrder('${escapeSQL(value)}'); return false;">${value}</a>`;
                         }
 
-                        return `<td class="px-4 py-3 text-sm text-slate-700">${value || ''}</td>`;
+                        return `<td class="px-4 py-3 text-sm text-slate-700 ${colorClass}">${value || ''}</td>`;
                     }).join('') +
                 `</tr>`;
             }).join('');
@@ -2369,6 +2400,17 @@
                 return;
             }
 
+            // Helper to format currency with negative handling
+            const formatCurrency = (val) => {
+                const num = parseFloat(val || 0);
+                const isNeg = num < 0;
+                const formatted = '$' + Math.abs(num).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                return {
+                    value: isNeg ? '-' + formatted : formatted,
+                    colorClass: isNeg ? 'text-red-600 font-semibold' : 'text-slate-700'
+                };
+            };
+
             // Create expanded row with line items table
             const targetRow = tbody.querySelector(`tr[data-row-index="${rowIndex}"]`);
             const expandedRow = document.createElement('tr');
@@ -2388,15 +2430,18 @@
                                 </tr>
                             </thead>
                             <tbody>
-                                ${lineItems.map(item => `
+                                ${lineItems.map(item => {
+                                    const unitCost = formatCurrency(item.unit_cost);
+                                    const lineTotal = formatCurrency(item.line_total);
+                                    return `
                                     <tr class="border-t border-slate-200">
                                         <td class="py-1 text-slate-700">${item.part_num || ''}</td>
                                         <td class="py-1 text-slate-700">${item.part_description || ''}</td>
                                         <td class="py-1 text-right text-slate-700">${parseFloat(item.qty || 0).toLocaleString()}</td>
-                                        <td class="py-1 text-right text-slate-700">$${parseFloat(item.unit_cost || 0).toFixed(2)}</td>
-                                        <td class="py-1 text-right text-slate-700">$${parseFloat(item.line_total || 0).toLocaleString('en-US', {minimumFractionDigits: 2})}</td>
+                                        <td class="py-1 text-right ${unitCost.colorClass}">${unitCost.value}</td>
+                                        <td class="py-1 text-right ${lineTotal.colorClass}">${lineTotal.value}</td>
                                     </tr>
-                                `).join('')}
+                                `}).join('')}
                             </tbody>
                         </table>
                     </div>
