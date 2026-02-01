@@ -1,11 +1,28 @@
 # TODO List
 
+## Completed Tasks
+
+### Price Formatting - Use System Property
+- [x] Use Fishbowl system property `REPORT_DECIMAL_PRICE` (format: `$ #,##0.00`) for price formatting
+- [x] Apply to Sales_Dashboard.htm - global `formatCurrency()` function using PRICE_FORMAT, CURRENCY_SYMBOL, DECIMAL_PLACES
+- [x] Apply to Purchasing_Dashboard.htm - same implementation
+- [ ] Apply to other dashboards: Inventory, Combined (if applicable)
+
+### Terminology Update
+- [x] Change all references from 'Salesman' to 'Sales Person' in Sales Dashboard
+- [x] Update column headings in drilldown tables
+- [x] Update filter labels
+- [x] Update tooltips and any other UI text
+- Note: Purchasing Dashboard doesn't use 'Salesman' terminology
+
+---
+
 ## Pending Tasks
 
 ### Sales Credit Note Display Review
 - [ ] Review credit note (negative qty line item) display - currently too much red after recent changes
+- [x] Change styling: keep red text for negatives but remove bold font weight (completed)
 - [ ] Consider following standard Fishbowl sales order info: Qty, negative price, negative total (no margin shown)
-- [ ] Change styling: keep red text for negatives but remove bold font weight
 - [ ] Test with various credit/return scenarios
 
 **Notes:**
@@ -20,40 +37,17 @@
 
 ---
 
-### Price Formatting - Use System Property
-- [ ] Use Fishbowl system property `REPORT_DECIMAL_PRICE` (format: `$ #,##0.00`) for price formatting
-- [ ] Apply to all dashboards: Sales, Purchasing, Inventory, Combined
-- [ ] This may resolve/simplify the currency localization task below
+### Currency Localization (Partially Addressed)
+- [x] Created global `formatCurrency()` function using REPORT_DECIMAL_PRICE property
+- [x] Currency symbol extracted from price format pattern
+- [x] Decimal places extracted from price format pattern
+- [ ] Still using 'en-US' locale for number formatting (thousands separator, decimal point)
+- [ ] May need additional property for full locale support if non-US formatting needed (1.234,56 format)
 
----
-
-### Terminology Update
-- [ ] Change all references from 'Salesman' to 'Sales Person'
-- [ ] Update column headings in drilldown tables
-- [ ] Update filter labels
-- [ ] Update tooltips and any other UI text
-
-**Affected files:**
-- Sales_Dashboard.htm (filter, queries, column headings)
-- Any other files referencing 'Salesman'
-
----
-
-### Currency Localization
-- [ ] Investigate if Fishbowl has existing currency/locale properties we can use
-- [ ] If not, add `BI_CURRENCY_SYMBOL` and `BI_CURRENCY_LOCALE` properties
-- [ ] Create global `formatCurrency()` function in both dashboards
-- [ ] Replace all hardcoded `$` and `en-US` formatting (~50+ locations in Sales Dashboard, ~30+ in Purchasing Dashboard)
-- [ ] Apply same fix to other dashboards (Inventory_Dashboard.htm, etc.)
-
-**Affected files:**
-- Sales_Dashboard.htm
-- Purchasing_Dashboard.htm
+**Affected files still needing updates:**
 - Inventory_Dashboard.htm
-- Dashboard_Combined.htm
+- Dashboard_Combined.htm (if exists)
 
 **Notes:**
-- Currently hardcoded to `$` symbol and `en-US` locale
-- Need to support different currencies (USD, EUR, GBP, AUD, etc.)
-- Need to support different number formats (1,234.56 vs 1.234,56)
-- May be addressed by `REPORT_DECIMAL_PRICE` property above
+- REPORT_DECIMAL_PRICE property now used for currency symbol and decimal places
+- Full locale support would require additional property for number formatting style
