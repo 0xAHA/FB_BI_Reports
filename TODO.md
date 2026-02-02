@@ -94,3 +94,7 @@
 
 #### Pending:
 - [ ] Review and test all queries with real data
+- [ ] Confirm best method for correct cost attribution for Scrap/Adjustments
+  - Currently using partcost.avgCost (current average cost)
+  - Should investigate using cost at time of scrap/adjustment instead
+  - May need to pull from inventorylog or related cost history table
