@@ -83,6 +83,14 @@
 - [x] Added Debug Console (collapsible, auto-scrolling, same as Sales/Purchasing)
 - [x] Added Drilldown Modal with export to CSV functionality
 
+#### Additional Updates:
+- [x] Fixed inventorylogtype IDs: 67=Scrap (adj:scp), 68=Cycle Count (adj:cyc), 64=Adjust Inc, 65=Adjust Dec
+- [x] Changed from part.stdCost to partcost.avgCost for accurate current valuation
+- [x] Added 4-column KPI tiles row: Total Value, Unavailable Stock, Below Reorder, Short Parts
+- [x] Added Unavailable Stock KPI tile with modal drilldown (uses qtynotavailable view)
+- [x] Added Below Reorder KPI tile with modal drilldown (uses partreorder table)
+- [x] Updated Stock Movement chart with correct inventorylogtype IDs (10=Recv, 20=Ship, 30=Transfer, 40/50=Production)
+- [x] All KPI tiles are clickable with modal drilldowns and export to CSV
+
 #### Pending:
 - [ ] Review and test all queries with real data
-- [ ] Verify inventorylogtype IDs for cycle count (30, 60, 70) and scrap (90) match Fishbowl configuration
