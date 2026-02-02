@@ -76,9 +76,13 @@
 - [x] Updated date handling functions (getQuarterDates, getFYDates, getCalendarYearDates, getDateCondition)
 - [x] Added updateDateRangeDisplay for header date range display
 - [x] Added clearAllFilters button
-- [x] Added Short Parts Alert tile (shows count of parts in picking with insufficient stock)
+- [x] Added Short Parts Alert tile with click-to-expand modal drilldown (shows part, orders affected, sales value at risk)
 - [x] Implemented Stock Movement chart using part activity report query (summarized by category: Receiving, Shipping, Adjustments, Transfers, Production)
+- [x] Added Cycle Count Adjustments KPI tile with modal drilldown (shows parts adjusted, qty change, value impact)
+- [x] Added Scrapped Items KPI tile with modal drilldown (shows parts scrapped, qty, value lost)
+- [x] Added Debug Console (collapsible, auto-scrolling, same as Sales/Purchasing)
+- [x] Added Drilldown Modal with export to CSV functionality
 
 #### Pending:
 - [ ] Review and test all queries with real data
-- [ ] Add drill-down functionality to charts
+- [ ] Verify inventorylogtype IDs for cycle count (30, 60, 70) and scrap (90) match Fishbowl configuration
