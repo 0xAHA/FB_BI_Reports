@@ -43,13 +43,16 @@
 - [x] Decimal places extracted from price format pattern
 - [x] Applied to Sales Dashboard
 - [ ] Apply currency symbol mapping to Purchasing Dashboard (copy CURRENCY_SYMBOLS and getHomeCurrencySymbol)
+- [ ] Apply currency symbol mapping to Combined Dashboard
+- [ ] Apply currency symbol mapping to individual tile reports
 - [ ] Still using 'en-US' locale for number formatting (thousands separator, decimal point)
 - [ ] May need additional property for full locale support if non-US formatting needed (1.234,56 format)
 
 **Affected files still needing updates:**
 - Purchasing_Dashboard.htm (currency symbol mapping)
+- Dashboard_Combined.htm
+- Individual tile reports (*.htm)
 - Inventory_Dashboard.htm
-- Dashboard_Combined.htm (if exists)
 
 **Notes:**
 - Currency symbol now determined by querying home currency code from `currency` table and mapping via CURRENCY_SYMBOLS
