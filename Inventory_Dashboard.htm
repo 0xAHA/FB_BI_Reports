@@ -1010,22 +1010,17 @@
             let categoryCondition = productCategory !== '%' ? `AND pt.name = '${productCategory}'` : '';
             let vendorCondition = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = p.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
 
-            // Use partcost.avgCost for accurate current valuation
+            // Tag-based valuation query (like Inventory Valuation Summary report)
             const query = `
                 SELECT
-                    SUM(qoh.qty * COALESCE(pc.avgCost, 0)) as total_value,
+                    SUM(tag.qty * COALESCE(pc.avgCost, 0)) as total_value,
                     COUNT(DISTINCT p.id) as part_count,
-                    SUM(qoh.qty) as total_qty,
-                    SUM(CASE
-                        WHEN qoh.qty < COALESCE(pr.reorderpoint, 0)
-                        AND pr.reorderpoint IS NOT NULL
-                        THEN 1 ELSE 0
-                    END) as below_reorder
+                    SUM(tag.qty) as total_qty
                 FROM part p
-                JOIN qtyonhand qoh ON p.id = qoh.partid
-                JOIN locationgroup lg ON qoh.locationgroupid = lg.id
-                LEFT JOIN partcost pc ON p.id = pc.partid
-                LEFT JOIN partreorder pr ON p.id = pr.partid AND qoh.locationgroupid = pr.locationgroupid
+                INNER JOIN partcost pc ON p.id = pc.partid
+                INNER JOIN tag ON p.id = tag.partid
+                INNER JOIN location loc ON tag.locationid = loc.id
+                INNER JOIN locationgroup lg ON loc.locationgroupid = lg.id
                 LEFT JOIN producttree pt ON p.treeId = pt.id
                 WHERE p.activeflag = 1
                     AND p.typeid = 10
@@ -1035,7 +1030,49 @@
             `;
 
             debugLog('KPI Query executing...', 'info');
-            return JSON.parse(runQuery(query));
+            try {
+                return JSON.parse(runQuery(query));
+            } catch (e) {
+                debugLog('Error getting KPI metrics: ' + e.message, 'error');
+                return [];
+            }
+        }
+
+        function getBelowReorderCount() {
+            const locationGroup = document.getElementById('locationGroupFilter').value;
+            const productCategory = document.getElementById('productCategoryFilter').value;
+            const vendorFilter = document.getElementById('vendorFilter').value;
+
+            let lgCondition = locationGroup !== '%' ? `AND lg.id = ${locationGroup}` : '';
+            let categoryCondition = productCategory !== '%' ? `AND pt.name = '${productCategory}'` : '';
+            let vendorCondition = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = p.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
+
+            // Count parts below reorder point
+            const query = `
+                SELECT COUNT(DISTINCT p.id) as below_reorder
+                FROM part p
+                INNER JOIN partreorder pr ON p.id = pr.partid
+                INNER JOIN locationgroup lg ON pr.locationgroupid = lg.id
+                LEFT JOIN qtyonhand qoh ON p.id = qoh.partid AND qoh.locationgroupid = lg.id
+                LEFT JOIN producttree pt ON p.treeId = pt.id
+                WHERE p.activeflag = 1
+                    AND p.typeid = 10
+                    AND pr.reorderpoint IS NOT NULL
+                    AND pr.reorderpoint > 0
+                    AND COALESCE(qoh.qty, 0) < pr.reorderpoint
+                    ${lgCondition}
+                    ${categoryCondition}
+                    ${vendorCondition}
+            `;
+
+            debugLog('Below Reorder Query executing...', 'info');
+            try {
+                const result = JSON.parse(runQuery(query));
+                return result && result.length > 0 ? parseInt(result[0].below_reorder || 0) : 0;
+            } catch (e) {
+                debugLog('Error getting below reorder count: ' + e.message, 'error');
+                return 0;
+            }
         }
 
         function loadLocationGroups() {
@@ -1261,7 +1298,7 @@
             let categoryCondition = productCategory !== '%' ? `AND pt.name = '${productCategory}'` : '';
             let vendorCondition = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = PART.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
 
-            // Scrap adjustments: typeId = 67 (adj:scp)
+            // Scrap/Consume: typeId = 67 (adj:scp), 50 (consume)
             const query = `
                 SELECT
                     COUNT(DISTINCT PART.id) AS part_count,
@@ -1273,7 +1310,7 @@
                 LEFT JOIN partcost pc ON PART.id = pc.partid
                 LEFT JOIN producttree pt ON PART.treeId = pt.id
                 WHERE ${getDateCondition('INVENTORYLOG.eventDate')}
-                    AND INVENTORYLOG.TYPEID = 67
+                    AND INVENTORYLOG.TYPEID IN (67, 50)
                     AND PART.activeflag = 1
                     AND PART.typeid = 10
                     ${lgCondition}
@@ -1315,7 +1352,7 @@
                 LEFT JOIN partcost pc ON PART.id = pc.partid
                 LEFT JOIN producttree pt ON PART.treeId = pt.id
                 WHERE ${getDateCondition('INVENTORYLOG.eventDate')}
-                    AND INVENTORYLOG.TYPEID = 67
+                    AND INVENTORYLOG.TYPEID IN (67, 50)
                     AND PART.activeflag = 1
                     AND PART.typeid = 10
                     ${lgCondition}
@@ -2286,6 +2323,8 @@
         function updateKPIs(data) {
             if (!data || data.length === 0) {
                 debugLog('No KPI data returned', 'warning');
+                document.getElementById('kpiTotalValue').textContent = '$0';
+                document.getElementById('kpiPartCount').textContent = '0 parts';
                 return;
             }
 
@@ -2294,13 +2333,15 @@
             // Update Total Value KPI tile
             const totalValue = formatCurrency(metrics.total_value || 0, false);
             const partCount = parseInt(metrics.part_count || 0);
-            const belowReorder = parseInt(metrics.below_reorder || 0);
 
             document.getElementById('kpiTotalValue').textContent = totalValue;
             document.getElementById('kpiPartCount').textContent = partCount.toLocaleString() + ' parts';
-            document.getElementById('kpiBelowReorder').textContent = belowReorder.toLocaleString();
 
-            debugLog(`KPIs updated: Value=${totalValue}, Parts=${partCount}, Below Reorder=${belowReorder}`, 'success');
+            debugLog(`KPIs updated: Value=${totalValue}, Parts=${partCount}`, 'success');
+        }
+
+        function updateBelowReorderKPI(count) {
+            document.getElementById('kpiBelowReorder').textContent = (count || 0).toLocaleString();
         }
 
         function updateUnavailableKPI(data) {
@@ -2452,9 +2493,13 @@
             debugLog('Loading dashboard...', 'info');
 
             try {
-                // Load KPIs
+                // Load KPIs (inventory valuation)
                 const kpiData = getKPIMetrics();
                 updateKPIs(kpiData);
+
+                // Load below reorder count
+                const belowReorderCount = getBelowReorderCount();
+                updateBelowReorderKPI(belowReorderCount);
 
                 // Load short parts count
                 const shortCount = getShortParts();
@@ -2539,14 +2584,9 @@
         }
 
         function updateShortPartsAlert(count) {
-            const alertDiv = document.getElementById('shortPartsAlert');
             const countDiv = document.getElementById('shortPartsCount');
-
-            if (count > 0) {
-                alertDiv.style.display = 'block';
-                countDiv.textContent = count.toLocaleString();
-            } else {
-                alertDiv.style.display = 'none';
+            if (countDiv) {
+                countDiv.textContent = (count || 0).toLocaleString();
             }
         }
 
