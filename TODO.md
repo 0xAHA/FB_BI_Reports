@@ -107,3 +107,17 @@
 - [ ] Fix "Include No ROP/OUL" feature - not showing parts without reorder points
   - Checkbox exists but filter may not be working correctly
   - Need to verify SQL query includes parts with NULL reorderpoint/orderuptolevel
+
+---
+
+### #4922 - Printing/Downloading from Built-in Fishbowl Buttons
+- [ ] Built-in Fishbowl print/download buttons are separate to rendered buttons in the page
+  - Need to investigate how to hook into or style these buttons
+  - May need coordination with Fishbowl application layer
+
+---
+
+### #4921 - Date Format Standardization
+- [ ] Use `DateFormatShort` property for date display in dashboard header date ranges
+- [ ] Ensure default format is US format `MM/dd/yyyy` across all files
+- [ ] Apply to: Sales_Dashboard.htm, Purchasing_Dashboard.htm, Inventory_Dashboard.htm
