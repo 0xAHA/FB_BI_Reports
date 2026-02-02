@@ -52,10 +52,30 @@
 - Purchasing_Dashboard.htm (currency symbol mapping)
 - Dashboard_Combined.htm
 - Individual tile reports (*.htm)
-- Inventory_Dashboard.htm
 
 **Notes:**
 - Currency symbol now determined by querying home currency code from `currency` table and mapping via CURRENCY_SYMBOLS
 - Supports 30+ currencies (AUD, USD, EUR, GBP, JPY, etc.)
 - Falls back to REPORT_DECIMAL_PRICE parsing if DB query fails
 - Full locale support would require additional property for number formatting style
+
+---
+
+### Inventory Dashboard - Initial Implementation
+
+#### Completed:
+- [x] Updated date range selector to match Sales/Purchasing dashboards (dropdown with presets: 30/60/90/180/365 days, This/Last Quarter, Current/Last FY, Current/Last CY, Custom Range)
+- [x] Removed Part Type filter (now fixed to typeid=10 for Inventory parts)
+- [x] Removed Tracking Method filter
+- [x] Added Product Category filter (using producttree)
+- [x] Implemented new inventory availability query (based on Fishbowl Inventory Availability by Location Group report)
+- [x] Updated Top Parts by Value to show availability data (On Hand, Available, Committed, On Order)
+- [x] Applied currency symbol mapping and formatCurrency function
+- [x] Updated date handling functions (getQuarterDates, getFYDates, getCalendarYearDates, getDateCondition)
+- [x] Added updateDateRangeDisplay for header date range display
+- [x] Added clearAllFilters button
+
+#### Pending:
+- [ ] Integrate part activity report query for Stock Movement chart (currently placeholder)
+- [ ] Review and test all queries with real data
+- [ ] Add drill-down functionality to charts
