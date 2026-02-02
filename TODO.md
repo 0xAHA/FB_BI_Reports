@@ -39,15 +39,20 @@
 
 ### Currency Localization (Partially Addressed)
 - [x] Created global `formatCurrency()` function using REPORT_DECIMAL_PRICE property
-- [x] Currency symbol extracted from price format pattern
+- [x] Currency symbol mapped from home currency code in database (CURRENCY_SYMBOLS lookup)
 - [x] Decimal places extracted from price format pattern
+- [x] Applied to Sales Dashboard
+- [ ] Apply currency symbol mapping to Purchasing Dashboard (copy CURRENCY_SYMBOLS and getHomeCurrencySymbol)
 - [ ] Still using 'en-US' locale for number formatting (thousands separator, decimal point)
 - [ ] May need additional property for full locale support if non-US formatting needed (1.234,56 format)
 
 **Affected files still needing updates:**
+- Purchasing_Dashboard.htm (currency symbol mapping)
 - Inventory_Dashboard.htm
 - Dashboard_Combined.htm (if exists)
 
 **Notes:**
-- REPORT_DECIMAL_PRICE property now used for currency symbol and decimal places
+- Currency symbol now determined by querying home currency code from `currency` table and mapping via CURRENCY_SYMBOLS
+- Supports 30+ currencies (AUD, USD, EUR, GBP, JPY, etc.)
+- Falls back to REPORT_DECIMAL_PRICE parsing if DB query fails
 - Full locale support would require additional property for number formatting style
