@@ -341,7 +341,7 @@
             </div>
 
             <!-- Bottom Row Charts -->
-            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div class="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-4 gap-6">
                 <!-- Top Parts by Value -->
                 <div class="bg-white rounded-2xl shadow-md border border-slate-300 p-6">
                     <h3 class="text-lg font-bold text-slate-800 mb-4 flex items-center gap-2">
@@ -373,6 +373,17 @@
                         Availability Status
                     </h3>
                     <div id="statusChart" style="height: 280px;"></div>
+                </div>
+
+                <!-- Slow-Moving Inventory -->
+                <div class="bg-white rounded-2xl shadow-md border border-slate-300 p-6">
+                    <h3 class="text-lg font-bold text-slate-800 mb-4 flex items-center gap-2">
+                        <svg class="w-5 h-5 text-orange-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4"></path>
+                        </svg>
+                        Slow-Moving Inventory
+                    </h3>
+                    <div id="slowMovingChart" style="height: 280px;"></div>
                 </div>
             </div>
 
@@ -641,6 +652,17 @@
 
             logDiv.appendChild(entry);
             logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        function showTooltip(event, html) {
+            tooltip.style('opacity', 1)
+                .html(html)
+                .style('left', (event.pageX + 10) + 'px')
+                .style('top', (event.pageY - 10) + 'px');
+        }
+
+        function hideTooltip() {
+            tooltip.style('opacity', 0);
         }
 
         function toggleDebugConsole() {
@@ -947,23 +969,24 @@
             const productCategory = document.getElementById('productCategoryFilter').value;
             const vendorFilter = document.getElementById('vendorFilter').value;
 
-            let lgCondition = locationGroup !== '%' ? `AND lg.id = ${locationGroup}` : '';
+            let lgCondition = locationGroup !== '%' ? `AND locationgroup.id = ${locationGroup}` : '';
             let categoryCondition = productCategory !== '%' ? `AND pt.name = '${productCategory}'` : '';
-            let vendorCondition = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = p.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
+            let vendorCondition = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = part.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
 
-            // Use qtyonhand view with partcost for valuation (more reliable than tag table)
+            // Match Inventory Valuation Summary report query structure exactly
+            // Uses tag table joined through location to locationgroup
             const query = `
                 SELECT
-                    SUM(qoh.qty * COALESCE(pc.avgCost, 0)) as total_value,
-                    COUNT(DISTINCT p.id) as part_count,
-                    SUM(qoh.qty) as total_qty
-                FROM part p
-                INNER JOIN qtyonhand qoh ON p.id = qoh.partid
-                INNER JOIN locationgroup lg ON qoh.locationgroupid = lg.id
-                LEFT JOIN partcost pc ON p.id = pc.partid
-                LEFT JOIN producttree pt ON p.treeId = pt.id
-                WHERE p.activeflag = 1
-                    AND p.typeid = 10
+                    SUM(tag.qty * COALESCE(partcost.avgCost, 0)) as total_value,
+                    COUNT(DISTINCT part.id) as part_count,
+                    SUM(tag.qty) as total_qty
+                FROM part
+                INNER JOIN partcost ON part.id = partcost.partid
+                INNER JOIN tag ON part.id = tag.partid
+                INNER JOIN location ON tag.locationid = location.id
+                INNER JOIN locationgroup ON location.locationgroupid = locationgroup.id
+                LEFT JOIN producttree pt ON part.treeId = pt.id
+                WHERE 1=1
                     ${lgCondition}
                     ${categoryCondition}
                     ${vendorCondition}
@@ -1796,6 +1819,62 @@
             return JSON.parse(runQuery(query));
         }
 
+        // Slow-Moving Inventory - parts with high days of supply based on sales velocity
+        function getSlowMovingInventory() {
+            try {
+                const { start, end } = getDateRange();
+                const daysDiff = moment(end).diff(moment(start), 'days') || 364;
+
+                const locationGroup = document.getElementById('locationGroupFilter').value;
+                const productCategory = document.getElementById('productCategoryFilter').value;
+                const vendorFilter = document.getElementById('vendorFilter').value;
+
+                let lgCondition = locationGroup !== '%' ? `AND lg.id = ${locationGroup}` : '';
+                let categoryCondition = productCategory !== '%' ? `AND pt.name = '${productCategory}'` : '';
+                let vendorCondition = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = p.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
+
+                // Calculate days of supply based on qty on hand and sales velocity
+                const query = `
+                    SELECT
+                        p.num AS part_num,
+                        p.description AS part_name,
+                        COALESCE(SUM(CASE WHEN postso.postDate >= '${start}' AND postso.postDate <= '${end}' THEN postsoitem.qty ELSE 0 END), 0) AS qty_sold,
+                        COALESCE(SUM(CASE WHEN postso.postDate >= '${start}' AND postso.postDate <= '${end}' THEN postsoitem.qty ELSE 0 END), 0) / ${daysDiff} AS daily_velocity,
+                        COALESCE(qoh.qty, 0) AS qty_on_hand,
+                        CASE
+                            WHEN COALESCE(SUM(CASE WHEN postso.postDate >= '${start}' AND postso.postDate <= '${end}' THEN postsoitem.qty ELSE 0 END), 0) / ${daysDiff} > 0
+                            THEN COALESCE(qoh.qty, 0) / (COALESCE(SUM(CASE WHEN postso.postDate >= '${start}' AND postso.postDate <= '${end}' THEN postsoitem.qty ELSE 0 END), 0) / ${daysDiff})
+                            ELSE 99999
+                        END AS days_of_supply
+                    FROM part p
+                    LEFT JOIN qtyonhand qoh ON p.id = qoh.partid
+                    LEFT JOIN locationgroup lg ON qoh.locationgroupid = lg.id
+                    LEFT JOIN producttree pt ON p.treeId = pt.id
+                    LEFT JOIN soitem ON soitem.productId = p.id AND soitem.typeId NOT IN (30, 40)
+                    LEFT JOIN postsoitem ON postsoitem.soitemId = soitem.id
+                    LEFT JOIN so ON so.id = soitem.soId
+                    LEFT JOIN postso ON postso.soId = so.id
+                    WHERE p.activeflag = 1
+                        AND p.typeid = 10
+                        ${lgCondition}
+                        ${categoryCondition}
+                        ${vendorCondition}
+                    GROUP BY p.id, p.num, p.description, qoh.qty
+                    HAVING qty_on_hand > 0 AND daily_velocity < 1
+                    ORDER BY days_of_supply DESC
+                    LIMIT 20
+                `;
+
+                debugLog('Slow-Moving Inventory query executing...', 'info');
+                const result = JSON.parse(runQuery(query));
+                debugLog(`Slow-Moving Inventory returned ${result ? result.length : 0} rows`, 'info');
+                return result || [];
+            } catch (error) {
+                debugLog(`ERROR in getSlowMovingInventory: ${error.message}`, 'error');
+                return [];
+            }
+        }
+
         // ============================================
         // Chart Rendering Functions
         // ============================================
@@ -2267,6 +2346,86 @@
             });
         }
 
+        function renderSlowMovingChart(data) {
+            const container = document.getElementById('slowMovingChart');
+            container.innerHTML = '';
+
+            if (!data || !Array.isArray(data) || data.length === 0) {
+                container.innerHTML = '<div class="text-center text-slate-400 py-8">No slow-moving inventory found</div>';
+                return;
+            }
+
+            const width = container.clientWidth;
+            const height = 280;
+            const margin = { top: 10, right: 10, bottom: 60, left: 100 };
+
+            const svg = d3.select(container)
+                .append('svg')
+                .attr('width', width)
+                .attr('height', height);
+
+            const topData = data.slice(0, 10);
+
+            // Cap days_of_supply at a reasonable maximum for display
+            const maxDays = Math.min(d3.max(topData, d => parseFloat(d.days_of_supply) || 0), 365);
+
+            const x = d3.scaleLinear()
+                .domain([0, maxDays])
+                .nice()
+                .range([margin.left, width - margin.right]);
+
+            const y = d3.scaleBand()
+                .domain(topData.map(d => d.part_name || d.part_num))
+                .range([margin.top, height - margin.bottom])
+                .padding(0.2);
+
+            svg.selectAll('rect')
+                .data(topData)
+                .enter()
+                .append('rect')
+                .attr('x', margin.left)
+                .attr('y', d => y(d.part_name || d.part_num))
+                .attr('width', d => Math.max(0, x(Math.min(parseFloat(d.days_of_supply) || 0, maxDays)) - margin.left))
+                .attr('height', y.bandwidth())
+                .attr('fill', '#f97316')
+                .style('cursor', 'pointer')
+                .on('mouseover', function(event, d) {
+                    d3.select(this).style('opacity', 0.7);
+                    showTooltip(event, `
+                        <strong>${d.part_name || d.part_num}</strong><br>
+                        On Hand: ${parseFloat(d.qty_on_hand || 0).toLocaleString()}<br>
+                        Sold (period): ${parseFloat(d.qty_sold || 0).toLocaleString()}<br>
+                        Days of Supply: ${d.days_of_supply && d.days_of_supply < 99999 ? parseFloat(d.days_of_supply).toFixed(0) : '∞'}
+                    `);
+                })
+                .on('mouseout', function() {
+                    d3.select(this).style('opacity', 1);
+                    hideTooltip();
+                });
+
+            svg.append('g')
+                .attr('transform', `translate(0, ${height - margin.bottom})`)
+                .attr('class', 'axis')
+                .call(d3.axisBottom(x));
+
+            // Add X-axis label
+            svg.append('text')
+                .attr('x', width / 2)
+                .attr('y', height - 5)
+                .attr('text-anchor', 'middle')
+                .style('font-size', '12px')
+                .style('fill', '#64748b')
+                .text('Days of Stock');
+
+            svg.append('g')
+                .attr('transform', `translate(${margin.left}, 0)`)
+                .attr('class', 'axis')
+                .call(d3.axisLeft(y))
+                .selectAll('text')
+                .style('font-size', '9px')
+                .text(d => d && d.length > 15 ? d.substring(0, 15) + '...' : d);
+        }
+
         // Store KPI values globally for header updates
         let kpiValues = {
             totalValue: 0,
@@ -2518,6 +2677,10 @@
                 // Load stock movement data
                 const movementData = getMovementSummary();
                 renderMovementChart(movementData);
+
+                // Load slow-moving inventory data
+                const slowMovingData = getSlowMovingInventory();
+                renderSlowMovingChart(slowMovingData);
 
                 debugLog('Dashboard loaded successfully', 'success');
 
