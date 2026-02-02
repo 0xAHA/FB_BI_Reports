@@ -98,3 +98,12 @@
   - Currently using partcost.avgCost (current average cost)
   - Should investigate using cost at time of scrap/adjustment instead
   - May need to pull from inventorylog or related cost history table
+
+---
+
+### Inv_Reorder_Watchlist.htm - Issues
+
+#### Pending:
+- [ ] Fix "Include No ROP/OUL" feature - not showing parts without reorder points
+  - Checkbox exists but filter may not be working correctly
+  - Need to verify SQL query includes parts with NULL reorderpoint/orderuptolevel
