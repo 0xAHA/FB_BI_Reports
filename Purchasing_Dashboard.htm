@@ -404,8 +404,8 @@
                     </div>
                 </div>
 
-                <!-- Debug Console -->
-                <div class="mt-6">
+                <!-- Debug Console (hidden by default, shown if BI_SHOW_DEBUG=true) -->
+                <div id="debugConsoleContainer" class="mt-6" style="display: none;">
                     <div class="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
                         <button onclick="toggleDebugConsole()" class="w-full px-6 py-3 flex items-center justify-between hover:bg-slate-50 transition-colors">
                             <div class="flex items-center gap-2">
@@ -497,6 +497,103 @@
         let customStartDate = null;
         let customEndDate = null;
 
+        // Financial Year start month (1-12, default 7 = July)
+        // Configure via Fishbowl property: BI_FY_START_MONTH
+        const FY_START_MONTH = parseInt(getProperty('BI_FY_START_MONTH', '7')) || 7;
+
+        // Debug mode from Fishbowl system property (default to false)
+        const BI_SHOW_DEBUG_PROP = typeof getProperty === 'function' ? getProperty('BI_SHOW_DEBUG', 'false') : 'false';
+        const DEBUG_MODE = BI_SHOW_DEBUG_PROP === 'true' || BI_SHOW_DEBUG_PROP === true;
+
+        // Date format from Fishbowl system property (default to US format)
+        const FB_DATE_FORMAT = typeof getProperty === 'function' ? getProperty('DateFormatShort', 'MM/dd/yyyy') : 'MM/dd/yyyy';
+        // Convert Java SimpleDateFormat to moment.js format (dd -> DD, yyyy -> YYYY)
+        const MOMENT_DATE_FORMAT = FB_DATE_FORMAT
+            .replace(/yyyy/g, 'YYYY')
+            .replace(/yy/g, 'YY')
+            .replace(/dd/g, 'DD');
+
+        // Price formatting from Fishbowl system property
+        // Format: "$ #,##0.00" - currency symbol followed by number format
+        const PRICE_FORMAT = getProperty('REPORT_DECIMAL_PRICE', '$ #,##0.00');
+
+        // Currency symbols lookup table
+        const CURRENCY_SYMBOLS = {
+            'AUD': '$',      // Australian Dollar
+            'USD': '$',      // US Dollar
+            'NZD': '$',      // New Zealand Dollar
+            'CAD': '$',      // Canadian Dollar
+            'SGD': '$',      // Singapore Dollar
+            'HKD': '$',      // Hong Kong Dollar
+            'EUR': '€',      // Euro
+            'GBP': '£',      // British Pound
+            'JPY': '¥',      // Japanese Yen
+            'CNY': '¥',      // Chinese Yuan
+            'CHF': 'CHF',    // Swiss Franc
+            'SEK': 'kr',     // Swedish Krona
+            'NOK': 'kr',     // Norwegian Krone
+            'DKK': 'kr',     // Danish Krone
+            'INR': '₹',      // Indian Rupee
+            'ZAR': 'R',      // South African Rand
+            'BRL': 'R$',     // Brazilian Real
+            'MXN': '$',      // Mexican Peso
+            'KRW': '₩',      // South Korean Won
+            'THB': '฿',      // Thai Baht
+            'MYR': 'RM',     // Malaysian Ringgit
+            'PHP': '₱',      // Philippine Peso
+            'IDR': 'Rp',     // Indonesian Rupiah
+            'AED': 'د.إ',    // UAE Dirham
+            'SAR': '﷼',      // Saudi Riyal
+            'RUB': '₽',      // Russian Ruble
+            'PLN': 'zł',     // Polish Zloty
+            'TRY': '₺',      // Turkish Lira
+            'ILS': '₪',      // Israeli Shekel
+            'CZK': 'Kč',     // Czech Koruna
+            'HUF': 'Ft',     // Hungarian Forint
+            'TWD': 'NT$',    // Taiwan Dollar
+            'VND': '₫',      // Vietnamese Dong
+        };
+
+        // Get home currency symbol from database
+        function getHomeCurrencySymbol() {
+            try {
+                const query = `SELECT code FROM currency WHERE homeCurrency = 1 LIMIT 1`;
+                const result = runQuery(query);
+                if (result) {
+                    const parsed = JSON.parse(result);
+                    if (parsed && parsed.length > 0 && parsed[0].code) {
+                        const code = parsed[0].code.toUpperCase();
+                        const symbol = CURRENCY_SYMBOLS[code] || code;
+                        console.log(`Home currency: ${code} → Symbol: ${symbol}`);
+                        return symbol;
+                    }
+                }
+            } catch (e) {
+                console.error(`getHomeCurrencySymbol error: ${e.message}`);
+            }
+            // Fallback to parsing from REPORT_DECIMAL_PRICE
+            return PRICE_FORMAT.match(/^[^#0,.\s]+/) ? PRICE_FORMAT.match(/^[^#0,.\s]+/)[0].trim() : '$';
+        }
+
+        // Parse decimal places from price format
+        const DECIMAL_PLACES = (PRICE_FORMAT.match(/\.([0#]+)$/) || ['', '00'])[1].length;
+
+        // Get the currency symbol (from DB or fallback)
+        const CURRENCY_SYMBOL = getHomeCurrencySymbol();
+
+        // Global currency formatting function
+        function formatCurrency(value, showDecimals = true) {
+            const num = parseFloat(value || 0);
+            const isNegative = num < 0;
+            const absValue = Math.abs(num);
+            const decimals = showDecimals ? DECIMAL_PLACES : 0;
+            const formatted = absValue.toLocaleString('en-US', {
+                minimumFractionDigits: decimals,
+                maximumFractionDigits: decimals
+            });
+            return isNegative ? `-${CURRENCY_SYMBOL}${formatted}` : `${CURRENCY_SYMBOL}${formatted}`;
+        }
+
         // Color palette for charts
         const colorPalette = [
             '#2d9cdb', '#3b82f6', '#10b981', '#f59e0b', '#ef4444',
@@ -521,7 +618,21 @@
 
         // Initialize on page load
         window.addEventListener('DOMContentLoaded', function() {
+            // Show debug console if DEBUG_MODE is enabled
+            if (DEBUG_MODE) {
+                document.getElementById('debugConsoleContainer').style.display = 'block';
+            }
+
             console.log('Purchasing Dashboard initializing...');
+
+            // Set default date range to Current Financial Year
+            const fyDates = getFYDates(0);
+            customStartDate = fyDates.start;
+            customEndDate = fyDates.end;
+            document.getElementById('dateRangeFilter').value = 'current_fy';
+            document.getElementById('customStartDate').value = fyDates.start;
+            document.getElementById('customEndDate').value = fyDates.end;
+
             loadFilters();
             loadDashboard();
         });
@@ -562,31 +673,49 @@
         }
 
         function getQuarterDates(quartersAgo) {
+            // Use moment's built-in quarter handling for proper year rollover
             const now = moment();
-            const quarter = now.quarter() - quartersAgo;
-            const year = now.year() - Math.floor((now.quarter() - quartersAgo - 1) / 4);
-            const targetQuarter = ((quarter - 1 + 4) % 4) + 1;
+            const currentQuarterStart = moment(now).startOf('quarter');
+            const targetQuarterStart = moment(currentQuarterStart).subtract(quartersAgo, 'quarters');
 
-            const start = moment().year(year).quarter(targetQuarter).startOf('quarter').format('YYYY-MM-DD');
-            const end = moment().year(year).quarter(targetQuarter).endOf('quarter').format('YYYY-MM-DD');
+            const start = targetQuarterStart.startOf('quarter').format('YYYY-MM-DD');
+            const end = moment(targetQuarterStart).endOf('quarter').format('YYYY-MM-DD');
 
             return { start, end };
         }
 
         function getFYDates(yearsAgo) {
-            const fyStartMonth = 6; // July (0-indexed = 6)
+            // Financial Year: Configurable via BI_FY_START_MONTH property (1-12)
+            // Default: July (7) to June (6) - Australian/UK financial year
             const now = moment();
-            const currentMonth = now.month();
+            const currentMonth = now.month() + 1; // Convert 0-11 to 1-12
+            const currentYear = now.year();
 
-            let fyYear = now.year() - yearsAgo;
-            if (currentMonth < fyStartMonth) {
-                fyYear -= 1;
+            // FY_START_MONTH is 1-12 (e.g., 7 = July, 10 = October, 1 = January)
+            const fyStartMonth = Math.max(1, Math.min(12, FY_START_MONTH));
+
+            // Determine which FY we're currently in
+            let fyStartYear = currentMonth >= fyStartMonth ? currentYear : currentYear - 1;
+            fyStartYear -= yearsAgo;
+
+            // Calculate end month and year
+            let fyEndMonth, fyEndYear;
+            if (fyStartMonth === 1) {
+                // January start = calendar year (Jan-Dec)
+                fyEndMonth = 12;
+                fyEndYear = fyStartYear;
+            } else {
+                fyEndMonth = fyStartMonth - 1;
+                fyEndYear = fyStartYear + 1;
             }
 
-            const start = moment().year(fyYear).month(fyStartMonth).date(1).format('YYYY-MM-DD');
-            const end = moment().year(fyYear + 1).month(fyStartMonth).date(1).subtract(1, 'day').format('YYYY-MM-DD');
+            // Get the last day of the end month
+            const endDate = moment([fyEndYear, fyEndMonth - 1, 1]).endOf('month');
 
-            return { start, end };
+            return {
+                start: `${fyStartYear}-${String(fyStartMonth).padStart(2, '0')}-01`,
+                end: endDate.format('YYYY-MM-DD')
+            };
         }
 
         // ============================================
@@ -786,9 +915,9 @@
             const metrics = data[0];
             const kpiCardsContainer = document.getElementById('kpiCards');
 
-            const totalSpend = '$' + parseFloat(metrics.total_spend || 0).toLocaleString('en-US', {minimumFractionDigits: 0, maximumFractionDigits: 0});
+            const totalSpend = formatCurrency(metrics.total_spend || 0, false);
             const poCount = (metrics.po_count || 0).toLocaleString();
-            const avgPOValue = '$' + parseFloat(metrics.avg_po_value || 0).toLocaleString('en-US', {minimumFractionDigits: 0, maximumFractionDigits: 0});
+            const avgPOValue = formatCurrency(metrics.avg_po_value || 0, false);
 
             // Get average lead time
             let avgLeadTime = 'N/A';
@@ -1276,7 +1405,7 @@
                         tooltip.style('opacity', 1)
                             .html(`
                                 <div><span class="tooltip-label">Month:</span><span class="tooltip-value">${moment(d.month).format('MMM YYYY')}</span></div>
-                                <div><span class="tooltip-label">Total Spend:</span><span class="tooltip-value">$${parseFloat(d.total_spend).toLocaleString('en-US', {minimumFractionDigits: 2})}</span></div>
+                                <div><span class="tooltip-label">Total Spend:</span><span class="tooltip-value">${formatCurrency(d.total_spend)}</span></div>
                             `)
                             .style('left', (event.pageX + 10) + 'px')
                             .style('top', (event.pageY - 10) + 'px');
@@ -1318,7 +1447,7 @@
                         tooltip.style('opacity', 1)
                             .html(`
                                 <div><span class="tooltip-label">Month:</span><span class="tooltip-value">${moment(d.month).format('MMM YYYY')}</span></div>
-                                <div><span class="tooltip-label">Total Spend:</span><span class="tooltip-value">$${parseFloat(d.total_spend).toLocaleString('en-US', {minimumFractionDigits: 2})}</span></div>
+                                <div><span class="tooltip-label">Total Spend:</span><span class="tooltip-value">${formatCurrency(d.total_spend)}</span></div>
                             `)
                             .style('left', (event.pageX + 10) + 'px')
                             .style('top', (event.pageY - 10) + 'px');
@@ -1342,7 +1471,7 @@
 
             svg.append('g')
                 .attr('class', 'axis')
-                .call(d3.axisLeft(y).ticks(5).tickFormat(d => '$' + (d / 1000).toFixed(0) + 'k'));
+                .call(d3.axisLeft(y).ticks(5).tickFormat(d => CURRENCY_SYMBOL + (d / 1000).toFixed(0) + 'k'));
 
             debugLog(`Monthly spend chart rendered: ${data.length} months`, 'success');
         }
@@ -1558,7 +1687,7 @@
                 item.innerHTML = `
                     <div class="flex justify-between text-sm">
                         <span class="font-semibold text-slate-700">PO ${po.po_num}</span>
-                        <span class="text-blue-700 font-bold">$${parseFloat(po.po_value).toLocaleString('en-US', {maximumFractionDigits: 0})}</span>
+                        <span class="text-blue-700 font-bold">${formatCurrency(po.po_value, false)}</span>
                     </div>
                     <div class="flex justify-between text-xs text-slate-500 mt-1">
                         <span>${po.vendor_name}</span>
@@ -1594,7 +1723,7 @@
                 item.innerHTML = `
                     <div class="flex justify-between text-sm">
                         <span class="font-semibold text-slate-700">PO ${po.po_num}</span>
-                        <span class="text-red-700 font-bold">$${parseFloat(po.po_value).toLocaleString('en-US', {maximumFractionDigits: 0})}</span>
+                        <span class="text-red-700 font-bold">${formatCurrency(po.po_value, false)}</span>
                     </div>
                     <div class="flex justify-between text-xs text-slate-500 mt-1">
                         <span>${po.vendor_name}</span>
@@ -1630,11 +1759,11 @@
                 item.innerHTML = `
                     <div class="flex justify-between text-sm">
                         <span class="font-semibold text-slate-700">PO ${po.po_num}</span>
-                        <span class="text-green-700 font-bold">$${parseFloat(po.po_value).toLocaleString('en-US', {maximumFractionDigits: 0})}</span>
+                        <span class="text-green-700 font-bold">${formatCurrency(po.po_value, false)}</span>
                     </div>
                     <div class="flex justify-between text-xs text-slate-500 mt-1">
                         <span>${po.vendor_name}</span>
-                        <span class="text-green-600 font-medium">${moment(po.received_date).format('MMM D')}</span>
+                        <span class="text-green-600 font-medium">${moment(po.received_date).format(MOMENT_DATE_FORMAT)}</span>
                     </div>
                 `;
                 item.addEventListener('click', () => drilldownRecentlyReceived());
@@ -1691,7 +1820,7 @@
                     tooltip.style('opacity', 1)
                         .html(`
                             <div><span class="tooltip-label">Vendor:</span><span class="tooltip-value">${d.vendor_name}</span></div>
-                            <div><span class="tooltip-label">Total Spend:</span><span class="tooltip-value">$${parseFloat(d.total_spend).toLocaleString('en-US', {minimumFractionDigits: 2})}</span></div>
+                            <div><span class="tooltip-label">Total Spend:</span><span class="tooltip-value">${formatCurrency(d.total_spend)}</span></div>
                             <div><span class="tooltip-label">PO Count:</span><span class="tooltip-value">${parseInt(d.po_count).toLocaleString()}</span></div>
                             <div class="text-xs text-slate-500 mt-1">Click to view POs</div>
                         `)
@@ -1709,7 +1838,7 @@
             svg.append('g')
                 .attr('class', 'axis')
                 .attr('transform', `translate(0,${height})`)
-                .call(d3.axisBottom(x).ticks(4).tickFormat(d => '$' + (d / 1000).toFixed(0) + 'k'));
+                .call(d3.axisBottom(x).ticks(4).tickFormat(d => CURRENCY_SYMBOL + (d / 1000).toFixed(0) + 'k'));
 
             svg.append('g')
                 .attr('class', 'axis')
@@ -1768,7 +1897,7 @@
                         .html(`
                             <div><span class="tooltip-label">Vendor:</span><span class="tooltip-value">${d.vendor_name}</span></div>
                             <div><span class="tooltip-label">PO Count:</span><span class="tooltip-value">${parseInt(d.po_count).toLocaleString()}</span></div>
-                            <div><span class="tooltip-label">Total Spend:</span><span class="tooltip-value">$${parseFloat(d.total_spend).toLocaleString('en-US', {minimumFractionDigits: 2})}</span></div>
+                            <div><span class="tooltip-label">Total Spend:</span><span class="tooltip-value">${formatCurrency(d.total_spend)}</span></div>
                         `)
                         .style('left', (event.pageX + 10) + 'px')
                         .style('top', (event.pageY - 10) + 'px');
@@ -1932,7 +2061,7 @@
                             <div><span class="tooltip-label">Part:</span><span class="tooltip-value">${d.part_num}</span></div>
                             <div><span class="tooltip-label">Description:</span><span class="tooltip-value">${d.part_description}</span></div>
                             <div><span class="tooltip-label">Quantity:</span><span class="tooltip-value">${parseFloat(d.total_qty).toLocaleString()}</span></div>
-                            <div><span class="tooltip-label">Total Cost:</span><span class="tooltip-value">$${parseFloat(d.total_cost).toLocaleString('en-US', {minimumFractionDigits: 2})}</span></div>
+                            <div><span class="tooltip-label">Total Cost:</span><span class="tooltip-value">${formatCurrency(d.total_cost)}</span></div>
                         `)
                         .style('left', (event.pageX + 10) + 'px')
                         .style('top', (event.pageY - 10) + 'px');
@@ -2002,7 +2131,7 @@
                     tooltip.style('opacity', 1)
                         .html(`
                             <div><span class="tooltip-label">Category:</span><span class="tooltip-value">${d.category_name}</span></div>
-                            <div><span class="tooltip-label">Total Spend:</span><span class="tooltip-value">$${parseFloat(d.total_spend).toLocaleString('en-US', {minimumFractionDigits: 2})}</span></div>
+                            <div><span class="tooltip-label">Total Spend:</span><span class="tooltip-value">${formatCurrency(d.total_spend)}</span></div>
                             <div><span class="tooltip-label">PO Count:</span><span class="tooltip-value">${parseInt(d.po_count).toLocaleString()}</span></div>
                             <div class="text-xs text-slate-500 mt-1">Click to view POs</div>
                         `)
@@ -2020,7 +2149,7 @@
             svg.append('g')
                 .attr('class', 'axis')
                 .attr('transform', `translate(0,${height})`)
-                .call(d3.axisBottom(x).ticks(4).tickFormat(d => '$' + (d / 1000).toFixed(0) + 'k'));
+                .call(d3.axisBottom(x).ticks(4).tickFormat(d => CURRENCY_SYMBOL + (d / 1000).toFixed(0) + 'k'));
 
             svg.append('g')
                 .attr('class', 'axis')
@@ -2053,11 +2182,11 @@
                 item.innerHTML = `
                     <div class="flex justify-between text-sm">
                         <span class="font-semibold text-slate-700">PO ${po.po_num}</span>
-                        <span class="text-purple-700 font-bold">$${parseFloat(po.po_value).toLocaleString('en-US', {maximumFractionDigits: 0})}</span>
+                        <span class="text-purple-700 font-bold">${formatCurrency(po.po_value, false)}</span>
                     </div>
                     <div class="flex justify-between text-xs text-slate-500 mt-1">
                         <span>${po.vendor_name}</span>
-                        <span class="text-purple-600 font-medium">${moment(po.received_date).format('MMM D, YYYY')}</span>
+                        <span class="text-purple-600 font-medium">${moment(po.received_date).format(MOMENT_DATE_FORMAT)}</span>
                     </div>
                 `;
                 list.appendChild(item);
@@ -2144,24 +2273,12 @@
             const displayEl = document.getElementById('dateRangeDisplay');
             if (!displayEl) return;
 
-            const rangeValue = document.getElementById('dateRangeFilter').value;
-            let displayText = '';
-
+            // Always show the actual date range using DateFormatShort property
             if (customStartDate && customEndDate) {
-                displayText = `(${moment(customStartDate).format('D MMM YYYY')} - ${moment(customEndDate).format('D MMM YYYY')})`;
-            } else if (rangeValue === 'this_quarter') {
-                displayText = '(This Quarter)';
-            } else if (rangeValue === 'last_quarter') {
-                displayText = '(Last Quarter)';
-            } else if (rangeValue === 'current_fy') {
-                displayText = '(Current Financial Year)';
-            } else if (rangeValue === 'last_fy') {
-                displayText = '(Last Financial Year)';
-            } else if (rangeValue) {
-                displayText = `(Last ${rangeValue} Days)`;
+                displayEl.textContent = `(${moment(customStartDate).format(MOMENT_DATE_FORMAT)} - ${moment(customEndDate).format(MOMENT_DATE_FORMAT)})`;
+            } else {
+                displayEl.textContent = '';
             }
-
-            displayEl.textContent = displayText;
         }
 
         function exportToCSV() {
@@ -2199,6 +2316,9 @@
         }
 
         function debugLog(message, type = 'info') {
+            // Only log if DEBUG_MODE is enabled
+            if (!DEBUG_MODE) return;
+
             const timestamp = new Date().toLocaleTimeString();
             const logDiv = document.getElementById('debugLog');
 
@@ -2313,16 +2433,22 @@
                 return `<tr class="${rowClass}" ${rowClick} data-row-index="${rowIndex}">` +
                     currentDrilldownColumns.map(col => {
                         let value = row[col.key];
+                        let colorClass = '';
+                        const numericValue = parseFloat(value || 0);
 
                         // Format based on type
                         if (col.type === 'currency') {
-                            value = '$' + parseFloat(value || 0).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                            value = formatCurrency(numericValue);
+                            // Red text for negative currency values (not bold per UX feedback)
+                            if (numericValue < 0) colorClass = 'text-red-600';
                         } else if (col.type === 'number') {
-                            value = parseFloat(value || 0).toLocaleString('en-US');
+                            value = numericValue.toLocaleString('en-US');
                         } else if (col.type === 'percent') {
-                            value = (parseFloat(value || 0) * 100).toFixed(1) + '%';
+                            value = (numericValue * 100).toFixed(1) + '%';
+                            // Red text for negative percentages (not bold per UX feedback)
+                            if (numericValue < 0) colorClass = 'text-red-600';
                         } else if (col.type === 'date') {
-                            value = moment(value).format('D MMM YYYY');
+                            value = moment(value).format(MOMENT_DATE_FORMAT);
                         } else if (col.format) {
                             value = col.format(value);
                         }
@@ -2332,7 +2458,7 @@
                             value = `<a href="#" class="order-link" onclick="event.stopPropagation(); openPurchaseOrder('${escapeSQL(value)}'); return false;">${value}</a>`;
                         }
 
-                        return `<td class="px-4 py-3 text-sm text-slate-700">${value || ''}</td>`;
+                        return `<td class="px-4 py-3 text-sm text-slate-700 ${colorClass}">${value || ''}</td>`;
                     }).join('') +
                 `</tr>`;
             }).join('');
@@ -2369,6 +2495,16 @@
                 return;
             }
 
+            // Helper to format currency cell with color class for negative handling
+            const formatCurrencyCell = (val) => {
+                const num = parseFloat(val || 0);
+                const isNeg = num < 0;
+                return {
+                    value: formatCurrency(num),
+                    colorClass: isNeg ? 'text-red-600' : 'text-slate-700'
+                };
+            };
+
             // Create expanded row with line items table
             const targetRow = tbody.querySelector(`tr[data-row-index="${rowIndex}"]`);
             const expandedRow = document.createElement('tr');
@@ -2388,15 +2524,18 @@
                                 </tr>
                             </thead>
                             <tbody>
-                                ${lineItems.map(item => `
+                                ${lineItems.map(item => {
+                                    const unitCost = formatCurrencyCell(item.unit_cost);
+                                    const lineTotal = formatCurrencyCell(item.line_total);
+                                    return `
                                     <tr class="border-t border-slate-200">
                                         <td class="py-1 text-slate-700">${item.part_num || ''}</td>
                                         <td class="py-1 text-slate-700">${item.part_description || ''}</td>
                                         <td class="py-1 text-right text-slate-700">${parseFloat(item.qty || 0).toLocaleString()}</td>
-                                        <td class="py-1 text-right text-slate-700">$${parseFloat(item.unit_cost || 0).toFixed(2)}</td>
-                                        <td class="py-1 text-right text-slate-700">$${parseFloat(item.line_total || 0).toLocaleString('en-US', {minimumFractionDigits: 2})}</td>
+                                        <td class="py-1 text-right ${unitCost.colorClass}">${unitCost.value}</td>
+                                        <td class="py-1 text-right ${lineTotal.colorClass}">${lineTotal.value}</td>
                                     </tr>
-                                `).join('')}
+                                `}).join('')}
                             </tbody>
                         </table>
                     </div>
