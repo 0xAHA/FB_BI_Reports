@@ -37,21 +37,16 @@
 
 ---
 
-### Currency Localization (Partially Addressed)
+### Currency Localization (Complete for applicable files)
 - [x] Created global `formatCurrency()` function using REPORT_DECIMAL_PRICE property
 - [x] Currency symbol mapped from home currency code in database (CURRENCY_SYMBOLS lookup)
 - [x] Decimal places extracted from price format pattern
 - [x] Applied to Sales Dashboard
-- [ ] Apply currency symbol mapping to Purchasing Dashboard (copy CURRENCY_SYMBOLS and getHomeCurrencySymbol)
-- [ ] Apply currency symbol mapping to Combined Dashboard
-- [ ] Apply currency symbol mapping to individual tile reports
+- [x] Applied to Purchasing Dashboard (added CURRENCY_SYMBOLS and getHomeCurrencySymbol)
+- [x] Applied to Inventory Dashboard
+- [x] Dashboard_Combined and individual tile reports do NOT display currency/value amounts - no changes needed
 - [ ] Still using 'en-US' locale for number formatting (thousands separator, decimal point)
 - [ ] May need additional property for full locale support if non-US formatting needed (1.234,56 format)
-
-**Affected files still needing updates:**
-- Purchasing_Dashboard.htm (currency symbol mapping)
-- Dashboard_Combined.htm
-- Individual tile reports (*.htm)
 
 **Notes:**
 - Currency symbol now determined by querying home currency code from `currency` table and mapping via CURRENCY_SYMBOLS
@@ -103,21 +98,26 @@
 
 ### Inv_Reorder_Watchlist.htm - Issues
 
-#### Pending:
-- [ ] Fix "Include No ROP/OUL" feature - not showing parts without reorder points
-  - Checkbox exists but filter may not be working correctly
-  - Need to verify SQL query includes parts with NULL reorderpoint/orderuptolevel
+#### Completed:
+- [x] Fix "Include No ROP/OUL" feature - not showing parts without reorder points
+  - Changed INNER JOIN to LEFT OUTER JOIN for partreorder in company-wide query
+  - Added condition to include parts with NO partreorder entry when checkbox is checked
+  - Parts with NULL/0 reorderpoint/orderuptolevel now show with state='norop'
+  - Added part.typeid = 10 filter to both queries to only include Inventory parts
 
 ---
 
 ### #4922 - Printing/Downloading from Built-in Fishbowl Buttons
 - [ ] Built-in Fishbowl print/download buttons are separate to rendered buttons in the page
   - Need to investigate how to hook into or style these buttons
-  - May need coordination with Fishbowl application layer
+  - **Requires external assistance / coordination with Fishbowl application layer**
 
 ---
 
-### #4921 - Date Format Standardization
-- [ ] Use `DateFormatShort` property for date display in dashboard header date ranges
-- [ ] Ensure default format is US format `MM/dd/yyyy` across all files
-- [ ] Apply to: Sales_Dashboard.htm, Purchasing_Dashboard.htm, Inventory_Dashboard.htm
+### #4921 - Date Format Standardization (Completed)
+- [x] Use `DateFormatShort` property for date display in dashboard header date ranges
+- [x] Ensure default format is US format `MM/dd/yyyy` across all files
+- [x] Apply to: Sales_Dashboard.htm, Purchasing_Dashboard.htm, Inventory_Dashboard.htm
+- [x] Apply to: Dashboard_Combined.htm (added moment.js and MOMENT_DATE_FORMAT conversion)
+- [x] Apply to: Individual pages (Open_Sales_Orders_Table_Simple, Open_Purchase_Orders_Table_Simple, etc.)
+- [x] Date filters now compare against formatted dates (matching displayed format)
