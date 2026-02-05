@@ -89,10 +89,14 @@
 
 #### Pending:
 - [ ] Review and test all queries with real data
-- [ ] Confirm best method for correct cost attribution for Scrap/Adjustments
-  - Currently using partcost.avgCost (current average cost)
-  - Should investigate using cost at time of scrap/adjustment instead
-  - May need to pull from inventorylog or related cost history table
+
+#### Completed (Cost Attribution):
+- [x] Correct cost attribution for Scrap/Adjustments implemented
+  - Now using POST table with POST.AMOUNT for historical cost at time of adjustment
+  - Uses POST.DATEPOSTED for date filtering
+  - POST.REFITEMID = 2 for Scrap, 3 for Cycle Count
+  - Joins to INVENTORYLOG via RECORDID for location group filtering and notes
+  - **Verified against standard Fishbowl Adjustments report for Last Calendar Year - numbers match**
 
 ---
 
