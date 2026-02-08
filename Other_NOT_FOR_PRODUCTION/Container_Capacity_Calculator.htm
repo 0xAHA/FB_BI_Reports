@@ -1048,8 +1048,9 @@
             var spec = getContainerSpec();
             if (document.getElementById('enableHeightRestriction').checked) {
                 var maxFill = parseFloat(document.getElementById('maxFillHeight').value) || spec.height;
+                maxFill = Math.min(maxFill, spec.height); // Never exceed container height
                 var pallet = parseFloat(document.getElementById('palletHeight').value) || 0;
-                return Math.min(maxFill - pallet, spec.height);
+                return Math.max(0, Math.min(maxFill - pallet, spec.height));
             }
             return spec.height;
         }
@@ -1097,7 +1098,7 @@
             var vol = l * w * h;
             var payload = parseFloat(document.getElementById('maxPayload').value) || 0;
 
-            document.getElementById('summaryDims').innerHTML = formatNumber(l) + ' &times; ' + formatNumber(w) + ' &times; ' + formatNumber(h) + 'm';
+            document.getElementById('summaryDims').innerHTML = '<span class="text-slate-400">(L)</span> ' + formatNumber(l) + ' &times; <span class="text-slate-400">(W)</span> ' + formatNumber(w) + ' &times; <span class="text-slate-400">(H)</span> ' + formatNumber(h) + 'm';
             document.getElementById('summaryVolume').textContent = formatNumber(vol) + ' m\u00B3';
             document.getElementById('summaryPayload').textContent = formatNumber(payload, 0) + ' kg';
         }
@@ -1549,9 +1550,14 @@
                 .attr('height', '100%')
                 .attr('preserveAspectRatio', 'xMidYMid meet');
 
-            var angle = Math.PI / 6;
-            var cosA = Math.cos(angle);
-            var sinA = Math.sin(angle);
+            // Dimetric projection: slightly different angles for x/z axes
+            // so the rear bottom edge doesn't visually overlap the front top edge
+            var angleX = Math.PI / 7;   // ~25.7° for length axis (shallower)
+            var angleZ = Math.PI / 5;   // 36° for width axis (steeper)
+            var cosAx = Math.cos(angleX);
+            var sinAx = Math.sin(angleX);
+            var cosAz = Math.cos(angleZ);
+            var sinAz = Math.sin(angleZ);
 
             var spec = getContainerSpec();
             var effectiveH = getEffectiveHeight();
@@ -1569,8 +1575,8 @@
 
             function iso(x, y, z) {
                 return {
-                    px: cx + (x - z) * cosA,
-                    py: cy - y + (x + z) * sinA
+                    px: cx + x * cosAx - z * cosAz,
+                    py: cy - y + x * sinAx + z * sinAz
                 };
             }
 
@@ -1588,10 +1594,9 @@
 
             var g = svg.append('g');
 
-            // --- CARTONS inside the container ---
+            // --- PALLETS inside the container (filling from rear) ---
             if (fillRatio > 0) {
-                var cartonFillH = effectiveBoxH * Math.min(fillRatio, 1.0);
-                renderCartons(g, iso, pts, boxL, boxW, cartonFillH, scale);
+                renderPallets(g, iso, pts, boxL, boxW, effectiveBoxH, scale, Math.min(fillRatio, 1.0));
             }
 
             // Overflow indicator
@@ -1643,16 +1648,27 @@
                 .attr('x2', corners.C.px).attr('y2', corners.C.py)
                 .style('stroke', '#334155').style('stroke-width', '2');
 
-            // Height restriction line (if enabled)
+            // Height restriction line on all 4 sides (if enabled)
             if (document.getElementById('enableHeightRestriction').checked && effectiveBoxH < boxH) {
                 var rE = iso(0, effectiveBoxH, 0);
                 var rF = iso(boxL, effectiveBoxH, 0);
                 var rG = iso(boxL, effectiveBoxH, boxW);
+                var rH = iso(0, effectiveBoxH, boxW);
+                // Front: E→F
                 g.append('line').attr('x1', rE.px).attr('y1', rE.py)
                     .attr('x2', rF.px).attr('y2', rF.py)
                     .style('stroke', '#f59e0b').style('stroke-width', '1.5').style('stroke-dasharray', '8,4');
+                // Right: F→G
                 g.append('line').attr('x1', rF.px).attr('y1', rF.py)
                     .attr('x2', rG.px).attr('y2', rG.py)
+                    .style('stroke', '#f59e0b').style('stroke-width', '1.5').style('stroke-dasharray', '8,4');
+                // Back: G→H
+                g.append('line').attr('x1', rG.px).attr('y1', rG.py)
+                    .attr('x2', rH.px).attr('y2', rH.py)
+                    .style('stroke', '#f59e0b').style('stroke-width', '1.5').style('stroke-dasharray', '8,4');
+                // Left: H→E
+                g.append('line').attr('x1', rH.px).attr('y1', rH.py)
+                    .attr('x2', rE.px).attr('y2', rE.py)
                     .style('stroke', '#f59e0b').style('stroke-width', '1.5').style('stroke-dasharray', '8,4');
             }
 
@@ -1753,9 +1769,6 @@
             // Fill % label (left of fill line)
             var fLbl = document.getElementById('labelFillPct');
             if (fillRatio > 0 && fillRatio <= 1.0) {
-                var angle = Math.PI / 6;
-                var cosA = Math.cos(angle);
-                var sinA = Math.sin(angle);
                 var fY = effectiveBoxH * fillRatio;
                 // iso(0, fY, 0) - but we need the actual point
                 var fPt = { px: corners.A.px, py: corners.A.py - fY + 0 }; // simplified: use corner A's x, shifted up
@@ -1798,111 +1811,146 @@
            CARTON RENDERING - COMPLETE BOXES
            ============================================ */
 
-        function renderCartons(g, iso, pts, boxL, boxW, fillH, scale) {
-            if (fillH <= 0) return;
+        function renderPallets(g, iso, pts, boxL, boxW, effectiveBoxH, scale, fillRatio) {
+            if (fillRatio <= 0 || effectiveBoxH <= 0) return;
 
-            // Carton size relative to container
-            var cartonL = boxL * 0.10;
-            var cartonW = boxW * 0.28;
-            var cartonH = fillH * 0.22;
+            // Standard Australian pallet: 1.165m × 1.165m
+            // Fits 2-across in standard containers (2 × 1.165 = 2.33m ≈ 2.35m width)
+            var palletLenM = 1.165;
+            var palletWidM = 1.165;
+            var palletBaseHM = 0.15; // Pallet deck height in metres
 
-            cartonL = Math.max(cartonL, 8);
-            cartonW = Math.max(cartonW, 6);
-            cartonH = Math.max(cartonH, 6);
+            var palletL = palletLenM * scale;
+            var palletW = palletWidM * scale;
+            var palletBaseH = Math.min(palletBaseHM * scale, effectiveBoxH * 0.08);
 
-            var nL = Math.max(1, Math.floor(boxL / cartonL));
-            var nW = Math.max(1, Math.floor(boxW / cartonW));
-            var nH = Math.max(1, Math.floor(fillH / cartonH));
+            // How many pallets fit in each direction
+            var nL = Math.max(1, Math.floor(boxL / palletL));
+            var nW = Math.max(1, Math.floor(boxW / palletW));
 
-            cartonL = boxL / nL;
-            cartonW = boxW / nW;
-            cartonH = fillH / nH;
+            // Actual pallet size snapped to fill container evenly
+            var actualPL = boxL / nL;
+            var actualPW = boxW / nW;
 
-            var gap = Math.max(1, scale * 0.02);
+            var totalPositions = nL * nW;
+            var exactFilled = totalPositions * fillRatio;
+            var fullPallets = Math.floor(exactFilled);
+            var partialFraction = exactFilled - fullPallets;
 
-            // Carton colour palette - each has 6 face colours for a complete box
-            var cartonColors = [
-                { front: 'rgba(180, 140, 80, 0.72)', right: 'rgba(150, 115, 55, 0.68)', top: 'rgba(205, 170, 105, 0.75)',
-                  left: 'rgba(195, 158, 95, 0.55)', back: 'rgba(170, 130, 70, 0.50)', bottom: 'rgba(140, 105, 50, 0.45)',
-                  stroke: 'rgba(110, 80, 30, 0.55)' },
-                { front: 'rgba(170, 130, 70, 0.68)', right: 'rgba(140, 105, 45, 0.65)', top: 'rgba(195, 160, 95, 0.72)',
-                  left: 'rgba(185, 148, 85, 0.52)', back: 'rgba(160, 120, 60, 0.47)', bottom: 'rgba(130, 95, 40, 0.42)',
-                  stroke: 'rgba(100, 70, 25, 0.50)' },
-                { front: 'rgba(190, 150, 90, 0.70)', right: 'rgba(160, 125, 65, 0.66)', top: 'rgba(215, 180, 115, 0.74)',
-                  left: 'rgba(205, 168, 105, 0.53)', back: 'rgba(180, 140, 80, 0.48)', bottom: 'rgba(150, 115, 55, 0.43)',
-                  stroke: 'rgba(120, 90, 35, 0.52)' },
-                { front: 'rgba(165, 125, 65, 0.66)', right: 'rgba(135, 100, 40, 0.62)', top: 'rgba(190, 155, 90, 0.70)',
-                  left: 'rgba(180, 142, 80, 0.50)', back: 'rgba(155, 115, 55, 0.45)', bottom: 'rgba(125, 90, 35, 0.40)',
-                  stroke: 'rgba(95, 65, 20, 0.48)' }
+            var gap = Math.max(0.5, scale * 0.008);
+            var goodsH = effectiveBoxH - palletBaseH;
+
+            // Pallet base colours (wooden)
+            var baseCol = {
+                front: 'rgba(139, 90, 43, 0.85)', right: 'rgba(120, 75, 35, 0.80)',
+                top: 'rgba(160, 110, 60, 0.88)', left: 'rgba(145, 95, 48, 0.70)',
+                back: 'rgba(110, 70, 30, 0.60)', stroke: 'rgba(80, 50, 15, 0.55)'
+            };
+
+            // Goods colours - alternating for visual variety
+            var goodsColors = [
+                { front: 'rgba(180, 140, 80, 0.75)', right: 'rgba(150, 115, 55, 0.70)', top: 'rgba(205, 170, 105, 0.78)',
+                  left: 'rgba(195, 158, 95, 0.58)', back: 'rgba(170, 130, 70, 0.52)',
+                  stroke: 'rgba(110, 80, 30, 0.50)' },
+                { front: 'rgba(170, 130, 70, 0.70)', right: 'rgba(140, 105, 45, 0.65)', top: 'rgba(195, 160, 95, 0.72)',
+                  left: 'rgba(185, 148, 85, 0.52)', back: 'rgba(160, 120, 60, 0.47)',
+                  stroke: 'rgba(100, 70, 25, 0.48)' },
+                { front: 'rgba(190, 150, 90, 0.72)', right: 'rgba(160, 125, 65, 0.68)', top: 'rgba(215, 180, 115, 0.76)',
+                  left: 'rgba(205, 168, 105, 0.55)', back: 'rgba(180, 140, 80, 0.50)',
+                  stroke: 'rgba(120, 90, 35, 0.50)' }
             ];
 
-            function colorIdx(ix, iy, iz) {
-                return ((ix * 7) + (iy * 13) + (iz * 3)) % cartonColors.length;
-            }
-
-            // Render back-to-front for correct overlap: high z first, low y first, low x first
+            // Render back-to-front for correct overlap: high z (rear) first, low x first
             for (var iz = nW - 1; iz >= 0; iz--) {
-                for (var iy = 0; iy < nH; iy++) {
-                    for (var ix = 0; ix < nL; ix++) {
-                        var x0 = ix * cartonL + gap;
-                        var y0 = iy * cartonH + gap;
-                        var z0 = iz * cartonW + gap;
-                        var cL = cartonL - gap * 2;
-                        var cW = cartonW - gap * 2;
-                        var cH = cartonH - gap * 2;
-                        if (cL <= 0 || cW <= 0 || cH <= 0) continue;
+                for (var ix = 0; ix < nL; ix++) {
+                    // Fill from rear: rear row (iz=nW-1) fills first
+                    var fillIdx = (nW - 1 - iz) * nL + ix;
+                    var isFull = fillIdx < fullPallets;
+                    var isPartial = (fillIdx === fullPallets) && partialFraction > 0.02;
 
-                        var col = cartonColors[colorIdx(ix, iy, iz)];
+                    var x0 = ix * actualPL + gap;
+                    var z0 = iz * actualPW + gap;
+                    var pL = actualPL - gap * 2;
+                    var pW = actualPW - gap * 2;
+                    if (pL <= 0 || pW <= 0) continue;
 
-                        // 8 corners
-                        var cA = iso(x0, y0, z0);
-                        var cB = iso(x0 + cL, y0, z0);
-                        var cC = iso(x0 + cL, y0, z0 + cW);
-                        var cD = iso(x0, y0, z0 + cW);
-                        var cE = iso(x0, y0 + cH, z0);
-                        var cF = iso(x0 + cL, y0 + cH, z0);
-                        var cG = iso(x0 + cL, y0 + cH, z0 + cW);
-                        var cH2 = iso(x0, y0 + cH, z0 + cW);
+                    // --- Pallet base (always drawn for all positions) ---
+                    var bA = iso(x0, 0, z0);
+                    var bB = iso(x0 + pL, 0, z0);
+                    var bC = iso(x0 + pL, 0, z0 + pW);
+                    var bD = iso(x0, 0, z0 + pW);
+                    var bE = iso(x0, palletBaseH, z0);
+                    var bF = iso(x0 + pL, palletBaseH, z0);
+                    var bG = iso(x0 + pL, palletBaseH, z0 + pW);
+                    var bH = iso(x0, palletBaseH, z0 + pW);
 
-                        // Draw all 6 faces for a complete box
-                        // Back-left face (partially hidden but gives depth)
-                        g.append('polygon').attr('points', pts(cD, cC, cG, cH2))
-                            .style('fill', col.back).style('stroke', col.stroke).style('stroke-width', '0.4');
-                        // Left face
-                        g.append('polygon').attr('points', pts(cA, cD, cH2, cE))
-                            .style('fill', col.left).style('stroke', col.stroke).style('stroke-width', '0.4');
-                        // Bottom face
-                        g.append('polygon').attr('points', pts(cA, cB, cC, cD))
-                            .style('fill', col.bottom).style('stroke', col.stroke).style('stroke-width', '0.3');
+                    // Hidden faces first
+                    g.append('polygon').attr('points', pts(bD, bC, bG, bH))
+                        .style('fill', baseCol.back).style('stroke', baseCol.stroke).style('stroke-width', '0.3');
+                    g.append('polygon').attr('points', pts(bA, bD, bH, bE))
+                        .style('fill', baseCol.left).style('stroke', baseCol.stroke).style('stroke-width', '0.3');
+                    // Visible faces
+                    g.append('polygon').attr('points', pts(bA, bB, bF, bE))
+                        .style('fill', baseCol.front).style('stroke', baseCol.stroke).style('stroke-width', '0.5');
+                    g.append('polygon').attr('points', pts(bB, bC, bG, bF))
+                        .style('fill', baseCol.right).style('stroke', baseCol.stroke).style('stroke-width', '0.5');
+                    g.append('polygon').attr('points', pts(bE, bF, bG, bH))
+                        .style('fill', baseCol.top).style('stroke', baseCol.stroke).style('stroke-width', '0.5');
 
-                        // Front face
-                        g.append('polygon').attr('points', pts(cA, cB, cF, cE))
-                            .style('fill', col.front).style('stroke', col.stroke).style('stroke-width', '0.6');
-                        // Right face
-                        g.append('polygon').attr('points', pts(cB, cC, cG, cF))
-                            .style('fill', col.right).style('stroke', col.stroke).style('stroke-width', '0.6');
-                        // Top face
-                        g.append('polygon').attr('points', pts(cE, cF, cG, cH2))
-                            .style('fill', col.top).style('stroke', col.stroke).style('stroke-width', '0.6');
+                    // Slat lines on pallet top (decorative)
+                    for (var s = 0; s < 3; s++) {
+                        var slatZ = z0 + pW * (0.15 + s * 0.35);
+                        var sS = iso(x0, palletBaseH, slatZ);
+                        var sE2 = iso(x0 + pL, palletBaseH, slatZ);
+                        g.append('line').attr('x1', sS.px).attr('y1', sS.py)
+                            .attr('x2', sE2.px).attr('y2', sE2.py)
+                            .style('stroke', baseCol.stroke).style('stroke-width', '0.5');
+                    }
 
-                        // Tape line across top (decorative)
-                        var tapeMidX = x0 + cL / 2;
-                        var tapeS = iso(tapeMidX, y0 + cH, z0);
-                        var tapeE = iso(tapeMidX, y0 + cH, z0 + cW);
-                        g.append('line')
-                            .attr('x1', tapeS.px).attr('y1', tapeS.py)
-                            .attr('x2', tapeE.px).attr('y2', tapeE.py)
-                            .style('stroke', 'rgba(160, 120, 40, 0.30)')
-                            .style('stroke-width', Math.max(1, cL * 0.05));
+                    // --- Goods on pallet (if filled) ---
+                    if (isFull || isPartial) {
+                        var gH = isPartial ? goodsH * partialFraction : goodsH;
+                        if (gH <= 0) continue;
 
-                        // Vertical tape line down front face (decorative)
-                        var tapeFrontTop = iso(tapeMidX, y0 + cH, z0);
-                        var tapeFrontBot = iso(tapeMidX, y0, z0);
-                        g.append('line')
-                            .attr('x1', tapeFrontTop.px).attr('y1', tapeFrontTop.py)
-                            .attr('x2', tapeFrontBot.px).attr('y2', tapeFrontBot.py)
-                            .style('stroke', 'rgba(160, 120, 40, 0.22)')
-                            .style('stroke-width', Math.max(1, cL * 0.05));
+                        var col = goodsColors[(ix + iz) % goodsColors.length];
+                        var baseY = palletBaseH;
+
+                        var gA = iso(x0, baseY, z0);
+                        var gB = iso(x0 + pL, baseY, z0);
+                        var gC = iso(x0 + pL, baseY, z0 + pW);
+                        var gD = iso(x0, baseY, z0 + pW);
+                        var gE = iso(x0, baseY + gH, z0);
+                        var gF = iso(x0 + pL, baseY + gH, z0);
+                        var gG = iso(x0 + pL, baseY + gH, z0 + pW);
+                        var gH2 = iso(x0, baseY + gH, z0 + pW);
+
+                        // Hidden faces
+                        g.append('polygon').attr('points', pts(gD, gC, gG, gH2))
+                            .style('fill', col.back).style('stroke', col.stroke).style('stroke-width', '0.3');
+                        g.append('polygon').attr('points', pts(gA, gD, gH2, gE))
+                            .style('fill', col.left).style('stroke', col.stroke).style('stroke-width', '0.3');
+                        // Visible faces
+                        g.append('polygon').attr('points', pts(gA, gB, gF, gE))
+                            .style('fill', col.front).style('stroke', col.stroke).style('stroke-width', '0.5');
+                        g.append('polygon').attr('points', pts(gB, gC, gG, gF))
+                            .style('fill', col.right).style('stroke', col.stroke).style('stroke-width', '0.5');
+                        g.append('polygon').attr('points', pts(gE, gF, gG, gH2))
+                            .style('fill', col.top).style('stroke', col.stroke).style('stroke-width', '0.5');
+
+                        // Shrink-wrap strap lines (decorative)
+                        if (gH > 5) {
+                            var strapY = baseY + gH * 0.45;
+                            var stFS = iso(x0, strapY, z0);
+                            var stFE = iso(x0 + pL, strapY, z0);
+                            g.append('line').attr('x1', stFS.px).attr('y1', stFS.py)
+                                .attr('x2', stFE.px).attr('y2', stFE.py)
+                                .style('stroke', 'rgba(0,0,0,0.10)').style('stroke-width', Math.max(1, gH * 0.025));
+                            var stRS = iso(x0 + pL, strapY, z0);
+                            var stRE = iso(x0 + pL, strapY, z0 + pW);
+                            g.append('line').attr('x1', stRS.px).attr('y1', stRS.py)
+                                .attr('x2', stRE.px).attr('y2', stRE.py)
+                                .style('stroke', 'rgba(0,0,0,0.08)').style('stroke-width', Math.max(1, gH * 0.025));
+                        }
                     }
                 }
             }
