@@ -102,6 +102,7 @@
 - [x] Reduced Stock Loss dollar value font size
 - [x] Format all drilldown quantities to 2 decimal places
 - [x] Use consistent MOMENT_DATE_FORMAT for all drilldown dates
+- [x] Remove non-functional Export buttons from Sales, Purchasing, and Inventory dashboards
 
 #### SQL Query Fixes:
 - [x] Fix tag table queries to use correct location relationship
@@ -131,6 +132,10 @@
   - Added condition to include parts with NO partreorder entry when checkbox is checked
   - Parts with NULL/0 reorderpoint/orderuptolevel now show with state='norop'
   - Added part.typeid = 10 filter to both queries to only include Inventory parts
+- [x] Fix multi-location aggregated row display for parts with Location Group ROPs
+  - Show "-" for ROP and OUL columns instead of misleading summed totals
+  - Remove colored status bar for aggregated rows (not meaningful for mixed states)
+  - Preserve normal behavior for single location group filter and Company Wide settings
 
 ---
 
