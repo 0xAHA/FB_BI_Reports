@@ -87,12 +87,40 @@
 - [x] Updated Stock Movement chart with correct inventorylogtype IDs (10=Recv, 20=Ship, 30=Transfer, 40/50=Production)
 - [x] All KPI tiles are clickable with modal drilldowns and export to CSV
 
+#### Fulfillment Pipeline (Added):
+- [x] Added Fulfillment Pipeline metrics to Inventory Dashboard (moved from Sales)
+- [x] Short Pick tile with detailed counts and drilldown
+- [x] Items Ready to Ship tile with counts and drilldown
+- [x] Fixed ShipItem.QtyShipped column reference
+- [x] Fixed Short Parts value calculation using SoItem.UnitPrice
+
+#### Layout & UI Improvements:
+- [x] Redesigned Inventory Dashboard layout with improved KPI tiles
+- [x] Stacked Fulfillment Pipeline metrics vertically with smaller font
+- [x] Dynamic color for Cycle Count adjustments (green=positive, red=negative)
+- [x] Stock Levels by Location Group with dynamic coloring
+- [x] Reduced Stock Loss dollar value font size
+- [x] Format all drilldown quantities to 2 decimal places
+- [x] Use consistent MOMENT_DATE_FORMAT for all drilldown dates
+- [x] Remove non-functional Export buttons from Sales, Purchasing, and Inventory dashboards
+
+#### SQL Query Fixes:
+- [x] Fix tag table queries to use correct location relationship
+- [x] Remove producttree references from tag-based stock queries
+- [x] Use partcost.avgCost instead of product.avgCost (SQL error fix)
+- [x] Exclude zero-quantity cycle count adjustments from drilldown
+- [x] Use POST.DATECREATED instead of DATEPOSTED for adjustments
+
 #### Pending:
 - [ ] Review and test all queries with real data
-- [ ] Confirm best method for correct cost attribution for Scrap/Adjustments
-  - Currently using partcost.avgCost (current average cost)
-  - Should investigate using cost at time of scrap/adjustment instead
-  - May need to pull from inventorylog or related cost history table
+
+#### Completed (Cost Attribution):
+- [x] Correct cost attribution for Scrap/Adjustments implemented
+  - Now using POST table with POST.AMOUNT for historical cost at time of adjustment
+  - Uses POST.DATEPOSTED for date filtering
+  - POST.REFITEMID = 2 for Scrap, 3 for Cycle Count
+  - Joins to INVENTORYLOG via RECORDID for location group filtering and notes
+  - **Verified against standard Fishbowl Adjustments report for Last Calendar Year - numbers match**
 
 ---
 
@@ -104,6 +132,10 @@
   - Added condition to include parts with NO partreorder entry when checkbox is checked
   - Parts with NULL/0 reorderpoint/orderuptolevel now show with state='norop'
   - Added part.typeid = 10 filter to both queries to only include Inventory parts
+- [x] Fix multi-location aggregated row display for parts with Location Group ROPs
+  - Show "-" for ROP and OUL columns instead of misleading summed totals
+  - Remove colored status bar for aggregated rows (not meaningful for mixed states)
+  - Preserve normal behavior for single location group filter and Company Wide settings
 
 ---
 
