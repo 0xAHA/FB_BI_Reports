@@ -87,6 +87,29 @@
 - [x] Updated Stock Movement chart with correct inventorylogtype IDs (10=Recv, 20=Ship, 30=Transfer, 40/50=Production)
 - [x] All KPI tiles are clickable with modal drilldowns and export to CSV
 
+#### Fulfillment Pipeline (Added):
+- [x] Added Fulfillment Pipeline metrics to Inventory Dashboard (moved from Sales)
+- [x] Short Pick tile with detailed counts and drilldown
+- [x] Items Ready to Ship tile with counts and drilldown
+- [x] Fixed ShipItem.QtyShipped column reference
+- [x] Fixed Short Parts value calculation using SoItem.UnitPrice
+
+#### Layout & UI Improvements:
+- [x] Redesigned Inventory Dashboard layout with improved KPI tiles
+- [x] Stacked Fulfillment Pipeline metrics vertically with smaller font
+- [x] Dynamic color for Cycle Count adjustments (green=positive, red=negative)
+- [x] Stock Levels by Location Group with dynamic coloring
+- [x] Reduced Stock Loss dollar value font size
+- [x] Format all drilldown quantities to 2 decimal places
+- [x] Use consistent MOMENT_DATE_FORMAT for all drilldown dates
+
+#### SQL Query Fixes:
+- [x] Fix tag table queries to use correct location relationship
+- [x] Remove producttree references from tag-based stock queries
+- [x] Use partcost.avgCost instead of product.avgCost (SQL error fix)
+- [x] Exclude zero-quantity cycle count adjustments from drilldown
+- [x] Use POST.DATECREATED instead of DATEPOSTED for adjustments
+
 #### Pending:
 - [ ] Review and test all queries with real data
 
