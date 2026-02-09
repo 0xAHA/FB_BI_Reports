@@ -408,16 +408,16 @@
                     <div id="valueChart" style="height: 300px;"></div>
                 </div>
 
-                <!-- Stock Levels by Location -->
+                <!-- Stock Levels by Location Group -->
                 <div class="bg-white rounded-2xl shadow-md border border-slate-300 p-6">
                     <h3 class="text-lg font-bold text-slate-800 mb-4 flex items-center gap-2">
                         <svg class="w-5 h-5 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path>
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path>
                         </svg>
-                        Stock Levels by Location
+                        Stock Levels by Location Group
                     </h3>
-                    <div id="locationChart" style="height: 300px;"></div>
+                    <div id="locationChart" style="height: 300px; overflow-y: auto;"></div>
                 </div>
             </div>
 
@@ -965,7 +965,7 @@
             return JSON.parse(runQuery(query));
         }
 
-        function getStockByLocation() {
+        function getStockByLocationGroup() {
             const locationGroup = document.getElementById('locationGroupFilter').value;
             const productCategory = document.getElementById('productCategoryFilter').value;
             const vendorFilter = document.getElementById('vendorFilter').value;
@@ -974,26 +974,71 @@
             let categoryCondition = productCategory !== '%' ? `AND pt.name = '${productCategory}'` : '';
             let vendorCondition = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = p.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
 
+            // Get current inventory value by location group using avgCost
             const query = `
                 SELECT
-                    lg.name as location,
-                    DATE(il.dateCreated) as date,
-                    SUM(il.qtyOnHand) as qty
-                FROM inventorylog il
-                JOIN part p ON il.partId = p.id
-                JOIN locationgroup lg ON il.locationgroupid = lg.id
+                    lg.id as location_group_id,
+                    lg.name as location_group_name,
+                    COUNT(DISTINCT p.id) as part_count,
+                    SUM(COALESCE(inv.qty, 0)) as total_qty,
+                    SUM(COALESCE(inv.qty, 0) * COALESCE(p.avgCost, 0)) as total_value
+                FROM locationgroup lg
+                LEFT JOIN (
+                    SELECT
+                        tag.locationgroupid,
+                        tag.partid,
+                        SUM(tag.qty) as qty
+                    FROM tag
+                    WHERE tag.qty > 0
+                    GROUP BY tag.locationgroupid, tag.partid
+                ) inv ON inv.locationgroupid = lg.id
+                LEFT JOIN part p ON inv.partid = p.id AND p.activeflag = 1 AND p.typeid = 10
                 LEFT JOIN producttree pt ON p.treeId = pt.id
-                WHERE ${getDateCondition('il.dateCreated')}
-                    AND p.activeflag = 1
-                    AND p.typeid = 10
+                WHERE 1=1
                     ${lgCondition}
                     ${categoryCondition}
                     ${vendorCondition}
-                GROUP BY lg.name, DATE(il.dateCreated)
-                ORDER BY lg.name, date ASC
+                GROUP BY lg.id, lg.name
+                HAVING total_qty > 0 OR total_value > 0
+                ORDER BY total_value DESC
             `;
 
-            console.log('Stock by Location Query:', query);
+            console.log('Stock by Location Group Query:', query);
+            debugLog('Stock by Location Group Query: ' + query.replace(/\s+/g, ' ').trim(), 'info');
+            return JSON.parse(runQuery(query));
+        }
+
+        function getStockByLocationGroupDetail(locationGroupId) {
+            const productCategory = document.getElementById('productCategoryFilter').value;
+            const vendorFilter = document.getElementById('vendorFilter').value;
+
+            let categoryCondition = productCategory !== '%' ? `AND pt.name = '${productCategory}'` : '';
+            let vendorCondition = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = p.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
+
+            // Get parts and their values for a specific location group
+            const query = `
+                SELECT
+                    p.num as part_num,
+                    p.description,
+                    pt.name as category,
+                    SUM(tag.qty) as qty_on_hand,
+                    COALESCE(p.avgCost, 0) as avg_cost,
+                    SUM(tag.qty) * COALESCE(p.avgCost, 0) as total_value
+                FROM tag
+                JOIN part p ON tag.partid = p.id
+                LEFT JOIN producttree pt ON p.treeId = pt.id
+                WHERE tag.locationgroupid = ${locationGroupId}
+                    AND tag.qty > 0
+                    AND p.activeflag = 1
+                    AND p.typeid = 10
+                    ${categoryCondition}
+                    ${vendorCondition}
+                GROUP BY p.id, p.num, p.description, pt.name, p.avgCost
+                ORDER BY total_value DESC
+            `;
+
+            console.log('Stock by Location Group Detail Query:', query);
+            debugLog('Stock by Location Group Detail Query: ' + query.replace(/\s+/g, ' ').trim(), 'info');
             return JSON.parse(runQuery(query));
         }
 
@@ -2365,6 +2410,10 @@
                 .call(d3.axisLeft(y).ticks(5).tickFormat(d => CURRENCY_SYMBOL + d3.format('.2s')(d)));
         }
 
+        // Store location group data and sort state for the table
+        let locationGroupTableData = [];
+        let locationGroupSort = { column: 'total_value', direction: 'desc' };
+
         function renderLocationChart(data) {
             const container = document.getElementById('locationChart');
             container.innerHTML = '';
@@ -2374,85 +2423,201 @@
                 return;
             }
 
-            // Group data by location
-            const grouped = d3.group(data, d => d.location);
-            const locations = Array.from(grouped.keys());
+            // Store data for sorting
+            locationGroupTableData = data;
 
-            const margin = { top: 20, right: 120, bottom: 40, left: 60 };
-            const width = container.offsetWidth - margin.left - margin.right;
-            const height = 300 - margin.top - margin.bottom;
+            // Render as a table with clickable rows
+            renderLocationGroupTable();
+        }
 
-            const svg = d3.select(container)
-                .append('svg')
-                .attr('width', width + margin.left + margin.right)
-                .attr('height', height + margin.top + margin.bottom)
-                .append('g')
-                .attr('transform', `translate(${margin.left},${margin.top})`);
+        function renderLocationGroupTable() {
+            const container = document.getElementById('locationChart');
+            const data = locationGroupTableData;
 
-            // Scales
-            const x = d3.scaleTime()
-                .domain(d3.extent(data, d => new Date(d.date)))
-                .range([0, width]);
+            if (!data || data.length === 0) {
+                container.innerHTML = '<p class="text-center text-slate-500 py-12 text-sm">No data available</p>';
+                return;
+            }
 
-            const y = d3.scaleLinear()
-                .domain([0, d3.max(data, d => parseFloat(d.qty))])
-                .nice()
-                .range([height, 0]);
-
-            // Grid
-            svg.append('g')
-                .attr('class', 'grid')
-                .attr('opacity', 0.1)
-                .call(d3.axisLeft(y).tickSize(-width).tickFormat(''));
-
-            // Line generator
-            const line = d3.line()
-                .x(d => x(new Date(d.date)))
-                .y(d => y(parseFloat(d.qty)));
-
-            // Draw lines for each location
-            locations.forEach((location, i) => {
-                const locationData = grouped.get(location);
-                const color = colorPalette[i % colorPalette.length];
-
-                svg.append('path')
-                    .datum(locationData)
-                    .attr('class', 'line')
-                    .attr('d', line)
-                    .attr('stroke', color);
+            // Sort data
+            const sortedData = [...data].sort((a, b) => {
+                let aVal, bVal;
+                if (locationGroupSort.column === 'location_group_name') {
+                    aVal = (a.location_group_name || '').toLowerCase();
+                    bVal = (b.location_group_name || '').toLowerCase();
+                } else {
+                    aVal = parseFloat(a[locationGroupSort.column] || 0);
+                    bVal = parseFloat(b[locationGroupSort.column] || 0);
+                }
+                if (aVal < bVal) return locationGroupSort.direction === 'asc' ? -1 : 1;
+                if (aVal > bVal) return locationGroupSort.direction === 'asc' ? 1 : -1;
+                return 0;
             });
 
-            // Axes
-            svg.append('g')
-                .attr('class', 'axis')
-                .attr('transform', `translate(0,${height})`)
-                .call(d3.axisBottom(x).ticks(6).tickFormat(d3.timeFormat('%b %d')));
+            const getSortClass = (col) => {
+                if (locationGroupSort.column !== col) return 'cursor-pointer hover:bg-slate-200';
+                return `cursor-pointer hover:bg-slate-200 sort-${locationGroupSort.direction}`;
+            };
 
-            svg.append('g')
-                .attr('class', 'axis')
-                .call(d3.axisLeft(y).ticks(5));
+            const getSortIcon = (col) => {
+                if (locationGroupSort.column !== col) return '<span class="text-slate-300 ml-1">▲</span>';
+                return locationGroupSort.direction === 'asc'
+                    ? '<span class="text-indigo-600 ml-1">▲</span>'
+                    : '<span class="text-indigo-600 ml-1">▼</span>';
+            };
 
-            // Legend
-            const legend = svg.append('g')
-                .attr('transform', `translate(${width + 10}, 0)`);
+            let tableHtml = `
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="border-b border-slate-200 bg-slate-50">
+                            <th class="text-left px-3 py-2 font-semibold text-slate-700 ${getSortClass('location_group_name')}" onclick="sortLocationGroupTable('location_group_name')">
+                                Location Group${getSortIcon('location_group_name')}
+                            </th>
+                            <th class="text-right px-3 py-2 font-semibold text-slate-700 ${getSortClass('part_count')}" onclick="sortLocationGroupTable('part_count')">
+                                Parts${getSortIcon('part_count')}
+                            </th>
+                            <th class="text-right px-3 py-2 font-semibold text-slate-700 ${getSortClass('total_qty')}" onclick="sortLocationGroupTable('total_qty')">
+                                Qty On Hand${getSortIcon('total_qty')}
+                            </th>
+                            <th class="text-right px-3 py-2 font-semibold text-slate-700 ${getSortClass('total_value')}" onclick="sortLocationGroupTable('total_value')">
+                                Total Value${getSortIcon('total_value')}
+                            </th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
 
-            locations.forEach((location, i) => {
-                const legendRow = legend.append('g')
-                    .attr('transform', `translate(0, ${i * 20})`);
-
-                legendRow.append('rect')
-                    .attr('width', 16)
-                    .attr('height', 3)
-                    .attr('fill', colorPalette[i % colorPalette.length]);
-
-                legendRow.append('text')
-                    .attr('x', 22)
-                    .attr('y', 3)
-                    .attr('text-anchor', 'start')
-                    .style('font-size', '11px')
-                    .style('fill', '#64748b')
-                    .text(location);
+            sortedData.forEach((row, idx) => {
+                const bgClass = idx % 2 === 0 ? 'bg-white' : 'bg-slate-50';
+                tableHtml += `
+                    <tr class="${bgClass} hover:bg-indigo-50 cursor-pointer transition-colors border-b border-slate-100"
+                        onclick="showLocationGroupDrilldown(${row.location_group_id}, '${escapeSQL(row.location_group_name)}')">
+                        <td class="px-3 py-2 text-slate-800 font-medium">${row.location_group_name}</td>
+                        <td class="px-3 py-2 text-right text-slate-600">${parseInt(row.part_count || 0).toLocaleString()}</td>
+                        <td class="px-3 py-2 text-right text-slate-600">${formatQty(row.total_qty)}</td>
+                        <td class="px-3 py-2 text-right text-indigo-600 font-semibold">${formatCurrency(row.total_value)}</td>
+                    </tr>
+                `;
             });
+
+            tableHtml += '</tbody></table>';
+            container.innerHTML = tableHtml;
+        }
+
+        function sortLocationGroupTable(column) {
+            if (locationGroupSort.column === column) {
+                locationGroupSort.direction = locationGroupSort.direction === 'asc' ? 'desc' : 'asc';
+            } else {
+                locationGroupSort.column = column;
+                // Default to desc for numeric columns, asc for text
+                locationGroupSort.direction = column === 'location_group_name' ? 'asc' : 'desc';
+            }
+            renderLocationGroupTable();
+        }
+
+        function showLocationGroupDrilldown(locationGroupId, locationGroupName) {
+            debugLog(`Opening drilldown for location group: ${locationGroupName} (ID: ${locationGroupId})`, 'click');
+
+            const data = getStockByLocationGroupDetail(locationGroupId);
+            currentDrilldownData = data;
+
+            if (!data || data.length === 0) {
+                showDrilldown(
+                    `Stock in ${locationGroupName}`,
+                    'No parts found in this location group',
+                    '<p class="text-center text-slate-500 py-8">No inventory found in this location group</p>',
+                    ''
+                );
+                return;
+            }
+
+            // Store for sorting
+            let drilldownData = [...data];
+            let drilldownSort = { column: 'total_value', direction: 'desc' };
+
+            function renderDrilldownTable() {
+                // Sort data
+                const sortedData = [...drilldownData].sort((a, b) => {
+                    let aVal, bVal;
+                    if (drilldownSort.column === 'part_num' || drilldownSort.column === 'description' || drilldownSort.column === 'category') {
+                        aVal = (a[drilldownSort.column] || '').toLowerCase();
+                        bVal = (b[drilldownSort.column] || '').toLowerCase();
+                    } else {
+                        aVal = parseFloat(a[drilldownSort.column] || 0);
+                        bVal = parseFloat(b[drilldownSort.column] || 0);
+                    }
+                    if (aVal < bVal) return drilldownSort.direction === 'asc' ? -1 : 1;
+                    if (aVal > bVal) return drilldownSort.direction === 'asc' ? 1 : -1;
+                    return 0;
+                });
+
+                const getSortClass = (col) => {
+                    if (drilldownSort.column !== col) return 'sortable';
+                    return `sortable sort-${drilldownSort.direction}`;
+                };
+
+                let tableHtml = `
+                    <div class="drilldown-table-wrapper custom-scrollbar mt-4">
+                        <table class="drilldown-table">
+                            <thead>
+                                <tr>
+                                    <th class="text-left px-4 py-3 text-xs font-semibold text-slate-600 uppercase tracking-wider ${getSortClass('part_num')}" onclick="window.sortLgDrilldown('part_num')">Part #${getSortIcon()}</th>
+                                    <th class="text-left px-4 py-3 text-xs font-semibold text-slate-600 uppercase tracking-wider ${getSortClass('description')}" onclick="window.sortLgDrilldown('description')">Description${getSortIcon()}</th>
+                                    <th class="text-left px-4 py-3 text-xs font-semibold text-slate-600 uppercase tracking-wider ${getSortClass('category')}" onclick="window.sortLgDrilldown('category')">Category${getSortIcon()}</th>
+                                    <th class="text-right px-4 py-3 text-xs font-semibold text-slate-600 uppercase tracking-wider ${getSortClass('qty_on_hand')}" onclick="window.sortLgDrilldown('qty_on_hand')">Qty On Hand${getSortIcon()}</th>
+                                    <th class="text-right px-4 py-3 text-xs font-semibold text-slate-600 uppercase tracking-wider ${getSortClass('avg_cost')}" onclick="window.sortLgDrilldown('avg_cost')">Avg Cost${getSortIcon()}</th>
+                                    <th class="text-right px-4 py-3 text-xs font-semibold text-slate-600 uppercase tracking-wider ${getSortClass('total_value')}" onclick="window.sortLgDrilldown('total_value')">Total Value${getSortIcon()}</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                `;
+
+                sortedData.forEach((row, idx) => {
+                    const bgClass = idx % 2 === 0 ? 'bg-white' : 'bg-slate-50';
+                    tableHtml += `
+                        <tr class="${bgClass} hover:bg-indigo-50 transition-colors">
+                            <td class="px-4 py-3 text-slate-800 font-medium">${row.part_num}</td>
+                            <td class="px-4 py-3 text-slate-600">${row.description || ''}</td>
+                            <td class="px-4 py-3 text-slate-500">${row.category || ''}</td>
+                            <td class="px-4 py-3 text-right text-slate-600">${formatQty(row.qty_on_hand)}</td>
+                            <td class="px-4 py-3 text-right text-slate-600">${formatCurrency(row.avg_cost)}</td>
+                            <td class="px-4 py-3 text-right text-indigo-600 font-semibold">${formatCurrency(row.total_value)}</td>
+                        </tr>
+                    `;
+                });
+
+                tableHtml += '</tbody></table></div>';
+
+                document.getElementById('drilldownContent').innerHTML = tableHtml;
+            }
+
+            // Expose sort function for this drilldown
+            window.sortLgDrilldown = function(column) {
+                if (drilldownSort.column === column) {
+                    drilldownSort.direction = drilldownSort.direction === 'asc' ? 'desc' : 'asc';
+                } else {
+                    drilldownSort.column = column;
+                    drilldownSort.direction = (column === 'part_num' || column === 'description' || column === 'category') ? 'asc' : 'desc';
+                }
+                renderDrilldownTable();
+            };
+
+            renderDrilldownTable();
+
+            // Calculate totals
+            const totalValue = data.reduce((sum, r) => sum + parseFloat(r.total_value || 0), 0);
+            const totalQty = data.reduce((sum, r) => sum + parseFloat(r.qty_on_hand || 0), 0);
+            const uniqueParts = data.length;
+
+            const footer = `
+                <div class="flex items-center justify-between text-slate-600">
+                    <span><strong>${uniqueParts}</strong> parts</span>
+                    <span>Total Qty: <strong>${formatQty(totalQty)}</strong></span>
+                    <span>Total Value: <strong class="text-indigo-600">${formatCurrency(totalValue)}</strong></span>
+                </div>
+            `;
+
+            showDrilldown(`Stock in ${locationGroupName}`, 'Inventory by part in this location group', document.getElementById('drilldownContent').innerHTML, footer);
         }
 
         function renderTopPartsChart(data) {
@@ -3039,7 +3204,7 @@
                 const valueData = getInventoryValueOverTime();
                 renderValueOverTimeChart(valueData);
 
-                const locationData = getStockByLocation();
+                const locationData = getStockByLocationGroup();
                 renderLocationChart(locationData);
 
                 const topPartsData = getTopPartsByValue();
@@ -3079,13 +3244,22 @@
                 if (partsEl) partsEl.textContent = partCount.toLocaleString() + ' parts';
 
                 const valueStr = netValue >= 0 ? `+${formatCurrency(netValue)}` : formatCurrency(netValue);
-                if (valueEl) valueEl.textContent = valueStr;
+                if (valueEl) {
+                    valueEl.textContent = valueStr;
+                    // Red when negative (loss), blue when positive (gain)
+                    valueEl.classList.remove('text-blue-600', 'text-red-600');
+                    valueEl.classList.add(netValue >= 0 ? 'text-blue-600' : 'text-red-600');
+                }
 
                 // Track for stock loss total - use absolute value for losses
                 kpiValues.cycleCountValue = Math.abs(netValue < 0 ? netValue : 0);
             } else {
                 if (partsEl) partsEl.textContent = '0 parts';
-                if (valueEl) valueEl.textContent = '$0';
+                if (valueEl) {
+                    valueEl.textContent = '$0';
+                    valueEl.classList.remove('text-red-600');
+                    valueEl.classList.add('text-blue-600');
+                }
                 kpiValues.cycleCountValue = 0;
             }
             updateStockLossTotal();
