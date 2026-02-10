@@ -2332,15 +2332,17 @@
 
             let lgCondition = locationGroup !== '%' ? `AND il.locationGroupId = ${locationGroup}` : '';
             let lgConditionReceipt = locationGroup !== '%' ? `AND r.locationgroupid = ${locationGroup}` : '';
+            let lgConditionPost = locationGroup !== '%' ? `AND INVENTORYLOG.LOCATIONGROUPID = ${locationGroup}` : '';
             let vendorCondition = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = p.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
             let vendorConditionReceipt = vendorFilter !== '%' ? `AND po.vendorid = ${vendorFilter}` : '';
+            let vendorConditionPost = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = PART.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
 
             // Value-based movement summary
             // Received: From receiptitem with statusid >= 20 (Reconciled, Received, Fulfilled), uses landedtotalcost
             //           Date filtered by newest of dateReceived/dateReconciled (whichever is most recent)
             // Shipped: From inventorylog typeId 20 (sales shipments)
-            // Scrap: From inventorylog typeId 67
-            // Adjustments: From inventorylog typeId IN (64, 65, 68)
+            // Scrap: From POST table (TYPEID=50, REFITEMID=2) using POST.AMOUNT for historical cost
+            // Adjustments: From POST table (TYPEID=50, REFITEMID=3) using POST.AMOUNT for historical cost (Cycle Count)
             const query = `
                 SELECT 'Received' as category,
                     COALESCE(SUM(ri.qty), 0) as total_qty,
@@ -2381,40 +2383,37 @@
                 UNION ALL
 
                 SELECT 'Scrap' as category,
-                    ABS(SUM(COALESCE(scr.qty, 0))) as total_qty,
-                    ABS(SUM(COALESCE(scr.qty, 0) * COALESCE(pc.avgCost, 0))) as total_value,
-                    SUM(COALESCE(scr.cnt, 0)) as count
-                FROM part p
-                LEFT JOIN partcost pc ON p.id = pc.partid
-                LEFT JOIN (
-                    SELECT partId, SUM(changeQty) AS qty, COUNT(*) as cnt
-                    FROM inventorylog il
-                    WHERE il.eventDate >= '${start}' AND il.eventDate <= '${end}'
-                      AND il.typeId = 67
-                      ${lgCondition}
-                    GROUP BY partId
-                ) AS scr ON p.id = scr.partId
-                WHERE p.activeflag = 1 AND p.typeid = 10 ${vendorCondition}
-                HAVING total_qty != 0
+                    COALESCE(SUM(ABS(POST.QUANTITY)), 0) as total_qty,
+                    COALESCE(SUM(ABS(POST.AMOUNT)), 0) as total_value,
+                    COUNT(*) as count
+                FROM POST
+                INNER JOIN PART ON POST.REFID = PART.ID
+                LEFT JOIN INVENTORYLOG ON INVENTORYLOG.RECORDID = POST.ID AND INVENTORYLOG.TABLEID = -1407594912
+                WHERE POST.TYPEID = 50
+                    AND POST.REFITEMID = 2
+                    AND POST.DATECREATED >= '${start}' AND POST.DATECREATED <= '${end}'
+                    AND PART.activeflag = 1
+                    AND PART.typeid = 10
+                    ${lgConditionPost}
+                    ${vendorConditionPost}
 
                 UNION ALL
 
                 SELECT 'Adjustments' as category,
-                    SUM(COALESCE(adj.qty, 0)) as total_qty,
-                    SUM(COALESCE(adj.qty, 0) * COALESCE(pc.avgCost, 0)) as total_value,
-                    SUM(COALESCE(adj.cnt, 0)) as count
-                FROM part p
-                LEFT JOIN partcost pc ON p.id = pc.partid
-                LEFT JOIN (
-                    SELECT partId, SUM(changeQty) AS qty, COUNT(*) as cnt
-                    FROM inventorylog il
-                    WHERE il.eventDate >= '${start}' AND il.eventDate <= '${end}'
-                      AND il.typeId IN (64, 65, 68)
-                      ${lgCondition}
-                    GROUP BY partId
-                ) AS adj ON p.id = adj.partId
-                WHERE p.activeflag = 1 AND p.typeid = 10 ${vendorCondition}
-                HAVING total_qty != 0
+                    COALESCE(SUM(ABS(POST.QUANTITY)), 0) as total_qty,
+                    COALESCE(SUM(POST.AMOUNT), 0) as total_value,
+                    COUNT(*) as count
+                FROM POST
+                INNER JOIN PART ON POST.REFID = PART.ID
+                LEFT JOIN INVENTORYLOG ON INVENTORYLOG.RECORDID = POST.ID AND INVENTORYLOG.TABLEID = -1407594912
+                WHERE POST.TYPEID = 50
+                    AND POST.REFITEMID = 3
+                    AND COALESCE(POST.QUANTITY, 0) != 0
+                    AND POST.DATECREATED >= '${start}' AND POST.DATECREATED <= '${end}'
+                    AND PART.activeflag = 1
+                    AND PART.typeid = 10
+                    ${lgConditionPost}
+                    ${vendorConditionPost}
             `;
 
             debugLog('Movement Summary Query: ' + query, 'info');
@@ -3595,8 +3594,8 @@
                 // Stock Value Flow
                 // Received = receiptitem.landedtotalcost (statusid >= 20: reconciled/received/fulfilled, date by newest of dateReceived/dateReconciled)
                 // Shipped = inventorylog typeId 20 with partcost.avgcost
-                // Scrap = inventorylog typeId 67 with partcost.avgcost
-                // Adjustments = inventorylog typeId IN (64,65,68) with partcost.avgcost
+                // Scrap = POST table (TYPEID=50, REFITEMID=2) using POST.AMOUNT (same as Stock Loss tile)
+                // Adjustments = POST table (TYPEID=50, REFITEMID=3) using POST.AMOUNT (same as Stock Loss tile)
                 const movementData = getMovementSummary();
                 const inventoryRevenue = getInventoryRevenue();
                 debugLog('Stock Value Flow loaded. Revenue for margin calc: ' + formatCurrencyValue(inventoryRevenue), 'info');
