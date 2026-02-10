@@ -2158,6 +2158,97 @@
             showDrilldown('Below Reorder Point', 'Parts with stock below reorder level', tableHtml, footer);
         }
 
+        function getABCCodeDetail(abcCode) {
+            const locationGroup = document.getElementById('locationGroupFilter').value;
+            const vendorFilter = document.getElementById('vendorFilter').value;
+
+            let lgCondition = locationGroup !== '%' ? `AND lg.id = ${locationGroup}` : '';
+            let vendorCondition = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = p.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
+
+            // Handle NULL/empty abcCode
+            let abcCondition = abcCode === 'U' || abcCode === '' || abcCode === null
+                ? `AND (p.abcCode IS NULL OR p.abcCode = '')`
+                : `AND p.abcCode = '${abcCode}'`;
+
+            const query = `
+                SELECT
+                    p.num as part_num,
+                    p.description,
+                    COALESCE(p.abcCode, 'U') as abc_code,
+                    SUM(COALESCE(qoh.qty, 0)) as qty_on_hand,
+                    COALESCE(pc.avgCost, 0) as avg_cost,
+                    SUM(COALESCE(qoh.qty, 0) * COALESCE(pc.avgCost, 0)) as total_value
+                FROM part p
+                LEFT JOIN qtyonhand qoh ON p.id = qoh.partid
+                LEFT JOIN locationgroup lg ON qoh.locationgroupid = lg.id
+                LEFT JOIN partcost pc ON p.id = pc.partid
+                WHERE p.activeflag = 1
+                    AND p.typeid = 10
+                    ${abcCondition}
+                    ${lgCondition}
+                    ${vendorCondition}
+                GROUP BY p.id, p.num, p.description, p.abcCode, pc.avgCost
+                HAVING qty_on_hand > 0
+                ORDER BY total_value DESC
+                LIMIT 100
+            `;
+
+            debugLog('ABC Detail Query: ' + query, 'info');
+            return JSON.parse(runQuery(query));
+        }
+
+        function showABCCodeModal(abcCode, statusLabel) {
+            debugLog(`Loading ABC code ${abcCode} details...`, 'click');
+            const data = getABCCodeDetail(abcCode);
+            currentDrilldownData = data;
+
+            if (data.length === 0) {
+                showDrilldown(`ABC Code: ${statusLabel}`, 'No parts found', '<p class="text-center text-slate-500 py-8">No parts found with this ABC code</p>', '');
+                return;
+            }
+
+            const totalValue = data.reduce((sum, r) => sum + parseFloat(r.total_value || 0), 0);
+            const totalQty = data.reduce((sum, r) => sum + parseFloat(r.qty_on_hand || 0), 0);
+
+            let tableHtml = `
+                <table class="w-full text-sm">
+                    <thead class="bg-slate-100 sticky top-0 z-10">
+                        <tr>
+                            <th class="px-4 py-3 text-left font-semibold text-slate-700">Part Number</th>
+                            <th class="px-4 py-3 text-left font-semibold text-slate-700">Description</th>
+                            <th class="px-4 py-3 text-right font-semibold text-slate-700">Qty On Hand</th>
+                            <th class="px-4 py-3 text-right font-semibold text-slate-700">Avg Cost</th>
+                            <th class="px-4 py-3 text-right font-semibold text-slate-700">Total Value</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-200">
+            `;
+
+            data.forEach(row => {
+                tableHtml += `
+                    <tr class="hover:bg-slate-50">
+                        <td class="px-4 py-3 font-mono text-sm text-cyan-700 cursor-pointer hover:underline" onclick="window.open('fishbowl://part/${row.part_num}', '_blank')">${row.part_num}</td>
+                        <td class="px-4 py-3">${row.description || ''}</td>
+                        <td class="px-4 py-3 text-right font-medium">${formatQty(row.qty_on_hand)}</td>
+                        <td class="px-4 py-3 text-right">${formatCurrencyValue(row.avg_cost)}</td>
+                        <td class="px-4 py-3 text-right font-medium">${formatCurrencyValue(row.total_value)}</td>
+                    </tr>
+                `;
+            });
+
+            tableHtml += '</tbody></table>';
+
+            const footer = `
+                <div class="flex justify-between items-center">
+                    <span><strong>${data.length}</strong> parts${data.length >= 100 ? ' (limited to 100)' : ''}</span>
+                    <span>Total Qty: <strong>${formatQty(totalQty)}</strong></span>
+                    <span>Total Value: <strong class="text-indigo-600">${formatCurrencyValue(totalValue)}</strong></span>
+                </div>
+            `;
+
+            showDrilldown(`ABC Code: ${statusLabel}`, 'Parts with this ABC classification', tableHtml, footer);
+        }
+
         function getStockMovements() {
             const locationGroup = document.getElementById('locationGroupFilter').value;
             const productCategory = document.getElementById('productCategoryFilter').value;
@@ -2246,6 +2337,25 @@
 
                 UNION ALL
 
+                SELECT 'Scrap' as category,
+                    ABS(SUM(COALESCE(scrap.qty, 0))) as total_qty,
+                    ABS(SUM(COALESCE(scrap.qty, 0) * COALESCE(pc.avgCost, 0))) as total_value,
+                    SUM(COALESCE(scrap.cnt, 0)) as count
+                FROM part p
+                LEFT JOIN partcost pc ON p.id = pc.partid
+                LEFT JOIN (
+                    SELECT partId, SUM(changeQty) AS qty, COUNT(*) as cnt
+                    FROM inventorylog il
+                    WHERE il.eventDate >= '${start}' AND il.eventDate <= '${end}'
+                      AND il.typeId = 67
+                      ${lgCondition}
+                    GROUP BY partId
+                ) AS scrap ON p.id = scrap.partId
+                WHERE p.activeflag = 1 AND p.typeid = 10 ${vendorCondition}
+                HAVING total_qty != 0
+
+                UNION ALL
+
                 SELECT 'Adjustments' as category,
                     SUM(COALESCE(adj.qty, 0)) as total_qty,
                     SUM(COALESCE(adj.qty, 0) * COALESCE(pc.avgCost, 0)) as total_value,
@@ -2256,7 +2366,7 @@
                     SELECT partId, SUM(changeQty) AS qty, COUNT(*) as cnt
                     FROM inventorylog il
                     WHERE il.eventDate >= '${start}' AND il.eventDate <= '${end}'
-                      AND il.typeId IN (64, 65, 67, 68)
+                      AND il.typeId IN (64, 65, 68)
                       ${lgCondition}
                     GROUP BY partId
                 ) AS adj ON p.id = adj.partId
@@ -2801,6 +2911,7 @@
                 .attr('fill', d => color(d.data.abc_code || 'Unassigned'))
                 .attr('stroke', 'white')
                 .attr('stroke-width', 2)
+                .style('cursor', 'pointer')
                 .on('mouseover', function(event, d) {
                     d3.select(this)
                         .transition()
@@ -2815,6 +2926,7 @@
                             <div><span class="tooltip-label">Quantity:</span><span class="tooltip-value">${formatQty(d.data.qty)}</span></div>
                             <div><span class="tooltip-label">Value:</span><span class="tooltip-value">${formatCurrencyValue(d.data.total_value)}</span></div>
                             <div><span class="tooltip-label">% of Total:</span><span class="tooltip-value">${pct}%</span></div>
+                            <div class="text-xs text-cyan-400 mt-1">Click to view parts</div>
                         `)
                         .style('left', (event.pageX + 10) + 'px')
                         .style('top', (event.pageY - 10) + 'px');
@@ -2825,6 +2937,10 @@
                         .duration(200)
                         .attr('d', arc);
                     tooltip.style('opacity', 0);
+                })
+                .on('click', function(event, d) {
+                    tooltip.style('opacity', 0);
+                    showABCCodeModal(d.data.abc_code, d.data.status);
                 });
 
             // Center text showing total value
@@ -2881,28 +2997,30 @@
             const movementColors = {
                 'Received': '#10b981',    // Green - stock in
                 'Shipped': '#ef4444',     // Red - stock out
-                'Adjustments': '#f59e0b', // Amber
+                'Scrap': '#dc2626',       // Dark red - scrapped
+                'Adjustments': '#3b82f6', // Blue - cycle count/adjustments
                 'Other': '#94a3b8'        // Gray
             };
 
             // Calculate values for each category
             const received = data.find(d => d.category === 'Received');
             const shipped = data.find(d => d.category === 'Shipped');
+            const scrap = data.find(d => d.category === 'Scrap');
             const adjustments = data.find(d => d.category === 'Adjustments');
-            const other = data.find(d => d.category === 'Other');
 
             const receivedValue = parseFloat(received?.total_value || 0);
             const shippedValue = Math.abs(parseFloat(shipped?.total_value || 0));
+            const scrapValue = Math.abs(parseFloat(scrap?.total_value || 0));
             const adjustmentsValue = parseFloat(adjustments?.total_value || 0);
-            const otherValue = parseFloat(other?.total_value || 0);
 
-            // Net position = received - shipped + adjustments + other
-            const netPosition = receivedValue - shippedValue + adjustmentsValue + otherValue;
+            // Net position = received - shipped - scrap + adjustments
+            const netPosition = receivedValue - shippedValue - scrapValue + adjustmentsValue;
 
             // Build bar chart data
             const chartData = [
                 { category: 'Received', value: receivedValue, color: movementColors['Received'], count: received?.count || 0 },
                 { category: 'Shipped', value: -shippedValue, color: movementColors['Shipped'], count: shipped?.count || 0 },
+                { category: 'Scrap', value: -scrapValue, color: movementColors['Scrap'], count: scrap?.count || 0 },
                 { category: 'Adjustments', value: adjustmentsValue, color: movementColors['Adjustments'], count: adjustments?.count || 0 }
             ].filter(d => d.value !== 0 || d.count > 0);
 
