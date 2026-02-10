@@ -2326,50 +2326,51 @@
             const vendorFilter = document.getElementById('vendorFilter').value;
             const { start, end } = getDateRange();
 
-            let lgCondition = locationGroup !== '%' ? `AND il.locationGroupId = ${locationGroup}` : '';
-            let vendorCondition = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = p.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
+            // Location group conditions for different table contexts
+            let lgConditionPO = locationGroup !== '%' ? `AND po.locationgroupid = ${locationGroup}` : '';
+            let lgConditionSO = locationGroup !== '%' ? `AND PostSo.LocationGroupId = ${locationGroup}` : '';
+            let lgConditionPost = locationGroup !== '%' ? `AND INVENTORYLOG.LOCATIONGROUPID = ${locationGroup}` : '';
+            let vendorCondition = vendorFilter !== '%' ? `AND po.vendorid = ${vendorFilter}` : '';
+            let vendorConditionPart = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = part.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
 
-            // Value-based movement summary using subqueries for accurate categorization
-            // Purchases: typeId 10/15 with receiptitem.soitemid IS NULL (PO receipt, not SO return)
-            // Shipped: typeId 20 (sales shipments)
-            // Adjustments: typeId 64, 65, 67, 68
+            // Value-based movement summary
+            // Received: From postpoitem (PO receipts) - matches Purchasing Dashboard
+            // Shipped: From PostSoItem (sales) - matches Sales Dashboard COGS
+            // Both use posted costs for accuracy and only include inventory-type parts
             const query = `
                 SELECT 'Received' as category,
-                    SUM(COALESCE(purchases.qty, 0)) as total_qty,
-                    SUM(COALESCE(purchases.qty, 0) * COALESCE(pc.avgCost, 0)) as total_value,
-                    SUM(COALESCE(purchases.cnt, 0)) as count
-                FROM part p
-                LEFT JOIN partcost pc ON p.id = pc.partid
-                LEFT JOIN (
-                    SELECT il.partId, SUM(il.changeQty) AS qty, COUNT(*) as cnt
-                    FROM inventorylog il
-                    LEFT JOIN receiptitem ri ON CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(il.info, 'Receipt Item ', -1), ' ', 1) AS UNSIGNED) = ri.id
-                    WHERE il.eventDate >= '${start}' AND il.eventDate <= '${end}'
-                      AND il.typeId IN (10, 15)
-                      ${lgCondition}
-                      AND (ri.soitemid IS NULL OR il.info NOT LIKE '%Receipt Item%')
-                    GROUP BY il.partId
-                ) AS purchases ON p.id = purchases.partId
-                WHERE p.activeflag = 1 AND p.typeid = 10 ${vendorCondition}
+                    COALESCE(SUM(postpoitem.postedQty), 0) as total_qty,
+                    COALESCE(SUM(postpoitem.postedtotalcost), 0) as total_value,
+                    COUNT(*) as count
+                FROM postpoitem
+                JOIN postpo ON postpoitem.postpoid = postpo.id
+                JOIN poitem ON postpoitem.poitemid = poitem.id
+                JOIN part ON poitem.partid = part.id
+                JOIN po ON poitem.poid = po.id
+                WHERE postpo.postdate >= '${start}' AND postpo.postdate <= '${end}'
+                  AND part.typeid = 10
+                  AND part.activeflag = 1
+                  ${lgConditionPO}
+                  ${vendorCondition}
                 HAVING total_qty != 0
 
                 UNION ALL
 
                 SELECT 'Shipped' as category,
-                    ABS(SUM(COALESCE(sales.qty, 0))) as total_qty,
-                    ABS(SUM(COALESCE(sales.qty, 0) * COALESCE(pc.avgCost, 0))) as total_value,
-                    SUM(COALESCE(sales.cnt, 0)) as count
-                FROM part p
-                LEFT JOIN partcost pc ON p.id = pc.partid
-                LEFT JOIN (
-                    SELECT partId, SUM(changeQty) AS qty, COUNT(*) as cnt
-                    FROM inventorylog il
-                    WHERE il.eventDate >= '${start}' AND il.eventDate <= '${end}'
-                      AND il.typeId = 20
-                      ${lgCondition}
-                    GROUP BY partId
-                ) AS sales ON p.id = sales.partId
-                WHERE p.activeflag = 1 AND p.typeid = 10 ${vendorCondition}
+                    COALESCE(SUM(PostSoItem.Qty), 0) as total_qty,
+                    COALESCE(SUM(PostSoItem.PostedTotalCost), 0) as total_value,
+                    COUNT(*) as count
+                FROM PostSo
+                JOIN PostSoItem ON PostSoItem.PostSoId = PostSo.Id
+                JOIN SoItem ON SoItem.Id = PostSoItem.SoItemId
+                JOIN Product ON Product.Id = SoItem.ProductId
+                JOIN Part ON Part.Id = Product.PartId
+                WHERE PostSo.DATECREATED >= '${start}' AND PostSo.DATECREATED <= '${end}'
+                  AND SoItem.typeId NOT IN (30, 40)
+                  AND Part.typeid = 10
+                  AND Part.activeflag = 1
+                  ${lgConditionSO}
+                  ${vendorConditionPart.replace('part.id', 'Part.id')}
                 HAVING total_qty != 0
 
                 UNION ALL
@@ -2391,8 +2392,8 @@
                       AND POST.DATECREATED >= '${start}' AND POST.DATECREATED <= '${end}'
                       AND PART.activeflag = 1
                       AND PART.typeid = 10
-                      ${lgCondition.replace('il.locationGroupId', 'INVENTORYLOG.LOCATIONGROUPID')}
-                      ${vendorCondition.replace('p.id', 'PART.id')}
+                      ${lgConditionPost}
+                      ${vendorConditionPart.replace('part.id', 'PART.id')}
                 ) AS scrap
                 HAVING total_value > 0
 
@@ -2416,8 +2417,8 @@
                       AND POST.DATECREATED >= '${start}' AND POST.DATECREATED <= '${end}'
                       AND PART.activeflag = 1
                       AND PART.typeid = 10
-                      ${lgCondition.replace('il.locationGroupId', 'INVENTORYLOG.LOCATIONGROUPID')}
-                      ${vendorCondition.replace('p.id', 'PART.id')}
+                      ${lgConditionPost}
+                      ${vendorConditionPart.replace('part.id', 'PART.id')}
                 ) AS adj
                 HAVING total_qty != 0
             `;
@@ -2426,51 +2427,25 @@
             return JSON.parse(runQuery(query));
         }
 
-        // Cross-Dashboard Validation Metrics
-        // Compares Stock Value Flow data with Purchasing/Sales Dashboard data
-        function getMovementValidation() {
+        // Get Revenue for inventory parts (for margin calculation in Stock Value Flow)
+        function getInventoryRevenue() {
             const { start, end } = getDateRange();
-            const lg = document.getElementById('locationFilter').value;
-            const lgCondition = lg !== '%' ? `AND locationgroup.id = ${lg}` : '';
+            const lg = document.getElementById('locationGroupFilter').value;
+            const lgCondition = lg !== '%' ? `AND PostSo.LocationGroupId = ${lg}` : '';
 
-            // Get Total Spend from postpoitem - INVENTORY PARTS ONLY
-            // This should be comparable to our "Received" value
-            const purchasingQuery = `
+            // Get Revenue from PostSoItem - INVENTORY PARTS ONLY
+            const query = `
                 SELECT
-                    SUM(postpoitem.postedtotalcost) as total_spend_inventory,
-                    SUM(postpoitem.postedQty) as total_qty_received,
-                    COUNT(DISTINCT poitem.partid) as unique_parts
-                FROM postpoitem
-                JOIN postpo ON postpoitem.postpoid = postpo.id
-                JOIN poitem ON postpoitem.poitemid = poitem.id
-                JOIN part ON poitem.partid = part.id
-                JOIN po ON poitem.poid = po.id
-                JOIN locationgroup ON po.locationgroupid = locationgroup.id
-                WHERE postpo.postdate >= '${start}' AND postpo.postdate <= '${end}'
-                  AND part.typeid = 10
-                  AND part.activeflag = 1
-                  ${lgCondition}
-            `;
-
-            // Get COGS from PostSoItem - INVENTORY PARTS ONLY
-            // This should be comparable to our "Shipped" value (at cost)
-            const salesQuery = `
-                SELECT
-                    SUM(PostSoItem.PostedTotalCost) as cogs_inventory,
-                    SUM(PostSoItem.Qty) as total_qty_shipped,
-                    COUNT(DISTINCT SoItem.ProductId) as unique_products,
-                    SUM(COALESCE(((PostSoItem.TotalPrice/PostSoItem.Qty)-((PostSoItem.TotalPrice/PostSoItem.Qty)*PSI.AdjustPercent)), PostSoItem.TotalPrice/PostSoItem.Qty) * PostSoItem.Qty) as revenue_inventory
+                    SUM(COALESCE(((PostSoItem.TotalPrice/PostSoItem.Qty)-((PostSoItem.TotalPrice/PostSoItem.Qty)*PSI.AdjustPercent)), PostSoItem.TotalPrice/PostSoItem.Qty) * PostSoItem.Qty) as revenue
                 FROM PostSo
                 JOIN PostSoItem ON PostSoItem.PostSoId = PostSo.Id
                 JOIN SoItem ON SoItem.Id = PostSoItem.SoItemId
-                JOIN So ON So.Id = SoItem.SoId
                 JOIN Product ON Product.Id = SoItem.ProductId
                 JOIN Part ON Part.Id = Product.PartId
                 LEFT JOIN PostSoItem PSI ON PSI.SoItemId = COALESCE(
                     (SELECT K.Id FROM SoItem K WHERE K.SoLineItem = SoItem.SoLineItem+1 AND K.TypeId = 30 AND SoItem.typeId !=30 AND K.SoId = SoItem.SoId ORDER BY K.SoLineItem ASC LIMIT 1),
                     (SELECT K.Id FROM SoItem K WHERE K.SoLineItem > SoItem.SoLineItem AND EXISTS (SELECT * FROM SoItem J WHERE J.TypeId = 40 AND J.SoId = K.SoId AND J.SoLineItem >= K.SoLineItem-1 ORDER BY J.SoLineItem ASC) AND K.TypeId = 30 AND SoItem.typeId !=30 AND K.SoId = SoItem.SoId ORDER BY K.SoLineItem ASC LIMIT 1)
                 ) AND PSI.PostSoId = PostSo.Id
-                LEFT JOIN locationgroup ON PostSo.LocationGroupId = locationgroup.id
                 WHERE PostSo.DATECREATED >= '${start}' AND PostSo.DATECREATED <= '${end}'
                   AND SoItem.typeId NOT IN (30, 40)
                   AND Part.typeid = 10
@@ -2478,19 +2453,12 @@
                   ${lgCondition}
             `;
 
-            debugLog('Purchasing Validation Query: ' + purchasingQuery, 'info');
-            debugLog('Sales Validation Query: ' + salesQuery, 'info');
-
             try {
-                const purchasingData = JSON.parse(runQuery(purchasingQuery));
-                const salesData = JSON.parse(runQuery(salesQuery));
-                return {
-                    purchasing: purchasingData[0] || {},
-                    sales: salesData[0] || {}
-                };
+                const data = JSON.parse(runQuery(query));
+                return parseFloat(data[0]?.revenue || 0);
             } catch (e) {
-                debugLog('Validation query error: ' + e.message, 'error');
-                return { purchasing: {}, sales: {} };
+                debugLog('Revenue query error: ' + e.message, 'error');
+                return 0;
             }
         }
 
@@ -3100,7 +3068,7 @@
             });
         }
 
-        function renderMovementChart(data, validation) {
+        function renderMovementChart(data, revenue) {
             const container = document.getElementById('movementChart');
             container.innerHTML = '';
 
@@ -3132,32 +3100,23 @@
             // Net position = received - shipped - scrap + adjustments
             const netPosition = receivedValue - shippedValue - scrapValue + adjustmentsValue;
 
-            // Extract validation data for comparison
-            const purchasingSpend = parseFloat(validation?.purchasing?.total_spend_inventory || 0);
-            const salesCOGS = parseFloat(validation?.sales?.cogs_inventory || 0);
-            const salesRevenue = parseFloat(validation?.sales?.revenue_inventory || 0);
-
-            // Build bar chart data with validation comparisons
+            // Build bar chart data
+            // Received/Shipped now use same data sources as Purchasing/Sales dashboards
             const chartData = [
                 {
                     category: 'Received',
                     value: receivedValue,
                     color: movementColors['Received'],
                     count: received?.count || 0,
-                    comparison: purchasingSpend,
-                    comparisonLabel: 'PO Posted Cost',
-                    comparisonNote: 'Purchasing Dashboard uses actual posted cost; this uses qty × avg cost'
+                    note: 'Matches Purchasing Dashboard "Inventory Spend"'
                 },
                 {
                     category: 'Shipped',
                     value: -shippedValue,
                     color: movementColors['Shipped'],
                     count: shipped?.count || 0,
-                    comparison: salesCOGS,
-                    comparisonLabel: 'Sales COGS',
-                    comparisonNote: 'Should match (both are cost basis for inventory parts)',
-                    revenue: salesRevenue,
-                    revenueLabel: 'Sales Revenue'
+                    revenue: revenue,
+                    note: 'Matches Sales Dashboard "COGS"'
                 },
                 { category: 'Scrap', value: -scrapValue, color: movementColors['Scrap'], count: scrap?.count || 0 },
                 { category: 'Adjustments', value: adjustmentsValue, color: movementColors['Adjustments'], count: adjustments?.count || 0 }
@@ -3212,36 +3171,30 @@
                     d3.select(this).attr('opacity', 0.8);
                     const valueDisplay = d.value >= 0 ? `+${formatCurrencyValue(d.value)}` : formatCurrencyValue(d.value);
 
-                    // Build tooltip with validation comparison if available
+                    // Build tooltip
                     let tooltipHtml = `
                         <div><span class="tooltip-label">Category:</span><span class="tooltip-value">${d.category}</span></div>
-                        <div><span class="tooltip-label">Value (Avg Cost):</span><span class="tooltip-value" style="color: ${d.value >= 0 ? '#10b981' : '#ef4444'}">${valueDisplay}</span></div>
+                        <div><span class="tooltip-label">Value (Posted Cost):</span><span class="tooltip-value" style="color: ${d.value >= 0 ? '#10b981' : '#ef4444'}">${valueDisplay}</span></div>
                         <div><span class="tooltip-label">Transactions:</span><span class="tooltip-value">${parseInt(d.count).toLocaleString()}</span></div>
                     `;
 
-                    // Add comparison data if available
-                    if (d.comparison) {
-                        const diff = Math.abs(d.value) - d.comparison;
-                        const diffPercent = d.comparison > 0 ? ((diff / d.comparison) * 100).toFixed(1) : 0;
+                    // Add revenue and margin for Shipped category
+                    if (d.revenue && d.revenue > 0) {
+                        const cogs = Math.abs(d.value);
+                        const grossProfit = d.revenue - cogs;
+                        const marginPct = (grossProfit / d.revenue * 100).toFixed(1);
                         tooltipHtml += `
                             <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #475569;">
-                                <div><span class="tooltip-label">${d.comparisonLabel}:</span><span class="tooltip-value">${formatCurrencyValue(d.comparison)}</span></div>
-                                <div><span class="tooltip-label">Difference:</span><span class="tooltip-value" style="color: ${Math.abs(diffPercent) < 5 ? '#10b981' : '#f59e0b'}">${formatCurrencyValue(diff)} (${diffPercent}%)</span></div>
+                                <div><span class="tooltip-label">Revenue:</span><span class="tooltip-value" style="color: #3b82f6">${formatCurrencyValue(d.revenue)}</span></div>
+                                <div><span class="tooltip-label">Gross Profit:</span><span class="tooltip-value" style="color: #10b981">${formatCurrencyValue(grossProfit)}</span></div>
+                                <div><span class="tooltip-label">Margin:</span><span class="tooltip-value">${marginPct}%</span></div>
                             </div>
                         `;
-                        if (d.comparisonNote) {
-                            tooltipHtml += `<div style="font-size: 10px; color: #94a3b8; margin-top: 4px; max-width: 220px;">${d.comparisonNote}</div>`;
-                        }
                     }
 
-                    // Add revenue for Shipped category
-                    if (d.revenue) {
-                        tooltipHtml += `
-                            <div style="margin-top: 4px;">
-                                <div><span class="tooltip-label">${d.revenueLabel}:</span><span class="tooltip-value" style="color: #3b82f6">${formatCurrencyValue(d.revenue)}</span></div>
-                                <div><span class="tooltip-label">Margin:</span><span class="tooltip-value">${formatCurrencyValue(d.revenue - Math.abs(d.value))} (${((d.revenue - Math.abs(d.value)) / d.revenue * 100).toFixed(1)}%)</span></div>
-                            </div>
-                        `;
+                    // Add note if available
+                    if (d.note) {
+                        tooltipHtml += `<div style="font-size: 10px; color: #94a3b8; margin-top: 6px; max-width: 200px;">${d.note}</div>`;
                     }
 
                     tooltip.style('opacity', 1)
@@ -3624,13 +3577,13 @@
                 const statusData = getAvailabilityStatus();
                 renderStatusChart(statusData);
 
-                // Load stock movement data with cross-dashboard validation
+                // Stock Value Flow - uses same data sources as Purchasing/Sales dashboards
+                // Received = postpoitem.postedtotalcost (matches Purchasing "Inventory Spend")
+                // Shipped = PostSoItem.PostedTotalCost (matches Sales "COGS")
                 const movementData = getMovementSummary();
-                const movementValidation = getMovementValidation();
-                debugLog('Movement Validation: Purchasing=' + formatCurrencyValue(movementValidation?.purchasing?.total_spend_inventory || 0) +
-                         ', COGS=' + formatCurrencyValue(movementValidation?.sales?.cogs_inventory || 0) +
-                         ', Revenue=' + formatCurrencyValue(movementValidation?.sales?.revenue_inventory || 0), 'info');
-                renderMovementChart(movementData, movementValidation);
+                const inventoryRevenue = getInventoryRevenue();
+                debugLog('Stock Value Flow loaded. Revenue for margin calc: ' + formatCurrencyValue(inventoryRevenue), 'info');
+                renderMovementChart(movementData, inventoryRevenue);
 
                 // Load slow-moving inventory data
                 const slowMovingData = getSlowMovingInventory();
