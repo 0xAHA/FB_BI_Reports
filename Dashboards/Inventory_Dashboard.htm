@@ -2426,6 +2426,74 @@
             return JSON.parse(runQuery(query));
         }
 
+        // Cross-Dashboard Validation Metrics
+        // Compares Stock Value Flow data with Purchasing/Sales Dashboard data
+        function getMovementValidation() {
+            const { start, end } = getDateRange();
+            const lg = document.getElementById('locationFilter').value;
+            const lgCondition = lg !== '%' ? `AND locationgroup.id = ${lg}` : '';
+
+            // Get Total Spend from postpoitem - INVENTORY PARTS ONLY
+            // This should be comparable to our "Received" value
+            const purchasingQuery = `
+                SELECT
+                    SUM(postpoitem.postedtotalcost) as total_spend_inventory,
+                    SUM(postpoitem.postedQty) as total_qty_received,
+                    COUNT(DISTINCT poitem.partid) as unique_parts
+                FROM postpoitem
+                JOIN postpo ON postpoitem.postpoid = postpo.id
+                JOIN poitem ON postpoitem.poitemid = poitem.id
+                JOIN part ON poitem.partid = part.id
+                JOIN po ON poitem.poid = po.id
+                JOIN locationgroup ON po.locationgroupid = locationgroup.id
+                WHERE postpo.postdate >= '${start}' AND postpo.postdate <= '${end}'
+                  AND part.typeid = 10
+                  AND part.activeflag = 1
+                  ${lgCondition}
+            `;
+
+            // Get COGS from PostSoItem - INVENTORY PARTS ONLY
+            // This should be comparable to our "Shipped" value (at cost)
+            const salesQuery = `
+                SELECT
+                    SUM(PostSoItem.PostedTotalCost) as cogs_inventory,
+                    SUM(PostSoItem.Qty) as total_qty_shipped,
+                    COUNT(DISTINCT SoItem.ProductId) as unique_products,
+                    SUM(COALESCE(((PostSoItem.TotalPrice/PostSoItem.Qty)-((PostSoItem.TotalPrice/PostSoItem.Qty)*PSI.AdjustPercent)), PostSoItem.TotalPrice/PostSoItem.Qty) * PostSoItem.Qty) as revenue_inventory
+                FROM PostSo
+                JOIN PostSoItem ON PostSoItem.PostSoId = PostSo.Id
+                JOIN SoItem ON SoItem.Id = PostSoItem.SoItemId
+                JOIN So ON So.Id = SoItem.SoId
+                JOIN Product ON Product.Id = SoItem.ProductId
+                JOIN Part ON Part.Id = Product.PartId
+                LEFT JOIN PostSoItem PSI ON PSI.SoItemId = COALESCE(
+                    (SELECT K.Id FROM SoItem K WHERE K.SoLineItem = SoItem.SoLineItem+1 AND K.TypeId = 30 AND SoItem.typeId !=30 AND K.SoId = SoItem.SoId ORDER BY K.SoLineItem ASC LIMIT 1),
+                    (SELECT K.Id FROM SoItem K WHERE K.SoLineItem > SoItem.SoLineItem AND EXISTS (SELECT * FROM SoItem J WHERE J.TypeId = 40 AND J.SoId = K.SoId AND J.SoLineItem >= K.SoLineItem-1 ORDER BY J.SoLineItem ASC) AND K.TypeId = 30 AND SoItem.typeId !=30 AND K.SoId = SoItem.SoId ORDER BY K.SoLineItem ASC LIMIT 1)
+                ) AND PSI.PostSoId = PostSo.Id
+                LEFT JOIN locationgroup ON PostSo.LocationGroupId = locationgroup.id
+                WHERE PostSo.DATECREATED >= '${start}' AND PostSo.DATECREATED <= '${end}'
+                  AND SoItem.typeId NOT IN (30, 40)
+                  AND Part.typeid = 10
+                  AND Part.activeflag = 1
+                  ${lgCondition}
+            `;
+
+            debugLog('Purchasing Validation Query: ' + purchasingQuery, 'info');
+            debugLog('Sales Validation Query: ' + salesQuery, 'info');
+
+            try {
+                const purchasingData = JSON.parse(runQuery(purchasingQuery));
+                const salesData = JSON.parse(runQuery(salesQuery));
+                return {
+                    purchasing: purchasingData[0] || {},
+                    sales: salesData[0] || {}
+                };
+            } catch (e) {
+                debugLog('Validation query error: ' + e.message, 'error');
+                return { purchasing: {}, sales: {} };
+            }
+        }
+
         // Slow-Moving Inventory - parts with high days of supply based on sales velocity
         // Using exact working query from Sales Dashboard
         function getSlowMovingInventory() {
@@ -3032,7 +3100,7 @@
             });
         }
 
-        function renderMovementChart(data) {
+        function renderMovementChart(data, validation) {
             const container = document.getElementById('movementChart');
             container.innerHTML = '';
 
@@ -3064,10 +3132,33 @@
             // Net position = received - shipped - scrap + adjustments
             const netPosition = receivedValue - shippedValue - scrapValue + adjustmentsValue;
 
-            // Build bar chart data
+            // Extract validation data for comparison
+            const purchasingSpend = parseFloat(validation?.purchasing?.total_spend_inventory || 0);
+            const salesCOGS = parseFloat(validation?.sales?.cogs_inventory || 0);
+            const salesRevenue = parseFloat(validation?.sales?.revenue_inventory || 0);
+
+            // Build bar chart data with validation comparisons
             const chartData = [
-                { category: 'Received', value: receivedValue, color: movementColors['Received'], count: received?.count || 0 },
-                { category: 'Shipped', value: -shippedValue, color: movementColors['Shipped'], count: shipped?.count || 0 },
+                {
+                    category: 'Received',
+                    value: receivedValue,
+                    color: movementColors['Received'],
+                    count: received?.count || 0,
+                    comparison: purchasingSpend,
+                    comparisonLabel: 'PO Posted Cost',
+                    comparisonNote: 'Purchasing Dashboard uses actual posted cost; this uses qty × avg cost'
+                },
+                {
+                    category: 'Shipped',
+                    value: -shippedValue,
+                    color: movementColors['Shipped'],
+                    count: shipped?.count || 0,
+                    comparison: salesCOGS,
+                    comparisonLabel: 'Sales COGS',
+                    comparisonNote: 'Should match (both are cost basis for inventory parts)',
+                    revenue: salesRevenue,
+                    revenueLabel: 'Sales Revenue'
+                },
                 { category: 'Scrap', value: -scrapValue, color: movementColors['Scrap'], count: scrap?.count || 0 },
                 { category: 'Adjustments', value: adjustmentsValue, color: movementColors['Adjustments'], count: adjustments?.count || 0 }
             ].filter(d => d.value !== 0 || d.count > 0);
@@ -3120,12 +3211,41 @@
                 .on('mouseover', function(event, d) {
                     d3.select(this).attr('opacity', 0.8);
                     const valueDisplay = d.value >= 0 ? `+${formatCurrencyValue(d.value)}` : formatCurrencyValue(d.value);
+
+                    // Build tooltip with validation comparison if available
+                    let tooltipHtml = `
+                        <div><span class="tooltip-label">Category:</span><span class="tooltip-value">${d.category}</span></div>
+                        <div><span class="tooltip-label">Value (Avg Cost):</span><span class="tooltip-value" style="color: ${d.value >= 0 ? '#10b981' : '#ef4444'}">${valueDisplay}</span></div>
+                        <div><span class="tooltip-label">Transactions:</span><span class="tooltip-value">${parseInt(d.count).toLocaleString()}</span></div>
+                    `;
+
+                    // Add comparison data if available
+                    if (d.comparison) {
+                        const diff = Math.abs(d.value) - d.comparison;
+                        const diffPercent = d.comparison > 0 ? ((diff / d.comparison) * 100).toFixed(1) : 0;
+                        tooltipHtml += `
+                            <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #475569;">
+                                <div><span class="tooltip-label">${d.comparisonLabel}:</span><span class="tooltip-value">${formatCurrencyValue(d.comparison)}</span></div>
+                                <div><span class="tooltip-label">Difference:</span><span class="tooltip-value" style="color: ${Math.abs(diffPercent) < 5 ? '#10b981' : '#f59e0b'}">${formatCurrencyValue(diff)} (${diffPercent}%)</span></div>
+                            </div>
+                        `;
+                        if (d.comparisonNote) {
+                            tooltipHtml += `<div style="font-size: 10px; color: #94a3b8; margin-top: 4px; max-width: 220px;">${d.comparisonNote}</div>`;
+                        }
+                    }
+
+                    // Add revenue for Shipped category
+                    if (d.revenue) {
+                        tooltipHtml += `
+                            <div style="margin-top: 4px;">
+                                <div><span class="tooltip-label">${d.revenueLabel}:</span><span class="tooltip-value" style="color: #3b82f6">${formatCurrencyValue(d.revenue)}</span></div>
+                                <div><span class="tooltip-label">Margin:</span><span class="tooltip-value">${formatCurrencyValue(d.revenue - Math.abs(d.value))} (${((d.revenue - Math.abs(d.value)) / d.revenue * 100).toFixed(1)}%)</span></div>
+                            </div>
+                        `;
+                    }
+
                     tooltip.style('opacity', 1)
-                        .html(`
-                            <div><span class="tooltip-label">Category:</span><span class="tooltip-value">${d.category}</span></div>
-                            <div><span class="tooltip-label">Value:</span><span class="tooltip-value" style="color: ${d.value >= 0 ? '#10b981' : '#ef4444'}">${valueDisplay}</span></div>
-                            <div><span class="tooltip-label">Transactions:</span><span class="tooltip-value">${parseInt(d.count).toLocaleString()}</span></div>
-                        `)
+                        .html(tooltipHtml)
                         .style('left', (event.pageX + 10) + 'px')
                         .style('top', (event.pageY - 10) + 'px');
                 })
@@ -3504,9 +3624,13 @@
                 const statusData = getAvailabilityStatus();
                 renderStatusChart(statusData);
 
-                // Load stock movement data
+                // Load stock movement data with cross-dashboard validation
                 const movementData = getMovementSummary();
-                renderMovementChart(movementData);
+                const movementValidation = getMovementValidation();
+                debugLog('Movement Validation: Purchasing=' + formatCurrencyValue(movementValidation?.purchasing?.total_spend_inventory || 0) +
+                         ', COGS=' + formatCurrencyValue(movementValidation?.sales?.cogs_inventory || 0) +
+                         ', Revenue=' + formatCurrencyValue(movementValidation?.sales?.revenue_inventory || 0), 'info');
+                renderMovementChart(movementData, movementValidation);
 
                 // Load slow-moving inventory data
                 const slowMovingData = getSlowMovingInventory();
