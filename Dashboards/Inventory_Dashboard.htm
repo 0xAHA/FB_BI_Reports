@@ -2330,90 +2330,93 @@
             const vendorFilter = document.getElementById('vendorFilter').value;
             const { start, end } = getDateRange();
 
-            // Location group conditions for different table contexts
-            let lgConditionPO = locationGroup !== '%' ? `AND po.locationgroupid = ${locationGroup}` : '';
-            let lgConditionSO = locationGroup !== '%' ? `AND PostSo.LocationGroupId = ${locationGroup}` : '';
-            let lgConditionPost = locationGroup !== '%' ? `AND INVENTORYLOG.LOCATIONGROUPID = ${locationGroup}` : '';
-            let vendorCondition = vendorFilter !== '%' ? `AND po.vendorid = ${vendorFilter}` : '';
-            let vendorConditionPart = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = part.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
+            let lgCondition = locationGroup !== '%' ? `AND il.locationGroupId = ${locationGroup}` : '';
+            let lgConditionReceipt = locationGroup !== '%' ? `AND r.locationgroupid = ${locationGroup}` : '';
+            let vendorCondition = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = p.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
+            let vendorConditionReceipt = vendorFilter !== '%' ? `AND po.vendorid = ${vendorFilter}` : '';
 
             // Value-based movement summary
-            // Received: From postpoitem (PO receipts) - uses poitem.unitcost (available before posting to accounting)
-            // Shipped: From PostSoItem (sales) - uses PostedTotalCost
-            // Scrap/Adjustments: From INVENTORYLOG directly (available before posting to accounting)
+            // Received: From receiptitem with statusid >= 20 (Reconciled, Received, Fulfilled), uses landedtotalcost
+            // Shipped: From inventorylog typeId 20 (sales shipments)
+            // Scrap: From inventorylog typeId 67
+            // Adjustments: From inventorylog typeId IN (64, 65, 68)
             const query = `
                 SELECT 'Received' as category,
-                    COALESCE(SUM(postpoitem.Qty), 0) as total_qty,
-                    COALESCE(SUM(postpoitem.Qty * poitem.unitcost), 0) as total_value,
+                    COALESCE(SUM(ri.qty), 0) as total_qty,
+                    COALESCE(SUM(ri.landedtotalcost), 0) as total_value,
                     COUNT(*) as count
-                FROM postpoitem
-                JOIN postpo ON postpoitem.postpoid = postpo.id
-                JOIN poitem ON postpoitem.poitemid = poitem.id
-                JOIN part ON poitem.partid = part.id
+                FROM receiptitem ri
+                JOIN receipt r ON ri.receiptid = r.id
+                JOIN poitem ON ri.poitemid = poitem.id
+                JOIN part p ON poitem.partid = p.id
                 JOIN po ON poitem.poid = po.id
-                WHERE postpo.DateCreated >= '${start}' AND postpo.DateCreated <= '${end}'
-                  AND part.typeid = 10
-                  AND part.activeflag = 1
-                  ${lgConditionPO}
-                  ${vendorCondition}
+                WHERE r.datecreated >= '${start}' AND r.datecreated <= '${end}'
+                  AND ri.statusid >= 20
+                  AND p.typeid = 10
+                  AND p.activeflag = 1
+                  ${lgConditionReceipt}
+                  ${vendorConditionReceipt}
 
                 UNION ALL
 
                 SELECT 'Shipped' as category,
-                    COALESCE(SUM(PostSoItem.Qty), 0) as total_qty,
-                    COALESCE(SUM(PostSoItem.Qty * COALESCE(pc.avgcost, 0)), 0) as total_value,
-                    COUNT(*) as count
-                FROM PostSo
-                JOIN PostSoItem ON PostSoItem.PostSoId = PostSo.Id
-                JOIN SoItem ON SoItem.Id = PostSoItem.SoItemId
-                JOIN Product ON Product.Id = SoItem.ProductId
-                JOIN Part ON Part.Id = Product.PartId
-                LEFT JOIN partcost pc ON Part.id = pc.partid
-                WHERE PostSo.DATECREATED >= '${start}' AND PostSo.DATECREATED <= '${end}'
-                  AND SoItem.typeId NOT IN (30, 40)
-                  AND Part.typeid = 10
-                  AND Part.activeflag = 1
-                  ${lgConditionSO}
-                  ${vendorConditionPart.replace('part.id', 'Part.id')}
+                    ABS(SUM(COALESCE(sales.qty, 0))) as total_qty,
+                    ABS(SUM(COALESCE(sales.qty, 0) * COALESCE(pc.avgCost, 0))) as total_value,
+                    SUM(COALESCE(sales.cnt, 0)) as count
+                FROM part p
+                LEFT JOIN partcost pc ON p.id = pc.partid
+                LEFT JOIN (
+                    SELECT partId, SUM(changeQty) AS qty, COUNT(*) as cnt
+                    FROM inventorylog il
+                    WHERE il.eventDate >= '${start}' AND il.eventDate <= '${end}'
+                      AND il.typeId = 20
+                      ${lgCondition}
+                    GROUP BY partId
+                ) AS sales ON p.id = sales.partId
+                WHERE p.activeflag = 1 AND p.typeid = 10 ${vendorCondition}
+                HAVING total_qty != 0
 
                 UNION ALL
 
                 SELECT 'Scrap' as category,
-                    COALESCE(SUM(ABS(INVENTORYLOG.CHANGEQTY)), 0) as total_qty,
-                    COALESCE(SUM(ABS(INVENTORYLOG.CHANGEQTY) * COALESCE(pc.avgcost, 0)), 0) as total_value,
-                    COUNT(*) as count
-                FROM INVENTORYLOG
-                INNER JOIN PART ON INVENTORYLOG.PARTID = PART.ID
-                LEFT JOIN partcost pc ON PART.id = pc.partid
-                WHERE INVENTORYLOG.TYPEID = 67
-                  AND INVENTORYLOG.EVENTDATE >= '${start}' AND INVENTORYLOG.EVENTDATE <= '${end}'
-                  AND PART.activeflag = 1
-                  AND PART.typeid = 10
-                  ${lgConditionPost}
-                  ${vendorConditionPart.replace('part.id', 'PART.id')}
+                    ABS(SUM(COALESCE(scr.qty, 0))) as total_qty,
+                    ABS(SUM(COALESCE(scr.qty, 0) * COALESCE(pc.avgCost, 0))) as total_value,
+                    SUM(COALESCE(scr.cnt, 0)) as count
+                FROM part p
+                LEFT JOIN partcost pc ON p.id = pc.partid
+                LEFT JOIN (
+                    SELECT partId, SUM(changeQty) AS qty, COUNT(*) as cnt
+                    FROM inventorylog il
+                    WHERE il.eventDate >= '${start}' AND il.eventDate <= '${end}'
+                      AND il.typeId = 67
+                      ${lgCondition}
+                    GROUP BY partId
+                ) AS scr ON p.id = scr.partId
+                WHERE p.activeflag = 1 AND p.typeid = 10 ${vendorCondition}
+                HAVING total_qty != 0
 
                 UNION ALL
 
                 SELECT 'Adjustments' as category,
-                    COALESCE(SUM(INVENTORYLOG.CHANGEQTY), 0) as total_qty,
-                    COALESCE(SUM(INVENTORYLOG.CHANGEQTY * COALESCE(pc.avgcost, 0)), 0) as total_value,
-                    COUNT(*) as count
-                FROM INVENTORYLOG
-                INNER JOIN PART ON INVENTORYLOG.PARTID = PART.ID
-                LEFT JOIN partcost pc ON PART.id = pc.partid
-                WHERE INVENTORYLOG.TYPEID IN (64, 65, 68)
-                  AND INVENTORYLOG.CHANGEQTY != 0
-                  AND INVENTORYLOG.EVENTDATE >= '${start}' AND INVENTORYLOG.EVENTDATE <= '${end}'
-                  AND PART.activeflag = 1
-                  AND PART.typeid = 10
-                  ${lgConditionPost}
-                  ${vendorConditionPart.replace('part.id', 'PART.id')}
+                    SUM(COALESCE(adj.qty, 0)) as total_qty,
+                    SUM(COALESCE(adj.qty, 0) * COALESCE(pc.avgCost, 0)) as total_value,
+                    SUM(COALESCE(adj.cnt, 0)) as count
+                FROM part p
+                LEFT JOIN partcost pc ON p.id = pc.partid
+                LEFT JOIN (
+                    SELECT partId, SUM(changeQty) AS qty, COUNT(*) as cnt
+                    FROM inventorylog il
+                    WHERE il.eventDate >= '${start}' AND il.eventDate <= '${end}'
+                      AND il.typeId IN (64, 65, 68)
+                      ${lgCondition}
+                    GROUP BY partId
+                ) AS adj ON p.id = adj.partId
+                WHERE p.activeflag = 1 AND p.typeid = 10 ${vendorCondition}
+                HAVING total_qty != 0
             `;
 
             debugLog('Movement Summary Query: ' + query, 'info');
-            const result = JSON.parse(runQuery(query));
-            debugLog('Movement Summary Result: ' + JSON.stringify(result), 'info');
-            return result;
+            return JSON.parse(runQuery(query));
         }
 
         // Get Revenue for inventory parts (for margin calculation in Stock Value Flow)
@@ -3090,22 +3093,19 @@
             const netPosition = receivedValue - shippedValue - scrapValue + adjustmentsValue;
 
             // Build bar chart data
-            // Received/Shipped now use same data sources as Purchasing/Sales dashboards
             const chartData = [
                 {
                     category: 'Received',
                     value: receivedValue,
                     color: movementColors['Received'],
-                    count: received?.count || 0,
-                    note: 'Matches Purchasing Dashboard "Inventory Spend"'
+                    count: received?.count || 0
                 },
                 {
                     category: 'Shipped',
                     value: -shippedValue,
                     color: movementColors['Shipped'],
                     count: shipped?.count || 0,
-                    revenue: revenue,
-                    note: 'Matches Sales Dashboard "COGS"'
+                    revenue: revenue
                 },
                 { category: 'Scrap', value: -scrapValue, color: movementColors['Scrap'], count: scrap?.count || 0 },
                 { category: 'Adjustments', value: adjustmentsValue, color: movementColors['Adjustments'], count: adjustments?.count || 0 }
@@ -3590,10 +3590,11 @@
                 const statusData = getAvailabilityStatus();
                 renderStatusChart(statusData);
 
-                // Stock Value Flow - uses real-time data (no accounting posting required)
-                // Received = postpoitem.Qty * poitem.unitcost (PO receipt cost)
-                // Shipped = PostSoItem.Qty * partcost.avgcost (current avg cost)
-                // Scrap/Adjustments = INVENTORYLOG with partcost.avgcost
+                // Stock Value Flow
+                // Received = receiptitem.landedtotalcost (statusid >= 20: reconciled/received/fulfilled)
+                // Shipped = inventorylog typeId 20 with partcost.avgcost
+                // Scrap = inventorylog typeId 67 with partcost.avgcost
+                // Adjustments = inventorylog typeId IN (64,65,68) with partcost.avgcost
                 const movementData = getMovementSummary();
                 const inventoryRevenue = getInventoryRevenue();
                 debugLog('Stock Value Flow loaded. Revenue for margin calc: ' + formatCurrencyValue(inventoryRevenue), 'info');
