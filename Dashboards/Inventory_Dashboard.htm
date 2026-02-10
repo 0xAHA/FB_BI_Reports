@@ -2195,43 +2195,73 @@
 
         function getMovementSummary() {
             const locationGroup = document.getElementById('locationGroupFilter').value;
-            const productCategory = document.getElementById('productCategoryFilter').value;
             const vendorFilter = document.getElementById('vendorFilter').value;
+            const { start, end } = getDateRange();
 
-            let lgCondition = locationGroup !== '%' ? `AND LOCGRP.id = ${locationGroup}` : '';
-            let vendorCondition = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = PART.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
+            let lgCondition = locationGroup !== '%' ? `AND il.locationGroupId = ${locationGroup}` : '';
+            let vendorCondition = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = p.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
 
-            // Value-based movement summary:
-            // 10=Receive, 20=Ship, 67=Scrap, 68=Cycle Count, 64=Adjust Inc, 65=Adjust Dec
+            // Value-based movement summary using subqueries for accurate categorization
+            // Purchases: typeId 10/15 with receiptitem.soitemid IS NULL (PO receipt, not SO return)
+            // Shipped: typeId 20 (sales shipments)
+            // Adjustments: typeId 64, 65, 67, 68
             const query = `
-                SELECT
-                    CASE
-                        WHEN INVENTORYLOGTYPE.ID = 10 THEN 'Received'
-                        WHEN INVENTORYLOGTYPE.ID = 20 THEN 'Shipped'
-                        WHEN INVENTORYLOGTYPE.ID IN (64, 65, 67, 68) THEN 'Adjustments'
-                        ELSE 'Other'
-                    END as category,
-                    SUM(INVENTORYLOG.CHANGEQTY) as total_qty,
-                    SUM(INVENTORYLOG.CHANGEQTY * COALESCE(pc.avgCost, 0)) as total_value,
-                    COUNT(*) as count
-                FROM INVENTORYLOG
-                INNER JOIN LOCATIONGROUP LOCGRP ON INVENTORYLOG.LOCATIONGROUPID = LOCGRP.ID
-                INNER JOIN INVENTORYLOGTYPE ON INVENTORYLOG.TYPEID = INVENTORYLOGTYPE.ID
-                INNER JOIN PART ON INVENTORYLOG.PARTID = PART.ID
-                LEFT JOIN partcost pc ON PART.id = pc.partid
-                WHERE ${getDateCondition('INVENTORYLOG.eventDate')}
-                    AND PART.activeflag = 1
-                    AND PART.typeid = 10
-                    ${lgCondition}
-                    ${vendorCondition}
-                GROUP BY
-                    CASE
-                        WHEN INVENTORYLOGTYPE.ID = 10 THEN 'Received'
-                        WHEN INVENTORYLOGTYPE.ID = 20 THEN 'Shipped'
-                        WHEN INVENTORYLOGTYPE.ID IN (64, 65, 67, 68) THEN 'Adjustments'
-                        ELSE 'Other'
-                    END
-                ORDER BY ABS(SUM(INVENTORYLOG.CHANGEQTY * COALESCE(pc.avgCost, 0))) DESC
+                SELECT 'Received' as category,
+                    SUM(COALESCE(purchases.qty, 0)) as total_qty,
+                    SUM(COALESCE(purchases.qty, 0) * COALESCE(pc.avgCost, 0)) as total_value,
+                    SUM(COALESCE(purchases.cnt, 0)) as count
+                FROM part p
+                LEFT JOIN partcost pc ON p.id = pc.partid
+                LEFT JOIN (
+                    SELECT il.partId, SUM(il.changeQty) AS qty, COUNT(*) as cnt
+                    FROM inventorylog il
+                    LEFT JOIN receiptitem ri ON CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(il.info, 'Receipt Item ', -1), ' ', 1) AS UNSIGNED) = ri.id
+                    WHERE il.eventDate >= '${start}' AND il.eventDate <= '${end}'
+                      AND il.typeId IN (10, 15)
+                      ${lgCondition}
+                      AND (ri.soitemid IS NULL OR il.info NOT LIKE '%Receipt Item%')
+                    GROUP BY il.partId
+                ) AS purchases ON p.id = purchases.partId
+                WHERE p.activeflag = 1 AND p.typeid = 10 ${vendorCondition}
+                HAVING total_qty != 0
+
+                UNION ALL
+
+                SELECT 'Shipped' as category,
+                    ABS(SUM(COALESCE(sales.qty, 0))) as total_qty,
+                    ABS(SUM(COALESCE(sales.qty, 0) * COALESCE(pc.avgCost, 0))) as total_value,
+                    SUM(COALESCE(sales.cnt, 0)) as count
+                FROM part p
+                LEFT JOIN partcost pc ON p.id = pc.partid
+                LEFT JOIN (
+                    SELECT partId, SUM(changeQty) AS qty, COUNT(*) as cnt
+                    FROM inventorylog il
+                    WHERE il.eventDate >= '${start}' AND il.eventDate <= '${end}'
+                      AND il.typeId = 20
+                      ${lgCondition}
+                    GROUP BY partId
+                ) AS sales ON p.id = sales.partId
+                WHERE p.activeflag = 1 AND p.typeid = 10 ${vendorCondition}
+                HAVING total_qty != 0
+
+                UNION ALL
+
+                SELECT 'Adjustments' as category,
+                    SUM(COALESCE(adj.qty, 0)) as total_qty,
+                    SUM(COALESCE(adj.qty, 0) * COALESCE(pc.avgCost, 0)) as total_value,
+                    SUM(COALESCE(adj.cnt, 0)) as count
+                FROM part p
+                LEFT JOIN partcost pc ON p.id = pc.partid
+                LEFT JOIN (
+                    SELECT partId, SUM(changeQty) AS qty, COUNT(*) as cnt
+                    FROM inventorylog il
+                    WHERE il.eventDate >= '${start}' AND il.eventDate <= '${end}'
+                      AND il.typeId IN (64, 65, 67, 68)
+                      ${lgCondition}
+                    GROUP BY partId
+                ) AS adj ON p.id = adj.partId
+                WHERE p.activeflag = 1 AND p.typeid = 10 ${vendorCondition}
+                HAVING total_qty != 0
             `;
 
             debugLog('Movement Summary Query: ' + query, 'info');
