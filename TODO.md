@@ -112,7 +112,7 @@
 - [x] Use POST.DATECREATED instead of DATEPOSTED for adjustments
 
 #### Pending:
-- [ ] Review and test all queries with real data
+- [x] Review and test all queries with real data (validated against standard Fishbowl reports)
 
 #### Completed (Cost Attribution):
 - [x] Correct cost attribution for Scrap/Adjustments implemented
