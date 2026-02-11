@@ -1515,6 +1515,87 @@
             }
         }
 
+        function getReceivedDetail() {
+            const locationGroup = document.getElementById('locationGroupFilter').value;
+            const vendorFilter = document.getElementById('vendorFilter').value;
+            const { start, end } = getDateRange();
+
+            let lgCondition = locationGroup !== '%' ? `AND r.locationgroupid = ${locationGroup}` : '';
+            let vendorCondition = vendorFilter !== '%' ? `AND po.vendorid = ${vendorFilter}` : '';
+
+            const query = `
+                SELECT
+                    COALESCE(GREATEST(ri.dateReceived, ri.dateReconciled), ri.dateReceived, ri.dateReconciled) as date_received,
+                    p.num AS part_num,
+                    p.description,
+                    ri.qty,
+                    ri.landedtotalcost as total_cost,
+                    po.num as po_num,
+                    v.name as vendor_name,
+                    COALESCE(lg.name, 'Unknown') as location_group
+                FROM receiptitem ri
+                JOIN receipt r ON ri.receiptid = r.id
+                JOIN poitem ON ri.poitemid = poitem.id
+                JOIN part p ON poitem.partid = p.id
+                JOIN po ON poitem.poid = po.id
+                LEFT JOIN vendor v ON po.vendorid = v.id
+                LEFT JOIN locationgroup lg ON r.locationgroupid = lg.id
+                WHERE COALESCE(GREATEST(ri.dateReceived, ri.dateReconciled), ri.dateReceived, ri.dateReconciled) >= '${start}'
+                  AND COALESCE(GREATEST(ri.dateReceived, ri.dateReconciled), ri.dateReceived, ri.dateReconciled) <= '${end} 23:59:59'
+                  AND ri.statusid >= 20
+                  AND p.typeid = 10
+                  AND p.activeflag = 1
+                  ${lgCondition}
+                  ${vendorCondition}
+                ORDER BY COALESCE(GREATEST(ri.dateReceived, ri.dateReconciled), ri.dateReceived, ri.dateReconciled) DESC
+            `;
+
+            debugLog('Received Detail Query: ' + query.replace(/\\s+/g, ' ').trim(), 'info');
+            try {
+                return JSON.parse(runQuery(query));
+            } catch (e) {
+                debugLog('Error getting received detail: ' + e.message, 'error');
+                return [];
+            }
+        }
+
+        function getShippedDetail() {
+            const vendorFilter = document.getElementById('vendorFilter').value;
+            const { start, end } = getDateRange();
+
+            let vendorCondition = vendorFilter !== '%' ? `AND EXISTS (SELECT 1 FROM vendorparts vp WHERE vp.partid = p.id AND vp.vendorid = ${vendorFilter} AND vp.defaultflag = 1)` : '';
+
+            const query = `
+                SELECT
+                    psi.dateCreated as date_shipped,
+                    p.num AS part_num,
+                    p.description,
+                    psi.qty,
+                    psi.PostedTotalCost as total_cost,
+                    so.num as so_num,
+                    c.name as customer_name
+                FROM postsoitem psi
+                JOIN soitem si ON psi.soitemid = si.id
+                JOIN part p ON si.productid = p.id
+                JOIN so ON si.soid = so.id
+                LEFT JOIN customer c ON so.customerid = c.id
+                WHERE psi.dateCreated >= '${start}'
+                  AND psi.dateCreated <= '${end} 23:59:59'
+                  AND p.activeflag = 1
+                  AND p.typeid = 10
+                  ${vendorCondition}
+                ORDER BY psi.dateCreated DESC
+            `;
+
+            debugLog('Shipped Detail Query: ' + query.replace(/\\s+/g, ' ').trim(), 'info');
+            try {
+                return JSON.parse(runQuery(query));
+            } catch (e) {
+                debugLog('Error getting shipped detail: ' + e.message, 'error');
+                return [];
+            }
+        }
+
         // Fulfillment Pipeline - SO items picked but awaiting pack/ship
         // Uses Ship.StatusId: 10 = Entered (not packed), 20 = Packed (awaiting ship)
         // OrderTypeId 20 = Sales Orders only
@@ -1934,6 +2015,124 @@
             `;
 
             showDrilldown('Scrapped Items', 'Items scrapped in selected period', tableHtml, footer);
+        }
+
+        function showReceivedModal() {
+            debugLog('Loading received details...', 'click');
+            const data = getReceivedDetail();
+            currentDrilldownData = data;
+
+            if (data.length === 0) {
+                showDrilldown('Received Items', 'No received items found', '<p class="text-center text-slate-500 py-8">No received items in this period</p>', '');
+                return;
+            }
+
+            const totalValue = data.reduce((sum, r) => sum + parseFloat(r.total_cost || 0), 0);
+            const totalQty = data.reduce((sum, r) => sum + parseFloat(r.qty || 0), 0);
+            const uniqueParts = new Set(data.map(r => r.part_num)).size;
+
+            let tableHtml = `
+                <table class="w-full text-sm" style="table-layout: auto;">
+                    <thead class="bg-slate-100 sticky top-0 z-10">
+                        <tr>
+                            <th class="px-3 py-3 text-left font-semibold text-slate-700 whitespace-nowrap">Date</th>
+                            <th class="px-3 py-3 text-left font-semibold text-slate-700 whitespace-nowrap">PO #</th>
+                            <th class="px-3 py-3 text-left font-semibold text-slate-700 whitespace-nowrap">Part Number</th>
+                            <th class="px-3 py-3 text-left font-semibold text-slate-700">Description</th>
+                            <th class="px-3 py-3 text-left font-semibold text-slate-700 whitespace-nowrap">Vendor</th>
+                            <th class="px-3 py-3 text-left font-semibold text-slate-700 whitespace-nowrap">Location</th>
+                            <th class="px-3 py-3 text-right font-semibold text-slate-700 whitespace-nowrap">Qty</th>
+                            <th class="px-3 py-3 text-right font-semibold text-slate-700 whitespace-nowrap">Cost</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-200">
+            `;
+
+            data.forEach(row => {
+                tableHtml += `
+                    <tr class="hover:bg-slate-50">
+                        <td class="px-3 py-3 text-slate-500 whitespace-nowrap">${moment(row.date_received).format(MOMENT_DATE_FORMAT)}</td>
+                        <td class="px-3 py-3 font-mono text-sm whitespace-nowrap">${row.po_num || ''}</td>
+                        <td class="px-3 py-3 font-mono text-sm whitespace-nowrap">${row.part_num}</td>
+                        <td class="px-3 py-3">${row.description || ''}</td>
+                        <td class="px-3 py-3 whitespace-nowrap">${row.vendor_name || ''}</td>
+                        <td class="px-3 py-3 whitespace-nowrap">${row.location_group || ''}</td>
+                        <td class="px-3 py-3 text-right font-medium whitespace-nowrap">${formatQty(row.qty)}</td>
+                        <td class="px-3 py-3 text-right text-green-600 font-medium whitespace-nowrap">${formatCurrencyValue(row.total_cost)}</td>
+                    </tr>
+                `;
+            });
+
+            tableHtml += '</tbody></table>';
+
+            const footer = `
+                <div class="flex justify-between items-center">
+                    <span><strong>${uniqueParts}</strong> unique parts</span>
+                    <span><strong>${data.length}</strong> receipt lines</span>
+                    <span>Total Qty: <strong>${formatQty(totalQty)}</strong></span>
+                    <span>Total Cost: <strong class="text-green-600">${formatCurrencyValue(totalValue)}</strong></span>
+                </div>
+            `;
+
+            showDrilldown('Received Items', 'Items received in selected period', tableHtml, footer);
+        }
+
+        function showShippedModal() {
+            debugLog('Loading shipped details...', 'click');
+            const data = getShippedDetail();
+            currentDrilldownData = data;
+
+            if (data.length === 0) {
+                showDrilldown('Shipped Items', 'No shipped items found', '<p class="text-center text-slate-500 py-8">No shipped items in this period</p>', '');
+                return;
+            }
+
+            const totalValue = data.reduce((sum, r) => sum + parseFloat(r.total_cost || 0), 0);
+            const totalQty = data.reduce((sum, r) => sum + parseFloat(r.qty || 0), 0);
+            const uniqueParts = new Set(data.map(r => r.part_num)).size;
+
+            let tableHtml = `
+                <table class="w-full text-sm" style="table-layout: auto;">
+                    <thead class="bg-slate-100 sticky top-0 z-10">
+                        <tr>
+                            <th class="px-3 py-3 text-left font-semibold text-slate-700 whitespace-nowrap">Date</th>
+                            <th class="px-3 py-3 text-left font-semibold text-slate-700 whitespace-nowrap">SO #</th>
+                            <th class="px-3 py-3 text-left font-semibold text-slate-700 whitespace-nowrap">Part Number</th>
+                            <th class="px-3 py-3 text-left font-semibold text-slate-700">Description</th>
+                            <th class="px-3 py-3 text-left font-semibold text-slate-700 whitespace-nowrap">Customer</th>
+                            <th class="px-3 py-3 text-right font-semibold text-slate-700 whitespace-nowrap">Qty</th>
+                            <th class="px-3 py-3 text-right font-semibold text-slate-700 whitespace-nowrap">Cost</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-200">
+            `;
+
+            data.forEach(row => {
+                tableHtml += `
+                    <tr class="hover:bg-slate-50">
+                        <td class="px-3 py-3 text-slate-500 whitespace-nowrap">${moment(row.date_shipped).format(MOMENT_DATE_FORMAT)}</td>
+                        <td class="px-3 py-3 font-mono text-sm whitespace-nowrap">${row.so_num || ''}</td>
+                        <td class="px-3 py-3 font-mono text-sm whitespace-nowrap">${row.part_num}</td>
+                        <td class="px-3 py-3">${row.description || ''}</td>
+                        <td class="px-3 py-3 whitespace-nowrap">${row.customer_name || ''}</td>
+                        <td class="px-3 py-3 text-right font-medium whitespace-nowrap">${formatQty(row.qty)}</td>
+                        <td class="px-3 py-3 text-right text-red-600 font-medium whitespace-nowrap">${formatCurrencyValue(row.total_cost)}</td>
+                    </tr>
+                `;
+            });
+
+            tableHtml += '</tbody></table>';
+
+            const footer = `
+                <div class="flex justify-between items-center">
+                    <span><strong>${uniqueParts}</strong> unique parts</span>
+                    <span><strong>${data.length}</strong> invoice lines</span>
+                    <span>Total Qty: <strong>${formatQty(totalQty)}</strong></span>
+                    <span>Total Cost: <strong class="text-red-600">${formatCurrencyValue(totalValue)}</strong></span>
+                </div>
+            `;
+
+            showDrilldown('Shipped Items', 'Items invoiced/shipped in selected period', tableHtml, footer);
         }
 
         function showFulfillmentPipelineModal() {
@@ -3051,7 +3250,25 @@
                 .on('mouseout', function() {
                     d3.select(this).attr('opacity', 1);
                     tooltip.style('opacity', 0);
-                });
+                })
+                .on('click', function(event, d) {
+                    // Open modal based on category
+                    switch(d.category) {
+                        case 'Received':
+                            showReceivedModal();
+                            break;
+                        case 'Shipped':
+                            showShippedModal();
+                            break;
+                        case 'Scrap':
+                            showScrapModal();
+                            break;
+                        case 'Adjustments':
+                            showCycleCountModal();
+                            break;
+                    }
+                })
+                .style('cursor', 'pointer');
 
             // Value labels on bars (on the opposite side from bar, near $0 line)
             svg.selectAll('.bar-label')
