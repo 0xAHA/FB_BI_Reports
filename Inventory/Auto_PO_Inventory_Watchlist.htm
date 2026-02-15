@@ -135,6 +135,7 @@
         .group-inventory-key { background-color: #fef3c7 !important; }
         .group-reorder-params { background-color: #dcfce7 !important; }
         .group-allocation { background-color: #fafafa !important; }
+        .group-status { background-color: transparent !important; }
 
         /* ============================================
            Auto PO Specific Styles
@@ -454,7 +455,7 @@
                     </div>
                     <div class="flex items-center gap-4 py-1">
                         <label class="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer whitespace-nowrap" title="Only show parts where this is the default vendor">
-                            <input type="checkbox" id="paramDefaultVendorOnly" checked class="accent-[#2d9cdb]"> Default Vendor Only
+                            <input type="checkbox" id="paramDefaultVendorOnly" class="accent-[#2d9cdb]"> Default Vendor Only
                         </label>
                         <label class="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer whitespace-nowrap">
                             <input type="checkbox" id="paramShowVendorPN" checked class="accent-[#2d9cdb]"> Vendor Part #
@@ -681,6 +682,47 @@
         return isNaN(num) ? 0 : num;
     }
 
+    // ============================================
+    // Compute inventory status (state + capacity %)
+    // Matches Inv_Reorder_Watchlist logic
+    // ============================================
+    function computePartStatus(item) {
+        var rop = parseFloat(item.reorder_level) || 0;
+        var oul = parseFloat(item.target_level) || 0;
+        // Compute available: on_hand - allocated + drop_ship (approximation without "not available")
+        var onhand = parseFloat(item.qty_on_hand) || 0;
+        var allocated = parseFloat(item.qty_allocated) || 0;
+        var dropship = parseFloat(item.qty_on_drop_ship) || 0;
+        var available = Math.max(0, onhand - allocated + dropship);
+        // Use _available if already computed from standard query
+        if (item._available !== undefined) available = item._available;
+
+        item._available = available;
+
+        if (!rop || !oul || rop === 0 || oul === 0) {
+            item._state = 'norop';
+            item._capacitypct = null;
+            return;
+        }
+
+        if (available > oul) {
+            item._state = 'fb10';
+            item._capacitypct = 150;
+        } else if (available < rop) {
+            item._state = 'fb40';
+            item._capacitypct = Math.round(-1 * ((rop - available) / rop) * 100 * 10) / 10;
+        } else if (oul === rop) {
+            item._state = available >= oul ? 'fb20' : 'fb40';
+            item._capacitypct = available >= oul ? 100 : Math.round(-1 * ((rop - available) / rop) * 100 * 10) / 10;
+        } else if (available <= rop + (0.2 * (oul - rop))) {
+            item._state = 'fb30';
+            item._capacitypct = Math.round(((available - rop) / (oul - rop)) * 100 * 10) / 10;
+        } else {
+            item._state = 'fb20';
+            item._capacitypct = Math.round(((available - rop) / (oul - rop)) * 100 * 10) / 10;
+        }
+    }
+
     // Currency formatting — currencyLocale() returns { symbol, locale } with no arguments
     var CURRENCY_LOCALE_OBJ = (typeof currencyLocale === 'function') ? currencyLocale() : {};
     var CURRENCY_SYMBOL = (CURRENCY_LOCALE_OBJ && CURRENCY_LOCALE_OBJ.symbol) || '$';
@@ -818,16 +860,14 @@
                 debugLog('Failed to load vendorparts lookup: ' + e.message, 'error');
             }
 
-            // Build default vendor map if needed
-            if (defaultVendorOnly) {
-                try {
-                    var dvRows = JSON.parse(runQuery("SELECT partid, vendorid FROM vendorparts WHERE defaultflag = 1"));
-                    dvRows.forEach(function(r) { defaultVendorMap[r.partid] = r.vendorid; });
-                    debugLog('Default vendor map: ' + dvRows.length + ' entries', 'info');
-                } catch(e) {
-                    console.error('Failed to load default vendor map:', e);
-                    debugLog('Failed to load default vendor map: ' + e.message, 'error');
-                }
+            // Always build default vendor map (needed for smart auto-selection)
+            try {
+                var dvRows = JSON.parse(runQuery("SELECT partid, vendorid FROM vendorparts WHERE defaultflag = 1"));
+                dvRows.forEach(function(r) { defaultVendorMap[r.partid] = r.vendorid; });
+                debugLog('Default vendor map: ' + dvRows.length + ' entries', 'info');
+            } catch(e) {
+                console.error('Failed to load default vendor map:', e);
+                debugLog('Failed to load default vendor map: ' + e.message, 'error');
             }
 
             var vendorIds = [];
@@ -883,10 +923,16 @@
                                 debugLog('Sample item for vendor ' + vid + ': part_num=' + item.part_num + ' _fbPartNum=' + item._fbPartNum + ' _vendorPartNum=' + item._vendorPartNum + ' last_cost=' + item.last_cost + ' (' + typeof item.last_cost + ')', 'info');
                             }
 
+                            // Mark as auto PO sourced
+                            item._isAutoPo = true;
+
                             allResults.push(item);
                             var key = item.vendor_id + '_' + item.part_id;
                             var sugQty = parseFloat(item.qty_suggested) || 0;
-                            selectionState[key] = sugQty > 0;
+                            // Only auto-select if qty suggested > 0 AND this is the default vendor
+                            // (or no default vendor is set for this part)
+                            var isDefaultVendor = !defaultVendorMap[item.part_id] || defaultVendorMap[item.part_id] == item.vendor_id;
+                            selectionState[key] = sugQty > 0 && isDefaultVendor;
                             addedForVendor++;
                         });
                         if (addedForVendor > 0) {
@@ -901,11 +947,110 @@
                 }
             });
 
+            // ------------------------------------------------
+            // Load standard inventory data for parts NOT already
+            // returned by Auto PO — allows users to add items
+            // to POs that weren't auto-suggested
+            // ------------------------------------------------
+            try {
+                var autoPoPartIds = {};
+                allResults.forEach(function(item) { autoPoPartIds[item.part_id] = true; });
+
+                var stdQuery =
+                    "SELECT " +
+                    "  p.id as part_id, p.num as part_num, p.description as part_description, " +
+                    "  COALESCE(uom.code, '') as part_uom_code, p.uomid as part_uom_id, " +
+                    "  vp.vendorid as vendor_id, COALESCE(v.name, '') as vendor_name, " +
+                    "  COALESCE(pr.reorderpoint, 0) as reorder_level, " +
+                    "  COALESCE(pr.orderuptolevel, 0) as target_level, " +
+                    "  COALESCE(t.qtyonhand, 0) as qty_on_hand, " +
+                    "  COALESCE(t.qtyonorder, 0) as qty_on_order, " +
+                    "  COALESCE(t.qtyallocated, 0) as qty_allocated, " +
+                    "  COALESCE(t.qtydropship, 0) as qty_on_drop_ship, " +
+                    "  COALESCE(t.qtyavailable, 0) as _available " +
+                    "FROM part p " +
+                    "  INNER JOIN uom ON p.uomid = uom.id " +
+                    "  LEFT JOIN partreorder pr ON p.id = pr.partid AND pr.locationgroupid IS NULL " +
+                    "  INNER JOIN vendorparts vp ON p.id = vp.partid AND vp.defaultflag = 1 " +
+                    "  INNER JOIN vendor v ON vp.vendorid = v.id AND v.activeflag = 1 " +
+                    "  LEFT JOIN (" +
+                    "    SELECT partid, " +
+                    "      COALESCE(SUM(qtyonhand), 0) as qtyonhand, " +
+                    "      COALESCE(SUM(qtyallocated), 0) as qtyallocated, " +
+                    "      COALESCE(SUM(qtyonorder), 0) as qtyonorder, " +
+                    "      COALESCE(SUM(qtydropship), 0) as qtydropship, " +
+                    "      IF(COALESCE(SUM(qtyonhand) - SUM(qtyallocated) - SUM(qtynotavailable) + SUM(qtydropship), 0) < 0, 0, " +
+                    "         COALESCE(SUM(qtyonhand) - SUM(qtyallocated) - SUM(qtynotavailable) + SUM(qtydropship), 0)) as qtyavailable " +
+                    "    FROM qtyinventorytotals GROUP BY partid" +
+                    "  ) as t ON p.id = t.partid " +
+                    "WHERE p.typeid = 10 AND vp.vendorid IS NOT NULL";
+
+                // Respect vendor filter
+                if (vendorVal !== 'all') {
+                    stdQuery += " AND vp.vendorid = " + parseInt(vendorVal);
+                }
+
+                // Respect include No ROP/OUL setting
+                if (!includeNoROP) {
+                    stdQuery += " AND pr.reorderpoint IS NOT NULL AND pr.reorderpoint > 0 AND pr.orderuptolevel IS NOT NULL AND pr.orderuptolevel > 0";
+                }
+
+                var stdRows = JSON.parse(runQuery(stdQuery));
+                var stdAdded = 0;
+
+                stdRows.forEach(function(row) {
+                    // Skip parts already covered by Auto PO data
+                    if (autoPoPartIds[row.part_id]) return;
+
+                    // Merge vendorparts data (cost, leadtime, vendor PN, FB part number)
+                    var vpKey = row.part_id + '_' + row.vendor_id;
+                    var vpData = vendorPartsLookup[vpKey];
+                    if (vpData) {
+                        row.last_cost = vpData.lastcost;
+                        row.lead_time = vpData.leadtime;
+                        row._vendorPartNum = vpData.vendorpartnumber;
+                        row._fbPartNum = vpData.fbpartnum;
+                    } else {
+                        row.last_cost = 0;
+                        row.lead_time = 0;
+                        row._vendorPartNum = '';
+                        row._fbPartNum = row.part_num || '';
+                    }
+                    if (!row._fbPartNum) row._fbPartNum = row.part_num || '';
+
+                    // Standard rows have no auto PO suggestion
+                    row.qty_needed = 0;
+                    row.qty_suggested = 0;
+                    row.vendor_uom_code = row.part_uom_code;
+                    row.vendor_uom_id = row.part_uom_id;
+                    row._isStandardRow = true;
+                    row._available = parseFloat(row._available) || 0;
+
+                    allResults.push(row);
+                    var key = row.vendor_id + '_' + row.part_id;
+                    selectionState[key] = false; // Standard rows start unchecked
+                    stdAdded++;
+                });
+
+                debugLog('Standard inventory: ' + stdAdded + ' additional parts added (from ' + stdRows.length + ' queried)', 'success');
+                totalParts += stdAdded;
+            } catch(stdErr) {
+                console.error('Standard inventory query failed:', stdErr);
+                debugLog('Standard inventory query failed: ' + stdErr.message, 'error');
+            }
+
+            // ------------------------------------------------
+            // Compute status (state + capacity %) for all rows
+            // ------------------------------------------------
+            allResults.forEach(function(item) {
+                computePartStatus(item);
+            });
+
             document.getElementById('btnLoadData').disabled = false;
 
             if (allResults.length === 0) {
-                showStatus('No reorder suggestions found for the selected parameters.', 'warning');
-                debugLog('No reorder suggestions found', 'warning');
+                showStatus('No inventory data found for the selected parameters.', 'warning');
+                debugLog('No inventory data found', 'warning');
                 document.getElementById('tableContainer').style.display = 'none';
                 document.getElementById('columnFilters').style.display = 'none';
                 document.getElementById('poSummaryBar').style.display = 'none';
@@ -1050,7 +1195,7 @@
                     createdCell: function(td, cellData, rowData) {
                         if (!rowData._isHeader) return;
                         var $td = $(td);
-                        $td.attr('colspan', 14);
+                        $td.attr('colspan', 15);
                         $td.parent().addClass('vendor-group-header');
                         $td.nextAll().remove();
 
@@ -1076,12 +1221,78 @@
                         );
                     }
                 },
-                // Col 1: Part Number - FB part number with vendor part number in brackets
+                // Col 1: Status - Inventory status with capacity bar
+                {
+                    title: '<span title="Inventory status with capacity percentage">Status</span>',
+                    data: '_capacitypct',
+                    defaultContent: '',
+                    width: '7%',
+                    className: 'dt-center group-status',
+                    orderable: false,
+                    render: function(data, type, row) {
+                        if (row._isHeader) return '';
+                        if (type !== 'display') {
+                            if (row._state === 'norop') return 999999;
+                            return data;
+                        }
+                        var text;
+                        if (row._state === 'norop') {
+                            text = 'No ROP/OUL';
+                        } else if (row._state === 'fb10' || data > 100) {
+                            text = 'Overstocked';
+                        } else {
+                            text = data + '%';
+                        }
+                        return '<strong style="font-size:11px;">' + text + '</strong>';
+                    },
+                    createdCell: function(td, cellData, rowData) {
+                        if (rowData._isHeader) return;
+
+                        var state = rowData._state;
+                        var pct = rowData._capacitypct;
+                        var bgColor, lightColor;
+
+                        if (state === 'norop') {
+                            td.style.setProperty('background', '#e2e8f0', 'important');
+                            td.style.setProperty('color', '#64748b', 'important');
+                            td.style.setProperty('font-weight', 'normal', 'important');
+                            return;
+                        } else if (state === 'fb10') {
+                            bgColor = '#1976D2'; lightColor = '#90CAF9';
+                        } else if (state === 'fb20') {
+                            bgColor = '#2E7D32'; lightColor = '#A5D6A7';
+                        } else if (state === 'fb30') {
+                            bgColor = '#F57C00'; lightColor = '#FFCC80';
+                        } else if (state === 'fb40') {
+                            bgColor = '#C62828'; lightColor = '#EF9A9A';
+                        } else {
+                            td.style.setProperty('background', '#e2e8f0', 'important');
+                            td.style.setProperty('color', '#64748b', 'important');
+                            return;
+                        }
+
+                        var gradient;
+                        if (state === 'fb10' || pct > 100) {
+                            gradient = bgColor;
+                        } else if (pct < 0) {
+                            var fillFromRight = Math.min(100, Math.abs(pct));
+                            gradient = 'linear-gradient(to left, ' + bgColor + ' ' + fillFromRight + '%, ' + lightColor + ' ' + fillFromRight + '%)';
+                        } else {
+                            var fillPercent = Math.max(0, Math.min(100, pct));
+                            gradient = 'linear-gradient(to right, ' + bgColor + ' ' + fillPercent + '%, ' + lightColor + ' ' + fillPercent + '%)';
+                        }
+
+                        td.style.setProperty('background', gradient, 'important');
+                        td.style.setProperty('color', '#FFFFFF', 'important');
+                        td.style.setProperty('text-shadow', '1px 1px 2px rgba(0,0,0,0.8)', 'important');
+                    }
+                },
+                // Col 2: Part Number - FB part number with vendor part number in brackets
                 {
                     title: '<span title="Part number">Part #</span>',
                     data: 'part_num',
                     defaultContent: '',
-                    width: '10%',
+                    width: '9%',
                     className: 'dt-left group-part-info',
                     render: function(data, type, row) {
                         if (row._isHeader) return '';
@@ -1102,12 +1313,12 @@
                         return row._fbPartNum || data;
                     }
                 },
-                // Col 2: Description
+                // Col 3: Description
                 {
                     title: '<span title="Part description">Description</span>',
                     data: 'part_description',
                     defaultContent: '',
-                    width: '18%',
+                    width: '15%',
                     className: 'group-part-info',
                     render: function(data, type, row) {
                         if (row._isHeader) return '';
@@ -1297,6 +1508,7 @@
                 _partCount: group.parts.length,
                 _selectedCount: selectedCount,
                 // Provide all data fields as null so DataTables doesn't render "undefined"
+                _capacitypct: null, _state: null,
                 part_num: null, part_description: null, part_uom_code: null,
                 qty_on_hand: null, qty_on_order: null, qty_allocated: null,
                 qty_on_drop_ship: null, reorder_level: null, target_level: null,
