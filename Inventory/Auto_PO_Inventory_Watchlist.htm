@@ -2078,39 +2078,72 @@
      * Lookup the company Ship To address from the location group.
      * ShipTo on a PO = where goods are delivered (our warehouse), not the vendor's address.
      * Uses locationgroup -> address link, preferring type 10 (Ship To), fallback type 50 (Main Office).
+     * Multi-tier fallback:
+     *   1. Ship To or Main Office for the exact location group
+     *   2. Any default Ship To linked to any location group (company warehouse)
+     *   3. Main Office (type 50) for the company account (accountid from LG)
      */
     function lookupCompanyShipTo(locationGroupId) {
         var empty = { name: '', address: '', city: '', state: '', zip: '', country: '' };
+
+        function extractAddr(row) {
+            return {
+                name: row.addressName || '',
+                address: row.address || '',
+                city: row.city || '',
+                state: row.stateName || '',
+                zip: row.zip || '',
+                country: row.countryName || ''
+            };
+        }
+
+        var addrCols =
+            "SELECT a.addressName, a.address, a.city, " +
+            "COALESCE(sc.name, '') AS stateName, a.zip, COALESCE(cc.name, '') AS countryName, " +
+            "a.typeid, a.defaultflag " +
+            "FROM address a " +
+            "LEFT JOIN stateconst sc ON sc.id = a.stateId " +
+            "LEFT JOIN countryconst cc ON cc.id = a.countryId ";
+
         try {
             if (!locationGroupId || locationGroupId <= 0) return empty;
+            var lgId = parseInt(locationGroupId);
 
-            // Location group addresses are linked via address.locationgroupid
-            var sql =
-                "SELECT a.addressName, a.address, a.city, " +
-                "COALESCE(sc.name, '') AS stateName, a.zip, COALESCE(cc.name, '') AS countryName, " +
-                "a.typeid, a.defaultflag " +
-                "FROM address a " +
-                "LEFT JOIN stateconst sc ON sc.id = a.stateId " +
-                "LEFT JOIN countryconst cc ON cc.id = a.countryId " +
-                "WHERE a.locationgroupid = " + parseInt(locationGroupId) +
+            // Step 1: Address linked to this specific location group (type 10 preferred, then 50)
+            var sql = addrCols +
+                "WHERE a.locationgroupid = " + lgId +
                 " AND a.typeid IN (10, 50)" +
                 " ORDER BY " +
                 "  CASE WHEN a.typeid = 10 THEN 0 ELSE 1 END, " +
                 "  a.defaultflag DESC";
 
             var rows = JSON.parse(runQuery(sql));
-            debugLog('Company ShipTo rows (lgId ' + locationGroupId + '): ' + JSON.stringify(rows), 'info');
-            if (!rows || rows.length === 0) return empty;
+            debugLog('Company ShipTo rows (lgId ' + lgId + '): ' + JSON.stringify(rows), 'info');
+            if (rows && rows.length > 0) return extractAddr(rows[0]);
 
-            var best = rows[0]; // Already ordered by preference
-            return {
-                name: best.addressName || '',
-                address: best.address || '',
-                city: best.city || '',
-                state: best.stateName || '',
-                zip: best.zip || '',
-                country: best.countryName || ''
-            };
+            // Step 2: Any Ship To (type 10) linked to ANY location group (company warehouse)
+            debugLog('No ShipTo for LG ' + lgId + ', trying any company Ship To address', 'info');
+            var fallbackSql = addrCols +
+                "WHERE a.typeid = 10" +
+                " AND a.locationgroupid IS NOT NULL AND a.locationgroupid > 0" +
+                " ORDER BY a.defaultflag DESC";
+
+            var fallbackRows = JSON.parse(runQuery(fallbackSql));
+            debugLog('Company ShipTo fallback rows: ' + JSON.stringify(fallbackRows), 'info');
+            if (fallbackRows && fallbackRows.length > 0) return extractAddr(fallbackRows[0]);
+
+            // Step 3: Main Office (type 50) for the company account that owns this LG
+            debugLog('No Ship To found at all, trying company Main Office', 'info');
+            var mainSql = addrCols +
+                "WHERE a.typeid = 50" +
+                " AND a.accountid = (SELECT accountid FROM locationgroup WHERE id = " + lgId + ")" +
+                " ORDER BY a.defaultflag DESC";
+
+            var mainRows = JSON.parse(runQuery(mainSql));
+            debugLog('Company Main Office fallback rows: ' + JSON.stringify(mainRows), 'info');
+            if (mainRows && mainRows.length > 0) return extractAddr(mainRows[0]);
+
+            return empty;
         } catch (e) {
             debugLog('Company ShipTo lookup error: ' + e.message, 'error');
             return empty;
@@ -2153,6 +2186,9 @@
 
             // Fallback: RemitToName must not be empty — use vendor name if no address found
             if (!remitTo.name) remitTo.name = vendorName;
+
+            // Fallback: ShipToName must not be empty — use location group name if no address found
+            if (!shipTo.name) shipTo.name = lgName;
 
             debugLog('RemitTo address: ' + JSON.stringify(remitTo), 'info');
             debugLog('ShipTo address: ' + JSON.stringify(shipTo), 'info');
