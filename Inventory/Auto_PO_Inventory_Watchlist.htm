@@ -2002,6 +2002,74 @@
         return '';
     }
 
+    /**
+     * Lookup vendor address from the address table.
+     * @param {number} vendorId - Vendor ID to resolve accountid
+     * @param {number} addrType - Address type: 30=Remit To, 10=Ship To
+     * @param {number} locationGroupId - Current location group ID (0 or -1 = any)
+     * @returns {object} Address fields {name, address, city, state, zip, country} or empty strings
+     */
+    function lookupVendorAddress(vendorId, addrType, locationGroupId) {
+        var empty = { name: '', address: '', city: '', state: '', zip: '', country: '' };
+        try {
+            // Get vendor's accountid
+            var vendorRows = JSON.parse(runQuery(
+                "SELECT accountid FROM vendor WHERE id = " + parseInt(vendorId)
+            ));
+            if (!vendorRows || vendorRows.length === 0) return empty;
+            var accountId = vendorRows[0].accountid;
+            if (!accountId) return empty;
+
+            // Query addresses for this account, ordered by: requested type first, then Main Office (50)
+            // Prefer defaultFlag=true, and matching locationgroupid
+            var sql =
+                "SELECT a.name, a.address, a.city, a.state, a.zip, a.country, " +
+                "a.typeid, a.defaultflag, a.locationgroupid " +
+                "FROM address a " +
+                "WHERE a.accountid = " + parseInt(accountId) +
+                " AND a.typeid IN (" + parseInt(addrType) + ", 50)" +
+                " ORDER BY " +
+                "  CASE WHEN a.typeid = " + parseInt(addrType) + " THEN 0 ELSE 1 END, " +
+                "  a.defaultflag DESC";
+
+            var rows = JSON.parse(runQuery(sql));
+            if (!rows || rows.length === 0) return empty;
+
+            // Pick best match: prefer requested type with matching locationgroup, then defaultFlag
+            var best = null;
+            var lgId = (locationGroupId && locationGroupId > 0) ? locationGroupId : null;
+
+            for (var i = 0; i < rows.length; i++) {
+                var r = rows[i];
+                var isRequestedType = (parseInt(r.typeid) === addrType);
+                var isLgMatch = lgId && (parseInt(r.locationgroupid) === lgId);
+                var isDefault = (r.defaultflag === '1' || r.defaultflag === 1 || r.defaultflag === true);
+
+                // Best: requested type + matching LG
+                if (isRequestedType && isLgMatch) { best = r; break; }
+                // Next best: requested type + default flag
+                if (!best && isRequestedType && isDefault) { best = r; }
+                // Next: requested type (any)
+                if (!best && isRequestedType) { best = r; }
+                // Fallback: Main Office type 50
+                if (!best) { best = r; }
+            }
+
+            if (!best) return empty;
+            return {
+                name: best.name || '',
+                address: best.address || '',
+                city: best.city || '',
+                state: best.state || '',
+                zip: best.zip || '',
+                country: best.country || ''
+            };
+        } catch (e) {
+            debugLog('Address lookup error (type ' + addrType + '): ' + e.message, 'error');
+            return empty;
+        }
+    }
+
     function submitPoFromModal(vendorId) {
         var items = window._modalItems;
         var vendorName = window._modalVendorName;
@@ -2025,11 +2093,18 @@
         try {
             var poNum = getNextPoNumber();
             var lgName = getLocationGroupName();
+            var lgId = parseInt(document.getElementById('paramLocationGroup').value) || 0;
             var today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 
             // Read PO status from modal dropdown
             var statusEl = document.getElementById('modal-po-status');
             var poStatus = statusEl ? parseInt(statusEl.value) : 10;
+
+            // Lookup vendor addresses
+            var remitTo = lookupVendorAddress(vendorId, 30, lgId);  // type 30 = Remit To, fallback 50
+            var shipTo  = lookupVendorAddress(vendorId, 10, lgId);  // type 10 = Ship To, fallback 50
+            debugLog('RemitTo address: ' + JSON.stringify(remitTo), 'info');
+            debugLog('ShipTo address: ' + JSON.stringify(shipTo), 'info');
 
             // === Build CSV rows matching Fishbowl ImportPurchaseOrder export format ===
             // Structure: PO header row, Item header row, PO data row, Item data rows
@@ -2054,14 +2129,17 @@
                 '"RevisionLevel","Note","QuickBooksClassName","CustomerJob"'
             );
 
+            // Helper to escape CSV values
+            function esc(val) { return (val || '').replace(/"/g, '""'); }
+
             // Row 3: PO data
-            var escapedVendor = vendorName.replace(/"/g, '""');
+            var escapedVendor = esc(vendorName);
             csvRows.push(
                 '"PO","' + poNum + '",' + poStatus + ',"' + escapedVendor + '","",' +
-                '"' + escapedVendor + '","","","","","",' +  // RemitToName = VendorName, rest auto-filled by FB
-                '"","","","","","","",' +  // ShipTo fields
+                '"' + esc(remitTo.name) + '","' + esc(remitTo.address) + '","' + esc(remitTo.city) + '","' + esc(remitTo.state) + '","' + esc(remitTo.zip) + '","' + esc(remitTo.country) + '",' +
+                '"' + esc(shipTo.name) + '","","' + esc(shipTo.address) + '","' + esc(shipTo.city) + '","' + esc(shipTo.state) + '","' + esc(shipTo.zip) + '","' + esc(shipTo.country) + '",' +
                 '"","","","","","' + today + '","","","","","","","","","Auto PO from BI Report",' +
-                '"","' + lgName + '","","","","","",""'
+                '"","' + esc(lgName) + '","","","","","",""'
             );
 
             // Row 4+: Item data rows
