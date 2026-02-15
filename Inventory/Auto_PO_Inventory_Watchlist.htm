@@ -652,7 +652,13 @@
     function formatCurrencyVal(val) {
         var num = safeCost(val);
         try {
-            return currencyLocale(num);
+            var result = currencyLocale(num);
+            // Guard against currencyLocale returning objects or non-strings
+            if (result === null || result === undefined || typeof result === 'object') {
+                debugLog('currencyLocale returned ' + typeof result + ' for input ' + num, 'warning');
+                return '$' + num.toFixed(2);
+            }
+            return String(result);
         } catch(e) {
             return '$' + num.toFixed(2);
         }
@@ -746,19 +752,34 @@
         try {
             debugLog('Loading Auto PO data — Vendor: ' + vendorVal + ', LG: ' + locationGroupId + ', QB: ' + qbClassId, 'info');
 
-            // Build vendorparts lookup for lastcost, leadtime, vendorPartNumber
+            // Build vendorparts lookup for lastcost, leadtime, vendorPartNumber, and real FB part number
             vendorPartsLookup = {};
             try {
-                var vpRows = JSON.parse(runQuery("SELECT vp.partid, vp.vendorid, vp.lastcost, vp.leadtime, vp.vendorPartNumber FROM vendorparts vp"));
+                var vpRows = JSON.parse(runQuery(
+                    "SELECT vp.partid, vp.vendorid, vp.lastcost, vp.leadtime, vp.vendorPartNumber, p.num AS partnum " +
+                    "FROM vendorparts vp INNER JOIN part p ON p.id = vp.partid"
+                ));
                 vpRows.forEach(function(r) {
                     var vpKey = r.partid + '_' + r.vendorid;
+                    var rawCost = r.lastcost;
+                    var parsedCost = 0;
+                    if (rawCost !== null && rawCost !== undefined && typeof rawCost !== 'object') {
+                        parsedCost = parseFloat(rawCost) || 0;
+                    }
                     vendorPartsLookup[vpKey] = {
-                        lastcost: parseFloat(r.lastcost) || 0,
+                        lastcost: parsedCost,
                         leadtime: parseInt(r.leadtime) || 0,
-                        vendorpartnumber: r.vendorPartNumber || r.vendorpartnumber || ''
+                        vendorpartnumber: r.vendorPartNumber || r.vendorpartnumber || '',
+                        fbpartnum: r.partnum || r.PARTNUM || ''
                     };
                 });
                 debugLog('Loaded vendorparts lookup: ' + vpRows.length + ' records', 'success');
+                // Debug: log a sample record to check field types
+                var sampleKeys = Object.keys(vendorPartsLookup);
+                if (sampleKeys.length > 0) {
+                    var s = vendorPartsLookup[sampleKeys[0]];
+                    debugLog('Sample vendorpart: key=' + sampleKeys[0] + ' fbpartnum=' + s.fbpartnum + ' vendorpn=' + s.vendorpartnumber + ' lastcost=' + s.lastcost + ' (' + typeof s.lastcost + ') leadtime=' + s.leadtime, 'info');
+                }
             } catch(e) {
                 console.error('Failed to load vendorparts lookup:', e);
                 debugLog('Failed to load vendorparts lookup: ' + e.message, 'error');
@@ -803,21 +824,31 @@
                             // Default vendor filter: skip if this vendor is not the default for this part
                             if (defaultVendorOnly && defaultVendorMap[item.part_id] && defaultVendorMap[item.part_id] !== item.vendor_id) return;
 
-                            // Merge vendorparts data (lastcost, leadtime, vendorPartNumber)
+                            // Merge vendorparts data (lastcost, leadtime, vendorPartNumber, FB part number)
                             var vpKey = item.part_id + '_' + item.vendor_id;
                             var vpData = vendorPartsLookup[vpKey];
                             if (vpData) {
                                 item.last_cost = vpData.lastcost;
                                 item.lead_time = vpData.leadtime;
                                 item._vendorPartNum = vpData.vendorpartnumber;
+                                item._fbPartNum = vpData.fbpartnum;
                             } else {
-                                item.last_cost = 0;
-                                item.lead_time = 0;
+                                // Force numeric even if getAutoPo returned an object
+                                item.last_cost = safeCost(item.last_cost);
+                                item.lead_time = parseInt(item.lead_time) || 0;
                                 item._vendorPartNum = '';
+                                item._fbPartNum = '';
                             }
 
-                            // Clean part number (strip any vendor PN suffix from getAutoPo format)
-                            item._cleanPartNum = (item.part_num || '').split('/')[0].trim();
+                            // If we couldn't get FB part number from vendorparts, try to extract from getAutoPo's part_num
+                            if (!item._fbPartNum) {
+                                item._fbPartNum = (item.part_num || '');
+                            }
+
+                            // Debug first item to trace values
+                            if (addedForVendor === 0) {
+                                debugLog('Sample item for vendor ' + vid + ': part_num=' + item.part_num + ' _fbPartNum=' + item._fbPartNum + ' _vendorPartNum=' + item._vendorPartNum + ' last_cost=' + item.last_cost + ' (' + typeof item.last_cost + ')', 'info');
+                            }
 
                             allResults.push(item);
                             var key = item.vendor_id + '_' + item.part_id;
@@ -989,7 +1020,7 @@
                         );
                     }
                 },
-                // Col 1: Part Number - show vendor part number in brackets
+                // Col 1: Part Number - FB part number with vendor part number in brackets
                 {
                     title: '<span title="Part number">Part #</span>',
                     data: 'part_num',
@@ -999,18 +1030,20 @@
                     render: function(data, type, row) {
                         if (row._isHeader) return '';
                         if (type === 'display') {
-                            var cleanPN = row._cleanPartNum || (data || '').split('/')[0].trim();
+                            // _fbPartNum = real Fishbowl part number from part.num
+                            // _vendorPartNum = vendor's part number from vendorparts.vendorPartNumber
+                            var fbPN = row._fbPartNum || '';
                             var vendorPN = row._vendorPartNum || '';
                             var showVPN = document.getElementById('paramShowVendorPN').checked;
-                            var displayText = cleanPN;
-                            if (showVPN && vendorPN && vendorPN !== cleanPN) {
-                                displayText = cleanPN + ' <span style="color:#64748b; font-weight:400;">(' + vendorPN + ')</span>';
+                            var displayText = fbPN;
+                            if (showVPN && vendorPN && vendorPN !== fbPN) {
+                                displayText = fbPN + ' <span style="color:#64748b; font-weight:400;">(' + vendorPN + ')</span>';
                             }
-                            var escaped = cleanPN.replace(/'/g, "\\'");
-                            var tooltipText = cleanPN + (vendorPN ? ' | Vendor PN: ' + vendorPN : '');
+                            var escaped = fbPN.replace(/'/g, "\\'");
+                            var tooltipText = fbPN + (vendorPN ? ' | Vendor PN: ' + vendorPN : '');
                             return '<a href="#" class="item-link" onmouseenter="showTooltip(event, \'' + tooltipText.replace(/'/g, "\\'") + '\')" onmouseleave="hideTooltip()" onclick="openModule(\'Part\', \'' + escaped + '\'); return false;"><strong>' + displayText + '</strong></a>';
                         }
-                        return data;
+                        return row._fbPartNum || data;
                     }
                 },
                 // Col 2: Description
@@ -1327,17 +1360,19 @@
             if (qty <= 0) return;
 
             var cost = safeCost(item.last_cost);
-            var cleanPartNum = item._cleanPartNum || (item.part_num || '').split('/')[0].trim();
+            var fbPN = item._fbPartNum || '';
             var vendorPN = item._vendorPartNum || '';
             var showVPN = document.getElementById('paramShowVendorPN').checked;
-            var partDisplay = cleanPartNum;
-            if (showVPN && vendorPN && vendorPN !== cleanPartNum) {
-                partDisplay = cleanPartNum + ' (' + vendorPN + ')';
+            var partDisplay = fbPN;
+            if (showVPN && vendorPN && vendorPN !== fbPN) {
+                partDisplay = fbPN + ' (' + vendorPN + ')';
             }
+
+            debugLog('Modal item: ' + fbPN + ' qty=' + qty + ' cost=' + cost + ' (' + typeof cost + ') lineTotal=' + (qty * cost), 'info');
 
             selectedItems.push({
                 partId: item.part_id,
-                partNum: cleanPartNum,
+                partNum: fbPN,
                 partNumDisplay: partDisplay,
                 partDescription: item.part_description || '',
                 qty: qty,
