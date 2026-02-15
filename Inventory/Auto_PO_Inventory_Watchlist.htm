@@ -329,7 +329,8 @@
             .dataTables_wrapper .dataTables_paginate,
             .dt-buttons, button, .btn, header,
             .row-checkbox, .qty-input, .btn-create-po,
-            #parametersPanel, #statusArea, .modal-overlay { display: none !important; }
+            #parametersPanel, #statusArea, .modal-overlay,
+            #debugConsoleContainer { display: none !important; }
             table.dataTable { width: 100% !important; font-size: 7pt; }
             table.dataTable thead th { font-size: 6.5pt; padding: 3px 2px; border: 1px solid #ccc; }
             table.dataTable tbody td { font-size: 7pt; padding: 2px 1px; border: 1px solid #ccc; }
@@ -501,6 +502,36 @@
                 <p class="text-slate-500 text-sm mb-2">Configure parameters above and click <strong>Load Data</strong> to fetch reorder suggestions.</p>
                 <p class="text-slate-400 text-xs">The system will calculate suggested purchase quantities for each vendor.</p>
             </div>
+
+            <!-- Debug Console (hidden by default, shown if BI_SHOW_DEBUG=true) -->
+            <div id="debugConsoleContainer" class="mt-6" style="display: none;">
+                <div class="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+                    <button onclick="toggleDebugConsole()" class="w-full px-6 py-3 flex items-center justify-between hover:bg-slate-50 transition-colors">
+                        <div class="flex items-center gap-2">
+                            <svg class="w-4 h-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"></path>
+                            </svg>
+                            <span class="text-sm font-semibold text-slate-700">Debug Console</span>
+                            <span class="text-xs text-slate-400 font-normal">Auto-scrolls to latest entry</span>
+                        </div>
+                        <svg id="debugChevron" class="w-5 h-5 text-slate-400 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+                        </svg>
+                    </button>
+
+                    <div id="debugContent" class="hidden border-t border-slate-200">
+                        <div class="bg-slate-900 px-4 py-2 flex items-center justify-between">
+                            <span class="text-xs text-slate-400 font-mono">Auto PO Diagnostics</span>
+                            <button onclick="clearDebugLog()" class="text-xs text-slate-400 hover:text-white transition-colors">
+                                Clear
+                            </button>
+                        </div>
+                        <div id="debugLog" class="bg-slate-950 text-slate-200 p-4 font-mono text-xs max-h-96 overflow-y-auto" style="scrollbar-width: thin;">
+                            <div class="text-slate-500 italic">Waiting for application to initialize...</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -520,6 +551,12 @@
     let dataTable = null;
     // Map of default vendor per part: { partId: vendorId }
     let defaultVendorMap = {};
+    // Map of vendorparts data: { "partId_vendorId": { lastcost, leadtime, vendorpartnumber } }
+    let vendorPartsLookup = {};
+
+    // Debug mode from Fishbowl system property (default to false)
+    const BI_SHOW_DEBUG_PROP = typeof getProperty === 'function' ? getProperty('BI_SHOW_DEBUG', 'false') : 'false';
+    const DEBUG_MODE = BI_SHOW_DEBUG_PROP === 'true' || BI_SHOW_DEBUG_PROP === true;
 
     // ============================================
     // Tooltip
@@ -541,6 +578,56 @@
     function toggleInstructions() {
         const panel = document.getElementById('instructionsPanel');
         panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+    }
+
+    // ============================================
+    // Debug Console
+    // ============================================
+    function debugLog(message, type) {
+        type = type || 'info';
+        if (!DEBUG_MODE) return;
+
+        var timestamp = new Date().toLocaleTimeString();
+        var logDiv = document.getElementById('debugLog');
+        if (!logDiv) return;
+
+        // Clear initial placeholder message
+        if (logDiv.querySelector('.italic')) {
+            logDiv.innerHTML = '';
+        }
+
+        var colors = {
+            'info': 'text-blue-400',
+            'success': 'text-green-400',
+            'warning': 'text-yellow-400',
+            'error': 'text-red-400',
+            'click': 'text-purple-400'
+        };
+
+        var entry = document.createElement('div');
+        entry.className = 'py-0.5';
+        entry.innerHTML = '<span class="text-slate-500">[' + timestamp + ']</span> <span class="' + (colors[type] || colors.info) + '">' + message + '</span>';
+
+        logDiv.appendChild(entry);
+        logDiv.scrollTop = logDiv.scrollHeight;
+    }
+
+    function toggleDebugConsole() {
+        var content = document.getElementById('debugContent');
+        var chevron = document.getElementById('debugChevron');
+
+        if (content.classList.contains('hidden')) {
+            content.classList.remove('hidden');
+            chevron.style.transform = 'rotate(180deg)';
+        } else {
+            content.classList.add('hidden');
+            chevron.style.transform = 'rotate(0deg)';
+        }
+    }
+
+    function clearDebugLog() {
+        var logDiv = document.getElementById('debugLog');
+        if (logDiv) logDiv.innerHTML = '<div class="text-slate-500 italic">Log cleared</div>';
     }
 
     // ============================================
@@ -657,20 +744,46 @@
         document.getElementById('btnLoadData').disabled = true;
 
         try {
+            debugLog('Loading Auto PO data — Vendor: ' + vendorVal + ', LG: ' + locationGroupId + ', QB: ' + qbClassId, 'info');
+
+            // Build vendorparts lookup for lastcost, leadtime, vendorPartNumber
+            vendorPartsLookup = {};
+            try {
+                var vpRows = JSON.parse(runQuery("SELECT vp.partid, vp.vendorid, vp.lastcost, vp.leadtime, vp.vendorPartNumber FROM vendorparts vp"));
+                vpRows.forEach(function(r) {
+                    var vpKey = r.partid + '_' + r.vendorid;
+                    vendorPartsLookup[vpKey] = {
+                        lastcost: parseFloat(r.lastcost) || 0,
+                        leadtime: parseInt(r.leadtime) || 0,
+                        vendorpartnumber: r.vendorPartNumber || r.vendorpartnumber || ''
+                    };
+                });
+                debugLog('Loaded vendorparts lookup: ' + vpRows.length + ' records', 'success');
+            } catch(e) {
+                console.error('Failed to load vendorparts lookup:', e);
+                debugLog('Failed to load vendorparts lookup: ' + e.message, 'error');
+            }
+
             // Build default vendor map if needed
             if (defaultVendorOnly) {
                 try {
                     var dvRows = JSON.parse(runQuery("SELECT partid, vendorid FROM vendorparts WHERE defaultflag = 1"));
                     dvRows.forEach(function(r) { defaultVendorMap[r.partid] = r.vendorid; });
-                } catch(e) { console.error('Failed to load default vendor map:', e); }
+                    debugLog('Default vendor map: ' + dvRows.length + ' entries', 'info');
+                } catch(e) {
+                    console.error('Failed to load default vendor map:', e);
+                    debugLog('Failed to load default vendor map: ' + e.message, 'error');
+                }
             }
 
             var vendorIds = [];
             if (vendorVal === 'all') {
                 var vResult = JSON.parse(runQuery("SELECT DISTINCT v.id FROM vendor v INNER JOIN vendorparts vp ON v.id = vp.vendorid WHERE v.activeflag = 1 ORDER BY v.id"));
                 vendorIds = vResult.map(function(v) { return v.id; });
+                debugLog('Processing all vendors: ' + vendorIds.length + ' found', 'info');
             } else {
                 vendorIds = [parseInt(vendorVal)];
+                debugLog('Processing single vendor ID: ' + vendorVal, 'info');
             }
 
             var totalParts = 0;
@@ -690,6 +803,22 @@
                             // Default vendor filter: skip if this vendor is not the default for this part
                             if (defaultVendorOnly && defaultVendorMap[item.part_id] && defaultVendorMap[item.part_id] !== item.vendor_id) return;
 
+                            // Merge vendorparts data (lastcost, leadtime, vendorPartNumber)
+                            var vpKey = item.part_id + '_' + item.vendor_id;
+                            var vpData = vendorPartsLookup[vpKey];
+                            if (vpData) {
+                                item.last_cost = vpData.lastcost;
+                                item.lead_time = vpData.leadtime;
+                                item._vendorPartNum = vpData.vendorpartnumber;
+                            } else {
+                                item.last_cost = 0;
+                                item.lead_time = 0;
+                                item._vendorPartNum = '';
+                            }
+
+                            // Clean part number (strip any vendor PN suffix from getAutoPo format)
+                            item._cleanPartNum = (item.part_num || '').split('/')[0].trim();
+
                             allResults.push(item);
                             var key = item.vendor_id + '_' + item.part_id;
                             var sugQty = parseFloat(item.qty_suggested) || 0;
@@ -699,10 +828,12 @@
                         if (addedForVendor > 0) {
                             totalParts += addedForVendor;
                             vendorsWithData++;
+                            debugLog('Vendor ' + vid + ': ' + addedForVendor + ' parts loaded', 'success');
                         }
                     }
                 } catch (innerErr) {
                     console.error('getAutoPo failed for vendor ' + vid + ':', innerErr);
+                    debugLog('getAutoPo failed for vendor ' + vid + ': ' + innerErr.message, 'error');
                 }
             });
 
@@ -710,6 +841,7 @@
 
             if (allResults.length === 0) {
                 showStatus('No reorder suggestions found for the selected parameters.', 'warning');
+                debugLog('No reorder suggestions found', 'warning');
                 document.getElementById('tableContainer').style.display = 'none';
                 document.getElementById('columnFilters').style.display = 'none';
                 document.getElementById('emptyState').style.display = 'block';
@@ -717,6 +849,7 @@
             }
 
             showStatus('Loaded ' + totalParts + ' parts from ' + vendorsWithData + ' vendor(s).', 'success');
+            debugLog('Total loaded: ' + totalParts + ' parts from ' + vendorsWithData + ' vendor(s)', 'success');
             document.getElementById('emptyState').style.display = 'none';
             document.getElementById('columnFilters').style.display = 'block';
             document.getElementById('tableContainer').style.display = 'block';
@@ -856,21 +989,26 @@
                         );
                     }
                 },
-                // Col 1: Part Number - strip vendor part number from link
+                // Col 1: Part Number - show vendor part number in brackets
                 {
                     title: '<span title="Part number">Part #</span>',
                     data: 'part_num',
                     defaultContent: '',
-                    width: '8%',
+                    width: '10%',
                     className: 'dt-left group-part-info',
                     render: function(data, type, row) {
                         if (row._isHeader) return '';
                         if (type === 'display') {
-                            // part_num may contain "PARTNUM / VENDORPN" - extract just the part number for the link
-                            var displayText = data || '';
-                            var linkPartNum = displayText.split('/')[0].trim();
-                            var escaped = linkPartNum.replace(/'/g, "\\'");
-                            return '<a href="#" class="item-link" onmouseenter="showTooltip(event, \'' + (displayText).replace(/'/g, "\\'") + '\')" onmouseleave="hideTooltip()" onclick="openModule(\'Part\', \'' + escaped + '\'); return false;"><strong>' + displayText + '</strong></a>';
+                            var cleanPN = row._cleanPartNum || (data || '').split('/')[0].trim();
+                            var vendorPN = row._vendorPartNum || '';
+                            var showVPN = document.getElementById('paramShowVendorPN').checked;
+                            var displayText = cleanPN;
+                            if (showVPN && vendorPN && vendorPN !== cleanPN) {
+                                displayText = cleanPN + ' <span style="color:#64748b; font-weight:400;">(' + vendorPN + ')</span>';
+                            }
+                            var escaped = cleanPN.replace(/'/g, "\\'");
+                            var tooltipText = cleanPN + (vendorPN ? ' | Vendor PN: ' + vendorPN : '');
+                            return '<a href="#" class="item-link" onmouseenter="showTooltip(event, \'' + tooltipText.replace(/'/g, "\\'") + '\')" onmouseleave="hideTooltip()" onclick="openModule(\'Part\', \'' + escaped + '\'); return false;"><strong>' + displayText + '</strong></a>';
                         }
                         return data;
                     }
@@ -1189,13 +1327,18 @@
             if (qty <= 0) return;
 
             var cost = safeCost(item.last_cost);
-            // Extract clean part number (before any vendor part number separator)
-            var cleanPartNum = (item.part_num || '').split('/')[0].trim();
+            var cleanPartNum = item._cleanPartNum || (item.part_num || '').split('/')[0].trim();
+            var vendorPN = item._vendorPartNum || '';
+            var showVPN = document.getElementById('paramShowVendorPN').checked;
+            var partDisplay = cleanPartNum;
+            if (showVPN && vendorPN && vendorPN !== cleanPartNum) {
+                partDisplay = cleanPartNum + ' (' + vendorPN + ')';
+            }
 
             selectedItems.push({
                 partId: item.part_id,
                 partNum: cleanPartNum,
-                partNumDisplay: item.part_num || '',
+                partNumDisplay: partDisplay,
                 partDescription: item.part_description || '',
                 qty: qty,
                 uomId: item.vendor_uom_id || item.part_uom_id,
@@ -1351,19 +1494,25 @@
 
             var csvData = csvLines.join('\n');
 
+            debugLog('Submitting PO for vendor: ' + vendorName + ' (' + items.length + ' items)', 'click');
+            debugLog('PO CSV data:\n' + csvData, 'info');
+
             try {
                 var importResult = importData('ImportPurchaseOrder', csvData);
                 showStatus('PO created successfully for ' + vendorName + '! ' + items.length + ' line items.', 'success');
+                debugLog('PO created successfully for ' + vendorName + ': ' + items.length + ' line items', 'success');
                 closePoModal();
             } catch (importErr) {
                 console.error('Import failed:', importErr);
                 showStatus('PO data prepared for ' + vendorName + '. Auto-import may not be available. Check console for details.', 'warning');
+                debugLog('PO import failed for ' + vendorName + ': ' + importErr.message, 'error');
                 console.log('PO Import Data for ' + vendorName + ':\n' + csvData);
                 closePoModal();
             }
         } catch (e) {
             console.error('submitPoFromModal error:', e);
             showStatus('Error creating PO: ' + e.message, 'error');
+            debugLog('submitPoFromModal error: ' + e.message, 'error');
         }
     }
 
@@ -1377,7 +1526,17 @@
     // Init
     // ============================================
     $(document).ready(function() {
+        // Show debug console if BI_SHOW_DEBUG property is set
+        if (DEBUG_MODE) {
+            document.getElementById('debugConsoleContainer').style.display = 'block';
+        }
+
+        debugLog('Auto PO Inventory Watchlist initialized', 'success');
+        debugLog('Debug mode: ' + DEBUG_MODE + ' (BI_SHOW_DEBUG=' + BI_SHOW_DEBUG_PROP + ')', 'info');
+        debugLog('User: ' + (user.fullName || user.firstName + ' ' + user.lastName || 'ID ' + currentUser), 'info');
+
         initParameters();
+        debugLog('Parameters initialized', 'success');
     });
 
     </script>
