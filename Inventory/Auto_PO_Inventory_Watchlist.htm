@@ -438,7 +438,7 @@
 
                         <h3 class="text-sm font-bold text-slate-700 mt-4 mb-2">Key Metrics</h3>
                         <div class="text-sm text-slate-600 space-y-1">
-                            <p><strong>Available:</strong> On Hand &minus; Allocated + Drop Ship</p>
+                            <p><strong>Available:</strong> On Hand &minus; Allocated &minus; Not Available + Drop Ship</p>
                             <p><strong>Needed:</strong> Calculated shortfall quantity from the Auto PO engine</p>
                             <p><strong>Order Qty:</strong> Suggested purchase quantity (editable per row)</p>
                             <p><strong>ROP:</strong> Reorder Point &mdash; minimum threshold triggering a reorder</p>
@@ -814,12 +814,14 @@
     function computePartStatus(item) {
         var rop = parseFloat(item.reorder_level) || 0;
         var oul = parseFloat(item.target_level) || 0;
-        // Compute available: on_hand - allocated + drop_ship (approximation without "not available")
+        // Compute available: on_hand - allocated - not_available + drop_ship
+        // The SQL query computes the full formula (including qtynotavailable) as _available.
+        // JS fallback only used for Auto PO engine rows where _available is not pre-computed.
         var onhand = parseFloat(item.qty_on_hand) || 0;
         var allocated = parseFloat(item.qty_allocated) || 0;
         var dropship = parseFloat(item.qty_on_drop_ship) || 0;
         var available = Math.max(0, onhand - allocated + dropship);
-        // Use _available if already computed from standard query
+        // Use _available if already computed from standard query (includes Not Available)
         if (item._available !== undefined) available = item._available;
 
         item._available = available;
@@ -1478,7 +1480,7 @@
                 },
                 // Col 5: Available
                 {
-                    title: '<span title="Available quantity: On Hand - Allocated + Drop Ship">Avail</span>',
+                    title: '<span title="Available quantity: On Hand - Allocated - Not Available + Drop Ship">Avail</span>',
                     data: '_available',
                     defaultContent: '0',
                     width: '5%',
@@ -1847,6 +1849,7 @@
             selectedItems.push({
                 partId: item.part_id,
                 partNum: fbPN,
+                vendorPartNum: vendorPN,
                 partNumDisplay: partDisplay,
                 partDescription: item.part_description || '',
                 qty: qty,
@@ -1969,6 +1972,30 @@
         if (gtEl) gtEl.textContent = formatCurrencyVal(grandTotal);
     }
 
+    function getNextPoNumber() {
+        try {
+            var poNum = getProperty('Auto PO Number', '');
+            if (poNum) {
+                debugLog('Next PO number from property: ' + poNum, 'info');
+                return poNum;
+            }
+        } catch (e) {
+            debugLog('Could not read Auto PO Number property: ' + e.message, 'warning');
+        }
+        return '';
+    }
+
+    function getLocationGroupName() {
+        var sel = document.getElementById('paramLocationGroup');
+        if (sel.selectedIndex >= 0) {
+            var text = sel.options[sel.selectedIndex].text;
+            // "All" option has value -1, return empty for import (Fishbowl will use default)
+            if (sel.value === '-1') return '';
+            return text;
+        }
+        return '';
+    }
+
     function submitPoFromModal(vendorId) {
         var items = window._modalItems;
         var vendorName = window._modalVendorName;
@@ -1990,33 +2017,103 @@
         }
 
         try {
-            var locationGroupId = parseInt(document.getElementById('paramLocationGroup').value);
-            var lgId = locationGroupId === -1 ? 0 : locationGroupId;
+            var poNum = getNextPoNumber();
+            var lgName = getLocationGroupName();
+            var today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 
-            var csvLines = [];
-            csvLines.push('"Flag","POType","Status","VendorName","VendorContact","RemitToName","RemitToAddress","RemitToCity","RemitToState","RemitToZip","RemitToCountry","ShipToName","DeliverToName","BLType","FOBPointName","CarrierName","CarrierServiceName","PaymentTermsName","Note","CustomerSO","DateCreated","Vendor SO Num","DateScheduled","DateExpired","Phone","Fax","Email","URL","CurrencyName","CurrencyRate","LocationGroupName","BuyerId","Buyer","PriorityId","QuickBooksClassName","CF-Custom"');
-            csvLines.push('"PO",20,"Bid Request","' + vendorName.replace(/"/g, '""') + '","","","","","","","","","","","","","","","Auto PO from BI Report","","","","","","","","","","","","",' + lgId + ',"","",0,"",""');
+            // === Build CSV rows matching Fishbowl ImportPurchaseOrder format ===
+            // PO header columns:
+            //   Flag, PONum, Status, VendorName, VendorContact, RemitToName, RemitToAddress,
+            //   RemitToCity, RemitToState, RemitToZip, RemitToCountry, ShipToName, DeliverToName,
+            //   ShipToAddress, ShipToCity, ShipToState, ShipToZip, ShipToCountry, CarrierName,
+            //   CarrierService, TaxCode, VendorSONum, CustomerSONum, CreatedDate, CompletedDate,
+            //   ConfirmedDate, FulfillmentDate, IssuedDate, Buyer, ShippingTerms, PaymentTerms,
+            //   FOB, Note, QuickBooksClassName, LocationGroupName, URL, Phone, Email,
+            //   CurrencyName, CurrencyRate, CF-Custom
+            // Item row columns:
+            //   Flag, POItemTypeID, PartNumber, VendorPartNumber, PartQuantity, FulfilledQuantity,
+            //   PickedQuantity, UOM, PartPrice, TaxCode, FulfillmentDate, LastFulfillmentDate,
+            //   RevisionLevel, Note, QuickBooksClassName, CustomerJob
 
+            var csvRows = [];
+
+            // Header row (column names for PO)
+            csvRows.push(
+                '"Flag","PONum","Status","VendorName","VendorContact",' +
+                '"RemitToName","RemitToAddress","RemitToCity","RemitToState","RemitToZip","RemitToCountry",' +
+                '"ShipToName","DeliverToName","ShipToAddress","ShipToCity","ShipToState","ShipToZip","ShipToCountry",' +
+                '"CarrierName","CarrierService","TaxCode","VendorSONum","CustomerSONum",' +
+                '"CreatedDate","CompletedDate","ConfirmedDate","FulfillmentDate","IssuedDate",' +
+                '"Buyer","ShippingTerms","PaymentTerms","FOB","Note",' +
+                '"QuickBooksClassName","LocationGroupName","URL","Phone","Email",' +
+                '"CurrencyName","CurrencyRate","CF-Custom"'
+            );
+
+            // PO data row
+            var escapedVendor = vendorName.replace(/"/g, '""');
+            csvRows.push(
+                '"PO","' + poNum + '","Bid Request","' + escapedVendor + '","",' +
+                '"","","","","","",' +  // RemitTo fields
+                '"","","","","","","",' +  // ShipTo fields
+                '"","","","","","' + today + '","","","","","","","","","Auto PO from BI Report",' +
+                '"","' + lgName + '","","","","","",""'
+            );
+
+            // Item rows
             items.forEach(function(item) {
-                csvLines.push('"Item",10,"' + item.partNum.replace(/"/g, '""') + '","","","' + item.qty + '","' + item.uomCode + '","' + item.unitCost + '","",""');
+                var escapedPN = item.partNum.replace(/"/g, '""');
+                var escapedVPN = (item.vendorPartNum || '').replace(/"/g, '""');
+                csvRows.push(
+                    '"Item",10,"' + escapedPN + '","' + escapedVPN + '",' +
+                    item.qty + ',0,0,' +
+                    '"' + item.uomCode + '",' + item.unitCost.toFixed(2) + ',' +
+                    '"","","","","","",""'
+                );
             });
 
-            var csvData = csvLines.join('\n');
+            var csvData = csvRows.join('\n');
 
-            debugLog('Submitting PO for vendor: ' + vendorName + ' (' + items.length + ' items)', 'click');
+            debugLog('Submitting PO for vendor: ' + vendorName + ' (' + items.length + ' items, PO#: ' + (poNum || 'auto') + ')', 'click');
             debugLog('PO CSV data:\n' + csvData, 'info');
 
-            try {
-                var importResult = importData('ImportPurchaseOrder', csvData);
-                showStatus('PO created successfully for ' + vendorName + '! ' + items.length + ' line items.', 'success');
+            // === Submit via Fishbowl ImportRq API ===
+            var payload = {
+                "ImportRq": {
+                    "Type": "ImportPurchaseOrder",
+                    "Rows": {
+                        "Row": csvRows
+                    }
+                }
+            };
+
+            debugLog('Import payload: ' + JSON.stringify(payload), 'info');
+
+            var response = runApiRequest('ImportRq', JSON.stringify(payload));
+
+            if (!response) {
+                showStatus('PO import failed for ' + vendorName + ': No response from API.', 'error');
+                debugLog('PO import failed: No response from runApiRequest', 'error');
+                return;
+            }
+
+            var result = typeof response === 'string' ? JSON.parse(response) : response;
+            debugLog('PO import response: ' + JSON.stringify(result), 'info');
+
+            if (result && result.ImportRs && result.ImportRs.statusCode === 1000) {
+                showStatus('PO created successfully for ' + vendorName + '! ' + items.length + ' line items.' + (poNum ? ' PO#: ' + poNum : ''), 'success');
                 debugLog('PO created successfully for ' + vendorName + ': ' + items.length + ' line items', 'success');
                 closePoModal();
-            } catch (importErr) {
-                console.error('Import failed:', importErr);
-                showStatus('PO data prepared for ' + vendorName + '. Auto-import may not be available. Check console for details.', 'warning');
-                debugLog('PO import failed for ' + vendorName + ': ' + importErr.message, 'error');
-                console.log('PO Import Data for ' + vendorName + ':\n' + csvData);
-                closePoModal();
+            } else {
+                var errorMsg = 'PO import failed for ' + vendorName;
+                if (result && result.ImportRs && result.ImportRs.statusMessage) {
+                    errorMsg += ': ' + result.ImportRs.statusMessage;
+                } else if (result && result.ErrorRs && result.ErrorRs.statusMessage) {
+                    errorMsg += ': ' + result.ErrorRs.statusMessage;
+                } else {
+                    errorMsg += ': ' + JSON.stringify(result);
+                }
+                showStatus(errorMsg, 'error');
+                debugLog(errorMsg, 'error');
             }
         } catch (e) {
             console.error('submitPoFromModal error:', e);
