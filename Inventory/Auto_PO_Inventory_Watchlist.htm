@@ -1372,12 +1372,25 @@
                         var selectAllChecked = (selectedCount === partCount && partCount > 0) ? 'checked' : '';
                         var selectAllCb = '<input type="checkbox" class="vendor-select-all" data-vendor-id="' + vid + '" ' + selectAllChecked + ' onclick="toggleVendorSelectAll(' + vid + ', this.checked)" title="Select/Deselect all for this vendor">';
                         var poValueHtml = '<span class="vendor-po-value" data-vendor-id="' + vid + '">PO Value: ' + formatCurrencyVal(poValue) + '</span>';
-                        var createPoBtn = '<button class="btn-create-po" onclick="openPoModal(' + vid + ')" title="Create PO for ' + vname.replace(/"/g, '&quot;') + '"><svg class="w-3.5 h-3.5 inline-block mr-1 align-text-bottom" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>Create PO</button>';
+
+                        // If a PO was already raised this session, show link instead of Create button
+                        var existingPo = (window._vendorPOs && window._vendorPOs[vid]) ? window._vendorPOs[vid] : null;
+                        var actionHtml;
+                        if (existingPo) {
+                            actionHtml = '<a href="#" class="po-raised-link" onclick="openModule(\'Purchase Order\', \'' + existingPo + '\'); return false;" ' +
+                                'style="display:inline-flex; align-items:center; gap:4px; font-size:12px; padding:4px 10px; border-radius:6px; ' +
+                                'background:#dcfce7; color:#166534; font-weight:600; text-decoration:none; border:1px solid #bbf7d0;">' +
+                                '<svg style="width:14px;height:14px;" fill="none" stroke="currentColor" viewBox="0 0 24 24">' +
+                                '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>' +
+                                'PO# ' + existingPo + '</a>';
+                        } else {
+                            actionHtml = '<button class="btn-create-po" onclick="openPoModal(' + vid + ')" title="Create PO for ' + vname.replace(/"/g, '&quot;') + '"><svg class="w-3.5 h-3.5 inline-block mr-1 align-text-bottom" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>Create PO</button>';
+                        }
 
                         $td.html(
                             '<div style="display:flex; align-items:center; justify-content:space-between;">' +
                                 '<div>' + expandBtn + selectAllCb + vendorIcon + vendorLink + countBadge + '</div>' +
-                                '<div style="display:flex; align-items:center;">' + poValueHtml + createPoBtn + '</div>' +
+                                '<div style="display:flex; align-items:center;">' + poValueHtml + actionHtml + '</div>' +
                             '</div>'
                         );
                     }
@@ -2010,30 +2023,6 @@
         if (gtEl) gtEl.textContent = formatCurrencyVal(grandTotal);
     }
 
-    function getNextPoNumber() {
-        try {
-            // Read Auto PO Number from sysproperties (Fishbowl increments it internally)
-            var propNum = '';
-            try {
-                var propRows = JSON.parse(runQuery(
-                    "SELECT sysvalue FROM sysproperties WHERE syskey = 'Auto PO Number'"
-                ));
-                if (propRows && propRows.length > 0 && propRows[0].sysvalue) {
-                    propNum = propRows[0].sysvalue;
-                }
-            } catch (e) {
-                debugLog('Direct SQL property read failed, falling back to getProperty(): ' + e.message, 'warning');
-                propNum = getProperty('Auto PO Number', '');
-            }
-            var candidate = parseInt(propNum) || 1;
-            debugLog('Auto PO Number property value: ' + propNum + ' → using ' + candidate, 'info');
-            return String(candidate);
-        } catch (e) {
-            debugLog('Could not determine next PO number: ' + e.message, 'error');
-        }
-        return null;
-    }
-
     /**
      * Get location group name for PO creation.
      * When a specific LG is selected, returns that name.
@@ -2237,11 +2226,6 @@
         }
 
         try {
-            var poNum = getNextPoNumber();
-            if (poNum === null) {
-                showStatus('PO number from system property already exists. Check the "Auto PO Number" property in Fishbowl.', 'error');
-                return;
-            }
             var lgName = getLocationGroupName();
             var lgId = getLocationGroupId();
             debugLog('PO submit: lgName=' + lgName + ' lgId=' + lgId + ' vendorId=' + vendorId, 'info');
@@ -2327,7 +2311,7 @@
             // Row 3: PO data
             var escapedVendor = esc(vendorName);
             csvRows.push(
-                '"PO","' + poNum + '",' + poStatus + ',"' + escapedVendor + '","",' +
+                '"PO","",' + poStatus + ',"' + escapedVendor + '","",' +
                 '"' + esc(remitTo.name) + '","' + esc(remitTo.address) + '","' + esc(remitTo.city) + '","' + esc(remitTo.state) + '","' + esc(remitTo.zip) + '","' + esc(remitTo.country) + '",' +
                 '"' + esc(shipTo.name) + '","","' + esc(shipTo.address) + '","' + esc(shipTo.city) + '","' + esc(shipTo.state) + '","' + esc(shipTo.zip) + '","' + esc(shipTo.country) + '",' +
                 '"' + esc(carrierName) + '","","","","","' + today + '","","","","","","","","","Auto PO from BI Report",' +
@@ -2375,13 +2359,72 @@
             debugLog('PO import response: ' + JSON.stringify(result), 'info');
 
             if (result && result.ImportRs && result.ImportRs.statusCode === 1000) {
-                showStatus('PO created successfully for ' + vendorName + '! ' + items.length + ' line items.' + (poNum ? ' PO#: ' + poNum : ''), 'success');
                 debugLog('PO created successfully for ' + vendorName + ': ' + items.length + ' line items', 'success');
+
+                // Look up the PO that was just created by finding the most recent PO for this vendor
+                // and verifying the line-item count matches what we submitted
+                var poNum = '';
+                try {
+                    var poRows = JSON.parse(runQuery(
+                        "SELECT po.id, po.num FROM po " +
+                        "WHERE po.vendorid = " + parseInt(vendorId) +
+                        " ORDER BY po.id DESC LIMIT 1"
+                    ));
+                    if (poRows && poRows.length > 0) {
+                        // Verify by checking item count on this PO matches what we sent
+                        var poId = poRows[0].id;
+                        var candidateNum = poRows[0].num;
+                        var itemCountRows = JSON.parse(runQuery(
+                            "SELECT COUNT(*) AS cnt FROM poitem WHERE poid = " + poId
+                        ));
+                        var dbCount = (itemCountRows && itemCountRows.length > 0) ? parseInt(itemCountRows[0].cnt) : 0;
+                        if (dbCount === items.length) {
+                            poNum = candidateNum;
+                            debugLog('Verified PO#' + poNum + ' (id=' + poId + ') with ' + dbCount + ' items', 'success');
+                        } else {
+                            // Count mismatch — still use the number but log a warning
+                            poNum = candidateNum;
+                            debugLog('PO#' + poNum + ' item count mismatch: expected ' + items.length + ', got ' + dbCount, 'warning');
+                        }
+                    }
+                } catch (e) {
+                    debugLog('Could not look up created PO number: ' + e.message, 'warning');
+                }
+
+                showStatus('PO created successfully for ' + vendorName + '! ' + items.length + ' line items.' + (poNum ? ' PO#: ' + poNum : ''), 'success');
+
+                // Store the PO against this vendor so the header row can show it
+                if (poNum) {
+                    if (!window._vendorPOs) window._vendorPOs = {};
+                    window._vendorPOs[vendorId] = poNum;
+                }
+
+                // Update vendor header row with PO link badge
+                var headerRow = document.querySelector('.vendor-group-header .vendor-expand-toggle[data-vendor-id="' + vendorId + '"]');
+                if (headerRow && poNum) {
+                    var headerDiv = headerRow.closest('.vendor-group-header td > div');
+                    if (headerDiv) {
+                        // Remove the Create PO button and replace with PO link
+                        var createBtn = headerDiv.querySelector('.btn-create-po');
+                        if (createBtn) createBtn.remove();
+                        var rightDiv = headerDiv.querySelector('div:last-child');
+                        if (rightDiv) {
+                            rightDiv.insertAdjacentHTML('beforeend',
+                                ' <a href="#" class="po-raised-link" onclick="openModule(\'Purchase Order\', \'' + poNum + '\'); return false;" ' +
+                                'style="display:inline-flex; align-items:center; gap:4px; font-size:12px; padding:4px 10px; border-radius:6px; ' +
+                                'background:#dcfce7; color:#166534; font-weight:600; text-decoration:none; border:1px solid #bbf7d0;">' +
+                                '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="width:14px;height:14px;">' +
+                                '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>' +
+                                'PO# ' + poNum + '</a>'
+                            );
+                        }
+                    }
+                }
 
                 // Mark submitted rows in the table (visual only, resets on page reload)
                 var submittedKeys = {};
                 items.forEach(function(item) {
-                    submittedKeys[vendorId + '_' + item.partId] = poNum;
+                    submittedKeys[vendorId + '_' + item.partId] = poNum || 'created';
                 });
                 document.querySelectorAll('.row-checkbox[data-key]').forEach(function(cb) {
                     var key = cb.getAttribute('data-key');
@@ -2390,15 +2433,15 @@
                         if (tr) {
                             tr.style.backgroundColor = '#f0fdf4';
                             tr.style.opacity = '0.7';
-                            // Add a PO badge to the first cell after the checkbox
-                            var partCell = tr.querySelectorAll('td')[1];
-                            if (partCell && !partCell.querySelector('.po-badge')) {
-                                partCell.insertAdjacentHTML('beforeend',
-                                    ' <span class="po-badge" style="display:inline-block; font-size:10px; padding:1px 6px; border-radius:4px; background:#bbf7d0; color:#166534; font-weight:600; vertical-align:middle;">PO# ' + submittedKeys[key] + '</span>'
-                                );
+                            if (poNum) {
+                                var partCell = tr.querySelectorAll('td')[1];
+                                if (partCell && !partCell.querySelector('.po-badge')) {
+                                    partCell.insertAdjacentHTML('beforeend',
+                                        ' <span class="po-badge" style="display:inline-block; font-size:10px; padding:1px 6px; border-radius:4px; background:#bbf7d0; color:#166534; font-weight:600; vertical-align:middle;">PO# ' + poNum + '</span>'
+                                    );
+                                }
                             }
                         }
-                        // Uncheck and disable the checkbox
                         cb.checked = false;
                         cb.disabled = true;
                         selectionState[key] = false;
