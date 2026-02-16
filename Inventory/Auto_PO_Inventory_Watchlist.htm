@@ -1122,6 +1122,105 @@
             });
 
             // ------------------------------------------------
+            // Post-filter getAutoPo results by date range
+            // The engine ignores date params, so we query
+            // SO / WO demand within the window ourselves
+            // and recalculate shortfall accordingly.
+            // ------------------------------------------------
+            try {
+                var partsToFilter = [];
+                allResults.forEach(function(item) {
+                    if (item._isAutoPo && (parseFloat(item.qty_needed) || 0) > 0) {
+                        if (partsToFilter.indexOf(item.part_id) === -1) {
+                            partsToFilter.push(item.part_id);
+                        }
+                    }
+                });
+
+                if (partsToFilter.length > 0) {
+                    var partIdList = partsToFilter.join(',');
+
+                    // SO demand: unfulfilled qty on open SOs within date range
+                    var soDemandMap = {};
+                    try {
+                        var soRows = JSON.parse(runQuery(
+                            "SELECT si.productid AS part_id, " +
+                            "  COALESCE(SUM(GREATEST(si.qtytofulfill - si.qtyfulfilled, 0)), 0) AS dated_demand " +
+                            "FROM soitem si " +
+                            "INNER JOIN so ON so.id = si.soid " +
+                            "WHERE si.productid IN (" + partIdList + ") " +
+                            "  AND so.statusid >= 20 AND so.statusid < 60 " +
+                            "  AND si.typeid = 10 " +
+                            "  AND so.datefirstship >= '" + startDate + "' " +
+                            "  AND so.datefirstship <= '" + endDate + " 23:59:59' " +
+                            "GROUP BY si.productid"
+                        ));
+                        soRows.forEach(function(r) {
+                            soDemandMap[r.part_id] = parseFloat(r.dated_demand) || 0;
+                        });
+                        debugLog('Date-filtered SO demand for ' + partsToFilter.length + ' parts: ' + JSON.stringify(soDemandMap), 'info');
+                    } catch (e) {
+                        debugLog('SO date-filter query failed: ' + e.message, 'warning');
+                    }
+
+                    // WO/MO demand: raw material consumption on open WOs within date range
+                    var woDemandMap = {};
+                    if (includeMfg) {
+                        try {
+                            var woRows = JSON.parse(runQuery(
+                                "SELECT wi.partid AS part_id, " +
+                                "  COALESCE(SUM(GREATEST(wi.qtytofulfill - wi.qtyfulfilled, 0)), 0) AS dated_demand " +
+                                "FROM woitem wi " +
+                                "INNER JOIN wo ON wo.id = wi.woid " +
+                                "INNER JOIN moitem mi ON wo.moitemid = mi.id " +
+                                "INNER JOIN mo ON mo.id = mi.moid " +
+                                "WHERE wi.partid IN (" + partIdList + ") " +
+                                "  AND wi.typeid = 20 " +
+                                "  AND mo.statusid >= 20 AND mo.statusid < 60 " +
+                                "  AND COALESCE(wo.datescheduled, mi.datescheduled) >= '" + startDate + "' " +
+                                "  AND COALESCE(wo.datescheduled, mi.datescheduled) <= '" + endDate + " 23:59:59' " +
+                                "GROUP BY wi.partid"
+                            ));
+                            woRows.forEach(function(r) {
+                                woDemandMap[r.part_id] = parseFloat(r.dated_demand) || 0;
+                            });
+                            debugLog('Date-filtered WO demand for ' + partsToFilter.length + ' parts: ' + JSON.stringify(woDemandMap), 'info');
+                        } catch (e) {
+                            debugLog('WO date-filter query failed: ' + e.message, 'warning');
+                        }
+                    }
+
+                    // Recalculate shortfall using date-filtered demand
+                    allResults.forEach(function(item) {
+                        if (!item._isAutoPo || (parseFloat(item.qty_needed) || 0) <= 0) return;
+
+                        var soDemand = soDemandMap[item.part_id] || 0;
+                        var woDemand = woDemandMap[item.part_id] || 0;
+                        var datedAlloc = soDemand + woDemand;
+                        var onhand = parseFloat(item.qty_on_hand) || 0;
+                        var onorder = parseFloat(item.qty_on_order) || 0;
+                        var origNeeded = parseFloat(item.qty_needed) || 0;
+                        var newNeeded = Math.max(0, datedAlloc - onhand - onorder);
+
+                        debugLog('Date filter [' + item.part_num + ' v' + item.vendor_id + ']: ' +
+                            'SO=' + soDemand + ' WO=' + woDemand + ' datedAlloc=' + datedAlloc +
+                            ' onhand=' + onhand + ' onorder=' + onorder +
+                            ' → needed: ' + origNeeded + ' → ' + newNeeded, 'info');
+
+                        item.qty_needed = newNeeded;
+                        item.qty_suggested = newNeeded;
+
+                        if (newNeeded === 0) {
+                            var key = item.vendor_id + '_' + item.part_id;
+                            selectionState[key] = false;
+                        }
+                    });
+                }
+            } catch (e) {
+                debugLog('Date post-filter failed: ' + e.message, 'error');
+            }
+
+            // ------------------------------------------------
             // Load standard inventory data for parts NOT already
             // returned by Auto PO — allows users to add items
             // to POs that weren't auto-suggested
