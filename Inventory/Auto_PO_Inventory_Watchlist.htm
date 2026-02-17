@@ -837,11 +837,13 @@
         var oul = parseFloat(item.target_level) || 0;
         // Compute available: on_hand - allocated - not_available + drop_ship
         // The SQL query computes the full formula (including qtynotavailable) as _available.
-        // JS fallback only used for Auto PO engine rows where _available is not pre-computed.
+        // JS fallback used for Auto PO engine rows where _available is not pre-computed;
+        // _qty_not_available is injected by the post-filter's qtynotavailable query.
         var onhand = parseFloat(item.qty_on_hand) || 0;
         var allocated = parseFloat(item.qty_allocated) || 0;
         var dropship = parseFloat(item.qty_on_drop_ship) || 0;
-        var available = Math.max(0, onhand - allocated + dropship);
+        var notAvail = parseFloat(item._qty_not_available) || 0;
+        var available = Math.max(0, onhand - allocated - notAvail + dropship);
         // Use _available if already computed from standard query (includes Not Available)
         if (item._available !== undefined) available = item._available;
 
@@ -1441,7 +1443,30 @@
                         }
                     }
 
+                    // Query Not Available qty so we can compute true available
+                    // (the getAutoPo engine doesn't return this field)
+                    var notAvailMap = {};
+                    try {
+                        var naSql = "SELECT partid AS part_id, COALESCE(SUM(qty), 0) AS qty " +
+                            "FROM qtynotavailable WHERE partid IN (" + partIdList + ") ";
+                        if (locationGroupId > 0) {
+                            naSql += "AND locationgroupid = " + locationGroupId + " ";
+                        }
+                        naSql += "GROUP BY partid";
+                        var naRows = safeParseQuery(naSql);
+                        naRows.forEach(function(r) {
+                            notAvailMap[r.part_id] = parseFloat(r.qty) || 0;
+                        });
+                        debugLog('Not Available qty for post-filter parts' +
+                            (locationGroupId > 0 ? ' (LG=' + locationGroupId + ')' : '') +
+                            ': ' + JSON.stringify(notAvailMap), 'info');
+                    } catch (e) {
+                        debugLog('qtynotavailable query failed: ' + e.message, 'warning');
+                    }
+
                     // Recalculate shortfall using date-filtered demand
+                    // Use available (on_hand - allocated - not_available + drop_ship) instead
+                    // of raw on_hand, since not_available stock cannot fulfill demand.
                     allResults.forEach(function(item) {
                         if (!item._isAutoPo || (parseFloat(item.qty_needed) || 0) <= 0) return;
 
@@ -1450,14 +1475,22 @@
                         var woDemand = woDemandMap[item.part_id] || 0;
                         var datedAlloc = soDemand + toDemand + woDemand;
                         var onhand = parseFloat(item.qty_on_hand) || 0;
+                        var allocated = parseFloat(item.qty_allocated) || 0;
+                        var dropship = parseFloat(item.qty_on_drop_ship) || 0;
+                        var notAvail = notAvailMap[item.part_id] || 0;
+                        var available = Math.max(0, onhand - allocated - notAvail + dropship);
                         var onorder = parseFloat(item.qty_on_order) || 0;
                         var origNeeded = parseFloat(item.qty_needed) || 0;
-                        var newNeeded = Math.max(0, datedAlloc - onhand - onorder);
+                        var newNeeded = Math.max(0, datedAlloc - available - onorder);
+
+                        // Store not_available so computePartStatus can use the correct available
+                        item._qty_not_available = notAvail;
 
                         debugLog('Date filter [' + item.part_num + ' v' + item.vendor_id + ']: ' +
                             'SO=' + soDemand + ' TO=' + toDemand + ' WO=' + woDemand +
                             ' datedAlloc=' + datedAlloc +
-                            ' onhand=' + onhand + ' onorder=' + onorder +
+                            ' onhand=' + onhand + ' notAvail=' + notAvail +
+                            ' available=' + available + ' onorder=' + onorder +
                             ' → needed: ' + origNeeded + ' → ' + newNeeded, 'info');
 
                         item.qty_needed = newNeeded;
