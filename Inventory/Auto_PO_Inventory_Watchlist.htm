@@ -1281,49 +1281,15 @@
             });
 
             // ------------------------------------------------
-            // Per-LG supplementary scan (hybrid: SQL pre-filter + engine)
+            // Per-LG supplementary scan
             // When lgReorderEnabled and "All" LGs is selected,
             // the company-wide getAutoPo can miss parts that need
             // stock at individual LGs (because aggregate stock is
-            // sufficient). We use a SQL pre-filter to identify
-            // which vendor×LG combos have parts with ROP > 0,
-            // then only call getAutoPo for those combos.
+            // sufficient). Scan each vendor×LG via the engine to
+            // discover per-LG shortfalls and demand.
             // ------------------------------------------------
             if (lgReorderEnabled && locationGroupId === -1 && userLocationGroups.length > 0) {
-                var lgIdList = userLocationGroups.map(function(lg) { return lg.id; }).join(',');
-                var totalPossible = vendorIds.length * userLocationGroups.length;
-
-                // SQL pre-filter: find which vendor×LG combos have parts with ROP > 0
-                var targetCombos = [];
-                try {
-                    var comboSql =
-                        "SELECT DISTINCT vp.vendorid, pr.locationgroupid " +
-                        "FROM partreorder pr " +
-                        "  INNER JOIN part p ON pr.partid = p.id AND p.typeid = 10 " +
-                        "  INNER JOIN vendorparts vp ON pr.partid = vp.partid " +
-                        "  INNER JOIN vendor v ON vp.vendorid = v.id AND v.activeflag = 1 " +
-                        "WHERE pr.locationgroupid IN (" + lgIdList + ") " +
-                        "  AND pr.reorderpoint > 0";
-                    if (vendorVal !== 'all') {
-                        comboSql += " AND vp.vendorid = " + parseInt(vendorVal);
-                    }
-                    if (defaultVendorOnly) {
-                        comboSql += " AND vp.defaultflag = 1";
-                    }
-                    var comboRows = JSON.parse(runQuery(comboSql));
-                    comboRows.forEach(function(r) {
-                        targetCombos.push({ vid: parseInt(r.vendorid), lgId: parseInt(r.locationgroupid) });
-                    });
-                    debugLog('=== Per-LG supplementary scan: ' + targetCombos.length + ' vendor×LG combos with ROP (of ' + totalPossible + ' possible) ===', 'info');
-                } catch (preErr) {
-                    // Fallback: scan all combos
-                    debugLog('Per-LG pre-filter failed (' + preErr.message + '), scanning all ' + totalPossible + ' combos', 'warning');
-                    vendorIds.forEach(function(vid) {
-                        userLocationGroups.forEach(function(lg) {
-                            targetCombos.push({ vid: vid, lgId: lg.id });
-                        });
-                    });
-                }
+                debugLog('=== Per-LG supplementary scan (' + userLocationGroups.length + ' LGs × ' + vendorIds.length + ' vendors) ===', 'info');
 
                 // Build LG name lookup
                 var lgNameMap = {};
@@ -1338,84 +1304,86 @@
                 var perLgAdded = 0;
                 var perLgUpdated = 0;
 
-                targetCombos.forEach(function(combo) {
-                    try {
-                        var perLgJson = getAutoPo(combo.vid, combo.lgId, qbClassId, showVendorPN, includeNoROP, includeMfg, startDate, endDate);
-                        var perLgItems = JSON.parse(perLgJson);
-                        if (!perLgItems || perLgItems.length === 0) return;
+                vendorIds.forEach(function(vid) {
+                    userLocationGroups.forEach(function(lg) {
+                        try {
+                            var perLgJson = getAutoPo(vid, lg.id, qbClassId, showVendorPN, includeNoROP, includeMfg, startDate, endDate);
+                            var perLgItems = JSON.parse(perLgJson);
+                            if (!perLgItems || perLgItems.length === 0) return;
 
-                        perLgItems.forEach(function(plItem) {
-                            if (!plItem.part_id || !plItem.part_num) return;
-                            var sugQty = parseFloat(plItem.qty_suggested) || 0;
-                            if (sugQty <= 0) return;
+                            perLgItems.forEach(function(plItem) {
+                                if (!plItem.part_id || !plItem.part_num) return;
+                                var sugQty = parseFloat(plItem.qty_suggested) || 0;
+                                if (sugQty <= 0) return;
 
-                            var mapKey = plItem.vendor_id + '_' + plItem.part_id;
-                            var existing = existingMap[mapKey];
+                                var mapKey = plItem.vendor_id + '_' + plItem.part_id;
+                                var existing = existingMap[mapKey];
 
-                            // Trace tracked parts
-                            if (isTracePart(plItem.part_num)) {
-                                debugLog('>>> ' + plItem.part_num + ' PER-LG SCAN [LG=' + (lgNameMap[combo.lgId] || combo.lgId) + ' id=' + combo.lgId + ']: ' +
-                                    'suggested=' + sugQty + ' needed=' + plItem.qty_needed +
-                                    ' onhand=' + plItem.qty_on_hand + ' allocated=' + plItem.qty_allocated +
-                                    ' ROP=' + plItem.reorder_level + ' OUL=' + plItem.target_level +
-                                    ' existing=' + !!existing, 'warning');
-                            }
-
-                            if (existing) {
-                                // Part exists — attach per-LG qty
-                                if (!existing._perLgQty) existing._perLgQty = {};
-                                existing._perLgQty[combo.lgId] = sugQty;
-
-                                // If company-wide had no suggestion, accumulate per-LG
-                                if (!existing._hasCompanyWideSuggestion) {
-                                    existing.qty_suggested = (parseFloat(existing.qty_suggested) || 0) + sugQty;
-                                    existing.qty_needed = (parseFloat(existing.qty_needed) || 0) + (parseFloat(plItem.qty_needed) || 0);
-                                    var key = existing.vendor_id + '_' + existing.part_id;
-                                    var isDefVendor = !defaultVendorMap[existing.part_id] || defaultVendorMap[existing.part_id] == existing.vendor_id;
-                                    selectionState[key] = (parseFloat(existing.qty_suggested) || 0) > 0 && isDefVendor;
-                                    perLgUpdated++;
+                                // Trace tracked parts
+                                if (isTracePart(plItem.part_num)) {
+                                    debugLog('>>> ' + plItem.part_num + ' PER-LG SCAN [LG=' + lg.name + ' id=' + lg.id + ']: ' +
+                                        'suggested=' + sugQty + ' needed=' + plItem.qty_needed +
+                                        ' onhand=' + plItem.qty_on_hand + ' allocated=' + plItem.qty_allocated +
+                                        ' ROP=' + plItem.reorder_level + ' OUL=' + plItem.target_level +
+                                        ' existing=' + !!existing, 'warning');
                                 }
-                            } else {
-                                // Part doesn't exist — create new entry from per-LG data
-                                if (defaultVendorOnly && defaultVendorMap[plItem.part_id] && defaultVendorMap[plItem.part_id] !== plItem.vendor_id) return;
 
-                                var vpKey = plItem.part_id + '_' + plItem.vendor_id;
-                                var vpData = vendorPartsLookup[vpKey];
-                                if (vpData) {
-                                    plItem.last_cost = vpData.lastcost;
-                                    plItem.lead_time = vpData.leadtime;
-                                    plItem._vendorPartNum = vpData.vendorpartnumber;
-                                    plItem._fbPartNum = vpData.fbpartnum;
+                                if (existing) {
+                                    // Part exists — attach per-LG qty
+                                    if (!existing._perLgQty) existing._perLgQty = {};
+                                    existing._perLgQty[lg.id] = sugQty;
+
+                                    // If company-wide had no suggestion, accumulate per-LG
+                                    if (!existing._hasCompanyWideSuggestion) {
+                                        existing.qty_suggested = (parseFloat(existing.qty_suggested) || 0) + sugQty;
+                                        existing.qty_needed = (parseFloat(existing.qty_needed) || 0) + (parseFloat(plItem.qty_needed) || 0);
+                                        var key = existing.vendor_id + '_' + existing.part_id;
+                                        var isDefVendor = !defaultVendorMap[existing.part_id] || defaultVendorMap[existing.part_id] == existing.vendor_id;
+                                        selectionState[key] = (parseFloat(existing.qty_suggested) || 0) > 0 && isDefVendor;
+                                        perLgUpdated++;
+                                    }
                                 } else {
-                                    plItem.last_cost = safeCost(plItem.last_cost);
-                                    plItem.lead_time = parseInt(plItem.lead_time) || 0;
-                                    plItem._vendorPartNum = '';
-                                    plItem._fbPartNum = '';
+                                    // Part doesn't exist — create new entry from per-LG data
+                                    if (defaultVendorOnly && defaultVendorMap[plItem.part_id] && defaultVendorMap[plItem.part_id] !== plItem.vendor_id) return;
+
+                                    var vpKey = plItem.part_id + '_' + plItem.vendor_id;
+                                    var vpData = vendorPartsLookup[vpKey];
+                                    if (vpData) {
+                                        plItem.last_cost = vpData.lastcost;
+                                        plItem.lead_time = vpData.leadtime;
+                                        plItem._vendorPartNum = vpData.vendorpartnumber;
+                                        plItem._fbPartNum = vpData.fbpartnum;
+                                    } else {
+                                        plItem.last_cost = safeCost(plItem.last_cost);
+                                        plItem.lead_time = parseInt(plItem.lead_time) || 0;
+                                        plItem._vendorPartNum = '';
+                                        plItem._fbPartNum = '';
+                                    }
+                                    if (!plItem._fbPartNum) plItem._fbPartNum = plItem.part_num || '';
+
+                                    // Enforce min qty
+                                    if (useMinQty && vpData && vpData.qtymin > 0 && sugQty > 0 && sugQty < vpData.qtymin) {
+                                        plItem.qty_suggested = vpData.qtymin;
+                                    }
+
+                                    plItem._isAutoPo = true;
+                                    plItem._perLgQty = {};
+                                    plItem._perLgQty[lg.id] = sugQty;
+
+                                    allResults.push(plItem);
+                                    existingMap[mapKey] = plItem;
+
+                                    var key = plItem.vendor_id + '_' + plItem.part_id;
+                                    var isDefVendor = !defaultVendorMap[plItem.part_id] || defaultVendorMap[plItem.part_id] == plItem.vendor_id;
+                                    selectionState[key] = sugQty > 0 && isDefVendor;
+                                    perLgAdded++;
+                                    totalParts++;
                                 }
-                                if (!plItem._fbPartNum) plItem._fbPartNum = plItem.part_num || '';
-
-                                // Enforce min qty
-                                if (useMinQty && vpData && vpData.qtymin > 0 && sugQty > 0 && sugQty < vpData.qtymin) {
-                                    plItem.qty_suggested = vpData.qtymin;
-                                }
-
-                                plItem._isAutoPo = true;
-                                plItem._perLgQty = {};
-                                plItem._perLgQty[combo.lgId] = sugQty;
-
-                                allResults.push(plItem);
-                                existingMap[mapKey] = plItem;
-
-                                var key = plItem.vendor_id + '_' + plItem.part_id;
-                                var isDefVendor = !defaultVendorMap[plItem.part_id] || defaultVendorMap[plItem.part_id] == plItem.vendor_id;
-                                selectionState[key] = sugQty > 0 && isDefVendor;
-                                perLgAdded++;
-                                totalParts++;
-                            }
-                        });
-                    } catch (plErr) {
-                        debugLog('Per-LG scan failed for vendor ' + combo.vid + ' LG ' + (lgNameMap[combo.lgId] || combo.lgId) + ': ' + plErr.message, 'warning');
-                    }
+                            });
+                        } catch (plErr) {
+                            debugLog('Per-LG scan failed for vendor ' + vid + ' LG ' + lg.name + ': ' + plErr.message, 'warning');
+                        }
+                    });
                 });
 
                 debugLog('Per-LG scan complete: ' + perLgAdded + ' new parts added, ' + perLgUpdated + ' updated with per-LG suggestions', 'success');
