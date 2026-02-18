@@ -735,6 +735,10 @@
     let vendorPartsLookup = {};
     // Track collapsed/expanded state per vendor: { vendorId: true/false }
     let vendorCollapsed = {};
+    // Whether system uses per-LG reorder points (set in initParameters)
+    let lgReorderEnabled = false;
+    // User's accessible location groups: [{ id, name }, ...]
+    let userLocationGroups = [];
 
     // Debug mode from Fishbowl system property (default to false)
     const BI_SHOW_DEBUG_PROP = typeof getProperty === 'function' ? getProperty('BI_SHOW_DEBUG', 'false') : 'false';
@@ -908,7 +912,7 @@
         } catch (e) { console.error('Failed to load vendors:', e); }
 
         // Check if system uses per-LG reorder points
-        var lgReorderEnabled = false;
+        lgReorderEnabled = false;
         try {
             var sysPropRaw = runQuery(
                 "SELECT * FROM sysProperties WHERE sysKey = 'locationGroupReordering'"
@@ -940,11 +944,13 @@
                     " ORDER BY lg.name"
                 ));
                 var sel = document.getElementById('paramLocationGroup');
+                userLocationGroups = [];
                 lgs.forEach(function(lg) {
                     var opt = document.createElement('option');
                     opt.value = lg.id;
                     opt.textContent = lg.name;
                     sel.appendChild(opt);
+                    userLocationGroups.push({ id: parseInt(lg.id), name: lg.name });
                     // Capture user's default location group
                     if (lg.defaultflag === '1' || lg.defaultflag === 1 || lg.defaultflag === true) {
                         userDefaultLG = { id: parseInt(lg.id), name: lg.name };
@@ -2314,7 +2320,7 @@
     // ============================================
     // PO Modal
     // ============================================
-    function openPoModal(vendorId) {
+    function collectModalItems(vendorId) {
         var selectedItems = [];
         allResults.forEach(function(item) {
             if (item.vendor_id !== vendorId) return;
@@ -2333,8 +2339,6 @@
                 partDisplay = fbPN + ' (' + vendorPN + ')';
             }
 
-            debugLog('Modal item: ' + fbPN + ' qty=' + qty + ' cost=' + cost + ' (' + typeof cost + ') lineTotal=' + (qty * cost), 'info');
-
             selectedItems.push({
                 partId: item.part_id,
                 partNum: fbPN,
@@ -2342,13 +2346,54 @@
                 partNumDisplay: partDisplay,
                 partDescription: item.part_description || '',
                 qty: qty,
+                originalQty: qty,
                 uomId: item.vendor_uom_id || item.part_uom_id,
                 uomCode: item.vendor_uom_code || item.part_uom_code || 'ea',
                 unitCost: cost,
-                lineTotal: qty * cost,
-                locationGroupId: item.location_group_id || 0
+                lineTotal: qty * cost
             });
         });
+        return selectedItems;
+    }
+
+    function buildModalTableHtml(items, editable) {
+        var tableRows = '';
+        items.forEach(function(item, idx) {
+            var qtyCell = editable
+                ? '<input type="number" class="modal-input" id="modal-qty-' + idx + '" value="' + item.qty + '" min="0" step="1" onchange="recalcModalLine(' + idx + ')">'
+                : '<input type="number" class="modal-input" id="modal-qty-' + idx + '" value="' + item.qty + '" min="0" step="1" onchange="recalcModalLine(' + idx + ')">';
+            tableRows +=
+                '<tr>' +
+                    '<td><strong>' + item.partNumDisplay + '</strong></td>' +
+                    '<td>' + item.partDescription + '</td>' +
+                    '<td class="col-right">' + item.uomCode + '</td>' +
+                    '<td class="col-right">' + qtyCell + '</td>' +
+                    '<td class="col-right"><input type="number" class="modal-input" id="modal-cost-' + idx + '" value="' + item.unitCost.toFixed(2) + '" min="0" step="0.01" onchange="recalcModalLine(' + idx + ')"></td>' +
+                    '<td class="col-right" id="modal-linetotal-' + idx + '">' + formatCurrencyVal(item.lineTotal) + '</td>' +
+                '</tr>';
+        });
+
+        var grandTotal = 0;
+        items.forEach(function(i) { grandTotal += i.lineTotal; });
+
+        tableRows +=
+            '<tr class="modal-total-row">' +
+                '<td colspan="3"></td>' +
+                '<td class="col-right"><strong>Total</strong></td>' +
+                '<td></td>' +
+                '<td class="col-right"><strong id="modal-grand-total">' + formatCurrencyVal(grandTotal) + '</strong></td>' +
+            '</tr>';
+
+        return '<table class="modal-table">' +
+            '<thead><tr>' +
+                '<th>Part #</th><th>Description</th><th class="col-right">UOM</th>' +
+                '<th class="col-right">Qty</th><th class="col-right">Unit Cost</th><th class="col-right">Line Total</th>' +
+            '</tr></thead>' +
+            '<tbody>' + tableRows + '</tbody></table>';
+    }
+
+    function openPoModal(vendorId) {
+        var selectedItems = collectModalItems(vendorId);
 
         if (selectedItems.length === 0) {
             showStatus('No parts selected with qty > 0 for this vendor.', 'warning');
@@ -2360,30 +2405,49 @@
             if (item.vendor_id === vendorId && !vendorName) vendorName = item.vendor_name;
         });
 
-        // Build modal HTML
-        var grandTotal = 0;
-        selectedItems.forEach(function(i) { grandTotal += i.lineTotal; });
+        // Store modal state
+        window._modalItems = selectedItems;
+        window._modalVendorId = vendorId;
+        window._modalVendorName = vendorName;
+        window._modalMode = 'single';
+        window._modalCreatedPOs = [];  // track POs created in per-LG mode: [{ lgId, lgName, poNum, items }]
+        // Deep copy original items so we can track remainders
+        window._modalOriginalItems = JSON.parse(JSON.stringify(selectedItems));
 
-        var tableRows = '';
-        selectedItems.forEach(function(item, idx) {
-            tableRows +=
-                '<tr>' +
-                    '<td><strong>' + item.partNumDisplay + '</strong></td>' +
-                    '<td>' + item.partDescription + '</td>' +
-                    '<td class="col-right">' + item.uomCode + '</td>' +
-                    '<td class="col-right"><input type="number" class="modal-input" id="modal-qty-' + idx + '" value="' + item.qty + '" min="0" step="1" onchange="recalcModalLine(' + idx + ')"></td>' +
-                    '<td class="col-right"><input type="number" class="modal-input" id="modal-cost-' + idx + '" value="' + item.unitCost.toFixed(2) + '" min="0" step="0.01" onchange="recalcModalLine(' + idx + ')"></td>' +
-                    '<td class="col-right" id="modal-linetotal-' + idx + '">' + formatCurrencyVal(item.lineTotal) + '</td>' +
-                '</tr>';
-        });
+        var isLgSplitAvailable = lgReorderEnabled && document.getElementById('paramLocationGroup').value === '-1' && userLocationGroups.length > 1;
 
-        tableRows +=
-            '<tr class="modal-total-row">' +
-                '<td colspan="3"></td>' +
-                '<td class="col-right"><strong>Total</strong></td>' +
-                '<td></td>' +
-                '<td class="col-right"><strong id="modal-grand-total">' + formatCurrencyVal(grandTotal) + '</strong></td>' +
-            '</tr>';
+        // Build LG options for dropdown
+        var lgOptions = '';
+        if (isLgSplitAvailable) {
+            userLocationGroups.forEach(function(lg) {
+                var selected = (lg.id === userDefaultLG.id) ? ' selected' : '';
+                lgOptions += '<option value="' + lg.id + '"' + selected + '>' + lg.name + '</option>';
+            });
+        }
+
+        // LG selector section (only shown when LG split is available)
+        var lgSectionHtml = '';
+        if (isLgSplitAvailable) {
+            lgSectionHtml =
+                '<div style="border-bottom:1px solid #e2e8f0; padding:12px 24px; background:#f8fafc;">' +
+                    '<div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">' +
+                        '<span style="font-size:12px; color:#64748b; font-weight:600;">Order Mode:</span>' +
+                        '<label style="font-size:13px; cursor:pointer; display:flex; align-items:center; gap:4px;">' +
+                            '<input type="radio" name="modal-lg-mode" value="single" checked onchange="switchModalLgMode(\'single\')"> Single PO' +
+                        '</label>' +
+                        '<label style="font-size:13px; cursor:pointer; display:flex; align-items:center; gap:4px;">' +
+                            '<input type="radio" name="modal-lg-mode" value="per-lg" onchange="switchModalLgMode(\'per-lg\')"> Per Location Group' +
+                        '</label>' +
+                        '<div style="margin-left:auto; display:flex; align-items:center; gap:6px;">' +
+                            '<label id="modal-lg-label" style="font-size:12px; color:#64748b; white-space:nowrap;">Ship to:</label>' +
+                            '<select id="modal-lg-select" style="padding:4px 8px; font-size:12px; border:1px solid #cbd5e1; border-radius:4px; min-width:140px;" onchange="onModalLgChange()">' +
+                                lgOptions +
+                            '</select>' +
+                        '</div>' +
+                    '</div>' +
+                    '<div id="modal-lg-created" style="display:none; margin-top:8px;"></div>' +
+                '</div>';
+        }
 
         var html =
             '<div class="modal-overlay" onclick="closePoModal(event)">' +
@@ -2391,24 +2455,15 @@
                     '<div class="modal-header">' +
                         '<div>' +
                             '<h2 style="font-size:16px; font-weight:700; color:#1e293b; margin:0;">Create Purchase Order</h2>' +
-                            '<p style="font-size:12px; color:#64748b; margin:2px 0 0 0;">Vendor: <strong>' + vendorName + '</strong> &mdash; ' + selectedItems.length + ' line items</p>' +
+                            '<p style="font-size:12px; color:#64748b; margin:2px 0 0 0;">Vendor: <strong>' + vendorName + '</strong> &mdash; <span id="modal-item-count">' + selectedItems.length + '</span> line items</p>' +
                         '</div>' +
                         '<button onclick="closePoModal()" style="background:none; border:none; cursor:pointer; padding:4px; color:#94a3b8;">' +
                             '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>' +
                         '</button>' +
                     '</div>' +
-                    '<div class="modal-body">' +
-                        '<table class="modal-table">' +
-                            '<thead><tr>' +
-                                '<th>Part #</th>' +
-                                '<th>Description</th>' +
-                                '<th class="col-right">UOM</th>' +
-                                '<th class="col-right">Qty</th>' +
-                                '<th class="col-right">Unit Cost</th>' +
-                                '<th class="col-right">Line Total</th>' +
-                            '</tr></thead>' +
-                            '<tbody>' + tableRows + '</tbody>' +
-                        '</table>' +
+                    lgSectionHtml +
+                    '<div class="modal-body" id="modal-table-body">' +
+                        buildModalTableHtml(selectedItems, true) +
                     '</div>' +
                     '<div class="modal-footer">' +
                         '<div style="display:flex; align-items:center; gap:12px;">' +
@@ -2422,18 +2477,261 @@
                         '</div>' +
                         '<div style="display:flex; gap:8px;">' +
                             '<button onclick="closePoModal()" style="padding:6px 16px; font-size:13px; border:1px solid #cbd5e1; border-radius:6px; background:white; cursor:pointer; font-weight:500;">Cancel</button>' +
-                            '<button onclick="submitPoFromModal(' + vendorId + ')" class="btn-create-po" style="padding:6px 16px; font-size:13px; border-radius:6px;">Create PO</button>' +
+                            '<button id="modal-submit-btn" onclick="submitPoFromModal(' + vendorId + ')" class="btn-create-po" style="padding:6px 16px; font-size:13px; border-radius:6px;">Create PO</button>' +
                         '</div>' +
                     '</div>' +
                 '</div>' +
             '</div>';
 
         document.getElementById('poModal').innerHTML = html;
+    }
 
-        // Store modal items for later
-        window._modalItems = selectedItems;
-        window._modalVendorId = vendorId;
-        window._modalVendorName = vendorName;
+    function switchModalLgMode(mode) {
+        window._modalMode = mode;
+        var label = document.getElementById('modal-lg-label');
+        if (mode === 'single') {
+            if (label) label.textContent = 'Ship to:';
+            // Restore full item list (minus any already-ordered quantities from per-LG POs)
+            refreshModalTableForRemainder();
+        } else {
+            if (label) label.textContent = 'Location Group:';
+            // Load per-LG quantities for the currently selected LG
+            onModalLgChange();
+        }
+    }
+
+    function onModalLgChange() {
+        if (window._modalMode !== 'per-lg') return;
+        var lgSel = document.getElementById('modal-lg-select');
+        if (!lgSel) return;
+        var lgId = parseInt(lgSel.value);
+        var lgName = lgSel.options[lgSel.selectedIndex].text;
+
+        // Check if PO already created for this LG
+        var alreadyDone = window._modalCreatedPOs.some(function(p) { return p.lgId === lgId; });
+        if (alreadyDone) {
+            document.getElementById('modal-table-body').innerHTML =
+                '<div style="text-align:center; padding:32px; color:#64748b;">' +
+                    '<p style="font-size:14px; font-weight:600;">PO already created for ' + lgName + '</p>' +
+                    '<p style="font-size:12px; margin-top:4px;">Select another location group or switch to Single PO for remaining items.</p>' +
+                '</div>';
+            document.getElementById('modal-submit-btn').disabled = true;
+            document.getElementById('modal-item-count').textContent = '0';
+            return;
+        }
+
+        // Call getAutoPo for this specific LG to get per-LG quantities
+        loadPerLgItems(lgId);
+    }
+
+    function loadPerLgItems(lgId) {
+        var vendorId = window._modalVendorId;
+        var qbClassId = parseInt(document.getElementById('paramQBClass').value);
+        var showVendorPN = document.getElementById('paramShowVendorPN').checked;
+        var includeNoROP = document.getElementById('paramIncludeNoROP').checked;
+        var includeMfg = document.getElementById('paramIncludeMfg').checked;
+        var startDate = document.getElementById('paramStartDate').value;
+        var endDate = document.getElementById('paramEndDate').value;
+
+        try {
+            var resultJson = getAutoPo(vendorId, lgId, qbClassId, showVendorPN, includeNoROP, includeMfg, startDate, endDate);
+            var engineItems = JSON.parse(resultJson);
+
+            // Build map of per-LG suggested quantities by part_id
+            var lgQtyMap = {};
+            if (engineItems && engineItems.length > 0) {
+                engineItems.forEach(function(ei) {
+                    var sugQty = parseFloat(ei.qty_suggested) || 0;
+                    if (sugQty > 0) {
+                        lgQtyMap[ei.part_id] = sugQty;
+                    }
+                });
+            }
+
+            // Build per-LG items from original selection, using per-LG quantities
+            // Also subtract any quantities already ordered for this part in other LG POs
+            var perLgItems = [];
+            var originalItems = window._modalOriginalItems;
+            originalItems.forEach(function(orig) {
+                var lgQty = lgQtyMap[orig.partId] || 0;
+                if (lgQty <= 0) return;
+
+                // Cap to remaining qty (original minus already-ordered across all LGs)
+                var alreadyOrdered = 0;
+                window._modalCreatedPOs.forEach(function(po) {
+                    po.items.forEach(function(pi) {
+                        if (pi.partId === orig.partId) alreadyOrdered += pi.qty;
+                    });
+                });
+                var remaining = orig.originalQty - alreadyOrdered;
+                if (remaining <= 0) return;
+                var qty = Math.min(lgQty, remaining);
+                if (qty <= 0) return;
+
+                perLgItems.push({
+                    partId: orig.partId,
+                    partNum: orig.partNum,
+                    vendorPartNum: orig.vendorPartNum,
+                    partNumDisplay: orig.partNumDisplay,
+                    partDescription: orig.partDescription,
+                    qty: qty,
+                    originalQty: orig.originalQty,
+                    uomId: orig.uomId,
+                    uomCode: orig.uomCode,
+                    unitCost: orig.unitCost,
+                    lineTotal: qty * orig.unitCost
+                });
+            });
+
+            window._modalItems = perLgItems;
+
+            if (perLgItems.length === 0) {
+                document.getElementById('modal-table-body').innerHTML =
+                    '<div style="text-align:center; padding:32px; color:#64748b;">' +
+                        '<p style="font-size:14px;">No suggested quantities for this location group.</p>' +
+                    '</div>';
+                document.getElementById('modal-submit-btn').disabled = true;
+                document.getElementById('modal-item-count').textContent = '0';
+            } else {
+                document.getElementById('modal-table-body').innerHTML = buildModalTableHtml(perLgItems, true);
+                document.getElementById('modal-submit-btn').disabled = false;
+                document.getElementById('modal-item-count').textContent = perLgItems.length;
+            }
+
+            debugLog('Per-LG items for LG ' + lgId + ': ' + perLgItems.length + ' items', 'info');
+        } catch (e) {
+            debugLog('Failed to load per-LG Auto PO data: ' + e.message, 'error');
+            document.getElementById('modal-table-body').innerHTML =
+                '<div style="text-align:center; padding:32px; color:#ef4444;">' +
+                    '<p style="font-size:14px;">Error loading data for this location group.</p>' +
+                    '<p style="font-size:12px; margin-top:4px;">' + e.message + '</p>' +
+                '</div>';
+            document.getElementById('modal-submit-btn').disabled = true;
+        }
+    }
+
+    function refreshModalTableForRemainder() {
+        // Rebuild items list from originals minus already-ordered quantities
+        var remainderItems = [];
+        window._modalOriginalItems.forEach(function(orig) {
+            var alreadyOrdered = 0;
+            window._modalCreatedPOs.forEach(function(po) {
+                po.items.forEach(function(pi) {
+                    if (pi.partId === orig.partId) alreadyOrdered += pi.qty;
+                });
+            });
+            var remaining = orig.originalQty - alreadyOrdered;
+            if (remaining <= 0) return;
+
+            remainderItems.push({
+                partId: orig.partId,
+                partNum: orig.partNum,
+                vendorPartNum: orig.vendorPartNum,
+                partNumDisplay: orig.partNumDisplay,
+                partDescription: orig.partDescription,
+                qty: remaining,
+                originalQty: orig.originalQty,
+                uomId: orig.uomId,
+                uomCode: orig.uomCode,
+                unitCost: orig.unitCost,
+                lineTotal: remaining * orig.unitCost
+            });
+        });
+
+        window._modalItems = remainderItems;
+
+        if (remainderItems.length === 0) {
+            document.getElementById('modal-table-body').innerHTML =
+                '<div style="text-align:center; padding:32px; color:#16a34a;">' +
+                    '<svg class="w-8 h-8" style="margin:0 auto 8px; color:#16a34a;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>' +
+                    '<p style="font-size:14px; font-weight:600;">All items have been ordered</p>' +
+                '</div>';
+            document.getElementById('modal-submit-btn').disabled = true;
+            document.getElementById('modal-item-count').textContent = '0';
+        } else {
+            document.getElementById('modal-table-body').innerHTML = buildModalTableHtml(remainderItems, true);
+            document.getElementById('modal-submit-btn').disabled = false;
+            document.getElementById('modal-item-count').textContent = remainderItems.length;
+        }
+    }
+
+    function updateModalCreatedSummary() {
+        var container = document.getElementById('modal-lg-created');
+        if (!container || window._modalCreatedPOs.length === 0) return;
+
+        var html = '<div style="display:flex; flex-wrap:wrap; gap:6px; align-items:center;">' +
+            '<span style="font-size:11px; color:#64748b; font-weight:600;">Created:</span>';
+        window._modalCreatedPOs.forEach(function(po) {
+            html += '<span style="display:inline-flex; align-items:center; gap:3px; font-size:11px; padding:2px 8px; border-radius:4px; background:#dcfce7; color:#166534; font-weight:500; border:1px solid #bbf7d0;">' +
+                po.lgName + (po.poNum ? ' &mdash; PO# ' + po.poNum : '') +
+                ' (' + po.items.length + ' items)</span>';
+        });
+        html += '</div>';
+        container.innerHTML = html;
+        container.style.display = 'block';
+    }
+
+    function markVendorHeaderComplete(vendorId, vendorName) {
+        var headerRow = document.querySelector('.vendor-group-header .vendor-expand-toggle[data-vendor-id="' + vendorId + '"]');
+        if (!headerRow) return;
+        var headerDiv = headerRow.closest('.vendor-group-header td > div');
+        if (!headerDiv) return;
+
+        // Collect all PO numbers for this vendor
+        var poNums = [];
+        if (window._vendorPOs && window._vendorPOs[vendorId]) {
+            var stored = window._vendorPOs[vendorId];
+            if (Array.isArray(stored)) { poNums = stored; }
+            else if (stored) { poNums = [stored]; }
+        }
+
+        // Remove existing Create PO button
+        var createBtn = headerDiv.querySelector('.btn-create-po');
+        if (createBtn) createBtn.remove();
+
+        // Add PO link badges
+        var rightDiv = headerDiv.querySelector('div:last-child');
+        if (rightDiv) {
+            poNums.forEach(function(poNum) {
+                if (!poNum) return;
+                rightDiv.insertAdjacentHTML('beforeend',
+                    ' <a href="#" class="po-raised-link" onclick="openModule(\'Purchase Order\', \'' + poNum + '\'); return false;" ' +
+                    'style="display:inline-flex; align-items:center; gap:4px; font-size:12px; padding:4px 10px; border-radius:6px; ' +
+                    'background:#dcfce7; color:#166534; font-weight:600; text-decoration:none; border:1px solid #bbf7d0;">' +
+                    '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="width:14px;height:14px;">' +
+                    '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>' +
+                    'PO# ' + poNum + '</a>'
+                );
+            });
+        }
+    }
+
+    function markSubmittedRows(vendorId, items, poNum) {
+        var submittedKeys = {};
+        items.forEach(function(item) {
+            submittedKeys[vendorId + '_' + item.partId] = poNum || 'created';
+        });
+        document.querySelectorAll('.row-checkbox[data-key]').forEach(function(cb) {
+            var key = cb.getAttribute('data-key');
+            if (submittedKeys[key]) {
+                var tr = cb.closest('tr');
+                if (tr) {
+                    tr.style.backgroundColor = '#f0fdf4';
+                    tr.style.opacity = '0.7';
+                    if (poNum) {
+                        var partCell = tr.querySelectorAll('td')[1];
+                        if (partCell && !partCell.querySelector('.po-badge')) {
+                            partCell.insertAdjacentHTML('beforeend',
+                                ' <span class="po-badge" style="display:inline-block; font-size:10px; padding:1px 6px; border-radius:4px; background:#bbf7d0; color:#166534; font-weight:600; vertical-align:middle;">PO# ' + poNum + '</span>'
+                            );
+                        }
+                    }
+                }
+                cb.checked = false;
+                cb.disabled = true;
+                selectionState[key] = false;
+            }
+        });
     }
 
     function closePoModal(event) {
@@ -2671,9 +2969,20 @@
             return;
         }
 
+        var isPerLg = window._modalMode === 'per-lg';
+        var isSingleWithLgSelect = window._modalMode === 'single' && document.getElementById('modal-lg-select');
+
         try {
-            var lgName = getLocationGroupName();
-            var lgId = getLocationGroupId();
+            var lgName, lgId;
+            if (isPerLg || isSingleWithLgSelect) {
+                // Use the modal LG dropdown
+                var lgSel = document.getElementById('modal-lg-select');
+                lgId = parseInt(lgSel.value);
+                lgName = lgSel.options[lgSel.selectedIndex].text;
+            } else {
+                lgName = getLocationGroupName();
+                lgId = getLocationGroupId();
+            }
             debugLog('PO submit: lgName=' + lgName + ' lgId=' + lgId + ' vendorId=' + vendorId, 'info');
             // Format today's date using Fishbowl's DateFormatShort property
             var fbDateFormat = getProperty('DateFormatShort', 'MM/dd/yyyy');
@@ -2778,7 +3087,7 @@
 
             var csvData = csvRows.join('\n');
 
-            debugLog('Submitting PO for vendor: ' + vendorName + ' (' + items.length + ' items, PO#: ' + (poNum || 'auto') + ')', 'click');
+            debugLog('Submitting PO for vendor: ' + vendorName + ' (' + items.length + ' items)', 'click');
             debugLog('PO CSV data:\n' + csvData, 'info');
 
             // === Submit via Fishbowl ImportRq API ===
@@ -2837,64 +3146,76 @@
                     debugLog('Could not look up created PO number: ' + e.message, 'warning');
                 }
 
-                showStatus('PO created successfully for ' + vendorName + '! ' + items.length + ' line items.' + (poNum ? ' PO#: ' + poNum : ''), 'success');
+                var lgSuffix = isPerLg ? ' (' + lgName + ')' : '';
+                showStatus('PO created successfully for ' + vendorName + lgSuffix + '! ' + items.length + ' line items.' + (poNum ? ' PO#: ' + poNum : ''), 'success');
 
                 // Store the PO against this vendor so the header row can show it
                 if (poNum) {
                     if (!window._vendorPOs) window._vendorPOs = {};
-                    window._vendorPOs[vendorId] = poNum;
-                }
-
-                // Update vendor header row with PO link badge
-                var headerRow = document.querySelector('.vendor-group-header .vendor-expand-toggle[data-vendor-id="' + vendorId + '"]');
-                if (headerRow && poNum) {
-                    var headerDiv = headerRow.closest('.vendor-group-header td > div');
-                    if (headerDiv) {
-                        // Remove the Create PO button and replace with PO link
-                        var createBtn = headerDiv.querySelector('.btn-create-po');
-                        if (createBtn) createBtn.remove();
-                        var rightDiv = headerDiv.querySelector('div:last-child');
-                        if (rightDiv) {
-                            rightDiv.insertAdjacentHTML('beforeend',
-                                ' <a href="#" class="po-raised-link" onclick="openModule(\'Purchase Order\', \'' + poNum + '\'); return false;" ' +
-                                'style="display:inline-flex; align-items:center; gap:4px; font-size:12px; padding:4px 10px; border-radius:6px; ' +
-                                'background:#dcfce7; color:#166534; font-weight:600; text-decoration:none; border:1px solid #bbf7d0;">' +
-                                '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="width:14px;height:14px;">' +
-                                '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>' +
-                                'PO# ' + poNum + '</a>'
-                            );
+                    // For per-LG mode, store array of POs; for single mode, store single PO
+                    if (isPerLg) {
+                        if (!Array.isArray(window._vendorPOs[vendorId])) {
+                            window._vendorPOs[vendorId] = [];
                         }
+                        window._vendorPOs[vendorId].push(poNum);
+                    } else {
+                        window._vendorPOs[vendorId] = poNum;
                     }
                 }
 
-                // Mark submitted rows in the table (visual only, resets on page reload)
-                var submittedKeys = {};
-                items.forEach(function(item) {
-                    submittedKeys[vendorId + '_' + item.partId] = poNum || 'created';
-                });
-                document.querySelectorAll('.row-checkbox[data-key]').forEach(function(cb) {
-                    var key = cb.getAttribute('data-key');
-                    if (submittedKeys[key]) {
-                        var tr = cb.closest('tr');
-                        if (tr) {
-                            tr.style.backgroundColor = '#f0fdf4';
-                            tr.style.opacity = '0.7';
-                            if (poNum) {
-                                var partCell = tr.querySelectorAll('td')[1];
-                                if (partCell && !partCell.querySelector('.po-badge')) {
-                                    partCell.insertAdjacentHTML('beforeend',
-                                        ' <span class="po-badge" style="display:inline-block; font-size:10px; padding:1px 6px; border-radius:4px; background:#bbf7d0; color:#166534; font-weight:600; vertical-align:middle;">PO# ' + poNum + '</span>'
-                                    );
-                                }
+                if (isPerLg) {
+                    // Per-LG mode: record this PO and refresh the modal for the next LG
+                    window._modalCreatedPOs.push({
+                        lgId: lgId,
+                        lgName: lgName,
+                        poNum: poNum,
+                        items: JSON.parse(JSON.stringify(items))
+                    });
+
+                    updateModalCreatedSummary();
+
+                    // Check if all items are accounted for
+                    var totalRemaining = 0;
+                    window._modalOriginalItems.forEach(function(orig) {
+                        var ordered = 0;
+                        window._modalCreatedPOs.forEach(function(po) {
+                            po.items.forEach(function(pi) {
+                                if (pi.partId === orig.partId) ordered += pi.qty;
+                            });
+                        });
+                        totalRemaining += Math.max(0, orig.originalQty - ordered);
+                    });
+
+                    if (totalRemaining <= 0) {
+                        // All ordered — update header, mark rows, show completion in modal
+                        markVendorHeaderComplete(vendorId, vendorName);
+                        markSubmittedRows(vendorId, items, poNum);
+                        refreshModalTableForRemainder(); // shows "All items ordered" message
+                    } else {
+                        // Auto-advance to the next un-ordered LG
+                        var lgSel = document.getElementById('modal-lg-select');
+                        var nextLgFound = false;
+                        var orderedLgIds = {};
+                        window._modalCreatedPOs.forEach(function(po) { orderedLgIds[po.lgId] = true; });
+                        for (var oi = 0; oi < lgSel.options.length; oi++) {
+                            if (!orderedLgIds[parseInt(lgSel.options[oi].value)]) {
+                                lgSel.selectedIndex = oi;
+                                nextLgFound = true;
+                                break;
                             }
                         }
-                        cb.checked = false;
-                        cb.disabled = true;
-                        selectionState[key] = false;
+                        if (nextLgFound) {
+                            onModalLgChange();
+                        } else {
+                            refreshModalTableForRemainder();
+                        }
                     }
-                });
-
-                closePoModal();
+                } else {
+                    // Single PO mode — update header, mark rows, close modal
+                    markVendorHeaderComplete(vendorId, vendorName);
+                    markSubmittedRows(vendorId, items, poNum);
+                    closePoModal();
+                }
             } else {
                 var errorMsg = 'PO import failed for ' + vendorName;
                 if (result && result.ImportRs && result.ImportRs.statusMessage) {
