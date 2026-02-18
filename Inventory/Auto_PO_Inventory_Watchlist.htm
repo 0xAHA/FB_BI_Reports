@@ -1225,6 +1225,15 @@
                                 ' needed=' + item.qty_needed +
                                 ' suggested=' + item.qty_suggested, 'info');
 
+                            // === TRACE: B201 ===
+                            if ((item._fbPartNum || item.part_num || '').toUpperCase() === 'B201') {
+                                debugLog('>>> B201 TRACE [vendor=' + vid + ']: RAW from engine: ' + JSON.stringify(item), 'warning');
+                                debugLog('>>> B201 TRACE: vpKey=' + vpKey + ' vpData=' + JSON.stringify(vpData || null), 'warning');
+                                debugLog('>>> B201 TRACE: defaultVendorOnly=' + defaultVendorOnly +
+                                    ' defaultVendorMap[' + item.part_id + ']=' + (defaultVendorMap[item.part_id] || 'undefined') +
+                                    ' item.vendor_id=' + item.vendor_id, 'warning');
+                            }
+
                             // Enforce minimum order qty if UseMinQtyAutoGenPOs is enabled
                             if (useMinQty && vpData && vpData.qtymin > 0) {
                                 var curSug = parseFloat(item.qty_suggested) || 0;
@@ -1503,6 +1512,13 @@
                     // but zero-out parts that have NO demand within the date window.
                     // We don't try to re-derive the qty — the engine knows better.
                     allResults.forEach(function(item) {
+                        // === TRACE: B201 date filter ===
+                        if ((item._fbPartNum || item.part_num || '').toUpperCase() === 'B201') {
+                            debugLog('>>> B201 DATE FILTER ENTRY: _isAutoPo=' + item._isAutoPo +
+                                ' qty_needed=' + item.qty_needed + ' qty_suggested=' + item.qty_suggested +
+                                ' vendor=' + item.vendor_id, 'warning');
+                        }
+
                         if (!item._isAutoPo || (parseFloat(item.qty_needed) || 0) <= 0) return;
 
                         var soDemand = soDemandMap[item.part_id] || 0;
@@ -1514,6 +1530,13 @@
                         // Store not_available so computePartStatus can use the correct available
                         var notAvail = notAvailMap[item.part_id] || 0;
                         item._qty_not_available = notAvail;
+
+                        // === TRACE: B201 date filter detail ===
+                        if ((item._fbPartNum || item.part_num || '').toUpperCase() === 'B201') {
+                            debugLog('>>> B201 DATE FILTER: SO=' + soDemand + ' TO=' + toDemand + ' WO=' + woDemand +
+                                ' datedAlloc=' + datedAlloc + ' origNeeded=' + origNeeded +
+                                ' notAvail=' + notAvail, 'warning');
+                        }
 
                         if (datedAlloc <= 0) {
                             // No demand in date window — suppress this suggestion
@@ -1607,6 +1630,14 @@
                 var stdAdded = 0;
 
                 stdRows.forEach(function(row) {
+                    // === TRACE: B201 standard inventory ===
+                    if ((row.part_num || '').toUpperCase() === 'B201') {
+                        debugLog('>>> B201 STANDARD ROW: already in autoPo=' + !!autoPoPartIds[row.part_id] +
+                            ' vendor=' + row.vendor_id + ' ' + row.vendor_name +
+                            ' available=' + row._available +
+                            ' ROP=' + row.reorder_level + ' OUL=' + row.target_level, 'warning');
+                    }
+
                     // Skip parts already covered by Auto PO data
                     if (autoPoPartIds[row.part_id]) return;
 
@@ -1645,6 +1676,27 @@
             } catch(stdErr) {
                 console.error('Standard inventory query failed:', stdErr);
                 debugLog('Standard inventory query failed: ' + stdErr.message, 'error');
+            }
+
+            // === TRACE: B201 final summary ===
+            var b201Items = allResults.filter(function(r) {
+                return (r._fbPartNum || r.part_num || '').toUpperCase() === 'B201';
+            });
+            if (b201Items.length > 0) {
+                debugLog('>>> B201 FINAL SUMMARY: ' + b201Items.length + ' row(s) in allResults', 'warning');
+                b201Items.forEach(function(b, idx) {
+                    var key = b.vendor_id + '_' + b.part_id;
+                    debugLog('>>> B201 [' + idx + ']: vendor=' + b.vendor_name + ' (id=' + b.vendor_id + ')' +
+                        ' partId=' + b.part_id +
+                        ' isAutoPo=' + !!b._isAutoPo + ' isStandard=' + !!b._isStandardRow +
+                        ' needed=' + b.qty_needed + ' suggested=' + b.qty_suggested +
+                        ' onhand=' + b.qty_on_hand + ' allocated=' + b.qty_allocated +
+                        ' onorder=' + b.qty_on_order + ' available=' + b._available +
+                        ' ROP=' + b.reorder_level + ' OUL=' + b.target_level +
+                        ' selected=' + !!selectionState[key], 'warning');
+                });
+            } else {
+                debugLog('>>> B201 FINAL SUMMARY: NOT FOUND in allResults (0 rows)', 'error');
             }
 
             // ------------------------------------------------
@@ -2491,13 +2543,109 @@
         var label = document.getElementById('modal-lg-label');
         if (mode === 'single') {
             if (label) label.textContent = 'Ship to:';
+            // Restore full LG dropdown (all user LGs)
+            var lgSel = document.getElementById('modal-lg-select');
+            if (lgSel) {
+                lgSel.innerHTML = '';
+                userLocationGroups.forEach(function(lg) {
+                    var opt = document.createElement('option');
+                    opt.value = lg.id;
+                    opt.textContent = lg.name;
+                    if (lg.id === userDefaultLG.id) opt.selected = true;
+                    lgSel.appendChild(opt);
+                });
+            }
             // Restore full item list (minus any already-ordered quantities from per-LG POs)
             refreshModalTableForRemainder();
         } else {
             if (label) label.textContent = 'Location Group:';
-            // Load per-LG quantities for the currently selected LG
-            onModalLgChange();
+            // Pre-scan all LGs to find which have suggestions, cache results
+            prescanLgSuggestions();
         }
+    }
+
+    function prescanLgSuggestions() {
+        var vendorId = window._modalVendorId;
+        var qbClassId = parseInt(document.getElementById('paramQBClass').value);
+        var showVendorPN = document.getElementById('paramShowVendorPN').checked;
+        var includeNoROP = document.getElementById('paramIncludeNoROP').checked;
+        var includeMfg = document.getElementById('paramIncludeMfg').checked;
+        var startDate = document.getElementById('paramStartDate').value;
+        var endDate = document.getElementById('paramEndDate').value;
+
+        window._lgSuggestionCache = {};
+        var lgsWithSuggestions = [];
+        var originalItems = window._modalOriginalItems;
+        var originalPartIds = {};
+        originalItems.forEach(function(o) { originalPartIds[o.partId] = true; });
+
+        debugLog('Pre-scanning ' + userLocationGroups.length + ' LGs for vendor ' + vendorId + '...', 'info');
+
+        userLocationGroups.forEach(function(lg) {
+            // Skip LGs that already have a PO created
+            var alreadyDone = window._modalCreatedPOs.some(function(p) { return p.lgId === lg.id; });
+            if (alreadyDone) return;
+
+            try {
+                var resultJson = getAutoPo(vendorId, lg.id, qbClassId, showVendorPN, includeNoROP, includeMfg, startDate, endDate);
+                var engineItems = JSON.parse(resultJson);
+
+                var lgQtyMap = {};
+                var hasSuggestions = false;
+                if (engineItems && engineItems.length > 0) {
+                    engineItems.forEach(function(ei) {
+                        var sugQty = parseFloat(ei.qty_suggested) || 0;
+                        if (sugQty > 0 && originalPartIds[ei.part_id]) {
+                            lgQtyMap[ei.part_id] = sugQty;
+                            hasSuggestions = true;
+                        }
+                    });
+                }
+
+                if (hasSuggestions) {
+                    window._lgSuggestionCache[lg.id] = lgQtyMap;
+                    lgsWithSuggestions.push(lg);
+                    debugLog('  LG ' + lg.name + ' (id=' + lg.id + '): ' + Object.keys(lgQtyMap).length + ' parts with suggestions', 'info');
+                } else {
+                    debugLog('  LG ' + lg.name + ' (id=' + lg.id + '): no suggestions', 'info');
+                }
+            } catch (e) {
+                debugLog('  LG ' + lg.name + ' scan failed: ' + e.message, 'warning');
+            }
+        });
+
+        debugLog('LGs with suggestions: ' + lgsWithSuggestions.length + '/' + userLocationGroups.length, 'info');
+
+        // Rebuild dropdown with only LGs that have suggestions
+        var lgSel = document.getElementById('modal-lg-select');
+        if (lgSel) {
+            lgSel.innerHTML = '';
+            if (lgsWithSuggestions.length === 0) {
+                var opt = document.createElement('option');
+                opt.value = '';
+                opt.textContent = '(No LGs with suggestions)';
+                opt.disabled = true;
+                lgSel.appendChild(opt);
+                document.getElementById('modal-table-body').innerHTML =
+                    '<div style="text-align:center; padding:32px; color:#64748b;">' +
+                        '<p style="font-size:14px;">No location groups have suggested quantities for this vendor.</p>' +
+                        '<p style="font-size:12px; margin-top:4px;">Switch to Single PO mode to create one order.</p>' +
+                    '</div>';
+                document.getElementById('modal-submit-btn').disabled = true;
+                document.getElementById('modal-item-count').textContent = '0';
+                return;
+            }
+            lgsWithSuggestions.forEach(function(lg, idx) {
+                var opt = document.createElement('option');
+                opt.value = lg.id;
+                opt.textContent = lg.name;
+                if (idx === 0) opt.selected = true;
+                lgSel.appendChild(opt);
+            });
+        }
+
+        // Load the first LG's items
+        onModalLgChange();
     }
 
     function onModalLgChange() {
@@ -2525,27 +2673,32 @@
     }
 
     function loadPerLgItems(lgId) {
-        var vendorId = window._modalVendorId;
-        var qbClassId = parseInt(document.getElementById('paramQBClass').value);
-        var showVendorPN = document.getElementById('paramShowVendorPN').checked;
-        var includeNoROP = document.getElementById('paramIncludeNoROP').checked;
-        var includeMfg = document.getElementById('paramIncludeMfg').checked;
-        var startDate = document.getElementById('paramStartDate').value;
-        var endDate = document.getElementById('paramEndDate').value;
-
         try {
-            var resultJson = getAutoPo(vendorId, lgId, qbClassId, showVendorPN, includeNoROP, includeMfg, startDate, endDate);
-            var engineItems = JSON.parse(resultJson);
-
-            // Build map of per-LG suggested quantities by part_id
+            // Use cached per-LG data from prescan if available, otherwise call engine
             var lgQtyMap = {};
-            if (engineItems && engineItems.length > 0) {
-                engineItems.forEach(function(ei) {
-                    var sugQty = parseFloat(ei.qty_suggested) || 0;
-                    if (sugQty > 0) {
-                        lgQtyMap[ei.part_id] = sugQty;
-                    }
-                });
+            if (window._lgSuggestionCache && window._lgSuggestionCache[lgId]) {
+                lgQtyMap = window._lgSuggestionCache[lgId];
+                debugLog('Using cached per-LG data for LG ' + lgId, 'info');
+            } else {
+                var vendorId = window._modalVendorId;
+                var qbClassId = parseInt(document.getElementById('paramQBClass').value);
+                var showVendorPN = document.getElementById('paramShowVendorPN').checked;
+                var includeNoROP = document.getElementById('paramIncludeNoROP').checked;
+                var includeMfg = document.getElementById('paramIncludeMfg').checked;
+                var startDate = document.getElementById('paramStartDate').value;
+                var endDate = document.getElementById('paramEndDate').value;
+
+                var resultJson = getAutoPo(vendorId, lgId, qbClassId, showVendorPN, includeNoROP, includeMfg, startDate, endDate);
+                var engineItems = JSON.parse(resultJson);
+
+                if (engineItems && engineItems.length > 0) {
+                    engineItems.forEach(function(ei) {
+                        var sugQty = parseFloat(ei.qty_suggested) || 0;
+                        if (sugQty > 0) {
+                            lgQtyMap[ei.part_id] = sugQty;
+                        }
+                    });
+                }
             }
 
             // Build per-LG items from original selection, using per-LG quantities
