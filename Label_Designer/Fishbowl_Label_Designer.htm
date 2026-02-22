@@ -99,6 +99,10 @@
       </div>
     </div>
     <div class="flex items-center gap-2">
+      <button onclick="document.getElementById('import-jrxml-file').click()" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 border border-slate-300 text-slate-700 rounded-lg text-sm font-semibold transition-colors flex items-center gap-2">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+        Import JRXML
+      </button>
       <button onclick="openEditor(null)" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-semibold transition-colors flex items-center gap-2">
         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
         New Blank Label
@@ -222,6 +226,7 @@
     <div class="sep"></div>
     <button onclick="saveDesign()">Save JSON</button>
     <button onclick="document.getElementById('load-file').click()">Load</button>
+    <button onclick="document.getElementById('import-jrxml-file').click()">Import JRXML</button>
     <button onclick="saveTemplateToFishbowl()" style="background:#0e7490">Save to Fishbowl</button>
   </div>
   <div class="editor-panel no-print" style="grid-area:epalette;border-right:1px solid #cbd5e1">
@@ -250,6 +255,16 @@
 <!-- Hidden inputs -->
 <input type="file" id="image-upload" accept="image/*" style="display:none">
 <input type="file" id="load-file" accept=".json" style="display:none">
+<input type="file" id="import-jrxml-file" accept=".jrxml,.xml" style="display:none">
+
+<!-- Drag-and-drop overlay -->
+<div id="drop-overlay" style="display:none;position:fixed;inset:0;z-index:100;background:rgba(45,156,219,.12);border:3px dashed var(--color-primary);pointer-events:none">
+  <div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px">
+    <svg style="width:56px;height:56px;color:var(--color-primary)" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+    <p style="font-size:18px;font-weight:600;color:var(--color-primary)">Drop JRXML file to import</p>
+    <p style="font-size:13px;color:#64748b">or .json label design file</p>
+  </div>
+</div>
 
 <!-- Loading Overlay -->
 <div id="loadingOverlay" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" style="display:none">
@@ -1306,6 +1321,348 @@ function loadDesign(file) {
   reader.readAsText(file);
 }
 
+// =============================================
+// JRXML IMPORT
+// =============================================
+function importJRXML(file) {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const xmlStr = e.target.result;
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(xmlStr, 'application/xml');
+      const parseError = doc.querySelector('parsererror');
+      if (parseError) throw new Error('Invalid XML: ' + parseError.textContent.substring(0, 100));
+
+      const jr = doc.documentElement;
+      const nsResolver = (prefix) => {
+        const ns = {
+          jr: 'http://jasperreports.sourceforge.net/jasperreports',
+          jrc: 'http://jasperreports.sourceforge.net/jasperreports/components',
+          c: 'http://jasperreports.sourceforge.net/jasperreports/components'
+        };
+        return ns[prefix] || null;
+      };
+
+      // Parse label dimensions from jasperReport attributes
+      const pageW = parseInt(jr.getAttribute('pageWidth')) || parseInt(jr.getAttribute('columnWidth')) || 288;
+      const pageH = parseInt(jr.getAttribute('pageHeight')) || 432;
+      const labelName = jr.getAttribute('name') || file.name.replace(/\.jrxml$/i, '');
+
+      // Parse fields
+      const fieldEls = jr.querySelectorAll('field');
+      const templateFields = [];
+      fieldEls.forEach(f => {
+        templateFields.push({
+          name: f.getAttribute('name'),
+          javaClass: f.getAttribute('class') || 'java.lang.String',
+          label: f.getAttribute('name'),
+          sampleData: SAMPLE_DATA[f.getAttribute('name')] || f.getAttribute('name')
+        });
+      });
+
+      // Parse parameters
+      const paramEls = jr.querySelectorAll('parameter');
+      const templateParams = [];
+      paramEls.forEach(p => {
+        const name = p.getAttribute('name');
+        // Skip JasperReports built-in parameters
+        if (name && name.startsWith('JASPER_')) return;
+        if (name === 'REPORT_LOCALE' || name === 'REPORT_TIME_ZONE') return;
+        const prompt = p.querySelector('property[name="prompt"]');
+        const defExpr = p.querySelector('defaultValueExpression');
+        templateParams.push({
+          name: name,
+          javaClass: p.getAttribute('class') || 'java.lang.String',
+          prompt: prompt ? prompt.getAttribute('value') : name,
+          default: defExpr ? defExpr.textContent.replace(/^"(.*)"$/, '$1') : ''
+        });
+      });
+
+      // Parse query
+      let templateQuery = null;
+      const queryEl = jr.querySelector('queryString');
+      if (queryEl) {
+        templateQuery = { sql: queryEl.textContent.trim() };
+      }
+
+      // Collect all elements from all bands
+      const elements = [];
+      let zIdx = 1;
+
+      // Helper: get text from CDATA or text content
+      function textOf(el) { return el ? el.textContent.trim() : ''; }
+
+      // Helper: parse a reportElement
+      function parseReportElement(parent) {
+        const re = parent.querySelector('reportElement');
+        if (!re) return { x: 0, y: 0, width: 100, height: 30, rotation: 0 };
+        const rot = re.getAttribute('rotation') || '';
+        let rotDeg = 0;
+        if (rot === 'Left') rotDeg = 270;
+        else if (rot === 'Right') rotDeg = 90;
+        else if (rot === 'UpsideDown') rotDeg = 180;
+        else if (rot && !isNaN(parseInt(rot))) rotDeg = parseInt(rot);
+        return {
+          x: parseInt(re.getAttribute('x')) || 0,
+          y: parseInt(re.getAttribute('y')) || 0,
+          width: parseInt(re.getAttribute('width')) || 100,
+          height: parseInt(re.getAttribute('height')) || 30,
+          rotation: rotDeg,
+          mode: re.getAttribute('mode') || '',
+          forecolor: re.getAttribute('forecolor') || '',
+          backcolor: re.getAttribute('backcolor') || ''
+        };
+      }
+
+      // Helper: parse textElement for font info
+      function parseTextElement(parent) {
+        const te = parent.querySelector('textElement');
+        const result = { fontFamily: 'SansSerif', fontSize: 12, fontBold: false, fontItalic: false, textAlign: 'left', textColor: '#000000' };
+        if (!te) return result;
+        const align = te.getAttribute('textAlignment') || '';
+        if (align === 'Center') result.textAlign = 'center';
+        else if (align === 'Right') result.textAlign = 'right';
+        const font = te.querySelector('font');
+        if (font) {
+          result.fontFamily = font.getAttribute('fontName') || 'SansSerif';
+          result.fontSize = parseInt(font.getAttribute('size')) || 12;
+          result.fontBold = font.getAttribute('isBold') === 'true';
+          result.fontItalic = font.getAttribute('isItalic') === 'true';
+        }
+        return result;
+      }
+
+      // Helper: parse pen for line/border styling
+      function parsePen(parent) {
+        const ge = parent.querySelector('graphicElement');
+        const pen = ge ? ge.querySelector('pen') : parent.querySelector('pen');
+        if (!pen) return { lineWidth: 1, lineColor: '#000000' };
+        return {
+          lineWidth: parseFloat(pen.getAttribute('lineWidth')) || 1,
+          lineColor: pen.getAttribute('lineColor') || '#000000'
+        };
+      }
+
+      // Process all bands (detail, title, pageHeader, columnHeader, summary, etc.)
+      const bandSelectors = ['detail band', 'title band', 'pageHeader band', 'columnHeader band', 'columnFooter band', 'pageFooter band', 'summary band', 'background band'];
+      const bands = [];
+      bandSelectors.forEach(sel => {
+        jr.querySelectorAll(sel).forEach(b => bands.push(b));
+      });
+      // Also look for any band directly
+      if (bands.length === 0) {
+        jr.querySelectorAll('band').forEach(b => bands.push(b));
+      }
+
+      bands.forEach(band => {
+        // Static text elements
+        band.querySelectorAll(':scope > staticText').forEach(st => {
+          const re = parseReportElement(st);
+          const te = parseTextElement(st);
+          const textEl = st.querySelector('text');
+          elements.push({
+            id: genId(), type: 'staticText', uuid: uid(),
+            x: re.x, y: re.y, width: re.width, height: re.height, rotation: re.rotation,
+            zIndex: zIdx++,
+            text: textOf(textEl),
+            ...te,
+            textColor: re.forecolor || te.textColor
+          });
+        });
+
+        // Text fields (field tokens)
+        band.querySelectorAll(':scope > textField').forEach(tf => {
+          const re = parseReportElement(tf);
+          const te = parseTextElement(tf);
+          const expr = tf.querySelector('textFieldExpression');
+          const exprText = textOf(expr);
+          // Extract field name from $F{fieldName} or use as static text
+          const fieldMatch = exprText.match(/\$F\{([^}]+)\}/);
+          if (fieldMatch) {
+            elements.push({
+              id: genId(), type: 'fieldToken', uuid: uid(),
+              x: re.x, y: re.y, width: re.width, height: re.height, rotation: re.rotation,
+              zIndex: zIdx++,
+              fieldName: fieldMatch[1],
+              ...te,
+              textColor: re.forecolor || te.textColor
+            });
+          } else {
+            // Treat as static text if no field reference
+            let staticVal = exprText.replace(/^"(.*)"$/, '$1');
+            elements.push({
+              id: genId(), type: 'staticText', uuid: uid(),
+              x: re.x, y: re.y, width: re.width, height: re.height, rotation: re.rotation,
+              zIndex: zIdx++,
+              text: staticVal || exprText,
+              ...te,
+              textColor: re.forecolor || te.textColor
+            });
+          }
+        });
+
+        // Lines
+        band.querySelectorAll(':scope > line').forEach(ln => {
+          const re = parseReportElement(ln);
+          const pen = parsePen(ln);
+          const isVert = re.width <= re.height;
+          elements.push({
+            id: genId(), type: 'line', uuid: uid(),
+            x: re.x, y: re.y, width: re.width, height: re.height, rotation: re.rotation,
+            zIndex: zIdx++,
+            lineThickness: pen.lineWidth,
+            lineColor: pen.lineColor,
+            orientation: isVert ? 'vertical' : 'horizontal'
+          });
+        });
+
+        // Rectangles
+        band.querySelectorAll(':scope > rectangle').forEach(rect => {
+          const re = parseReportElement(rect);
+          const pen = parsePen(rect);
+          const radius = parseInt(rect.getAttribute('radius')) || 0;
+          const fillColor = (re.mode === 'Transparent') ? 'transparent' : (re.backcolor || 'transparent');
+          elements.push({
+            id: genId(), type: 'rectangle', uuid: uid(),
+            x: re.x, y: re.y, width: re.width, height: re.height, rotation: re.rotation,
+            zIndex: zIdx++,
+            borderThickness: pen.lineWidth,
+            borderColor: pen.lineColor,
+            fillColor: fillColor,
+            cornerRadius: radius
+          });
+        });
+
+        // Images
+        band.querySelectorAll(':scope > image').forEach(img => {
+          const re = parseReportElement(img);
+          const scaleAttr = img.getAttribute('scaleImage') || '';
+          const scaleMode = scaleAttr === 'FillFrame' ? 'stretch' : 'retain';
+          const imgExpr = img.querySelector('imageExpression');
+          let imageData = '';
+          if (imgExpr) {
+            const exprText = textOf(imgExpr);
+            // Try to extract base64 data
+            const b64Match = exprText.match(/parseBase64Binary\("([^"]+)"\)/);
+            if (b64Match) {
+              imageData = 'data:image/png;base64,' + b64Match[1];
+            }
+          }
+          elements.push({
+            id: genId(), type: 'image', uuid: uid(),
+            x: re.x, y: re.y, width: re.width, height: re.height, rotation: re.rotation,
+            zIndex: zIdx++,
+            imageData: imageData,
+            scaleMode: scaleMode
+          });
+        });
+
+        // Component elements (barcodes)
+        band.querySelectorAll(':scope > componentElement').forEach(ce => {
+          const re = parseReportElement(ce);
+          // Detect barcode type - look for barbecue, QRCode, or other barcode tags
+          let barcodeType = 'Code128';
+          let dataSource = 'static';
+          let fieldName = '';
+          let staticValue = '12345';
+          let showHumanReadable = true;
+
+          // barbecue barcodes
+          const barbecue = ce.querySelector('barbecue');
+          if (barbecue) {
+            const bcType = barbecue.getAttribute('type') || 'Code128';
+            if (bcType === 'Code39' || bcType.includes('39')) barcodeType = 'Code39';
+            else if (bcType === 'EAN13' || bcType.includes('EAN')) barcodeType = 'EAN13';
+            else barcodeType = 'Code128';
+            showHumanReadable = barbecue.getAttribute('drawText') !== 'false';
+            const codeExpr = barbecue.querySelector('codeExpression');
+            if (codeExpr) {
+              const cText = textOf(codeExpr);
+              const fm = cText.match(/\$F\{([^}]+)\}/);
+              if (fm) { dataSource = 'field'; fieldName = fm[1]; }
+              else { staticValue = cText.replace(/^"(.*)"$/, '$1'); }
+            }
+          }
+
+          // QRCode
+          const qr = ce.querySelector('QRCode');
+          if (qr) {
+            barcodeType = 'QRCode';
+            const codeExpr = qr.querySelector('codeExpression');
+            if (codeExpr) {
+              const cText = textOf(codeExpr);
+              const fm = cText.match(/\$F\{([^}]+)\}/);
+              if (fm) { dataSource = 'field'; fieldName = fm[1]; }
+              else { staticValue = cText.replace(/^"(.*)"$/, '$1'); }
+            }
+          }
+
+          // Also check for Code128, Code39, EAN128, etc. component tags
+          ['Code128', 'Code39', 'EAN13', 'EAN128', 'UPCA', 'UPCE', 'Codabar', 'PDF417', 'DataMatrix'].forEach(tag => {
+            const bcEl = ce.querySelector(tag);
+            if (bcEl) {
+              barcodeType = (tag === 'EAN128' || tag === 'Code128') ? 'Code128' :
+                            (tag === 'EAN13') ? 'EAN13' :
+                            (tag === 'Code39') ? 'Code39' : 'Code128';
+              const codeExpr = bcEl.querySelector('codeExpression');
+              if (codeExpr) {
+                const cText = textOf(codeExpr);
+                const fm = cText.match(/\$F\{([^}]+)\}/);
+                if (fm) { dataSource = 'field'; fieldName = fm[1]; }
+                else { staticValue = cText.replace(/^"(.*)"$/, '$1'); }
+              }
+            }
+          });
+
+          elements.push({
+            id: genId(), type: 'barcode', uuid: uid(),
+            x: re.x, y: re.y, width: re.width, height: re.height, rotation: re.rotation,
+            zIndex: zIdx++,
+            barcodeType, dataSource, fieldName, staticValue, showHumanReadable
+          });
+        });
+      });
+
+      // Apply to state
+      state.label = { name: labelName, width: pageW, height: pageH };
+      state.elements = elements;
+      state.selectedIds = [];
+      state.nextId = elements.length + 1;
+      state.nextZIndex = zIdx;
+      state.templateFields = templateFields;
+      state.templateQuery = templateQuery;
+      state.templateParams = templateParams;
+      state.currentTemplate = {
+        meta: { name: labelName, description: 'Imported from JRXML', icon: 'tag', labelSize: 'custom' },
+        label: deepClone(state.label),
+        elements: deepClone(elements),
+        fields: deepClone(templateFields),
+        query: templateQuery ? deepClone(templateQuery) : null,
+        parameters: deepClone(templateParams),
+        options: {}
+      };
+
+      // Register sample data for imported fields
+      templateFields.forEach(f => {
+        if (!SAMPLE_DATA[f.name]) SAMPLE_DATA[f.name] = f.sampleData || f.name;
+      });
+
+      buildFieldPalette();
+      showView('editor');
+
+      const elCount = elements.length;
+      const fieldCount = templateFields.length;
+      console.log(`JRXML import: ${elCount} elements, ${fieldCount} fields, label ${pageW}x${pageH}pt`);
+
+    } catch (err) {
+      alert('Error importing JRXML: ' + err.message);
+      console.error('JRXML import error:', err);
+    }
+  };
+  reader.readAsText(file);
+}
+
 function downloadFile(filename, content, mime) {
   const blob = new Blob([content], { type: mime });
   const a = document.createElement('a');
@@ -1527,6 +1884,45 @@ document.addEventListener('DOMContentLoaded', () => {
       loadFile.value = '';
     });
   }
+
+  // Import JRXML file
+  const importFile = document.getElementById('import-jrxml-file');
+  if (importFile) {
+    importFile.addEventListener('change', e => {
+      if (e.target.files[0]) importJRXML(e.target.files[0]);
+      importFile.value = '';
+    });
+  }
+
+  // Drag-and-drop for JRXML/JSON files
+  let dropCounter = 0;
+  const dropOverlay = document.getElementById('drop-overlay');
+  document.addEventListener('dragenter', e => {
+    e.preventDefault();
+    dropCounter++;
+    if (dropOverlay) dropOverlay.style.display = 'block';
+  });
+  document.addEventListener('dragleave', e => {
+    e.preventDefault();
+    dropCounter--;
+    if (dropCounter <= 0) { dropCounter = 0; if (dropOverlay) dropOverlay.style.display = 'none'; }
+  });
+  document.addEventListener('dragover', e => { e.preventDefault(); });
+  document.addEventListener('drop', e => {
+    e.preventDefault();
+    dropCounter = 0;
+    if (dropOverlay) dropOverlay.style.display = 'none';
+    const file = e.dataTransfer.files[0];
+    if (!file) return;
+    const name = file.name.toLowerCase();
+    if (name.endsWith('.jrxml') || name.endsWith('.xml')) {
+      importJRXML(file);
+    } else if (name.endsWith('.json')) {
+      loadDesign(file);
+    } else {
+      alert('Unsupported file type. Please drop a .jrxml or .json file.');
+    }
+  });
 
   // Field search
   const fieldSearch = document.getElementById('field-search');
