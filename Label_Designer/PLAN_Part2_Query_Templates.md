@@ -1,245 +1,339 @@
-# Part 2 Plan: Label Query Templates & SQL Generator
+# Part 2 Plan: Label Template System (Revised)
 
-## Overview
-Add a **Label Template System** to the Fishbowl Label Designer that provides pre-built label templates with auto-generated SQL queries. When a user selects a template, the designer:
-1. Pre-populates the canvas with a sensible default layout
-2. Auto-adds the correct `$F{...}` field tokens for that label type
-3. Generates the correct SQL `<queryString>` in the JRXML export
-4. Includes a parameter dropdown for runtime filtering (e.g. PO number, location group)
+## Key Design Changes
 
----
+### 1. Start in Selector/Preview Mode (not Editor)
+The app opens as a **report selector** — styled like a standard Fishbowl BI dashboard — where users:
+- Browse available label templates (built-in + saved)
+- Select a template and set parameters (PO#, Part#, etc.)
+- Preview the label with live/sample data
+- Print/Export directly
+- Optionally click "Edit Design" to enter the WYSIWYG editor
 
-## Standard Label Templates
+### 2. Fishbowl BI Dashboard Styling
+Match `Template/Core_Dashboard_Template.htm`:
+- Same brand colors (`--color-primary: #2d9cdb`, sidebar `#06162d`)
+- Same header bar, filter cards, rounded-2xl panels, Inter font
+- Same loading overlay, custom scrollbars
+- Debug console for SQL troubleshooting
 
-### Template 1: Part / Product Label
-**Use case:** General inventory labels for shelves, bins, products
-**Fields:**
-- `part_number` (part.num)
-- `part_description` (part.description)
-- `part_upc` (part.upc — for barcode)
-- `uom` (uom.code)
-- `unit_cost` (partcost.avgCost)
-- `location_name` (location.name)
-- `location_group` (locationgroup.name)
-- `qty_on_hand` (SUM(tag.qty))
-
-**Default layout:** Part number in large bold, barcode (UPC Code128), description below, qty + location at bottom
-
-**SQL:** Simple part + tag + location + partcost join
+### 3. Template Storage via `part.details`
+Follow the `WO_Capacity_Planning_Gantt_v3.htm` pattern:
+- Save templates as base64-encoded JSON in `part.details`
+- Use dummy inactive parts with naming convention `_labelTpl_TemplateName`
+- Load via `runQuery("SELECT details FROM part WHERE num = '...'"`
+- Save via `ImportRq` API with `ImportPart` type
+- Part settings: `Active=false`, `PartType="Internal Use"`, `ABCCode="N"`
 
 ---
 
-### Template 2: Part Label with Tracking (Serial/Lot)
-**Use case:** Labels for serialized or lot-tracked parts
-**Fields:** All of Template 1, plus:
-- `tracking_type` (parttracking.trackingtypeid → 'Lot'/'Serial'/'Lot & Serial')
-- `serial_number` (serialnum.serialnumber)
-- `batch_qty` (tag.qty per lot)
-- `tag_date` (tag.datetimecreated)
+## Application Flow
 
-**Default layout:** Part number + serial/lot barcode, tracking type indicator, qty
+### View 1: Template Selector (Landing Page)
 
-**SQL:** Part + tag + parttracking + serialnum joins
-**Note:** One label per serial number (serial) or per tag (lot)
+```
++----------------------------------------------------------------+
+|  [Fishbowl icon] Label Designer            [+ New Blank] [gear] |
++----------------------------------------------------------------+
+|                                                                  |
+|  BUILT-IN TEMPLATES                                              |
+|  +------------+ +------------+ +------------+ +------------+     |
+|  | [icon]     | | [icon]     | | [icon]     | | [icon]     |     |
+|  | Part Label | | Receiving  | | Shipping   | | Pick       |     |
+|  | 4"x6"      | | 4"x3"      | | 4"x6"      | | 4"x3"      |     |
+|  | Basic part | | PO receipt | | SO shipment| | Pick ticket|     |
+|  | label with | | labels     | | labels     | | labels     |     |
+|  | UPC barcode| |            | |            | |            |     |
+|  +------------+ +------------+ +------------+ +------------+     |
+|  +------------+ +------------+ +------------+ +------------+     |
+|  | Tracking   | | Work Order | | Location   | | Custom     |     |
+|  | Serial/Lot | | Finished   | | Bin Label  | | Blank      |     |
+|  +------------+ +------------+ +------------+ +------------+     |
+|                                                                  |
+|  SAVED TEMPLATES (from Fishbowl)                                 |
+|  +------------+ +------------+ +------------+                    |
+|  | My Custom  | | Warehouse  | | [+ Save    |                    |
+|  | Label v2   | | Bin Labels | |  Current]  |                    |
+|  +------------+ +------------+ +------------+                    |
+|                                                                  |
++----------------------------------------------------------------+
+```
 
----
+- Grid of template cards with icons, names, label sizes, descriptions
+- Two sections: "Built-in Templates" and "Saved Templates" (loaded from DB)
+- "New Blank" button opens editor with empty canvas
+- Clicking a template opens the Parameter/Preview view
 
-### Template 3: Multi-Tracking Label
-**Use case:** Parts with multiple tracking values (e.g. lot + serial + expiration)
-**Fields:** All of Template 2, plus:
-- `tracking_value_1` through `tracking_value_4` (for multiple tracking dimensions)
-- `expiration_date` (tracking expiration if applicable)
+### View 2: Parameter & Preview (After Template Selection)
 
-**Default layout:** Part number, multiple tracking fields stacked, barcode
+```
++----------------------------------------------------------------+
+|  [< Back] Receiving Label                [Edit Design] [Print]  |
++----------------------------------------------------------------+
+|  PARAMETERS                                                      |
+|  +-----------------------------------------------------------+  |
+|  | PO Number: [___________] [v]  Location Group: [All______] |  |
+|  | [x] Show cost  [x] Show vendor  [ ] Show barcode          |  |
+|  +-----------------------------------------------------------+  |
+|                                                                  |
+|  PREVIEW                                                         |
+|  +-------------------+                                           |
+|  |    +-----------+   |  Label: Receiving Label (4" x 3")       |
+|  |    | PO-12345  |   |  Records: 12 items                      |
+|  |    | PRT-10042 |   |  Template: Built-in                     |
+|  |    | ||||||||| |   |                                          |
+|  |    | Hex Bolt  |   |  [Print All] [Print Selected] [PDF]     |
+|  |    | Qty: 50   |   |  [Export JRXML] [Save as Template]      |
+|  |    +-----------+   |                                          |
+|  +-------------------+                                           |
+|                                                                  |
+|  DATA (from query)                                               |
+|  +-----------------------------------------------------------+  |
+|  | # | Part Number | Description      | Qty | PO     | Vendor|  |
+|  |---|-------------|------------------|-----|--------|-------|  |
+|  | 1 | PRT-10042   | Hex Bolt M8x25   | 50  | PO-123 | Acme  |  |
+|  | 2 | PRT-10043   | Washer M8        | 100 | PO-123 | Acme  |  |
+|  +-----------------------------------------------------------+  |
++----------------------------------------------------------------+
+```
 
-**SQL:** Part + parttracking with multi-row tracking join
+- **Parameter bar** with template-specific filters (dropdowns populated from DB)
+- **Live preview** of a single label rendered at actual size with real data
+- **Data table** showing all records the query returns (optional expand)
+- **Actions**: Print, PDF, JRXML Export, Save as Template
+- **"Edit Design"** button → switches to the WYSIWYG editor (View 3)
+- Show/hide field toggles let users optionally hide certain fields on the label
+- When running inside Fishbowl (runQuery available): live data from DB
+- When running standalone (no runQuery): sample data for demo
 
----
+### View 3: WYSIWYG Editor (Existing Design Tool)
 
-### Template 4: Receiving Label
-**Use case:** Print labels for items just received on a PO
-**Parameters:** PO Number or Receipt ID (user selects at print time)
-**Fields:**
-- `po_number` (po.num)
-- `part_number` (part.num)
-- `part_description` (part.description)
-- `received_qty` (receiptitem.qty)
-- `uom` (uom.code)
-- `date_received` (GREATEST(ri.dateReceived, ri.dateReconciled))
-- `vendor_name` (vendor.name)
-- `unit_cost` (ri.landedtotalcost / ri.qty)
-- `location_group` (locationgroup.name)
-
-**Default layout:** PO number header, part number + barcode, qty received, vendor, date
-
-**SQL:** receiptitem → receipt → poitem → part → po → vendor
-**Filter:** `WHERE po.num = $P{po_number}` or `WHERE r.id = $P{receipt_id}`
-**Note:** One label per receiptitem line (or qty-based: print N labels for qty N)
-
----
-
-### Template 5: Shipping Label
-**Use case:** Labels for outbound shipments
-**Parameters:** Ship Number or SO Number
-**Fields:**
-- `ship_number` (ship.num)
-- `sales_order` (so.num)
-- `customer_name` (customer.name)
-- `ship_to_address` (ship.shiptoname)
-- `part_number` (part.num)
-- `part_description` (part.description)
-- `qty_shipped` (shipitem.qtyshipped — NOT .qty!)
-- `uom` (uom.code)
-- `carrier` (carrier.name)
-- `service` (carrierservice.name)
-- `customer_po` (so.customerpo)
-
-**Default layout:** Ship-to address block at top, SO/ship number, part + qty, carrier info
-
-**SQL:** ship → shipitem → soitem → so → part → customer → carrier
-**Filter:** `WHERE ship.num = $P{ship_number}` or `WHERE so.num = $P{so_number}`
-
----
-
-### Template 6: Pick Ticket Label
-**Use case:** Labels for warehouse picks
-**Parameters:** Pick Number
-**Fields:**
-- `pick_number` (pick.num)
-- `scheduled_date` (pick.datescheduled)
-- `priority` (priority.name)
-- `part_number` (part.num)
-- `part_description` (part.description)
-- `qty_to_pick` (pickitem.qty)
-- `available_qty` (qtyonhand - qtycommitted - qtynotavailabletopick)
-- `order_type` (CASE ordertypeid: 10=PO, 20=SO, 30=WO, 40=TO)
-- `order_number` (COALESCE(so.num, po.num, wo.num, xo.num))
-- `entity_name` (customer or vendor name)
-- `location_group` (locationgroup.name)
-
-**Default layout:** Pick # header, part number + barcode, qty to pick vs available, order info
-
-**SQL:** pick → pickitem → part + order type joins
-**Filter:** `WHERE pick.num = $P{pick_number}`
+Same as current implementation but with additions:
+- "Back to Selector" button in toolbar
+- Template SQL query editor (expandable panel)
+- Parameter definitions editor
+- "Save to Fishbowl" button (writes to part.details via ImportRq)
 
 ---
 
-### Template 7: Work Order Finished Goods Label
-**Use case:** Labels for completed manufactured items
-**Parameters:** WO Number
-**Fields:**
-- `work_order_number` (wo.num)
-- `scheduled_date` (wo.datescheduled)
-- `finished_part_number` (part.num — from woitem)
-- `finished_part_description` (part.description)
-- `qty_to_produce` (woitem.qty)
-- `uom` (uom.code)
-- `bom_number` (bom.num)
-- `manufacturing_order` (mo.num)
-- `work_order_status` (wostatus.name)
-- `location_group` (locationgroup.name)
+## Template Data Model
 
-**Default layout:** WO number header, finished part + barcode, BOM reference, qty
+Each template (built-in or saved) is a JSON object:
 
-**SQL:** wo → woitem → part + moitem → mo → bom
-**Filter:** `WHERE wo.num = $P{wo_number}`
-
----
-
-### Template 8: Inventory Location / Bin Label
-**Use case:** Labels for physical bin/shelf locations showing stock
-**Parameters:** Location Group
-**Fields:**
-- `location_name` (location.name)
-- `location_group` (locationgroup.name)
-- `part_number` (part.num)
-- `part_description` (part.description)
-- `qty_at_location` (tag.qty)
-- `uom` (uom.code)
-- `unit_cost` (partcost.avgCost)
-- `total_value` (tag.qty * partcost.avgCost)
-- `reorder_point` (partreorder.reorderpoint)
-- `stock_status` (LOW STOCK / OK)
-
-**Default layout:** Location name large at top, part details, qty with stock status indicator
-
-**SQL:** tag → location → part → partcost → partreorder
-**Filter:** `WHERE lg.id = $P{location_group_id}`
-
----
-
-## Implementation Plan
-
-### Phase 1: Template Data Model
-- Define template configurations as JSON objects containing:
-  - Template name, description, default label size
-  - Field definitions (name, sql_expression, display_label, sample_data)
-  - Default element layout (positions, sizes, fonts)
-  - SQL query string with `$P{parameter}` placeholders
-  - Parameter definitions (name, type, prompt text)
-  - Table join chain documentation
-
-### Phase 2: Template Selector UI
-- Add "Templates" button to toolbar (or make it a section in the left panel)
-- Modal/panel showing template cards with:
-  - Template name and icon
-  - Brief description
-  - Preview thumbnail
-- Clicking a template:
-  - Prompts to confirm (will replace current design)
-  - Sets label size to template default
-  - Clears canvas and adds pre-positioned elements
-  - Registers template fields in the field palette
-  - Stores the SQL query with the design
-
-### Phase 3: JRXML Query Integration
-- Extend JRXML export to include `<queryString>` element:
-  ```xml
-  <queryString>
-      <![CDATA[SELECT ... FROM ... WHERE ...]]>
-  </queryString>
-  ```
-- Add `<parameter>` elements for runtime filters:
-  ```xml
-  <parameter name="po_number" class="java.lang.String">
-      <parameterDescription><![CDATA[Enter PO Number]]></parameterDescription>
-  </parameter>
-  ```
-- Ensure field names in `<field>` declarations match SQL column aliases
-
-### Phase 4: Template Customization
-- After loading a template, users can still:
-  - Move/resize/delete any element
-  - Add additional elements (static text, extra barcodes, etc.)
-  - Modify the SQL query (simple text editor for advanced users)
-  - Add/remove parameters
-- Template serves as a starting point, not a locked design
-
-### Phase 5: Print Quantity Logic
-- For receiving/shipping labels, users may want to print qty-based:
-  - "Print 1 label per line item" vs "Print N labels where N = received qty"
-- Add a "Copies per record" option in template settings
-- This maps to JasperReports' `isCountOnPage` or subreport logic
+```json
+{
+  "version": 1,
+  "meta": {
+    "name": "Receiving Label",
+    "description": "Print labels for items received on a purchase order",
+    "icon": "receive",
+    "category": "built-in",
+    "labelSize": "4x3",
+    "createdAt": "2025-01-01T00:00:00Z",
+    "updatedAt": "2025-01-01T00:00:00Z"
+  },
+  "label": {
+    "name": "Receiving Label",
+    "width": 288,
+    "height": 216
+  },
+  "elements": [
+    {
+      "id": "elem_1", "type": "fieldToken", "fieldName": "po_number",
+      "x": 10, "y": 10, "width": 268, "height": 24,
+      "fontSize": 16, "fontBold": true, "fontFamily": "SansSerif",
+      "textAlign": "left", "textColor": "#000000", "rotation": 0, "zIndex": 1
+    },
+    {
+      "id": "elem_2", "type": "barcode", "barcodeType": "Code128",
+      "dataSource": "field", "fieldName": "part_number",
+      "x": 10, "y": 40, "width": 200, "height": 60,
+      "showHumanReadable": true, "rotation": 0, "zIndex": 2
+    }
+  ],
+  "fields": [
+    { "name": "po_number",    "sqlExpr": "po.num",                 "javaClass": "java.lang.String", "label": "PO Number",     "sampleData": "PO-12345" },
+    { "name": "part_number",  "sqlExpr": "p.num",                  "javaClass": "java.lang.String", "label": "Part Number",   "sampleData": "PRT-10042" },
+    { "name": "description",  "sqlExpr": "p.description",          "javaClass": "java.lang.String", "label": "Description",   "sampleData": "Hex Bolt M8x25" },
+    { "name": "received_qty", "sqlExpr": "ri.qty",                 "javaClass": "java.lang.Double", "label": "Received Qty",  "sampleData": "50" },
+    { "name": "uom",          "sqlExpr": "COALESCE(uom.code,'EA')", "javaClass": "java.lang.String", "label": "UOM",           "sampleData": "ea" },
+    { "name": "vendor_name",  "sqlExpr": "v.name",                 "javaClass": "java.lang.String", "label": "Vendor",        "sampleData": "Acme Supply Co" },
+    { "name": "date_received","sqlExpr": "COALESCE(GREATEST(ri.dateReceived,ri.dateReconciled),ri.dateReceived)", "javaClass": "java.lang.String", "label": "Date Received", "sampleData": "2025-12-15" },
+    { "name": "unit_cost",    "sqlExpr": "ri.landedtotalcost/NULLIF(ri.qty,0)", "javaClass": "java.lang.Double", "label": "Unit Cost", "sampleData": "$4.50" },
+    { "name": "location_group","sqlExpr": "lg.name",               "javaClass": "java.lang.String", "label": "Location Group","sampleData": "Main Warehouse" }
+  ],
+  "query": {
+    "sql": "SELECT po.num AS po_number, p.num AS part_number, p.description, ri.qty AS received_qty, COALESCE(uom.code,'EA') AS uom, v.name AS vendor_name, COALESCE(GREATEST(ri.dateReceived,ri.dateReconciled),ri.dateReceived) AS date_received, ri.landedtotalcost/NULLIF(ri.qty,0) AS unit_cost, lg.name AS location_group FROM receiptitem ri JOIN receipt r ON ri.receiptid=r.id JOIN poitem ON ri.poitemid=poitem.id JOIN part p ON poitem.partid=p.id JOIN po ON poitem.poid=po.id LEFT JOIN vendor v ON po.vendorid=v.id LEFT JOIN uom ON p.uomid=uom.id LEFT JOIN locationgroup lg ON r.locationgroupid=lg.id WHERE ri.statusid>=20 AND p.typeid=10 AND po.num LIKE $P{po_number} ORDER BY p.num",
+    "notes": "One label per receiptitem line"
+  },
+  "parameters": [
+    { "name": "po_number", "javaClass": "java.lang.String", "prompt": "PO Number", "default": "%", "inputType": "text" },
+    { "name": "location_group_id", "javaClass": "java.lang.Integer", "prompt": "Location Group", "default": "", "inputType": "dropdown", "lookupQuery": "SELECT id, name FROM locationgroup WHERE activeflag=1 ORDER BY name" }
+  ],
+  "options": {
+    "toggleableFields": ["unit_cost", "vendor_name", "date_received"],
+    "copiesPerRecord": false
+  }
+}
+```
 
 ---
 
-## SQL Gotchas to Encode in Templates
+## Storage: part.details Pattern
 
-1. **ShipItem.QtyShipped** — always use `qtyshipped`, never `qty`
-2. **SoItem.UnitPrice** — for sale price calculations
-3. **part.typeid = 10** — always filter to inventory parts
-4. **receiptitem.statusid >= 20** — reconciled/received items only
-5. **pick.statusid < 40** — active picks only
-6. **LEFT JOINs** — needed for partcost, partreorder, vendor (may not exist)
-7. **COALESCE** — for nullable qty fields (qtyonhand, etc.)
-8. **GREATEST(dateReceived, dateReconciled)** — for actual receipt date
-9. **POST table** — for historical cost attribution (not current avgCost)
-10. **locationgroupid** — always scope queries to user's location group
+### Naming Convention
+Each saved template stored as an inactive part:
+- Part number: `_labelTpl_{TemplateName}` (e.g. `_labelTpl_ReceivingLabel`)
+- Description: `Label Template: Receiving Label`
+- Active: `false`
+- Part Type: `Internal Use`
+- Details: base64-encoded JSON template
+
+### Save Flow (via ImportRq API)
+```javascript
+function saveTemplateToFishbowl(template) {
+    const json = JSON.stringify(template);
+    const base64 = btoa(json);
+    const partNum = '_labelTpl_' + template.meta.name.replace(/[^a-zA-Z0-9]/g, '');
+
+    const headers = queryImportHeaders();  // Get ImportPart CSV headers
+    const fieldValues = {
+        'PartNumber': `"${partNum}"`,
+        'PartDescription': `"Label Template: ${template.meta.name}"`,
+        'PartDetails': `"${base64}"`,
+        'UOM': '"ea"',
+        'PartType': '"Internal Use"',
+        'Active': '"false"',
+        'ABCCode': '"N"',
+        // ... other required fields with defaults
+    };
+
+    // Build CSV and call ImportRq API
+    runApiRequest('ImportRq', JSON.stringify({
+        ImportRq: { Type: 'ImportPart', Rows: { Row: [headers, csvRow] } }
+    }));
+}
+```
+
+### Load Flow (via runQuery)
+```javascript
+function loadSavedTemplates() {
+    const query = `
+        SELECT num, description, details
+        FROM part
+        WHERE num LIKE '_labelTpl_%'
+        AND typeid = 30  -- Internal Use
+        ORDER BY num
+    `;
+    const results = JSON.parse(runQuery(query));
+    return results.map(row => {
+        const json = atob(row.details);
+        return JSON.parse(json);
+    });
+}
+```
+
+---
+
+## Built-in Templates (8 total)
+
+| # | Template | Default Size | Primary Fields | Parameter |
+|---|----------|-------------|----------------|-----------|
+| 1 | Part / Product Label | 4"x6" | part_number, description, UPC barcode, qty, location | Location Group |
+| 2 | Part + Serial/Lot Tracking | 4"x6" | part_number, serial/lot barcode, tracking type, qty | Location Group |
+| 3 | Multi-Tracking Label | 4"x6" | part_number, multiple tracking values, expiration | Location Group |
+| 4 | Receiving Label | 4"x3" | po_number, part_number, received_qty, vendor, date | PO Number |
+| 5 | Shipping Label | 4"x6" | ship_number, SO, customer, ship-to, carrier, qty | Ship/SO Number |
+| 6 | Pick Ticket Label | 4"x3" | pick_number, part_number, qty_to_pick, available, order | Pick Number |
+| 7 | Work Order Label | 4"x3" | wo_number, finished_part, qty, BOM, MO | WO Number |
+| 8 | Inventory Location Label | 4"x3" | location_name, part_number, qty, cost, reorder status | Location Group |
+
+---
+
+## Implementation Phases
+
+### Phase 1: Restyle as Fishbowl BI Dashboard
+- Replace current CSS with Core_Dashboard_Template styling
+- Add CSS variables (`--color-primary`, etc.)
+- Use Tailwind via CDN
+- Add header bar, loading overlay, custom scrollbars
+- Add debug console (collapsible)
+
+### Phase 2: Template Selector View (Landing Page)
+- Template card grid with built-in templates
+- Each card: icon, name, description, label size, click to select
+- "New Blank Label" card to go straight to editor
+- Section for saved templates (loaded from DB or shown as empty)
+- Fishbowl API detection: check if `runQuery` exists
+  - If yes: load saved templates from part.details
+  - If no: show "Connect to Fishbowl to access saved templates"
+
+### Phase 3: Parameter & Preview View
+- Parameter bar with template-specific inputs
+- Dropdowns populated via `lookupQuery` (when in Fishbowl)
+- Field toggle checkboxes (show/hide optional fields)
+- Live label preview using the rendering engine from the editor
+- Data table showing query results (when in Fishbowl)
+- Print/PDF/JRXML export buttons
+- "Edit Design" button to enter editor
+
+### Phase 4: Editor View Updates
+- Add "Back to Selector" button
+- Add template SQL editor (collapsible textarea in properties panel)
+- Add parameter definitions editor
+- "Save to Fishbowl" button with ImportRq integration
+- "Save Locally" button (JSON download, current behavior)
+
+### Phase 5: JRXML Export Enhancements
+- Include `<queryString>` in export
+- Include `<parameter>` elements with prompts and defaults
+- Field `class` attributes from template definitions (String, Double, etc.)
+- Ensure SQL column aliases match `<field name="...">` declarations
+
+### Phase 6: All 8 Built-in Templates
+- Define complete JSON configs for each template
+- Default element layouts (positions, sizes, fonts, barcodes)
+- Correct SQL queries extracted from research
+- Parameter definitions with lookup queries
+- Sample data for standalone preview
+
+---
+
+## SQL Gotchas Encoded in Templates
+
+1. `ShipItem.QtyShipped` — never `qty`
+2. `SoItem.UnitPrice` — for sale price
+3. `part.typeid = 10` — inventory parts only
+4. `receiptitem.statusid >= 20` — reconciled/received
+5. `pick.statusid < 40` — active picks
+6. `LEFT JOIN` for partcost, partreorder, vendor
+7. `COALESCE` for nullable qty fields
+8. `GREATEST(dateReceived, dateReconciled)` for receipt date
+9. `locationgroupid` scoping in all queries
+
+---
+
+## API Detection Pattern
+
+```javascript
+// Detect if running inside Fishbowl
+const IN_FISHBOWL = typeof runQuery === 'function';
+
+function safeRunQuery(sql) {
+    if (!IN_FISHBOWL) return null;
+    try { return JSON.parse(runQuery(sql)); }
+    catch(e) { debugLog('Query error: ' + e.message, 'error'); return null; }
+}
+```
+
+When not in Fishbowl: all features work with sample data, save/load uses JSON files only, "Save to Fishbowl" is disabled with tooltip explaining why.
 
 ---
 
 ## File References
 
+- Core styling template: `Template/Core_Dashboard_Template.htm`
+- Part.details storage example: `Manufacturing/WO_Capacity_Planning_Gantt_v3.htm` (lines 3395-3556)
 - Schema documentation: `Label_Designer/fishbowl_schema_reference.txt`
 - SQL query templates: `Label_Designer/label_query_templates.sql`
-- Label Designer app: `Label_Designer/Fishbowl_Label_Designer.htm`
+- Current Label Designer: `Label_Designer/Fishbowl_Label_Designer.htm`
