@@ -348,6 +348,40 @@ function safeRunQuery(sql) {
   try { return JSON.parse(runQuery(sql)); } catch(e) { console.error('Query error:', e); return null; }
 }
 
+// Resolve data rows for multi-label output.
+// In Fishbowl: run the template SQL query → each result row = one label.
+// Standalone: prompt for copy count → repeat sample data that many times.
+// Returns an array of row objects (key→value maps).
+function getLabelDataRows() {
+  // Try running the real query if in Fishbowl and a query is defined
+  if (IN_FISHBOWL && state.templateQuery && state.templateQuery.sql) {
+    let sql = state.templateQuery.sql;
+    // Substitute parameters with their default values
+    (state.templateParams || []).forEach(p => {
+      sql = sql.replace(new RegExp('\\$P\\{' + p.name + '\\}', 'g'), p.defaultValue || '');
+    });
+    const result = safeRunQuery(sql);
+    if (result && Array.isArray(result) && result.length > 0) return result;
+    if (result && result.rows && Array.isArray(result.rows) && result.rows.length > 0) return result.rows;
+  }
+
+  // Standalone / no query — build a sample row from SAMPLE_DATA and ask for copies
+  const copies = parseInt(prompt('Number of labels to print:', '1'), 10);
+  if (!copies || copies < 1) return [];
+  const sampleRow = {};
+  state.elements.forEach(el => {
+    if (el.type === 'fieldToken') sampleRow[el.fieldName] = SAMPLE_DATA[el.fieldName] || el.fieldName;
+    if (el.type === 'barcode' && el.dataSource === 'field') sampleRow[el.fieldName] = SAMPLE_DATA[el.fieldName] || '12345';
+  });
+  return Array(Math.min(copies, 500)).fill(sampleRow);
+}
+
+// Resolve a field value from a data row, falling back to sample data
+function resolveField(fieldName, dataRow) {
+  if (dataRow && dataRow[fieldName] != null) return String(dataRow[fieldName]);
+  return SAMPLE_DATA[fieldName] || fieldName;
+}
+
 // =============================================
 // CONFIGURATION & CONSTANTS
 // =============================================
@@ -1464,75 +1498,84 @@ function textElementXml(el) {
 // =============================================
 // PDF EXPORT
 // =============================================
+function renderElementToPDF(pdf, el, dataRow) {
+  // Render a single element onto the current PDF page using dataRow for field values
+  switch (el.type) {
+    case 'staticText':
+    case 'fieldToken': {
+      const text = el.type === 'staticText' ? (el.text || '') : resolveField(el.fieldName, dataRow);
+      if (!text) break;
+      const style = (el.fontBold ? 'bold' : '') + (el.fontItalic ? 'italic' : '');
+      const fontName = el.fontFamily === 'SansSerif' ? 'helvetica' : el.fontFamily === 'Serif' ? 'times' : 'courier';
+      pdf.setFont(fontName, style || 'normal');
+      pdf.setFontSize(el.fontSize);
+      const rgb = hexToRgbArr(el.textColor || '#000000');
+      pdf.setTextColor(rgb[0], rgb[1], rgb[2]);
+      let tx = el.x, align = 'left';
+      if (el.textAlign === 'center') { tx = el.x + el.width / 2; align = 'center'; }
+      else if (el.textAlign === 'right') { tx = el.x + el.width; align = 'right'; }
+      pdf.text(text, tx, el.y + el.fontSize, { align, maxWidth: el.width });
+      break;
+    }
+    case 'barcode': {
+      const data = el.dataSource === 'field' ? resolveField(el.fieldName, dataRow) : (el.staticValue || '12345');
+      const cvs = document.createElement('canvas');
+      bwipjs.toCanvas(cvs, { bcid: BARCODE_MAP[el.barcodeType] || 'code128', text: data, scale: 3, height: Math.max(5, Math.round(el.height / 3)), includetext: el.showHumanReadable, textxalign: 'center' });
+      pdf.addImage(cvs.toDataURL('image/png'), 'PNG', el.x, el.y, el.width, el.height);
+      break;
+    }
+    case 'line': {
+      const rgb = hexToRgbArr(el.lineColor || '#000000');
+      pdf.setDrawColor(rgb[0], rgb[1], rgb[2]);
+      pdf.setLineWidth(el.lineThickness || 1);
+      if (el.orientation === 'horizontal') pdf.line(el.x, el.y, el.x + el.width, el.y);
+      else pdf.line(el.x, el.y, el.x, el.y + el.height);
+      break;
+    }
+    case 'rectangle': {
+      const bRgb = hexToRgbArr(el.borderColor || '#000000');
+      pdf.setDrawColor(bRgb[0], bRgb[1], bRgb[2]);
+      pdf.setLineWidth(el.borderThickness || 1);
+      if (el.fillColor && el.fillColor !== 'transparent') {
+        const fRgb = hexToRgbArr(el.fillColor);
+        pdf.setFillColor(fRgb[0], fRgb[1], fRgb[2]);
+        pdf.roundedRect(el.x, el.y, el.width, el.height, el.cornerRadius || 0, el.cornerRadius || 0, 'FD');
+      } else {
+        pdf.roundedRect(el.x, el.y, el.width, el.height, el.cornerRadius || 0, el.cornerRadius || 0, 'S');
+      }
+      break;
+    }
+    case 'image': {
+      if (el.imageData) {
+        pdf.addImage(el.imageData, 'PNG', el.x, el.y, el.width, el.height);
+      }
+      break;
+    }
+  }
+}
+
 function exportPDF() {
   if (!window.jspdf) {
     alert('jsPDF library not loaded. Please check your internet connection and reload the page.');
     return;
   }
+
+  // Resolve data rows
+  const rows = getLabelDataRows();
+  if (!rows || rows.length === 0) return;
+
   try {
     const { jsPDF } = window.jspdf;
     const w = state.label.width, h = state.label.height;
-    // Pass format as [width, height] without explicit orientation to avoid dimension swapping
     const pdf = new jsPDF({ unit: 'pt', format: [w, h] });
-
     const sorted = [...state.elements].sort((a, b) => a.zIndex - b.zIndex);
-    sorted.forEach(el => {
-      try {
-        switch (el.type) {
-          case 'staticText':
-          case 'fieldToken': {
-            const text = el.type === 'staticText' ? (el.text || '') : (SAMPLE_DATA[el.fieldName] || el.fieldName || '');
-            if (!text) break;
-            const style = (el.fontBold ? 'bold' : '') + (el.fontItalic ? 'italic' : '');
-            const fontName = el.fontFamily === 'SansSerif' ? 'helvetica' : el.fontFamily === 'Serif' ? 'times' : 'courier';
-            pdf.setFont(fontName, style || 'normal');
-            pdf.setFontSize(el.fontSize);
-            const rgb = hexToRgbArr(el.textColor || '#000000');
-            pdf.setTextColor(rgb[0], rgb[1], rgb[2]);
-            let tx = el.x, align = 'left';
-            if (el.textAlign === 'center') { tx = el.x + el.width / 2; align = 'center'; }
-            else if (el.textAlign === 'right') { tx = el.x + el.width; align = 'right'; }
-            pdf.text(text, tx, el.y + el.fontSize, { align, maxWidth: el.width });
-            break;
-          }
-          case 'barcode': {
-            const data = el.dataSource === 'field' ? (SAMPLE_DATA[el.fieldName] || '12345') : (el.staticValue || '12345');
-            const cvs = document.createElement('canvas');
-            bwipjs.toCanvas(cvs, { bcid: BARCODE_MAP[el.barcodeType] || 'code128', text: data, scale: 3, height: Math.max(5, Math.round(el.height / 3)), includetext: el.showHumanReadable, textxalign: 'center' });
-            pdf.addImage(cvs.toDataURL('image/png'), 'PNG', el.x, el.y, el.width, el.height);
-            break;
-          }
-          case 'line': {
-            const rgb = hexToRgbArr(el.lineColor || '#000000');
-            pdf.setDrawColor(rgb[0], rgb[1], rgb[2]);
-            pdf.setLineWidth(el.lineThickness || 1);
-            if (el.orientation === 'horizontal') pdf.line(el.x, el.y, el.x + el.width, el.y);
-            else pdf.line(el.x, el.y, el.x, el.y + el.height);
-            break;
-          }
-          case 'rectangle': {
-            const bRgb = hexToRgbArr(el.borderColor || '#000000');
-            pdf.setDrawColor(bRgb[0], bRgb[1], bRgb[2]);
-            pdf.setLineWidth(el.borderThickness || 1);
-            if (el.fillColor && el.fillColor !== 'transparent') {
-              const fRgb = hexToRgbArr(el.fillColor);
-              pdf.setFillColor(fRgb[0], fRgb[1], fRgb[2]);
-              pdf.roundedRect(el.x, el.y, el.width, el.height, el.cornerRadius || 0, el.cornerRadius || 0, 'FD');
-            } else {
-              pdf.roundedRect(el.x, el.y, el.width, el.height, el.cornerRadius || 0, el.cornerRadius || 0, 'S');
-            }
-            break;
-          }
-          case 'image': {
-            if (el.imageData) {
-              pdf.addImage(el.imageData, 'PNG', el.x, el.y, el.width, el.height);
-            }
-            break;
-          }
-        }
-      } catch (elErr) {
-        console.warn('PDF: skipped element', el.id, el.type, elErr.message);
-      }
+
+    rows.forEach((row, pageIndex) => {
+      if (pageIndex > 0) pdf.addPage([w, h]);
+      sorted.forEach(el => {
+        try { renderElementToPDF(pdf, el, row); }
+        catch (elErr) { console.warn('PDF: skipped element', el.id, el.type, elErr.message); }
+      });
     });
 
     pdf.save((state.label.name || 'label') + '.pdf');
@@ -1858,8 +1901,8 @@ function updateSqlLint() {
 // =============================================
 // PRINT
 // =============================================
-function buildPrintElementHTML(el) {
-  // Build HTML string for a single element in print/preview mode — no DOM manipulation
+function buildPrintElementHTML(el, dataRow) {
+  // Build HTML string for a single element — uses dataRow for field values
   const e = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   let style = `position:absolute;left:${el.x}px;top:${el.y}px;width:${el.width}px;height:${el.height}px;z-index:${el.zIndex}`;
   if (el.rotation) style += `;transform:rotate(${el.rotation}deg)`;
@@ -1872,13 +1915,12 @@ function buildPrintElementHTML(el) {
     }
     case 'fieldToken': {
       const jc = el.textAlign==='center'?'center':el.textAlign==='right'?'flex-end':'flex-start';
-      const sample = SAMPLE_DATA[el.fieldName] || el.fieldName;
-      inner = `<div style="overflow:hidden;white-space:nowrap;text-overflow:ellipsis;width:100%;height:100%;display:flex;align-items:flex-start;padding:2px;font-family:${e(el.fontFamily)};font-size:${el.fontSize}px;font-weight:${el.fontBold?'bold':'normal'};font-style:${el.fontItalic?'italic':'normal'};text-align:${el.textAlign};color:${el.textColor};justify-content:${jc}">${e(sample)}</div>`;
+      const val = resolveField(el.fieldName, dataRow);
+      inner = `<div style="overflow:hidden;white-space:nowrap;text-overflow:ellipsis;width:100%;height:100%;display:flex;align-items:flex-start;padding:2px;font-family:${e(el.fontFamily)};font-size:${el.fontSize}px;font-weight:${el.fontBold?'bold':'normal'};font-style:${el.fontItalic?'italic':'normal'};text-align:${el.textAlign};color:${el.textColor};justify-content:${jc}">${e(val)}</div>`;
       break;
     }
     case 'barcode': {
-      // Barcodes need bwip-js; render to canvas, export as data URL image
-      const data = el.dataSource==='field' ? (SAMPLE_DATA[el.fieldName]||'12345') : (el.staticValue||'12345');
+      const data = el.dataSource==='field' ? resolveField(el.fieldName, dataRow) : (el.staticValue||'12345');
       try {
         const cvs = document.createElement('canvas');
         bwipjs.toCanvas(cvs, {bcid:BARCODE_MAP[el.barcodeType]||'code128',text:data,scale:3,height:Math.max(5,Math.round(el.height/3)),includetext:el.showHumanReadable,textxalign:'center'});
@@ -1912,22 +1954,29 @@ function buildPrintElementHTML(el) {
 }
 
 function doPrint() {
-  // Build print page entirely from state — no view switching, no DOM capture
+  // Resolve data — Fishbowl query or copy count prompt
+  const rows = getLabelDataRows();
+  if (!rows || rows.length === 0) return;
+
   const w = state.label.width, h = state.label.height;
   const wIn = (w / 72).toFixed(4), hIn = (h / 72).toFixed(4);
-
   const sorted = [...state.elements].sort((a,b) => a.zIndex - b.zIndex);
-  const elementsHtml = sorted.map(el => buildPrintElementHTML(el)).join('\n');
 
-  const printDoc = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Print Label</title>
+  // Build one page div per data row
+  const pages = rows.map(row => {
+    const elHtml = sorted.map(el => buildPrintElementHTML(el, row)).join('\n');
+    return `<div class="label-page"><div style="position:relative;width:${w}px;height:${h}px;background:#fff;overflow:hidden">\n${elHtml}\n</div></div>`;
+  });
+
+  const printDoc = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Print Labels</title>
 <style>
 @page{size:${wIn}in ${hIn}in;margin:0}
 *{-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important;color-adjust:exact!important;margin:0;padding:0;box-sizing:border-box}
-body{margin:0;padding:0;width:${w}px;height:${h}px;overflow:hidden}
+body{margin:0;padding:0}
+.label-page{width:${w}px;height:${h}px;overflow:hidden;page-break-after:always}
+.label-page:last-child{page-break-after:auto}
 </style></head><body>
-<div style="position:relative;width:${w}px;height:${h}px;background:#fff;overflow:hidden">
-${elementsHtml}
-</div>
+${pages.join('\n')}
 <script>window.onload=function(){setTimeout(function(){window.print();setTimeout(function(){window.close()},500)},200)}<\/script></body></html>`;
 
   const printWin = window.open('', '_blank', `width=${Math.max(400,w)},height=${Math.max(400,h)}`);
