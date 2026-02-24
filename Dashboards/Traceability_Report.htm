@@ -600,6 +600,59 @@
             margin-bottom: 8px;
         }
 
+        .trace-badge {
+            display: inline-block;
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 9px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+            margin-left: 6px;
+            vertical-align: middle;
+            background: #fef3c7;
+            color: #92400e;
+        }
+
+        .trace-summary {
+            margin-bottom: 16px;
+            padding: 12px 16px;
+            background: #fffbeb;
+            border: 1px solid #fde68a;
+            border-radius: 6px;
+            font-size: 12px;
+            color: #92400e;
+        }
+
+        .trace-summary-heading {
+            font-weight: 700;
+            margin-bottom: 6px;
+            font-size: 13px;
+        }
+
+        .trace-summary-detail {
+            margin: 3px 0;
+            color: #78350f;
+        }
+
+        .trace-summary-parts {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            margin-top: 4px;
+        }
+
+        .trace-part-chip {
+            display: inline-block;
+            padding: 2px 6px;
+            background: #fef9c3;
+            border: 1px solid #fde68a;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: 500;
+            color: #713f12;
+        }
+
         /* Modal table */
         .modal-table {
             width: 100%;
@@ -869,6 +922,7 @@
         var trackingTypes = [];     // Discovered PartTracking types
         var recallData = [];        // Recall contact list data
         var orderDetailData = [];   // Detailed order data for drill-down
+        var traceResult = null;     // WO traceability resolution results
         var customStartDate = null;
         var customEndDate = null;
         var hasSearched = false;
@@ -1725,6 +1779,7 @@
 
         /**
          * Build the associated orders tab - loads full order details with entity/address/contact info
+         * Includes WO traceability: traces through BOM to find downstream SOs and upstream POs
          */
         function buildAssociatedOrdersTab() {
             var container = document.getElementById('ordersTabContent');
@@ -1737,12 +1792,34 @@
 
             for (var i = 0; i < allData.length; i++) {
                 var row = allData[i];
-                if (row.ordertype === 'SO' && row.ordernum) soNums[row.ordernum] = true;
-                else if (row.ordertype === 'PO' && row.ordernum) poNums[row.ordernum] = true;
+                if (row.ordertype === 'SO' && row.ordernum) soNums[row.ordernum] = 'direct';
+                else if (row.ordertype === 'PO' && row.ordernum) poNums[row.ordernum] = 'direct';
                 else if (row.ordertype === 'WO' && row.ordernum) woNums[row.ordernum] = true;
             }
 
             orderDetailData = [];
+            traceResult = null;
+
+            // WO Traceability - resolve BOM and discover downstream/upstream orders
+            var woNumList = Object.keys(woNums).sort();
+            if (woNumList.length > 0) {
+                var dates = getDateRange();
+                traceResult = resolveWOTraceability(woNumList, dates);
+
+                // Merge traced SOs (mark as 'traced' if not already direct)
+                for (var ts = 0; ts < traceResult.tracedSONums.length; ts++) {
+                    if (!soNums[traceResult.tracedSONums[ts]]) {
+                        soNums[traceResult.tracedSONums[ts]] = 'traced';
+                    }
+                }
+
+                // Merge traced POs
+                for (var tp = 0; tp < traceResult.tracedPONums.length; tp++) {
+                    if (!poNums[traceResult.tracedPONums[tp]]) {
+                        poNums[traceResult.tracedPONums[tp]] = 'traced';
+                    }
+                }
+            }
 
             // Load SO details with Customer info
             var soNumList = Object.keys(soNums);
@@ -1773,6 +1850,10 @@
                     debugLog('Loading SO order details...', 'query');
                     var soResult = JSON.parse(runQuery(soQuery));
                     if (soResult) {
+                        // Mark source (direct vs traced through WO)
+                        for (var sr = 0; sr < soResult.length; sr++) {
+                            soResult[sr].source = soNums[soResult[sr].ordernum] || 'direct';
+                        }
                         orderDetailData = orderDetailData.concat(soResult);
                         debugLog('Loaded ' + soResult.length + ' SO order details', 'success');
                     }
@@ -1810,6 +1891,9 @@
                     debugLog('Loading PO order details...', 'query');
                     var poResult = JSON.parse(runQuery(poQuery));
                     if (poResult) {
+                        for (var pr = 0; pr < poResult.length; pr++) {
+                            poResult[pr].source = poNums[poResult[pr].ordernum] || 'direct';
+                        }
                         orderDetailData = orderDetailData.concat(poResult);
                         debugLog('Loaded ' + poResult.length + ' PO order details', 'success');
                     }
@@ -1818,19 +1902,162 @@
                 }
             }
 
-            // WO entries (production only, no customer/vendor)
-            var woNumList = Object.keys(woNums).sort();
-
             renderOrderDetails(container, woNumList);
         }
 
         /**
-         * Render order detail cards grouped by customer/vendor
+         * Resolve WO traceability chain via BOM structure.
+         * Traces finished goods downstream to SOs/Customers and raw materials upstream to POs/Vendors.
+         */
+        function resolveWOTraceability(woNumList, dates) {
+            var result = {
+                bomParts: [],
+                finishedGoodNums: [],
+                rawMaterialNums: [],
+                tracedSONums: [],
+                tracedPONums: []
+            };
+
+            if (woNumList.length === 0) return result;
+
+            var woInClause = woNumList.map(function(n) { return "'" + escapeSQL(n) + "'"; }).join(', ');
+
+            // Step 1: BOM resolution - find finished goods and raw materials for these WOs
+            try {
+                var bomQuery =
+                    "SELECT DISTINCT " +
+                    "    wo.Num AS wonum, " +
+                    "    p.Num AS partnum, " +
+                    "    p.Description AS partdesc, " +
+                    "    bi.TypeId AS bomitemtypeid " +
+                    "FROM Wo wo " +
+                    "INNER JOIN MoItem mi ON wo.MoItemId = mi.Id " +
+                    "INNER JOIN BomItem bi ON bi.BomId = mi.BomId " +
+                    "INNER JOIN Part p ON bi.PartId = p.Id " +
+                    "WHERE wo.Num IN (" + woInClause + ")";
+
+                debugLog('Resolving WO BOM structure...', 'query');
+                var bomResult = JSON.parse(runQuery(bomQuery));
+                if (bomResult) {
+                    result.bomParts = bomResult;
+                    debugLog('Found ' + bomResult.length + ' BOM parts across ' + woNumList.length + ' WOs', 'success');
+                }
+            } catch (e) {
+                debugLog('Error resolving WO BOM: ' + e.message, 'error');
+                return result;
+            }
+
+            // Separate finished goods (TypeId=10) and raw materials (TypeId=20)
+            var fgParts = {};
+            var rmParts = {};
+            for (var i = 0; i < result.bomParts.length; i++) {
+                var bp = result.bomParts[i];
+                if (String(bp.bomitemtypeid) === '10') {
+                    fgParts[bp.partnum] = true;
+                } else if (String(bp.bomitemtypeid) === '20') {
+                    rmParts[bp.partnum] = true;
+                }
+            }
+            result.finishedGoodNums = Object.keys(fgParts);
+            result.rawMaterialNums = Object.keys(rmParts);
+
+            debugLog('BOM: ' + result.finishedGoodNums.length + ' finished goods, ' + result.rawMaterialNums.length + ' raw materials', 'info');
+
+            // Step 2: Forward trace - find SOs for finished goods (shipped to customers)
+            if (result.finishedGoodNums.length > 0) {
+                try {
+                    var fgInClause = result.finishedGoodNums.map(function(n) { return "'" + escapeSQL(n) + "'"; }).join(', ');
+                    var soTraceQuery =
+                        "SELECT DISTINCT so.Num AS ordernum " +
+                        "FROM SoItem soi " +
+                        "INNER JOIN So so ON soi.SoId = so.Id " +
+                        "INNER JOIN Part p ON soi.ProductId = p.Id " +
+                        "WHERE p.Num IN (" + fgInClause + ") " +
+                        "AND so.DateCreated BETWEEN '" + dates.start + "' AND '" + dates.end + "'";
+
+                    debugLog('Forward trace: finding SOs for finished goods...', 'query');
+                    var soTraceResult = JSON.parse(runQuery(soTraceQuery));
+                    if (soTraceResult) {
+                        result.tracedSONums = soTraceResult.map(function(r) { return r.ordernum; });
+                        debugLog('Forward trace found ' + result.tracedSONums.length + ' SOs via WO finished goods', 'success');
+                    }
+                } catch (e) {
+                    debugLog('Error in forward trace (SO): ' + e.message, 'error');
+                }
+            }
+
+            // Step 3: Backward trace - find POs for raw materials (sourced from vendors)
+            if (result.rawMaterialNums.length > 0) {
+                try {
+                    var rmInClause = result.rawMaterialNums.map(function(n) { return "'" + escapeSQL(n) + "'"; }).join(', ');
+                    var poTraceQuery =
+                        "SELECT DISTINCT po.Num AS ordernum " +
+                        "FROM PoItem poi " +
+                        "INNER JOIN Po po ON poi.PoId = po.Id " +
+                        "INNER JOIN Part p ON poi.PartId = p.Id " +
+                        "WHERE p.Num IN (" + rmInClause + ") " +
+                        "AND po.DateCreated BETWEEN '" + dates.start + "' AND '" + dates.end + "'";
+
+                    debugLog('Backward trace: finding POs for raw materials...', 'query');
+                    var poTraceResult = JSON.parse(runQuery(poTraceQuery));
+                    if (poTraceResult) {
+                        result.tracedPONums = poTraceResult.map(function(r) { return r.ordernum; });
+                        debugLog('Backward trace found ' + result.tracedPONums.length + ' POs via WO raw materials', 'success');
+                    }
+                } catch (e) {
+                    debugLog('Error in backward trace (PO): ' + e.message, 'error');
+                }
+            }
+
+            return result;
+        }
+
+        /**
+         * Render order detail cards grouped by customer/vendor, with BOM trace summary
          */
         function renderOrderDetails(container, woNumList) {
             if (orderDetailData.length === 0 && woNumList.length === 0) {
                 container.innerHTML = '<p style="color: #94a3b8; text-align: center; padding: 20px;">No orders found in the current search results.</p>';
                 return;
+            }
+
+            var html = '';
+
+            // BOM Traceability summary (if WOs were resolved)
+            if (traceResult && traceResult.bomParts.length > 0) {
+                html += '<div class="trace-summary">';
+                html += '<div class="trace-summary-heading">WO Traceability Chain</div>';
+
+                if (traceResult.finishedGoodNums.length > 0) {
+                    html += '<div class="trace-summary-detail">Finished goods (' + traceResult.finishedGoodNums.length + '):</div>';
+                    html += '<div class="trace-summary-parts">';
+                    for (var fg = 0; fg < traceResult.finishedGoodNums.length; fg++) {
+                        html += '<span class="trace-part-chip">' + escapeHTML(traceResult.finishedGoodNums[fg]) + '</span>';
+                    }
+                    html += '</div>';
+                }
+
+                if (traceResult.rawMaterialNums.length > 0) {
+                    html += '<div class="trace-summary-detail" style="margin-top: 6px;">Raw materials (' + traceResult.rawMaterialNums.length + '):</div>';
+                    html += '<div class="trace-summary-parts">';
+                    for (var rm = 0; rm < traceResult.rawMaterialNums.length; rm++) {
+                        html += '<span class="trace-part-chip">' + escapeHTML(traceResult.rawMaterialNums[rm]) + '</span>';
+                    }
+                    html += '</div>';
+                }
+
+                var tracedCounts = [];
+                if (traceResult.tracedSONums.length > 0) {
+                    tracedCounts.push(traceResult.tracedSONums.length + ' SOs traced via finished goods');
+                }
+                if (traceResult.tracedPONums.length > 0) {
+                    tracedCounts.push(traceResult.tracedPONums.length + ' POs traced via raw materials');
+                }
+                if (tracedCounts.length > 0) {
+                    html += '<div class="trace-summary-detail" style="margin-top: 6px;">Discovered: ' + tracedCounts.join(', ') + '</div>';
+                }
+
+                html += '</div>';
             }
 
             // Group SO/PO records by entity
@@ -1860,11 +2087,10 @@
                 entityGroups[key].orders.push({
                     ordernum: row.ordernum,
                     ordertype: row.ordertype,
-                    ordervalue: row.ordervalue
+                    ordervalue: row.ordervalue,
+                    source: row.source || 'direct'
                 });
             }
-
-            var html = '';
 
             // Render entity cards
             for (var e = 0; e < entityOrder.length; e++) {
@@ -1904,7 +2130,7 @@
 
                 // Orders table
                 html += '<table class="modal-table">';
-                html += '<thead><tr><th>Order #</th><th style="text-align: right;">Order Value</th></tr></thead>';
+                html += '<thead><tr><th>Order #</th><th>Source</th><th style="text-align: right;">Order Value</th></tr></thead>';
                 html += '<tbody>';
 
                 for (var o = 0; o < entity.orders.length; o++) {
@@ -1913,6 +2139,9 @@
                     var orderLabel = order.ordertype + ' ' + order.ordernum;
                     var valueNum = parseFloat(order.ordervalue || 0);
                     var valueStr = valueNum ? '$' + formatNumber(valueNum, 2) : '-';
+                    var sourceLabel = order.source === 'traced'
+                        ? '<span class="trace-badge">via WO</span>'
+                        : 'Direct';
 
                     html += '<tr>';
                     html += '<td><a href="#" class="order-link" onclick="event.preventDefault(); ';
@@ -1920,6 +2149,7 @@
                         html += 'if(typeof openModule===\'function\') openModule(\'' + moduleName + '\', \'' + escapeSQL(order.ordernum) + '\');';
                     }
                     html += ' return false;">' + escapeHTML(orderLabel) + '</a></td>';
+                    html += '<td>' + sourceLabel + '</td>';
                     html += '<td style="text-align: right; font-weight: 600;">' + valueStr + '</td>';
                     html += '</tr>';
                 }
@@ -2104,7 +2334,7 @@
             }
 
             try {
-                var csv = 'Entity Type,Entity Name,Address,City,State,Zip,Contact Name,Phone,Email,Order Type,Order #,Order Value\n';
+                var csv = 'Entity Type,Entity Name,Address,City,State,Zip,Contact Name,Phone,Email,Order Type,Order #,Order Value,Source\n';
                 var count = 0;
 
                 for (var i = 0; i < orderDetailData.length; i++) {
@@ -2121,7 +2351,8 @@
                         row.email || '',
                         row.ordertype || '',
                         row.ordernum || '',
-                        row.ordervalue || ''
+                        row.ordervalue || '',
+                        row.source === 'traced' ? 'Traced via WO' : 'Direct'
                     ];
 
                     csv += fields.map(function(f) {
