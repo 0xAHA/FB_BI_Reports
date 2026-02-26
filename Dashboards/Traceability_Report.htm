@@ -352,6 +352,25 @@
             white-space: nowrap;
         }
 
+        /* Expanded row indicator (WO smart expansion) */
+        .row-expanded {
+            border-left: 3px solid #a78bfa;
+        }
+
+        .expanded-badge {
+            display: inline-block;
+            padding: 1px 5px;
+            border-radius: 3px;
+            font-size: 9px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+            background: #ede9fe;
+            color: #6d28d9;
+            margin-left: 4px;
+            vertical-align: middle;
+        }
+
         /* Filter Info */
         .filter-info {
             font-size: 11px;
@@ -769,7 +788,7 @@
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
                 </svg>
                 <input type="text" id="searchInput" class="search-input"
-                    placeholder="Search part number, description, order number, tracking info (serial, lot, batch)..."
+                    placeholder="Search part number, serial/lot/batch, order number (SO/PO/WO), or description..."
                     onkeydown="if(event.key==='Enter') executeSearch()">
             </div>
             <button class="btn btn-primary" style="padding: 8px 16px; font-size: 13px;" onclick="executeSearch()">Search</button>
@@ -806,6 +825,7 @@
             <div class="filter-group">
                 <label>Movement Type</label>
                 <select id="movementTypeFilter" onchange="executeSearch()">
+                    <option value="traceability" selected>Traceability (Receive, Ship, Build, Consume)</option>
                     <option value="%">All Types</option>
                     <option value="10">Receive</option>
                     <option value="20">Ship</option>
@@ -847,8 +867,8 @@
             <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
             </svg>
-            <h3>Enter a search term to view traceability data</h3>
-            <p>Search by part number, description, order number, or tracking info (serial, lot, batch number)</p>
+            <h3>Enter a search term to trace inventory movements</h3>
+            <p>Search by part number, serial/lot/batch, or order number &mdash; WO results auto-expand to show the full chain (raw materials in, finished goods out)</p>
         </div>
         <table class="tile-table" id="resultsTable" style="display: none;">
             <thead id="tableHead">
@@ -1141,7 +1161,7 @@
          */
         function clearAllFilters() {
             document.getElementById('dateRangeFilter').value = 'thisFY';
-            document.getElementById('movementTypeFilter').value = '%';
+            document.getElementById('movementTypeFilter').value = 'traceability';
             document.getElementById('locationGroupFilter').value = '%';
             document.getElementById('orderTypeFilter').value = '%';
             document.getElementById('searchInput').value = '';
@@ -1218,8 +1238,23 @@
             var filterInfo = document.getElementById('filterInfo');
             if (!filterInfo) return;
 
+            var parts = [];
+
+            // Count expanded rows
+            var expandedCount = 0;
+            for (var i = 0; i < allData.length; i++) {
+                if (allData[i]._source === 'expanded') expandedCount++;
+            }
+            if (expandedCount > 0) {
+                parts.push(expandedCount + ' added via WO expansion');
+            }
+
             if (allData.length !== filteredData.length) {
-                filterInfo.textContent = 'Showing ' + filteredData.length + ' of ' + allData.length + ' movements';
+                parts.unshift('Showing ' + filteredData.length + ' of ' + allData.length + ' movements');
+            }
+
+            if (parts.length > 0) {
+                filterInfo.textContent = parts.join(' | ');
                 filterInfo.style.display = 'inline-block';
             } else {
                 filterInfo.style.display = 'none';
@@ -1335,6 +1370,12 @@
                 var row = filteredData[i];
                 var tr = document.createElement('tr');
 
+                // Mark expanded rows with visual indicator
+                if (row._source === 'expanded') {
+                    tr.classList.add('row-expanded');
+                    tr.title = 'Added via WO smart expansion (related to WO ' + (row.ordernum || '') + ')';
+                }
+
                 for (var j = 0; j < columns.length; j++) {
                     var col = columns[j];
                     var td = createCellContent(row, col.key);
@@ -1437,7 +1478,14 @@
                         };
                     })(orderType, orderNum);
                     td.appendChild(orderLink);
-                    td.title = orderType + ' ' + orderNum;
+                    // Show badge for WO-expanded rows
+                    if (row._source === 'expanded') {
+                        var expBadge = document.createElement('span');
+                        expBadge.className = 'expanded-badge';
+                        expBadge.textContent = 'via WO';
+                        td.appendChild(expBadge);
+                    }
+                    td.title = orderType + ' ' + orderNum + (row._source === 'expanded' ? ' (expanded via WO)' : '');
                 }
 
             } else if (columnKey === 'entityname') {
@@ -1564,6 +1612,131 @@
         }
 
         /**
+         * WO Smart Expansion: Given initial search results, find any WO numbers,
+         * then pull ALL movements (types 10/20/40/50) for those WOs to show the
+         * complete picture of what went in (Consume/Receive) and came out (Build/Ship).
+         * Merges new rows into results, marking expanded rows with _source = 'expanded'.
+         */
+        function expandViaWorkOrders(initialResults, dates, dynamicTrackingCols, lgCondition) {
+            // Mark all initial results as direct matches
+            for (var i = 0; i < initialResults.length; i++) {
+                initialResults[i]._source = 'direct';
+            }
+
+            // Collect WO numbers from initial results
+            var woNums = {};
+            for (var j = 0; j < initialResults.length; j++) {
+                var row = initialResults[j];
+                if (row.ordertype === 'WO' && row.ordernum) {
+                    woNums[row.ordernum] = true;
+                }
+            }
+
+            var woNumList = Object.keys(woNums);
+            if (woNumList.length === 0) {
+                debugLog('No WO numbers found in results, skipping expansion', 'info');
+                return initialResults;
+            }
+
+            debugLog('WO Smart Expansion: expanding ' + woNumList.length + ' work orders: ' + woNumList.join(', '), 'info');
+
+            // Build a set of existing InventoryLog IDs to avoid duplicates
+            var existingIds = {};
+            for (var k = 0; k < initialResults.length; k++) {
+                if (initialResults[k].ilid) {
+                    existingIds[initialResults[k].ilid] = true;
+                }
+            }
+
+            try {
+                var woInClause = woNumList.map(function(n) { return "'" + escapeSQL(n) + "'"; }).join(', ');
+
+                var expandQuery =
+                    "SELECT " +
+                    "    il.Id AS ilid, " +
+                    "    il.DateCreated AS datecreated, " +
+                    "    il.ChangeQty AS qty, " +
+                    "    ilt.Name AS movementtypename, " +
+                    "    il.TypeId AS movementtypeid, " +
+                    "    p.Num AS partnum, " +
+                    "    p.Description AS partdesc, " +
+                    "    u.Code AS uom, " +
+                    "    lg.Name AS locationgroup, " +
+                    "    CASE " +
+                    "        WHEN il.TableId = 1555030112 THEN 'SO' " +
+                    "        WHEN il.TableId = 1259138490 THEN 'PO' " +
+                    "        WHEN il.TableId IN (-1515431424, -355941248) THEN 'WO' " +
+                    "        ELSE '' " +
+                    "    END AS ordertype, " +
+                    "    COALESCE(so_num.Num, po_num.Num, wo_num.Num, '') AS ordernum, " +
+                    "    COALESCE(cust.Name, vend.Name, '') AS entityname" +
+                    dynamicTrackingCols + " " +
+                    "FROM InventoryLog il " +
+                    "INNER JOIN Part p ON il.PartId = p.Id " +
+                    "LEFT JOIN InventoryLogType ilt ON il.TypeId = ilt.Id " +
+                    "LEFT JOIN Uom u ON p.UomId = u.Id " +
+                    "LEFT JOIN LocationGroup lg ON il.LocationGroupId = lg.Id " +
+                    "LEFT JOIN SoItem soi ON il.TableId = 1555030112 AND il.RecordId = soi.Id " +
+                    "LEFT JOIN So so_num ON soi.SoId = so_num.Id " +
+                    "LEFT JOIN Customer cust ON so_num.CustomerId = cust.Id " +
+                    "LEFT JOIN PoItem poi ON il.TableId = 1259138490 AND il.RecordId = poi.Id " +
+                    "LEFT JOIN Po po_num ON poi.PoId = po_num.Id " +
+                    "LEFT JOIN Vendor vend ON po_num.VendorId = vend.Id " +
+                    "LEFT JOIN WoItem woi ON il.TableId IN (-1515431424, -355941248) AND il.RecordId = woi.Id " +
+                    "LEFT JOIN Wo wo_num ON woi.WoId = wo_num.Id " +
+                    "LEFT JOIN Tag tag ON tag.Num = il.BegTagNum " +
+                    "LEFT JOIN PartToTracking ptt ON p.Id = ptt.PartId " +
+                    "LEFT JOIN PartTracking pt ON ptt.PartTrackingId = pt.Id " +
+                    "LEFT JOIN TrackingText ttext ON tag.Id = ttext.TagId AND pt.Id = ttext.PartTrackingId " +
+                    "LEFT JOIN TrackingInteger tint ON tag.Id = tint.TagId AND pt.Id = tint.PartTrackingId " +
+                    "LEFT JOIN TrackingDecimal tdec ON tag.Id = tdec.TagId AND pt.Id = tdec.PartTrackingId " +
+                    "LEFT JOIN TrackingDate tdate ON tag.Id = tdate.TagId AND pt.Id = tdate.PartTrackingId " +
+                    "LEFT JOIN Serial ser ON tag.Id = ser.TagId " +
+                    "LEFT JOIN SerialNum sn ON ser.Id = sn.SerialId AND pt.Id = sn.PartTrackingId " +
+                    "WHERE " +
+                    "    p.TypeId = 10 " +
+                    "    AND il.TypeId IN (10, 20, 40, 50) " +
+                    "    AND il.DateCreated BETWEEN '" + dates.start + "' AND '" + dates.end + "' " +
+                    "    AND wo_num.Num IN (" + woInClause + ") " +
+                    lgCondition +
+                    " GROUP BY il.Id " +
+                    "ORDER BY il.DateCreated DESC";
+
+                debugLog('Executing WO expansion query...', 'query');
+                var expandResult = runQuery(expandQuery);
+                if (!expandResult) {
+                    debugLog('WO expansion query returned null', 'warning');
+                    return initialResults;
+                }
+
+                var expandedRows = JSON.parse(expandResult);
+                if (!expandedRows || expandedRows.length === 0) {
+                    debugLog('WO expansion returned 0 additional rows', 'info');
+                    return initialResults;
+                }
+
+                // Merge, skipping duplicates
+                var addedCount = 0;
+                for (var m = 0; m < expandedRows.length; m++) {
+                    var expRow = expandedRows[m];
+                    if (!existingIds[expRow.ilid]) {
+                        expRow._source = 'expanded';
+                        initialResults.push(expRow);
+                        existingIds[expRow.ilid] = true;
+                        addedCount++;
+                    }
+                }
+
+                debugLog('WO Smart Expansion: added ' + addedCount + ' related movements (from ' + expandedRows.length + ' total WO movements)', 'success');
+
+            } catch (e) {
+                debugLog('Error in WO expansion: ' + e.message, 'error');
+            }
+
+            return initialResults;
+        }
+
+        /**
          * Execute the main search query
          */
         function executeSearch() {
@@ -1605,7 +1778,9 @@
                 // Movement type filter
                 var movementTypeVal = document.getElementById('movementTypeFilter').value;
                 var movementTypeCondition = '';
-                if (movementTypeVal !== '%') {
+                if (movementTypeVal === 'traceability') {
+                    movementTypeCondition = " AND il.TypeId IN (10, 20, 40, 50)";
+                } else if (movementTypeVal !== '%') {
                     movementTypeCondition = " AND il.TypeId = " + parseInt(movementTypeVal);
                 }
 
@@ -1633,6 +1808,7 @@
 
                 var query =
                     "SELECT " +
+                    "    il.Id AS ilid, " +
                     "    il.DateCreated AS datecreated, " +
                     "    il.ChangeQty AS qty, " +
                     "    ilt.Name AS movementtypename, " +
@@ -1704,6 +1880,12 @@
 
                 debugLog('Parsed ' + result.length + ' records', 'success');
 
+                // WO Smart Expansion: if traceability mode, find WO numbers in results
+                // and pull in all related movements for those WOs
+                if (movementTypeVal === 'traceability') {
+                    result = expandViaWorkOrders(result, dates, dynamicTrackingCols, lgCondition);
+                }
+
                 allData = result;
                 filteredData = result.slice();
                 hasSearched = true;
@@ -1715,8 +1897,9 @@
                 // Show associated orders button
                 document.getElementById('btnAssociatedOrders').style.display = result.length > 0 ? 'inline-block' : 'none';
 
-                // Update KPIs
+                // Update KPIs and filter info (shows expansion count)
                 updateKPIs();
+                updateFilterInfo();
 
                 // Update timestamp
                 document.getElementById('lastUpdated').textContent = moment().format('MMM D, YYYY h:mm A');
