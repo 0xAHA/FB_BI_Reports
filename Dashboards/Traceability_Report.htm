@@ -2030,6 +2030,165 @@
         }
 
         /**
+         * Tracking Value Expansion.
+         * Given the initial results, collect all distinct tracking values (serial, lot, etc.)
+         * and query for ALL movements sharing those tracking values — without date restriction.
+         * This ensures the complete lifecycle of each tracking value is shown,
+         * even if the Build/Receive happened outside the selected date range.
+         */
+        function expandViaTracking(initialResults, dynamicTrackingCols, lgCondition) {
+            // Collect unique tracking values from initial results
+            var trackingSearches = []; // { trackingType, values[] }
+
+            for (var t = 0; t < trackingTypes.length; t++) {
+                var tt = trackingTypes[t];
+                var tkey = 'tracking_' + tt.id;
+                var uniqueVals = {};
+
+                for (var i = 0; i < initialResults.length; i++) {
+                    var val = initialResults[i][tkey];
+                    if (val) {
+                        var parts = val.split(', ');
+                        for (var p = 0; p < parts.length; p++) {
+                            var v = parts[p].trim();
+                            if (v) uniqueVals[v] = true;
+                        }
+                    }
+                }
+
+                var valList = Object.keys(uniqueVals);
+                if (valList.length > 0 && valList.length <= 50) {
+                    trackingSearches.push({ trackingType: tt, values: valList });
+                }
+            }
+
+            if (trackingSearches.length === 0) {
+                debugLog('Tracking expansion: no tracking values found in results', 'info');
+                return initialResults;
+            }
+
+            debugLog('Tracking expansion: tracing ' + trackingSearches.length + ' tracking type(s)...', 'info');
+
+            // Build WHERE conditions for each tracking type
+            var conditions = [];
+            for (var s = 0; s < trackingSearches.length; s++) {
+                var search = trackingSearches[s];
+                var typeId = parseInt(search.trackingType.typeid) || 0;
+                var ptId = search.trackingType.id;
+                var inClause = search.values.map(function(v) { return "'" + escapeSQL(v) + "'"; }).join(', ');
+
+                if (typeId === 40) {
+                    // Serial number
+                    conditions.push("tisn.SerialNum IN (" + inClause + ")");
+                } else if (typeId === 20 || typeId === 30) {
+                    // Date
+                    conditions.push("(ti.PartTrackingId = " + ptId + " AND SUBSTRING(ti.InfoDate FROM 1 FOR 10) IN (" + inClause + "))");
+                } else if (typeId === 50 || typeId === 60) {
+                    // Decimal
+                    conditions.push("(ti.PartTrackingId = " + ptId + " AND CAST(ti.InfoDouble AS CHAR) IN (" + inClause + "))");
+                } else if (typeId === 70 || typeId === 80) {
+                    // Integer
+                    conditions.push("(ti.PartTrackingId = " + ptId + " AND CAST(ti.InfoInteger AS CHAR) IN (" + inClause + "))");
+                } else {
+                    // Text (lot number, etc.)
+                    conditions.push("(ti.PartTrackingId = " + ptId + " AND ti.Info IN (" + inClause + "))");
+                }
+            }
+
+            if (conditions.length === 0) return initialResults;
+
+            // Build existing ID set to avoid duplicates
+            var existingIds = {};
+            for (var k = 0; k < initialResults.length; k++) {
+                if (initialResults[k].ilid) existingIds[initialResults[k].ilid] = true;
+            }
+
+            try {
+                // Query ALL movements with matching tracking values — NO date restriction
+                // This finds the complete lifecycle (build, ship, receive, consume) regardless of when it happened
+                var traceQuery =
+                    "SELECT " +
+                    "    il.Id AS ilid, " +
+                    "    il.TableId AS tableid, " +
+                    "    il.RecordId AS recordid, " +
+                    "    il.EventDate AS datecreated, " +
+                    "    il.ChangeQty AS qty, " +
+                    "    ilt.Name AS movementtypename, " +
+                    "    il.TypeId AS movementtypeid, " +
+                    "    p.Num AS partnum, " +
+                    "    p.Description AS partdesc, " +
+                    "    u.Code AS uom, " +
+                    "    lg.Name AS locationgroup, " +
+                    "    CASE " +
+                    "        WHEN il.TableId = 1555030112 THEN 'SO' " +
+                    "        WHEN il.TableId = 1259138490 THEN 'PO' " +
+                    "        WHEN il.TableId IN (-1515431424, -355941248) THEN 'WO' " +
+                    "        ELSE '' " +
+                    "    END AS ordertype, " +
+                    "    COALESCE(so_num.Num, po_num.Num, wo_num.Num, '') AS ordernum, " +
+                    "    COALESCE(cust.Name, vend.Name, '') AS entityname, " +
+                    "    COALESCE(il.Info, '') AS ilinfo" +
+                    dynamicTrackingCols + " " +
+                    "FROM InventoryLog il " +
+                    "INNER JOIN Part p ON il.PartId = p.Id " +
+                    "LEFT JOIN InventoryLogType ilt ON il.TypeId = ilt.Id " +
+                    "LEFT JOIN Uom u ON p.UomId = u.Id " +
+                    "LEFT JOIN LocationGroup lg ON il.LocationGroupId = lg.Id " +
+                    "LEFT JOIN ShipItem shi ON il.TableId = 1555030112 AND il.RecordId = shi.Id " +
+                    "LEFT JOIN SoItem soi ON shi.SoItemId = soi.Id " +
+                    "LEFT JOIN So so_num ON soi.SoId = so_num.Id " +
+                    "LEFT JOIN Customer cust ON so_num.CustomerId = cust.Id " +
+                    "LEFT JOIN PoItem poi ON il.TableId = 1259138490 AND il.RecordId = poi.Id " +
+                    "LEFT JOIN Po po_num ON poi.PoId = po_num.Id " +
+                    "LEFT JOIN Vendor vend ON po_num.VendorId = vend.Id " +
+                    "LEFT JOIN WoItem woi ON il.TableId IN (-1515431424, -355941248) AND il.RecordId = woi.Id " +
+                    "LEFT JOIN Wo wo_num ON woi.WoId = wo_num.Id " +
+                    "LEFT JOIN TiInventoryLog ti ON il.Id = ti.InventoryLogId " +
+                    "LEFT JOIN TiInventoryLogSn tisn ON ti.Id = tisn.TiInventoryLogId " +
+                    "WHERE " +
+                    "    p.TypeId = 10 " +
+                    "    AND il.TypeId IN (10, 20, 50) " +
+                    "    AND (" + conditions.join(" OR ") + ") " +
+                    lgCondition +
+                    " GROUP BY il.Id " +
+                    "ORDER BY il.EventDate ASC " +
+                    "LIMIT 500";
+
+                debugLog('Tracking expansion query...', 'query');
+                var traceResult = runQuery(traceQuery);
+                if (!traceResult) {
+                    debugLog('Tracking expansion query returned null', 'warning');
+                    return initialResults;
+                }
+
+                var tracedRows = JSON.parse(traceResult);
+                if (!tracedRows || tracedRows.length === 0) {
+                    debugLog('Tracking expansion: 0 additional movements found', 'info');
+                    return initialResults;
+                }
+
+                // Merge, skipping duplicates
+                var addedCount = 0;
+                for (var m = 0; m < tracedRows.length; m++) {
+                    var row = tracedRows[m];
+                    if (!existingIds[row.ilid]) {
+                        row._source = 'traced';
+                        initialResults.push(row);
+                        existingIds[row.ilid] = true;
+                        addedCount++;
+                    }
+                }
+
+                debugLog('Tracking expansion: added ' + addedCount + ' movements (from ' + tracedRows.length + ' total)', 'success');
+
+            } catch (e) {
+                debugLog('Error in tracking expansion: ' + e.message, 'error');
+            }
+
+            return initialResults;
+        }
+
+        /**
          * WO Smart Expansion using BOM validation.
          * 1. Collect WO numbers from initial results
          * 2. Validate via BOM: verify the matched part is actually on each WO's BOM
@@ -2040,9 +2199,11 @@
          * This avoids the unreliable RecordId→WoItem.Id join entirely.
          */
         function expandViaWorkOrders(initialResults, dates, dynamicTrackingCols, lgCondition) {
-            // Mark all initial results as direct matches
+            // Mark initial results as direct matches (preserve existing _source tags)
             for (var i = 0; i < initialResults.length; i++) {
-                initialResults[i]._source = 'direct';
+                if (!initialResults[i]._source) {
+                    initialResults[i]._source = 'direct';
+                }
             }
 
             // Collect WO numbers and their associated parts from initial results
@@ -2409,6 +2570,14 @@
                 // WO Smart Expansion: if traceability mode, find WO numbers in results
                 // and pull in all related movements for those WOs
                 if (movementTypeVal === 'traceability') {
+                    // Step 1: Tracking expansion — find ALL movements sharing
+                    // the same tracking values (serial/lot/etc.) regardless of date.
+                    // This ensures e.g. searching a serial finds both the Ship AND the Build.
+                    result = expandViaTracking(result, dynamicTrackingCols, lgCondition);
+
+                    // Step 2: WO expansion — for any WOs now in the results
+                    // (including those added by tracking expansion), pull in
+                    // BOM chain movements (raw material consumes, etc.)
                     result = expandViaWorkOrders(result, dates, dynamicTrackingCols, lgCondition);
                 }
 
