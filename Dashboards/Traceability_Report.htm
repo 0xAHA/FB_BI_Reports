@@ -1538,10 +1538,53 @@
                     else others.push(woMovements[m]);
                 }
 
+                // Helper: extract tracking value filter from movement rows.
+                // Returns an SQL EXISTS clause that narrows results to matching tracking values,
+                // or empty string if no tracking values are available.
+                function buildTrackingFilter(movements) {
+                    var trackConds = [];
+                    for (var tt = 0; tt < trackingTypes.length; tt++) {
+                        var ttype = trackingTypes[tt];
+                        var tkey = 'tracking_' + ttype.id;
+                        var typeId = parseInt(ttype.typeid) || 0;
+                        var vals = {};
+                        for (var mi = 0; mi < movements.length; mi++) {
+                            var tv = movements[mi][tkey];
+                            if (tv) {
+                                var tvParts = tv.split(', ');
+                                for (var tp = 0; tp < tvParts.length; tp++) {
+                                    var tvVal = tvParts[tp].trim();
+                                    if (tvVal) vals[tvVal] = true;
+                                }
+                            }
+                        }
+                        var valList = Object.keys(vals);
+                        if (valList.length === 0) continue;
+                        var inClause = valList.map(function(v) { return "'" + escapeSQL(v) + "'"; }).join(', ');
+                        if (typeId === 40) {
+                            trackConds.push("tisn_f.SerialNum IN (" + inClause + ")");
+                        } else if (typeId === 20 || typeId === 30) {
+                            trackConds.push("(ti_f.PartTrackingId = " + ttype.id + " AND SUBSTRING(ti_f.InfoDate FROM 1 FOR 10) IN (" + inClause + "))");
+                        } else if (typeId === 50 || typeId === 60) {
+                            trackConds.push("(ti_f.PartTrackingId = " + ttype.id + " AND CAST(ti_f.InfoDouble AS CHAR) IN (" + inClause + "))");
+                        } else if (typeId === 70 || typeId === 80) {
+                            trackConds.push("(ti_f.PartTrackingId = " + ttype.id + " AND CAST(ti_f.InfoInteger AS CHAR) IN (" + inClause + "))");
+                        } else {
+                            trackConds.push("(ti_f.PartTrackingId = " + ttype.id + " AND ti_f.Info IN (" + inClause + "))");
+                        }
+                    }
+                    if (trackConds.length === 0) return '';
+                    return " AND EXISTS (SELECT 1 FROM TiInventoryLog ti_f " +
+                        "LEFT JOIN TiInventoryLogSn tisn_f ON ti_f.Id = tisn_f.TiInventoryLogId " +
+                        "WHERE ti_f.InventoryLogId = il.Id AND (" + trackConds.join(" OR ") + "))";
+                }
+
                 // Forward trace: find SOs that shipped the finished goods
+                // Narrow to SOs whose shipment tracking matches this WO's build tracking
                 var soDetails = [];
                 if (finishedGoods.length > 0) {
                     var fgInClause = finishedGoods.map(function(fg) { return "'" + escapeSQL(fg.partnum) + "'"; }).join(', ');
+                    var soTrackingFilter = buildTrackingFilter(builds);
                     var soQuery =
                         "SELECT DISTINCT so.Num AS ordernum, cust.Name AS entityname, " +
                         "    COALESCE(addr.Address, '') AS address, COALESCE(addr.City, '') AS city, " +
@@ -1561,17 +1604,20 @@
                         "WHERE p.Num IN (" + fgInClause + ") " +
                         "AND il.ChangeQty < 0 " +
                         "AND il.EventDate BETWEEN '" + dates.start + "' AND '" + dates.end + " 23:59:59' " +
-                        "ORDER BY cust.Name, so.Num";
+                        soTrackingFilter +
+                        " ORDER BY cust.Name, so.Num";
 
-                    debugLog('WO drill-down: forward trace to SOs...', 'query');
+                    debugLog('WO drill-down: forward trace to SOs' + (soTrackingFilter ? ' (tracking-filtered)' : ' (no tracking filter)') + '...', 'query');
                     var soResult = JSON.parse(runQuery(soQuery));
                     if (soResult) soDetails = soResult;
                 }
 
                 // Backward trace: find POs that supplied raw materials
+                // Narrow to POs whose receipt tracking matches this WO's consume tracking
                 var poDetails = [];
                 if (rawMaterials.length > 0) {
                     var rmInClause = rawMaterials.map(function(rm) { return "'" + escapeSQL(rm.partnum) + "'"; }).join(', ');
+                    var poTrackingFilter = buildTrackingFilter(consumes);
                     var poQuery =
                         "SELECT DISTINCT po.Num AS ordernum, vend.Name AS entityname, " +
                         "    COALESCE(addr.Address, '') AS address, COALESCE(addr.City, '') AS city, " +
@@ -1590,9 +1636,10 @@
                         "WHERE p.Num IN (" + rmInClause + ") " +
                         "AND il.ChangeQty > 0 " +
                         "AND il.EventDate BETWEEN '" + dates.start + "' AND '" + dates.end + " 23:59:59' " +
-                        "ORDER BY vend.Name, po.Num";
+                        poTrackingFilter +
+                        " ORDER BY vend.Name, po.Num";
 
-                    debugLog('WO drill-down: backward trace to POs...', 'query');
+                    debugLog('WO drill-down: backward trace to POs' + (poTrackingFilter ? ' (tracking-filtered)' : ' (no tracking filter)') + '...', 'query');
                     var poResult = JSON.parse(runQuery(poQuery));
                     if (poResult) poDetails = poResult;
                 }
@@ -2070,8 +2117,9 @@
          * even if the Build/Receive happened outside the selected date range.
          */
         function expandViaTracking(initialResults, dynamicTrackingCols, lgCondition) {
-            // Collect unique tracking values from initial results
+            // Collect unique tracking values AND part numbers from initial results
             var trackingSearches = []; // { trackingType, values[] }
+            var partNums = {};
 
             for (var t = 0; t < trackingTypes.length; t++) {
                 var tt = trackingTypes[t];
@@ -2081,6 +2129,7 @@
                 for (var i = 0; i < initialResults.length; i++) {
                     var val = initialResults[i][tkey];
                     if (val) {
+                        if (initialResults[i].partnum) partNums[initialResults[i].partnum] = true;
                         var parts = val.split(', ');
                         for (var p = 0; p < parts.length; p++) {
                             var v = parts[p].trim();
@@ -2182,6 +2231,7 @@
                     "    p.TypeId = 10 " +
                     "    AND il.TypeId IN (10, 20, 50) " +
                     "    AND (" + conditions.join(" OR ") + ") " +
+                    "    AND p.Num IN (" + Object.keys(partNums).map(function(n) { return "'" + escapeSQL(n) + "'"; }).join(', ') + ") " +
                     lgCondition +
                     " GROUP BY il.Id " +
                     "ORDER BY il.EventDate ASC " +
