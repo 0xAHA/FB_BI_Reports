@@ -1270,16 +1270,19 @@
         }
 
         function ordersShareTracking(orderA, orderB) {
-            if (!orderA.tracking || !orderB.tracking) return false;
-            for (var tk in orderA.tracking) {
-                if (!orderA.tracking.hasOwnProperty(tk) || !orderB.tracking.hasOwnProperty(tk)) continue;
-                var valsA = orderA.tracking[tk].split(', ');
-                var valsB = orderB.tracking[tk].split(', ');
-                for (var va = 0; va < valsA.length; va++) {
-                    var a = valsA[va].trim();
-                    if (!a) continue;
-                    for (var vb = 0; vb < valsB.length; vb++) {
-                        if (a === valsB[vb].trim()) return true;
+            // Use per-part tracking for precise linkage:
+            // Two orders are related only if they share a tracking value
+            // on the SAME part number (prevents false links from serial reuse
+            // across different parts or coincidental date matches).
+            var ptA = orderA.partTracking, ptB = orderB.partTracking;
+            if (!ptA || !ptB) return false;
+            for (var part in ptA) {
+                if (!ptA.hasOwnProperty(part) || !ptB.hasOwnProperty(part)) continue;
+                // Same part exists on both orders — check tracking values
+                for (var tk in ptA[part]) {
+                    if (!ptA[part].hasOwnProperty(tk) || !ptB[part] || !ptB[part].hasOwnProperty(tk)) continue;
+                    for (var val in ptA[part][tk]) {
+                        if (ptA[part][tk].hasOwnProperty(val) && ptB[part][tk] && ptB[part][tk].hasOwnProperty(val)) return true;
                     }
                 }
             }
@@ -1330,24 +1333,28 @@
         function getChainSharedTracking(chain) {
             if (chain.length <= 1) return [];
             var shared = [];
+            // Find tracking values shared on the SAME part across multiple orders
             for (var t = 0; t < trackingTypes.length; t++) {
                 var tk = 'tracking_' + trackingTypes[t].id;
-                var valueCounts = {};
+                // Collect part+value combos and count how many orders have them
+                var partValCounts = {}; // key: "part|value" -> count
                 for (var c = 0; c < chain.length; c++) {
-                    var order = chain[c].order;
-                    if (order.tracking && order.tracking[tk]) {
-                        var vals = order.tracking[tk].split(', ');
-                        for (var v = 0; v < vals.length; v++) {
-                            var val = vals[v].trim();
-                            if (!val) continue;
-                            if (!valueCounts[val]) valueCounts[val] = 0;
-                            valueCounts[val]++;
+                    var pt = chain[c].order.partTracking;
+                    if (!pt) continue;
+                    for (var part in pt) {
+                        if (!pt.hasOwnProperty(part) || !pt[part][tk]) continue;
+                        for (var val in pt[part][tk]) {
+                            if (!pt[part][tk].hasOwnProperty(val)) continue;
+                            var pvKey = part + '|' + val;
+                            if (!partValCounts[pvKey]) partValCounts[pvKey] = { part: part, val: val, count: 0 };
+                            partValCounts[pvKey].count++;
                         }
                     }
                 }
-                for (var val2 in valueCounts) {
-                    if (valueCounts.hasOwnProperty(val2) && valueCounts[val2] >= 2) {
-                        shared.push({ abbr: trackingTypes[t].abbr || trackingTypes[t].name, value: formatTrackingValue(tk, val2) });
+                for (var pvk in partValCounts) {
+                    if (partValCounts.hasOwnProperty(pvk) && partValCounts[pvk].count >= 2) {
+                        var pvc = partValCounts[pvk];
+                        shared.push({ abbr: trackingTypes[t].abbr || trackingTypes[t].name, value: formatTrackingValue(tk, pvc.val), part: pvc.part });
                     }
                 }
             }
@@ -1392,7 +1399,7 @@
                 // Show shared tracking values that link the chain
                 var sharedTracking = getChainSharedTracking(chain);
                 if (sharedTracking.length > 0) {
-                    var sharedLabel = sharedTracking.map(function(s) { return s.abbr + ': ' + s.value; }).join(', ');
+                    var sharedLabel = sharedTracking.map(function(s) { return s.part + ' ' + s.abbr + ': ' + s.value; }).join(', ');
                     bodyHtml += '<span class="gantt-chain-shared" title="' + escapeHTML(sharedLabel) + '"><span class="shared-label">Linked by:</span> ' + escapeHTML(sharedLabel) + '</span>';
                 }
                 bodyHtml += '</div>';
@@ -1668,7 +1675,7 @@
                 var row = movements[i], otype = (row.ordertype || '').toLowerCase(), onum = row.ordernum || '';
                 if (otype !== 'po' && otype !== 'wo' && otype !== 'so') continue;
                 if (!onum) continue;
-                if (!columnData[otype][onum]) { columnData[otype][onum] = { ordertype: row.ordertype, ordernum: onum, entityname: row.entityname || '', date: row.datecreated, endDate: row.datecreated, lines: [], movements: [], tracking: {}, contact: null }; }
+                if (!columnData[otype][onum]) { columnData[otype][onum] = { ordertype: row.ordertype, ordernum: onum, entityname: row.entityname || '', date: row.datecreated, endDate: row.datecreated, lines: [], movements: [], tracking: {}, partTracking: {}, contact: null }; }
                 var order = columnData[otype][onum];
                 order.movements.push(row);
                 if (row.datecreated && (!order.date || row.datecreated < order.date)) order.date = row.datecreated;
@@ -1683,6 +1690,12 @@
                         for (var ev = 0; ev < existVals.length; ev++) { var vv = existVals[ev].trim(); if (vv) valSet[vv] = true; }
                         for (var nv = 0; nv < newVals.length; nv++) { var vv2 = newVals[nv].trim(); if (vv2) valSet[vv2] = true; }
                         order.tracking[tk] = Object.keys(valSet).join(', ');
+                        // Build per-part tracking index for precise chain linkage
+                        if (row.partnum) {
+                            if (!order.partTracking[row.partnum]) order.partTracking[row.partnum] = {};
+                            if (!order.partTracking[row.partnum][tk]) order.partTracking[row.partnum][tk] = {};
+                            for (var ptv = 0; ptv < newVals.length; ptv++) { var ptvv = newVals[ptv].trim(); if (ptvv) order.partTracking[row.partnum][tk][ptvv] = true; }
+                        }
                     }
                 }
                 if (row.partnum) {
