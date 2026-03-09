@@ -207,7 +207,8 @@
             display: none;
         }
         .gantt-context-menu.show { display: block; }
-        .gantt-context-menu input[type="date"] {
+        .gantt-context-menu input[type="date"],
+        .gantt-context-menu select {
             width: 100%;
             border: 1px solid #cbd5e1;
             border-radius: 0.5rem;
@@ -215,8 +216,10 @@
             font-size: 0.8125rem;
             color: #334155;
             outline: none;
+            background: white;
         }
-        .gantt-context-menu input[type="date"]:focus {
+        .gantt-context-menu input[type="date"]:focus,
+        .gantt-context-menu select:focus {
             border-color: var(--color-primary);
             box-shadow: 0 0 0 3px rgba(45,156,219,0.15);
         }
@@ -232,7 +235,7 @@
             <svg class="w-4 h-4 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
             </svg>
-            Set WO Dates
+            <span id="woContextMenuTitle">Set WO Dates</span>
         </div>
         <div class="space-y-3 mb-4">
             <div>
@@ -242,6 +245,12 @@
             <div>
                 <label class="block text-xs font-medium text-slate-500 mb-1">End Date</label>
                 <input type="date" id="woContextMenuEnd">
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-slate-500 mb-1">Category</label>
+                <select id="woContextMenuCategory">
+                    <!-- Populated dynamically from capacitySettings.categories -->
+                </select>
             </div>
         </div>
         <div class="flex gap-2">
@@ -1504,13 +1513,28 @@ async function saveWODates(woNum, newStartDate, newEndDate) {
 // CONTEXT MENU (RIGHT-CLICK)
 // ============================================
 let _ctxWONum = null;
+let _ctxWO    = null; // Full WO object for category comparison
 
-function showWOContextMenu(event, woNum, startDate, endDate) {
+function showWOContextMenu(event, wo) {
     hideAllContextMenus();
-    _ctxWONum = woNum;
+    _ctxWONum = wo.wo_num;
+    _ctxWO    = wo;
 
-    document.getElementById('woContextMenuStart').value = moment(startDate).format('YYYY-MM-DD');
-    document.getElementById('woContextMenuEnd').value = moment(endDate).format('YYYY-MM-DD');
+    document.getElementById('woContextMenuTitle').textContent = `WO ${wo.wo_num}`;
+    document.getElementById('woContextMenuStart').value = moment(wo.date_scheduled_start).format('YYYY-MM-DD');
+    document.getElementById('woContextMenuEnd').value   = moment(wo.date_scheduled).format('YYYY-MM-DD');
+
+    // Populate category dropdown
+    const catSelect = document.getElementById('woContextMenuCategory');
+    catSelect.innerHTML = '';
+    const sortedCats = [...capacitySettings.categories].sort((a, b) => a.name.localeCompare(b.name));
+    sortedCats.forEach(cat => {
+        const opt = document.createElement('option');
+        opt.value = cat.id;
+        opt.textContent = cat.name;
+        if (cat.id === wo.calcategory_id) opt.selected = true;
+        catSelect.appendChild(opt);
+    });
 
     _positionContextMenu('woContextMenu', event.clientX, event.clientY);
     event.preventDefault();
@@ -1537,12 +1561,15 @@ function _positionContextMenu(menuId, x, y) {
 function hideAllContextMenus() {
     document.querySelectorAll('.gantt-context-menu').forEach(m => m.classList.remove('show'));
     _ctxWONum = null;
+    _ctxWO    = null;
 }
 
 async function applyWOContextMenu() {
-    const startDate = document.getElementById('woContextMenuStart').value;
-    const endDate   = document.getElementById('woContextMenuEnd').value;
-    const woNum = _ctxWONum;
+    const startDate    = document.getElementById('woContextMenuStart').value;
+    const endDate      = document.getElementById('woContextMenuEnd').value;
+    const newCatId     = parseInt(document.getElementById('woContextMenuCategory').value, 10);
+    const wo           = _ctxWO;
+    const woNum        = _ctxWONum;
     hideAllContextMenus();
 
     if (!woNum || !startDate || !endDate) return;
@@ -1552,7 +1579,81 @@ async function applyWOContextMenu() {
     redoStack = [];
     updateUndoRedoButtons();
 
-    await saveWODates(woNum, startDate, endDate);
+    const datesChanged    = startDate !== moment(wo.date_scheduled_start).format('YYYY-MM-DD') ||
+                            endDate   !== moment(wo.date_scheduled).format('YYYY-MM-DD');
+    const categoryChanged = !isNaN(newCatId) && newCatId !== wo.calcategory_id;
+
+    if (datesChanged && categoryChanged) {
+        // Single API round-trip for both changes
+        await saveWODatesAndCategory(woNum, startDate, endDate, newCatId);
+    } else if (datesChanged) {
+        await saveWODates(woNum, startDate, endDate);
+    } else if (categoryChanged) {
+        await saveWOCategory(woNum, newCatId);
+        loadWorkOrders();
+    }
+}
+
+// Combined save — updates dates AND category in one Get/Save API call
+async function saveWODatesAndCategory(woNum, newStartDate, newEndDate, newCategoryId) {
+    debugLog('info', `Saving WO ${woNum} dates + category ${newCategoryId}`);
+
+    try {
+        const woRequest  = { GetWorkOrderRq: { WorkOrderNumber: woNum } };
+        const woResponse = JSON.parse(runApiRequest('GetWorkOrderRq', JSON.stringify(woRequest)));
+
+        if (woResponse.GetWorkOrderRs && woResponse.GetWorkOrderRs.statusCode === 1000 && woResponse.GetWorkOrderRs.WO) {
+            const wo = woResponse.GetWorkOrderRs.WO;
+
+            // Preserve time components
+            const originalStart   = moment(wo.DateScheduledToStart);
+            const originalEnd     = moment(wo.DateScheduled);
+            const newStartMoment  = moment(newStartDate).hour(originalStart.hour()).minute(originalStart.minute()).second(originalStart.second());
+            const newEndMoment    = moment(newEndDate).hour(originalEnd.hour()).minute(originalEnd.minute()).second(originalEnd.second());
+
+            // Enforce start < finish
+            if (newStartMoment.isSameOrAfter(newEndMoment)) {
+                newStartMoment.hour(6).minute(0).second(0);
+                newEndMoment.hour(18).minute(0).second(0);
+                debugLog('warn', `WO ${woNum}: Time conflict — defaulting to 06:00–18:00`);
+            }
+
+            wo.DateScheduledToStart = newStartMoment.format('YYYY-MM-DD[T]HH:mm:ss');
+            wo.DateScheduled        = newEndMoment.format('YYYY-MM-DD[T]HH:mm:ss');
+
+            if (wo.WOItems && wo.WOItems.WOItem) {
+                const items = Array.isArray(wo.WOItems.WOItem) ? wo.WOItems.WOItem : [wo.WOItems.WOItem];
+                items.forEach(item => {
+                    if (item.DateScheduled) {
+                        const orig = moment(item.DateScheduled);
+                        item.DateScheduled = moment(newStartDate).hour(orig.hour()).minute(orig.minute()).second(orig.second()).format('YYYY-MM-DD[T]HH:mm:ss');
+                    }
+                });
+            }
+
+            wo.CalCategoryID = newCategoryId;
+
+            const saveRequest  = { SaveWorkOrderRq: { WO: wo } };
+            const saveResponse = JSON.parse(runApiRequest('SaveWorkOrderRq', JSON.stringify(saveRequest)));
+
+            if (saveResponse.SaveWorkOrderRs && saveResponse.SaveWorkOrderRs.statusCode === 1000) {
+                debugLog('success', `WO ${woNum} dates + category updated`);
+                showToast(`WO ${woNum} updated`, 'success');
+                loadWorkOrders();
+                return true;
+            } else {
+                const errorMsg = saveResponse.SaveWorkOrderRs ? saveResponse.SaveWorkOrderRs.statusMessage : 'Unknown error';
+                throw new Error('Failed to save WO: ' + errorMsg);
+            }
+        } else {
+            const errorMsg = woResponse.GetWorkOrderRs ? woResponse.GetWorkOrderRs.statusMessage : 'Failed to retrieve WO';
+            throw new Error('Failed to get WO: ' + errorMsg);
+        }
+    } catch (error) {
+        debugLog('error', `Failed to save WO ${woNum} dates+category`, error);
+        showToast(`Failed to save WO: ${error.message}`, 'error', 5000);
+        return false;
+    }
 }
 
 function generateMockData() {
@@ -2842,10 +2943,10 @@ function renderGanttChart() {
                 }
             });
 
-            // Right-click to set WO dates via date pickers
+            // Right-click to set WO dates and category via pickers
             bar.on('contextmenu', function(event) {
                 hideWOTooltip();
-                showWOContextMenu(event, wo.wo_num, wo.date_scheduled_start, wo.date_scheduled);
+                showWOContextMenu(event, wo);
             });
 
             // Label - single line format: "WO 5:001 - FG2100 x 3"
@@ -4335,6 +4436,12 @@ function renderCapacityWOs(category, weekStart, numWeeks = 1) {
             }
         });
 
+        // Right-click to set WO dates and category via pickers
+        bar.on('contextmenu', function(event) {
+            hideWOTooltip();
+            showWOContextMenu(event, wo);
+        });
+
         // Add drag behavior
         const woId = wo.wo_id;
         let dragStartX = paddedX;
@@ -5230,6 +5337,13 @@ function renderCalendarWOs(table, calendarStart) {
             e.stopPropagation();
             const weekStart = woStart.clone().startOf('isoWeek');
             scrollCapacityToWeek(weekStart);
+        });
+
+        // Right-click to set WO dates and category via pickers
+        woBar.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            hideWOTooltip();
+            showWOContextMenu(e, wo);
         });
 
         // Append to the row (not tbody) with relative positioning
