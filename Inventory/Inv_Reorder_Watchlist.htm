@@ -73,10 +73,19 @@
             border: none;
             border-bottom: 2px solid #e2e8f0;
             text-align: center;
-            white-space: normal;
+            white-space: nowrap;
+            overflow: hidden;
             line-height: 1.3;
             text-transform: uppercase;
             letter-spacing: 0.5px;
+        }
+
+        /* Truncate header text with ellipsis when column is too narrow */
+        table.dataTable thead th > span {
+            display: block;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
 
         table.dataTable thead th:first-child {
@@ -1496,6 +1505,73 @@
       window.exportToCSV = exportToCSV;
       window.printTable = printTable;
 
+      // Shrink header span font sizes to fit their column width, then CSS ellipsis handles the rest.
+      // Uses canvas text measurement so no DOM reflow is triggered.
+      function fitHeaderText() {
+        var minFontSize = 9;
+        var defaultFontSize = 12;
+        var letterSpacingPx = 0.5; // matches CSS letter-spacing: 0.5px
+        var canvas = fitHeaderText._canvas || (fitHeaderText._canvas = document.createElement('canvas'));
+        var ctx = canvas.getContext('2d');
+
+        // Target the scrollable header table (DataTables keeps headers in a separate wrapper)
+        var $ths = $('#report-table_wrapper .dataTables_scrollHead thead th');
+        if (!$ths.length) $ths = $('#report-table thead th');
+
+        $ths.each(function() {
+          var $th = $(this);
+          var $span = $th.find('span').first();
+          if (!$span.length) return;
+
+          // Reset to default first so measurements are repeatable
+          $span.css('font-size', defaultFontSize + 'px');
+
+          // Get text as rendered (uppercase due to CSS text-transform)
+          var text = $span.text().trim().toUpperCase();
+          if (!text) return;
+
+          // Available width = th inner width minus horizontal padding
+          var padL = parseFloat($th.css('padding-left')) || 8;
+          var padR = parseFloat($th.css('padding-right')) || 8;
+          var available = Math.max(0, $th.innerWidth() - padL - padR);
+          if (available <= 0) return;
+
+          // Measure text width at current font size via canvas
+          function measure(size) {
+            ctx.font = '600 ' + size + 'px Inter, -apple-system, sans-serif';
+            // Add letter-spacing contribution manually (n-1 gaps)
+            return ctx.measureText(text).width + Math.max(0, text.length - 1) * letterSpacingPx;
+          }
+
+          if (measure(defaultFontSize) <= available) return; // already fits
+
+          // Step down until it fits or we hit the minimum
+          var fontSize = defaultFontSize - 1;
+          while (fontSize > minFontSize && measure(fontSize) > available) {
+            fontSize--;
+          }
+          $span.css('font-size', fontSize + 'px');
+        });
+      }
+
+      // Dynamically recalculate the DataTables scroll body height so it fills the remaining
+      // window space. This corrects the initial 100vh mis-calculation in JxBrowser and also
+      // keeps things correct when the application window is resized.
+      function recalculateScrollHeight() {
+        var scrollHead = document.querySelector('#report-table_wrapper .dataTables_scrollHead');
+        var scrollBody = document.querySelector('#report-table_wrapper .dataTables_scrollBody');
+        if (!scrollHead || !scrollBody) return;
+
+        var headRect = scrollHead.getBoundingClientRect();
+        var headBottom = headRect.top + headRect.height;
+        var available = window.innerHeight - headBottom - 20; // 20 px bottom breathing room
+
+        if (available > 100) {
+          scrollBody.style.height = available + 'px';
+          scrollBody.style.maxHeight = available + 'px';
+        }
+      }
+
       function drawTable() {
         dataset = getData();
 
@@ -1529,8 +1605,13 @@
         let table = $('#report-table');
         table.empty();
 
-        $(window).on('resize scroll', function() {
-          table.columns.adjust();
+        // Fix broken resize handler — must use DataTable API, not the jQuery object
+        $(window).on('resize', function() {
+          if ($.fn.DataTable.isDataTable('#report-table')) {
+            $('#report-table').DataTable().columns.adjust();
+            recalculateScrollHeight();
+            fitHeaderText();
+          }
         });
 
         let dataTable = table.DataTable({
@@ -1969,6 +2050,10 @@
 
             // Update vendor header colspans
             updateVendorHeaderColspan();
+
+            // Fit header text and correct scroll height after every draw
+            fitHeaderText();
+            recalculateScrollHeight();
           }
         });
 
@@ -1987,6 +2072,34 @@
 
         // Force initial column width adjustment
         dataTable.columns.adjust().draw(false);
+
+        // JxBrowser may not have settled its layout at this point.
+        // Run staggered adjustments so the table fills the correct width
+        // and header fonts are sized properly once the viewport is stable.
+        [50, 150, 400].forEach(function(delay) {
+          setTimeout(function() {
+            if ($.fn.DataTable.isDataTable('#report-table')) {
+              $('#report-table').DataTable().columns.adjust();
+              fitHeaderText();
+              recalculateScrollHeight();
+            }
+          }, delay);
+        });
+
+        // ResizeObserver watches the actual container element rather than the
+        // window object. JxBrowser can resize the container without firing a
+        // window 'resize' event, so this catches those cases too.
+        if (window.ResizeObserver) {
+          var _roTarget = document.querySelector('.flex-1') || document.body;
+          var _ro = new ResizeObserver(function() {
+            if ($.fn.DataTable.isDataTable('#report-table')) {
+              $('#report-table').DataTable().columns.adjust();
+              fitHeaderText();
+              recalculateScrollHeight();
+            }
+          });
+          _ro.observe(_roTarget);
+        }
       }
 
       function refreshTable() {
