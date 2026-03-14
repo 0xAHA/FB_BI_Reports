@@ -770,6 +770,8 @@
         .tracking-group-entry { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 4px 0 4px 12px; border-bottom: 1px solid #f8fafc; }
         .tracking-group-entry:last-child { border-bottom: none; }
         .tracking-group-part { font-size: 11px; font-weight: 600; color: #1e293b; min-width: 120px; }
+        .tracking-group-part.clickable { cursor: pointer; color: #2563eb; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 2px; }
+        .tracking-group-part.clickable:hover { color: #1d4ed8; text-decoration-style: solid; }
         .tracking-group-qty { font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; min-width: 60px; }
         .tracking-group-qty.positive { color: #155724; }
         .tracking-group-qty.negative { color: #721c24; }
@@ -1623,8 +1625,18 @@
                     html += '<div class="tracking-group"><div class="tracking-group-header ' + cat2 + '"><div class="tg-icon"></div>' + catLabels[cat2] + '</div>';
                     for (var ce = 0; ce < catEntries.length; ce++) {
                         var entry = catEntries[ce], eqv = entry.qty, eqc = eqv >= 0 ? 'positive' : 'negative';
+                        // Serialize this entry's tracking for drill-down
+                        var entryTrackingData = {};
+                        for (var etk2 in entry.tracking) {
+                            if (entry.tracking.hasOwnProperty(etk2)) entryTrackingData[etk2] = Object.keys(entry.tracking[etk2]);
+                        }
+                        var trackingDataAttr = escapeHTML(JSON.stringify(entryTrackingData));
                         html += '<div class="tracking-group-entry">';
-                        html += '<span class="tracking-group-part">' + escapeHTML(entry.partnum) + '</span>';
+                        if (Object.keys(entryTrackingData).length > 0) {
+                            html += '<span class="tracking-group-part clickable" onclick="drillIntoPart(\'' + escapeSQL(entry.partnum) + '\', this.getAttribute(\'data-tracking\'))" data-tracking="' + trackingDataAttr + '" title="Click to trace this part with its tracking">' + escapeHTML(entry.partnum) + '</span>';
+                        } else {
+                            html += '<span class="tracking-group-part">' + escapeHTML(entry.partnum) + '</span>';
+                        }
                         html += '<span class="tracking-group-qty ' + eqc + '">' + (eqv >= 0 ? '+' : '') + eqv.toFixed(2) + '</span>';
                         for (var etk in entry.tracking) {
                             if (!entry.tracking.hasOwnProperty(etk)) continue;
@@ -1666,6 +1678,91 @@
             updateSearchPlaceholder();
             closeDrillPanel();
             executeSearch();
+        }
+
+        /**
+         * Drill into a part number with its attached tracking values.
+         * Finds all movements for this part that share any of the given tracking,
+         * then expands outward to related orders (POs, WOs, SOs).
+         *
+         * trackingJSON: '{"tracking_5":["LOT123"],"tracking_6":["2025-04-01"]}'
+         */
+        function drillIntoPart(partNum, trackingJSON) {
+            var trackingData = {};
+            try { trackingData = JSON.parse(trackingJSON); } catch (e) { debugLog('drillIntoPart: bad JSON', 'error'); }
+
+            var trackingDesc = [];
+            for (var tk in trackingData) {
+                if (!trackingData.hasOwnProperty(tk)) continue;
+                var label = tk;
+                for (var ti = 0; ti < trackingTypes.length; ti++) {
+                    if ('tracking_' + trackingTypes[ti].id === tk) { label = trackingTypes[ti].abbr || trackingTypes[ti].name; break; }
+                }
+                trackingDesc.push(label + '=' + trackingData[tk].join(','));
+            }
+            debugLog('Drill-down: tracing part "' + partNum + '" with tracking: ' + trackingDesc.join('; '), 'info');
+
+            try {
+                var dynCols = buildDynamicTrackingCols();
+                var lgVal = document.getElementById('locationGroupFilter').value;
+                var lgCond = lgVal !== '%' ? " AND lg.Name = '" + escapeSQL(lgVal) + "'" : '';
+                var dates = getDateRange();
+
+                // Build tracking conditions from the attached tracking values
+                var tvList = [];
+                for (var tk2 in trackingData) {
+                    if (!trackingData.hasOwnProperty(tk2)) continue;
+                    var idStr = tk2.replace('tracking_', '');
+                    for (var tti = 0; tti < trackingTypes.length; tti++) {
+                        if (String(trackingTypes[tti].id) === idStr) {
+                            tvList.push({ trackingType: trackingTypes[tti], values: trackingData[tk2] });
+                            break;
+                        }
+                    }
+                }
+
+                var results = [];
+
+                if (tvList.length > 0) {
+                    // Search by part + tracking values combined
+                    var trackConds = buildTrackingConditions(tvList);
+                    var where = "p.Num = '" + escapeSQL(partNum) + "' AND (" + trackConds + ")" + lgCond;
+                    debugLog('Part+tracking combined search...', 'query');
+                    results = JSON.parse(runQuery(buildMovementQuery(where, dynCols))) || [];
+                    debugLog('Part+tracking: ' + results.length + ' direct movements', 'info');
+                }
+
+                // Also get all movements for this part with any tracking to catch related activity
+                if (results.length === 0) {
+                    var partWhere = "p.Num = '" + escapeSQL(partNum) + "'" + lgCond;
+                    debugLog('Fallback: all movements for part ' + partNum, 'query');
+                    results = JSON.parse(runQuery(buildMovementQuery(partWhere, dynCols))) || [];
+                }
+
+                // Expand: find other orders connected by these tracking values
+                results = expandTrackingForSameParts(results, dynCols, lgCond);
+                results = expandWOFromResults(results, dates, dynCols, lgCond);
+
+                // Tag-based enhancement if available
+                if (schemaCapabilities.useTagTracing && results.length > 0) {
+                    results = enhanceWithTagTracing(results, dynCols, lgCond);
+                }
+
+                allData = results; filteredData = results.slice(); hasSearched = true;
+                orderLinks = {}; // reset — let chain building use tracking match
+                processMovementsIntoColumns(results); updateKPIs(); updateFilterInfo();
+                document.getElementById('emptyState').style.display = 'none';
+                document.getElementById('columnView').style.display = 'block';
+                document.getElementById('lastUpdated').textContent = moment().format('MMM D, YYYY h:mm A');
+                closeDrillPanel(); renderColumnView();
+
+                // Update search bar to reflect what was searched
+                document.getElementById('searchTypeFilter').value = 'part';
+                document.getElementById('searchInput').value = partNum;
+                updateSearchPlaceholder();
+
+                debugLog('Part drill-down complete: ' + results.length + ' movements found', 'success');
+            } catch (error) { debugLog('Part drill-down ERROR: ' + error.message, 'error'); console.error(error); }
         }
 
         function renderTimelineNode(row) {
