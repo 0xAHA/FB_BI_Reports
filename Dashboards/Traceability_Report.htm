@@ -890,6 +890,18 @@
         var hasSearched = false;
         var columnData = { po: {}, wo: {}, so: {} };
         var recallAddresses = [];
+        var orderLinks = {};  // tag-based: "PO:123" -> ["WO:456", ...] explicit link map
+
+        // Schema capabilities — probed at startup
+        var schemaCapabilities = {
+            hasTagTable: false,
+            hasPickItemTable: false,
+            hasReceiptItemTagId: false,
+            hasShipItemTagId: false,
+            hasTagWoItemId: false,
+            tagCount: 0,
+            useTagTracing: false
+        };
 
         // ============================================================================
         // FISHBOWL PROPERTIES & DATE FORMAT
@@ -1133,7 +1145,7 @@
             document.getElementById('customDateInputs').classList.remove('visible');
             customStartDate = null; customEndDate = null;
             allData = []; filteredData = []; hasSearched = false;
-            columnData = { po: {}, wo: {}, so: {} }; recallAddresses = [];
+            columnData = { po: {}, wo: {}, so: {} }; recallAddresses = []; orderLinks = {};
             document.getElementById('kpiCards').style.display = 'none';
             document.getElementById('filterInfo').style.display = 'none';
             document.getElementById('emptyState').style.display = 'block';
@@ -1228,10 +1240,29 @@
             function find(x) { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
             function union(a, b) { var ra = find(a), rb = find(b); if (ra !== rb) parent[ra] = rb; }
 
-            for (var i2 = 0; i2 < allOrders.length; i2++) {
-                for (var j = i2 + 1; j < allOrders.length; j++) {
-                    if (ordersShareTracking(allOrders[i2].order, allOrders[j].order)) {
-                        union(allOrders[i2].type + ':' + allOrders[i2].num, allOrders[j].type + ':' + allOrders[j].num);
+            // Use explicit tag-based links if available, otherwise fall back to tracking-based matching
+            var hasExplicitLinks = orderLinks && Object.keys(orderLinks).length > 0;
+            if (hasExplicitLinks) {
+                debugLog('Building chains from tag-based links (' + Object.keys(orderLinks).length + ' linked orders)', 'info');
+                for (var lk in orderLinks) {
+                    if (!orderLinks.hasOwnProperty(lk)) continue;
+                    // Convert tag link key format "PO:123" to union-find format "po:123"
+                    var ufKey = lk.toLowerCase();
+                    var linked = orderLinks[lk];
+                    for (var li = 0; li < linked.length; li++) {
+                        var ufLinked = linked[li].toLowerCase();
+                        // Only union if both keys exist in our order set
+                        if (parent.hasOwnProperty(ufKey) && parent.hasOwnProperty(ufLinked)) {
+                            union(ufKey, ufLinked);
+                        }
+                    }
+                }
+            } else {
+                for (var i2 = 0; i2 < allOrders.length; i2++) {
+                    for (var j = i2 + 1; j < allOrders.length; j++) {
+                        if (ordersShareTracking(allOrders[i2].order, allOrders[j].order)) {
+                            union(allOrders[i2].type + ':' + allOrders[i2].num, allOrders[j].type + ':' + allOrders[j].num);
+                        }
                     }
                 }
             }
@@ -1269,11 +1300,28 @@
             return chains;
         }
 
+        /**
+         * Check if a tracking key corresponds to a date-type tracking (expiry, etc.)
+         * Date-type tracking (typeId 20=date, 30=expiry) produces false chain links
+         * because many unrelated orders share common dates.
+         */
+        function isDateTypeTracking(trackingKey) {
+            var idStr = trackingKey.replace('tracking_', '');
+            for (var t = 0; t < trackingTypes.length; t++) {
+                if (String(trackingTypes[t].id) === idStr) {
+                    var typeId = parseInt(trackingTypes[t].typeid) || 0;
+                    return typeId === 20 || typeId === 30;
+                }
+            }
+            return false;
+        }
+
         function ordersShareTracking(orderA, orderB) {
             // Use per-part tracking for precise linkage:
             // Two orders are related only if they share a tracking value
             // on the SAME part number (prevents false links from serial reuse
             // across different parts or coincidental date matches).
+            // Also excludes date-type tracking (expiry dates etc.) from linkage.
             var ptA = orderA.partTracking, ptB = orderB.partTracking;
             if (!ptA || !ptB) return false;
             for (var part in ptA) {
@@ -1281,6 +1329,8 @@
                 // Same part exists on both orders — check tracking values
                 for (var tk in ptA[part]) {
                     if (!ptA[part].hasOwnProperty(tk) || !ptB[part] || !ptB[part].hasOwnProperty(tk)) continue;
+                    // Skip date-type tracking to avoid false positives from shared dates
+                    if (isDateTypeTracking(tk)) continue;
                     for (var val in ptA[part][tk]) {
                         if (ptA[part][tk].hasOwnProperty(val) && ptB[part][tk] && ptB[part][tk].hasOwnProperty(val)) return true;
                     }
@@ -1765,9 +1815,14 @@
             debugLog('WO BOM expansion for ' + woList.length + ' WOs...', 'query');
             var bom = JSON.parse(runQuery("SELECT wo.Num AS wonum, p.Num AS partnum FROM Wo wo INNER JOIN MoItem mi ON wo.MoItemId = mi.Id INNER JOIN BomItem bi ON bi.BomId = mi.BomId INNER JOIN Part p ON bi.PartId = p.Id WHERE wo.Num IN (" + woIn + ")")) || [];
             if (bom.length === 0) return results;
-            var bomParts = {}; for (var b = 0; b < bom.length; b++) bomParts[bom[b].partnum] = true;
+            // Only expand BOM parts that have matching tracking values in our results
+            var resultParts = {}; for (var rp = 0; rp < results.length; rp++) { if (results[rp].partnum) resultParts[results[rp].partnum] = true; }
+            var bomParts = {}; for (var b = 0; b < bom.length; b++) { if (resultParts[bom[b].partnum]) bomParts[bom[b].partnum] = true; }
+            // If no overlap, include all BOM parts
+            if (Object.keys(bomParts).length === 0) { for (var b2 = 0; b2 < bom.length; b2++) bomParts[bom[b2].partnum] = true; }
             var partIn = Object.keys(bomParts).map(function(p) { return "'" + escapeSQL(p) + "'"; }).join(', ');
-            var where = "p.Num IN (" + partIn + ") AND il.TypeId IN (10, 50) AND il.EventDate BETWEEN '" + dates.start + "' AND '" + dates.end + " 23:59:59'" + lgCond;
+            // No date bounds on expansion — find all related movements regardless of date
+            var where = "p.Num IN (" + partIn + ") AND il.TypeId IN (10, 50)" + lgCond;
             var expanded = JSON.parse(runQuery(buildMovementQuery(where, dynCols))) || [];
             var existIds = {}; for (var k = 0; k < results.length; k++) existIds[results[k].ilid] = true;
             for (var j = 0; j < expanded.length; j++) { if (!existIds[expanded[j].ilid]) { results.push(expanded[j]); existIds[expanded[j].ilid] = true; } }
@@ -1785,17 +1840,51 @@
             if (range === 'custom') { var cs = document.getElementById('customStartDate').value, ce = document.getElementById('customEndDate').value;
                 if (cs && ce) { customStartDate = cs; customEndDate = ce; } else { debugLog('Please enter both dates', 'warning'); return; } }
             var searchType = document.getElementById('searchTypeFilter').value;
-            debugLog('Search type: ' + searchType + ', term: "' + searchTerm + '"', 'info');
+            debugLog('Search type: ' + searchType + ', term: "' + searchTerm + '", strategy: ' + (schemaCapabilities.useTagTracing ? 'TAG' : 'INVENTORYLOG'), 'info');
             try {
                 var dates = getDateRange(), dynCols = buildDynamicTrackingCols();
                 var lgVal = document.getElementById('locationGroupFilter').value;
                 var lgCond = lgVal !== '%' ? " AND lg.Name = '" + escapeSQL(lgVal) + "'" : '';
                 var escaped = escapeSQL(searchTerm), results = [];
-                if (searchType === 'tracking') results = searchByTracking(escaped, dates, dynCols, lgCond);
-                else if (searchType === 'part') results = searchByPart(escaped, dates, dynCols, lgCond);
-                else if (searchType === 'wo') results = searchByWO(escaped, dates, dynCols, lgCond);
-                else if (searchType === 'so') results = searchByOrder('so', escaped, dates, dynCols, lgCond);
-                else if (searchType === 'po') results = searchByOrder('po', escaped, dates, dynCols, lgCond);
+
+                if (schemaCapabilities.useTagTracing && searchType !== 'tracking') {
+                    // === TAG-BASED STRATEGY ===
+                    debugLog('Using tag-based tracing strategy', 'info');
+                    var seedTags = [];
+                    if (searchType === 'po') seedTags = findTagsForPO(escaped);
+                    else if (searchType === 'wo') seedTags = findTagsForWO(escaped);
+                    else if (searchType === 'so') seedTags = findTagsForSO(escaped);
+                    else if (searchType === 'part') seedTags = findTagsByPart(escaped);
+
+                    if (seedTags.length === 0) {
+                        debugLog('No tags found for search term, falling back to InventoryLog', 'warning');
+                        results = executeSearchInventoryLog(searchType, escaped, dates, dynCols, lgCond);
+                    } else {
+                        // Extract unique tag IDs
+                        var seedTagIds = {};
+                        for (var st = 0; st < seedTags.length; st++) {
+                            var tid = seedTags[st].tagId || seedTags[st].tagid;
+                            if (tid) seedTagIds[tid] = true;
+                        }
+                        var tagIdList = Object.keys(seedTagIds).map(function(id) { return parseInt(id); });
+                        debugLog('Found ' + tagIdList.length + ' seed tags, starting BFS traversal...', 'info');
+
+                        // BFS trace
+                        var traceResult = traceFromTags(tagIdList, 5);
+
+                        if (traceResult.orders.length === 0) {
+                            debugLog('BFS found no orders, falling back to InventoryLog', 'warning');
+                            results = executeSearchInventoryLog(searchType, escaped, dates, dynCols, lgCond);
+                        } else {
+                            // Load InventoryLog movements for all discovered orders
+                            results = loadMovementsForOrders(traceResult.orders, dynCols, lgCond);
+                        }
+                    }
+                } else {
+                    // === INVENTORYLOG STRATEGY (fallback or tracking search) ===
+                    results = executeSearchInventoryLog(searchType, escaped, dates, dynCols, lgCond);
+                }
+
                 allData = results; filteredData = results.slice(); hasSearched = true;
                 processMovementsIntoColumns(results); updateKPIs(); updateFilterInfo();
                 document.getElementById('emptyState').style.display = 'none';
@@ -1804,6 +1893,83 @@
                 closeDrillPanel(); renderColumnView();
                 debugLog('Search complete: ' + results.length + ' movements found', 'success');
             } catch (error) { debugLog('ERROR: ' + error.message, 'error'); console.error(error); }
+        }
+
+        /**
+         * InventoryLog-based search (original approach, used as fallback or for tracking searches)
+         */
+        function executeSearchInventoryLog(searchType, escaped, dates, dynCols, lgCond) {
+            var results = [];
+            if (searchType === 'tracking') {
+                results = searchByTracking(escaped, dates, dynCols, lgCond);
+                // If tag tracing is available, enhance with tag-based expansion
+                if (schemaCapabilities.useTagTracing && results.length > 0) {
+                    results = enhanceWithTagTracing(results, dynCols, lgCond);
+                }
+            }
+            else if (searchType === 'part') results = searchByPart(escaped, dates, dynCols, lgCond);
+            else if (searchType === 'wo') results = searchByWO(escaped, dates, dynCols, lgCond);
+            else if (searchType === 'so') results = searchByOrder('so', escaped, dates, dynCols, lgCond);
+            else if (searchType === 'po') results = searchByOrder('po', escaped, dates, dynCols, lgCond);
+            return results;
+        }
+
+        /**
+         * After InventoryLog tracking search finds initial orders,
+         * use tag-based expansion to find connected orders more accurately
+         */
+        function enhanceWithTagTracing(results, dynCols, lgCond) {
+            // Extract unique order numbers from InventoryLog results
+            var orderNums = {};
+            for (var i = 0; i < results.length; i++) {
+                var r = results[i];
+                if (r.ordertype && r.ordernum) {
+                    orderNums[r.ordertype + ':' + r.ordernum] = { ordertype: r.ordertype, ordernum: r.ordernum };
+                }
+            }
+
+            // Get tags for each discovered order
+            var allTagIds = {};
+            for (var key in orderNums) {
+                if (!orderNums.hasOwnProperty(key)) continue;
+                var order = orderNums[key];
+                var tags = getTagsForOrder(order.ordertype, order.ordernum);
+                for (var t = 0; t < tags.length; t++) allTagIds[tags[t]] = true;
+            }
+
+            var tagIdList = Object.keys(allTagIds).map(function(id) { return parseInt(id); });
+            if (tagIdList.length === 0) return results;
+
+            debugLog('Enhancing tracking search with ' + tagIdList.length + ' tags from ' + Object.keys(orderNums).length + ' orders', 'info');
+
+            // BFS trace from these tags
+            var traceResult = traceFromTags(tagIdList, 3);
+            if (traceResult.orders.length === 0) return results;
+
+            // Load movements for any NEW orders discovered
+            var existingOrders = {};
+            for (var ek in orderNums) { if (orderNums.hasOwnProperty(ek)) existingOrders[ek] = true; }
+
+            var newOrders = [];
+            for (var no = 0; no < traceResult.orders.length; no++) {
+                var nk = traceResult.orders[no].ordertype + ':' + traceResult.orders[no].ordernum;
+                if (!existingOrders[nk]) newOrders.push(traceResult.orders[no]);
+            }
+
+            if (newOrders.length > 0) {
+                debugLog('Tag enhancement found ' + newOrders.length + ' additional orders', 'info');
+                var newMovements = loadMovementsForOrders(newOrders, dynCols, lgCond);
+                var existIds = {};
+                for (var ei = 0; ei < results.length; ei++) existIds[results[ei].ilid] = true;
+                for (var ni = 0; ni < newMovements.length; ni++) {
+                    if (!existIds[newMovements[ni].ilid]) {
+                        results.push(newMovements[ni]);
+                        existIds[newMovements[ni].ilid] = true;
+                    }
+                }
+            }
+
+            return results;
         }
 
         function searchByTracking(searchVal, dates, dynCols, lgCond) {
@@ -2047,6 +2213,469 @@
             URL.revokeObjectURL(url);
         }
         // ============================================================================
+        // SCHEMA DISCOVERY & TAG-BASED TRACING
+        // ============================================================================
+
+        function discoverSchemaCapabilities() {
+            debugLog('Probing tag-based schema capabilities...', 'info');
+
+            // Probe tag table
+            try {
+                var r = JSON.parse(runQuery("SELECT id, partId, woItemId FROM tag LIMIT 1"));
+                schemaCapabilities.hasTagTable = true;
+                schemaCapabilities.hasTagWoItemId = true;
+                debugLog('tag table: EXISTS (partId, woItemId confirmed)', 'success');
+            } catch (e) {
+                debugLog('tag table: NOT FOUND (' + e.message + ')', 'warning');
+            }
+
+            // Probe pickitem table
+            try {
+                JSON.parse(runQuery("SELECT id, tagId, destTagId, woItemId FROM pickitem LIMIT 1"));
+                schemaCapabilities.hasPickItemTable = true;
+                debugLog('pickitem table: EXISTS (tagId, destTagId, woItemId confirmed)', 'success');
+            } catch (e) {
+                debugLog('pickitem table: NOT FOUND (' + e.message + ')', 'warning');
+            }
+
+            // Probe receiptitem.tagId
+            try {
+                JSON.parse(runQuery("SELECT id, tagId, poItemId FROM receiptitem LIMIT 1"));
+                schemaCapabilities.hasReceiptItemTagId = true;
+                debugLog('receiptitem.tagId: EXISTS', 'success');
+            } catch (e) {
+                debugLog('receiptitem.tagId: NOT FOUND (' + e.message + ')', 'warning');
+            }
+
+            // Probe shipitem.tagId
+            try {
+                JSON.parse(runQuery("SELECT id, tagId, soItemId FROM shipitem LIMIT 1"));
+                schemaCapabilities.hasShipItemTagId = true;
+                debugLog('shipitem.tagId: EXISTS', 'success');
+            } catch (e) {
+                debugLog('shipitem.tagId: NOT FOUND (' + e.message + ')', 'warning');
+            }
+
+            // Check tag row count
+            if (schemaCapabilities.hasTagTable) {
+                try {
+                    var cnt = JSON.parse(runQuery("SELECT COUNT(*) AS cnt FROM tag"));
+                    schemaCapabilities.tagCount = parseInt(cnt[0].cnt) || 0;
+                    debugLog('tag row count: ' + schemaCapabilities.tagCount, 'info');
+                } catch (e) {
+                    debugLog('tag count failed: ' + e.message, 'warning');
+                }
+            }
+
+            // Compute master flag
+            schemaCapabilities.useTagTracing = schemaCapabilities.hasTagTable &&
+                schemaCapabilities.hasPickItemTable &&
+                schemaCapabilities.tagCount > 0 &&
+                (schemaCapabilities.hasReceiptItemTagId || schemaCapabilities.hasShipItemTagId);
+
+            debugLog('Tag tracing ' + (schemaCapabilities.useTagTracing ? 'ENABLED' : 'DISABLED (falling back to InventoryLog)'), schemaCapabilities.useTagTracing ? 'success' : 'warning');
+        }
+
+        /**
+         * Utility: chunk an array and run a query function for each batch
+         */
+        function batchQuery(items, batchSize, queryFn) {
+            var results = [];
+            for (var i = 0; i < items.length; i += batchSize) {
+                var batch = items.slice(i, i + batchSize);
+                var batchResults = queryFn(batch);
+                for (var j = 0; j < batchResults.length; j++) results.push(batchResults[j]);
+            }
+            return results;
+        }
+
+        /**
+         * Build SQL IN clause from array of values
+         */
+        function buildInClause(values) {
+            return values.map(function(v) { return "'" + escapeSQL(String(v)) + "'"; }).join(', ');
+        }
+
+        /**
+         * Build SQL IN clause from array of numeric IDs
+         */
+        function buildIdInClause(ids) {
+            return ids.map(function(id) { return parseInt(id); }).join(', ');
+        }
+
+        // ---- Tag seed queries: find initial tags for a search term ----
+
+        function findTagsForPO(poNum) {
+            if (!schemaCapabilities.hasReceiptItemTagId) return [];
+            try {
+                var q = "SELECT ri.tagId, t.partId, p.Num AS partnum, ri.qty " +
+                    "FROM receiptitem ri " +
+                    "INNER JOIN poitem poi ON ri.poItemId = poi.id " +
+                    "INNER JOIN po ON poi.poId = po.id " +
+                    "INNER JOIN tag t ON ri.tagId = t.id " +
+                    "INNER JOIN part p ON t.partId = p.id " +
+                    "WHERE po.Num = '" + escapeSQL(poNum) + "'";
+                debugLog('Tag seed: PO ' + poNum, 'query');
+                return JSON.parse(runQuery(q)) || [];
+            } catch (e) { debugLog('findTagsForPO error: ' + e.message, 'error'); return []; }
+        }
+
+        function findTagsForWO(woNum) {
+            var results = [];
+            // Consumed tags (via pickitem)
+            if (schemaCapabilities.hasPickItemTable) {
+                try {
+                    var q1 = "SELECT pi.tagId, t.partId, p.Num AS partnum, pi.qty, 'consumed' AS role " +
+                        "FROM pickitem pi " +
+                        "INNER JOIN woitem wi ON pi.woItemId = wi.id " +
+                        "INNER JOIN wo ON wi.woId = wo.id " +
+                        "INNER JOIN tag t ON pi.tagId = t.id " +
+                        "INNER JOIN part p ON t.partId = p.id " +
+                        "WHERE wo.Num = '" + escapeSQL(woNum) + "'";
+                    debugLog('Tag seed: WO ' + woNum + ' consumed', 'query');
+                    var r1 = JSON.parse(runQuery(q1)) || [];
+                    for (var i = 0; i < r1.length; i++) results.push(r1[i]);
+                } catch (e) { debugLog('findTagsForWO consumed error: ' + e.message, 'error'); }
+
+                // destTag (new tag after pick)
+                try {
+                    var q2 = "SELECT pi.destTagId AS tagId, t.partId, p.Num AS partnum, pi.qty, 'produced' AS role " +
+                        "FROM pickitem pi " +
+                        "INNER JOIN woitem wi ON pi.woItemId = wi.id " +
+                        "INNER JOIN wo ON wi.woId = wo.id " +
+                        "INNER JOIN tag t ON pi.destTagId = t.id " +
+                        "INNER JOIN part p ON t.partId = p.id " +
+                        "WHERE wo.Num = '" + escapeSQL(woNum) + "' AND pi.destTagId IS NOT NULL";
+                    debugLog('Tag seed: WO ' + woNum + ' destTag', 'query');
+                    var r2 = JSON.parse(runQuery(q2)) || [];
+                    for (var j = 0; j < r2.length; j++) results.push(r2[j]);
+                } catch (e) { debugLog('findTagsForWO destTag error: ' + e.message, 'error'); }
+            }
+
+            // Produced tags (tag.woItemId → woitem → wo)
+            if (schemaCapabilities.hasTagWoItemId) {
+                try {
+                    var q3 = "SELECT t.id AS tagId, t.partId, p.Num AS partnum, t.qty, 'produced' AS role " +
+                        "FROM tag t " +
+                        "INNER JOIN woitem wi ON t.woItemId = wi.id " +
+                        "INNER JOIN wo ON wi.woId = wo.id " +
+                        "INNER JOIN part p ON t.partId = p.id " +
+                        "WHERE wo.Num = '" + escapeSQL(woNum) + "'";
+                    debugLog('Tag seed: WO ' + woNum + ' produced (tag.woItemId)', 'query');
+                    var r3 = JSON.parse(runQuery(q3)) || [];
+                    for (var k = 0; k < r3.length; k++) results.push(r3[k]);
+                } catch (e) { debugLog('findTagsForWO produced error: ' + e.message, 'error'); }
+            }
+
+            return results;
+        }
+
+        function findTagsForSO(soNum) {
+            if (!schemaCapabilities.hasShipItemTagId) return [];
+            try {
+                var q = "SELECT si.tagId, t.partId, p.Num AS partnum, si.qtyShipped AS qty " +
+                    "FROM shipitem si " +
+                    "INNER JOIN soitem soi ON si.soItemId = soi.id " +
+                    "INNER JOIN so ON soi.soId = so.id " +
+                    "INNER JOIN tag t ON si.tagId = t.id " +
+                    "INNER JOIN part p ON t.partId = p.id " +
+                    "WHERE so.Num = '" + escapeSQL(soNum) + "'";
+                debugLog('Tag seed: SO ' + soNum, 'query');
+                return JSON.parse(runQuery(q)) || [];
+            } catch (e) { debugLog('findTagsForSO error: ' + e.message, 'error'); return []; }
+        }
+
+        function findTagsByPart(partNum) {
+            try {
+                var q = "SELECT t.id AS tagId, t.partId, p.Num AS partnum, t.qty " +
+                    "FROM tag t " +
+                    "INNER JOIN part p ON t.partId = p.id " +
+                    "WHERE p.Num LIKE '%" + escapeSQL(partNum) + "%' LIMIT 500";
+                debugLog('Tag seed: part ' + partNum, 'query');
+                return JSON.parse(runQuery(q)) || [];
+            } catch (e) { debugLog('findTagsByPart error: ' + e.message, 'error'); return []; }
+        }
+
+        // ---- Tag expansion: find orders linked to a set of tag IDs ----
+
+        function findOrdersFromTags(tagIds) {
+            if (!tagIds || tagIds.length === 0) return [];
+            var orders = []; // { ordertype, ordernum, tagId, partnum }
+
+            return batchQuery(tagIds, 200, function(batch) {
+                var batchOrders = [];
+                var idIn = buildIdInClause(batch);
+
+                // PO orders via receiptitem
+                if (schemaCapabilities.hasReceiptItemTagId) {
+                    try {
+                        var q1 = "SELECT ri.tagId, po.Num AS ordernum, 'PO' AS ordertype, " +
+                            "v.Name AS entityname, p.Num AS partnum " +
+                            "FROM receiptitem ri " +
+                            "INNER JOIN poitem poi ON ri.poItemId = poi.id " +
+                            "INNER JOIN po ON poi.poId = po.id " +
+                            "LEFT JOIN vendor v ON po.vendorId = v.id " +
+                            "INNER JOIN tag t ON ri.tagId = t.id " +
+                            "INNER JOIN part p ON t.partId = p.id " +
+                            "WHERE ri.tagId IN (" + idIn + ")";
+                        var r1 = JSON.parse(runQuery(q1)) || [];
+                        for (var i = 0; i < r1.length; i++) batchOrders.push(r1[i]);
+                    } catch (e) { debugLog('findOrdersFromTags PO error: ' + e.message, 'error'); }
+                }
+
+                // WO orders via pickitem (consumed)
+                if (schemaCapabilities.hasPickItemTable) {
+                    try {
+                        var q2 = "SELECT pi.tagId, wo.Num AS ordernum, 'WO' AS ordertype, " +
+                            "'' AS entityname, p.Num AS partnum " +
+                            "FROM pickitem pi " +
+                            "INNER JOIN woitem wi ON pi.woItemId = wi.id " +
+                            "INNER JOIN wo ON wi.woId = wo.id " +
+                            "INNER JOIN tag t ON pi.tagId = t.id " +
+                            "INNER JOIN part p ON t.partId = p.id " +
+                            "WHERE pi.tagId IN (" + idIn + ")";
+                        var r2 = JSON.parse(runQuery(q2)) || [];
+                        for (var j = 0; j < r2.length; j++) batchOrders.push(r2[j]);
+                    } catch (e) { debugLog('findOrdersFromTags WO consumed error: ' + e.message, 'error'); }
+
+                    // WO via pickitem destTag
+                    try {
+                        var q2b = "SELECT pi.destTagId AS tagId, wo.Num AS ordernum, 'WO' AS ordertype, " +
+                            "'' AS entityname, p.Num AS partnum " +
+                            "FROM pickitem pi " +
+                            "INNER JOIN woitem wi ON pi.woItemId = wi.id " +
+                            "INNER JOIN wo ON wi.woId = wo.id " +
+                            "INNER JOIN tag t ON pi.destTagId = t.id " +
+                            "INNER JOIN part p ON t.partId = p.id " +
+                            "WHERE pi.destTagId IN (" + idIn + ")";
+                        var r2b = JSON.parse(runQuery(q2b)) || [];
+                        for (var jb = 0; jb < r2b.length; jb++) batchOrders.push(r2b[jb]);
+                    } catch (e) { debugLog('findOrdersFromTags WO destTag error: ' + e.message, 'error'); }
+                }
+
+                // WO orders via tag.woItemId (produced)
+                if (schemaCapabilities.hasTagWoItemId) {
+                    try {
+                        var q3 = "SELECT t.id AS tagId, wo.Num AS ordernum, 'WO' AS ordertype, " +
+                            "'' AS entityname, p.Num AS partnum " +
+                            "FROM tag t " +
+                            "INNER JOIN woitem wi ON t.woItemId = wi.id " +
+                            "INNER JOIN wo ON wi.woId = wo.id " +
+                            "INNER JOIN part p ON t.partId = p.id " +
+                            "WHERE t.id IN (" + idIn + ") AND t.woItemId IS NOT NULL";
+                        var r3 = JSON.parse(runQuery(q3)) || [];
+                        for (var k = 0; k < r3.length; k++) batchOrders.push(r3[k]);
+                    } catch (e) { debugLog('findOrdersFromTags WO produced error: ' + e.message, 'error'); }
+                }
+
+                // SO orders via shipitem
+                if (schemaCapabilities.hasShipItemTagId) {
+                    try {
+                        var q4 = "SELECT si.tagId, so.Num AS ordernum, 'SO' AS ordertype, " +
+                            "c.Name AS entityname, p.Num AS partnum " +
+                            "FROM shipitem si " +
+                            "INNER JOIN soitem soi ON si.soItemId = soi.id " +
+                            "INNER JOIN so ON soi.soId = so.id " +
+                            "LEFT JOIN customer c ON so.customerId = c.id " +
+                            "INNER JOIN tag t ON si.tagId = t.id " +
+                            "INNER JOIN part p ON t.partId = p.id " +
+                            "WHERE si.tagId IN (" + idIn + ")";
+                        var r4 = JSON.parse(runQuery(q4)) || [];
+                        for (var l = 0; l < r4.length; l++) batchOrders.push(r4[l]);
+                    } catch (e) { debugLog('findOrdersFromTags SO error: ' + e.message, 'error'); }
+                }
+
+                return batchOrders;
+            });
+        }
+
+        /**
+         * Get all tag IDs associated with an order (reverse lookup)
+         */
+        function getTagsForOrder(orderType, orderNum) {
+            var tagIds = {};
+            if (orderType === 'PO') {
+                var tags = findTagsForPO(orderNum);
+                for (var i = 0; i < tags.length; i++) tagIds[tags[i].tagId] = true;
+            } else if (orderType === 'WO') {
+                var tags2 = findTagsForWO(orderNum);
+                for (var j = 0; j < tags2.length; j++) tagIds[tags2[j].tagId] = true;
+            } else if (orderType === 'SO') {
+                var tags3 = findTagsForSO(orderNum);
+                for (var k = 0; k < tags3.length; k++) tagIds[tags3[k].tagId] = true;
+            }
+            return Object.keys(tagIds).map(function(id) { return parseInt(id); });
+        }
+
+        /**
+         * BFS graph traversal from seed tag IDs
+         * Returns { orders: [{ordertype, ordernum}], orderLinks: {"PO:123": ["WO:456"]} }
+         */
+        function traceFromTags(seedTagIds, maxDepth) {
+            maxDepth = maxDepth || 5;
+            var visited = {};       // tagId -> true
+            var orderSet = {};      // "PO:123" -> {ordertype, ordernum, entityname}
+            var tagToOrders = {};   // tagId -> ["PO:123", "WO:456"]
+            orderLinks = {};        // reset global
+
+            var frontier = [];
+            for (var s = 0; s < seedTagIds.length; s++) {
+                var sid = parseInt(seedTagIds[s]);
+                if (!visited[sid]) { frontier.push(sid); visited[sid] = true; }
+            }
+
+            var depth = 0;
+            while (frontier.length > 0 && depth < maxDepth) {
+                depth++;
+                debugLog('BFS depth ' + depth + ': expanding ' + frontier.length + ' tags...', 'info');
+
+                // Cap frontier size
+                if (frontier.length > 500) {
+                    debugLog('WARNING: frontier capped at 500 tags (had ' + frontier.length + ')', 'warning');
+                    frontier = frontier.slice(0, 500);
+                }
+
+                // Find all orders linked to these tags
+                var foundOrders = findOrdersFromTags(frontier);
+                debugLog('BFS depth ' + depth + ': found ' + foundOrders.length + ' order-tag links', 'info');
+
+                // Build tag-to-order mapping and create edges
+                for (var f = 0; f < foundOrders.length; f++) {
+                    var fo = foundOrders[f];
+                    var nodeKey = fo.ordertype + ':' + fo.ordernum;
+                    var tagId = parseInt(fo.tagId);
+
+                    // Register order
+                    if (!orderSet[nodeKey]) {
+                        orderSet[nodeKey] = { ordertype: fo.ordertype, ordernum: fo.ordernum, entityname: fo.entityname || '' };
+                    }
+
+                    // Track tag-to-order mapping
+                    if (!tagToOrders[tagId]) tagToOrders[tagId] = [];
+                    if (tagToOrders[tagId].indexOf(nodeKey) === -1) tagToOrders[tagId].push(nodeKey);
+                }
+
+                // Build explicit order links from shared tags
+                for (var tid in tagToOrders) {
+                    if (!tagToOrders.hasOwnProperty(tid)) continue;
+                    var linked = tagToOrders[tid];
+                    for (var la = 0; la < linked.length; la++) {
+                        for (var lb = la + 1; lb < linked.length; lb++) {
+                            if (!orderLinks[linked[la]]) orderLinks[linked[la]] = [];
+                            if (!orderLinks[linked[lb]]) orderLinks[linked[lb]] = [];
+                            if (orderLinks[linked[la]].indexOf(linked[lb]) === -1) orderLinks[linked[la]].push(linked[lb]);
+                            if (orderLinks[linked[lb]].indexOf(linked[la]) === -1) orderLinks[linked[lb]].push(linked[la]);
+                        }
+                    }
+                }
+
+                // Check order cap
+                if (Object.keys(orderSet).length > 200) {
+                    debugLog('WARNING: order cap reached (200), stopping BFS', 'warning');
+                    break;
+                }
+
+                // For each NEW order found this iteration, get its other tags to expand further
+                var nextFrontier = [];
+                var newOrderKeys = [];
+                for (var nk in orderSet) {
+                    if (!orderSet.hasOwnProperty(nk) || orderSet[nk]._expanded) continue;
+                    newOrderKeys.push(nk);
+                    orderSet[nk]._expanded = true;
+                }
+
+                for (var no = 0; no < newOrderKeys.length; no++) {
+                    var oKey = newOrderKeys[no];
+                    var oParts = oKey.split(':');
+                    var oType = oParts[0], oNum = oParts.slice(1).join(':');
+                    var otherTags = getTagsForOrder(oType, oNum);
+                    for (var ot = 0; ot < otherTags.length; ot++) {
+                        if (!visited[otherTags[ot]]) {
+                            visited[otherTags[ot]] = true;
+                            nextFrontier.push(otherTags[ot]);
+                        }
+                    }
+                }
+
+                frontier = nextFrontier;
+                if (nextFrontier.length === 0) {
+                    debugLog('BFS complete: no more tags to expand', 'success');
+                }
+            }
+
+            var orderList = [];
+            for (var ok in orderSet) {
+                if (orderSet.hasOwnProperty(ok)) {
+                    delete orderSet[ok]._expanded;
+                    orderList.push(orderSet[ok]);
+                }
+            }
+
+            debugLog('Tag trace complete: ' + orderList.length + ' orders found in ' + depth + ' depth(s)', 'success');
+            return { orders: orderList, orderLinks: orderLinks };
+        }
+
+        /**
+         * Load InventoryLog movements for a list of discovered orders
+         */
+        function loadMovementsForOrders(orders, dynCols, lgCond) {
+            var poNums = [], woNums = [], soNums = [];
+            for (var i = 0; i < orders.length; i++) {
+                if (orders[i].ordertype === 'PO') poNums.push(orders[i].ordernum);
+                else if (orders[i].ordertype === 'WO') woNums.push(orders[i].ordernum);
+                else if (orders[i].ordertype === 'SO') soNums.push(orders[i].ordernum);
+            }
+
+            var allMovements = [];
+
+            // Load PO movements
+            if (poNums.length > 0) {
+                var poIn = buildInClause(poNums);
+                var poWhere = "po_num.Num IN (" + poIn + ")" + lgCond;
+                debugLog('Loading movements for ' + poNums.length + ' POs...', 'query');
+                try {
+                    var poMoves = JSON.parse(runQuery(buildMovementQuery(poWhere, dynCols))) || [];
+                    for (var p = 0; p < poMoves.length; p++) allMovements.push(poMoves[p]);
+                } catch (e) { debugLog('PO movement load error: ' + e.message, 'error'); }
+            }
+
+            // Load WO movements
+            if (woNums.length > 0) {
+                var woIn = buildInClause(woNums);
+                var woWhere = "wo_num.Num IN (" + woIn + ")" + lgCond;
+                debugLog('Loading movements for ' + woNums.length + ' WOs...', 'query');
+                try {
+                    var woMoves = JSON.parse(runQuery(buildMovementQuery(woWhere, dynCols))) || [];
+                    for (var w = 0; w < woMoves.length; w++) allMovements.push(woMoves[w]);
+                } catch (e) { debugLog('WO movement load error: ' + e.message, 'error'); }
+            }
+
+            // Load SO movements
+            if (soNums.length > 0) {
+                var soIn = buildInClause(soNums);
+                var soWhere = "so_num.Num IN (" + soIn + ")" + lgCond;
+                debugLog('Loading movements for ' + soNums.length + ' SOs...', 'query');
+                try {
+                    var soMoves = JSON.parse(runQuery(buildMovementQuery(soWhere, dynCols))) || [];
+                    for (var sv = 0; sv < soMoves.length; sv++) allMovements.push(soMoves[sv]);
+                } catch (e) { debugLog('SO movement load error: ' + e.message, 'error'); }
+            }
+
+            // Dedup by ilid
+            var seen = {};
+            var deduped = [];
+            for (var d = 0; d < allMovements.length; d++) {
+                if (!seen[allMovements[d].ilid]) {
+                    seen[allMovements[d].ilid] = true;
+                    deduped.push(allMovements[d]);
+                }
+            }
+
+            debugLog('Loaded ' + deduped.length + ' movements for ' + orders.length + ' orders', 'success');
+            return deduped;
+        }
+
+        // ============================================================================
         // INITIALIZATION
         // ============================================================================
         window.onload = function() {
@@ -2055,6 +2684,7 @@
             }
             debugLog('Traceability Report initialized', 'info');
             discoverTrackingTypes();
+            discoverSchemaCapabilities();
             loadLocationGroups();
             updateSearchPlaceholder();
         };
