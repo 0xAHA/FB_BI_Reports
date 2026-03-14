@@ -362,6 +362,18 @@
             color: #1e40af;
         }
 
+        .tracking-chip.clickable {
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .tracking-chip.clickable:hover {
+            background: #dbeafe;
+            border-color: #93c5fd;
+            box-shadow: 0 1px 3px rgba(59, 130, 246, 0.25);
+            transform: translateY(-1px);
+        }
+
         .tracking-chip .chip-label {
             color: #64748b;
             font-weight: 600;
@@ -1618,8 +1630,13 @@
                             if (!entry.tracking.hasOwnProperty(etk)) continue;
                             var tLabel2 = '';
                             for (var tti = 0; tti < trackingTypes.length; tti++) { if ('tracking_' + trackingTypes[tti].id === etk) { tLabel2 = trackingTypes[tti].abbr || trackingTypes[tti].name; break; } }
-                            var trackVals = Object.keys(entry.tracking[etk]).join(', ');
-                            html += '<span class="tracking-chip"><span class="chip-label">' + escapeHTML(tLabel2) + '</span> ' + escapeHTML(formatTrackingValue(etk, trackVals)) + '</span>';
+                            var trackValArr = Object.keys(entry.tracking[etk]);
+                            for (var tvIdx = 0; tvIdx < trackValArr.length; tvIdx++) {
+                                var singleVal = trackValArr[tvIdx];
+                                html += '<span class="tracking-chip clickable" onclick="drillIntoTracking(\'' + escapeSQL(singleVal) + '\', \'' + escapeSQL(entry.partnum) + '\')" title="Click to trace this value">';
+                                html += '<span class="chip-label">' + escapeHTML(tLabel2) + '</span> ' + escapeHTML(formatTrackingValue(etk, singleVal));
+                                html += '</span>';
+                            }
                         }
                         html += '</div>';
                     }
@@ -1637,6 +1654,19 @@
         }
 
         function closeDrillPanel() { var p = document.getElementById('drillPanel'); if (p) p.classList.remove('visible'); var c = document.querySelectorAll('.trace-order-card, .gantt-bar'); for (var i = 0; i < c.length; i++) c[i].classList.remove('active'); }
+
+        /**
+         * Drill into a specific tracking value from the drill panel.
+         * Sets the search type to 'tracking', fills in the value, and re-executes search.
+         */
+        function drillIntoTracking(trackingValue, partNum) {
+            debugLog('Drill-down: tracing "' + trackingValue + '" from part ' + partNum, 'info');
+            document.getElementById('searchTypeFilter').value = 'tracking';
+            document.getElementById('searchInput').value = trackingValue;
+            updateSearchPlaceholder();
+            closeDrillPanel();
+            executeSearch();
+        }
 
         function renderTimelineNode(row) {
             var label = getMovementLabel(row), colors = getMovementColors(row);
@@ -1812,20 +1842,98 @@
             var woNums = {}; for (var i = 0; i < results.length; i++) { if (results[i].ordertype === 'WO' && results[i].ordernum) woNums[results[i].ordernum] = true; }
             var woList = Object.keys(woNums); if (woList.length === 0) return results;
             var woIn = woList.map(function(n) { return "'" + escapeSQL(n) + "'"; }).join(', ');
-            debugLog('WO BOM expansion for ' + woList.length + ' WOs...', 'query');
+
+            // Step 1: Get ALL movements for these WOs directly (consume, yield, etc.)
+            debugLog('WO full expansion for ' + woList.length + ' WOs...', 'query');
+            var woDirectWhere = "wo_num.Num IN (" + woIn + ")" + lgCond;
+            try {
+                var woDirectMoves = JSON.parse(runQuery(buildMovementQuery(woDirectWhere, dynCols))) || [];
+                var existIds = {}; for (var k = 0; k < results.length; k++) existIds[results[k].ilid] = true;
+                for (var j = 0; j < woDirectMoves.length; j++) {
+                    if (!existIds[woDirectMoves[j].ilid]) { results.push(woDirectMoves[j]); existIds[woDirectMoves[j].ilid] = true; }
+                }
+                debugLog('WO direct: added ' + (results.length - Object.keys(existIds).length + woDirectMoves.length) + ' movements', 'info');
+            } catch (e) { debugLog('WO direct expansion error: ' + e.message, 'error'); }
+
+            // Step 2: Get BOM parts and their receive/consume movements
             var bom = JSON.parse(runQuery("SELECT wo.Num AS wonum, p.Num AS partnum FROM Wo wo INNER JOIN MoItem mi ON wo.MoItemId = mi.Id INNER JOIN BomItem bi ON bi.BomId = mi.BomId INNER JOIN Part p ON bi.PartId = p.Id WHERE wo.Num IN (" + woIn + ")")) || [];
-            if (bom.length === 0) return results;
-            // Only expand BOM parts that have matching tracking values in our results
-            var resultParts = {}; for (var rp = 0; rp < results.length; rp++) { if (results[rp].partnum) resultParts[results[rp].partnum] = true; }
-            var bomParts = {}; for (var b = 0; b < bom.length; b++) { if (resultParts[bom[b].partnum]) bomParts[bom[b].partnum] = true; }
-            // If no overlap, include all BOM parts
-            if (Object.keys(bomParts).length === 0) { for (var b2 = 0; b2 < bom.length; b2++) bomParts[bom[b2].partnum] = true; }
-            var partIn = Object.keys(bomParts).map(function(p) { return "'" + escapeSQL(p) + "'"; }).join(', ');
-            // No date bounds on expansion — find all related movements regardless of date
-            var where = "p.Num IN (" + partIn + ") AND il.TypeId IN (10, 50)" + lgCond;
-            var expanded = JSON.parse(runQuery(buildMovementQuery(where, dynCols))) || [];
-            var existIds = {}; for (var k = 0; k < results.length; k++) existIds[results[k].ilid] = true;
-            for (var j = 0; j < expanded.length; j++) { if (!existIds[expanded[j].ilid]) { results.push(expanded[j]); existIds[expanded[j].ilid] = true; } }
+            if (bom.length > 0) {
+                var bomParts = {}; for (var b = 0; b < bom.length; b++) bomParts[bom[b].partnum] = true;
+                var partIn = Object.keys(bomParts).map(function(p) { return "'" + escapeSQL(p) + "'"; }).join(', ');
+                var where = "p.Num IN (" + partIn + ")" + lgCond;
+                var expanded = JSON.parse(runQuery(buildMovementQuery(where, dynCols))) || [];
+                var existIds2 = {}; for (var k2 = 0; k2 < results.length; k2++) existIds2[results[k2].ilid] = true;
+                for (var j2 = 0; j2 < expanded.length; j2++) {
+                    if (!existIds2[expanded[j2].ilid]) { results.push(expanded[j2]); existIds2[expanded[j2].ilid] = true; }
+                }
+            }
+
+            // Step 3: Trace consumed parts' tracking values back to POs
+            results = traceConsumedPartsToSource(results, woNums, dynCols, lgCond);
+
+            return results;
+        }
+
+        /**
+         * For consumed parts on WOs, find their tracking values and trace those
+         * back to source POs. This allows recall tracing from finished goods
+         * back through raw material suppliers.
+         */
+        function traceConsumedPartsToSource(results, woNums, dynCols, lgCond) {
+            // Collect tracking values from consumed movements on our WOs
+            var consumedTracking = [];
+            for (var i = 0; i < results.length; i++) {
+                var r = results[i];
+                if (String(r.movementtypeid) !== '50') continue; // only consume movements
+                if (r.ordertype !== 'WO' || !woNums[r.ordernum]) continue; // only our WOs
+                for (var t = 0; t < trackingTypes.length; t++) {
+                    var tt = trackingTypes[t], tkey = 'tracking_' + tt.id;
+                    if (r[tkey]) {
+                        var vals = r[tkey].split(', ');
+                        for (var v = 0; v < vals.length; v++) {
+                            var vv = vals[v].trim();
+                            if (vv) consumedTracking.push({ trackingType: tt, value: vv, partnum: r.partnum });
+                        }
+                    }
+                }
+            }
+            if (consumedTracking.length === 0) return results;
+
+            // Group by tracking type for efficient query
+            var byType = {};
+            var partSet = {};
+            for (var ct = 0; ct < consumedTracking.length; ct++) {
+                var key = consumedTracking[ct].trackingType.id;
+                if (!byType[key]) byType[key] = { trackingType: consumedTracking[ct].trackingType, values: [] };
+                if (byType[key].values.indexOf(consumedTracking[ct].value) === -1) byType[key].values.push(consumedTracking[ct].value);
+                partSet[consumedTracking[ct].partnum] = true;
+            }
+
+            var tvList = [];
+            for (var tk in byType) { if (byType.hasOwnProperty(tk)) tvList.push(byType[tk]); }
+
+            if (tvList.length === 0) return results;
+
+            // Build tracking conditions for consumed parts only
+            var trackConds = buildTrackingConditions(tvList);
+            var partIn = Object.keys(partSet).map(function(p) { return "'" + escapeSQL(p) + "'"; }).join(', ');
+            var where = "(" + trackConds + ") AND p.Num IN (" + partIn + ")" + lgCond;
+
+            debugLog('Tracing ' + consumedTracking.length + ' consumed tracking values to source POs...', 'query');
+            try {
+                var sourceMovements = JSON.parse(runQuery(buildMovementQuery(where, dynCols))) || [];
+                var existIds = {}; for (var ei = 0; ei < results.length; ei++) existIds[results[ei].ilid] = true;
+                var added = 0;
+                for (var si = 0; si < sourceMovements.length; si++) {
+                    if (!existIds[sourceMovements[si].ilid]) {
+                        results.push(sourceMovements[si]);
+                        existIds[sourceMovements[si].ilid] = true;
+                        added++;
+                    }
+                }
+                debugLog('Consumed-part tracing: added ' + added + ' source movements (POs/WOs)', 'success');
+            } catch (e) { debugLog('Consumed-part tracing error: ' + e.message, 'error'); }
+
             return results;
         }
 
