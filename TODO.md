@@ -153,3 +153,34 @@
 - [x] Apply to: Dashboard_Combined.htm (added moment.js and MOMENT_DATE_FORMAT conversion)
 - [x] Apply to: Individual pages (Open_Sales_Orders_Table_Simple, Open_Purchase_Orders_Table_Simple, etc.)
 - [x] Date filters now compare against formatted dates (matching displayed format)
+
+---
+
+### WO_Capacity_Planning_Gantt_v3.htm - Quality of Life Updates
+
+#### Gantt Tooltip - BOM vs Finished Good
+- [ ] In the stylised Gantt tooltip, the part number currently shows the Finished Good
+- [ ] Change to show two separate lines:
+  - `BOM: <bom part number>`
+  - `Finished Good: <finished good part number> x <qty>`
+- [ ] This correctly distinguishes the BOM being built from the output part
+
+#### Multi-Select Work Orders in Capacity Calendar
+- [ ] Add Ctrl+Click to toggle selection of individual WO blocks in the month calendar view
+- [ ] When one or more WOs are selected, clicking and dragging any selected WO should move all selected WOs to the same drop date
+- [ ] Consider visual indicator for selected state (e.g. highlighted border or overlay)
+- [ ] Deselect all on plain click of an unselected WO or on click of empty calendar cell
+
+#### Weekend Config Option
+- [ ] Add a config/toggle option to hide weekends from the Gantt and calendar views
+- [ ] When enabled, weekend columns are collapsed or hidden entirely (no scheduling allowed on Sat/Sun)
+- [ ] Consider whether existing WOs scheduled on weekends should be flagged or auto-moved
+
+---
+
+### Dashboard KPI & Tile Help/Explanations
+- [ ] Sales, Purchasing, and Inventory dashboards need explanations for what each KPI tile and chart means
+- [ ] **Option A:** Add tooltip (title attribute or hover popover) to each KPI tile explaining what it measures and how it is calculated
+- [ ] **Option B:** Add a Help button (top-right, next to Refresh) that opens a modal listing all KPIs and tiles with plain-text descriptions
+- [ ] Option B is preferred if explanations are too long for tooltips (e.g. chart tiles)
+- [ ] Applies to: Sales_Dashboard.htm, Purchasing_Dashboard.htm, Inventory_Dashboard.htm
