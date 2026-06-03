@@ -257,11 +257,13 @@ const ReportRCV = (function() {
                 orderLink.href = '#';
                 orderLink.className = 'order-link';
                 orderLink.textContent = row.ordernum;
-                orderLink.onclick = function(e) {
-                    e.preventDefault();
-                    openReceipt(row.ordernum);
-                    return false;
-                };
+                orderLink.onclick = function(type, orderNum) {
+                    return function(e) {
+                        e.preventDefault();
+                        openReceipt(type, orderNum);
+                        return false;
+                    };
+                }(row.type, row.ordernum);
                 td.appendChild(orderLink);
                 td.title = row.ordernum;
             } else {
@@ -311,10 +313,15 @@ const ReportRCV = (function() {
 
     /**
      * Open receipt in Fishbowl
+     * @param {string} type - Order type (PO/SO/TO)
      * @param {string} orderNum - Order number
      */
-    function openReceipt(orderNum) {
-        openModule('Receiving', orderNum);
+    function openReceipt(type, orderNum) {
+        let prefix = '';
+        if (type === 'PO') prefix = 'P';
+        else if (type === 'SO') prefix = 'S';
+        else if (type === 'TO') prefix = 'T';
+        openModule('Receiving', prefix + orderNum);
     }
 
     /**
