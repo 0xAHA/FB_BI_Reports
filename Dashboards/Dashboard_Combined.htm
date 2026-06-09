@@ -10,6 +10,7 @@
 
     <!-- Moment.js for date formatting -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script>
+    <script>{% Script fb-lib %}</script>
 
     <style>
         * {
@@ -431,6 +432,436 @@
     </style>
 </head>
 <body>
+    <!-- ========================================================================
+         Dashboard Settings Architecture (Phase 1 — added 2026-06-08)
+         ------------------------------------------------------------------------
+         Preference resolution order, per key (see `resolve()` below):
+           1. Per-user payload   loadSettings('cdx.bi.dashboard.combined.user.v1')
+                                 — per-user storage (FB convention).
+           2. Admin master       loadReportData() / saveReportData(...)
+                                 — single blob per report, visible to ALL
+                                 users. Writable only by admin. If
+                                 master._userEditingAllowed is false,
+                                 master wins over user for every key.
+                                 Mirrors WO_Capacity_Planning_Gantt_v4.htm
+                                 L1433-67.
+           3. getProperty(name, dflt)  — mapped via PROP_FALLBACK
+           4. DEFAULTS literal
+         loadSettings/saveSettings and loadReportData/saveReportData both
+         fall back to localStorage when the FB bridges are absent.
+         Admin = userName === 'admin' or hasUserAccess('Admin').
+         Settings panel = gear-icon button (top right), opens a side panel.
+         Migration: with no saved user/master state, behaviour is byte-identical
+         to pre-Phase-1 (every key falls through to property → default).
+         ======================================================================== -->
+
+    <!-- Settings Gear Button -->
+    <button id="dashSettingsBtn" type="button" title="Dashboard settings"
+            onclick="DashboardSettings.openPanel()">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true">
+            <path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/>
+        </svg>
+    </button>
+
+    <!-- Settings Panel -->
+    <div id="dashSettingsOverlay" style="display:none;" onclick="DashboardSettings.closePanelIfOverlay(event)">
+        <div id="dashSettingsPanel" onclick="event.stopPropagation()">
+            <div class="ds-header">
+                <h2 style="margin:0; font-size:16px;">Dashboard Settings</h2>
+                <button type="button" class="ds-close" onclick="DashboardSettings.closePanel()" title="Close">&times;</button>
+            </div>
+            <div class="ds-body">
+                <div id="dsLockBadge" class="ds-lock-badge" style="display:none;">
+                    Locked by admin — your changes won't be saved.
+                </div>
+
+                <div class="ds-section">
+                    <label class="ds-label">Columns</label>
+                    <select id="dsCols">
+                        <option value="1">1</option><option value="2">2</option>
+                        <option value="3">3</option><option value="4">4</option>
+                    </select>
+                </div>
+
+                <div class="ds-section">
+                    <label class="ds-label">Tile order &amp; visibility</label>
+                    <ul id="dsTileList" class="ds-tile-list"></ul>
+                    <div style="font-size:11px; color:#64748b;">Drag to reorder. Uncheck to hide a tile.</div>
+                </div>
+
+                <div class="ds-section">
+                    <label class="ds-label" for="dsRows">Rows per tile</label>
+                    <input type="number" id="dsRows" min="1" max="50" step="1" />
+                </div>
+
+                <div class="ds-section">
+                    <label class="ds-label" for="dsRefresh">Auto-refresh (seconds, 0 = off)</label>
+                    <input type="number" id="dsRefresh" min="0" max="3600" step="1" />
+                </div>
+
+                <div class="ds-section ds-checks">
+                    <label><input type="checkbox" id="dsHideEstimates" /> Hide Estimates (Sales Orders)</label>
+                    <label><input type="checkbox" id="dsHideBidRequests" /> Hide Bid Requests (Purchase Orders)</label>
+                    <label><input type="checkbox" id="dsDebug" /> Show debug console</label>
+                </div>
+
+                <!-- Phase 3 — Per-tile column visibility (standard + custom fields) -->
+                <div class="ds-section">
+                    <div class="ds-section-title">Column Visibility</div>
+                    <div class="ds-section-sub">Pick which standard columns and custom fields are visible per tile. Required columns (e.g. order numbers) cannot be hidden.</div>
+                    <div id="dsCfModules"></div>
+                </div>
+
+                <div id="dsAdminSection" class="ds-section ds-admin" style="display:none;">
+                    <label class="ds-label">Admin</label>
+                    <button type="button" class="ds-btn ds-btn-admin" onclick="DashboardSettings.publishMaster()">
+                        Publish as default for everyone
+                    </button>
+                    <button type="button" class="ds-btn ds-btn-admin" id="dsLockBtn" onclick="DashboardSettings.toggleLock()">
+                        Lock user editing
+                    </button>
+                </div>
+            </div>
+            <div class="ds-footer">
+                <button type="button" class="ds-btn ds-btn-secondary" onclick="DashboardSettings.resetToDefaults()">Reset to defaults</button>
+                <button type="button" class="ds-btn ds-btn-primary" onclick="DashboardSettings.saveUser()">Save (just me)</button>
+            </div>
+        </div>
+    </div>
+
+    <style>
+        #dashSettingsBtn {
+            position: fixed; top: 12px; right: 16px; z-index: 1000;
+            background: transparent; color: #94a3b8; border: 1px solid transparent;
+            border-radius: 6px; width: 27px; height: 27px; padding: 0;
+            display: flex; align-items: center; justify-content: center;
+            cursor: pointer; box-shadow: none; opacity: 0.35;
+            transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+        }
+        #dashSettingsBtn svg { width: 15px; height: 15px; }
+        #dashSettingsBtn:hover {
+            opacity: 1; background: #1e293b; color: #fff;
+            border-color: #334155; box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+        }
+        #dashSettingsOverlay {
+            position: fixed; inset: 0; background: rgba(0,0,0,0.45);
+            z-index: 1001; display: flex; justify-content: flex-end;
+        }
+        #dashSettingsPanel {
+            background: #f8fafc; color: #1e293b;
+            width: 380px; max-width: 95vw; height: 100%;
+            overflow-y: auto; box-shadow: -2px 0 12px rgba(0,0,0,0.25);
+            display: flex; flex-direction: column;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+        #dashSettingsPanel .ds-header {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 14px 18px; border-bottom: 1px solid #e2e8f0;
+            background: #fff;
+        }
+        #dashSettingsPanel .ds-close {
+            background: transparent; border: none; font-size: 24px;
+            cursor: pointer; color: #64748b; line-height: 1; padding: 0 4px;
+        }
+        #dashSettingsPanel .ds-body {
+            padding: 14px 18px; flex: 1; overflow-y: auto;
+        }
+        #dashSettingsPanel .ds-section { margin-bottom: 18px; }
+        #dashSettingsPanel .ds-label {
+            display: block; font-weight: 600; font-size: 12px;
+            text-transform: uppercase; letter-spacing: 0.04em;
+            color: #475569; margin-bottom: 6px;
+        }
+        #dashSettingsPanel input[type=number],
+        #dashSettingsPanel select {
+            width: 100%; padding: 6px 8px; font-size: 14px;
+            border: 1px solid #cbd5e1; border-radius: 4px; background: #fff;
+            box-sizing: border-box;
+        }
+        #dashSettingsPanel .ds-tile-list {
+            list-style: none; padding: 0; margin: 0;
+            border: 1px solid #cbd5e1; border-radius: 4px; background: #fff;
+        }
+        #dashSettingsPanel .ds-tile-list li {
+            padding: 6px 10px; border-bottom: 1px solid #e2e8f0;
+            display: flex; align-items: center; gap: 8px; font-size: 13px;
+            cursor: grab; user-select: none;
+        }
+        #dashSettingsPanel .ds-tile-list li:last-child { border-bottom: none; }
+        #dashSettingsPanel .ds-tile-list li.dragging { opacity: 0.4; }
+        #dashSettingsPanel .ds-tile-list li.drag-over { background: #e0f2fe; }
+        #dashSettingsPanel .ds-tile-list .ds-grip { color: #94a3b8; cursor: grab; }
+        #dashSettingsPanel .ds-checks label {
+            display: block; padding: 4px 0; font-size: 13px; cursor: pointer;
+        }
+        #dashSettingsPanel .ds-checks input { margin-right: 6px; }
+        #dashSettingsPanel .ds-footer {
+            padding: 12px 18px; border-top: 1px solid #e2e8f0;
+            background: #fff; display: flex; gap: 8px; justify-content: flex-end;
+        }
+        #dashSettingsPanel .ds-btn {
+            padding: 7px 14px; font-size: 13px; border-radius: 4px;
+            border: 1px solid #cbd5e1; background: #fff; cursor: pointer;
+        }
+        #dashSettingsPanel .ds-btn-primary {
+            background: #2563eb; color: #fff; border-color: #2563eb;
+        }
+        #dashSettingsPanel .ds-btn-primary:hover { background: #1d4ed8; }
+        #dashSettingsPanel .ds-btn-secondary:hover { background: #f1f5f9; }
+        #dashSettingsPanel .ds-btn-admin {
+            display: block; width: 100%; margin-bottom: 6px;
+            background: #fef3c7; border-color: #f59e0b; color: #7c2d12;
+        }
+        #dashSettingsPanel .ds-btn-admin:hover { background: #fde68a; }
+        #dashSettingsPanel .ds-admin { border-top: 1px dashed #cbd5e1; padding-top: 14px; }
+        #dashSettingsPanel .ds-lock-badge {
+            background: #fef3c7; color: #92400e; border: 1px solid #f59e0b;
+            padding: 6px 10px; border-radius: 4px; font-size: 12px; margin-bottom: 14px;
+        }
+        /* Phase 3 — Custom Fields picker */
+        #dashSettingsPanel .ds-section-title {
+            font-weight: 600; font-size: 12px; text-transform: uppercase;
+            letter-spacing: 0.04em; color: #475569; margin-bottom: 4px;
+        }
+        #dashSettingsPanel .ds-section-sub {
+            font-size: 11px; color: #64748b; margin-bottom: 10px;
+        }
+        #dashSettingsPanel .ds-cf-mod {
+            border: 1px solid #e2e8f0; border-radius: 4px; background: #fff;
+            margin-bottom: 6px;
+        }
+        #dashSettingsPanel .ds-cf-head {
+            display: flex; align-items: center; gap: 6px;
+            padding: 6px 10px; cursor: pointer; user-select: none;
+            font-size: 13px; font-weight: 600; color: #1e293b;
+        }
+        #dashSettingsPanel .ds-cf-head:hover { background: #f1f5f9; }
+        #dashSettingsPanel .ds-cf-caret {
+            display: inline-block; width: 10px; color: #64748b;
+            transition: transform 0.15s;
+        }
+        #dashSettingsPanel .ds-cf-mod.open .ds-cf-caret { transform: rotate(90deg); }
+        #dashSettingsPanel .ds-cf-count {
+            margin-left: auto; font-size: 11px; color: #64748b; font-weight: 400;
+        }
+        #dashSettingsPanel .ds-cf-body {
+            display: none; padding: 4px 10px 10px 26px; border-top: 1px solid #e2e8f0;
+        }
+        #dashSettingsPanel .ds-cf-mod.open .ds-cf-body { display: block; }
+        /* Fallback for older fb-lib that emitted raw <label> rows. */
+        #dashSettingsPanel .ds-cf-body > label {
+            display: flex; align-items: center; gap: 6px;
+            padding: 3px 0; font-size: 13px; cursor: pointer;
+        }
+        #dashSettingsPanel .ds-cf-body > label input { margin: 0; }
+        #dashSettingsPanel .ds-cf-row {
+            display: flex; align-items: center; gap: 6px;
+            padding: 4px 6px; border-radius: 4px;
+        }
+        #dashSettingsPanel .ds-cf-row + .ds-cf-row { margin-top: 2px; }
+        #dashSettingsPanel .ds-cf-row:hover { background: #f8fafc; }
+        #dashSettingsPanel .ds-cf-row.ds-cf-dragging { opacity: 0.4; }
+        #dashSettingsPanel .ds-cf-row.ds-cf-drop-over { background: #dbeafe; box-shadow: inset 0 2px 0 0 #3b82f6; }
+        #dashSettingsPanel .ds-cf-grip {
+            cursor: grab; color: #94a3b8; user-select: none; padding: 0 2px;
+            font-size: 13px; line-height: 1;
+        }
+        #dashSettingsPanel .ds-cf-grip:active { cursor: grabbing; }
+        #dashSettingsPanel .ds-cf-row label {
+            display: flex; align-items: center; gap: 6px;
+            font-size: 13px; cursor: pointer; flex: 1; margin: 0;
+        }
+        #dashSettingsPanel .ds-cf-row label input { margin: 0; }
+        #dashSettingsPanel .ds-cf-empty {
+            font-size: 12px; color: #94a3b8; font-style: italic;
+            padding: 6px 0;
+        }
+        #dashSettingsPanel .ds-cf-type {
+            display: inline-block; background: #f1f5f9; color: #475569;
+            border-radius: 8px; padding: 1px 7px; font-size: 10px;
+            font-weight: 500; text-transform: none; letter-spacing: 0;
+        }
+    </style>
+
+    <script>
+        // ========================================================================
+        // FBLib init + shims (replaces the inline DashboardSettingsCore IIFE).
+        // Must run BEFORE the tile-module IIFEs since those call dashResolve()
+        // at module-load time and capture the result into closure consts.
+        // ========================================================================
+        FBLib.Settings.init({
+            userKey:   'cdx.bi.dashboard.combined.user.v1',
+            masterKey: 'cdx.bi.dashboard.combined.master.v1',
+            defaultTileOrder: ['SO','PO','WO','RMA','TO','PICK','RCV','SHIP'],
+            tileToTable: {
+                SO: 'so', PO: 'po', WO: 'wo', RMA: 'rma',
+                TO: 'xo', PICK: 'pick', RCV: 'receipt', SHIP: 'ship'
+            },
+            defaults: {
+                v: 1,
+                layout: { cols: 2, tileOrder: ['SO','PO','WO','RMA','TO','PICK','RCV','SHIP'] },
+                rowsPerTile: 5,
+                refreshSec: 0,
+                hideEstimates: false,
+                hideBidRequests: false,
+                debug: false,
+                customFields: { SO: [], PO: [], WO: [], RMA: [], TO: [], PICK: [], RCV: [], SHIP: [] },
+                hiddenStandardColumns: { SO: [], PO: [], WO: [], RMA: [], TO: [], PICK: [], RCV: [], SHIP: [] },
+                columnOrder: { SO: [], PO: [], WO: [], RMA: [], TO: [], PICK: [], RCV: [], SHIP: [] }
+            },
+            propFallback: {
+                layout:          { name: 'BI_DASHBOARD_LAYOUT',    dflt: '2-SO-PO-WO-RMA-TO-PICK-RCV-SHIP',
+                                   parse: function (s) {
+                                       if (!s || typeof s !== 'string') return { cols: 2, tileOrder: ['SO','PO','WO','RMA','TO','PICK','RCV','SHIP'] };
+                                       var parts = s.split('-');
+                                       var cols = parseInt(parts[0], 10);
+                                       cols = isNaN(cols) ? 2 : Math.max(1, Math.min(4, cols));
+                                       var tiles = parts.slice(1).map(function (t) { return t.toUpperCase(); }).filter(Boolean);
+                                       return { cols: cols, tileOrder: tiles.length ? tiles : ['SO','PO','WO','RMA','TO','PICK','RCV','SHIP'] };
+                                   } },
+                rowsPerTile:     { name: 'BI_DASHBOARD_ROWS',      dflt: '5',     parse: function (v) { return parseInt(v, 10) || 5; } },
+                refreshSec:      { name: 'BI_DASHBOARD_REFRESH',   dflt: '0',     parse: function (v) { return parseInt(v, 10) || 0; } },
+                hideEstimates:   { name: 'BI_SO_SHOW_ESTIMATE',    dflt: 'true',  parse: function (v) { return v === 'false' || v === false; } },
+                hideBidRequests: { name: 'BI_PO_SHOW_BID_REQUEST', dflt: 'true',  parse: function (v) { return v === 'false' || v === false; } },
+                debug:           { name: 'BI_SHOW_DEBUG',          dflt: 'false', parse: function (v) { return v === 'true' || v === true; } }
+            }
+        });
+        FBLib.CfCatalog.load();
+
+        // Per-tile static-column manifests. alwaysOn columns cannot be hidden
+        // by the user (drill-through anchors + indicator icons).
+        const _TILE_COLUMNS = {
+            SO:   [
+                { key: 'scheduleindicator', label: 'Schedule', alwaysOn: true },
+                { key: 'statusname',        label: 'Status' },
+                { key: 'num',               label: 'Number', alwaysOn: true },
+                { key: 'datefirstship',     label: 'Date Scheduled' },
+                { key: 'dateissued',        label: 'Date Issued' },
+                { key: 'customername',      label: 'Customer' },
+                { key: 'customerpo',        label: 'Customer PO' }
+            ],
+            PO:   [
+                { key: 'scheduleindicator', label: 'Schedule', alwaysOn: true },
+                { key: 'statusname',        label: 'Status' },
+                { key: 'num',               label: 'Number', alwaysOn: true },
+                { key: 'datescheduled',     label: 'Date Scheduled' },
+                { key: 'dateissued',        label: 'Date Issued' },
+                { key: 'vendorname',        label: 'Vendor' },
+                { key: 'customerso',        label: 'Customer SO' }
+            ],
+            WO:   [
+                { key: 'scheduleindicator',  label: 'Schedule', alwaysOn: true },
+                { key: 'statusname',         label: 'Status' },
+                { key: 'monum',              label: 'MO #' },
+                { key: 'num',                label: 'WO #', alwaysOn: true },
+                { key: 'bomnum',             label: 'BOM #' },
+                { key: 'qty',                label: 'Qty' },
+                { key: 'datescheduledtostart', label: 'Start Date' },
+                { key: 'datescheduled',      label: 'Scheduled Date' }
+            ],
+            RMA:  [
+                { key: 'scheduleindicator', label: 'Schedule', alwaysOn: true },
+                { key: 'statusname',        label: 'Status' },
+                { key: 'type',              label: 'Type' },
+                { key: 'issue',             label: 'Issue' },
+                { key: 'num',               label: 'RMA #', alwaysOn: true },
+                { key: 'product',           label: 'Product' },
+                { key: 'qty',               label: 'Qty' },
+                { key: 'customername',      label: 'Customer' },
+                { key: 'datecreated',       label: 'Date Created' },
+                { key: 'dateexpires',       label: 'Date Expires' }
+            ],
+            TO:   [
+                { key: 'scheduleindicator', label: 'Schedule', alwaysOn: true },
+                { key: 'statusname',        label: 'Status' },
+                { key: 'type',              label: 'Type' },
+                { key: 'num',               label: 'Number', alwaysOn: true },
+                { key: 'datescheduled',     label: 'Date Scheduled' },
+                { key: 'dateissued',        label: 'Date Issued' },
+                { key: 'fromname',          label: 'From' },
+                { key: 'toname',            label: 'To' }
+            ],
+            PICK: [
+                { key: 'scheduleindicator',  label: 'Schedule', alwaysOn: true },
+                { key: 'availabilitystatus', label: 'Availability', alwaysOn: true },
+                { key: 'statusname',         label: 'Status' },
+                { key: 'num',                label: 'Number', alwaysOn: true },
+                { key: 'ordernum',           label: 'Order #' },
+                { key: 'datescheduled',      label: 'Scheduled Date' },
+                { key: 'priorityname',       label: 'Priority' },
+                { key: 'orderinfo',          label: 'Order Info' }
+            ],
+            RCV:  [
+                { key: 'scheduleindicator', label: 'Schedule', alwaysOn: true },
+                { key: 'statusname',        label: 'Status' },
+                { key: 'type',              label: 'Type' },
+                { key: 'ordernum',          label: 'Order #', alwaysOn: true },
+                { key: 'datescheduled',     label: 'Scheduled Date' },
+                { key: 'vendorname',        label: 'Vendor' }
+            ],
+            SHIP: [
+                { key: 'scheduleindicator', label: 'Schedule', alwaysOn: true },
+                { key: 'statusname',        label: 'Status' },
+                { key: 'type',              label: 'Type' },
+                { key: 'num',               label: 'Number', alwaysOn: true },
+                { key: 'ordernum',          label: 'Order #' },
+                { key: 'datescheduled',     label: 'Scheduled Date' },
+                { key: 'shipto',            label: 'Ship To' },
+                { key: 'carrier',           label: 'Carrier' },
+                { key: 'service',           label: 'Service' }
+            ]
+        };
+        Object.keys(_TILE_COLUMNS).forEach(function (code) {
+            FBLib.Columns.register(code, _TILE_COLUMNS[code]);
+        });
+
+        // Register each tile module so CF column-header clicks route to the
+        // right per-tile sortTable() function.
+        ['SO','PO','WO','RMA','TO','PICK','RCV','SHIP'].forEach(function (code) {
+            FBLib.CfCols.registerTileModule(code, 'Report' + code);
+        });
+
+        // Shims — keep the existing call sites in tile modules + Dashboard
+        // controller + DashboardSettings panel working unchanged.
+        window.DashboardCommon       = FBLib.Common;
+        window.DashboardSettingsCore = FBLib.Settings;
+        window.dashResolve           = FBLib.Settings.resolve;
+        window.DashboardCfCols       = FBLib.CfCols;
+        Object.defineProperty(window, 'DashboardCfCatalog',       { get: function () { return FBLib.CfCatalog.map;    } });
+        Object.defineProperty(window, 'DashboardCfCatalogLoaded', { get: function () { return FBLib.CfCatalog.loaded; } });
+    </script>
+
+    <script>
+        // ========================================================================
+        // CF catalog re-init hook. FBLib.CfCatalog.load() (called above) emits
+        // window.onFbLibCfCatalogLoaded() after the catalog query settles. We
+        // notify the settings panel and re-init any tile whose user-selected
+        // CFs are now in the catalog.
+        // ========================================================================
+        window.onFbLibCfCatalogLoaded = function () {
+            if (window.DashboardSettings && typeof DashboardSettings.onCatalogLoaded === 'function') {
+                try { DashboardSettings.onCatalogLoaded(); } catch (_) {}
+            }
+            var TILE_MODULES = {
+                SO: 'ReportSO', PO: 'ReportPO', WO: 'ReportWO',
+                RMA: 'ReportRMA', TO: 'ReportTO', PICK: 'ReportPICK',
+                RCV: 'ReportRCV', SHIP: 'ReportSHIP'
+            };
+            Object.keys(TILE_MODULES).forEach(function (code) {
+                try {
+                    var active = FBLib.Settings.activeCfsFor(code);
+                    if (!active || active.length === 0) return;
+                    var mod = window[TILE_MODULES[code]];
+                    var containerId = 'tile-' + code.toLowerCase();
+                    if (mod && typeof mod.init === 'function' && document.getElementById(containerId)) {
+                        mod.init(containerId);
+                    }
+                } catch (_) {}
+            });
+        };
+    </script>
+
+
     <!-- Dashboard Grid -->
     <div id="dashboardGrid"></div>
 
@@ -445,233 +876,6 @@
         </div>
     </div>
 
-    <script>
-        // ============================================================================
-        // EMBEDDED SCRIPTS - Dashboard Common Utilities  
-        // ============================================================================
-/**
- * Dashboard Common Utilities
- * Shared functions used across all dashboard tiles
- */
-
-window.DashboardCommon = (function() {
-    'use strict';
-
-    // Get Fishbowl properties
-    const FB_DATE_FORMAT = typeof getProperty === 'function' ? getProperty('DateFormatShort', 'MM/dd/yyyy') : 'MM/dd/yyyy';
-    // Convert Java SimpleDateFormat to Moment.js format (dd→DD, yyyy→YYYY)
-    const MOMENT_DATE_FORMAT = FB_DATE_FORMAT
-        .replace(/yyyy/g, 'YYYY')
-        .replace(/yy/g, 'YY')
-        .replace(/dd/g, 'DD');
-    const BI_SHOW_DEBUG_PROP = typeof getProperty === 'function' ? getProperty('BI_SHOW_DEBUG', 'false') : 'false';
-    const DEBUG_MODE = BI_SHOW_DEBUG_PROP === 'true' || BI_SHOW_DEBUG_PROP === true;
-
-    /**
-     * Format date from SQL format to display format using DateFormatShort property
-     * @param {string} dateStr - Date string in YYYY-MM-DD HH:mm:ss format
-     * @returns {string} Formatted date string
-     */
-    function formatDate(dateStr) {
-        if (!dateStr) return '';
-        return moment(dateStr).format(MOMENT_DATE_FORMAT);
-    }
-
-    /**
-     * Get schedule status color for indicator
-     * @param {string} dateStr - Date string in SQL format
-     * @returns {string} Color code: 'red', 'orange', 'blue', or ''
-     */
-    function getScheduleStatus(dateStr) {
-        if (!dateStr) return '';
-
-        // Parse date from SQL format (YYYY-MM-DD HH:mm:ss)
-        var dateParts = dateStr.split(' ')[0].split('-');
-        var schedDate = new Date(dateParts[0], dateParts[1] - 1, dateParts[2]);
-        schedDate.setHours(0, 0, 0, 0);
-
-        var today = new Date();
-        today.setHours(0, 0, 0, 0);
-
-        // Check if today
-        if (schedDate.getTime() === today.getTime()) {
-            return 'orange';
-        }
-
-        // Check if past
-        if (schedDate < today) {
-            return 'red';
-        }
-
-        // Check if within this calendar week (Sunday to Saturday)
-        var todayDay = today.getDay(); // 0 = Sunday, 6 = Saturday
-        var weekStart = new Date(today);
-        weekStart.setDate(today.getDate() - todayDay);
-        var weekEnd = new Date(weekStart);
-        weekEnd.setDate(weekStart.getDate() + 6);
-
-        if (schedDate >= weekStart && schedDate <= weekEnd) {
-            return 'blue';
-        }
-
-        return '';
-    }
-
-    /**
-     * Get status title for availability tooltip (for Picks, RMAs)
-     * @param {string} status - Status code
-     * @param {number} fullItems - Count of fully available items
-     * @param {number} partialItems - Count of partially available items
-     * @param {number} noneItems - Count of unavailable items
-     * @param {number} pendingItems - Count of pending items
-     * @returns {string} Tooltip text
-     */
-    function getStatusTitle(status, fullItems, partialItems, noneItems, pendingItems) {
-        if (status === 'committed') {
-            return 'All items committed (' + pendingItems + ' items)';
-        } else if (status === 'green') {
-            return 'All pending items available (' + fullItems + '/' + pendingItems + ')';
-        } else if (status === 'red') {
-            return 'No pending items available (0/' + pendingItems + ')';
-        } else if (status === 'orange') {
-            return 'Partially available (' + fullItems + ' full, ' + partialItems + ' partial, ' + noneItems + ' none of ' + pendingItems + ' pending)';
-        } else {
-            return 'No pending items (all finished)';
-        }
-    }
-
-    /**
-     * Create schedule indicator SVG icon
-     * @param {string} scheduleStatus - Color status: 'red', 'orange', 'blue'
-     * @param {string} dateStr - Original date string for title
-     * @returns {HTMLElement} SVG element or empty span
-     */
-    function createScheduleIndicator(scheduleStatus, dateStr) {
-        var td = document.createElement('td');
-        td.style.textAlign = 'center';
-
-        if (scheduleStatus) {
-            var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-            svg.setAttribute('class', 'clock-icon');
-            svg.setAttribute('viewBox', '0 0 24 24');
-            svg.setAttribute('fill', 'currentColor');
-            svg.style.width = '20px';
-            svg.style.height = '20px';
-            if (scheduleStatus === 'blue') svg.style.color = '#2d9cdb';
-            else if (scheduleStatus === 'orange') svg.style.color = '#f59e0b';
-            else if (scheduleStatus === 'red') svg.style.color = '#ef4444';
-
-            var path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-            path.setAttribute('d', 'M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm1 10.414V7a1 1 0 10-2 0v6a1 1 0 00.293.707l3 3a1 1 0 001.414-1.414L13 12.414z');
-            path.setAttribute('fill', 'none');
-            path.setAttribute('stroke', 'currentColor');
-            path.setAttribute('stroke-width', '1.8');
-            path.setAttribute('stroke-linecap', 'round');
-            path.setAttribute('stroke-linejoin', 'round');
-            svg.appendChild(path);
-            td.appendChild(svg);
-
-            if (scheduleStatus === 'orange') td.title = 'Scheduled for today';
-            else if (scheduleStatus === 'red') td.title = 'Past due';
-            else if (scheduleStatus === 'blue') td.title = 'Scheduled this week';
-        }
-
-        return td;
-    }
-
-    /**
-     * Create availability status indicator (for Picks, RMAs)
-     * @param {object} row - Data row containing availability status
-     * @returns {HTMLElement} TD element with status indicator
-     */
-    function createAvailabilityIndicator(row) {
-        var td = document.createElement('td');
-
-        if (row.availabilitystatus === 'committed') {
-            var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-            svg.setAttribute('class', 'status-icon-padlock');
-            svg.setAttribute('viewBox', '0 0 16 16');
-            svg.setAttribute('fill', 'currentColor');
-            svg.style.color = '#f59e0b';
-            svg.setAttribute('title', getStatusTitle(row.availabilitystatus, row.fullitems, row.partialitems, row.noneitems, row.pendingitems));
-            var path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-            path.setAttribute('fill-rule', 'evenodd');
-            path.setAttribute('d', 'M5 6.5V4.5a3 3 0 1 1 6 0V6.5h1.5V4.5a4.5 4.5 0 0 0-9 0V6.5H5zM2.5 8A1.5 1.5 0 0 1 4 6.5h8A1.5 1.5 0 0 1 13.5 8v5.5a1.5 1.5 0 0 1-1.5 1.5H4a1.5 1.5 0 0 1-1.5-1.5V8zm10 0a.5.5 0 0 0-.5-.5H4a.5.5 0 0 0-.5.5v5.5a.5.5 0 0 0 .5.5h8a.5.5 0 0 0 .5-.5V8z');
-            svg.appendChild(path);
-            td.appendChild(svg);
-        } else {
-            var circle = document.createElement('div');
-            circle.className = 'status-circle ' + (row.availabilitystatus || 'gray');
-            circle.title = getStatusTitle(row.availabilitystatus, row.fullitems, row.partialitems, row.noneitems, row.pendingitems);
-            td.appendChild(circle);
-        }
-
-        return td;
-    }
-
-    /**
-     * Debug logging utility
-     * @param {string} message - Log message
-     * @param {string} type - Message type: 'info', 'success', 'warning', 'error', 'query'
-     * @param {string} tileId - ID of the tile logging the message
-     */
-    function debugLog(message, type, tileId) {
-        if (!DEBUG_MODE) return;
-
-        var logDiv = document.getElementById('debugLog');
-        if (!logDiv) return;
-
-        var timestamp = new Date().toLocaleTimeString();
-
-        var placeholder = logDiv.querySelector('[style*="italic"]');
-        if (placeholder) {
-            logDiv.innerHTML = '';
-        }
-
-        var colors = {
-            'info': '#60a5fa',
-            'success': '#34d399',
-            'warning': '#fbbf24',
-            'error': '#f87171',
-            'query': '#a78bfa'
-        };
-
-        var entry = document.createElement('div');
-        entry.style.marginBottom = '4px';
-        var tilePrefix = tileId ? '[' + tileId + '] ' : '';
-        entry.innerHTML = '<span style="color: #64748b;">[' + timestamp + ']</span> ' +
-                         '<span style="color: #94a3b8;">' + tilePrefix + '</span>' +
-                         '<span style="color: ' + colors[type] + ';">' + message + '</span>';
-
-        logDiv.appendChild(entry);
-        logDiv.scrollTop = logDiv.scrollHeight;
-    }
-
-    /**
-     * Clear debug log
-     */
-    function clearDebugLog() {
-        var logDiv = document.getElementById('debugLog');
-        if (logDiv) {
-            logDiv.innerHTML = '<div style="color: #64748b; font-style: italic;">Log cleared...</div>';
-        }
-    }
-
-    // Public API
-    return {
-        DEBUG_MODE: DEBUG_MODE,
-        FB_DATE_FORMAT: FB_DATE_FORMAT,
-        MOMENT_DATE_FORMAT: MOMENT_DATE_FORMAT,
-        formatDate: formatDate,
-        getScheduleStatus: getScheduleStatus,
-        getStatusTitle: getStatusTitle,
-        createScheduleIndicator: createScheduleIndicator,
-        createAvailabilityIndicator: createAvailabilityIndicator,
-        debugLog: debugLog,
-        clearDebugLog: clearDebugLog
-    };
-})();
-    </script>
 
     <script>
         // ============================================================================
@@ -692,10 +896,13 @@ window.ReportSO = (function() {
     let sortColumn = 'dateissued';
     let sortDirection = 'desc';
 
-    // Get properties
-    const HIDE_ESTIMATES_DEFAULT = false;
-    const BI_SO_SHOW_ESTIMATE_PROP = getProperty('BI_SO_SHOW_ESTIMATE', HIDE_ESTIMATES_DEFAULT ? 'false' : 'true');
-    const HIDE_ESTIMATES = BI_SO_SHOW_ESTIMATE_PROP === 'false' || BI_SO_SHOW_ESTIMATE_PROP === false;
+    // Get properties — resolved through user → master → BI_SO_SHOW_ESTIMATE → false
+    const HIDE_ESTIMATES = (typeof dashResolve === 'function')
+        ? !!dashResolve('hideEstimates')
+        : (function () {
+            const p = (typeof getProperty === 'function') ? getProperty('BI_SO_SHOW_ESTIMATE', 'true') : 'true';
+            return p === 'false' || p === false;
+        })();
 
     /**
      * Initialize the Sales Orders tile
@@ -770,10 +977,39 @@ window.ReportSO = (function() {
             </div>
         `;
 
-        // Add event listener for hide estimates checkbox
+        // Apply user-hidden standard columns (Columns module).
+        try { FBLib.Columns.applyVisibilityToTable(container, 'SO'); } catch (_) {}
+
+        // Phase 4 — append user-selected custom-field columns to the header
+        if (window.DashboardCfCols) {
+            try { window.DashboardCfCols.injectHeader(containerId, 'SO'); } catch (_) {}
+            // Phase 5 — populate CF filter widgets in the empty cf-col slots
+            try {
+                const _fr = document.querySelector('#' + containerId + ' .tile-table thead tr.filter-row');
+                if (_fr && window.DashboardCfCols && window.DashboardCfCols.injectFilters) {
+                    window.DashboardCfCols.injectFilters('SO', _fr);
+                    _fr.querySelectorAll('td.cf-col [data-filter]').forEach(function (el) {
+                        el.addEventListener('input', applyFilters);
+                        el.addEventListener('change', applyFilters);
+                    });
+                }
+            } catch (_) {}
+        }
+
+        // Add event listener for hide estimates checkbox — persists to the
+        // per-user payload and notifies the Settings panel so its mirror updates.
         const checkbox = document.getElementById(containerId + '-hideEstimates');
         if (checkbox) {
-            checkbox.addEventListener('change', applyFilters);
+            checkbox.addEventListener('change', function () {
+                applyFilters();
+                if (window.DashboardSettingsCore) {
+                    window.DashboardSettingsCore.setUserKey('hideEstimates', checkbox.checked);
+                    window.DashboardSettingsCore.saveUser();
+                }
+                if (window.DashboardSettings && window.DashboardSettings.syncFromTiles) {
+                    window.DashboardSettings.syncFromTiles();
+                }
+            });
         }
     }
 
@@ -799,7 +1035,8 @@ window.ReportSO = (function() {
                 "    MAX(Customer.Name) AS customerName, " +
                 "    MAX(SoStatus.Name) AS statusName, " +
                 "    GROUP_CONCAT(DISTINCT CASE WHEN Pick.Num IS NOT NULL THEN CONCAT(Pick.Num, ':', COALESCE(PickStatus.Id, 0), ':', COALESCE(PickStatus.Name, 'None')) END ORDER BY Pick.Num SEPARATOR '|') AS pickInfo, " +
-                "    GROUP_CONCAT(DISTINCT CASE WHEN Ship.Num IS NOT NULL THEN CONCAT(Ship.Num, ':', COALESCE(ShipStatus.Id, 0), ':', COALESCE(ShipStatus.Name, 'None')) END ORDER BY Ship.Num SEPARATOR '|') AS shipInfo " +
+                "    GROUP_CONCAT(DISTINCT CASE WHEN Ship.Num IS NOT NULL THEN CONCAT(Ship.Num, ':', COALESCE(ShipStatus.Id, 0), ':', COALESCE(ShipStatus.Name, 'None')) END ORDER BY Ship.Num SEPARATOR '|') AS shipInfo" +
+                (window.DashboardCfCols ? window.DashboardCfCols.sqlSelectFor('SO', 'So', true) : ' ') +
                 "FROM So " +
                 "LEFT JOIN Customer ON So.CustomerId = Customer.Id " +
                 "LEFT JOIN SoStatus ON So.StatusId = SoStatus.Id " +
@@ -851,7 +1088,7 @@ window.ReportSO = (function() {
 
             // Column filters
             const container = document.getElementById(containerId);
-            const filterInputs = container.querySelectorAll('.filter-row input[data-filter]');
+            const filterInputs = container.querySelectorAll('.filter-row input[data-filter], .filter-row select[data-filter]');
             for (let i = 0; i < filterInputs.length; i++) {
                 const input = filterInputs[i];
                 if (input.value) {
@@ -864,6 +1101,8 @@ window.ReportSO = (function() {
                     } else if (filterKey === 'dateissued' || filterKey === 'datefirstship') {
                         // For date columns, filter on formatted date
                         cellValue = DashboardCommon.formatDate(row[filterKey]).toLowerCase();
+                    } else if (filterKey.indexOf('cf_') === 0 && window.DashboardCfCols && window.DashboardCfCols.formatForFilter) {
+                        cellValue = (window.DashboardCfCols.formatForFilter(filterKey, row[filterKey]) || '').toLowerCase();
                     } else {
                         cellValue = (row[filterKey] || '').toString().toLowerCase();
                     }
@@ -905,7 +1144,7 @@ window.ReportSO = (function() {
         if (checkbox) checkbox.checked = false;
 
         const container = document.getElementById(containerId);
-        const inputs = container.querySelectorAll('.filter-row input');
+        const inputs = container.querySelectorAll('.filter-row input, .filter-row select');
         for (let i = 0; i < inputs.length; i++) {
             inputs[i].value = '';
         }
@@ -1155,19 +1394,31 @@ window.ReportSO = (function() {
 
         tbody.innerHTML = '';
 
+        const cfExtra = (window.DashboardCfCols ? window.DashboardCfCols.extraColCount('SO') : 0);
+
         if (filteredData.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; padding: 20px; color: #94a3b8;">No sales orders found</td></tr>';
+            const colspan = 7 + cfExtra - FBLib.Columns.hiddenCount('SO');
+            tbody.innerHTML = '<tr><td colspan="' + colspan + '" style="text-align: center; padding: 20px; color: #94a3b8;">No sales orders found</td></tr>';
             return;
         }
 
-        const columnOrder = ['scheduleindicator', 'statusname', 'num', 'datefirstship', 'dateissued', 'customername', 'customerpo'];
+        let columnOrder = ['scheduleindicator', 'statusname', 'num', 'datefirstship', 'dateissued', 'customername', 'customerpo'];
+        try { columnOrder = FBLib.Columns.resolveOrder('SO', columnOrder); } catch (_) {}
+        const visibleCols = FBLib.Columns.visibleKeysFrom('SO', columnOrder);
 
         for (let i = 0; i < filteredData.length; i++) {
             const row = filteredData[i];
             const tr = document.createElement('tr');
 
-            for (let j = 0; j < columnOrder.length; j++) {
-                const cell = createCellContent(row, columnOrder[j]);
+            for (let j = 0; j < visibleCols.length; j++) {
+                const key = visibleCols[j];
+                let cell;
+                if (typeof key === 'string' && key.indexOf('cf_') === 0) {
+                    cell = (window.DashboardCfCols ? window.DashboardCfCols.buildCell(row, 'SO', key) : null);
+                    if (!cell) continue;
+                } else {
+                    cell = createCellContent(row, key);
+                }
                 tr.appendChild(cell);
             }
 
@@ -1217,10 +1468,13 @@ window.ReportPO = (function() {
     let sortColumn = 'dateissued';
     let sortDirection = 'desc';
 
-    // Get properties
-    const HIDE_BID_REQUESTS_DEFAULT = false;
-    const BI_PO_SHOW_BID_REQUEST_PROP = getProperty('BI_PO_SHOW_BID_REQUEST', HIDE_BID_REQUESTS_DEFAULT ? 'false' : 'true');
-    const HIDE_BID_REQUESTS = BI_PO_SHOW_BID_REQUEST_PROP === 'false' || BI_PO_SHOW_BID_REQUEST_PROP === false;
+    // Get properties — resolved through user → master → BI_PO_SHOW_BID_REQUEST → false
+    const HIDE_BID_REQUESTS = (typeof dashResolve === 'function')
+        ? !!dashResolve('hideBidRequests')
+        : (function () {
+            const p = (typeof getProperty === 'function') ? getProperty('BI_PO_SHOW_BID_REQUEST', 'true') : 'true';
+            return p === 'false' || p === false;
+        })();
 
     /**
      * Initialize the Purchase Orders tile
@@ -1295,10 +1549,39 @@ window.ReportPO = (function() {
             </div>
         `;
 
-        // Add event listener for hide bid requests checkbox
+        // Apply user-hidden standard columns (Columns module).
+        try { FBLib.Columns.applyVisibilityToTable(container, 'PO'); } catch (_) {}
+
+        // Phase 4 — append user-selected custom-field columns to the header
+        if (window.DashboardCfCols) {
+            try { window.DashboardCfCols.injectHeader(containerId, 'PO'); } catch (_) {}
+            // Phase 5 — populate CF filter widgets in the empty cf-col slots
+            try {
+                const _fr = document.querySelector('#' + containerId + ' .tile-table thead tr.filter-row');
+                if (_fr && window.DashboardCfCols && window.DashboardCfCols.injectFilters) {
+                    window.DashboardCfCols.injectFilters('PO', _fr);
+                    _fr.querySelectorAll('td.cf-col [data-filter]').forEach(function (el) {
+                        el.addEventListener('input', applyFilters);
+                        el.addEventListener('change', applyFilters);
+                    });
+                }
+            } catch (_) {}
+        }
+
+        // Add event listener for hide bid requests checkbox — persists to the
+        // per-user payload and notifies the Settings panel so its mirror updates.
         const checkbox = document.getElementById(containerId + '-hideBidRequests');
         if (checkbox) {
-            checkbox.addEventListener('change', applyFilters);
+            checkbox.addEventListener('change', function () {
+                applyFilters();
+                if (window.DashboardSettingsCore) {
+                    window.DashboardSettingsCore.setUserKey('hideBidRequests', checkbox.checked);
+                    window.DashboardSettingsCore.saveUser();
+                }
+                if (window.DashboardSettings && window.DashboardSettings.syncFromTiles) {
+                    window.DashboardSettings.syncFromTiles();
+                }
+            });
         }
     }
 
@@ -1322,7 +1605,8 @@ window.ReportPO = (function() {
                 "    Po.DateIssued AS dateIssued, " +
                 "    Po.DateFirstShip AS dateScheduled, " +
                 "    Vendor.Name AS vendorName, " +
-                "    PoStatus.Name AS statusName " +
+                "    PoStatus.Name AS statusName" +
+                (window.DashboardCfCols ? window.DashboardCfCols.sqlSelectFor('PO', 'Po', false) : ' ') +
                 "FROM Po " +
                 "LEFT JOIN Vendor ON Po.VendorId = Vendor.Id " +
                 "LEFT JOIN PoStatus ON Po.StatusId = PoStatus.Id " +
@@ -1363,7 +1647,7 @@ window.ReportPO = (function() {
 
             // Column filters
             const container = document.getElementById(containerId);
-            const filterInputs = container.querySelectorAll('.filter-row input[data-filter]');
+            const filterInputs = container.querySelectorAll('.filter-row input[data-filter], .filter-row select[data-filter]');
             for (let i = 0; i < filterInputs.length; i++) {
                 const input = filterInputs[i];
                 if (input.value) {
@@ -1373,6 +1657,8 @@ window.ReportPO = (function() {
                     // For date columns, filter on formatted date
                     if (filterKey === 'dateissued' || filterKey === 'datescheduled') {
                         cellValue = DashboardCommon.formatDate(row[filterKey]).toLowerCase();
+                    } else if (filterKey.indexOf('cf_') === 0 && window.DashboardCfCols && window.DashboardCfCols.formatForFilter) {
+                        cellValue = (window.DashboardCfCols.formatForFilter(filterKey, row[filterKey]) || '').toLowerCase();
                     } else {
                         cellValue = (row[filterKey] || '').toString().toLowerCase();
                     }
@@ -1414,7 +1700,7 @@ window.ReportPO = (function() {
         if (checkbox) checkbox.checked = false;
 
         const container = document.getElementById(containerId);
-        const inputs = container.querySelectorAll('.filter-row input');
+        const inputs = container.querySelectorAll('.filter-row input, .filter-row select');
         for (let i = 0; i < inputs.length; i++) {
             inputs[i].value = '';
         }
@@ -1507,19 +1793,31 @@ window.ReportPO = (function() {
 
         tbody.innerHTML = '';
 
+        const cfExtra = (window.DashboardCfCols ? window.DashboardCfCols.extraColCount('PO') : 0);
+
         if (filteredData.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; padding: 20px; color: #94a3b8;">No purchase orders found</td></tr>';
+            const colspan = 7 + cfExtra - FBLib.Columns.hiddenCount('PO');
+            tbody.innerHTML = '<tr><td colspan="' + colspan + '" style="text-align: center; padding: 20px; color: #94a3b8;">No purchase orders found</td></tr>';
             return;
         }
 
-        const columnOrder = ['scheduleindicator', 'statusname', 'num', 'datescheduled', 'dateissued', 'vendorname', 'customerso'];
+        let columnOrder = ['scheduleindicator', 'statusname', 'num', 'datescheduled', 'dateissued', 'vendorname', 'customerso'];
+        try { columnOrder = FBLib.Columns.resolveOrder('PO', columnOrder); } catch (_) {}
+        const visibleCols = FBLib.Columns.visibleKeysFrom('PO', columnOrder);
 
         for (let i = 0; i < filteredData.length; i++) {
             const row = filteredData[i];
             const tr = document.createElement('tr');
 
-            for (let j = 0; j < columnOrder.length; j++) {
-                const cell = createCellContent(row, columnOrder[j]);
+            for (let j = 0; j < visibleCols.length; j++) {
+                const key = visibleCols[j];
+                let cell;
+                if (typeof key === 'string' && key.indexOf('cf_') === 0) {
+                    cell = (window.DashboardCfCols ? window.DashboardCfCols.buildCell(row, 'PO', key) : null);
+                    if (!cell) continue;
+                } else {
+                    cell = createCellContent(row, key);
+                }
                 tr.appendChild(cell);
             }
 
@@ -1637,6 +1935,25 @@ window.ReportWO = (function() {
                 </table>
             </div>
         `;
+
+        // Apply user-hidden standard columns (Columns module).
+        try { FBLib.Columns.applyVisibilityToTable(container, 'WO'); } catch (_) {}
+
+        // Phase 4 — append user-selected custom-field columns to the header
+        if (window.DashboardCfCols) {
+            try { window.DashboardCfCols.injectHeader(containerId, 'WO'); } catch (_) {}
+            // Phase 5 — populate CF filter widgets in the empty cf-col slots
+            try {
+                const _fr = document.querySelector('#' + containerId + ' .tile-table thead tr.filter-row');
+                if (_fr && window.DashboardCfCols && window.DashboardCfCols.injectFilters) {
+                    window.DashboardCfCols.injectFilters('WO', _fr);
+                    _fr.querySelectorAll('td.cf-col [data-filter]').forEach(function (el) {
+                        el.addEventListener('input', applyFilters);
+                        el.addEventListener('change', applyFilters);
+                    });
+                }
+            } catch (_) {}
+        }
     }
 
     /**
@@ -1659,7 +1976,8 @@ window.ReportWO = (function() {
                 "    WoStatus.Name AS statusName, " +
                 "    Mo.num AS moNum, " +
                 "    Bom.num AS bomNum, " +
-                "    MoItem.qtyToFulfill AS qty " +
+                "    MoItem.qtyToFulfill AS qty" +
+                (window.DashboardCfCols ? window.DashboardCfCols.sqlSelectFor('WO', 'Wo', false) : ' ') +
                 "FROM Wo " +
                 "LEFT JOIN WoStatus ON Wo.statusId = WoStatus.Id " +
                 "LEFT JOIN MoItem ON Wo.moItemId = MoItem.id " +
@@ -1693,7 +2011,7 @@ window.ReportWO = (function() {
     function applyFilters() {
         filteredData = allData.filter(function(row) {
             const container = document.getElementById(containerId);
-            const filterInputs = container.querySelectorAll('.filter-row input[data-filter]');
+            const filterInputs = container.querySelectorAll('.filter-row input[data-filter], .filter-row select[data-filter]');
             for (let i = 0; i < filterInputs.length; i++) {
                 const input = filterInputs[i];
                 if (input.value) {
@@ -1703,6 +2021,8 @@ window.ReportWO = (function() {
                     // For date columns, filter on formatted date
                     if (filterKey === 'datescheduled' || filterKey === 'datescheduledtostart') {
                         cellValue = DashboardCommon.formatDate(row[filterKey]).toLowerCase();
+                    } else if (filterKey.indexOf('cf_') === 0 && window.DashboardCfCols && window.DashboardCfCols.formatForFilter) {
+                        cellValue = (window.DashboardCfCols.formatForFilter(filterKey, row[filterKey]) || '').toLowerCase();
                     } else {
                         cellValue = (row[filterKey] || '').toString().toLowerCase();
                     }
@@ -1740,7 +2060,7 @@ window.ReportWO = (function() {
      */
     function clearFilters() {
         const container = document.getElementById(containerId);
-        const inputs = container.querySelectorAll('.filter-row input');
+        const inputs = container.querySelectorAll('.filter-row input, .filter-row select');
         for (let i = 0; i < inputs.length; i++) {
             inputs[i].value = '';
         }
@@ -1831,19 +2151,31 @@ window.ReportWO = (function() {
 
         tbody.innerHTML = '';
 
+        const cfExtra = (window.DashboardCfCols ? window.DashboardCfCols.extraColCount('WO') : 0);
+
         if (filteredData.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 20px; color: #94a3b8;">No work orders found</td></tr>';
+            const colspan = 8 + cfExtra - FBLib.Columns.hiddenCount('WO');
+            tbody.innerHTML = '<tr><td colspan="' + colspan + '" style="text-align: center; padding: 20px; color: #94a3b8;">No work orders found</td></tr>';
             return;
         }
 
-        const columnOrder = ['scheduleindicator', 'statusname', 'monum', 'num', 'bomnum', 'qty', 'datescheduledtostart', 'datescheduled'];
+        let columnOrder = ['scheduleindicator', 'statusname', 'monum', 'num', 'bomnum', 'qty', 'datescheduledtostart', 'datescheduled'];
+        try { columnOrder = FBLib.Columns.resolveOrder('WO', columnOrder); } catch (_) {}
+        const visibleCols = FBLib.Columns.visibleKeysFrom('WO', columnOrder);
 
         for (let i = 0; i < filteredData.length; i++) {
             const row = filteredData[i];
             const tr = document.createElement('tr');
 
-            for (let j = 0; j < columnOrder.length; j++) {
-                const cell = createCellContent(row, columnOrder[j]);
+            for (let j = 0; j < visibleCols.length; j++) {
+                const key = visibleCols[j];
+                let cell;
+                if (typeof key === 'string' && key.indexOf('cf_') === 0) {
+                    cell = (window.DashboardCfCols ? window.DashboardCfCols.buildCell(row, 'WO', key) : null);
+                    if (!cell) continue;
+                } else {
+                    cell = createCellContent(row, key);
+                }
                 tr.appendChild(cell);
             }
 
@@ -1964,6 +2296,25 @@ window.ReportRMA = (function() {
                 </table>
             </div>
         `;
+
+        // Apply user-hidden standard columns (Columns module).
+        try { FBLib.Columns.applyVisibilityToTable(container, 'RMA'); } catch (_) {}
+
+        // Phase 4 — append user-selected custom-field columns to the header
+        if (window.DashboardCfCols) {
+            try { window.DashboardCfCols.injectHeader(containerId, 'RMA'); } catch (_) {}
+            // Phase 5 — populate CF filter widgets in the empty cf-col slots
+            try {
+                const _fr = document.querySelector('#' + containerId + ' .tile-table thead tr.filter-row');
+                if (_fr && window.DashboardCfCols && window.DashboardCfCols.injectFilters) {
+                    window.DashboardCfCols.injectFilters('RMA', _fr);
+                    _fr.querySelectorAll('td.cf-col [data-filter]').forEach(function (el) {
+                        el.addEventListener('input', applyFilters);
+                        el.addEventListener('change', applyFilters);
+                    });
+                }
+            } catch (_) {}
+        }
     }
 
     /**
@@ -1992,7 +2343,8 @@ window.ReportRMA = (function() {
                 "    CustomListItem.Name AS issueName, " +
                 "    RmaItem.productId AS productId, " +
                 "    Product.num AS productNum, " +
-                "    RmaItem.qty AS qty " +
+                "    RmaItem.qty AS qty" +
+                (window.DashboardCfCols ? window.DashboardCfCols.sqlSelectFor('RMA', 'Rma', false) : ' ') +
                 "FROM Rma " +
                 "LEFT JOIN RmaStatus ON Rma.statusId = RmaStatus.Id " +
                 "LEFT JOIN Customer ON Rma.customerId = Customer.id " +
@@ -2081,7 +2433,7 @@ window.ReportRMA = (function() {
     function applyFilters() {
         filteredData = allData.filter(function(row) {
             const container = document.getElementById(containerId);
-            const filterInputs = container.querySelectorAll('.filter-row input[data-filter]');
+            const filterInputs = container.querySelectorAll('.filter-row input[data-filter], .filter-row select[data-filter]');
             for (let i = 0; i < filterInputs.length; i++) {
                 const input = filterInputs[i];
                 if (input.value) {
@@ -2091,6 +2443,8 @@ window.ReportRMA = (function() {
                     // For date columns, filter on formatted date
                     if (filterKey === 'datecreated' || filterKey === 'dateexpires') {
                         cellValue = DashboardCommon.formatDate(row[filterKey]).toLowerCase();
+                    } else if (filterKey.indexOf('cf_') === 0 && window.DashboardCfCols && window.DashboardCfCols.formatForFilter) {
+                        cellValue = (window.DashboardCfCols.formatForFilter(filterKey, row[filterKey]) || '').toLowerCase();
                     } else {
                         cellValue = (row[filterKey] || '').toString().toLowerCase();
                     }
@@ -2128,7 +2482,7 @@ window.ReportRMA = (function() {
      */
     function clearFilters() {
         const container = document.getElementById(containerId);
-        const inputs = container.querySelectorAll('.filter-row input');
+        const inputs = container.querySelectorAll('.filter-row input, .filter-row select');
         for (let i = 0; i < inputs.length; i++) {
             inputs[i].value = '';
         }
@@ -2228,19 +2582,31 @@ window.ReportRMA = (function() {
 
         tbody.innerHTML = '';
 
+        const cfExtra = (window.DashboardCfCols ? window.DashboardCfCols.extraColCount('RMA') : 0);
+
         if (filteredData.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="10" style="text-align: center; padding: 20px; color: #94a3b8;">No RMA orders found</td></tr>';
+            const colspan = 10 + cfExtra - FBLib.Columns.hiddenCount('RMA');
+            tbody.innerHTML = '<tr><td colspan="' + colspan + '" style="text-align: center; padding: 20px; color: #94a3b8;">No RMA orders found</td></tr>';
             return;
         }
 
-        const columnOrder = ['scheduleindicator', 'statusname', 'type', 'issue', 'num', 'product', 'qty', 'customername', 'datecreated', 'dateexpires'];
+        let columnOrder = ['scheduleindicator', 'statusname', 'type', 'issue', 'num', 'product', 'qty', 'customername', 'datecreated', 'dateexpires'];
+        try { columnOrder = FBLib.Columns.resolveOrder('RMA', columnOrder); } catch (_) {}
+        const visibleCols = FBLib.Columns.visibleKeysFrom('RMA', columnOrder);
 
         for (let i = 0; i < filteredData.length; i++) {
             const row = filteredData[i];
             const tr = document.createElement('tr');
 
-            for (let j = 0; j < columnOrder.length; j++) {
-                const cell = createCellContent(row, columnOrder[j]);
+            for (let j = 0; j < visibleCols.length; j++) {
+                const key = visibleCols[j];
+                let cell;
+                if (typeof key === 'string' && key.indexOf('cf_') === 0) {
+                    cell = (window.DashboardCfCols ? window.DashboardCfCols.buildCell(row, 'RMA', key) : null);
+                    if (!cell) continue;
+                } else {
+                    cell = createCellContent(row, key);
+                }
                 tr.appendChild(cell);
             }
 
@@ -2357,6 +2723,25 @@ window.ReportTO = (function() {
                 </table>
             </div>
         `;
+
+        // Apply user-hidden standard columns (Columns module).
+        try { FBLib.Columns.applyVisibilityToTable(container, 'TO'); } catch (_) {}
+
+        // Phase 4 — append user-selected custom-field columns to the header
+        if (window.DashboardCfCols) {
+            try { window.DashboardCfCols.injectHeader(containerId, 'TO'); } catch (_) {}
+            // Phase 5 — populate CF filter widgets in the empty cf-col slots
+            try {
+                const _fr = document.querySelector('#' + containerId + ' .tile-table thead tr.filter-row');
+                if (_fr && window.DashboardCfCols && window.DashboardCfCols.injectFilters) {
+                    window.DashboardCfCols.injectFilters('TO', _fr);
+                    _fr.querySelectorAll('td.cf-col [data-filter]').forEach(function (el) {
+                        el.addEventListener('input', applyFilters);
+                        el.addEventListener('change', applyFilters);
+                    });
+                }
+            } catch (_) {}
+        }
     }
 
     /**
@@ -2379,7 +2764,8 @@ window.ReportTO = (function() {
                 "    XoStatus.Name AS statusName, " +
                 "    XoType.Name AS typeName, " +
                 "    FromLG.Name AS fromName, " +
-                "    ToLG.Name AS toName " +
+                "    ToLG.Name AS toName" +
+                (window.DashboardCfCols ? window.DashboardCfCols.sqlSelectFor('TO', 'Xo', false) : ' ') +
                 "FROM Xo " +
                 "LEFT JOIN XoStatus ON Xo.statusId = XoStatus.Id " +
                 "LEFT JOIN XoType ON Xo.typeId = XoType.Id " +
@@ -2418,7 +2804,7 @@ window.ReportTO = (function() {
     function applyFilters() {
         filteredData = allData.filter(function(row) {
             const container = document.getElementById(containerId);
-            const filterInputs = container.querySelectorAll('.filter-row input[data-filter]');
+            const filterInputs = container.querySelectorAll('.filter-row input[data-filter], .filter-row select[data-filter]');
             for (let i = 0; i < filterInputs.length; i++) {
                 const input = filterInputs[i];
                 if (input.value) {
@@ -2428,6 +2814,8 @@ window.ReportTO = (function() {
                     // For date columns, filter on formatted date
                     if (filterKey === 'datescheduled' || filterKey === 'dateissued') {
                         cellValue = DashboardCommon.formatDate(row[filterKey]).toLowerCase();
+                    } else if (filterKey.indexOf('cf_') === 0 && window.DashboardCfCols && window.DashboardCfCols.formatForFilter) {
+                        cellValue = (window.DashboardCfCols.formatForFilter(filterKey, row[filterKey]) || '').toLowerCase();
                     } else {
                         cellValue = (row[filterKey] || '').toString().toLowerCase();
                     }
@@ -2465,7 +2853,7 @@ window.ReportTO = (function() {
      */
     function clearFilters() {
         const container = document.getElementById(containerId);
-        const inputs = container.querySelectorAll('.filter-row input');
+        const inputs = container.querySelectorAll('.filter-row input, .filter-row select');
         for (let i = 0; i < inputs.length; i++) {
             inputs[i].value = '';
         }
@@ -2563,19 +2951,31 @@ window.ReportTO = (function() {
 
         tbody.innerHTML = '';
 
+        const cfExtra = (window.DashboardCfCols ? window.DashboardCfCols.extraColCount('TO') : 0);
+
         if (filteredData.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 20px; color: #94a3b8;">No transfer orders found</td></tr>';
+            const colspan = 8 + cfExtra - FBLib.Columns.hiddenCount('TO');
+            tbody.innerHTML = '<tr><td colspan="' + colspan + '" style="text-align: center; padding: 20px; color: #94a3b8;">No transfer orders found</td></tr>';
             return;
         }
 
-        const columnOrder = ['scheduleindicator', 'statusname', 'type', 'num', 'datescheduled', 'dateissued', 'fromname', 'toname'];
+        let columnOrder = ['scheduleindicator', 'statusname', 'type', 'num', 'datescheduled', 'dateissued', 'fromname', 'toname'];
+        try { columnOrder = FBLib.Columns.resolveOrder('TO', columnOrder); } catch (_) {}
+        const visibleCols = FBLib.Columns.visibleKeysFrom('TO', columnOrder);
 
         for (let i = 0; i < filteredData.length; i++) {
             const row = filteredData[i];
             const tr = document.createElement('tr');
 
-            for (let j = 0; j < columnOrder.length; j++) {
-                const cell = createCellContent(row, columnOrder[j]);
+            for (let j = 0; j < visibleCols.length; j++) {
+                const key = visibleCols[j];
+                let cell;
+                if (typeof key === 'string' && key.indexOf('cf_') === 0) {
+                    cell = (window.DashboardCfCols ? window.DashboardCfCols.buildCell(row, 'TO', key) : null);
+                    if (!cell) continue;
+                } else {
+                    cell = createCellContent(row, key);
+                }
                 tr.appendChild(cell);
             }
 
@@ -2698,6 +3098,25 @@ window.ReportPICK = (function() {
                 </table>
             </div>
         `;
+
+        // Apply user-hidden standard columns (Columns module).
+        try { FBLib.Columns.applyVisibilityToTable(container, 'PICK'); } catch (_) {}
+
+        // Phase 4 — append user-selected custom-field columns to the header
+        if (window.DashboardCfCols) {
+            try { window.DashboardCfCols.injectHeader(containerId, 'PICK'); } catch (_) {}
+            // Phase 5 — populate CF filter widgets in the empty cf-col slots
+            try {
+                const _fr = document.querySelector('#' + containerId + ' .tile-table thead tr.filter-row');
+                if (_fr && window.DashboardCfCols && window.DashboardCfCols.injectFilters) {
+                    window.DashboardCfCols.injectFilters('PICK', _fr);
+                    _fr.querySelectorAll('td.cf-col [data-filter]').forEach(function (el) {
+                        el.addEventListener('input', applyFilters);
+                        el.addEventListener('change', applyFilters);
+                    });
+                }
+            } catch (_) {}
+        }
     }
 
     /**
@@ -2806,7 +3225,8 @@ window.ReportPICK = (function() {
                 "    ) AS pendingItems, " +
                 "    ( " +
                 "        SELECT COUNT(*) FROM PickItem WHERE PickItem.PickId = Pick.Id AND PickItem.StatusId = 30 " +
-                "    ) AS committedItems " +
+                "    ) AS committedItems" +
+                (window.DashboardCfCols ? window.DashboardCfCols.sqlSelectFor('PICK', 'Pick', false) : ' ') +
                 "FROM Pick " +
                 "LEFT JOIN PickStatus ON Pick.StatusId = PickStatus.Id " +
                 "LEFT JOIN Priority ON Pick.Priority = Priority.Id " +
@@ -2867,7 +3287,7 @@ window.ReportPICK = (function() {
     function applyFilters() {
         filteredData = allData.filter(function(row) {
             const container = document.getElementById(containerId);
-            const filterInputs = container.querySelectorAll('.filter-row input[data-filter]');
+            const filterInputs = container.querySelectorAll('.filter-row input[data-filter], .filter-row select[data-filter]');
             for (let i = 0; i < filterInputs.length; i++) {
                 const input = filterInputs[i];
                 if (input.value) {
@@ -2877,6 +3297,8 @@ window.ReportPICK = (function() {
                     // For date columns, filter on formatted date
                     if (filterKey === 'datescheduled') {
                         cellValue = DashboardCommon.formatDate(row[filterKey]).toLowerCase();
+                    } else if (filterKey.indexOf('cf_') === 0 && window.DashboardCfCols && window.DashboardCfCols.formatForFilter) {
+                        cellValue = (window.DashboardCfCols.formatForFilter(filterKey, row[filterKey]) || '').toLowerCase();
                     } else {
                         const dataField = filterKey === 'ordernum' ? 'ordernumdisplay' : filterKey;
                         cellValue = (row[dataField] || '').toString().toLowerCase();
@@ -2915,7 +3337,7 @@ window.ReportPICK = (function() {
      */
     function clearFilters() {
         const container = document.getElementById(containerId);
-        const inputs = container.querySelectorAll('.filter-row input');
+        const inputs = container.querySelectorAll('.filter-row input, .filter-row select');
         for (let i = 0; i < inputs.length; i++) {
             inputs[i].value = '';
         }
@@ -3016,19 +3438,31 @@ window.ReportPICK = (function() {
 
         tbody.innerHTML = '';
 
+        const cfExtra = (window.DashboardCfCols ? window.DashboardCfCols.extraColCount('PICK') : 0);
+
         if (filteredData.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 20px; color: #94a3b8;">No picks found</td></tr>';
+            const colspan = 8 + cfExtra - FBLib.Columns.hiddenCount('PICK');
+            tbody.innerHTML = '<tr><td colspan="' + colspan + '" style="text-align: center; padding: 20px; color: #94a3b8;">No picks found</td></tr>';
             return;
         }
 
-        const columnOrder = ['scheduleindicator', 'availabilitystatus', 'statusname', 'num', 'ordernum', 'datescheduled', 'priorityname', 'orderinfo'];
+        let columnOrder = ['scheduleindicator', 'availabilitystatus', 'statusname', 'num', 'ordernum', 'datescheduled', 'priorityname', 'orderinfo'];
+        try { columnOrder = FBLib.Columns.resolveOrder('PICK', columnOrder); } catch (_) {}
+        const visibleCols = FBLib.Columns.visibleKeysFrom('PICK', columnOrder);
 
         for (let i = 0; i < filteredData.length; i++) {
             const row = filteredData[i];
             const tr = document.createElement('tr');
 
-            for (let j = 0; j < columnOrder.length; j++) {
-                const cell = createCellContent(row, columnOrder[j]);
+            for (let j = 0; j < visibleCols.length; j++) {
+                const key = visibleCols[j];
+                let cell;
+                if (typeof key === 'string' && key.indexOf('cf_') === 0) {
+                    cell = (window.DashboardCfCols ? window.DashboardCfCols.buildCell(row, 'PICK', key) : null);
+                    if (!cell) continue;
+                } else {
+                    cell = createCellContent(row, key);
+                }
                 tr.appendChild(cell);
             }
 
@@ -3141,6 +3575,25 @@ window.ReportRCV = (function() {
                 </table>
             </div>
         `;
+
+        // Apply user-hidden standard columns (Columns module).
+        try { FBLib.Columns.applyVisibilityToTable(container, 'RCV'); } catch (_) {}
+
+        // Phase 4 — append user-selected custom-field columns to the header
+        if (window.DashboardCfCols) {
+            try { window.DashboardCfCols.injectHeader(containerId, 'RCV'); } catch (_) {}
+            // Phase 5 — populate CF filter widgets in the empty cf-col slots
+            try {
+                const _fr = document.querySelector('#' + containerId + ' .tile-table thead tr.filter-row');
+                if (_fr && window.DashboardCfCols && window.DashboardCfCols.injectFilters) {
+                    window.DashboardCfCols.injectFilters('RCV', _fr);
+                    _fr.querySelectorAll('td.cf-col [data-filter]').forEach(function (el) {
+                        el.addEventListener('input', applyFilters);
+                        el.addEventListener('change', applyFilters);
+                    });
+                }
+            } catch (_) {}
+        }
     }
 
     /**
@@ -3183,7 +3636,8 @@ window.ReportRCV = (function() {
                 "        WHEN Receipt.OrderTypeId = 20 THEN (SELECT DateFirstShip FROM So WHERE Id = Receipt.SoId) " +
                 "        WHEN Receipt.OrderTypeId = 40 THEN (SELECT DateScheduled FROM Xo WHERE Id = Receipt.XoId) " +
                 "        ELSE NULL " +
-                "    END AS dateScheduled " +
+                "    END AS dateScheduled" +
+                (window.DashboardCfCols ? window.DashboardCfCols.sqlSelectFor('RCV', 'Receipt', false) : ' ') +
                 "FROM Receipt " +
                 "LEFT JOIN ReceiptStatus ON Receipt.StatusId = ReceiptStatus.Id " +
                 "INNER JOIN UserToLG ON Receipt.LocationGroupId = UserToLG.LocationGroupId AND UserToLG.UserId = " + userId + " " +
@@ -3214,7 +3668,7 @@ window.ReportRCV = (function() {
     function applyFilters() {
         filteredData = allData.filter(function(row) {
             const container = document.getElementById(containerId);
-            const filterInputs = container.querySelectorAll('.filter-row input[data-filter]');
+            const filterInputs = container.querySelectorAll('.filter-row input[data-filter], .filter-row select[data-filter]');
             for (let i = 0; i < filterInputs.length; i++) {
                 const input = filterInputs[i];
                 if (input.value) {
@@ -3224,6 +3678,8 @@ window.ReportRCV = (function() {
                     // For date columns, filter on formatted date
                     if (filterKey === 'datescheduled') {
                         cellValue = DashboardCommon.formatDate(row[filterKey]).toLowerCase();
+                    } else if (filterKey.indexOf('cf_') === 0 && window.DashboardCfCols && window.DashboardCfCols.formatForFilter) {
+                        cellValue = (window.DashboardCfCols.formatForFilter(filterKey, row[filterKey]) || '').toLowerCase();
                     } else {
                         cellValue = (row[filterKey] || '').toString().toLowerCase();
                     }
@@ -3261,7 +3717,7 @@ window.ReportRCV = (function() {
      */
     function clearFilters() {
         const container = document.getElementById(containerId);
-        const inputs = container.querySelectorAll('.filter-row input');
+        const inputs = container.querySelectorAll('.filter-row input, .filter-row select');
         for (let i = 0; i < inputs.length; i++) {
             inputs[i].value = '';
         }
@@ -3361,19 +3817,31 @@ window.ReportRCV = (function() {
 
         tbody.innerHTML = '';
 
+        const cfExtra = (window.DashboardCfCols ? window.DashboardCfCols.extraColCount('RCV') : 0);
+
         if (filteredData.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 20px; color: #94a3b8;">No receipts found</td></tr>';
+            const colspan = 6 + cfExtra - FBLib.Columns.hiddenCount('RCV');
+            tbody.innerHTML = '<tr><td colspan="' + colspan + '" style="text-align: center; padding: 20px; color: #94a3b8;">No receipts found</td></tr>';
             return;
         }
 
-        const columnOrder = ['scheduleindicator', 'statusname', 'type', 'ordernum', 'datescheduled', 'vendorname'];
+        let columnOrder = ['scheduleindicator', 'statusname', 'type', 'ordernum', 'datescheduled', 'vendorname'];
+        try { columnOrder = FBLib.Columns.resolveOrder('RCV', columnOrder); } catch (_) {}
+        const visibleCols = FBLib.Columns.visibleKeysFrom('RCV', columnOrder);
 
         for (let i = 0; i < filteredData.length; i++) {
             const row = filteredData[i];
             const tr = document.createElement('tr');
 
-            for (let j = 0; j < columnOrder.length; j++) {
-                const cell = createCellContent(row, columnOrder[j]);
+            for (let j = 0; j < visibleCols.length; j++) {
+                const key = visibleCols[j];
+                let cell;
+                if (typeof key === 'string' && key.indexOf('cf_') === 0) {
+                    cell = (window.DashboardCfCols ? window.DashboardCfCols.buildCell(row, 'RCV', key) : null);
+                    if (!cell) continue;
+                } else {
+                    cell = createCellContent(row, key);
+                }
                 tr.appendChild(cell);
             }
 
@@ -3497,6 +3965,25 @@ window.ReportSHIP = (function() {
                 </table>
             </div>
         `;
+
+        // Apply user-hidden standard columns (Columns module).
+        try { FBLib.Columns.applyVisibilityToTable(container, 'SHIP'); } catch (_) {}
+
+        // Phase 4 — append user-selected custom-field columns to the header
+        if (window.DashboardCfCols) {
+            try { window.DashboardCfCols.injectHeader(containerId, 'SHIP'); } catch (_) {}
+            // Phase 5 — populate CF filter widgets in the empty cf-col slots
+            try {
+                const _fr = document.querySelector('#' + containerId + ' .tile-table thead tr.filter-row');
+                if (_fr && window.DashboardCfCols && window.DashboardCfCols.injectFilters) {
+                    window.DashboardCfCols.injectFilters('SHIP', _fr);
+                    _fr.querySelectorAll('td.cf-col [data-filter]').forEach(function (el) {
+                        el.addEventListener('input', applyFilters);
+                        el.addEventListener('change', applyFilters);
+                    });
+                }
+            } catch (_) {}
+        }
     }
 
     /**
@@ -3524,7 +4011,8 @@ window.ReportSHIP = (function() {
                 "        WHEN Ship.OrderTypeId = 10 THEN Po.Num " +
                 "        WHEN Ship.OrderTypeId = 40 THEN Xo.Num " +
                 "    END AS orderNum, " +
-                "    COALESCE(So.DateFirstShip, Po.DateFirstShip, Xo.DateScheduled) AS dateScheduled " +
+                "    COALESCE(So.DateFirstShip, Po.DateFirstShip, Xo.DateScheduled) AS dateScheduled" +
+                (window.DashboardCfCols ? window.DashboardCfCols.sqlSelectFor('SHIP', 'Ship', false) : ' ') +
                 "FROM Ship " +
                 "LEFT JOIN ShipStatus ON Ship.StatusId = ShipStatus.Id " +
                 "LEFT JOIN Carrier ON Ship.CarrierId = Carrier.Id " +
@@ -3569,7 +4057,7 @@ window.ReportSHIP = (function() {
     function applyFilters() {
         filteredData = allData.filter(function(row) {
             const container = document.getElementById(containerId);
-            const filterInputs = container.querySelectorAll('.filter-row input[data-filter]');
+            const filterInputs = container.querySelectorAll('.filter-row input[data-filter], .filter-row select[data-filter]');
             for (let i = 0; i < filterInputs.length; i++) {
                 const input = filterInputs[i];
                 if (input.value) {
@@ -3579,6 +4067,8 @@ window.ReportSHIP = (function() {
                     // For date columns, filter on formatted date
                     if (filterKey === 'datescheduled') {
                         cellValue = DashboardCommon.formatDate(row[filterKey]).toLowerCase();
+                    } else if (filterKey.indexOf('cf_') === 0 && window.DashboardCfCols && window.DashboardCfCols.formatForFilter) {
+                        cellValue = (window.DashboardCfCols.formatForFilter(filterKey, row[filterKey]) || '').toLowerCase();
                     } else {
                         cellValue = (row[filterKey] || '').toString().toLowerCase();
                     }
@@ -3616,7 +4106,7 @@ window.ReportSHIP = (function() {
      */
     function clearFilters() {
         const container = document.getElementById(containerId);
-        const inputs = container.querySelectorAll('.filter-row input');
+        const inputs = container.querySelectorAll('.filter-row input, .filter-row select');
         for (let i = 0; i < inputs.length; i++) {
             inputs[i].value = '';
         }
@@ -3726,19 +4216,31 @@ window.ReportSHIP = (function() {
 
         tbody.innerHTML = '';
 
+        const cfExtra = (window.DashboardCfCols ? window.DashboardCfCols.extraColCount('SHIP') : 0);
+
         if (filteredData.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="9" style="text-align: center; padding: 20px; color: #94a3b8;">No shipments found</td></tr>';
+            const colspan = 9 + cfExtra - FBLib.Columns.hiddenCount('SHIP');
+            tbody.innerHTML = '<tr><td colspan="' + colspan + '" style="text-align: center; padding: 20px; color: #94a3b8;">No shipments found</td></tr>';
             return;
         }
 
-        const columnOrder = ['scheduleindicator', 'statusname', 'type', 'num', 'ordernum', 'datescheduled', 'shipto', 'carrier', 'service'];
+        let columnOrder = ['scheduleindicator', 'statusname', 'type', 'num', 'ordernum', 'datescheduled', 'shipto', 'carrier', 'service'];
+        try { columnOrder = FBLib.Columns.resolveOrder('SHIP', columnOrder); } catch (_) {}
+        const visibleCols = FBLib.Columns.visibleKeysFrom('SHIP', columnOrder);
 
         for (let i = 0; i < filteredData.length; i++) {
             const row = filteredData[i];
             const tr = document.createElement('tr');
 
-            for (let j = 0; j < columnOrder.length; j++) {
-                const cell = createCellContent(row, columnOrder[j]);
+            for (let j = 0; j < visibleCols.length; j++) {
+                const key = visibleCols[j];
+                let cell;
+                if (typeof key === 'string' && key.indexOf('cf_') === 0) {
+                    cell = (window.DashboardCfCols ? window.DashboardCfCols.buildCell(row, 'SHIP', key) : null);
+                    if (!cell) continue;
+                } else {
+                    cell = createCellContent(row, key);
+                }
                 tr.appendChild(cell);
             }
 
@@ -3820,11 +4322,20 @@ window.ReportSHIP = (function() {
              * Initialize the dashboard
              */
             function init() {
+                // Reset state so re-init (from the Settings panel's
+                // rebuildDashboard()) doesn't accumulate tiles or leak
+                // the previous auto-refresh timer.
+                if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
+                activeTiles = [];
+
                 DashboardCommon.debugLog('Initializing dashboard...', 'info', 'DASH');
 
-                // Show debug console if enabled
+                // Show / hide debug console based on resolved setting.
+                const _dbgEl = document.getElementById('debugConsole');
+                if (_dbgEl) {
+                    _dbgEl.style.display = DashboardCommon.DEBUG_MODE ? 'block' : 'none';
+                }
                 if (DashboardCommon.DEBUG_MODE) {
-                    document.getElementById('debugConsole').style.display = 'block';
                     DashboardCommon.debugLog('Debug mode enabled', 'info', 'DASH');
                 }
 
@@ -3847,34 +4358,33 @@ window.ReportSHIP = (function() {
             }
 
             /**
-             * Parse configuration from properties
-             * @returns {object} Configuration object
+             * Parse configuration through the layered settings resolver.
+             * Layout, rows, and refresh now come from:
+             *   user payload → admin master → getProperty → DEFAULTS
+             * (See DashboardSettings header comment at top of <body>.)
              */
             function parseConfiguration() {
-                // Get layout property (format: "{cols}-{tile1}-{tile2}-...")
-                const layoutProp = getProperty('BI_DASHBOARD_LAYOUT', DEFAULT_LAYOUT);
-                const parts = layoutProp.split('-');
-
-                const columns = parseInt(parts[0]) || DEFAULT_COLUMNS;
-                const tiles = parts.slice(1); // Remaining parts are tile codes
-
-                // Validate columns (1-4)
+                const core = window.DashboardSettingsCore;
+                if (core && typeof core.resolve === 'function') {
+                    const layout = core.resolve('layout') || { cols: DEFAULT_COLUMNS, tileOrder: [] };
+                    const cols = Math.max(1, Math.min(4, parseInt(layout.cols, 10) || DEFAULT_COLUMNS));
+                    const tiles = Array.isArray(layout.tileOrder) && layout.tileOrder.length
+                        ? layout.tileOrder.slice() : [];
+                    const rows = parseInt(core.resolve('rowsPerTile'), 10) || DEFAULT_ROWS;
+                    const refreshSeconds = parseInt(core.resolve('refreshSec'), 10) || 0;
+                    return { columns: cols, rows: rows, tiles: tiles, refreshSeconds: refreshSeconds };
+                }
+                // Defensive fallback — settings layer didn't load for some reason
+                const layoutProp = (typeof getProperty === 'function') ? getProperty('BI_DASHBOARD_LAYOUT', DEFAULT_LAYOUT) : DEFAULT_LAYOUT;
+                const parts = (layoutProp || '').split('-');
+                const columns = parseInt(parts[0], 10) || DEFAULT_COLUMNS;
                 const validColumns = Math.max(1, Math.min(4, columns));
-
-                // Get rows property
-                const rowsProp = getProperty('BI_DASHBOARD_ROWS', DEFAULT_ROWS.toString());
-                const rows = parseInt(rowsProp) || DEFAULT_ROWS;
-
-                // Get refresh property (in seconds, 0 = disabled)
-                const refreshProp = getProperty('BI_DASHBOARD_REFRESH', '0');
-                const refreshSeconds = parseInt(refreshProp) || 0;
-
-                return {
-                    columns: validColumns,
-                    rows: rows,
-                    tiles: tiles,
-                    refreshSeconds: refreshSeconds
-                };
+                const tiles = parts.slice(1);
+                const rowsProp = (typeof getProperty === 'function') ? getProperty('BI_DASHBOARD_ROWS', DEFAULT_ROWS.toString()) : DEFAULT_ROWS.toString();
+                const rows = parseInt(rowsProp, 10) || DEFAULT_ROWS;
+                const refreshProp = (typeof getProperty === 'function') ? getProperty('BI_DASHBOARD_REFRESH', '0') : '0';
+                const refreshSeconds = parseInt(refreshProp, 10) || 0;
+                return { columns: validColumns, rows: rows, tiles: tiles, refreshSeconds: refreshSeconds };
             }
 
             /**
@@ -3988,7 +4498,340 @@ window.ReportSHIP = (function() {
         // Initialize dashboard on page load
         window.onload = function() {
             Dashboard.init();
+            if (window.DashboardSettings && typeof window.DashboardSettings.init === 'function') {
+                window.DashboardSettings.init();
+            }
         };
+    </script>
+
+    <script>
+        // ========================================================================
+        // DashboardSettings — Settings-panel UI controller (Phase 1)
+        // Wires the gear button + side panel up to DashboardSettingsCore.
+        // Live changes (Save / Reset / Publish / Lock) trigger a full reload to
+        // re-evaluate the resolved config — simpler than rebuilding each tile.
+        // ========================================================================
+        window.DashboardSettings = (function () {
+            'use strict';
+            const core = window.DashboardSettingsCore;
+
+            // Holds the per-tile Picker sections (from FBLib.Picker) — each entry
+            // is `{ element, read() }`. Rebuilt every time renderCfPicker() runs.
+            let _pickerSections = [];
+
+            const TILE_LABELS = {
+                'SO':  'Sales Orders',
+                'PO':  'Purchase Orders',
+                'WO':  'Work Orders',
+                'RMA': 'RMA Orders',
+                'TO':  'Transfer Orders',
+                'PICK':'Items To Be Picked',
+                'RCV': 'Items To Be Received',
+                'SHIP':'Items To Be Shipped'
+            };
+
+            function init() {
+                if (!core) return;
+                // Show / hide admin section
+                const adminSec = document.getElementById('dsAdminSection');
+                if (adminSec) adminSec.style.display = core.isAdmin() ? 'block' : 'none';
+                refreshLockUI();
+            }
+
+            function refreshLockUI() {
+                if (!core) return;
+                const allowed = core.userEditingAllowed();
+                const badge = document.getElementById('dsLockBadge');
+                if (badge) badge.style.display = (!allowed && !core.isAdmin()) ? 'block' : 'none';
+                const lockBtn = document.getElementById('dsLockBtn');
+                if (lockBtn) lockBtn.textContent = allowed ? 'Lock user editing' : 'Unlock user editing';
+            }
+
+            function openPanel() {
+                if (!core) return;
+                seedPanel(core.effective());
+                refreshLockUI();
+                const overlay = document.getElementById('dashSettingsOverlay');
+                if (overlay) overlay.style.display = 'flex';
+            }
+            function closePanel() {
+                const overlay = document.getElementById('dashSettingsOverlay');
+                if (overlay) overlay.style.display = 'none';
+            }
+            function closePanelIfOverlay(e) {
+                if (e && e.target && e.target.id === 'dashSettingsOverlay') closePanel();
+            }
+
+            function seedPanel(eff) {
+                document.getElementById('dsCols').value           = String(eff.layout && eff.layout.cols ? eff.layout.cols : 2);
+                document.getElementById('dsRows').value           = eff.rowsPerTile;
+                document.getElementById('dsRefresh').value        = eff.refreshSec;
+                document.getElementById('dsHideEstimates').checked   = !!eff.hideEstimates;
+                document.getElementById('dsHideBidRequests').checked = !!eff.hideBidRequests;
+                document.getElementById('dsDebug').checked        = !!eff.debug;
+                renderTileList(eff.layout && Array.isArray(eff.layout.tileOrder)
+                    ? eff.layout.tileOrder
+                    : core.DEFAULT_TILE_ORDER.slice());
+                renderCfPicker(eff.customFields || {}, eff.hiddenStandardColumns || {});
+            }
+
+            // ── Phase 3 — Per-tile column visibility picker
+            // One collapsible section per tile, combining static columns and
+            // custom fields into a single multi-select. Each section is built
+            // by FBLib.Picker.renderTileSection and exposes a `read()` callback
+            // that we invoke from readPickerSelections() to capture state.
+            function renderCfPicker(currentSelection, currentHiddenStandard) {
+                const host = document.getElementById('dsCfModules');
+                if (!host) return;
+                if (!FBLib.CfCatalog.loaded) {
+                    host.innerHTML = '<div class="ds-cf-empty">Loading custom fields…</div>';
+                    _pickerSections = [];
+                    return;
+                }
+                host.innerHTML = '';
+                const tileCodes = core.DEFAULT_TILE_ORDER; // fixed order
+                _pickerSections = [];
+                tileCodes.forEach(function (code) {
+                    const sec = FBLib.Picker.renderTileSection({
+                        tileKey: code,
+                        label:   TILE_LABELS[code] || code,
+                        currentHiddenStatic: new Set(Array.isArray((currentHiddenStandard || {})[code]) ? currentHiddenStandard[code] : []),
+                        currentSelectedCfs:  new Set(Array.isArray((currentSelection || {})[code]) ? currentSelection[code] : []),
+                        onChange: onPickerChange
+                    });
+                    host.appendChild(sec.element);
+                    _pickerSections.push(sec);
+                });
+                host.dataset.cfReady = '1';
+            }
+
+            // Picker tick: persist both customFields + hiddenStandardColumns
+            // immediately. The Picker manages its own count badge updates;
+            // the per-tile re-render happens on Save (rebuildDashboard()).
+            function onPickerChange() {
+                const sel = readPickerSelections();
+                core.setUserKey('customFields', sel.customFields);
+                core.setUserKey('hiddenStandardColumns', sel.hiddenStandardColumns);
+                core.setUserKey('columnOrder', sel.columnOrder);
+                core.saveUser();
+            }
+
+            // Unified read across every tile section in the picker.
+            function readPickerSelections() {
+                const customFields = { SO: [], PO: [], WO: [], RMA: [], TO: [], PICK: [], RCV: [], SHIP: [] };
+                const hiddenStandardColumns = { SO: [], PO: [], WO: [], RMA: [], TO: [], PICK: [], RCV: [], SHIP: [] };
+                const columnOrder = { SO: [], PO: [], WO: [], RMA: [], TO: [], PICK: [], RCV: [], SHIP: [] };
+                _pickerSections.forEach(function (sec) {
+                    const r = sec.read();
+                    customFields[r.tileKey] = r.selectedCfs;
+                    hiddenStandardColumns[r.tileKey] = r.hiddenStatic;
+                    columnOrder[r.tileKey] = Array.isArray(r.orderedKeys) ? r.orderedKeys : [];
+                });
+                return { customFields: customFields, hiddenStandardColumns: hiddenStandardColumns, columnOrder: columnOrder };
+            }
+
+            // Called by the catalog loader once the async query resolves.
+            // If the panel is open at that moment, re-render against the
+            // freshly-populated catalog.
+            function onCatalogLoaded() {
+                const host = document.getElementById('dsCfModules');
+                if (!host) return;
+                const overlay = document.getElementById('dashSettingsOverlay');
+                if (overlay && overlay.style.display !== 'none') {
+                    const eff = core.effective();
+                    renderCfPicker(eff.customFields || {}, eff.hiddenStandardColumns || {});
+                }
+            }
+
+            function renderTileList(currentOrder) {
+                const list = document.getElementById('dsTileList');
+                if (!list) return;
+                list.innerHTML = '';
+                // Build ordered set: currentOrder first, then any missing tiles appended (unchecked)
+                const seen = new Set();
+                const ordered = [];
+                currentOrder.forEach(t => {
+                    const u = t.toUpperCase();
+                    if (TILE_LABELS[u] && !seen.has(u)) { ordered.push({ code: u, on: true }); seen.add(u); }
+                });
+                core.DEFAULT_TILE_ORDER.forEach(t => {
+                    if (!seen.has(t)) ordered.push({ code: t, on: false });
+                });
+
+                ordered.forEach(item => {
+                    const li = document.createElement('li');
+                    li.draggable = true;
+                    li.dataset.code = item.code;
+                    li.innerHTML = `
+                        <span class="ds-grip">&#8942;&#8942;</span>
+                        <input type="checkbox" ${item.on ? 'checked' : ''} />
+                        <span>${TILE_LABELS[item.code]} <span style="color:#94a3b8;">(${item.code})</span></span>
+                    `;
+                    li.addEventListener('dragstart', onDragStart);
+                    li.addEventListener('dragover', onDragOver);
+                    li.addEventListener('dragleave', onDragLeave);
+                    li.addEventListener('drop', onDrop);
+                    li.addEventListener('dragend', onDragEnd);
+                    list.appendChild(li);
+                });
+            }
+
+            // ── Drag-and-drop reordering
+            let _draggingEl = null;
+            function onDragStart(e) {
+                _draggingEl = this;
+                this.classList.add('dragging');
+                if (e.dataTransfer) {
+                    e.dataTransfer.effectAllowed = 'move';
+                    try { e.dataTransfer.setData('text/plain', this.dataset.code); } catch (_) {}
+                }
+            }
+            function onDragOver(e) {
+                e.preventDefault();
+                if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+                if (this !== _draggingEl) this.classList.add('drag-over');
+                return false;
+            }
+            function onDragLeave() { this.classList.remove('drag-over'); }
+            function onDrop(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                this.classList.remove('drag-over');
+                if (_draggingEl && _draggingEl !== this) {
+                    const parent = this.parentNode;
+                    const rect = this.getBoundingClientRect();
+                    const after = (e.clientY - rect.top) > (rect.height / 2);
+                    parent.insertBefore(_draggingEl, after ? this.nextSibling : this);
+                }
+                return false;
+            }
+            function onDragEnd() {
+                this.classList.remove('dragging');
+                document.querySelectorAll('#dsTileList li.drag-over').forEach(el => el.classList.remove('drag-over'));
+                _draggingEl = null;
+            }
+
+            // ── Reading the panel back into a payload
+            function readPanel() {
+                const cols = Math.max(1, Math.min(4, parseInt(document.getElementById('dsCols').value, 10) || 2));
+                const list = document.getElementById('dsTileList');
+                const tileOrder = [];
+                if (list) {
+                    list.querySelectorAll('li').forEach(li => {
+                        const cb = li.querySelector('input[type=checkbox]');
+                        if (cb && cb.checked) tileOrder.push(li.dataset.code);
+                    });
+                }
+                const rowsPerTile = Math.max(1, Math.min(50, parseInt(document.getElementById('dsRows').value, 10) || 5));
+                const refreshSec  = Math.max(0, parseInt(document.getElementById('dsRefresh').value, 10) || 0);
+                const sel = readPickerSelections();
+                return {
+                    layout: { cols: cols, tileOrder: tileOrder.length ? tileOrder : core.DEFAULT_TILE_ORDER.slice() },
+                    rowsPerTile: rowsPerTile,
+                    refreshSec: refreshSec,
+                    hideEstimates:   document.getElementById('dsHideEstimates').checked,
+                    hideBidRequests: document.getElementById('dsHideBidRequests').checked,
+                    debug:           document.getElementById('dsDebug').checked,
+                    customFields:           sel.customFields,
+                    hiddenStandardColumns:  sel.hiddenStandardColumns,
+                    columnOrder:            sel.columnOrder
+                };
+            }
+
+            // Tear down the existing dashboard and re-run init — used instead
+            // of location.reload() because that doesn't fire reliably inside
+            // the Fishbowl JxBrowser BI panel. Also rebuilds DashboardCommon
+            // so DEBUG_MODE re-evaluates against the freshly-saved setting.
+            function rebuildDashboard() {
+                try {
+                    if (window.Dashboard && Dashboard._refreshTimer) {
+                        clearInterval(Dashboard._refreshTimer);
+                    }
+                } catch (_) {}
+                // Empty the grid so createTiles() starts from a blank slate.
+                const grid = document.getElementById('dashboardGrid');
+                if (grid) {
+                    grid.innerHTML = '';
+                    grid.className = '';
+                }
+                // Re-evaluate DashboardCommon's resolved constants (DEBUG_MODE,
+                // FB_DATE_FORMAT) — they were captured at IIFE-load time and
+                // won't update on their own. Easiest: re-invoke the factory.
+                // Patch DashboardCommon.DEBUG_MODE so Dashboard.init()'s
+                // show/hide branch picks up the freshly-resolved value.
+                // (The closure-local const used by debugLog can't be mutated
+                // from outside, but that's harmless — the console panel is
+                // what the user actually sees.)
+                try {
+                    if (window.DashboardCommon) {
+                        DashboardCommon.DEBUG_MODE = !!core.resolve('debug');
+                    }
+                } catch (_) {}
+                if (window.Dashboard && typeof Dashboard.init === 'function') {
+                    Dashboard.init();
+                }
+            }
+
+            // ── Actions
+            function saveUser() {
+                if (!core) return;
+                const payload = readPanel();
+                Object.keys(payload).forEach(k => core.setUserKey(k, payload[k]));
+                const ok = core.saveUser();
+                if (!ok) {
+                    alert('User editing is locked by admin.');
+                    return;
+                }
+                closePanel();
+                rebuildDashboard();
+            }
+            function resetToDefaults() {
+                if (!core) return;
+                if (!confirm('Reset your personal settings to defaults?')) return;
+                core.clearUser();
+                closePanel();
+                rebuildDashboard();
+            }
+            function publishMaster() {
+                if (!core || !core.isAdmin()) return;
+                if (!confirm('Publish current panel values as the default for all users?')) return;
+                const payload = readPanel();
+                core.publishMaster(payload);
+                alert('Published as default for everyone.');
+                closePanel();
+                rebuildDashboard();
+            }
+            function toggleLock() {
+                if (!core || !core.isAdmin()) return;
+                const newLocked = core.userEditingAllowed(); // currently allowed → will lock
+                core.setLock(newLocked);
+                refreshLockUI();
+                alert('User editing: ' + (newLocked ? 'LOCKED' : 'UNLOCKED'));
+            }
+
+            // ── Tile → panel mirror sync (when the per-tile checkbox is toggled)
+            function syncFromTiles() {
+                if (!core) return;
+                const u = core.getUser();
+                const he = document.getElementById('dsHideEstimates');
+                const hb = document.getElementById('dsHideBidRequests');
+                if (he && u.hideEstimates !== undefined)   he.checked = !!u.hideEstimates;
+                if (hb && u.hideBidRequests !== undefined) hb.checked = !!u.hideBidRequests;
+            }
+
+            return {
+                init: init,
+                openPanel: openPanel,
+                closePanel: closePanel,
+                closePanelIfOverlay: closePanelIfOverlay,
+                saveUser: saveUser,
+                resetToDefaults: resetToDefaults,
+                publishMaster: publishMaster,
+                toggleLock: toggleLock,
+                syncFromTiles: syncFromTiles,
+                onCatalogLoaded: onCatalogLoaded
+            };
+        })();
     </script>
 </body>
 </html>

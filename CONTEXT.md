@@ -24,11 +24,7 @@ FB_BI_Reports/
 ├── Manufacturing/
 │   └── WO_Capacity_Planning_Gantt_v3.htm
 ├── scripts/                         # Shared JavaScript modules
-│   ├── dashboard-common.js          # Common utilities
-│   ├── dashboard-so.js              # Sales orders
-│   ├── dashboard-po.js              # Purchase orders
-│   ├── dashboard-ship.js            # Shipping
-│   └── ...
+│   └── fb-lib.js                    # Settings layer, CF discovery/rendering, column registry/picker
 ├── Template/
 │   └── Core_Dashboard_Template.htm  # Base template for new dashboards
 ├── Themes/                          # CSS themes
