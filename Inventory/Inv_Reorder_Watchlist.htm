@@ -743,15 +743,15 @@
                         <label class="block text-xs font-medium text-slate-600 mb-1">Status</label>
                         <div class="relative">
                             <button type="button" id="statusFilterBtn" onclick="toggleStatusDropdown()" class="w-full px-2 py-1 text-sm border border-slate-300 rounded bg-white text-left flex justify-between items-center">
-                                <span id="statusFilterLabel">All</span>
+                                <span id="statusFilterLabel">Critical, Alert</span>
                                 <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
                             </button>
                             <div id="statusDropdown" class="hidden absolute z-50 mt-1 w-full bg-white border border-slate-300 rounded shadow-lg">
                                 <label class="flex items-center px-2 py-1 hover:bg-slate-50 cursor-pointer text-sm">
-                                    <input type="checkbox" value="fb40" class="status-checkbox mr-2" onchange="updateStatusFilter()"> Critical
+                                    <input type="checkbox" value="fb40" class="status-checkbox mr-2" checked onchange="updateStatusFilter()"> Critical
                                 </label>
                                 <label class="flex items-center px-2 py-1 hover:bg-slate-50 cursor-pointer text-sm">
-                                    <input type="checkbox" value="fb30" class="status-checkbox mr-2" onchange="updateStatusFilter()"> Alert
+                                    <input type="checkbox" value="fb30" class="status-checkbox mr-2" checked onchange="updateStatusFilter()"> Alert
                                 </label>
                                 <label class="flex items-center px-2 py-1 hover:bg-slate-50 cursor-pointer text-sm">
                                     <input type="checkbox" value="fb20" class="status-checkbox mr-2" onchange="updateStatusFilter()"> Good
@@ -775,6 +775,17 @@
                         </button>
                     </div>
                 </div>
+            </div>
+
+            <!-- Truncation notice (shown when result hits ROW_LIMIT cap) -->
+            <div id="truncationNotice" class="hidden bg-amber-50 border border-amber-200 text-amber-900 px-3 py-2 rounded-lg mb-3 text-xs flex items-center gap-2">
+                <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+                </svg>
+                <span>
+                    Result capped at <strong id="truncationLimit">1,000</strong> rows.
+                    Narrow filters (status / vendor / part number) to see specific items beyond this cap.
+                </span>
             </div>
 
             <!-- Main Table Container -->
@@ -814,6 +825,12 @@
     let partNum = '%';
     let vendorId = '%';
     let locationGroupId = '%';
+
+    // Hard cap on rows returned from MySQL. Prevents the report from
+    // pulling 50k+ rows on databases where `includeNoRopOul` is on and no
+    // filters are set. The cap applies *before* aggregation, so the
+    // user-visible part count is usually smaller than ROW_LIMIT.
+    const ROW_LIMIT = 1000;
     let user = JSON.parse(getUser());
     let currentUser = user.id || user.userId;
 
@@ -1032,9 +1049,63 @@
       showTooltip(event, html);
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // SQL helpers (added when the report was refactored to push filters into
+    // the query instead of filtering a fully-loaded dataset client-side):
+    //
+    //   runQueryP   — prefers runQueryAsync so the UI thread isn't blocked
+    //                 while a multi-second query runs; falls back to the
+    //                 synchronous runQuery + JSON.parse on older clients.
+    //   _escSql     — single-quote escape for SQL string literals.
+    //   _escLike    — escapes %, _, and \ so user-typed filter text is
+    //                 treated as a literal substring in LIKE, not a pattern.
+    //   _debounce   — coalesces filter keystrokes into one re-query.
+    // ─────────────────────────────────────────────────────────────────────
+    async function runQueryP(sql) {
+      if (typeof runQueryAsync === 'function') {
+        try {
+          const r = await runQueryAsync(sql);
+          return Array.isArray(r) ? r : [];
+        } catch (e) { console.error('runQueryAsync failed', e); return []; }
+      }
+      try { return JSON.parse(runQuery(sql)) || []; }
+      catch (e) { console.error('runQuery failed', e); return []; }
+    }
+    function _escSql(s)  { return String(s == null ? '' : s).replace(/'/g, "''"); }
+    function _escLike(s) { return _escSql(s).replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_'); }
+    function _debounce(fn, ms) {
+      let t = null;
+      return function() {
+        clearTimeout(t);
+        t = setTimeout(() => fn.apply(this, arguments), ms);
+      };
+    }
+
     function monitor() {
-      function getData() {
-        let query = `SELECT
+      async function getData() {
+        // Read current UI filter state once per call so the query can be
+        // narrowed server-side (text / vendor / location / status / hide-X
+        // settings all push into an outer WHERE on the computed base view).
+        const fPartNum = ($('#filterPartNum').val() || '').trim();
+        const fDesc    = ($('#filterDescription').val() || '').trim();
+        const fVendor  = ($('#filterVendor').val() || '').trim();
+        const fLocs    = (typeof getSelectedLocations === 'function') ? getSelectedLocations() : [];
+        const fStates  = (typeof getSelectedStatuses === 'function') ? getSelectedStatuses() : [];
+
+        const conds = [];
+        if (fPartNum) conds.push("LOWER(partnum) LIKE LOWER('%" + _escLike(fPartNum) + "%')");
+        if (fDesc)    conds.push("LOWER(partdescription) LIKE LOWER('%" + _escLike(fDesc) + "%')");
+        if (fVendor)  conds.push("LOWER(vendorname) LIKE LOWER('%" + _escLike(fVendor) + "%')");
+        if (fLocs.length)   conds.push("locationgroup IN (" + fLocs.map(s => "'" + _escSql(s) + "'").join(",") + ")");
+        if (fStates.length) conds.push("state IN ("         + fStates.map(s => "'" + _escSql(s) + "'").join(",") + ")");
+        const excludedStates = [];
+        if (hideOverstocked) excludedStates.push("'fb10'");
+        if (hideAdequate)    excludedStates.push("'fb20'");
+        if (hideApproaching) excludedStates.push("'fb30'");
+        if (excludedStates.length) conds.push("state NOT IN (" + excludedStates.join(",") + ")");
+        const outerWhere = conds.length ? "WHERE " + conds.join(" AND ") : "";
+
+        let innerSql = `SELECT
           base.refresh,
           base.partid,
           base.partnum,
@@ -1241,88 +1312,48 @@
                   -- Only include parts that have NO partreorder settings at all
                   AND NOT EXISTS (SELECT 1 FROM partreorder pr WHERE pr.partid = part.id)
           ` : ''}
-        ) as base
+        ) as base`;
+
+        // Two-stage wrap:
+        //   1. Inner SELECT applies the user filters and a ROW_LIMIT cap,
+        //      ordered by criticality first (FIELD() puts fb40 → fb10 →
+        //      norop in worst-first order). This guarantees the top-N
+        //      most-actionable rows are returned even when filters are
+        //      wide open.
+        //   2. Outer SELECT re-sorts the (already-capped) result set by
+        //      vendor so the rendered table groups by vendor as before.
+        const query = `SELECT * FROM (
+          SELECT * FROM (${innerSql}) AS filtered_q
+          ${outerWhere}
+          ORDER BY FIELD(state, 'fb40', 'fb30', 'fb20', 'fb10', 'norop'), partnum
+          LIMIT ${ROW_LIMIT}
+        ) AS limited_q
         ORDER BY
-                CASE WHEN base.vendorname = 'No Default Vendor' THEN 1 ELSE 0 END,
-                base.vendorname,
-                (CASE
-                  WHEN base.reorderpoint IS NULL OR base.orderuptolevel IS NULL OR base.reorderpoint = 0 OR base.orderuptolevel = 0 THEN 'norop'
-                  WHEN base.available > base.orderuptolevel THEN 'fb10'
-                  WHEN base.available < base.reorderpoint THEN 'fb40'
-                  WHEN base.available >= base.reorderpoint
-                       AND base.available <= (base.reorderpoint + (0.2 * (base.orderuptolevel - base.reorderpoint))) THEN 'fb30'
-                  ELSE 'fb20'
-                END) DESC,
-                base.partnum`;
+          CASE WHEN vendorname = 'No Default Vendor' THEN 1 ELSE 0 END,
+          vendorname,
+          FIELD(state, 'fb40', 'fb30', 'fb20', 'fb10', 'norop'),
+          partnum`;
 
         console.log(query);
-        let dataset = JSON.parse(runQuery(query));
-        console.log(dataset);
-        return dataset;
+        const rows = await runQueryP(query);
+        console.log(rows);
+        return rows;
       }
 
-      function applyFilters(data, skipStatusFilter) {
-        // Get column filter values
-        var filterPartNum = ($('#filterPartNum').val() || '').toLowerCase();
-        var filterDescription = ($('#filterDescription').val() || '').toLowerCase();
-        var filterVendor = ($('#filterVendor').val() || '').toLowerCase();
-        var selectedStatuses = getSelectedStatuses();
-        var selectedLocations = getSelectedLocations();
-
-        return data.filter(function(row) {
-          // Overstocked: state === 'fb10' or capacity > 100
-          if (hideOverstocked && (row.state === 'fb10' || row.capacitypct > 100)) {
-            return false;
-          }
-
-          // Adequately stocked: capacity > 20 (but not overstocked)
-          if (hideAdequate && row.capacitypct > 20 && row.state !== 'fb10' && row.capacitypct <= 100) {
-            return false;
-          }
-
-          // Approaching reorder point: capacity 0-20%
-          if (hideApproaching && row.capacitypct >= 0 && row.capacitypct <= 20) {
-            return false;
-          }
-
-          // Column filters
-          if (filterPartNum && !(row.partnum || '').toLowerCase().includes(filterPartNum)) {
-            return false;
-          }
-          if (filterDescription && !(row.partdescription || '').toLowerCase().includes(filterDescription)) {
-            return false;
-          }
-          if (filterVendor && !(row.vendorname || '').toLowerCase().includes(filterVendor)) {
-            return false;
-          }
-          // Location filter (multi-select)
-          if (selectedLocations.length > 0 && selectedLocations.indexOf(row.locationgroup) === -1) {
-            return false;
-          }
-          // Status filter - skip if we're aggregating first
-          if (!skipStatusFilter && selectedStatuses.length > 0 && selectedStatuses.indexOf(row.state) === -1) {
-            return false;
-          }
-
-          return true;
-        });
+      // Pass-through. Filters were pushed into the SQL query in getData(),
+      // so by the time rows reach the renderer they're already narrowed.
+      // Kept as a function so existing call sites don't need to change.
+      function applyFilters(data /*, skipStatusFilter */) {
+        return data;
       }
 
-      // Filter aggregated data: keep parts that have at least one location matching status filter
-      function filterAggregatedByStatus(aggregatedData, allData) {
-        var selectedStatuses = getSelectedStatuses();
-        if (selectedStatuses.length === 0) return aggregatedData;
-
-        return aggregatedData.filter(function(aggRow) {
-          // Find all raw rows for this part
-          var partRows = allData.filter(function(row) {
-            return row.partnum === aggRow.partnum && row.vendorname === aggRow.vendorname;
-          });
-          // Check if any location matches the status filter
-          return partRows.some(function(row) {
-            return selectedStatuses.indexOf(row.state) !== -1;
-          });
-        });
+      // Pass-through (status filter is also handled in the SQL query). Note:
+      // with the SQL push the "show part if ANY location matches status"
+      // behaviour is gone — a part with mixed-status locations now shows
+      // only the rows matching the selected status. This is an intentional
+      // simplification.
+      function filterAggregatedByStatus(aggregatedData /*, allData */) {
+        return aggregatedData;
       }
 
       // Redraw table with current filters (without reinitializing DataTable)
@@ -1359,10 +1390,16 @@
         table.columns.adjust();
       }
 
-      // Apply column filters and redraw table
-      function applyColumnFilters() {
-        redrawWithFilters();
-      }
+      // Filter changes now re-run getData() so the SQL itself does the
+      // narrowing. Text inputs go through _debounce so a typed-out filter
+      // doesn't fire one query per keystroke; dropdowns (status/location)
+      // fire immediately via applyColumnFiltersNow().
+      const applyColumnFiltersNow = function() {
+        // refreshTable is async but we don't need to await it from a
+        // user-input handler — the spinner-less reload is fine here.
+        try { refreshTable(); } catch (e) { console.error('refresh failed', e); }
+      };
+      const applyColumnFilters = _debounce(applyColumnFiltersNow, 300);
 
       // Clear all column filters
       function clearColumnFilters() {
@@ -1375,7 +1412,7 @@
         // Reset location checkboxes
         $('.location-checkbox').prop('checked', false);
         $('#locationFilterLabel').text('All');
-        redrawWithFilters();
+        applyColumnFiltersNow();
       }
 
       // Open Part in Fishbowl
@@ -1421,7 +1458,7 @@
         } else {
           label.textContent = checkboxes.length + ' selected';
         }
-        applyColumnFilters();
+        applyColumnFiltersNow();
       }
 
       // Get selected status values
@@ -1447,7 +1484,7 @@
         } else {
           label.textContent = checkboxes.length + ' selected';
         }
-        applyColumnFilters();
+        applyColumnFiltersNow();
       }
 
       // Get selected location values
@@ -1789,18 +1826,13 @@
       }
 
       function _commitSettings() {
-          var prevIncludeNoRop = includeNoRopOul;
           hideOverstocked = document.getElementById('settingHideOverstocked').checked;
           hideAdequate    = document.getElementById('settingHideAdequate').checked;
           hideApproaching = document.getElementById('settingHideApproaching').checked;
           includeNoRopOul = document.getElementById('settingIncludeNoRopOul').checked;
           closeSettingsModal();
-          // includeNoRopOul changes the SQL query — need a full data reload
-          if (includeNoRopOul !== prevIncludeNoRop) {
-              refreshTable();
-          } else {
-              redrawWithFilters();
-          }
+          // All four settings now push into the SQL query — always reload.
+          refreshTable();
       }
 
       function applySettingsOnly() { _commitSettings(); }
@@ -1911,25 +1943,38 @@
         }
       }
 
-      function drawTable() {
+      // Toggle the "Result capped at N rows" banner based on whether the
+      // SQL hit ROW_LIMIT. False positive is possible if the unfiltered
+      // count is exactly ROW_LIMIT — acceptable, the message is advisory.
+      function updateTruncationNotice(rows) {
+        const el = document.getElementById('truncationNotice');
+        if (!el) return;
+        const limitEl = document.getElementById('truncationLimit');
+        if (limitEl) limitEl.textContent = ROW_LIMIT.toLocaleString();
+        if (rows && rows.length >= ROW_LIMIT) el.classList.remove('hidden');
+        else el.classList.add('hidden');
+      }
+
+      async function drawTable() {
         // Load and apply saved settings before getData() so the SQL template uses correct flags
         var _initSettings = loadBISettings();
         _applySettingsVars(_initSettings);
         loadConsumptionData();
 
-        dataset = getData();
+        dataset = await getData();
+        updateTruncationNotice(dataset);
 
         // Setup location filter based on data
         var hasLocationGroups = setupLocationFilter(dataset);
 
-        // Apply filters (skip status filter for aggregation)
-        let filteredData = applyFilters(dataset, true);
+        // Apply filters (now a pass-through — SQL did the narrowing)
+        let filteredData = applyFilters(dataset);
 
         // Aggregate by part for main display (keeps raw data in dataset for drill-down)
         let aggregatedData = aggregateByPart(filteredData);
 
-        // Filter aggregated data by status (show parts with ANY location matching status)
-        aggregatedData = filterAggregatedByStatus(aggregatedData, dataset);
+        // Status filter is also pushed into SQL now — pass-through.
+        aggregatedData = filterAggregatedByStatus(aggregatedData);
 
         // Insert vendor header rows
         let groupedData = [];
@@ -2487,23 +2532,20 @@
         }
       }
 
-      function refreshTable() {
+      async function refreshTable() {
         console.time('refreshRate');
         let table = $('#report-table').DataTable();
-        dataset = getData();
+        dataset = await getData();
+        updateTruncationNotice(dataset);
         loadConsumptionData();
 
         // Setup location filter based on data
         setupLocationFilter(dataset);
 
-        // Apply filters (skip status filter for aggregation)
-        let filteredData = applyFilters(dataset, true);
-
-        // Aggregate by part for main display
+        // Pass-throughs — SQL already filtered.
+        let filteredData = applyFilters(dataset);
         let aggregatedData = aggregateByPart(filteredData);
-
-        // Filter aggregated data by status (show parts with ANY location matching status)
-        aggregatedData = filterAggregatedByStatus(aggregatedData, dataset);
+        aggregatedData = filterAggregatedByStatus(aggregatedData);
 
         // Insert vendor header rows
         let groupedData = [];
@@ -2530,15 +2572,24 @@
         fitHeaderText();
 
         console.timeEnd('refreshRate');
-        setTimeout(refreshTable, dataset[0].refresh);
+        // Auto-refresh ticker — use the refresh interval from the very
+        // first row, or fall back to 5 minutes if the result set is empty
+        // (e.g. all parts filtered out by the user).
+        const ms = (dataset && dataset[0] && dataset[0].refresh) || 300000;
+        setTimeout(refreshTable, ms);
       }
 
       // Make refreshTable globally accessible
       window.refreshTable = refreshTable;
 
-      drawTable();
-      console.log(dataset[0].refresh);
-      setTimeout(refreshTable, dataset[0].refresh);
+      // drawTable() is now async — chain off it so we don't read dataset[0]
+      // before the first query resolves. The auto-refresh ticker is started
+      // inside refreshTable() itself, so we only need to kick it off once.
+      drawTable().then(() => {
+        const ms = (dataset && dataset[0] && dataset[0].refresh) || 300000;
+        console.log('Auto-refresh interval:', ms);
+        setTimeout(refreshTable, ms);
+      }).catch(e => console.error('drawTable failed', e));
     }
 
     $(document).ready(function() {
