@@ -486,6 +486,87 @@ function publicConnectionView(c) {
     };
 }
 
+// Find the TENANTS entry whose server matches the legacy entry's
+// implicit FB_URL. Lets the auto-upgrade pick the right tenantId/name
+// rather than a generic "default" fallback.
+async function findMatchingTenant(env, server) {
+    if (!env.TENANTS || !server) return null;
+    try {
+        const list = await env.TENANTS.list({ limit: 100 });
+        for (const k of (list.keys || [])) {
+            const raw = await env.TENANTS.get(k.name);
+            if (!raw) continue;
+            try {
+                const t = JSON.parse(raw);
+                if (t.server && t.server === server) {
+                    return { tenantId: k.name, name: t.name || k.name, server: t.server };
+                }
+            } catch (_) {}
+        }
+    } catch (_) {}
+    return null;
+}
+
+// Transparently upgrade a legacy per-email KV entry (plaintext or
+// encrypted, old shape) to the new connections-array shape. Captures
+// the FB company name + picks the right tenantId from TENANTS so the
+// header pill renders properly the first time the user reloads. No
+// user-visible interaction needed.
+//
+// Only invoked when the user has their OWN legacy entry (not a wildcard
+// or global * — those belong to other users and we don't want to
+// silently shadow them with a personal entry).
+async function tryUpgradeLegacyEntry(env, email, legacyConn) {
+    try {
+        const server = env.FB_URL;
+        if (!server) return null;
+
+        // Get an FB token via the existing DO infrastructure. Keyed
+        // 'fb:default:<user>' for legacy — same key the proxy uses.
+        const doId = env.TOKEN_MANAGER.idFromName('fb:default:' + legacyConn.fbUsername);
+        const stub = env.TOKEN_MANAGER.get(doId);
+        const fbToken = await doGetToken(stub, {
+            fbUsername: legacyConn.fbUsername,
+            fbPassword: legacyConn.fbPassword,
+            server,
+            appName: legacyConn.appName,
+            appId:   legacyConn.appId,
+        }, MAX_TOKEN_AGE_SECONDS);
+
+        const companyName = await fetchCompanyName(server, fbToken);
+
+        // Best-effort match to a real tenant; fall back to a synthesized
+        // "default" if there's no TENANTS entry pointing at this server.
+        const matched = await findMatchingTenant(env, server);
+        const tenantId   = matched ? matched.tenantId : 'default';
+        const tenantName = matched ? matched.name     : 'Fishbowl';
+
+        const encryptedPassword = await encryptString(env, legacyConn.fbPassword);
+        const newConn = {
+            tenantId,
+            tenantName,
+            companyName,
+            server,
+            fbUsername: legacyConn.fbUsername,
+            encryptedPassword,
+            appName:     legacyConn.appName,
+            appId:       legacyConn.appId,
+            displayName: legacyConn.displayName,
+            connectedAt: new Date().toISOString(),
+            upgradedFromLegacy: true,
+        };
+        const newEntry = {
+            lastTenantId: tenantId,
+            connections: [newConn],
+            updatedAt:    new Date().toISOString(),
+        };
+        await env.KEYS.put(email, JSON.stringify(newEntry));
+        return newConn;
+    } catch (_) {
+        return null;   // any failure → fall through to legacy display
+    }
+}
+
 async function handleWhoami(env, email) {
     let entry = null;
     try { entry = await readRawEntry(env, email); }
@@ -508,23 +589,39 @@ async function handleWhoami(env, email) {
         });
     }
 
-    // LEGACY fallback (or no entry at all) — try loadActiveConnection
-    // so domain wildcards / global * still surface as a single
-    // implicit "default" connection. Lets existing @fbinv.com users
-    // continue without doing /connect.
-    try {
-        const conn = await loadActiveConnection(env, email);
-        if (conn) {
+    // LEGACY fallback. Two cases:
+    //   (a) User has their own legacy entry → opportunistically upgrade
+    //       to the new shape (captures companyName, picks tenantId from
+    //       TENANTS). Transparent to the user.
+    //   (b) User has no per-email entry but matches a wildcard → return
+    //       the synthesised connection as-is; don't shadow the wildcard.
+    let conn;
+    try { conn = await loadActiveConnection(env, email); }
+    catch (e) { return jsonResponse(500, { error: e.message }); }
+
+    if (!conn) return jsonResponse(200, { email, needsLogin: true });
+
+    if (conn._isLegacy && conn._entryKey === email) {
+        const upgraded = await tryUpgradeLegacyEntry(env, email, conn);
+        if (upgraded) {
             return jsonResponse(200, {
                 email,
                 needsLogin:     false,
-                activeTenantId: conn.tenantId,
-                connections:    [publicConnectionView(conn)],
-                legacyFallback: conn._isLegacy === true,
+                activeTenantId: upgraded.tenantId,
+                connections:    [publicConnectionView(upgraded)],
+                upgraded:       true,
             });
         }
-    } catch (_) {}
-    return jsonResponse(200, { email, needsLogin: true });
+    }
+
+    // Wildcard fallback, or upgrade failed — return as-is.
+    return jsonResponse(200, {
+        email,
+        needsLogin:     false,
+        activeTenantId: conn.tenantId,
+        connections:    [publicConnectionView(conn)],
+        legacyFallback: conn._isLegacy === true,
+    });
 }
 
 async function handleConnect(env, email, request) {
