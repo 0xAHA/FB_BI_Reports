@@ -18,18 +18,25 @@ new_sqlite_classes = ["TokenManager"]
 # KV writes:    npx wrangler kv key put --binding=KEYS --env=production --remote ...
 # ─────────────────────────────────────────────────────────────────────
 [env.production.vars]
-WORKER_VERSION = "0.4.0"
+WORKER_VERSION = "0.7.0"
 FB_URL = "https://fb-api.0xaha.com"
 
-# KV namespace holding the staff API keys. Each entry shape:
-#   key  : <api-key>  (random 24+ char hex)
-#   value: '{"fbUsername":"...","fbPassword":"...","appName":"...","appId":102,"displayName":"..."}'
-#
+# KV namespace holding per-user FB connections. Keyed by Cloudflare
+# Access email. Two shapes supported (see worker.js for details):
+#   - new: { lastTenantId, connections: [{ tenantId, ..., encryptedPassword }] }
+#   - legacy: { fbUsername, fbPassword | encryptedPassword, ... }
 # Get the namespace id with:  npx wrangler kv namespace list
-# Paste it into the `id` field below.
 [[env.production.kv_namespaces]]
 binding = "KEYS"
 id = "b8119a1f616a4a72ba9157bca4889d3e"
+
+# KV namespace mapping tenant codes to FB server URLs. Admin-managed —
+# end users never enumerate this. Each value: { name, server }.
+# Create with: npx wrangler kv namespace create TENANTS --env production
+# Then paste the printed `id` below.
+[[env.production.kv_namespaces]]
+binding = "TENANTS"
+id = "6d401aaf33364cbf836c6f1e459ec172"
 
 # Durable Object binding. One TokenManager instance per API key (keyed
 # via idFromName(apiKey) inside the Worker); each instance caches the
@@ -37,3 +44,34 @@ id = "b8119a1f616a4a72ba9157bca4889d3e"
 [[env.production.durable_objects.bindings]]
 name = "TOKEN_MANAGER"
 class_name = "TokenManager"
+
+# Rate limiting — Cloudflare-native bindings (graduated from unsafe →
+# stable as of 2025). Two separate rate limiters:
+#
+#   RATE_LIMIT_CONNECT  — guards /api/_internal/connect against
+#                         tenant-code brute force. 10 attempts per email
+#                         per 60s. Legit users connect once and never
+#                         hit this; an attacker trying random codes is
+#                         capped at 10/min/email even past Access OTP.
+#
+#   RATE_LIMIT_PROXY    — guards the general /api/* proxy path against
+#                         runaway clients (infinite loops in the page,
+#                         broken automation, etc.). 120 req/min/email
+#                         comfortably covers normal page-load bursts
+#                         (~5-10 concurrent queries) while killing
+#                         pathological loops.
+#
+# `namespace_id` is an arbitrary numeric id local to your account —
+# use any value, just keep them unique within this file. Allowed
+# `period` values are 10 or 60 seconds.
+[[env.production.unsafe.bindings]]
+name = "RATE_LIMIT_CONNECT"
+type = "ratelimit"
+namespace_id = "1001"
+simple = { limit = 10, period = 60 }
+
+[[env.production.unsafe.bindings]]
+name = "RATE_LIMIT_PROXY"
+type = "ratelimit"
+namespace_id = "1002"
+simple = { limit = 120, period = 60 }

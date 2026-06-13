@@ -1,313 +1,441 @@
-# QuickOrder Portal — Cloudflare Worker
+# QuickOrder Portal — Cloudflare Worker + Pages Function
 
-This Worker is the auth + CORS layer that lets `SalesOrder/QuickOrder.htm`
-run from any browser instead of only inside the Fishbowl desktop client.
+This is the auth + proxy layer that lets `SalesOrder/QuickOrder.htm`
+run from any browser instead of only inside the Fishbowl desktop
+client.
+
+Two pieces of code live here:
+
+- **`worker.js`** — a private Worker that talks to the Fishbowl REST
+  API. Holds the KV namespace, the `TokenManager` Durable Object, and
+  the proxy logic. Has NO public URL — it's reachable only via a
+  Service Binding from the Pages Function.
+- **`../../SalesOrder/functions/api/[[path]].js`** — a Cloudflare
+  Pages Function that sits behind Cloudflare Access. Verifies the
+  Access JWT on every request, then forwards to the Worker via the
+  Service Binding with `X-User-Email` set to the verified email
+  claim.
 
 ## Architecture
 
 ```
 Staff browser
-   │  HTTPS  (CORS-permissive, gated by ?key=)
+   │
+   │  Cloudflare Access OTP — gates page load
    ▼
-Cloudflare Worker (this code)
-   │  HTTPS  (Tunnel hostname, e.g. fb-api.yourco.com)
+Pages: https://0xaha.com/ (the QuickOrder UI, static HTML)
+   │
+   │  same-origin fetch /api/*
    ▼
-cloudflared (Windows service, runs on the FB host)
+Pages Function (functions/api/[[path]].js)
+   │  - Verifies Cf-Access-Jwt-Assertion against Cloudflare JWKS
+   │  - Checks aud + iss + exp + nbf claims
+   │  - Sets X-User-Email from the verified email claim
+   │
+   │  Service Binding (internal, no public URL)
+   ▼
+Worker (this code)
+   │  - KV lookup by email → @domain → *
+   │  - Per-FB-user TokenManager DO (cached FB token, serialised refresh)
+   │  - Body buffered upfront so 401-retry on POST keeps the payload
+   │  - Proactive refresh once cached token > 50 min old
+   │
+   ▼  HTTPS via Tunnel
+cloudflared (Windows service, on the FB host)
    │  localhost:2456
    ▼
 Fishbowl REST API
 ```
 
-The Worker:
-1. Reads `?key=` (or `Authorization: Bearer`) from the inbound request.
-2. Looks the key up in the **KEYS** KV namespace (stored: `fbUsername`,
-   `fbPassword`, `appName`, `appId`, `displayName`).
-3. Asks the per-key **TokenManager** Durable Object for a current FB
-   Bearer token. On a cache miss the DO logs in via `POST /api/login`
-   and stashes the token in DO storage; on a hit it returns the
-   cached one with no upstream round trip.
-4. Proxies the request to the Tunnel URL stamping in that token.
-5. If FB returns 401 the cached token has expired — the Worker tells
-   the DO to invalidate (which logs out the old token before clearing
-   it), gets a fresh one, and retries the request once.
-6. Re-emits the response with `Access-Control-Allow-Origin: *` so the
-   browser will accept it from any origin.
+## Why this shape
 
-## Why a Durable Object
+A few constraints drove the architecture:
 
-The earlier design cached the Bearer token in KV and refreshed on 401.
-That works fine sequentially but leaks FB sessions on concurrent burst
-loads: QuickOrder fires ~5 parallel queries on first paint; if the
-cached token is stale, every Worker invocation independently logs in
-and orphans 4–5 sessions in Fishbowl's "logged-in users" list.
-Cloudflare KV has no compare-and-swap so the race is unfixable inside
-plain Workers.
+- **Cloudflare Access can't gate the API.** When `api.0xaha.com` was
+  in front of Access, cross-subdomain `fetch()` failed — Access
+  redirects to OTP, and XHR can't follow that. Solution: put the
+  Pages Function at `/api/*` on the same origin as the page, so the
+  Access cookie is automatically present.
+- **The Worker has no public URL.** Service Binding from Pages →
+  Worker is the only entry point. Removes the "anyone with X-User-Email
+  header can impersonate" attack class entirely.
+- **DO keyed by FB username, not email.** Multiple staff signing in
+  with their own emails but sharing one FB account (e.g. shared
+  `fam` user) land on the same DO and share its cached token. Without
+  this, each staff member would log in independently and FB's
+  single-session-per-user behaviour would have them invalidating each
+  other's tokens.
+- **JWT verified against JWKS, not trusted blindly.** The Pages
+  Function fetches Cloudflare's JWKS (cached at the edge for 1 hour),
+  verifies the RS256 signature with Web Crypto, and checks aud + iss
+  + exp + nbf. Defence in depth — Cloudflare's edge already
+  authenticated the request, but a verified signature ensures no
+  forged-header path can sneak past.
+- **Body buffered for 401 retry.** Workers request bodies are
+  one-shot streams. The Worker reads the body into an ArrayBuffer
+  once, then reuses it across the initial attempt + the 401-retry.
+  Without this, SO submits would silently lose the CSV body on a
+  stale-session refresh and create an empty order.
 
-We then shipped a per-request login + logout flow as a stop-gap — zero
-session leaks at the cost of ~100 ms login round trip on EVERY staff
-request. Correct, but chatty.
+## Bindings
 
-The Durable Object solves both problems:
+### Worker (`worker.js`)
 
-- **One DO instance per API key** (`idFromName(apiKey)`). Concurrent
-  requests for the same key share a single token; different keys are
-  isolated from each other.
-- **`blockConcurrencyWhile` serialises refresh.** Exactly one
-  `/api/login` round trip per token-expiry event no matter how many
-  parallel staff requests arrive. The other requests wait inside the
-  DO for the in-flight login to finish, then receive the fresh token.
-- **Invalidation logs out the previous token** before discarding it,
-  so every login still matches a logout — no orphaned sessions in
-  Fishbowl's "logged-in users" list.
-- **Cached on the hot path.** A request that hits a warm token sees
-  zero login latency — the DO returns the cached token from its
-  in-memory copy (rehydrated from SQLite storage on cold start).
+Configured in `wrangler.toml`:
 
-### Plan compatibility
+| Binding         | Type                 | Purpose                                          |
+|-----------------|----------------------|--------------------------------------------------|
+| `KEYS`          | KV namespace         | email / @domain / * → FB credentials JSON        |
+| `TOKEN_MANAGER` | Durable Object       | Per-FB-user cached token + serialised refresh    |
+| `FB_URL`        | env var              | Tunnel hostname for the FB REST API              |
+| `WORKER_VERSION`| env var              | Surfaced at `/health` for cache-bust visibility  |
 
-The Worker uses `new_sqlite_classes` in the migration (see
-`wrangler.toml`). SQLite-backed DOs are available on the **Workers
-Free** plan — the older KV-style DO (`new_classes`) requires Workers
-Paid. For QuickOrder's volume (small team, occasional usage), Free is
-fine.
+### Pages Function (`SalesOrder/functions/api/[[path]].js`)
+
+Configured in the Pages project dashboard → Settings → Bindings:
+
+| Binding             | Type            | Purpose                                       |
+|---------------------|-----------------|-----------------------------------------------|
+| `QUICKORDER_WORKER` | Service binding | Forward to the private Worker (entrypoint: default) |
+
+The Function also hardcodes two values at the top of the file —
+update these if you re-create the Access Application or move teams:
+
+| Constant              | Where to find it                                              |
+|-----------------------|---------------------------------------------------------------|
+| `ACCESS_TEAM_DOMAIN`  | Zero Trust → Settings → Custom Pages. Always `https://<team>.cloudflareaccess.com` |
+| `ACCESS_APP_AUD`      | Zero Trust → Access → Applications → your app → Overview → "Application Audience (AUD) Tag" |
+
+## KV: how staff get mapped to FB credentials
+
+The Worker tries three lookups in order — first hit wins:
+
+1. **Exact email** — `KEYS["andrew.doenau@fbinv.com"]`. Use for
+   per-user mappings (best audit trail).
+2. **Domain wildcard** — `KEYS["@fbinv.com"]`. Use to onboard a team
+   that shares one FB account.
+3. **Global fallback** — `KEYS["*"]`. Last resort. Only set if you
+   trust every email the Access policy admits.
+
+Each entry is a JSON object:
+
+```json
+{
+  "fbUsername":  "<fb-username>",
+  "fbPassword":  "<fb-password>",
+  "appName":     "Quick Order",
+  "appId":       102,
+  "displayName": "Fishbowl Staff"
+}
+```
+
+`appName` + `appId` are the Integrated Application credentials
+registered in Fishbowl → Maintenance → Integrated Applications.
+QuickOrder.htm registers as `(Quick Order, 102)` by default — the
+same IA approval covers both this portal and the desktop QuickOrder.
 
 ---
 
 ## One-time setup
 
-### 1. Install `cloudflared` on the Fishbowl host
+### 1. cloudflared on the Fishbowl host
 
 On the Windows machine that runs Fishbowl Server:
 
 ```powershell
-# Option A: winget
 winget install --id Cloudflare.cloudflared
-
-# Option B: download the MSI from
-# https://github.com/cloudflare/cloudflared/releases
+cloudflared tunnel login                  # opens browser; pick your domain
+cloudflared tunnel create fb-api          # note the UUID + credentials JSON path
 ```
 
-Authenticate:
-
-```powershell
-cloudflared tunnel login
-```
-
-This opens a browser. Pick the Cloudflare-managed domain you want to use
-(e.g. `yourco.com`).
-
-### 2. Create the Tunnel
-
-```powershell
-cloudflared tunnel create fb-api
-```
-
-This prints a Tunnel UUID and a path to a credentials JSON file.
-Note both — you'll need them for the config.
-
-Edit (or create) `C:\Users\<user>\.cloudflared\config.yml`:
+Create `C:\Users\<you>\.cloudflared\config.yml`:
 
 ```yaml
 tunnel: <tunnel-uuid>
-credentials-file: C:\Users\<user>\.cloudflared\<tunnel-uuid>.json
+credentials-file: C:\Users\<you>\.cloudflared\<tunnel-uuid>.json
 
 ingress:
-  - hostname: fb-api.yourco.com
+  - hostname: fb-api.0xaha.com           # change to your domain
     service: http://localhost:2456
   - service: http_status:404
 ```
 
-Then point a DNS record for that hostname at the Tunnel:
+Route DNS:
 
 ```powershell
-cloudflared tunnel route dns fb-api fb-api.yourco.com
+cloudflared tunnel route dns fb-api fb-api.0xaha.com
 ```
 
-### 3. Install as a Windows service
-
-So the tunnel runs even after the user logs out:
+Install as a Windows service so it survives reboots:
 
 ```powershell
 cloudflared service install
 ```
 
-Verify with:
+**Gotcha:** the service runs as `LocalSystem`, whose home dir is
+`C:\Windows\System32\config\systemprofile\.cloudflared\`. `cloudflared
+service install` usually copies the config across automatically, but
+sometimes you need to do it manually:
 
-```powershell
-Get-Service cloudflared
+```cmd
+set SVCDIR=C:\Windows\System32\config\systemprofile\.cloudflared
+if not exist "%SVCDIR%" mkdir "%SVCDIR%"
+copy "%USERPROFILE%\.cloudflared\config.yml"   "%SVCDIR%\" /Y
+copy "%USERPROFILE%\.cloudflared\*.json"       "%SVCDIR%\" /Y
+copy "%USERPROFILE%\.cloudflared\cert.pem"     "%SVCDIR%\" /Y
+sc stop cloudflared
+sc start cloudflared
 ```
 
-It should show `Running`. Logs are at
-`C:\Windows\System32\config\systemprofile\.cloudflared\cloudflared.log`.
+Another gotcha: in some versions `cloudflared service install`
+configures the service with no command-line args (i.e. just runs
+`cloudflared.exe` with nothing). Fix manually:
 
-### 4. Confirm the tunnel is up
-
-From any machine **outside** the FB server's LAN:
-
-```bash
-curl -i https://fb-api.yourco.com/api/login
+```cmd
+sc config cloudflared binPath= "\"C:\Program Files (x86)\cloudflared\cloudflared.exe\" --config \"C:\Windows\System32\config\systemprofile\.cloudflared\config.yml\" tunnel run"
+sc start cloudflared
 ```
 
-Expect a `4xx` from Fishbowl (login required). A `5xx` or DNS error means
-the tunnel isn't routing. A `Cloudflare 521` means cloudflared isn't running.
+Verify:
 
-### 5. Provision the Cloudflare Worker
-
-Install Wrangler:
-
-```bash
-npm install -g wrangler
-wrangler login
+```cmd
+sc query cloudflared              :: STATE: 4 RUNNING
+cloudflared tunnel info fb-api    :: should show active connectors
+curl -i https://fb-api.0xaha.com/api/login   :: 4xx from FB = tunnel OK
 ```
 
-Create the KV namespace (wrangler v3+ syntax — older `wrangler kv:namespace`
-with a colon also works):
+### 2. Cloudflare Access
 
-```bash
-wrangler kv namespace create KEYS
-# → ✨ Add the following to your configuration file:
-# kv_namespaces = [
-#   { binding = "KEYS", id = "abc123..." }
-# ]
+Zero Trust → **Access** → **Applications** → **Add an application** →
+**Self-hosted**:
+
+- **Application name:** `QuickOrder`
+- **Session duration:** 24 hours (or whatever you prefer)
+- **Application domains:**
+  - `0xaha.com` (path blank — covers everything including `/api/*`)
+- **Identity providers:** One-time PIN (default; built in)
+- **Policy:** Allow, emails ending in `@fbinv.com` (plus any
+  explicit personal addresses)
+
+Copy the **Application Audience (AUD) Tag** from the Overview tab —
+paste into `ACCESS_APP_AUD` at the top of `[[path]].js`.
+
+Confirm Cloudflare's team domain — usually
+`https://<your-team>.cloudflareaccess.com`. Set `ACCESS_TEAM_DOMAIN`
+in `[[path]].js`.
+
+### 3. Worker
+
+KV namespace:
+
+```cmd
+cd tools\cloudflare-worker
+npx wrangler kv namespace create KEYS
+:: paste the printed id into wrangler.toml under [[env.production.kv_namespaces]]
 ```
 
-Paste that `id` into `wrangler.toml` (replace the existing `id` under
-`[[env.production.kv_namespaces]]`).
-
-Update `wrangler.toml`:
-- Set `FB_URL` under `[env.production.vars]` to your Tunnel hostname.
-- Bump `WORKER_VERSION` whenever you deploy.
-
-The Durable Object binding is already declared at the bottom of
-`wrangler.toml`. The first `wrangler deploy` applies the `[[migrations]]`
-entry, which creates the `TokenManager` SQLite-backed DO class. No
-manual setup needed — Cloudflare provisions storage on first DO access.
+Set `FB_URL` in `wrangler.toml` to your tunnel hostname. Bump
+`WORKER_VERSION` whenever you deploy.
 
 Deploy:
 
-```bash
-wrangler deploy --env production
-```
-
-The first deploy prints the Worker URL — e.g.
-`https://quickorder-worker.<your-cf-subdomain>.workers.dev`.
-Bookmark this. You can also map a custom hostname under
-Cloudflare's "Workers Routes" later (e.g. `orders.yourco.com`).
-
-### 6. Provision your first staff API key
-
-For each Fishbowl user who needs portal access:
-
-```bash
-# 1. Generate a random key (Linux/Mac).
-#    On Windows:  -join ((48..57)+(97..122) | Get-Random -Count 32 | %{[char]$_})
-KEY=$(openssl rand -hex 24)
-echo "Hand this key to the staff member: $KEY"
-
-# 2. Write the KV entry. Per-request login means we only store the
-#    credentials; the FB Bearer token is freshly minted each request
-#    and reaped immediately after.
-wrangler kv key put --binding=KEYS --env=production "$KEY" \
-    "$(jq -n --arg u "andrew.doenau" \
-              --arg p "<their-FB-password>" \
-              --arg n "Andrew Doenau" \
-              '{fbUsername:$u, fbPassword:$p, appName:"Quick Order", appId:102, displayName:$n}')"
-```
-
-On Windows cmd, use this one-liner (no jq):
 ```cmd
-npx wrangler kv key put --binding=KEYS --env=production --remote "%KEY%" "{\"fbUsername\":\"andrew.doenau\",\"fbPassword\":\"<their-FB-password>\",\"appName\":\"Quick Order\",\"appId\":102,\"displayName\":\"Andrew Doenau\"}"
+npx wrangler deploy --env production
 ```
 
-Staff member's URL becomes:
+The first deploy auto-runs the `[[migrations]]` block in
+`wrangler.toml` to create the `TokenManager` SQLite-backed DO class.
 
+Make the Worker private — dashboard → Workers & Pages →
+`quickorder-worker-production` → **Settings** → **Domains & Routes**:
+
+- Remove any custom domain rows (e.g. the old `api.0xaha.com`)
+- Disable the `workers.dev` subdomain toggle
+
+Now the Worker is reachable only via service binding.
+
+### 4. Pages project
+
+The Pages project (`quickorder-portal`) holds the static HTML and
+the auth gateway Function.
+
+Deploy from inside the Pages source directory so Wrangler picks up
+the `functions/` subdirectory:
+
+```cmd
+cd SalesOrder
+npx wrangler pages deploy . --project-name quickorder-portal --branch main
 ```
-https://quickorder-worker.<subdomain>.workers.dev/?key=<KEY>
+
+You should see `✨ Compiled Worker successfully` and `Uploading
+Functions bundle` in the output — that confirms the Function was
+bundled.
+
+Bindings — dashboard → Workers & Pages → `quickorder-portal` →
+**Settings** → **Bindings** (or **Functions** → **Service bindings**):
+
+- Add **Service binding**:
+  - Variable name: `QUICKORDER_WORKER`
+  - Service: `quickorder-worker-production`
+  - Entrypoint: `default`
+
+Custom domains — Pages → `quickorder-portal` → **Custom domains** →
+add `0xaha.com` (or whatever your staff URL is).
+
+### 5. Provision your first tenant
+
+Each Fishbowl install you proxy to is a "tenant" — a TENANTS KV
+entry mapping a short tenant code (slug you pick) to its FB server
+URL. Create the TENANTS namespace + seed one entry for your own
+Fishbowl:
+
+```cmd
+cd tools\cloudflare-worker
+
+:: Create the namespace (only needed once; if it already exists,
+:: `wrangler kv namespace list` will show it)
+npx wrangler kv namespace create TENANTS --env production
+
+:: Paste the printed id into wrangler.toml under [[env.production.kv_namespaces]] binding="TENANTS"
+
+:: Seed the first tenant. The tenant code (here "hq") is what users
+:: type into the QuickOrder connect modal.
+npx wrangler kv key put --binding=TENANTS --env=production --remote ^
+    "hq" ^
+    "{\"name\":\"Fishbowl HQ\",\"server\":\"https://fb-api.0xaha.com\"}"
 ```
 
-They bookmark it. Done.
+Each additional tenant (real customer or test) gets its own slug +
+TENANTS entry pointing at THEIR tunnel hostname.
 
-### 7. Smoke test
+> The KEYS namespace stays empty initially — staff self-populate it
+> when they go through the connect flow. No admin-provisioned
+> credentials.
 
-```bash
-# Health
-curl https://quickorder-worker.<subdomain>.workers.dev/health
-# → {"ok":true,"version":"0.1.0","upstream":"https://fb-api.yourco.com"}
+### 6. Smoke test
 
-# Auth gate
-curl -i https://quickorder-worker.<subdomain>.workers.dev/api/parts
-# → 401 (no key)
+In an incognito browser window, visit `https://0xaha.com/`:
 
-curl -i "https://quickorder-worker.<subdomain>.workers.dev/api/parts?key=$KEY"
-# → 200 with the same JSON as a direct call to FB.
+1. Cloudflare Access OTP page → enter your email → get code → enter it
+2. QuickOrder page loads + shows the "Connect your Fishbowl account" modal
+3. Enter your tenant code (e.g. `hq`), your Fishbowl username, password, optional display name → Connect
+4. Page reloads; header pill shows your FB company name (from `SELECT name FROM company WHERE id = 1`)
+5. Products + customers load (data flows through Pages Function → Worker → Tunnel → FB)
+6. Click the pill → see your active connection + "Connect another tenant" option
+7. Sit idle for 8 minutes → an amber countdown pill appears (`2:00`) → ticks down → after 10 min total idle, page logs you out
 
-# CORS — from a browser DevTools console on any random page:
-fetch('https://quickorder-worker.<subdomain>.workers.dev/api/parts?key=...')
-  .then(r => r.json())
-  .then(console.log)
-# → should print parts, NOT throw "Failed to fetch".
+---
+
+## Day-to-day ops
+
+### List provisioned tenants
+
+```cmd
+npx wrangler kv key list --binding=TENANTS --env=production
+```
+
+### Add a new tenant
+
+```cmd
+npx wrangler kv key put --binding=TENANTS --env=production --remote ^
+    "<tenant-code>" ^
+    "{\"name\":\"<Display Name>\",\"server\":\"https://<their-tunnel-host>\"}"
+```
+
+Then tell the customer's staff: the tenant code is `<tenant-code>`,
+URL is `https://0xaha.com/`. They each go through the connect modal
+once with their own FB user/password.
+
+### Remove a tenant
+
+```cmd
+npx wrangler kv key delete --binding=TENANTS --env=production --remote "<tenant-code>"
+```
+
+Existing connected users keep working until their cached connection
+fails (FB password change, etc.); to force them out, also delete
+their KEYS entries (see below) and/or remove their email domain
+from the Access policy.
+
+### List user connections
+
+```cmd
+npx wrangler kv key list --binding=KEYS --env=production
+```
+
+Each key is a staff email; value is `{ lastTenantId, connections: [...] }`
+where each connection holds an encrypted FB password.
+
+### Revoke a user
+
+```cmd
+npx wrangler kv key delete --binding=KEYS --env=production --remote "<email>"
+```
+
+Their next page load returns 403 + the connect modal. Loading the
+static page still works (Cloudflare Access lets them through) but
+no data flows.
+
+To lock them out at the Access layer entirely (no OTP), edit the
+Access Application → Policies → remove their email or domain.
+
+### Rotate an FB password
+
+End-users self-recover: when FB rejects the cached password, the page
+re-shows the connect modal. The user types the new password, the
+connection updates, done. No admin action needed.
+
+To force re-onboarding for a specific user (e.g. their PC was lost),
+delete their KEYS entry as above — their next visit shows the
+connect modal pre-filled with the tenant code from the previous
+session.
+
+### Inspect a user's stored connections
+
+```cmd
+npx wrangler kv key get --binding=KEYS --env=production --remote "<email>"
+```
+
+The FB passwords are AES-GCM-encrypted ciphertext — readable bytes
+on screen are useless without the `KEYS_ENC_KEY` Worker secret.
+Still, don't run this on shared screens.
+
+### Tail Worker / Function logs
+
+```cmd
+npx wrangler tail --env production quickorder-worker
+npx wrangler pages deployment tail --project-name quickorder-portal
 ```
 
 ---
 
-## Day-to-day operations
+## Troubleshooting
 
-### List active keys
-
-```bash
-wrangler kv key list --binding=KEYS --env=production
-```
-
-### Revoke a key
-
-```bash
-wrangler kv key delete --binding=KEYS --env=production "<key>"
-```
-
-The staff member's bookmark immediately stops working — the next request
-returns 401.
-
-### Force a token refresh
-
-Tokens auto-refresh on 401, so manual intervention is rarely needed.
-If the staff member's FB password changes, re-provision the KV entry
-(re-run step 6 with the same `KEY` — KV `put` overwrites in place).
-The next request will fail to refresh against the cached (now-invalid)
-token, the DO will logout + re-login with the updated KV credentials,
-and the cycle stabilises on the new token within one request.
-
-### Inspect what's stored for a key
-
-```bash
-wrangler kv key get --binding=KEYS --env=production "<key>"
-```
-
-(Hands you back the JSON blob, including the FB password if stored —
-keep this off shared screens.)
+| Symptom | Likely cause |
+|---|---|
+| `Load failed: Unexpected token '<'` in the browser | Pages Function isn't routing — `/api/*` is falling through to static. Re-deploy from inside `SalesOrder/` (NOT the repo root) so Wrangler sees the `functions/` directory. |
+| `"Not authenticated via Cloudflare Access"` | Pages Function didn't see the JWT. Either Access isn't in front of this path (check Application Domains include `0xaha.com` with empty path), OR you're hitting the `pages.dev` URL instead of `0xaha.com`. |
+| `"JWT audience mismatch"` | `ACCESS_APP_AUD` in `[[path]].js` doesn't match your Access Application's AUD. Update + redeploy. |
+| `"JWT issuer mismatch"` | `ACCESS_TEAM_DOMAIN` is wrong. Should be `https://<team>.cloudflareaccess.com`. |
+| `"no Fishbowl account is mapped to that address"` | KV has no entry for the user's email, domain, OR `*`. Provision one (see Step 5 above). |
+| `1033` from `fb-api.0xaha.com` | cloudflared service not running on the FB host. `sc query cloudflared` → if not RUNNING, see Step 1 gotchas. |
+| `502 FB login failed` | KV `fbUsername`/`fbPassword` is wrong, OR the Fishbowl Integrated Application isn't approved. Check Fishbowl → Maintenance → Integrated Applications. |
+| Random `401`s every ~50 min | The cached token's age hit the proactive-refresh threshold and refresh failed. Check `MAX_TOKEN_AGE_SECONDS` and the IA still being valid in FB. |
+| Multiple FB sessions accumulating | DO key collision — verify `TokenManager.idFromName('fb:' + fbUsername)` is being used, not the email. Multiple users sharing one FB account MUST share one DO or they fight each other's sessions. |
 
 ---
 
 ## Local development
 
-```bash
-wrangler dev --env dev
+```cmd
+:: Worker dev (no public URL, just local hot reload)
+cd tools\cloudflare-worker
+npx wrangler dev --env production
+
+:: Pages dev (with Functions)
+cd SalesOrder
+npx wrangler pages dev .
 ```
 
-Opens a local URL. KV reads/writes go against a local simulator unless you
-pass `--remote`. For a true integration test, deploy to a dev environment
-with `wrangler deploy --env dev` and a separate `FB_URL` pointing at a dev
-Fishbowl instance.
-
----
-
-## Known unknowns (to verify during implementation)
-
-- **FB `/api/login` response shape** — the Worker's `extractToken()` probes
-  `token`, `access_token`, `bearer`, `bearerToken`. If FB uses a different
-  field, adjust that helper.
-- **FB session lifetime** — if tokens last days, the refresh-on-401 path
-  is rarely hit. If they last minutes, KV writes scale per-request — that
-  may need promoting to a Durable Object later for serialised refresh.
-- **Import endpoint exact path** — Phase 3 (SO submission) will hit the
-  Fishbowl REST import endpoint. The Worker is fully transparent so it
-  doesn't need to know the path, but the QuickOrder.htm side does.
+For end-to-end testing with real Access, deploy to a separate Pages
+project + Worker in your dev account.
