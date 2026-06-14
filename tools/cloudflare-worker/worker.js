@@ -658,14 +658,24 @@ async function handleConnect(env, email, request) {
             }),
         });
         if (!loginResp.ok) {
+            const respText = await loginResp.text().catch(() => '');
+            // IA-approval errors are NOT enumeration-sensitive — by
+            // returning this response FB has already confirmed the
+            // tenant exists. So we can safely surface a helpful
+            // message to the user pointing at the fix (admin needs
+            // to approve "Quick Order" in Maintenance → Integrated
+            // Applications). Generic fail for all other cases.
+            if (/integrated application has not been approved|not yet been approved|has not been approved/i.test(respText)) {
+                return jsonResponse(401, {
+                    error: 'This Fishbowl tenant has not yet approved the QuickOrder integrated application. Your Fishbowl administrator needs to approve "Quick Order" (app ID 102) under Maintenance → Integrated Applications. Once approved, try connecting again.',
+                });
+            }
             return jsonResponse(401, { error: CONNECT_GENERIC_FAIL });
         }
         const data = await loginResp.json().catch(() => ({}));
         token = extractToken(data);
         if (!token) return jsonResponse(401, { error: CONNECT_GENERIC_FAIL });
     } catch (e) {
-        // Unreachable upstream — distinguishable from bad creds, but
-        // a legitimate user can't fix a downed tunnel by guessing.
         return jsonResponse(502, {
             error: 'Fishbowl server is unreachable. Try again in a moment, or contact your admin.',
             detail: e && e.message,
