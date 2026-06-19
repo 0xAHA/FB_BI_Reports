@@ -1,5 +1,5 @@
 import logging
-import time
+import urllib.parse
 
 import keyring
 import requests
@@ -11,18 +11,25 @@ SERVICE_NAME = "fishbowl-powerbi-agent"
 
 class FishbowlClient:
     """
-    Authenticated HTTP client for the Fishbowl Advanced REST API.
-    Handles login, token caching, and automatic re-auth on expiry.
+    Authenticated client for the Fishbowl Advanced REST API.
 
-    Before first use, run setup_credentials.py to store credentials in
-    Windows Credential Manager.
+    Auth:  POST /api/login  →  Bearer token
+    Query: GET  /api/data-query?query=<sql>  (same SQL you'd use in a BI report)
+
+    The app (FISHBOWL_APP_NAME / FISHBOWL_APP_ID from config.py) must be
+    registered and approved in Fishbowl → Maintenance → Integrated Applications
+    before the first login will succeed.
+
+    Token has no server-advertised expiry, so 401 responses trigger a single
+    re-auth retry automatically.
     """
 
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, app_name: str, app_id: int):
         self.base_url = base_url.rstrip("/")
-        self.session = requests.Session()
+        self.app_name = app_name
+        self.app_id   = app_id
+        self.session  = requests.Session()
         self._token: str | None = None
-        self._token_expiry: float = 0.0
 
     # ------------------------------------------------------------------
     # Auth
@@ -38,67 +45,73 @@ class FishbowlClient:
             )
         return username, password
 
-    def _authenticate(self) -> None:
+    def authenticate(self) -> None:
+        """Login and cache the Bearer token. Called automatically on first use or after 401."""
         username, password = self._load_credentials()
-
-        # TODO: confirm the exact auth endpoint and request body from
-        #       http://<your-server>:2456/apidocs
         response = self.session.post(
             f"{self.base_url}/api/login",
-            json={"username": username, "password": password},
+            json={
+                "appName":  self.app_name,
+                "appId":    self.app_id,
+                "username": username,
+                "password": password,
+            },
             timeout=30,
         )
+        if response.status_code == 401:
+            data = {}
+            try:
+                data = response.json()
+            except Exception:
+                pass
+            msg = data.get("message") or data.get("Message") or "Unauthorized"
+            if "approval" in msg.lower():
+                raise RuntimeError(
+                    f'App "{self.app_name}" (id={self.app_id}) is registered but not yet approved. '
+                    "An admin must approve it in Fishbowl → Maintenance → Integrated Applications."
+                )
+            raise RuntimeError(f"Login failed (401): {msg}")
         response.raise_for_status()
         data = response.json()
-
-        # TODO: confirm token field name from the actual auth response.
-        #       Common names: "token", "access_token", "accessToken"
-        self._token = data.get("token") or data.get("access_token") or data.get("accessToken")
-        if not self._token:
+        token = data.get("token") or data.get("Token") or data.get("access_token")
+        if not token:
             raise RuntimeError(
-                f"Auth response did not contain a token. "
-                f"Fields returned: {list(data.keys())}"
+                f"Login succeeded but response contained no token. Fields: {list(data.keys())}"
             )
-
-        # Use server-provided expiry if available, otherwise assume 1 hour
-        expires_in = (
-            data.get("expiresIn")
-            or data.get("expires_in")
-            or data.get("expiresInSeconds")
-            or 3600
-        )
-        self._token_expiry = time.time() + int(expires_in)
-        logger.info("Authenticated to Fishbowl REST API")
+        self._token = token
+        logger.info("Authenticated to Fishbowl REST API as %s", username)
 
     def _get_token(self) -> str:
-        if time.time() >= self._token_expiry - 60:   # refresh 60 s before expiry
-            self._authenticate()
+        if not self._token:
+            self.authenticate()
         return self._token  # type: ignore[return-value]
 
     # ------------------------------------------------------------------
-    # HTTP helpers
+    # SQL query  (mirrors runQueryAsync in BI reports)
     # ------------------------------------------------------------------
 
-    def get(self, path: str, params: dict | None = None) -> dict | list:
-        """GET request. Returns parsed JSON."""
+    def query(self, sql: str) -> list[dict]:
+        """
+        Run a SELECT query via /api/data-query. Returns a list of dicts with
+        lowercase keys — identical behaviour to runQueryAsync in a BI report.
+        Automatically re-auths once on 401.
+        """
+        return self._do_query(sql, retry=True)
+
+    def _do_query(self, sql: str, retry: bool) -> list[dict]:
+        url = f"{self.base_url}/api/data-query"
         headers = {"Authorization": f"Bearer {self._get_token()}"}
         response = self.session.get(
-            f"{self.base_url}{path}",
-            params=params,
+            url,
+            params={"query": sql},
             headers=headers,
             timeout=60,
         )
+        if response.status_code == 401 and retry:
+            logger.info("Token rejected (401) — re-authenticating")
+            self._token = None
+            self.authenticate()
+            return self._do_query(sql, retry=False)
         response.raise_for_status()
-        return response.json()
-
-    def post(self, path: str, body: dict | None = None) -> dict | list:
-        """POST request. Returns parsed JSON."""
-        headers = {"Authorization": f"Bearer {self._get_token()}"}
-        response = self.session.post(
-            f"{self.base_url}{path}",
-            json=body,
-            headers=headers,
-            timeout=60,
-        )
-        response.raise_for_status()
-        return response.json()
+        rows = response.json()
+        return rows if isinstance(rows, list) else rows.get("results", [])
