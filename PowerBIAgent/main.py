@@ -40,7 +40,7 @@ def main() -> None:
     logger.info("Fishbowl → Power BI Agent starting")
     logger.info("Server: %s | Interval: %d min", config.FISHBOWL_BASE_URL, config.SYNC_INTERVAL_MINUTES)
 
-    fb = FishbowlClient(config.FISHBOWL_BASE_URL)
+    fb = FishbowlClient(config.FISHBOWL_BASE_URL, config.FISHBOWL_APP_NAME, config.FISHBOWL_APP_ID)
     pbi = PowerBIClient(config.POWERBI_PUSH_URL)
 
     def job() -> None:
