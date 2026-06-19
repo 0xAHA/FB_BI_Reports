@@ -24,11 +24,18 @@ class FishbowlClient:
     re-auth retry automatically.
     """
 
-    def __init__(self, base_url: str, app_name: str, app_id: int):
-        self.base_url = base_url.rstrip("/")
-        self.app_name = app_name
-        self.app_id   = app_id
-        self.session  = requests.Session()
+    def __init__(self, base_url: str, app_name: str, app_id: int,
+                 credentials: tuple[str, str] | None = None):
+        """
+        credentials: optional (username, password) tuple.
+            Provided by the Windows Service (decrypted from config.ini via
+            machine-scope DPAPI). Falls back to keyring for dev / standalone use.
+        """
+        self.base_url    = base_url.rstrip("/")
+        self.app_name    = app_name
+        self.app_id      = app_id
+        self._creds      = credentials   # (username, password) or None
+        self.session     = requests.Session()
         self._token: str | None = None
 
     # ------------------------------------------------------------------
@@ -36,12 +43,15 @@ class FishbowlClient:
     # ------------------------------------------------------------------
 
     def _load_credentials(self) -> tuple[str, str]:
+        if self._creds:
+            return self._creds
+        # Dev / standalone fallback — keyring (user-scope Credential Manager)
         username = keyring.get_password(SERVICE_NAME, "username")
         password = keyring.get_password(SERVICE_NAME, "password")
         if not username or not password:
             raise RuntimeError(
-                "Credentials not found in Windows Credential Manager. "
-                "Run setup_credentials.py first."
+                "Credentials not found. Either pass credentials= to FishbowlClient "
+                "or run setup_credentials.py to store them in Windows Credential Manager."
             )
         return username, password
 
