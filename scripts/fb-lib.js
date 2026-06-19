@@ -48,6 +48,46 @@ window.FBLib = (function () {
                 : `${day}/${month}/${year}`;
         }
 
+        // Home-company currency locale + symbol, resolved once. Falls back to
+        // en-US / $ when currencyLocale() is unavailable (e.g. outside the
+        // Fishbowl client). Mirrors the inline block reports used to carry.
+        let _currency = null;
+        function currency() {
+            if (_currency) return _currency;
+            try {
+                _currency = (typeof currencyLocale === 'function')
+                    ? currencyLocale() : { locale: 'en-US', symbol: '$' };
+            } catch (_) {
+                _currency = { locale: 'en-US', symbol: '$' };
+            }
+            if (!_currency || typeof _currency !== 'object') _currency = { locale: 'en-US', symbol: '$' };
+            if (!_currency.locale) _currency.locale = 'en-US';
+            if (!_currency.symbol) _currency.symbol = '$';
+            return _currency;
+        }
+
+        // Symbol + locale-aware 2-dp money formatting with negative handling.
+        function formatMoney(value) {
+            const num = parseFloat(value || 0);
+            if (isNaN(num)) return '';
+            const c = currency();
+            const neg = num < 0, abs = Math.abs(num);
+            return (neg ? '-' : '') + c.symbol +
+                abs.toLocaleString(c.locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+
+        // Integer-or-trimmed-decimal quantity formatting (drops trailing zeros).
+        function formatQty(value) {
+            const v = parseFloat(value);
+            if (isNaN(v)) return '';
+            return v % 1 === 0 ? String(Math.round(v)) : v.toFixed(4).replace(/\.?0+$/, '');
+        }
+
+        // Escape single quotes for safe inlining into a SQL string literal.
+        function escSQL(s) {
+            return String(s == null ? '' : s).replace(/'/g, "''");
+        }
+
         function getScheduleStatus(dateStr) {
             if (!dateStr) return '';
             const parts = String(dateStr).split(' ')[0].split('-');
@@ -152,6 +192,10 @@ window.FBLib = (function () {
             MOMENT_DATE_FORMAT: MOMENT_DATE_FORMAT,
             get DEBUG_MODE() { return _debugMode(); },
             formatDate: formatDate,
+            currency: currency,
+            formatMoney: formatMoney,
+            formatQty: formatQty,
+            escSQL: escSQL,
             getScheduleStatus: getScheduleStatus,
             getStatusTitle: getStatusTitle,
             createScheduleIndicator: createScheduleIndicator,

@@ -1,0 +1,4 @@
+- [User role](user_role.md) — develops/maintains single-file HTML+JS BI tools embedded in Fishbowl ERP (fbinv.com); no browser devtools in target, debug via in-page console
+- [Fishbowl BI runtime](feedback_fishbowl_runtime.md) — runQuery sync (JSON string|null) vs runQueryAsync (Promise<parsed>); writes via runRestApiAsync legacy external API; saveSettings persistence; CTE/EXISTS planner traps
+- [WO Finisher project](project_wo_finisher.md) — list-first multi-select Work Order finisher; reuses Pick Dashboard allocation engine + adds WO completion; grounded against example DB
+- [Fishbowl WO/pick schema](reference_fishbowl_wo_schema.md) — wo/woitem/pick/part/tracking model grounded against `example` DB for the WO finisher
