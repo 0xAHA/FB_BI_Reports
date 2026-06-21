@@ -21,7 +21,9 @@ CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 
 
 def _load_existing() -> dict:
-    cfg = configparser.ConfigParser()
+    # interpolation=None: the Power BI push URL contains '%' characters
+    # (URL-encoded key) that would otherwise break configparser interpolation.
+    cfg = configparser.ConfigParser(interpolation=None)
     cfg.read(CONFIG_PATH)
     return {
         "base_url": cfg.get("fishbowl", "base_url",  fallback="http://localhost:2456"),
@@ -36,7 +38,7 @@ def _load_existing() -> dict:
 
 def _save(values: dict) -> None:
     import credentials
-    cfg = configparser.ConfigParser()
+    cfg = configparser.ConfigParser(interpolation=None)
     cfg["fishbowl"] = {
         "base_url": values["base_url"],
         "app_name": values["app_name"],
@@ -87,7 +89,7 @@ class Wizard(tk.Tk):
         self.app_name = self._row(r, "App Name",     ex["app_name"]); r += 1
         self.app_id   = self._row(r, "App ID",       ex["app_id"]); r += 1
         tk.Label(self,
-                 text="App must be approved in Fishbowl → Maintenance → Integrated Applications",
+                 text="App must be approved in Fishbowl → Setup → Settings → Integrated Apps",
                  fg="#64748b", font=("Segoe UI", 8)
                  ).grid(row=r, column=1, sticky="w", padx=(0, 12), pady=(0, 6)); r += 1
 
@@ -164,7 +166,8 @@ class Wizard(tk.Tk):
         if not self.username.get().strip(): errors.append("Username")
         if not self.push_url.get().strip(): errors.append("Streaming Dataset URL")
         try:
-            int(self.interval.get().strip())
+            if int(self.interval.get().strip()) < 1:
+                errors.append("Sync interval (must be 1 or more minutes)")
         except ValueError:
             errors.append("Sync interval (must be a number)")
 

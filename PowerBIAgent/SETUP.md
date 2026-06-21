@@ -72,23 +72,20 @@ You can add multiple tiles from the same dataset. Tiles refresh automatically as
 
 ## Part 2 — Fishbowl Setup
 
-### 2.1 — Register the Integrated Application
+### 2.1 — Approve the Integrated Application
 
-The Fishbowl REST API requires third-party tools to be registered and approved before they can log in.
+The Fishbowl REST API requires third-party tools to be approved before they can log in. **You cannot add the app manually** — it only appears in Fishbowl *after* the agent has attempted to log in once and failed. That first failed attempt is what registers it.
 
-1. Open the Fishbowl Advanced client
-2. Go to **Maintenance** → **Integrated Applications**
-3. Click **Add**
-4. Fill in:
-   - **App Name:** `PowerBI Agent` *(must match exactly what you enter in the installer wizard)*
-   - **App ID:** `200` *(or any unused integer — must match the wizard)*
-   - **Description:** Fishbowl to Power BI sync agent
-5. Click **Save**
-6. The app will appear with a status of **Pending Approval**
-7. Right-click it and choose **Approve**
+So the order is:
 
-> If you skip the approval step the agent will start but immediately log an error:
-> `App "PowerBI Agent" registered but not yet approved.`
+1. Finish installing and let the agent run (Part 3). Its first sync attempt will **fail to authenticate** — this is expected, not a misconfiguration.
+2. In the Fishbowl Advanced client, go to **Setup** → **Settings** → **Integrated Apps** tab
+3. The app now appears in the list, showing the **App Name** and **App ID** you entered in the installer wizard (default `PowerBI Agent` / `200`)
+4. Select it and click the green **Approve** button in the top-right corner
+5. No restart needed — the agent authenticates on its next scheduled sync
+
+> Until you approve it, the agent logs:
+> `App "PowerBI Agent" (id=200) is registered but not yet approved.`
 
 ---
 
@@ -254,7 +251,7 @@ python wizard.py
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Service won't start | `config.ini` missing or incomplete | Run **Configure Agent** from Start Menu |
-| `App not yet approved` in log | Integrated Application not approved in Fishbowl | Go to Maintenance → Integrated Applications → Approve |
+| `App not yet approved` in log | Integrated app not approved in Fishbowl | Setup → Settings → Integrated Apps → select the app → green Approve button (top-right) |
 | `401 Unauthorized` in log | Wrong username/password | Run **Configure Agent** and re-enter credentials |
 | `Fetch failed` / network error | Agent can't reach Fishbowl server | Check `base_url` in `config.ini`; confirm port 2456 is accessible |
 | No data appearing in Power BI | Wrong or expired push URL | Re-create streaming dataset in Power BI and update `push_url` in `config.ini` |

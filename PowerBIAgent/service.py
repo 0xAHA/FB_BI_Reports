@@ -21,6 +21,7 @@ import configparser
 import logging
 import os
 import sys
+from logging.handlers import RotatingFileHandler
 
 import servicemanager
 import win32event
@@ -32,20 +33,25 @@ BASE_DIR    = os.path.dirname(sys.executable if getattr(sys, "frozen", False) el
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 
 
-def _setup_logging(log_path: str) -> None:
+def _setup_logging(log_path: str, level: int = logging.INFO) -> None:
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format="%(asctime)s  %(levelname)-8s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler(log_path, encoding="utf-8"),
+            # Rotate at ~1 MB, keep 5 old files (~6 MB total) so the log never
+            # grows unbounded — old lines roll into agent.log.1..5, oldest deleted.
+            RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=5,
+                                encoding="utf-8"),
         ],
     )
 
 
 def _read_config() -> dict:
-    cfg = configparser.ConfigParser()
+    # interpolation=None: the Power BI push URL contains '%' characters
+    # (URL-encoded key) that would otherwise break configparser interpolation.
+    cfg = configparser.ConfigParser(interpolation=None)
     cfg.read(CONFIG_PATH)
     return {
         "base_url": cfg.get("fishbowl", "base_url",  fallback="http://localhost:2456"),
@@ -57,6 +63,9 @@ def _read_config() -> dict:
         "interval": cfg.getint("agent", "sync_interval_minutes", fallback=15),
         "log_file": cfg.get("agent",    "log_file",
                             fallback=os.path.join(BASE_DIR, "agent.log")),
+        # INFO = one summary line per cycle (default). Set to DEBUG in config.ini
+        # under [agent] for the full step-by-step, or WARNING for errors only.
+        "log_level": cfg.get("agent",   "log_level", fallback="INFO"),
     }
 
 
@@ -87,8 +96,18 @@ def _run_loop(stop_event=None) -> None:
     Main sync loop — shared between the Windows Service and --debug mode.
     stop_event: a win32event handle (service mode) or None (debug/console mode).
     """
-    cfg = _read_config()
-    _setup_logging(cfg["log_file"])
+    try:
+        cfg = _read_config()
+    except Exception:
+        # config.ini missing/malformed — log to the default location and exit
+        # cleanly rather than crashing the service with no diagnostic.
+        _setup_logging(os.path.join(BASE_DIR, "agent.log"))
+        logging.getLogger(__name__).exception(
+            "Could not read config.ini — run the wizard (Configure Agent) to set it up")
+        return
+
+    level = getattr(logging, str(cfg["log_level"]).upper(), logging.INFO)
+    _setup_logging(cfg["log_file"], level)
     logger = logging.getLogger(__name__)
 
     import credentials
@@ -99,14 +118,29 @@ def _run_loop(stop_event=None) -> None:
     if not cfg["enc_pass"]:
         logger.error("No password found in config.ini — run the wizard first.")
         return
+    if not cfg["push_url"]:
+        logger.error("No Power BI push URL in config.ini — run the wizard first.")
+        return
 
-    password = credentials.decrypt(cfg["enc_pass"])
+    try:
+        password = credentials.decrypt(cfg["enc_pass"])
+    except Exception:
+        logger.exception(
+            "Could not decrypt the stored password. config.ini/agent.key may have "
+            "been copied from another machine or are corrupt — re-run the wizard "
+            "(Configure Agent) to re-enter credentials.")
+        return
+
     fb  = FishbowlClient(cfg["base_url"], cfg["app_name"], cfg["app_id"],
                          credentials=(cfg["username"], password))
     pbi = PowerBIClient(cfg["push_url"])
-    interval_ms = cfg["interval"] * 60 * 1000
 
-    logger.info("Fishbowl → Power BI Agent started  (interval: %d min)", cfg["interval"])
+    # Clamp to >= 1 minute so a misconfigured 0/negative interval can't spin the
+    # loop into a busy-wait that hammers Fishbowl and Power BI.
+    interval = max(1, cfg["interval"])
+    interval_ms = interval * 60 * 1000
+
+    logger.info("Fishbowl → Power BI Agent started  (interval: %d min)", interval)
 
     while True:
         try:
@@ -122,7 +156,7 @@ def _run_loop(stop_event=None) -> None:
         else:
             # Debug / console mode: plain sleep
             import time
-            time.sleep(cfg["interval"] * 60)
+            time.sleep(interval * 60)
 
     logger.info("Agent stopped")
 

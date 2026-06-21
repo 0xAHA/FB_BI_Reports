@@ -8,8 +8,8 @@
 
 [Setup]
 AppName=Fishbowl Power BI Agent
-AppVersion=1.0.0
-AppPublisher=Your Company Name
+AppVersion=0.0.1
+AppPublisher=0xAHA
 DefaultDirName={autopf}\Fishbowl Power BI Agent
 DefaultGroupName=Fishbowl Power BI Agent
 OutputBaseFilename=FishbowlPowerBIAgent-Setup
@@ -20,6 +20,10 @@ PrivilegesRequired=admin
 UninstallDisplayName=Fishbowl Power BI Agent
 UninstallDisplayIcon={app}\FishbowlPBIAgent.exe
 WizardStyle=modern
+; Shown as a wizard page near the start (Power BI prerequisites the user must
+; complete first) and after install completes (Fishbowl app-approval workflow).
+InfoBeforeFile=INSTALL_BEFORE.txt
+InfoAfterFile=INSTALL_AFTER.txt
 ; Minimum: Windows 10 (required for modern DPAPI behaviour)
 MinVersion=10.0
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -28,7 +32,7 @@ AppMutex=FishbowlPBIAgent_Setup
 
 [Messages]
 ; Shown on the final installer page
-FinishedLabel=The Fishbowl Power BI Agent has been installed.%n%nThe configuration wizard will open next so you can enter your server and Power BI settings.
+FinishedLabel=The Fishbowl Power BI Agent has been installed, configured, and started as a Windows service.%n%nYou can change settings any time from Start Menu → Configure Agent.
 
 [Files]
 ; Everything produced by PyInstaller — includes Python runtime and all dependencies
@@ -42,20 +46,43 @@ Name: "{group}\View Log";           Filename: "{app}\agent.log";            Work
 Name: "{group}\Uninstall Agent";    Filename: "{uninstallexe}"
 
 [Run]
-; ── Step 1: Open config wizard (user can tick/untick on the final page) ──
+; These run in order during setup. The wizard MUST finish (writing config.ini)
+; before the service is installed and started, otherwise the service starts
+; with no configuration. skipifsilent lets unattended installs skip the GUI.
+
+; ── Step 1: Configure — opens the wizard; setup waits until it closes ─────
 Filename: "{app}\FishbowlPBIAgent.exe"; \
     Parameters: "wizard"; \
-    Description: "Configure connection settings now (recommended)"; \
-    Flags: postinstall skipifsilent waituntilterminated nowait
+    StatusMsg: "Waiting for configuration to be saved..."; \
+    Flags: waituntilterminated skipifsilent
 
-; ── Step 2: Install the Windows Service ──────────────────────────────────
+; ── Step 2: Lock down the secret-bearing files ──────────────────────────
+; config.ini holds the Power BI key + DPAPI blob; agent.key is the DPAPI
+; entropy. Remove inherited ACEs (which grant 'Users' read under Program
+; Files) and grant only SYSTEM + Administrators, so standard local users
+; cannot read either file. Runs after the wizard creates them; harmless and
+; ignored if they don't exist (e.g. wizard cancelled). SIDs used for locale
+; independence: S-1-5-18 = SYSTEM, S-1-5-32-544 = Administrators.
+Filename: "{sys}\icacls.exe"; \
+    Parameters: """{app}\config.ini"" /inheritance:r /grant:r ""*S-1-5-18:(F)"" ""*S-1-5-32-544:(F)"""; \
+    StatusMsg: "Securing configuration..."; \
+    Flags: runhidden waituntilterminated skipifsilent
+Filename: "{sys}\icacls.exe"; \
+    Parameters: """{app}\agent.key"" /inheritance:r /grant:r ""*S-1-5-18:(F)"" ""*S-1-5-32-544:(F)"""; \
+    Flags: runhidden waituntilterminated skipifsilent
+
+; ── Step 3: Install the Windows Service (automatic, delayed start) ───────
+; --startup delayed = Automatic (Delayed Start): survives reboots and waits
+; for networking to settle before starting, so Fishbowl is reachable.
 Filename: "{app}\FishbowlPBIAgent.exe"; \
-    Parameters: "install"; \
+    Parameters: "--startup delayed install"; \
+    StatusMsg: "Installing the Windows service..."; \
     Flags: runhidden waituntilterminated
 
-; ── Step 3: Start the service ────────────────────────────────────────────
+; ── Step 4: Start the service ────────────────────────────────────────────
 Filename: "{app}\FishbowlPBIAgent.exe"; \
     Parameters: "start"; \
+    StatusMsg: "Starting the service..."; \
     Flags: runhidden waituntilterminated
 
 [UninstallRun]
