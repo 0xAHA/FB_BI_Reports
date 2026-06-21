@@ -16,6 +16,7 @@ The agent runs until Ctrl+C. Logs go to console and agent.log.
 
 import logging
 import time
+from logging.handlers import RotatingFileHandler
 
 import schedule
 
@@ -30,7 +31,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(config.LOG_FILE, encoding="utf-8"),
+        RotatingFileHandler(config.LOG_FILE, maxBytes=1_000_000, backupCount=5,
+                            encoding="utf-8"),
     ],
 )
 logger = logging.getLogger(__name__)

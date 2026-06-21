@@ -17,7 +17,7 @@ class FishbowlClient:
     Query: GET  /api/data-query?query=<sql>  (same SQL you'd use in a BI report)
 
     The app (FISHBOWL_APP_NAME / FISHBOWL_APP_ID from config.py) must be
-    registered and approved in Fishbowl → Maintenance → Integrated Applications
+    registered and approved in Fishbowl → Setup → Settings → Integrated Apps
     before the first login will succeed.
 
     Token has no server-advertised expiry, so 401 responses trigger a single
@@ -78,7 +78,8 @@ class FishbowlClient:
             if "approval" in msg.lower():
                 raise RuntimeError(
                     f'App "{self.app_name}" (id={self.app_id}) is registered but not yet approved. '
-                    "An admin must approve it in Fishbowl → Maintenance → Integrated Applications."
+                    "An admin must approve it in Fishbowl → Setup → Settings → Integrated Apps "
+                    "(select the app and click the green Approve button)."
                 )
             raise RuntimeError(f"Login failed (401): {msg}")
         response.raise_for_status()
@@ -124,4 +125,10 @@ class FishbowlClient:
             return self._do_query(sql, retry=False)
         response.raise_for_status()
         rows = response.json()
-        return rows if isinstance(rows, list) else rows.get("results", [])
+        if not isinstance(rows, list):
+            rows = rows.get("results", [])
+        # The REST /api/data-query endpoint preserves the alias casing from the
+        # SQL (e.g. "customerName"), unlike runQueryAsync inside the Fishbowl
+        # client which lowercases everything. Normalize here so all downstream
+        # code can rely on lowercase keys regardless of how the SQL is written.
+        return [{str(k).lower(): v for k, v in row.items()} for row in rows]
