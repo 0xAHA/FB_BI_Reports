@@ -1,0 +1,1126 @@
+<!DOCTYPE html>
+<!--
+    ████████████████████████████████████████████████████████████████████████
+    ██  SHELVED — 2026-06-27                                              ██
+    ██  Direct-from-BI access to the Fishbowl File Storage plugin is     ██
+    ██  not viable as of this date. Probe ran to completion; conclusion: ██
+    ██                                                                    ██
+    ██    1. plugindata.info auth_token is Fishbowl-encrypted binary     ██
+    ██       (38% printable after base64 decode) — cannot decrypt        ██
+    ██       client-side; only the plugin holds the key.                 ██
+    ██    2. /api/integrations/plugin-info IS reachable from a BI page   ██
+    ██       via runRestApiAsync, but the `authorization` query param    ██
+    ██       is value-validated server-side and returns 403 for any      ██
+    ██       value we can construct from outside the plugin (plain       ██
+    ██       strings, the plugin name, the encrypted blob, etc.).        ██
+    ██    3. The plugin's own settings UI does Microsoft login           ██
+    ██       directly and exposes no authorization code to the user.     ██
+    ██                                                                    ██
+    ██  CORS from JxBrowser → graph.microsoft.com DOES work (a Graph    ██
+    ██  401 reached the page — preflight passed). Worth remembering for ██
+    ██  any future browser-to-cloud-API integration that has its OWN   ██
+    ██  OAuth flow under our control.                                   ██
+    ██                                                                    ██
+    ██  Reusable techniques from this file (lift if you need them):     ██
+    ██    - reading + base64-diagnosing a plugin's token in plugindata  ██
+    ██    - inline #debugLog panel with no fb-lib dependency            ██
+    ██    - runRestApiAsync against /api/integrations/plugin-info        ██
+    ██      (works for Fishbowl Time, Shopify, etc.; the auth check     ██
+    ██      may behave differently per plugin)                          ██
+    ████████████████████████████████████████████████████████████████████████
+
+    File_Storage_Test.htm — proof-of-concept probe for the Fishbowl
+    File Storage plugin (OneDrive / Dropbox / Google Drive).
+
+    Plan: ~/.claude/plans/vivid-watching-wadler.md  →  "Immediate scope".
+
+    What this probe answers (cheaply):
+      1. Can we read the plugin's OAuth token out of `plugindata.info` JSON?
+      2. Can we hit Microsoft Graph from JxBrowser without a CORS reject?
+      3. Does the auto-folder + upload flow round-trip to the Fishbowl
+         desktop client's per-record file panel?
+
+    If any answer is no, we shelve the idea — so this file is intentionally
+    minimal: OneDrive only, Part + Product modules only, no fb-lib changes,
+    everything inline. The debug drawer is mounted + expanded on load so
+    Graph requests/responses are visible without ceremony.
+
+    Folder convention (verbatim from user):
+       /Apps/Fishbowl Inventory/{CompanyName}/{ModuleLabel}/{record.num}/
+
+    Channel JSON shape lives in `plugindata.info`:
+       { "channel_settings_map": { "OneDrive": {
+            "channel_enum": "ONE_DRIVE",
+            "name": "OneDrive",
+            "module_associations": { "PART": true, "PO": true, ... },
+            "data": { "auth_token": "<bearer>", "connection_name": "OneDrive" }
+       } } }
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>File Storage Test — Fishbowl File Storage plugin probe</title>
+
+    <!-- Shared Fishbowl BI lib — inlined by Fishbowl from the saved "fb-lib"
+         script. Used here only for FBLib.Common.mountDebugDrawer() +
+         FBLib.Common.debugLog(). No FBLib.Settings, no namespacing. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <style>
+        :root {
+            --color-primary: #2d9cdb;
+            --color-primary-dark: #1e7bb4;
+            --color-bg: #f8fafc;
+            --color-border: #e2e8f0;
+            --color-text: #1e293b;
+            --color-muted: #64748b;
+        }
+        * { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            font-size: 13px; color: var(--color-text); background: var(--color-bg);
+            /* Leave room at the bottom so the debug drawer never overlaps
+               the last record row when expanded. 260px ≈ drawer height. */
+            padding-bottom: 260px;
+        }
+        header {
+            position: sticky; top: 0; z-index: 50;
+            background: #fff; border-bottom: 1px solid var(--color-border);
+            padding: 14px 20px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+        }
+        header h1 { margin: 0; font-size: 16px; font-weight: 700; color: #0f172a; }
+        #connectionStatus { margin: 4px 0 0; font-size: 12px; color: var(--color-muted); }
+        #connectionStatus.ok      { color: #059669; }
+        #connectionStatus.err     { color: #b91c1c; }
+        #connectionStatus.warn    { color: #b45309; }
+
+        .container { padding: 20px; max-width: 1100px; margin: 0 auto; }
+        .toolbar {
+            display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+            background: #fff; border: 1px solid var(--color-border); border-radius: 10px;
+            padding: 12px 14px; margin-bottom: 16px;
+        }
+        .toolbar label { display: flex; gap: 6px; align-items: center; font-size: 12px; color: #334155; }
+        select, button, input[type="text"] {
+            font-family: inherit;
+            padding: 6px 10px; font-size: 13px; border: 1px solid #cbd5e1; border-radius: 6px;
+            color: var(--color-text); background: #fff;
+        }
+        select:focus, input:focus { outline: none; border-color: var(--color-primary); box-shadow: 0 0 0 3px rgba(45,156,219,0.15); }
+        button {
+            cursor: pointer; font-weight: 600; background: var(--color-primary); color: #fff;
+            border-color: var(--color-primary); transition: background 0.12s;
+        }
+        button:hover { background: var(--color-primary-dark); border-color: var(--color-primary-dark); }
+        button.ghost { background: #fff; color: #334155; border-color: #cbd5e1; }
+        button.ghost:hover { background: #f1f5f9; }
+        button:disabled { opacity: 0.55; cursor: not-allowed; }
+
+        /* Loading / empty states. */
+        .state-msg { padding: 24px; text-align: center; color: var(--color-muted); font-style: italic; background: #fff; border: 1px solid var(--color-border); border-radius: 10px; }
+        .state-msg.err { color: #991b1b; background: #fef2f2; border-color: #fca5a5; font-style: normal; }
+        .state-msg.warn { color: #7c2d12; background: #fff7ed; border-color: #fdba74; font-style: normal; }
+
+        /* Record rows. Two-line layout: identity on the left, drop-zone in
+           the middle (the headline UX), action button on the right. */
+        .record-list { display: flex; flex-direction: column; gap: 8px; }
+        .record-row {
+            display: grid; grid-template-columns: 220px 1fr auto; gap: 12px;
+            align-items: center;
+            background: #fff; border: 1px solid var(--color-border); border-radius: 10px;
+            padding: 10px 14px;
+            transition: border-color 0.12s, box-shadow 0.12s;
+        }
+        .record-row:hover { border-color: #cbd5e1; box-shadow: 0 1px 4px rgba(0,0,0,0.04); }
+        .record-num { font-weight: 700; font-size: 13px; color: #0f172a; }
+        .record-desc { font-size: 12px; color: var(--color-muted); margin-top: 2px; line-height: 1.3; }
+
+        /* Drop-zone — the UX cue is the dashed border + colour-change on
+           dragover. Disabled state (when token+company aren't ready) shows
+           as flat grey. */
+        .drop-zone {
+            border: 2px dashed #cbd5e1; border-radius: 8px;
+            padding: 10px 12px; font-size: 12px; color: var(--color-muted);
+            background: #f8fafc; cursor: pointer; text-align: center;
+            transition: all 0.15s ease;
+            min-height: 42px; display: flex; align-items: center; justify-content: center;
+        }
+        .drop-zone:hover { border-color: var(--color-primary); color: var(--color-primary-dark); background: #eff6ff; }
+        .drop-zone.dragover { border-style: solid; border-color: #10b981; background: #d1fae5; color: #065f46; }
+        .drop-zone.uploading { border-color: var(--color-primary); background: #eff6ff; }
+        .drop-zone.uploading .upload-progress {
+            font-size: 11px; color: var(--color-primary-dark);
+            margin-top: 4px;
+        }
+
+        /* Accordion for file list. Lazy-loaded on first expand; cached after. */
+        .accordion {
+            background: #fff; border: 1px solid var(--color-border); border-radius: 10px;
+            margin-top: -8px; padding: 12px 16px;
+            border-top-left-radius: 0; border-top-right-radius: 0;
+            border-top: none;
+        }
+        .accordion.hidden { display: none; }
+        .accordion-loading { color: var(--color-muted); font-style: italic; font-size: 12px; padding: 8px 0; }
+        .accordion-empty   { color: var(--color-muted); font-style: italic; font-size: 12px; padding: 8px 0; }
+        .accordion-err     { color: #991b1b; font-size: 12px; padding: 8px 10px; background: #fef2f2; border: 1px solid #fca5a5; border-radius: 6px; }
+
+        .file-list { display: flex; flex-direction: column; gap: 4px; }
+        .file-row {
+            display: grid; grid-template-columns: 24px 1fr auto auto; gap: 10px;
+            align-items: center; padding: 6px 8px; border-radius: 6px;
+        }
+        .file-row:hover { background: #f1f5f9; }
+        .file-icon { font-size: 16px; line-height: 1; text-align: center; opacity: 0.75; }
+        .file-name { font-size: 12px; color: #0f172a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .file-meta { font-size: 11px; color: var(--color-muted); }
+        .file-download {
+            font-size: 11px; padding: 3px 9px; border-radius: 5px;
+            background: var(--color-primary); color: #fff; text-decoration: none;
+            border: 1px solid var(--color-primary-dark);
+        }
+        .file-download:hover { background: var(--color-primary-dark); }
+
+        /* "View" toggle button on each row — quieter than the primary
+           accent so the drop-zone remains the visual anchor. */
+        .view-btn {
+            font-size: 12px; padding: 5px 12px; min-width: 84px;
+            background: #fff; color: #334155; border-color: #cbd5e1; font-weight: 500;
+        }
+        .view-btn:hover { background: #f1f5f9; }
+        .view-btn.expanded { background: #eff6ff; color: var(--color-primary-dark); border-color: #93c5fd; }
+
+        /* =====================================================
+           INLINE DEBUG PANEL
+           ----
+           Self-contained, NOT dependent on fb-lib's mountDebugDrawer
+           (which may be missing if the user hasn't re-saved their
+           fb-lib Script). The whole point of this probe is visible
+           failure modes — silent debug is a non-starter. The panel
+           sits fixed at the bottom of the viewport, always-on, with
+           Copy + Clear actions. Body padding-bottom (260px in :root)
+           already reserves space for it.
+           ===================================================== */
+        .debug-panel {
+            position: fixed; left: 0; right: 0; bottom: 0; z-index: 9000;
+            background: #fff; border-top: 1px solid var(--color-border);
+            box-shadow: 0 -4px 16px rgba(0,0,0,0.08);
+            font-family: 'Inter', -apple-system, sans-serif;
+        }
+        .debug-panel .dp-head {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 6px 14px; background: #f8fafc; border-bottom: 1px solid var(--color-border);
+        }
+        .debug-panel .dp-title { font-size: 12px; font-weight: 600; color: #475569; }
+        .debug-panel .dp-actions { display: flex; gap: 6px; }
+        .debug-panel .dp-btn {
+            font-size: 11px; padding: 3px 9px; border-radius: 5px;
+            border: 1px solid #cbd5e1; background: #fff; color: #334155;
+            cursor: pointer; font-family: inherit; font-weight: 500;
+        }
+        .debug-panel .dp-btn:hover { background: #f1f5f9; }
+        #debugLog {
+            background: #0f172a; color: #e2e8f0;
+            font-family: ui-monospace, 'Courier New', monospace; font-size: 11px;
+            padding: 10px 14px; height: 220px; overflow-y: auto;
+            line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+        }
+        #debugLog .dl-entry { margin-bottom: 2px; }
+        #debugLog .dl-time { color: #475569; }
+        #debugLog .dl-info    { color: #60a5fa; }
+        #debugLog .dl-success { color: #34d399; }
+        #debugLog .dl-warn    { color: #fbbf24; }
+        #debugLog .dl-error   { color: #f87171; }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>File Storage Test</h1>
+    <p id="connectionStatus">Reading plugin configuration&hellip;</p>
+</header>
+
+<div class="container">
+
+    <div class="toolbar">
+        <label>Module
+            <select id="moduleSelect" disabled>
+                <option value="">(loading)</option>
+            </select>
+        </label>
+        <button class="ghost" id="reloadBtn" onclick="loadRecords()" disabled>Reload records</button>
+        <label>Auth code
+            <input type="text" id="authCode"
+                   placeholder="passed as ?authorization=…"
+                   style="width:240px; font-family:ui-monospace,'Courier New',monospace; font-size:11px;"
+                   title="The /api/integrations/plugin-info endpoint requires `authorization` as a query parameter (separate from the transport JWT runRestApiAsync auto-injects). Paste a value and we'll send it. Persisted between reloads via saveSettings.">
+        </label>
+        <button class="ghost" id="testPluginInfoBtn" onclick="testPluginInfo()">Test plugin-info endpoint</button>
+        <span style="flex:1"></span>
+        <span style="font-size:11px; color: var(--color-muted);">
+            Probe page. See debug drawer at bottom for Graph request/response detail.
+        </span>
+    </div>
+
+    <div id="recordList" class="record-list">
+        <div class="state-msg">Pick a module to list records.</div>
+    </div>
+
+</div>
+
+<!--
+    Inline debug panel — always visible, NOT dependent on fb-lib's
+    mountDebugDrawer. The probe's job is to surface failures clearly;
+    a missing drawer would defeat the whole point. If fb-lib is also
+    present + has a drawer, we ignore it: this panel is the source of
+    truth for this page.
+-->
+<div class="debug-panel">
+    <div class="dp-head">
+        <span class="dp-title">Debug — Graph requests / responses</span>
+        <div class="dp-actions">
+            <button class="dp-btn" type="button" onclick="copyDebugLog()">Copy</button>
+            <button class="dp-btn" type="button" onclick="clearDebugLog()">Clear</button>
+        </div>
+    </div>
+    <div id="debugLog"></div>
+</div>
+
+<script>
+// ============================================================================
+// DEBUG LOGGER — writes directly to the inline #debugLog panel above.
+// No fb-lib dependency: even if FBLib.Common isn't available (e.g. the
+// user hasn't re-saved their fb-lib Script with the latest changes), this
+// probe still shows full output. We DO still forward to fb-lib's logger
+// when present, so if someone later wires a real drawer they get a copy
+// for free — but the inline panel is authoritative.
+// ============================================================================
+var _C = (window.FBLib && FBLib.Common) ? FBLib.Common : null;
+
+function dlog(message, kind) {
+    var level = kind || 'info';
+    var stamp = new Date().toLocaleTimeString();
+    var box = document.getElementById('debugLog');
+    if (box) {
+        var entry = document.createElement('div');
+        entry.className = 'dl-entry';
+        var timeSpan = '<span class="dl-time">[' + stamp + ']</span> ';
+        var levelClass = (level === 'success') ? 'dl-success'
+                       : (level === 'warn' || level === 'warning') ? 'dl-warn'
+                       : (level === 'error') ? 'dl-error'
+                       : 'dl-info';
+        var levelLabel = '<span class="' + levelClass + '">[' + String(level).toUpperCase() + ']</span> ';
+        entry.innerHTML = timeSpan + levelLabel +
+            String(message).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        box.appendChild(entry);
+        // Cap the buffer so a long-running session doesn't bloat the DOM.
+        while (box.children.length > 500) box.removeChild(box.firstChild);
+        box.scrollTop = box.scrollHeight;
+    }
+    // Forward to fb-lib's logger if present — harmless duplicate; useful
+    // when a future fb-lib drawer is also wired up.
+    try { if (_C && _C.debugLog) _C.debugLog(message, level); } catch (e) {}
+    // Browser console mirror.
+    if (level === 'error')      console.error('[' + level + ']', message);
+    else if (level === 'warn')  console.warn('[' + level + ']', message);
+    else                        console.log('[' + level + ']', message);
+}
+
+function copyDebugLog() {
+    var box = document.getElementById('debugLog');
+    if (!box) return;
+    var text = box.innerText || box.textContent || '';
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(function () {});
+    } else {
+        // Fallback: classic textarea + execCommand.
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); } catch (_) {}
+        document.body.removeChild(ta);
+    }
+}
+
+function clearDebugLog() {
+    var box = document.getElementById('debugLog');
+    if (box) box.innerHTML = '';
+}
+
+// ============================================================================
+// STATE — everything the page needs to construct paths + call Graph.
+// `channel` is the OneDrive entry from channel_settings_map; we cache it once
+// rather than re-parsing the JSON for every request.
+// ============================================================================
+var state = {
+    companyName: null,            // Fishbowl home-company name (folder segment)
+    channel: null,                // { channel_enum, name, module_associations, data: { auth_token } }
+    moduleAssoc: {},              // e.g. { PART: true, PRODUCT: true, ... }
+    records: [],                  // [{ num, description }] for the selected module
+    selectedModule: null          // 'PART' | 'PRODUCT'
+};
+
+// Module enum → human folder label. The user's plugin uses display names with
+// spaces on disk (e.g. "Purchase Order"), so we MUST NOT use the enum literal.
+// v1 only handles Part + Product; expand here when promoting past the probe.
+var MODULE_LABEL = {
+    'PART':    'Part',
+    'PRODUCT': 'Product'
+};
+
+// Per-module record-list SQL. Kept here next to MODULE_LABEL so adding a
+// module is one place to edit. `id` is the numeric PK we'll pass to the
+// /api/integrations/plugin-info endpoint as `recordId` — verified from the
+// apidocs sample response (recordId=72 for a WO row, matching wo.id).
+var MODULE_QUERY = {
+    'PART':    "SELECT id, num, description FROM part    WHERE activeFlag = 1 ORDER BY num LIMIT 100",
+    'PRODUCT': "SELECT id, num, description FROM product WHERE activeFlag = 1 ORDER BY num LIMIT 100"
+};
+
+// ============================================================================
+// CONNECTION STATUS — single source of truth for the header's status line.
+// `kind` colours the line: ok = green, warn = amber, err = red.
+// ============================================================================
+function setStatus(text, kind) {
+    var el = document.getElementById('connectionStatus');
+    if (!el) return;
+    el.textContent = text;
+    el.className = kind || '';
+}
+
+// ============================================================================
+// INIT — read plugin config, pick first connected channel, populate modules.
+// ============================================================================
+async function init() {
+    // The inline debug panel is already in the DOM — nothing to mount.
+    // (We used to call FBLib.Common.mountDebugDrawer here, but if a user's
+    // saved fb-lib doesn't have that function yet, the drawer never appears
+    // and the page goes silent on errors. The inline panel removes that
+    // dependency entirely.)
+    dlog('File_Storage_Test boot', 'info');
+
+    // Restore any previously-pasted auth code + persist on every change.
+    // Built-in saveSettings/loadSettings are scoped per Fishbowl user, so
+    // each tester keeps their own code without leaking it across accounts.
+    loadAuthCode();
+    var authEl = document.getElementById('authCode');
+    if (authEl) {
+        authEl.addEventListener('change', persistAuthCode);
+        authEl.addEventListener('blur',   persistAuthCode);
+    }
+
+    // Company name first — folder paths need it. Multi-LG installs need a
+    // smarter query; v1 takes the first row.
+    try {
+        var compRows = await runQueryAsync('SELECT name FROM company LIMIT 1');
+        if (compRows && compRows.length) {
+            state.companyName = String(compRows[0].name || '').trim();
+            dlog('Company name resolved: ' + state.companyName, 'success');
+        } else {
+            dlog('company table returned no rows', 'warn');
+        }
+    } catch (e) {
+        dlog('company query failed: ' + e.message, 'error');
+    }
+
+    // Pull the plugin row. The schema's filter column is `plugin`, with
+    // value "File Storage". We SELECT the whole row to surface dataKey /
+    // groupName in the debug drawer in case a future install uses a
+    // different layout.
+    var pluginRow = null;
+    try {
+        var rows = await runQueryAsync(
+            "SELECT id, plugin, dataKey, groupName, info FROM plugindata WHERE plugin = 'File Storage'"
+        );
+        if (!rows || !rows.length) {
+            setStatus('File Storage plugin not configured (no plugindata row).', 'err');
+            dlog('plugindata row missing — is the plugin installed + connected?', 'error');
+            return;
+        }
+        pluginRow = rows[0];
+        dlog('plugindata row found (id=' + pluginRow.id + ', dataKey=' + (pluginRow.datakey || '') + ')', 'info');
+    } catch (e) {
+        setStatus('Could not query plugindata: ' + e.message, 'err');
+        dlog('plugindata query failed: ' + e.message, 'error');
+        return;
+    }
+
+    // Parse the JSON. `info` keys come back lowercase from runQueryAsync —
+    // see CLAUDE.md note about column-name casing.
+    var cfg;
+    try {
+        cfg = JSON.parse(pluginRow.info);
+    } catch (e) {
+        setStatus('plugindata.info is not valid JSON.', 'err');
+        dlog('JSON parse failed: ' + e.message + ' — first 200 chars: ' + String(pluginRow.info).slice(0, 200), 'error');
+        return;
+    }
+    var map = (cfg && cfg.channel_settings_map) || {};
+    var channelNames = Object.keys(map);
+    if (!channelNames.length) {
+        setStatus('No channels connected in the File Storage plugin.', 'warn');
+        dlog('channel_settings_map is empty', 'warn');
+        return;
+    }
+    // Pick the first connected channel. v1 supports OneDrive only — anything
+    // else is surfaced as a warning and we stop here.
+    var firstName = channelNames[0];
+    var ch = map[firstName];
+    state.channel = ch;
+    state.moduleAssoc = (ch && ch.module_associations) || {};
+    var rawToken = ch && ch.data && ch.data.auth_token;
+    if (!rawToken) {
+        setStatus('Channel "' + firstName + '" has no auth_token in plugindata.', 'err');
+        dlog('auth_token missing on channel ' + firstName, 'error');
+        return;
+    }
+    // Sanitize the token. The "Failed to execute 'fetch' on 'Window': Invalid
+    // value" error from Chromium typically means the Authorization header
+    // value contains a forbidden character — CR, LF, NUL, or non-Latin-1.
+    // Trim + strip CR/LF/TAB and re-validate.
+    var token = String(rawToken).replace(/[\r\n\t\0]/g, '').trim();
+    if (token !== rawToken) {
+        dlog('auth_token had ' + (rawToken.length - token.length) + ' whitespace/control chars stripped before use', 'warn');
+    }
+    // Diagnostic: what does the token actually look like? If it's a Graph
+    // access token it should be a JWT starting "eyJ". If it's something
+    // else (a Fishbowl-internal handle, an OAuth refresh token, an
+    // encrypted blob) Graph will 401 or reject the header.
+    var tokFirst = token.slice(0, 12);
+    var tokLast  = token.slice(-8);
+    var looksJwt = /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(token);
+    var asciiClean = /^[\x21-\x7E]+$/.test(token);   // visible ASCII only
+    dlog('Token: length=' + token.length +
+         ', prefix="' + tokFirst + '"' +
+         ', suffix="' + tokLast + '"' +
+         ', looksJwt=' + looksJwt +
+         ', asciiClean=' + asciiClean, 'info');
+    if (!asciiClean) {
+        setStatus('auth_token contains non-ASCII characters — cannot send as a Bearer header.', 'err');
+        dlog('Token contains characters outside the HTTP-header allowed range. Graph WILL reject this. Aborting.', 'error');
+        return;
+    }
+    if (!looksJwt) {
+        // Not fatal — Microsoft access tokens are usually JWT but the
+        // docs say clients should treat the token as opaque. Surface it
+        // as a warning + try anyway. If Graph 401s we'll know.
+        dlog('Token does not look like a JWT (no eyJ…header.payload.sig). Could be a Fishbowl-internal handle, an opaque token, or a refresh token. Trying anyway — Graph will say if it works.', 'warn');
+        // The 50-stripped-CR/LF count + trailing `=` strongly suggest the
+        // stored value is PEM-style line-wrapped base64. Try decoding to
+        // see whether there's a usable token wrapped inside. Outcomes:
+        //   - Decoded text starts "eyJ"        → JWT wrapped in base64; use it
+        //   - Decoded text is JSON             → parse + look for access_token
+        //   - Decoded looks binary             → encrypted blob; shelve idea
+        diagnoseBase64(token);
+    }
+    // Stash the sanitized token back on the channel so every downstream
+    // request reads the clean value.
+    ch.data.auth_token = token;
+    dlog('Channel resolved: ' + firstName + ' (enum=' + ch.channel_enum + ')', 'success');
+
+    if (ch.channel_enum !== 'ONE_DRIVE') {
+        setStatus('Connected: ' + firstName + ' — but this probe only supports OneDrive. Stopping.', 'warn');
+        dlog('channel_enum=' + ch.channel_enum + ' is not ONE_DRIVE — bail out', 'warn');
+        return;
+    }
+    setStatus('Connected: ' + firstName + ' · Company: ' + (state.companyName || '(unknown)'), 'ok');
+
+    // Module dropdown — restrict to modules supported by THIS probe (Part
+    // + Product) AND enabled on the channel (module_associations === true).
+    var sel = document.getElementById('moduleSelect');
+    sel.innerHTML = '';
+    var blank = document.createElement('option');
+    blank.value = ''; blank.textContent = '(pick a module)';
+    sel.appendChild(blank);
+    var any = false;
+    Object.keys(MODULE_LABEL).forEach(function (key) {
+        if (state.moduleAssoc[key] !== true) {
+            dlog('Module ' + key + ' not enabled on this channel — skipping', 'info');
+            return;
+        }
+        var opt = document.createElement('option');
+        opt.value = key; opt.textContent = MODULE_LABEL[key];
+        sel.appendChild(opt);
+        any = true;
+    });
+    if (!any) {
+        setStatus('Connected, but neither Part nor Product is enabled on this channel.', 'warn');
+        sel.disabled = true;
+        return;
+    }
+    sel.disabled = false;
+    document.getElementById('reloadBtn').disabled = false;
+    sel.addEventListener('change', loadRecords);
+}
+
+// ============================================================================
+// RECORD LIST — query the appropriate table, render one row per record.
+// Drag-drop is wired per row via setupDropZone; the View accordion is
+// lazy — first click triggers the Graph list call.
+// ============================================================================
+async function loadRecords() {
+    var mod = document.getElementById('moduleSelect').value;
+    state.selectedModule = mod || null;
+    var host = document.getElementById('recordList');
+    if (!mod) { host.innerHTML = '<div class="state-msg">Pick a module to list records.</div>'; return; }
+    host.innerHTML = '<div class="state-msg">Loading ' + MODULE_LABEL[mod] + ' records&hellip;</div>';
+
+    try {
+        var sql = MODULE_QUERY[mod];
+        dlog('SQL: ' + sql, 'info');
+        var rows = await runQueryAsync(sql);
+        state.records = rows || [];
+        dlog('Got ' + state.records.length + ' record(s) for ' + mod, 'success');
+        renderRecords();
+    } catch (e) {
+        host.innerHTML = '<div class="state-msg err">Query failed: ' + escapeHtml(e.message) + '</div>';
+        dlog('Record query failed: ' + e.message, 'error');
+    }
+}
+
+function renderRecords() {
+    var host = document.getElementById('recordList');
+    host.innerHTML = '';
+    if (!state.records.length) {
+        host.innerHTML = '<div class="state-msg">No records found.</div>';
+        return;
+    }
+    state.records.forEach(function (r) {
+        var num = String(r.num || '').trim();
+        if (!num) return;
+        // Numeric PK — needed by the plugin-info endpoint's `recordId`
+        // parameter. Fall back to null if the row lacked an id (shouldn't
+        // happen now that MODULE_QUERY selects it, but defensive).
+        var recordId = (r.id != null) ? Number(r.id) : null;
+        var row = document.createElement('div');
+        row.className = 'record-row';
+        row.dataset.recordNum = num;
+        if (recordId != null) row.dataset.recordId = String(recordId);
+
+        var info = document.createElement('div');
+        info.innerHTML = '<div class="record-num">' + escapeHtml(num) + '</div>' +
+                         '<div class="record-desc">' + escapeHtml(r.description || '') + '</div>';
+        row.appendChild(info);
+
+        var dz = document.createElement('div');
+        dz.className = 'drop-zone';
+        dz.dataset.recordNum = num;
+        dz.innerHTML = '<span class="dz-label">Drop a file here to upload to OneDrive</span>';
+        setupDropZone(dz, num);
+        row.appendChild(dz);
+
+        // Two action buttons grouped in the right-hand cell. "View" still
+        // opens the OneDrive accordion (Graph-based, currently dead);
+        // "Plugin info" hits the Fishbowl REST integrations endpoint with
+        // this record's table + numeric id and dumps the response into the
+        // debug panel — that's the live test of the new approach.
+        var btnGroup = document.createElement('div');
+        btnGroup.style.cssText = 'display:flex; gap:6px;';
+
+        var btn = document.createElement('button');
+        btn.className = 'view-btn';
+        btn.type = 'button';
+        btn.textContent = 'View';
+        btn.dataset.recordNum = num;
+        btn.addEventListener('click', function () { toggleAccordion(btn, num); });
+        btnGroup.appendChild(btn);
+
+        var pluginBtn = document.createElement('button');
+        pluginBtn.className = 'view-btn';
+        pluginBtn.type = 'button';
+        pluginBtn.textContent = 'Plugin info';
+        pluginBtn.title = 'Call GET /api/integrations/plugin-info filtered to this record. Response dumps into debug panel.';
+        if (recordId == null) {
+            pluginBtn.disabled = true;
+            pluginBtn.title = 'Record has no numeric id from the SQL query — cannot filter the endpoint by recordId.';
+        }
+        pluginBtn.addEventListener('click', function () {
+            testPluginInfoForRecord(num, recordId);
+        });
+        btnGroup.appendChild(pluginBtn);
+
+        row.appendChild(btnGroup);
+
+        host.appendChild(row);
+
+        // Accordion sits immediately below the row so it visually attaches.
+        var acc = document.createElement('div');
+        acc.className = 'accordion hidden';
+        acc.id = 'acc-' + cssEscape(num);
+        acc.dataset.recordNum = num;
+        host.appendChild(acc);
+    });
+}
+
+// ============================================================================
+// DRAG-DROP — per-row upload. Pattern lifted from Import_Builder.htm:2220.
+// Single file per drop; multi-file drops are out of scope for the probe.
+// ============================================================================
+function setupDropZone(el, recordNum) {
+    el.addEventListener('dragover',  function (e) { e.preventDefault(); e.stopPropagation(); el.classList.add('dragover'); });
+    el.addEventListener('dragleave', function (e) { e.preventDefault(); e.stopPropagation(); el.classList.remove('dragover'); });
+    el.addEventListener('drop',      function (e) {
+        e.preventDefault(); e.stopPropagation();
+        el.classList.remove('dragover');
+        var files = e.dataTransfer && e.dataTransfer.files;
+        if (!files || !files.length) return;
+        if (files.length > 1) {
+            dlog('Multi-file drop received (' + files.length + ') — probe handles one; uploading first only.', 'warn');
+        }
+        uploadToRecord(recordNum, files[0], el);
+    });
+    // Click to pick a file (fallback for users who can't drag).
+    el.addEventListener('click', function () {
+        var inp = document.createElement('input');
+        inp.type = 'file';
+        inp.addEventListener('change', function () {
+            if (inp.files && inp.files[0]) uploadToRecord(recordNum, inp.files[0], el);
+        });
+        inp.click();
+    });
+}
+
+async function uploadToRecord(recordNum, file, dzEl) {
+    if (!state.channel) { dlog('No channel — cannot upload', 'error'); return; }
+    if (!state.companyName) { dlog('No company name — cannot construct path', 'error'); return; }
+    var label = MODULE_LABEL[state.selectedModule];
+    if (!label) { dlog('No module selected — cannot upload', 'error'); return; }
+    var folder = buildFolderPath(state.companyName, label, recordNum);
+    dlog('Upload start: "' + file.name + '" (' + file.size + ' bytes) → ' + folder, 'info');
+
+    dzEl.classList.add('uploading');
+    dzEl.innerHTML = '<span class="dz-label">Uploading ' + escapeHtml(file.name) + '&hellip;</span>' +
+                     '<div class="upload-progress">…</div>';
+    try {
+        // 1. Ensure the folder chain exists. Cheap (folder POSTs idempotent
+        //    via conflictBehavior=fail + 409 ignore) and avoids the "parent
+        //    not found" failure mode of path-based PUT.
+        await ensureFolderChain(folder);
+
+        // 2. Upload via the path-based PUT — supports up to 250 MB on
+        //    business plans. Resumable upload is documented but out of
+        //    scope for the probe.
+        var url = 'https://graph.microsoft.com/v1.0/me/drive/root:' +
+                  encodePath(folder + '/' + file.name) + ':/content';
+        dlog('PUT ' + url, 'info');
+        var r = await fetch(url, {
+            method: 'PUT',
+            headers: { 'Authorization': 'Bearer ' + state.channel.data.auth_token },
+            body: file
+        });
+        if (!r.ok) {
+            var text = await r.text();
+            throw new Error('PUT failed ' + r.status + ': ' + text.slice(0, 400));
+        }
+        var meta = await r.json();
+        dlog('Upload OK — id=' + meta.id + ', size=' + meta.size, 'success');
+        dzEl.classList.remove('uploading');
+        dzEl.innerHTML = '<span class="dz-label">✓ Uploaded ' + escapeHtml(file.name) + ' · drop another</span>';
+
+        // Refresh the accordion if it's open so the new file appears.
+        var acc = document.getElementById('acc-' + cssEscape(recordNum));
+        if (acc && !acc.classList.contains('hidden')) {
+            loadAccordion(recordNum, acc);
+        }
+    } catch (e) {
+        dlog('Upload failed: ' + e.message, 'error');
+        dzEl.classList.remove('uploading');
+        dzEl.innerHTML = '<span class="dz-label" style="color:#991b1b;">✗ Upload failed — see debug drawer</span>';
+        // Restore the prompt after a moment so the user can retry.
+        setTimeout(function () {
+            dzEl.innerHTML = '<span class="dz-label">Drop a file here to upload to OneDrive</span>';
+        }, 4000);
+    }
+}
+
+// Walk the folder chain segment-by-segment. Idempotent: a 409 on POST means
+// "folder already exists with that name" — we treat that as success.
+//
+// We use `conflictBehavior: 'fail'` rather than `'replace'` because the
+// behaviour of `'replace'` on a folder isn't fully documented in Graph
+// (could theoretically replace a folder with an empty one of the same name
+// in some edge cases). `'fail'` + ignore-409 is the safe choice.
+async function ensureFolderChain(fullPath) {
+    var segments = fullPath.split('/').filter(Boolean);
+    var parent = '';
+    for (var i = 0; i < segments.length; i++) {
+        var seg = segments[i];
+        var url = parent
+            ? 'https://graph.microsoft.com/v1.0/me/drive/root:' + encodePath(parent) + ':/children'
+            : 'https://graph.microsoft.com/v1.0/me/drive/root/children';
+        var r = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Authorization': 'Bearer ' + state.channel.data.auth_token,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                name: seg,
+                folder: {},
+                '@microsoft.graph.conflictBehavior': 'fail'
+            })
+        });
+        if (r.status === 409) {
+            // Folder already exists — desired state. Move on.
+        } else if (r.ok) {
+            dlog('Created folder: ' + parent + '/' + seg, 'info');
+        } else {
+            var text = await r.text();
+            throw new Error('ensureFolder("' + seg + '") failed ' + r.status + ': ' + text.slice(0, 400));
+        }
+        parent = parent + '/' + seg;
+    }
+}
+
+// ============================================================================
+// ACCORDION — listFolder via Graph. Lazy on first expand, cached on close
+// (closing doesn't refresh; uploading re-opens does).
+// ============================================================================
+async function toggleAccordion(btn, recordNum) {
+    var acc = document.getElementById('acc-' + cssEscape(recordNum));
+    if (!acc) return;
+    var nowOpen = acc.classList.contains('hidden');
+    if (nowOpen) {
+        acc.classList.remove('hidden');
+        btn.classList.add('expanded');
+        btn.textContent = 'Hide';
+        if (!acc.dataset.loaded) {
+            await loadAccordion(recordNum, acc);
+        }
+    } else {
+        acc.classList.add('hidden');
+        btn.classList.remove('expanded');
+        btn.textContent = 'View';
+    }
+}
+
+async function loadAccordion(recordNum, acc) {
+    if (!state.channel || !state.companyName || !state.selectedModule) {
+        acc.innerHTML = '<div class="accordion-err">Not ready — channel or company unresolved.</div>';
+        return;
+    }
+    var folder = buildFolderPath(state.companyName, MODULE_LABEL[state.selectedModule], recordNum);
+    acc.innerHTML = '<div class="accordion-loading">Loading files from ' + escapeHtml(folder) + '&hellip;</div>';
+    try {
+        // $select reduces payload + ensures @microsoft.graph.downloadUrl is
+        // present (it's not in the default field set). $top=200 is well
+        // above any sensible per-record file count for v1; we don't paginate.
+        var url = 'https://graph.microsoft.com/v1.0/me/drive/root:' + encodePath(folder) + ':/children' +
+                  '?$select=id,name,size,file,folder,lastModifiedDateTime,webUrl,@microsoft.graph.downloadUrl' +
+                  '&$top=200';
+        dlog('GET ' + url, 'info');
+        var r = await fetch(url, {
+            headers: { 'Authorization': 'Bearer ' + state.channel.data.auth_token }
+        });
+        // A missing folder is the normal "no files yet" case — render
+        // empty state instead of an error.
+        if (r.status === 404) {
+            acc.innerHTML = '<div class="accordion-empty">No files yet. Drag one onto the row to upload.</div>';
+            acc.dataset.loaded = '1';
+            dlog('Folder 404 — no files yet', 'info');
+            return;
+        }
+        if (!r.ok) {
+            var text = await r.text();
+            throw new Error('List ' + r.status + ': ' + text.slice(0, 400));
+        }
+        var data = await r.json();
+        var items = (data.value || []).filter(function (it) { return !it.folder; });
+        items.sort(function (a, b) {
+            return String(a.name || '').toLowerCase() < String(b.name || '').toLowerCase() ? -1 : 1;
+        });
+        if (!items.length) {
+            acc.innerHTML = '<div class="accordion-empty">Folder exists but is empty.</div>';
+        } else {
+            var html = '<div class="file-list">';
+            items.forEach(function (it) {
+                html +=
+                    '<div class="file-row">' +
+                        '<div class="file-icon">' + iconForMime(it.file && it.file.mimeType) + '</div>' +
+                        '<div class="file-name" title="' + escapeHtml(it.name) + '">' + escapeHtml(it.name) + '</div>' +
+                        '<div class="file-meta">' + formatBytes(it.size) + ' · ' + formatDate(it.lastModifiedDateTime) + '</div>' +
+                        '<a class="file-download" target="_blank" rel="noopener" href="' +
+                            escapeHtml(it['@microsoft.graph.downloadUrl'] || it.webUrl || '#') +
+                        '">Download</a>' +
+                    '</div>';
+            });
+            html += '</div>';
+            acc.innerHTML = html;
+        }
+        acc.dataset.loaded = '1';
+        dlog('Listed ' + items.length + ' file(s) for ' + recordNum, 'success');
+    } catch (e) {
+        acc.innerHTML = '<div class="accordion-err">List failed: ' + escapeHtml(e.message) + '</div>';
+        dlog('List failed for ' + recordNum + ': ' + e.message, 'error');
+    }
+}
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+function buildFolderPath(company, moduleLabel, recordNum) {
+    // The plugin's literal convention — verified verbatim by the user.
+    return '/Apps/Fishbowl Inventory/' + company + '/' + moduleLabel + '/' + recordNum;
+}
+
+// Encode each path segment but keep '/' as a separator. encodeURIComponent
+// would over-encode the slashes; encodeURI under-encodes characters that
+// Graph rejects in the path-with-colon syntax (e.g. '#', '?').
+function encodePath(path) {
+    return path.split('/').map(function (s) {
+        // OneDrive disallows these in file/folder names anyway: " * : < > ? / \ |
+        // but the path itself contains '/', so we encode per-segment.
+        return encodeURIComponent(s);
+    }).join('/');
+}
+
+// CSS.escape isn't always present in JxBrowser 8 (it is in modern Chromium,
+// but the legacy fallback is safer for the few non-alphanumeric chars a
+// part number might contain). Used as a DOM-id suffix only.
+function cssEscape(s) {
+    return String(s).replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' })[c];
+    });
+}
+
+function formatBytes(n) {
+    if (n == null) return '';
+    var x = Number(n); if (!isFinite(x)) return '';
+    if (x < 1024) return x + ' B';
+    if (x < 1024 * 1024) return (x / 1024).toFixed(1) + ' KB';
+    if (x < 1024 * 1024 * 1024) return (x / 1048576).toFixed(1) + ' MB';
+    return (x / 1073741824).toFixed(2) + ' GB';
+}
+
+function formatDate(iso) {
+    if (!iso) return '';
+    try {
+        var d = new Date(iso);
+        if (isNaN(d.getTime())) return iso;
+        return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } catch (e) { return String(iso); }
+}
+
+// ============================================================================
+// FISHBOWL REST ENDPOINT TESTS — /api/integrations/plugin-info
+//
+// Confirmed via apidocs (user-supplied):
+//   GET  /api/integrations/plugin-info?plugin=…&table=…&recordId=…
+//   POST /api/integrations/plugin-info   (creates a link — not a file upload)
+//
+// Auth is handled by runRestApiAsync — the `authorization` parameter the
+// apidocs lists is the same JWT the runtime already attaches as a header,
+// per bi-script-javascript-api-guide.md L380. We pass nothing extra.
+//
+// Response shape (verbatim from apidocs sample, for any plugin):
+//   [ { id, plugin, table, recordId, groupId, channelId, info? } ]
+//
+// For File Storage specifically, `channelId` is expected to be the
+// OneDrive item id and `info` may carry file metadata (name / url / etc.).
+// We dump the raw JSON into the debug panel so we can see exactly what's
+// there without guessing.
+// ============================================================================
+// Auth-code helpers. The plugin-info endpoint requires `authorization` as a
+// query parameter (NOT just the transport JWT). The value is set up in the
+// Fishbowl client's Integration Apps screen — see the readme banner above.
+// Persisted via saveSettings so the user doesn't paste it every reload.
+function getAuthCode() {
+    var el = document.getElementById('authCode');
+    return el ? String(el.value || '').trim() : '';
+}
+
+function persistAuthCode() {
+    var v = getAuthCode();
+    try { if (typeof saveSettings === 'function') saveSettings('fileStorageTest.authCode', v); } catch (e) {}
+}
+
+function loadAuthCode() {
+    try {
+        if (typeof loadSettings === 'function') {
+            var v = loadSettings('fileStorageTest.authCode');
+            var el = document.getElementById('authCode');
+            if (v && el) el.value = v;
+        }
+    } catch (e) {}
+}
+
+async function testPluginInfo() {
+    if (typeof runRestApiAsync !== 'function') {
+        dlog('runRestApiAsync is not available in this BI runtime — endpoint test cannot run', 'error');
+        return;
+    }
+    var authCode = getAuthCode();
+    if (!authCode) {
+        dlog('No auth code in the toolbar field. The endpoint requires `authorization` — generate one in Fishbowl (Admin → Integration Apps or equivalent), paste it into the Auth code field, and retry.', 'warn');
+        return;
+    }
+    dlog('→ GET /api/integrations/plugin-info?plugin=File Storage&authorization=' +
+         authCode.slice(0, 6) + '…', 'info');
+    try {
+        var result = await runRestApiAsync({
+            path: '/api/integrations/plugin-info',
+            queryParameters: [
+                ['plugin',        'File Storage'],
+                ['authorization', authCode]
+            ]
+        });
+        dumpJson('plugin-info (no record filter)', result);
+    } catch (e) {
+        dlog('plugin-info call failed: status=' + (e && e.status) + ' message=' + (e && e.message), 'error');
+    }
+}
+
+async function testPluginInfoForRecord(num, recordId) {
+    if (typeof runRestApiAsync !== 'function') {
+        dlog('runRestApiAsync not available', 'error');
+        return;
+    }
+    if (recordId == null) {
+        dlog('No recordId for ' + num + ' — cannot filter', 'warn');
+        return;
+    }
+    var authCode = getAuthCode();
+    if (!authCode) {
+        dlog('No auth code in the toolbar field — see toolbar tooltip + paste a Fishbowl integration authorization code first.', 'warn');
+        return;
+    }
+    var mod = state.selectedModule || 'PART';
+    dlog('→ GET /api/integrations/plugin-info?plugin=File Storage&table=' + mod +
+         '&recordId=' + recordId + '&authorization=' + authCode.slice(0, 6) + '…  (' + num + ')', 'info');
+    try {
+        var result = await runRestApiAsync({
+            path: '/api/integrations/plugin-info',
+            queryParameters: [
+                ['plugin',        'File Storage'],
+                ['table',         mod],
+                ['recordId',      String(recordId)],
+                ['authorization', authCode]
+            ]
+        });
+        dumpJson('plugin-info for ' + mod + '/' + num + ' (id=' + recordId + ')', result);
+    } catch (e) {
+        dlog('plugin-info call failed: status=' + (e && e.status) + ' message=' + (e && e.message), 'error');
+    }
+}
+
+// Pretty-print helper. Long JSON in a single log line is unreadable, so
+// we stringify with 2-space indent and let the panel's `white-space:
+// pre-wrap` render it as a block. Truncate at 4 KB to keep the DOM
+// reasonable — anything longer than that is fine to inspect via
+// devtools console (we also console.log the full value).
+function dumpJson(label, value) {
+    var pretty;
+    try { pretty = JSON.stringify(value, null, 2); }
+    catch (e) { pretty = String(value); }
+    if (pretty.length > 4000) {
+        dlog(label + ' (' + pretty.length + ' chars — truncated; full value in browser console):\n' + pretty.slice(0, 4000) + '\n…[truncated]', 'success');
+    } else {
+        dlog(label + ':\n' + pretty, 'success');
+    }
+    console.log(label, value);
+}
+
+// ============================================================================
+// TOKEN DIAGNOSTIC — base64-decode the auth_token and report what's inside.
+// Run only when the bare token isn't a JWT. Three possible outcomes:
+//   1. Decoded text starts "eyJ"  → there IS a JWT wrapped in base64; we can
+//                                   probably use the decoded value as the
+//                                   Bearer token directly.
+//   2. Decoded text is JSON       → look for `access_token` / `accessToken`
+//                                   inside; might be a credentials wrapper.
+//   3. Decoded looks like random  → it's an encrypted blob; only Fishbowl
+//      bytes (most chars outside    can decrypt it. Direct-Graph approach
+//      printable ASCII)             is dead.
+//
+// Microsoft Graph confirmed via 401 "IDX14100: JWT is not well formed" that
+// the raw value isn't usable — so we already KNOW the token needs unwrapping
+// (or is encrypted). This is the final dispositive check.
+// ============================================================================
+function diagnoseBase64(token) {
+    var decoded;
+    try {
+        decoded = atob(token);
+    } catch (e) {
+        dlog('base64 decode failed: ' + e.message + '. Token is not standard base64 — likely an opaque handle, NOT an unwrappable blob.', 'warn');
+        return;
+    }
+    var len = decoded.length;
+    // Printable-ASCII ratio. Strings with >95% printable + a clean head are
+    // probably text; <80% means binary (encrypted or compressed).
+    var printable = 0;
+    for (var i = 0; i < Math.min(len, 256); i++) {
+        var c = decoded.charCodeAt(i);
+        if (c === 9 || c === 10 || c === 13 || (c >= 32 && c <= 126)) printable++;
+    }
+    var ratio = printable / Math.min(len, 256);
+    var head = decoded.slice(0, 80).replace(/[^\x20-\x7E]/g, '·');
+    dlog('base64-decoded: length=' + len + ' bytes, printable-ratio=' + ratio.toFixed(2) +
+         ', head="' + head + '"', 'info');
+
+    if (/^eyJ[A-Za-z0-9_-]+\./.test(decoded)) {
+        // The PURE WIN case: there's a JWT wrapped inside the base64.
+        // Replace the channel's token with the decoded value and the user
+        // can retry — should now satisfy Graph.
+        dlog('Decoded payload appears to be a JWT — replacing token with decoded value. Reload + retry View.', 'success');
+        state.channel.data.auth_token = decoded.replace(/[\r\n\t\0]/g, '').trim();
+        return;
+    }
+    if (decoded.charAt(0) === '{') {
+        // JSON wrapper. Try to parse + report whatever keys are inside so we
+        // can spot an embedded access_token / accessToken / authentication
+        // section without having to dump the full blob.
+        try {
+            var obj = JSON.parse(decoded);
+            var keys = Object.keys(obj).join(', ');
+            dlog('Decoded payload is JSON with keys: ' + keys, 'info');
+            // Common token-wrapper field names.
+            var candidates = ['access_token', 'accessToken', 'token', 'bearer', 'authToken'];
+            for (var k = 0; k < candidates.length; k++) {
+                if (obj[candidates[k]]) {
+                    dlog('Found "' + candidates[k] + '" field inside the JSON wrapper — using it as Bearer. Reload + retry.', 'success');
+                    state.channel.data.auth_token = String(obj[candidates[k]]).replace(/[\r\n\t\0]/g, '').trim();
+                    return;
+                }
+            }
+            dlog('JSON wrapper has none of the expected token field names. Keys above — investigate manually.', 'warn');
+        } catch (e) {
+            dlog('Looked like JSON (leading "{") but JSON.parse failed: ' + e.message, 'warn');
+        }
+        return;
+    }
+    if (ratio < 0.8) {
+        dlog('Decoded payload is mostly non-printable bytes — this is encrypted (or compressed). The Fishbowl plugin stores an encrypted blob in plugindata.info; only Fishbowl can decrypt it. Direct-Graph approach is not viable as currently designed.', 'error');
+        return;
+    }
+    dlog('Decoded payload is printable but unrecognised format. Manual inspection needed — copy the debug log and look at the head.', 'warn');
+}
+
+function iconForMime(mime) {
+    if (!mime) return '📄';
+    if (mime.indexOf('image/') === 0) return '🖼';
+    if (mime === 'application/pdf') return '📕';
+    if (mime.indexOf('spreadsheet') !== -1 || mime.indexOf('excel') !== -1) return '📊';
+    if (mime.indexOf('word') !== -1 || mime.indexOf('document') !== -1) return '📝';
+    if (mime.indexOf('zip') !== -1 || mime.indexOf('compressed') !== -1) return '🗜';
+    if (mime.indexOf('video/') === 0) return '🎞';
+    if (mime.indexOf('audio/') === 0) return '🎵';
+    return '📄';
+}
+
+// Kick off.
+init();
+</script>
+
+</body>
+</html>

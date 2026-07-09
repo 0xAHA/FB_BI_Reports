@@ -1,8 +1,157 @@
+/*
+================================================================================
+  FILE:   fb-lib (shared JS runtime)
+  PATH:   scripts/fb-lib.js
+  --------------------------------------------------------------------------------
+  Canonical JavaScript runtime for every Fishbowl BI report. Deployed by
+  saving the contents as a Fishbowl Script named "fb-lib" and injecting it
+  into each report via Fishbowl's Script directive (whose literal
+  placeholder syntax is intentionally NOT written in this header — see
+  the HOW IT'S LOADED block below for the full doc, where the placeholder
+  is referenced abstractly to avoid the duplicate-mention trap that
+  breaks single-pass directive substitution when this file is inlined).
+  Exposes the
+  window.FBLib namespace: Common (date/money/qty formatters, debug logger,
+  drawer + multi-select primitives), Settings (layered user/master/property
+  preference resolver), CfCatalog / CfCols (custom-field discovery + column
+  rendering), Columns (per-tile column manifest), Picker (drag/drop column
+  picker), and Table (sort/filter/drag scaffolding).
+================================================================================
+*/
+
+// ============================================================================
+//  fb-lib.js — Shared runtime for Fishbowl BI reports
+// ============================================================================
+//
+// HOW IT'S LOADED
+// ---------------
+// Reports include this whole file inside an inline <script> tag using
+// the Fishbowl Script directive — `{` + `% Script fb-lib %}` (split here
+// to avoid recursive expansion: Fishbowl substitutes the directive
+// EVERYWHERE in the report HTML, including inside string literals and
+// HTML comments, and would also recurse into this file's documentation
+// if it appeared verbatim). The Fishbowl server replaces that
+// placeholder with the saved script content at delivery time. When
+// working locally outside Fishbowl, the placeholder is literally left
+// in place and the script block fails to parse — which is expected; the
+// report's own JS guards on `window.FBLib` being defined.
+//
+// PUBLIC API SURFACE
+// ------------------
+// Every public helper hangs off `window.FBLib`. The five sub-modules
+// listed here cover roughly 95% of what a typical report needs:
+//
+//   FBLib.Common         — date / money / qty formatting, debug logger,
+//                          status indicators, debug drawer, drop-down
+//                          drawer helpers, multi-select widget.
+//   FBLib.Settings       — layered preference resolver (user → master →
+//                          getProperty → defaults), with admin-publish +
+//                          editing-lock support.
+//   FBLib.CfCatalog      — Fishbowl custom-field discovery. Lazy-loaded
+//                          on first call; one-shot query buckets every
+//                          active CF by module table.
+//   FBLib.CfCols         — Render + filter active CFs into a per-tile
+//                          column set. Pairs with FBLib.Columns.
+//   FBLib.Columns        — Per-tile column manifest + visibility/ordering
+//                          helpers (settings-aware).
+//   FBLib.Picker         — Drag-and-drop column picker UI used by
+//                          report settings panels.
+//   FBLib.Table          — Sort / per-column filter / drag-reorder /
+//                          drag-resize scaffolding for a <table> in a
+//                          scroll container. Plug in via FBLib.Table.init.
+//
+// QUICK START — common building blocks
+// ------------------------------------
+//   // 1. Initialise settings BEFORE any code that calls resolve():
+//   FBLib.Settings.init({
+//       userKey:   'cdx.bi.myreport.user.v1',
+//       masterKey: 'cdx.bi.myreport.master.v1',
+//       defaults:  { dateRange: 'thisFY', showDebug: false }
+//   });
+//
+//   // 2. Mount the debug drawer (idempotent — call as many times as you like):
+//   FBLib.Common.mountDebugDrawer();
+//   FBLib.Common.debugLog('Hello world', 'info');
+//
+//   // 3. Register your settings/help/filters drop-down drawers so they
+//   //    share mutual-exclusion + ESC-to-close plumbing:
+//   FBLib.Common.registerDrawer({ id: 'setOverlay',     triggerId: 'setBtn'     });
+//   FBLib.Common.registerDrawer({ id: 'helpOverlay',    triggerId: 'helpBtn'    });
+//   FBLib.Common.registerDrawer({ id: 'filtersOverlay', triggerId: 'filtersBtn' });
+//   // Then in your header buttons: onclick="FBLib.Common.toggleDrawer('setOverlay')"
+//
+//   // 4. Wire up a sortable / filterable / draggable / resizable table:
+//   var table = FBLib.Table.init({
+//       tableEl:    document.getElementById('reportTable'),
+//       columns:    _columns,     // [{ key, label, type?, money?, qty?, date?, link?, vis? }, ...]
+//       getRows:    () => _dataset,
+//       onRender:   () => updateKpis(),
+//       settingsKey: 'columnOrder',   // optional — persists via FBLib.Settings
+//   });
+//   table.render();
+//
+//   // 5. Multi-select dropdown filter:
+//   FBLib.Common.MultiSelect.create({
+//       containerId: 'statusMs',     // host <div> with the canonical markup
+//       items:       [{ value: 20, label: 'Issued' }, { value: 25, label: 'In Progress' }],
+//       placeholder: 'All statuses',
+//       onChange:    selected => loadDashboard()
+//   });
+//
+// HOW STYLES ARE INJECTED
+// -----------------------
+// Most helpers that ship their own DOM (debug drawer, multi-select,
+// column picker, etc.) inject their CSS once via a `<style>` tag with a
+// known id, so calling the mount/create function repeatedly is cheap.
+// Report-level CSS (the drop-down `.fb-drawer` rules, the table classes
+// the Table helper looks for) is documented inline above each module.
+//
+// AI ASSISTANT GUIDANCE
+// ---------------------
+// (If you are an AI assistant reading this file to generate or modify a
+// Fishbowl BI report, follow these rules — they will save the user a
+// great deal of corrective feedback.)
+//
+//  • Prefer FBLib over hand-rolled equivalents. If a report already
+//    formats money with formatMoney() and you're adding a new feature,
+//    use FBLib.Common.formatMoney too — don't introduce a parallel
+//    helper. Same for date formatting, debug logging, drawer toggling.
+//
+//  • Drop-down drawers (`.fb-drawer` + `.fb-drawer-head` + `.fb-drawer-body`)
+//    are the STANDARD container for settings, help, and filters. Do NOT
+//    fall back to right-side slide-in panels — the codebase explicitly
+//    retired them. See the "DROP-DOWN DRAWER" comment block in Common
+//    below for the canonical markup + behaviour.
+//
+//  • Lowercase result keys: every column returned by `runQuery` /
+//    `runQueryAsync` is lowercased regardless of the SQL aliasing. Use
+//    `row.totalprice`, not `row.totalPrice`.
+//
+//  • Transfer Order's table is `xo`, not `to` (`to` is a SQL reserved
+//    word). FK convention is `fooId -> foo.id`. See schema/schema-index.md.
+//
+//  • Save preferences via FBLib.Settings, never directly via
+//    `localStorage` or `sessionStorage` — those are wiped frequently in
+//    JxBrowser and are per-browser, not per-Fishbowl-user.
+//
+//  • The Fishbowl client's embedded browser is JxBrowser 8 (modern
+//    Chromium). Modern JS is fine; CDN scripts work when the user has
+//    internet, but on-premise users often don't, so embed criticals or
+//    avoid them.
+//
+//  • Touch this file ONLY when adding genuinely reusable helpers. Per-
+//    report widgets belong in the report's own <script>. Once a pattern
+//    has been copy-pasted into 2+ reports, that's a good signal it
+//    should be lifted up here.
+//
+// ============================================================================
 window.FBLib = (function () {
     'use strict';
 
     // ====================================================================
-    // FBLib.Common — date / debug / status indicators
+    // FBLib.Common — date / money formatting, debug logger + drawer,
+    //                drop-down drawer registry, multi-select widget,
+    //                status indicators.
     // (replacement for the old dashboard-common.js)
     // ====================================================================
     const Common = (function () {
@@ -18,18 +167,29 @@ window.FBLib = (function () {
             .replace(/dd/g, 'DD');
 
         // DEBUG_MODE is dynamic — Settings.init() may change the resolution
-        // after this module loads, so we expose it as a getter. While
-        // Settings hasn't been initialised, we fall back to the
-        // BI_SHOW_DEBUG property (matches the old DashboardCommon).
+        // after this module loads, so we expose it as a getter. The signal
+        // is ONLY the user's persisted Settings — we no longer fall back
+        // to the BI_SHOW_DEBUG system property. Rationale: the property
+        // was set per-server (so every user of the server saw the same
+        // value, regardless of their preference) AND it was a global
+        // override the user couldn't change from the report UI. Reports
+        // now expose a per-user "Show debug console" checkbox that writes
+        // the `debug` (or legacy `showDebug`) key, which is the single
+        // source of truth here.
         function _debugMode() {
             try {
                 if (FBLib.Settings && FBLib.Settings._initialised) {
-                    return !!FBLib.Settings.resolve('debug');
+                    // Accept either 'debug' (the canonical key used by most
+                    // reports) or 'showDebug' (legacy alias kept for reports
+                    // — e.g. Import_Builder — that already shipped with the
+                    // older key in their persisted user settings). Either
+                    // truthy → debug mode is on.
+                    let v = FBLib.Settings.resolve('debug');
+                    if (v == null) v = FBLib.Settings.resolve('showDebug');
+                    return !!v;
                 }
             } catch (_) {}
-            const raw = (typeof getProperty === 'function')
-                ? getProperty('BI_SHOW_DEBUG', 'false') : 'false';
-            return raw === 'true' || raw === true;
+            return false;
         }
 
         function formatDate(dateStr) {
@@ -187,6 +347,629 @@ window.FBLib = (function () {
             if (logDiv) logDiv.innerHTML = '<div style="color: #64748b; font-style: italic;">Log cleared...</div>';
         }
 
+        // ============================================================
+        // DEBUG DRAWER — bottom-anchored, full-width, expandable
+        // ------------------------------------------------------------
+        // Modern replacement for the older inline "debug console" card
+        // that some reports still embed in their page flow. The drawer
+        // is fixed to the bottom of the viewport (out of the way), so
+        // a long report's main content isn't pushed around by debug
+        // output. It has three states:
+        //
+        //   - hidden    : container display:none (api.hide() — used when
+        //                 the user's "debug mode" setting is off)
+        //   - collapsed : visible bar only (the toggle header); content
+        //                 hidden (api.collapse())
+        //   - expanded  : header + scrollable log + diagnostics bar
+        //                 (api.expand())
+        //
+        // Drag-to-resize on the thin top-edge handle lets the user
+        // grow the log pane up to 70vh.
+        //
+        // Why not auto-mount?  Many reports never need debug; injecting
+        // ~10kB of DOM + style on every page load is wasted bytes. We
+        // require an explicit FBLib.Common.mountDebugDrawer() call from
+        // the host so the cost is only paid where actually used. The
+        // call is idempotent — repeat invocations return the same API.
+        //
+        // Element id `#debugLog` is preserved on purpose: the existing
+        // Common.debugLog() / Common.clearDebugLog() find their target
+        // by that id, so reports that already log via those functions
+        // get drawer output for free as soon as mountDebugDrawer() runs.
+        // ============================================================
+        let _drawerMounted = false;
+        let _drawerContainer = null;
+        let _drawerApi = null;
+
+        // CSS is injected once per page via a <style> tag with a known id.
+        // Everything below `.fblib-debug-drawer` to keep this self-contained
+        // (no clashes with host-page CSS). `#debugLog` is intentionally
+        // scoped so a host page that defines its own #debugLog styles
+        // gets overridden inside the drawer but not elsewhere.
+        const _DRAWER_CSS =
+            '.fblib-debug-drawer{position:fixed;bottom:0;left:0;right:0;z-index:9000;' +
+                'font-family:\'Inter\',-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;' +
+                'background:transparent;display:none}' +
+            '.fblib-debug-drawer.is-visible{display:block}' +
+            '.fblib-debug-drawer .fblib-debug-resize{height:5px;background:transparent;cursor:ns-resize;border-top:2px solid #e2e8f0}' +
+            '.fblib-debug-drawer .fblib-debug-shell{background:#fff;box-shadow:0 -4px 24px rgba(0,0,0,.12)}' +
+            '.fblib-debug-drawer .fblib-debug-toggle{width:100%;padding:8px 16px;display:flex;align-items:center;' +
+                'justify-content:space-between;background:none;border:none;cursor:pointer;text-align:left;font-family:inherit}' +
+            '.fblib-debug-drawer .fblib-debug-toggle:hover{background:#f8fafc}' +
+            '.fblib-debug-drawer .fblib-debug-titlegrp{display:flex;align-items:center;gap:8px}' +
+            '.fblib-debug-drawer .fblib-debug-title{font-size:12px;font-weight:600;color:#475569}' +
+            '.fblib-debug-drawer .fblib-debug-subtitle{font-size:11px;color:#94a3b8;font-weight:400}' +
+            '.fblib-debug-drawer .fblib-debug-chevron{transition:transform .2s ease;transform:rotate(180deg)}' +
+            '.fblib-debug-drawer.is-open .fblib-debug-chevron{transform:rotate(0deg)}' +
+            '.fblib-debug-drawer .fblib-debug-content{display:none;border-top:1px solid #e2e8f0;background:#fff}' +
+            '.fblib-debug-drawer.is-open .fblib-debug-content{display:block}' +
+            '.fblib-debug-drawer .fblib-debug-diag{background:#1e293b;padding:6px 14px;' +
+                'display:flex;align-items:center;justify-content:space-between;color:#cbd5e1}' +
+            '.fblib-debug-drawer .fblib-debug-diag-label{font-size:11px;font-family:ui-monospace,\'Courier New\',monospace;color:#94a3b8}' +
+            '.fblib-debug-drawer .fblib-debug-diag-actions{display:flex;align-items:center;gap:10px}' +
+            '.fblib-debug-drawer .fblib-debug-action{font-size:11px;color:#94a3b8;background:none;border:none;' +
+                'cursor:pointer;padding:0;display:inline-flex;align-items:center;gap:4px;font-family:inherit}' +
+            '.fblib-debug-drawer .fblib-debug-action:hover{color:#fff}' +
+            '.fblib-debug-drawer #debugLog{background:#0f172a;color:#e2e8f0;padding:10px 14px;' +
+                'font-family:ui-monospace,\'Courier New\',monospace;font-size:11px;' +
+                'height:200px;overflow-y:auto;line-height:1.5;white-space:pre-wrap}';
+
+        function _injectDrawerCss() {
+            if (document.getElementById('fbLibDebugDrawerStyle')) return;
+            const style = document.createElement('style');
+            style.id = 'fbLibDebugDrawerStyle';
+            style.textContent = _DRAWER_CSS;
+            document.head.appendChild(style);
+        }
+
+        // SVG kept inline so the drawer is self-contained — no external
+        // sprite or icon-font dependency.
+        const _DRAWER_HTML =
+            '<div class="fblib-debug-resize" title="Drag to resize"></div>' +
+            '<div class="fblib-debug-shell">' +
+                '<button type="button" class="fblib-debug-toggle">' +
+                    '<span class="fblib-debug-titlegrp">' +
+                        '<svg width="14" height="14" fill="none" stroke="#64748b" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">' +
+                            '<path d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"/></svg>' +
+                        '<span class="fblib-debug-title">Debug Console</span>' +
+                        '<span class="fblib-debug-subtitle">Auto-scrolls to latest entry</span>' +
+                    '</span>' +
+                    '<svg class="fblib-debug-chevron" width="16" height="16" fill="none" stroke="#94a3b8" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">' +
+                        '<path d="M19 9l-7 7-7-7"/></svg>' +
+                '</button>' +
+                '<div class="fblib-debug-content">' +
+                    '<div class="fblib-debug-diag">' +
+                        '<span class="fblib-debug-diag-label">Fishbowl Connection Diagnostics</span>' +
+                        '<span class="fblib-debug-diag-actions">' +
+                            '<button type="button" class="fblib-debug-action" data-action="copy" title="Copy log to clipboard">' +
+                                '<svg width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">' +
+                                    '<rect x="9" y="9" width="13" height="13" rx="2"/>' +
+                                    '<path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>' +
+                                'Copy</button>' +
+                            '<button type="button" class="fblib-debug-action" data-action="clear" title="Clear log">Clear</button>' +
+                        '</span>' +
+                    '</div>' +
+                    '<div id="debugLog">' +
+                        '<span style="color:#475569;font-style:italic;">Waiting for application to initialize&hellip;</span>' +
+                    '</div>' +
+                '</div>' +
+            '</div>';
+
+        function _wireDrawerHandlers(container) {
+            // Toggle expanded/collapsed on header click. We use a class
+            // rather than toggling .style.display so the chevron's CSS
+            // transition can drive off the same class.
+            const toggle = container.querySelector('.fblib-debug-toggle');
+            if (toggle) {
+                toggle.addEventListener('click', function () {
+                    container.classList.toggle('is-open');
+                });
+            }
+            // Copy + clear: stopPropagation prevents the wrapping
+            // header button from also receiving the click and toggling
+            // the drawer closed.
+            const copyBtn = container.querySelector('[data-action="copy"]');
+            if (copyBtn) {
+                copyBtn.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                    const logDiv = document.getElementById('debugLog');
+                    if (!logDiv) return;
+                    const text = logDiv.innerText || logDiv.textContent || '';
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        navigator.clipboard.writeText(text).catch(function () {});
+                    } else {
+                        const ta = document.createElement('textarea');
+                        ta.value = text;
+                        document.body.appendChild(ta);
+                        ta.select();
+                        try { document.execCommand('copy'); } catch (_) {}
+                        document.body.removeChild(ta);
+                    }
+                });
+            }
+            const clearBtn = container.querySelector('[data-action="clear"]');
+            if (clearBtn) {
+                clearBtn.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                    clearDebugLog();
+                });
+            }
+            // Drag-to-resize. The handle is the thin strip along the
+            // top edge of the drawer. We resize the inner #debugLog
+            // element (not the whole drawer) so the diagnostics bar +
+            // toggle header stay a fixed height.
+            const handle = container.querySelector('.fblib-debug-resize');
+            const logEl = container.querySelector('#debugLog');
+            if (handle && logEl) {
+                let resizing = false, startY = 0, startH = 0;
+                handle.addEventListener('mousedown', function (e) {
+                    resizing = true;
+                    startY = e.clientY;
+                    startH = logEl.offsetHeight;
+                    document.body.style.userSelect = 'none';
+                    e.preventDefault();
+                });
+                document.addEventListener('mousemove', function (e) {
+                    if (!resizing) return;
+                    const delta = startY - e.clientY;        // up-drag = positive delta
+                    const minH = 80;
+                    const maxH = Math.floor(window.innerHeight * 0.7);
+                    logEl.style.height = Math.max(minH, Math.min(maxH, startH + delta)) + 'px';
+                });
+                document.addEventListener('mouseup', function () {
+                    if (resizing) {
+                        resizing = false;
+                        document.body.style.userSelect = '';
+                    }
+                });
+            }
+        }
+
+        function _buildDrawerApi(container) {
+            return {
+                show:      function () { container.classList.add('is-visible'); },
+                hide:      function () { container.classList.remove('is-visible'); },
+                toggle:    function () { container.classList.toggle('is-visible'); },
+                expand:    function () { container.classList.add('is-open'); container.classList.add('is-visible'); },
+                collapse:  function () { container.classList.remove('is-open'); },
+                isOpen:    function () { return container.classList.contains('is-open'); },
+                isVisible: function () { return container.classList.contains('is-visible'); },
+                element:   container
+            };
+        }
+
+        // ================================================================
+        // DROP-DOWN DRAWER  —  the standard "settings / help / filters"
+        // pattern used across all BI reports. Replaces the older
+        // right-side slide-out panel-overlay style (which we no longer use
+        // — it took the whole viewport hostage and felt heavy for what is
+        // usually a quick toggle).
+        //
+        // SHAPE
+        //   The drawer is a sibling of <header>: it lives in the document
+        //   flow and pushes the rest of the page down when it opens. There
+        //   is no backdrop; clicking outside does not close it (that's the
+        //   filter-drawer convention from PurchaseOrderSummary, which we
+        //   adopted as the standard because users like to adjust filters
+        //   while looking at the table).
+        //
+        // CANONICAL CSS  (copy into the report's <style> block)
+        //   .fb-drawer {
+        //       background: #f8fafc; border-bottom: 1px solid #e2e8f0;
+        //       box-shadow: 0 6px 12px -8px rgba(15,23,42,0.18);
+        //       display: none; flex-shrink: 0;
+        //   }
+        //   .fb-drawer.open { display: block; }
+        //   .fb-drawer-head {
+        //       display: flex; justify-content: space-between; align-items: center;
+        //       padding: 10px 18px; border-bottom: 1px solid #e2e8f0;
+        //       background: var(--color-primary); color: #fff;
+        //   }
+        //   .fb-drawer-head h2 { margin:0; font-size:14px; color:#fff; font-weight:700; }
+        //   .fb-drawer-close { background: transparent; border: none; font-size: 22px;
+        //       cursor: pointer; color: #fff; line-height: 1; padding: 0 6px; opacity: 0.9; }
+        //   .fb-drawer-close:hover { opacity: 1; }
+        //   .fb-drawer-body { padding: 14px 18px; max-height: 65vh; overflow-y: auto; }
+        //   .fb-drawer-foot { padding: 10px 18px; border-top: 1px solid #e2e8f0;
+        //       background: #fff; display: flex; gap: 8px; justify-content: space-between;
+        //       align-items: center; flex-wrap: wrap; }
+        //   .hdr-btn.active { background: #eff6ff; border-color: #bfdbfe;
+        //       color: var(--color-primary-dark); }
+        //
+        // CANONICAL MARKUP  (drawer must be a SIBLING of <header>, NOT a child of body root only)
+        //   <header>
+        //     ...
+        //     <button id="setBtn" class="hdr-btn" onclick="FBLib.Common.toggleDrawer('setOverlay')">⚙</button>
+        //   </header>
+        //   <div id="setOverlay" class="fb-drawer">
+        //     <div class="fb-drawer-head">
+        //       <h2>Settings</h2>
+        //       <button class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')">&times;</button>
+        //     </div>
+        //     <div class="fb-drawer-body">…content…</div>
+        //     <div class="fb-drawer-foot">…optional buttons…</div>
+        //   </div>
+        //
+        // BEHAVIOR
+        //   - Opening one drawer closes any other registered drawer (one
+        //     open at a time, since they share the slot below the header).
+        //   - The trigger button gets `.active` while its drawer is open.
+        //   - ESC closes whichever drawer is open.
+        //
+        // API
+        //   FBLib.Common.registerDrawer({
+        //       id: 'setOverlay',          // the drawer element's id
+        //       triggerId: 'setBtn',       // the header button that toggles it (optional)
+        //       onBeforeOpen: () => {},    // hook — e.g. hydrate form values
+        //       onAfterClose: () => {}     // hook — rarely needed
+        //   });
+        //   FBLib.Common.openDrawer(id) / closeDrawer(id) / toggleDrawer(id) / closeAllDrawers();
+        // ================================================================
+        const _drawers = {};
+        function registerDrawer(cfg) {
+            if (!cfg || !cfg.id) return null;
+            _drawers[cfg.id] = {
+                id: cfg.id,
+                triggerId: cfg.triggerId || null,
+                onBeforeOpen: typeof cfg.onBeforeOpen === 'function' ? cfg.onBeforeOpen : null,
+                onAfterClose: typeof cfg.onAfterClose === 'function' ? cfg.onAfterClose : null
+            };
+            return { open: function () { openDrawer(cfg.id); },
+                     close: function () { closeDrawer(cfg.id); },
+                     toggle: function () { toggleDrawer(cfg.id); } };
+        }
+        function openDrawer(id) {
+            // Close every other registered drawer first — only one open at a time.
+            Object.keys(_drawers).forEach(function (other) {
+                if (other !== id) closeDrawer(other);
+            });
+            const cfg = _drawers[id];
+            try { if (cfg && cfg.onBeforeOpen) cfg.onBeforeOpen(); } catch (_) {}
+            const el = document.getElementById(id);
+            if (el) el.classList.add('open');
+            if (cfg && cfg.triggerId) {
+                const btn = document.getElementById(cfg.triggerId);
+                if (btn) btn.classList.add('active');
+            }
+        }
+        function closeDrawer(id) {
+            const el = document.getElementById(id);
+            if (el) el.classList.remove('open');
+            const cfg = _drawers[id];
+            if (cfg && cfg.triggerId) {
+                const btn = document.getElementById(cfg.triggerId);
+                if (btn) btn.classList.remove('active');
+            }
+            try { if (cfg && cfg.onAfterClose) cfg.onAfterClose(); } catch (_) {}
+        }
+        function toggleDrawer(id) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            if (el.classList.contains('open')) closeDrawer(id);
+            else openDrawer(id);
+        }
+        function closeAllDrawers() {
+            Object.keys(_drawers).forEach(closeDrawer);
+        }
+        // Global ESC handler — bind once. Idempotent guard via _escBound flag.
+        if (typeof document !== 'undefined' && !window._fbLibDrawerEscBound) {
+            window._fbLibDrawerEscBound = true;
+            document.addEventListener('keydown', function (e) {
+                if (e.key === 'Escape') closeAllDrawers();
+            });
+        }
+
+        // ================================================================
+        // MULTI-SELECT DROPDOWN  —  canonical "filter by a set of values"
+        // widget shared across report filter drawers. Visually + behaviourally
+        // a port of the .ms-* implementation in PurchaseOrderSummary.htm, but
+        // lifted up so new reports can adopt it with two lines of JS instead
+        // of 80 lines of copy-paste.
+        //
+        // CANONICAL MARKUP  (host page must provide this once per multi-select)
+        //   <div class="ms-container" id="statusMs">
+        //     <div class="ms-trigger" id="statusMs-trigger">
+        //       <span class="ms-placeholder" id="statusMs-placeholder">Select…</span>
+        //     </div>
+        //     <div class="ms-dropdown hidden" id="statusMs-dropdown">
+        //       <div class="ms-search"><input type="text" id="statusMs-search" placeholder="Search…"/></div>
+        //       <div class="ms-actions">
+        //         <span id="statusMs-all">Select All</span>
+        //         <span id="statusMs-clear">Clear All</span>
+        //       </div>
+        //       <div class="ms-list" id="statusMs-list"></div>
+        //     </div>
+        //   </div>
+        //
+        // CANONICAL CSS  (drop into the page's <style> block; or use the inline
+        // pattern from PurchaseOrderSummary.htm lines 19–44 verbatim.)
+        //   .ms-container { position: relative; }
+        //   .ms-trigger   { display:flex; align-items:center; flex-wrap:nowrap; gap:3px;
+        //                   border:1px solid #e2e8f0; border-radius:6px; padding:3px 8px;
+        //                   background:white; height:30px; overflow:hidden; cursor:pointer; font-size:12px; }
+        //   .ms-trigger:hover { border-color:#9ca3af; }
+        //   .ms-tag       { background:#dbeafe; color:#1d4ed8; padding:1px 5px; border-radius:3px;
+        //                   font-size:11px; display:flex; align-items:center; gap:2px; white-space:nowrap; }
+        //   .ms-tag-x     { cursor:pointer; font-weight:bold; }
+        //   .ms-placeholder { color:#9ca3af; }
+        //   .ms-dropdown  { position:absolute; z-index:500; top:calc(100% + 2px); left:0; right:0;
+        //                   min-width:220px; background:white; border:1px solid #d1d5db;
+        //                   border-radius:6px; box-shadow:0 6px 20px rgba(0,0,0,0.13);
+        //                   display:flex; flex-direction:column; max-height:280px; }
+        //   .ms-search input { width:100%; border:1px solid #d1d5db; border-radius:4px;
+        //                      padding:4px 8px; font-size:12px; outline:none; }
+        //   .ms-actions   { padding:3px 10px; border-bottom:1px solid #f3f4f6;
+        //                   display:flex; gap:10px; font-size:11px; }
+        //   .ms-actions span { color:#3b82f6; cursor:pointer; }
+        //   .ms-list      { overflow-y:auto; flex:1; }
+        //   .ms-item      { display:flex; align-items:center; gap:8px; padding:5px 10px;
+        //                   cursor:pointer; font-size:12px; }
+        //   .ms-item:hover { background:#eff6ff; }
+        //   .ms-empty     { padding:12px; color:#9ca3af; font-size:12px; text-align:center; }
+        //
+        // API
+        //   const ms = FBLib.Common.MultiSelect.create({
+        //       containerId: 'statusMs',
+        //       items: [{ value: 20, label: 'Issued' }, { value: 25, label: 'In Progress' }],
+        //       selected: [20],         // optional initial selection
+        //       placeholder: 'All statuses',
+        //       searchable: true,        // omit the search box by setting false
+        //       maxTags: 3,              // how many tags to show before "+N more"
+        //       onChange: selected => { /* called whenever the selection changes */ }
+        //   });
+        //   ms.getSelected();           // → array of values
+        //   ms.setSelected([20, 25]);   // replace selection programmatically
+        //   ms.setItems(newItems);      // swap the option list (e.g. cascading dropdowns)
+        //   ms.open() / ms.close();
+        //
+        // BEHAVIOUR
+        //   • Only one multi-select is open at a time (clicking another closes the previous).
+        //   • The dropdown closes on outside-click.
+        //   • The search input filters the list case-insensitively on .label.
+        //   • Selected values render as inline tags on the trigger; clicking a tag's × removes it.
+        //   • onChange fires on every selection mutation including Select-All / Clear-All / tag-x.
+        // ================================================================
+        const _msRegistry = {};
+        let _msActive = null;
+        let _msOutsideBound = false;
+
+        function _msEnsureOutsideClick() {
+            if (_msOutsideBound) return;
+            _msOutsideBound = true;
+            document.addEventListener('click', function (e) {
+                if (!_msActive) return;
+                const cont = document.getElementById(_msActive);
+                if (cont && !cont.contains(e.target)) {
+                    _msRegistry[_msActive] && _msRegistry[_msActive].close();
+                }
+            });
+        }
+
+        function _msCreate(opts) {
+            if (!opts || !opts.containerId) throw new Error('MultiSelect.create: containerId required');
+            const containerId = opts.containerId;
+            const container = document.getElementById(containerId);
+            if (!container) throw new Error('MultiSelect.create: #' + containerId + ' not found');
+
+            // The host may provide either the canonical id-suffix form
+            // (`statusMs-trigger`) or the legacy positional form (the
+            // PurchaseOrderSummary pattern uses `statusTrigger`). We accept
+            // either by stripping a trailing "Ms" if present.
+            const idBase = containerId.replace(/Ms$/i, '');
+            function q(suffix) {
+                return document.getElementById(containerId + '-' + suffix)
+                    || document.getElementById(idBase + suffix.charAt(0).toUpperCase() + suffix.slice(1));
+            }
+            const triggerEl = q('trigger');
+            const dropdownEl = q('dropdown');
+            const placeholderEl = q('placeholder');
+            const listEl = q('list');
+            const allEl = q('all');
+            const clearEl = q('clear');
+            const searchEl = q('search');
+            if (!triggerEl || !dropdownEl || !listEl) {
+                throw new Error('MultiSelect.create: required child elements missing under #' + containerId);
+            }
+
+            let items = (opts.items || []).map(_msNormItem);
+            const selected = new Set((opts.selected || []).map(String));
+            const placeholder = opts.placeholder || 'Select…';
+            const maxTags = (opts.maxTags == null) ? 3 : opts.maxTags;
+            const onChange = typeof opts.onChange === 'function' ? opts.onChange : function () {};
+            let lastFilter = '';
+
+            function _emit() { try { onChange(getSelected()); } catch (_) {} }
+            function _filteredItems() {
+                if (!lastFilter) return items;
+                const f = lastFilter.toLowerCase();
+                return items.filter(function (o) { return String(o.label).toLowerCase().indexOf(f) !== -1; });
+            }
+            function _renderList() {
+                const visible = _filteredItems();
+                listEl.innerHTML = '';
+                if (!visible.length) {
+                    listEl.innerHTML = '<div class="ms-empty">No items</div>';
+                    return;
+                }
+                let lastGroup;
+                visible.forEach(function (o) {
+                    if (o.group != null && o.group !== lastGroup) {
+                        if (lastGroup !== undefined) {
+                            const sep = document.createElement('div');
+                            sep.className = 'ms-sep';
+                            listEl.appendChild(sep);
+                        }
+                        const hdr = document.createElement('div');
+                        hdr.className = 'ms-group-hdr';
+                        hdr.textContent = o.group;
+                        listEl.appendChild(hdr);
+                        lastGroup = o.group;
+                    }
+                    const row = document.createElement('div');
+                    row.className = 'ms-item';
+                    const cb = document.createElement('input');
+                    cb.type = 'checkbox';
+                    cb.checked = selected.has(String(o.value));
+                    const sp = document.createElement('span');
+                    sp.textContent = o.label;
+                    row.appendChild(cb);
+                    row.appendChild(sp);
+                    row.addEventListener('click', function (e) {
+                        e.stopPropagation();
+                        const key = String(o.value);
+                        if (selected.has(key)) selected.delete(key);
+                        else selected.add(key);
+                        cb.checked = selected.has(key);
+                        _renderTrigger();
+                        _emit();
+                    });
+                    listEl.appendChild(row);
+                });
+            }
+            function _renderTrigger() {
+                triggerEl.querySelectorAll('.ms-tag').forEach(function (t) { t.remove(); });
+                const arr = [];
+                selected.forEach(function (v) { arr.push(v); });
+                if (!arr.length) {
+                    if (placeholderEl) {
+                        placeholderEl.textContent = placeholder;
+                        placeholderEl.style.display = '';
+                    }
+                    return;
+                }
+                if (placeholderEl) placeholderEl.style.display = 'none';
+                arr.slice(0, maxTags).forEach(function (v) {
+                    const item = items.find(function (o) { return String(o.value) === v; });
+                    const tag = document.createElement('span'); tag.className = 'ms-tag';
+                    const lbl = document.createElement('span'); lbl.textContent = item ? item.label : v;
+                    const x = document.createElement('span'); x.className = 'ms-tag-x'; x.textContent = '×';
+                    x.addEventListener('click', function (e) {
+                        e.stopPropagation();
+                        selected.delete(v);
+                        _renderTrigger();
+                        if (!dropdownEl.classList.contains('hidden')) _renderList();
+                        _emit();
+                    });
+                    tag.appendChild(lbl); tag.appendChild(x);
+                    if (placeholderEl) triggerEl.insertBefore(tag, placeholderEl);
+                    else triggerEl.appendChild(tag);
+                });
+                if (arr.length > maxTags) {
+                    const more = document.createElement('span');
+                    more.className = 'ms-tag';
+                    more.style.cssText = 'background:#e5e7eb;color:#374151;';
+                    more.textContent = '+' + (arr.length - maxTags) + ' more';
+                    if (placeholderEl) triggerEl.insertBefore(more, placeholderEl);
+                    else triggerEl.appendChild(more);
+                }
+            }
+            function open() {
+                if (_msActive && _msActive !== containerId) {
+                    const prev = _msRegistry[_msActive];
+                    if (prev) prev.close();
+                }
+                _msActive = containerId;
+                dropdownEl.classList.remove('hidden');
+                lastFilter = '';
+                if (searchEl) { searchEl.value = ''; setTimeout(function () { searchEl.focus(); }, 0); }
+                _renderList();
+            }
+            function close() {
+                dropdownEl.classList.add('hidden');
+                if (_msActive === containerId) _msActive = null;
+            }
+            function toggle() {
+                if (dropdownEl.classList.contains('hidden')) open();
+                else close();
+            }
+
+            // Wire trigger + actions.
+            triggerEl.addEventListener('click', function (e) { e.stopPropagation(); toggle(); });
+            if (allEl) allEl.addEventListener('click', function () {
+                items.forEach(function (o) { selected.add(String(o.value)); });
+                _renderList(); _renderTrigger(); _emit();
+            });
+            if (clearEl) clearEl.addEventListener('click', function () {
+                selected.clear();
+                _renderList(); _renderTrigger(); _emit();
+            });
+            if (searchEl) searchEl.addEventListener('input', function () {
+                lastFilter = searchEl.value;
+                _renderList();
+            });
+            _msEnsureOutsideClick();
+
+            const api = {
+                getSelected: function () {
+                    const out = [];
+                    selected.forEach(function (v) {
+                        // Round-trip back to the original value type where possible.
+                        const item = items.find(function (o) { return String(o.value) === v; });
+                        out.push(item ? item.value : v);
+                    });
+                    return out;
+                },
+                setSelected: function (vals) {
+                    selected.clear();
+                    (vals || []).forEach(function (v) { selected.add(String(v)); });
+                    _renderTrigger();
+                    if (!dropdownEl.classList.contains('hidden')) _renderList();
+                },
+                setItems: function (newItems) {
+                    items = (newItems || []).map(_msNormItem);
+                    _renderList(); _renderTrigger();
+                },
+                getItems: function () { return items.slice(); },
+                open: open, close: close, toggle: toggle,
+                element: container
+            };
+            _msRegistry[containerId] = api;
+
+            // Initial paint.
+            _renderTrigger();
+            return api;
+        }
+
+        function _msNormItem(it) {
+            if (it == null) return { value: '', label: '' };
+            if (typeof it === 'string' || typeof it === 'number') {
+                return { value: it, label: String(it) };
+            }
+            return {
+                value: it.value != null ? it.value : it.val,
+                label: it.label != null ? it.label : (it.lbl != null ? it.lbl : String(it.value != null ? it.value : it.val)),
+                group: it.group || it.fieldName || null
+            };
+        }
+
+        function _msGet(containerId) { return _msRegistry[containerId] || null; }
+
+        const MultiSelect = { create: _msCreate, get: _msGet };
+
+        // Public entry point. Idempotent — first call builds + wires the
+        // drawer and returns its API; subsequent calls return the cached
+        // API. Safe to call before DOMContentLoaded — the call will defer
+        // until the body is ready.
+        function mountDebugDrawer() {
+            if (_drawerMounted) return _drawerApi;
+            if (typeof document === 'undefined') return null;
+            if (!document.body) {
+                // body not yet present — defer until DOMContentLoaded
+                document.addEventListener('DOMContentLoaded', mountDebugDrawer, { once: true });
+                return null;
+            }
+            _injectDrawerCss();
+            _drawerContainer = document.createElement('div');
+            _drawerContainer.id = 'fbLibDebugDrawer';
+            _drawerContainer.className = 'fblib-debug-drawer';
+            _drawerContainer.innerHTML = _DRAWER_HTML;
+            document.body.appendChild(_drawerContainer);
+            _wireDrawerHandlers(_drawerContainer);
+            _drawerApi = _buildDrawerApi(_drawerContainer);
+            _drawerMounted = true;
+            return _drawerApi;
+        }
+
         return {
             FB_DATE_FORMAT: FB_DATE_FORMAT,
             MOMENT_DATE_FORMAT: MOMENT_DATE_FORMAT,
@@ -201,7 +984,16 @@ window.FBLib = (function () {
             createScheduleIndicator: createScheduleIndicator,
             createAvailabilityIndicator: createAvailabilityIndicator,
             debugLog: debugLog,
-            clearDebugLog: clearDebugLog
+            clearDebugLog: clearDebugLog,
+            mountDebugDrawer: mountDebugDrawer,
+            // Drop-down drawer pattern — see canonical doc block above.
+            registerDrawer: registerDrawer,
+            openDrawer: openDrawer,
+            closeDrawer: closeDrawer,
+            toggleDrawer: toggleDrawer,
+            closeAllDrawers: closeAllDrawers,
+            // Multi-select dropdown widget — see canonical comment block above.
+            MultiSelect: MultiSelect
         };
     })();
 
@@ -1077,12 +1869,510 @@ window.FBLib = (function () {
         return { renderTileSection: renderTileSection };
     })();
 
+    // ====================================================================
+    // FBLib.Table — sortable / filterable / drag-reorder / drag-resize
+    // table scaffolding. Lifted from the PurchaseOrderSummary.htm render
+    // pattern but generalised so any report can adopt it with one init()
+    // call.
+    //
+    // FEATURES
+    //   • Click-to-sort with 3-state toggle (unsorted → asc → desc → unsorted)
+    //   • Per-column text/select filters in a second sticky header row
+    //   • Drag-to-reorder columns (HTML5 drag-and-drop on the title <th>)
+    //   • Drag-to-resize column widths (handle on the right edge of each title)
+    //   • Lazy chunked body rendering (CHUNK_SIZE rows per tick + scroll-to-load)
+    //   • Sticky thead (relies on the host's CSS — see CANONICAL CSS below)
+    //   • Optional persistence to FBLib.Settings (column order + widths +
+    //     visibility) under a host-supplied settings key.
+    //
+    // CANONICAL CSS  (drop into the host page's <style> block)
+    //   .fb-table-container { overflow:auto; }
+    //   table.fb-table { width:100%; border-collapse:collapse; font-size:12px; table-layout:fixed; }
+    //   table.fb-table th {
+    //       background:#1e3a5f; color:#fff; font-weight:500;
+    //       padding:7px 10px; text-align:left; white-space:nowrap;
+    //       cursor:grab; user-select:none; position:sticky; top:0; z-index:10;
+    //       position:relative;
+    //   }
+    //   table.fb-table th:active { cursor:grabbing; }
+    //   table.fb-table th.sort-asc::after  { content:' ▲'; opacity:0.8; }
+    //   table.fb-table th.sort-desc::after { content:' ▼'; opacity:0.8; }
+    //   table.fb-table th.col-drag-over { background:#1a4f8a; border-left:3px solid #60a5fa; }
+    //   table.fb-table tr.filter-row th {
+    //       top:34px; z-index:9; background:#eff6ff; cursor:default;
+    //       padding:4px 6px;
+    //   }
+    //   table.fb-table tr.filter-row input, table.fb-table tr.filter-row select {
+    //       width:100%; padding:3px 6px; font-size:11px; border:1px solid #cbd5e1;
+    //       border-radius:4px; background:#fff;
+    //   }
+    //   table.fb-table td { padding:4px 10px; border-bottom:1px solid #e5e7eb; white-space:nowrap; }
+    //   table.fb-table tr:nth-child(even) td { background:#f9fafb; }
+    //   table.fb-table tr:hover td { background:#eff6ff !important; }
+    //   .fb-col-resize {
+    //       position:absolute; right:0; top:0; width:6px; height:100%;
+    //       cursor:col-resize; user-select:none;
+    //   }
+    //   .fb-col-resize:hover { background:rgba(255,255,255,0.3); }
+    //
+    // COLUMN SHAPE
+    //   {
+    //     key:      'num'             // mandatory — must match a row property
+    //     label:    'PO #'            // header text
+    //     vis:      true              // default visible; set false to hide
+    //     width:    160               // initial width in px (optional — flexes if omitted)
+    //     align:    'left'            // 'left' (default) | 'right' | 'center'
+    //     filter:   'text'            // 'text' | 'select' | false (default 'text')
+    //     filterOptions: [...]        // for filter:'select' — array of {value,label}, or 'auto' to populate from data
+    //     format:   v => '$' + v      // optional cell formatter (string-in, string-or-Node-out)
+    //     link:     'Sales Order'     // optional — wraps cell in <a> calling openModule(link, cellValue)
+    //     sortable: true              // default true
+    //   }
+    //
+    // API
+    //   var table = FBLib.Table.init({
+    //       tableEl:    document.getElementById('reportTable'),  // your <table class="fb-table"> element
+    //       columns:    _columns,
+    //       getRows:    () => _dataset,                          // called every render
+    //       chunkSize:  200,
+    //       lazy:       true,                                    // append-on-scroll (default true)
+    //       onSort:     (key, dir) => {},                        // optional hook
+    //       onReorder:  (newColumns) => {},                      // optional hook
+    //       settingsKey: 'tablePrefs',                           // optional FBLib.Settings key for persistence
+    //   });
+    //   table.render();                  // call after getRows() data changes
+    //   table.setColumns(newColumns);    // replace columns + re-render
+    //   table.getColumns();              // current column array (ordered + widths reflect drag state)
+    //   table.sort('num', 'asc');        // programmatic sort
+    //   table.getFilters();              // { colKey: filterValue }
+    //   table.setFilter(colKey, value);  // programmatic filter
+    //   table.clearFilters();
+    // ====================================================================
+    const Table = (function () {
+
+        function _escHtml(s) {
+            if (s == null) return '';
+            return String(s).replace(/[&<>"']/g, function (c) {
+                return ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' })[c];
+            });
+        }
+
+        function init(opts) {
+            opts = opts || {};
+            if (!opts.tableEl) throw new Error('FBLib.Table.init: tableEl required');
+            if (typeof opts.getRows !== 'function') throw new Error('FBLib.Table.init: getRows required');
+
+            const tableEl = opts.tableEl;
+            tableEl.classList.add('fb-table');
+            // Wrap in a scroll container if not already inside one.
+            let scrollEl = tableEl.parentElement;
+            if (!scrollEl || !scrollEl.classList.contains('fb-table-container')) {
+                scrollEl = document.createElement('div');
+                scrollEl.className = 'fb-table-container';
+                tableEl.parentNode.insertBefore(scrollEl, tableEl);
+                scrollEl.appendChild(tableEl);
+            }
+
+            // Ensure <thead> + <tbody> exist.
+            let theadEl = tableEl.querySelector('thead');
+            if (!theadEl) { theadEl = document.createElement('thead'); tableEl.appendChild(theadEl); }
+            let tbodyEl = tableEl.querySelector('tbody');
+            if (!tbodyEl) { tbodyEl = document.createElement('tbody'); tableEl.appendChild(tbodyEl); }
+
+            // Internal state.
+            let columns = (opts.columns || []).map(_normCol);
+            const getRows = opts.getRows;
+            const chunkSize = opts.chunkSize || 200;
+            const lazy = opts.lazy !== false;
+            const onSort = typeof opts.onSort === 'function' ? opts.onSort : function () {};
+            const onReorder = typeof opts.onReorder === 'function' ? opts.onReorder : function () {};
+            const onResize = typeof opts.onResize === 'function' ? opts.onResize : function () {};
+            const settingsKey = opts.settingsKey || null;
+
+            let sortCol = null, sortDir = 'asc';
+            const filters = {};
+            let dragColKey = null;
+            let _renderOffset = 0;
+            let _visRows = [];
+
+            // Restore persisted prefs (column order + widths + sort).
+            _restoreFromSettings();
+
+            function _normCol(c) {
+                return Object.assign({
+                    vis: true, sortable: true, filter: 'text', align: 'left'
+                }, c);
+            }
+
+            function _restoreFromSettings() {
+                if (!settingsKey || !window.FBLib || !FBLib.Settings || !FBLib.Settings._initialised) return;
+                try {
+                    const saved = FBLib.Settings.resolve(settingsKey);
+                    if (!saved || typeof saved !== 'object') return;
+                    if (Array.isArray(saved.order) && saved.order.length) {
+                        const map = {};
+                        columns.forEach(function (c) { map[c.key] = c; });
+                        const reordered = saved.order.map(function (k) { return map[k]; }).filter(Boolean);
+                        const extras = columns.filter(function (c) { return saved.order.indexOf(c.key) === -1; });
+                        columns = reordered.concat(extras);
+                    }
+                    if (saved.widths && typeof saved.widths === 'object') {
+                        columns.forEach(function (c) {
+                            if (saved.widths[c.key]) c.width = saved.widths[c.key];
+                        });
+                    }
+                    if (saved.hidden && Array.isArray(saved.hidden)) {
+                        const hs = new Set(saved.hidden);
+                        columns.forEach(function (c) { if (hs.has(c.key)) c.vis = false; });
+                    }
+                    if (saved.sortCol) { sortCol = saved.sortCol; sortDir = saved.sortDir || 'asc'; }
+                } catch (_) {}
+            }
+
+            function _persist() {
+                if (!settingsKey || !window.FBLib || !FBLib.Settings || !FBLib.Settings._initialised) return;
+                try {
+                    FBLib.Settings.setUserKey(settingsKey, {
+                        order:   columns.map(function (c) { return c.key; }),
+                        widths:  columns.reduce(function (a, c) { if (c.width) a[c.key] = c.width; return a; }, {}),
+                        hidden:  columns.filter(function (c) { return !c.vis; }).map(function (c) { return c.key; }),
+                        sortCol: sortCol,
+                        sortDir: sortDir
+                    });
+                    FBLib.Settings.saveUser();
+                } catch (_) {}
+            }
+
+            // ─── HEADER ─────────────────────────────────────────────────
+            function _renderHead() {
+                theadEl.innerHTML = '';
+                const vis = columns.filter(function (c) { return c.vis; });
+
+                // Title row.
+                const titleTr = document.createElement('tr');
+                vis.forEach(function (col) {
+                    const th = document.createElement('th');
+                    th.dataset.colKey = col.key;
+                    th.textContent = col.label;
+                    if (col.width) th.style.width = col.width + 'px';
+                    if (col.align === 'right')  th.style.textAlign = 'right';
+                    if (col.align === 'center') th.style.textAlign = 'center';
+                    if (sortCol === col.key) th.classList.add('sort-' + sortDir);
+                    if (col.sortable) {
+                        th.draggable = true;
+                        th.addEventListener('click', function (e) {
+                            // Ignore clicks on the resize handle.
+                            if (e.target && e.target.classList && e.target.classList.contains('fb-col-resize')) return;
+                            sort(col.key);
+                        });
+                        // Drag-to-reorder.
+                        th.addEventListener('dragstart', function (e) {
+                            dragColKey = col.key;
+                            setTimeout(function () { th.style.opacity = '0.4'; }, 0);
+                            try { e.dataTransfer.effectAllowed = 'move'; } catch (_) {}
+                        });
+                        th.addEventListener('dragend', function () {
+                            dragColKey = null; th.style.opacity = '';
+                            titleTr.querySelectorAll('th').forEach(function (h) { h.classList.remove('col-drag-over'); });
+                        });
+                        th.addEventListener('dragover', function (e) {
+                            e.preventDefault();
+                            try { e.dataTransfer.dropEffect = 'move'; } catch (_) {}
+                            titleTr.querySelectorAll('th').forEach(function (h) { h.classList.remove('col-drag-over'); });
+                            if (dragColKey && dragColKey !== col.key) th.classList.add('col-drag-over');
+                        });
+                        th.addEventListener('dragleave', function () { th.classList.remove('col-drag-over'); });
+                        th.addEventListener('drop', function (e) {
+                            e.preventDefault();
+                            th.classList.remove('col-drag-over');
+                            if (!dragColKey || dragColKey === col.key) return;
+                            const fi = columns.findIndex(function (c) { return c.key === dragColKey; });
+                            const ti = columns.findIndex(function (c) { return c.key === col.key; });
+                            if (fi === -1 || ti === -1) return;
+                            const [moved] = columns.splice(fi, 1);
+                            columns.splice(ti, 0, moved);
+                            onReorder(columns.slice());
+                            _persist();
+                            render();
+                        });
+                    }
+                    // Drag-to-resize handle.
+                    const grip = document.createElement('div');
+                    grip.className = 'fb-col-resize';
+                    grip.draggable = false;
+                    grip.addEventListener('mousedown', function (e) {
+                        e.preventDefault(); e.stopPropagation();
+                        const startX = e.clientX;
+                        const startW = th.getBoundingClientRect().width;
+                        document.body.style.userSelect = 'none';
+                        function onMove(ev) {
+                            const delta = ev.clientX - startX;
+                            const w = Math.max(40, startW + delta);
+                            col.width = Math.round(w);
+                            th.style.width = col.width + 'px';
+                        }
+                        function onUp() {
+                            document.removeEventListener('mousemove', onMove);
+                            document.removeEventListener('mouseup', onUp);
+                            document.body.style.userSelect = '';
+                            onResize(col.key, col.width);
+                            _persist();
+                        }
+                        document.addEventListener('mousemove', onMove);
+                        document.addEventListener('mouseup', onUp);
+                    });
+                    th.appendChild(grip);
+                    titleTr.appendChild(th);
+                });
+                theadEl.appendChild(titleTr);
+
+                // Filter row.
+                const filterTr = document.createElement('tr');
+                filterTr.className = 'filter-row';
+                vis.forEach(function (col) {
+                    const th = document.createElement('th');
+                    th.dataset.colKey = col.key;
+                    if (col.filter === false) { filterTr.appendChild(th); return; }
+                    const inp = col.filter === 'select'
+                        ? document.createElement('select')
+                        : document.createElement('input');
+                    if (inp.tagName === 'INPUT') {
+                        inp.type = 'text';
+                        inp.placeholder = 'Filter…';
+                        // Datalist for autocomplete on text filters.
+                        const listId = tableEl.id + '_dl_' + col.key;
+                        let dl = document.getElementById(listId);
+                        if (!dl) {
+                            dl = document.createElement('datalist');
+                            dl.id = listId;
+                            tableEl.parentNode.appendChild(dl);
+                        }
+                        inp.setAttribute('list', listId);
+                    } else {
+                        const blank = document.createElement('option');
+                        blank.value = ''; blank.textContent = '(all)';
+                        inp.appendChild(blank);
+                        const options = (col.filterOptions === 'auto' || !col.filterOptions)
+                            ? _autoOptionsFor(col)
+                            : col.filterOptions;
+                        options.forEach(function (o) {
+                            const op = document.createElement('option');
+                            op.value = o.value != null ? o.value : o;
+                            op.textContent = o.label != null ? o.label : (o.value != null ? o.value : o);
+                            inp.appendChild(op);
+                        });
+                    }
+                    if (filters[col.key]) inp.value = filters[col.key];
+                    const apply = function () { filters[col.key] = inp.value; render(); };
+                    if (inp.tagName === 'INPUT') {
+                        inp.addEventListener('input', _debounce(apply, 180));
+                        inp.addEventListener('change', apply);
+                    } else {
+                        inp.addEventListener('change', apply);
+                    }
+                    th.appendChild(inp);
+                    filterTr.appendChild(th);
+                });
+                theadEl.appendChild(filterTr);
+            }
+
+            function _autoOptionsFor(col) {
+                const seen = Object.create(null);
+                getRows().forEach(function (r) {
+                    const v = r[col.key];
+                    if (v == null || v === '') return;
+                    seen[String(v)] = true;
+                });
+                return Object.keys(seen).sort().map(function (v) { return { value: v, label: v }; });
+            }
+
+            function _refreshAutocompleteDatalists(rows) {
+                const vis = columns.filter(function (c) { return c.vis && c.filter !== false && c.filter !== 'select'; });
+                vis.forEach(function (col) {
+                    const dl = document.getElementById(tableEl.id + '_dl_' + col.key);
+                    if (!dl) return;
+                    const seen = Object.create(null);
+                    rows.forEach(function (r) {
+                        const v = r[col.key];
+                        if (v == null || v === '') return;
+                        seen[String(v)] = true;
+                    });
+                    const opts = Object.keys(seen).sort();
+                    dl.innerHTML = opts.map(function (v) { return '<option value="' + _escHtml(v) + '"></option>'; }).join('');
+                });
+            }
+
+            // ─── SORT + FILTER ──────────────────────────────────────────
+            function sort(key, dir) {
+                if (dir) { sortCol = key; sortDir = dir; }
+                else if (sortCol === key) sortDir = (sortDir === 'asc' ? 'desc' : (sortDir === 'desc' ? null : 'asc'));
+                else { sortCol = key; sortDir = 'asc'; }
+                if (sortDir === null) sortCol = null;
+                onSort(sortCol, sortDir);
+                _persist();
+                render();
+            }
+
+            function _sortRows(rows) {
+                if (!sortCol) return rows;
+                const col = columns.find(function (c) { return c.key === sortCol; });
+                const numeric = !!(col && (col.money || col.qty || col.type === 'number'));
+                const dirMul = sortDir === 'desc' ? -1 : 1;
+                return rows.slice().sort(function (a, b) {
+                    let va = a[sortCol], vb = b[sortCol];
+                    if (va == null) va = '';
+                    if (vb == null) vb = '';
+                    if (numeric) {
+                        va = parseFloat(va) || 0;
+                        vb = parseFloat(vb) || 0;
+                    } else {
+                        va = String(va).toLowerCase();
+                        vb = String(vb).toLowerCase();
+                    }
+                    return (va < vb ? -1 : va > vb ? 1 : 0) * dirMul;
+                });
+            }
+
+            function _filterRows(rows) {
+                const active = Object.keys(filters).filter(function (k) {
+                    return filters[k] != null && String(filters[k]).trim() !== '';
+                });
+                if (!active.length) return rows;
+                return rows.filter(function (r) {
+                    for (let i = 0; i < active.length; i++) {
+                        const k = active[i];
+                        const f = String(filters[k]).trim().toLowerCase();
+                        const v = r[k] == null ? '' : String(r[k]).toLowerCase();
+                        const col = columns.find(function (c) { return c.key === k; });
+                        if (col && col.filter === 'select') {
+                            if (v !== f) return false;
+                        } else {
+                            if (v.indexOf(f) === -1) return false;
+                        }
+                    }
+                    return true;
+                });
+            }
+
+            // ─── BODY ────────────────────────────────────────────────────
+            function _renderBody() {
+                tbodyEl.innerHTML = '';
+                const all = getRows() || [];
+                const filtered = _filterRows(all);
+                _visRows = _sortRows(filtered);
+                _renderOffset = 0;
+                _refreshAutocompleteDatalists(all);
+
+                if (!_visRows.length) {
+                    const vis = columns.filter(function (c) { return c.vis; });
+                    const tr = document.createElement('tr');
+                    const td = document.createElement('td');
+                    td.colSpan = vis.length;
+                    td.style.cssText = 'padding:2rem;color:#9ca3af;text-align:center;';
+                    td.textContent = all.length ? 'No rows match the current filters.' : 'No data to display.';
+                    tr.appendChild(td);
+                    tbodyEl.appendChild(tr);
+                    return;
+                }
+
+                _appendChunk();
+                _ensureLazyScroll();
+            }
+
+            function _appendChunk() {
+                const vis = columns.filter(function (c) { return c.vis; });
+                const slice = _visRows.slice(_renderOffset, _renderOffset + chunkSize);
+                if (!slice.length) return;
+                const frag = document.createDocumentFragment();
+                slice.forEach(function (row) {
+                    const tr = document.createElement('tr');
+                    vis.forEach(function (col) {
+                        const td = document.createElement('td');
+                        if (col.align === 'right')  td.style.textAlign = 'right';
+                        if (col.align === 'center') td.style.textAlign = 'center';
+                        const raw = row[col.key];
+                        if (col.link && raw != null && raw !== '') {
+                            const a = document.createElement('a');
+                            a.href = 'javascript:void(0)';
+                            a.className = 'fb-row-link';
+                            a.textContent = col.format ? col.format(raw, row) : String(raw);
+                            a.addEventListener('click', function (e) {
+                                e.preventDefault();
+                                if (typeof openModule === 'function') openModule(col.link, raw);
+                            });
+                            td.appendChild(a);
+                        } else if (typeof col.format === 'function') {
+                            const out = col.format(raw, row);
+                            if (out && out.nodeType) td.appendChild(out);
+                            else td.innerHTML = out == null ? '' : String(out);
+                        } else {
+                            td.textContent = raw == null ? '' : String(raw);
+                        }
+                        tr.appendChild(td);
+                    });
+                    frag.appendChild(tr);
+                });
+                tbodyEl.appendChild(frag);
+                _renderOffset += slice.length;
+            }
+
+            function _ensureLazyScroll() {
+                if (!lazy || scrollEl._fbLazyBound) return;
+                scrollEl._fbLazyBound = true;
+                let ticking = false;
+                scrollEl.addEventListener('scroll', function () {
+                    if (ticking) return;
+                    ticking = true;
+                    requestAnimationFrame(function () {
+                        ticking = false;
+                        if (_renderOffset >= _visRows.length) return;
+                        const near = (scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight) < 400;
+                        if (near) _appendChunk();
+                    });
+                });
+            }
+
+            function _debounce(fn, ms) {
+                let t = null;
+                return function () {
+                    const args = arguments, self = this;
+                    clearTimeout(t);
+                    t = setTimeout(function () { fn.apply(self, args); }, ms);
+                };
+            }
+
+            // ─── PUBLIC ──────────────────────────────────────────────────
+            function render() { _renderHead(); _renderBody(); }
+            function setColumns(newCols) { columns = (newCols || []).map(_normCol); _restoreFromSettings(); render(); }
+            function getColumns() { return columns.slice(); }
+            function getFilters() { return Object.assign({}, filters); }
+            function setFilter(key, value) { filters[key] = value; render(); }
+            function clearFilters() { Object.keys(filters).forEach(function (k) { delete filters[k]; }); render(); }
+            function getVisibleRows() { return _visRows.slice(); }
+
+            return {
+                render: render,
+                setColumns: setColumns,
+                getColumns: getColumns,
+                sort: sort,
+                getFilters: getFilters,
+                setFilter: setFilter,
+                clearFilters: clearFilters,
+                getVisibleRows: getVisibleRows,
+                element: tableEl
+            };
+        }
+
+        return { init: init };
+    })();
+
     return {
         Common: Common,
         Settings: Settings,
         CfCatalog: CfCatalog,
         CfCols: CfCols,
         Columns: Columns,
-        Picker: Picker
+        Picker: Picker,
+        Table: Table
     };
 })();

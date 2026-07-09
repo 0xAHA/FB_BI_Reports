@@ -1,0 +1,1407 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  REPORT: Work Order Parts Availability
+  PATH:   PurchaseOrder/WO_Parts_Availability.htm
+  --------------------------------------------------------------------------------
+  Production-planning tool listing every open Work Order, tracing the raw
+  parts each one needs (via its parent MO's raw moitems), and computing a
+  Buildable date by FIFO-allocating on-hand stock + incoming PO supply
+  across WOs in scheduled-start / priority order. Split-pane layout (card
+  list + persistent detail panel); memo-linked POs are scoped to their
+  source MO so committed supply isn't double-counted across WOs.
+================================================================================
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Work Order Parts Availability - Fishbowl BI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+
+  <!-- Shared Fishbowl BI stylesheet — injected from the saved "fb-styles" Style.
+       Source of truth: scripts/fb-styles.css. -->
+  <style>
+    {% Style fb-styles %}
+  </style>
+
+  <style>
+    html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family: 'Inter', sans-serif; }
+
+    /* Filter strip — single-row chips so the WO# search reads first. */
+    #filtersBar {
+      background: white; border-bottom: 1px solid #e2e8f0;
+      padding: 8px 16px; flex-shrink: 0;
+      display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px;
+      position: relative; z-index: 30;
+    }
+    #filtersBar input[type=text] {
+      padding: 4px 8px; border: 1px solid #e2e8f0; border-radius: 6px;
+      font-size: 12px; color: #374151; background: white; font-family: 'Inter', sans-serif;
+      height: 30px;
+    }
+    .fl-group { display: flex; align-items: center; gap: 6px; }
+    .fl-label {
+      font-size: 9px; font-weight: 700; letter-spacing: 0.04em;
+      text-transform: uppercase; color: #64748b;
+      padding: 4px 8px; background: #f1f5f9; border-radius: 999px;
+      white-space: nowrap;
+    }
+    .fl-divider { width: 1px; height: 22px; background: #e2e8f0; flex-shrink: 0; }
+    .fl-checkbox { display: flex; align-items: center; gap: 5px; font-size: 11px; color: #475569; cursor: pointer; }
+    .fl-checkbox input { margin: 0; }
+
+    /* Multi-select (location-group filter). */
+    .ms-container { position: relative; }
+    .ms-trigger {
+      display: flex; align-items: center; flex-wrap: nowrap; gap: 3px;
+      border: 1px solid #e2e8f0; border-radius: 6px; padding: 3px 8px;
+      background: white; height: 30px; min-width: 180px; overflow: hidden; cursor: pointer; font-size: 12px;
+    }
+    .ms-trigger:hover { border-color: #9ca3af; }
+    .ms-tag { background: #dbeafe; color: #1d4ed8; padding: 1px 5px; border-radius: 3px;
+      font-size: 11px; display: flex; align-items: center; gap: 2px; white-space: nowrap; }
+    .ms-tag-x { cursor: pointer; font-weight: bold; }
+    .ms-placeholder { color: #9ca3af; }
+    .ms-dropdown { position: absolute; z-index: 500; top: calc(100% + 2px); left: 0; right: 0; min-width: 220px;
+      background: white; border: 1px solid #d1d5db; border-radius: 6px;
+      box-shadow: 0 6px 20px rgba(0,0,0,0.13); display: flex; flex-direction: column; max-height: 280px; }
+    .ms-actions { padding: 3px 10px; border-bottom: 1px solid #f3f4f6; display: flex; gap: 10px; font-size: 11px; }
+    .ms-actions span { color: #3b82f6; cursor: pointer; }
+    .ms-actions span:hover { text-decoration: underline; }
+    .ms-list { overflow-y: auto; flex: 1; }
+    .ms-item { display: flex; align-items: center; gap: 8px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
+    .ms-item:hover { background: #eff6ff; }
+    .ms-empty { padding: 12px; color: #9ca3af; font-size: 12px; text-align: center; }
+
+    .num-cell { text-align: right; font-variant-numeric: tabular-nums; }
+
+    /* KPI summary bar — one strip across the top of the list. */
+    #kpiBar {
+      display: flex; gap: 10px; flex-shrink: 0;
+      padding: 8px 16px; background: #f8fafc; border-bottom: 1px solid #e2e8f0;
+    }
+    .kpi {
+      flex: 1; min-width: 140px; max-width: 240px;
+      background: white; border: 1px solid #e2e8f0; border-radius: 8px;
+      padding: 8px 12px; display: flex; flex-direction: column; gap: 2px;
+    }
+    .kpi-label { font-size: 10px; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; }
+    .kpi-value { font-size: 18px; font-weight: 700; color: #1e293b; font-variant-numeric: tabular-nums; }
+    .kpi.ok       { border-color: #6ee7b7; }
+    .kpi.ok       .kpi-value { color: #047857; }
+    .kpi.warn     { border-color: #fcd34d; }
+    .kpi.warn     .kpi-value { color: #b45309; }
+    .kpi.late     { border-color: #fca5a5; }
+    .kpi.late     .kpi-value { color: #b91c1c; }
+
+    /* Status badges (local palette). */
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; white-space: nowrap; }
+    .b10 { background:#f3f4f6; color:#374151; }
+    .b20 { background:#dbeafe; color:#1e40af; }
+    .b40 { background:#d1fae5; color:#065f46; }
+    .b60 { background:#bbf7d0; color:#14532d; }
+    .b-ok   { background:#d1fae5; color:#065f46; border:1px solid #6ee7b7; }
+    .b-warn { background:#fef3c7; color:#92400e; border:1px solid #fcd34d; }
+    .b-late { background:#fee2e2; color:#991b1b; border:1px solid #fca5a5; }
+    .b-mo   { background:#fef3c7; color:#92400e; border:1px solid #fcd34d; padding:0 5px; font-size:10px; font-weight:600; }
+    .badge-lg { font-size: 12px; padding: 4px 11px; font-weight: 600; }
+
+    /* Links */
+    .row-link { color: #2d9cdb; cursor: pointer; text-decoration: none; font-weight: 600; }
+    .row-link:hover { text-decoration: underline; color: #1e7bb4; }
+
+    /* Split pane — cards on the left (≈ 2/3), persistent detail on the
+       right (≈ 1/3). The detail pane is always visible; selecting a card
+       populates it. No slide-in animation, no backdrop. */
+    #splitPane { flex: 1; min-height: 0; display: flex; }
+    #cardScroll { flex: 2; min-width: 0; overflow-y: auto; padding: 12px 16px; background: #f8fafc; position: relative; }
+    #woCardList { display: flex; flex-direction: column; gap: 8px; }
+    .wo-card {
+      background: white; border: 1px solid #e2e8f0; border-radius: 10px;
+      padding: 12px 16px; cursor: pointer;
+      display: grid;
+      grid-template-columns: minmax(110px, 0.7fr) minmax(180px, 1.4fr) minmax(140px, 0.9fr) minmax(160px, 1fr) auto;
+      gap: 14px; align-items: center;
+      transition: border-color 0.12s, box-shadow 0.12s, transform 0.12s;
+    }
+    .wo-card:hover {
+      border-color: #93c5fd; box-shadow: 0 2px 12px -2px rgba(45, 156, 219, 0.18);
+    }
+    .wo-card.is-open { border-color: #2d9cdb; box-shadow: 0 2px 12px -2px rgba(45, 156, 219, 0.25); }
+    .wo-card-id { display: flex; flex-direction: column; gap: 3px; }
+    .wo-card-num { font-size: 14px; font-weight: 700; color: #1e3a5f; }
+    .wo-card-sub { font-size: 11px; color: #64748b; }
+    .wo-card-output { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .wo-card-output-part { font-size: 12px; font-weight: 600; color: #1e293b; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .wo-card-output-desc { font-size: 11px; color: #64748b; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .wo-card-meta-grid { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: #475569; }
+    .wo-card-meta-grid .lbl { color: #94a3b8; font-weight: 500; margin-right: 4px; }
+    .wo-card-parts { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: #475569; }
+    .wo-card-parts-bar {
+      height: 5px; background: #e2e8f0; border-radius: 999px; overflow: hidden;
+    }
+    .wo-card-parts-fill { height: 100%; background: #10b981; transition: width 0.2s; }
+    .wo-card-parts-fill.warn { background: #f59e0b; }
+    .wo-card-parts-fill.late { background: #ef4444; }
+    .wo-card-status { display: flex; flex-direction: column; gap: 4px; align-items: flex-end; min-width: 130px; }
+    .wo-card-chev {
+      color: #cbd5e1; font-size: 18px; line-height: 1; padding-left: 6px;
+      align-self: center;
+    }
+    .wo-card.is-open .wo-card-chev { color: #2d9cdb; }
+
+    /* Persistent detail pane on the right. No slide-in animation —
+       always visible, populated on card click. */
+    #detailPane {
+      flex: 1; min-width: 320px; max-width: 560px;
+      background: white; border-left: 1px solid #e2e8f0;
+      display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+    #detailEmpty {
+      flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      padding: 40px 24px; text-align: center; color: #94a3b8;
+      font-size: 13px; gap: 10px;
+    }
+    #detailEmpty svg { color: #cbd5e1; }
+    #detailContent { display: none; flex: 1; flex-direction: column; min-height: 0; }
+    #detailContent.open { display: flex; }
+    #detailContent.open ~ #detailEmpty { display: none; }
+    .drawer-head {
+      flex-shrink: 0; padding: 14px 18px;
+      background: #1e3a5f; color: white;
+      display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+    }
+    .drawer-head-title { font-size: 16px; font-weight: 700; line-height: 1.2; }
+    .drawer-head-sub { font-size: 12px; color: #cbd5e1; margin-top: 4px; }
+    .drawer-close {
+      background: transparent; border: none; color: white; font-size: 22px;
+      cursor: pointer; line-height: 1; padding: 0 6px; opacity: 0.85;
+    }
+    .drawer-close:hover { opacity: 1; }
+    .drawer-meta {
+      flex-shrink: 0; padding: 10px 18px; background: #f8fafc;
+      border-bottom: 1px solid #e2e8f0;
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px 16px;
+      font-size: 11px;
+    }
+    .drawer-meta .lbl { color: #94a3b8; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; font-size: 9px; display: block; margin-bottom: 2px; }
+    .drawer-meta .val { color: #1e293b; font-weight: 500; }
+    .drawer-body { flex: 1; overflow-y: auto; padding: 12px 18px; }
+    .drawer-body h4 { font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; margin: 0 0 8px 0; }
+
+    /* Parts mini-table inside the drawer. */
+    .parts-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+    .parts-table th {
+      text-align: left; font-weight: 600; color: #64748b; font-size: 10px;
+      text-transform: uppercase; letter-spacing: 0.04em;
+      padding: 6px 8px; border-bottom: 1px solid #e2e8f0; background: #f8fafc;
+      position: sticky; top: 0;
+    }
+    .parts-table td { padding: 8px; border-bottom: 1px solid #f1f5f9; vertical-align: top; }
+    .parts-table tr.part-main:hover td { background: #f8fafc; cursor: pointer; }
+    .parts-table tr.part-main.is-open td { background: #eff6ff; border-bottom-color: #cfe5fa; }
+    .part-toggle { width:14px; font-size:10px; color:#94a3b8; text-align:center; display:inline-block; user-select: none; }
+    .part-toggle.is-open { color: #2563eb; }
+    .part-num { font-weight: 700; color: #1e3a5f; font-size: 12px; }
+    .part-sub { font-size: 10px; color: #64748b; margin-top: 2px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .part-need { font-size: 11px; font-weight: 600; color: #1e293b; }
+    .part-stock { font-size: 11px; color: #64748b; }
+
+    /* PO/receipt sub-rows inside the drawer's parts table. */
+    .po-detail { background: #fafbfc; border-left: 3px solid #cbd5e1; }
+    .po-detail .po-line {
+      display: flex; align-items: center; gap: 10px; padding: 4px 8px 4px 24px;
+      font-size: 11px; color: #475569; border-bottom: 1px dashed #e5e7eb;
+    }
+    .po-detail .po-line:last-child { border-bottom: none; }
+    .po-detail .po-line.receipt { background: #f0fdf4; }
+    .po-detail .po-line.remaining { background: #fff7ed; }
+    .po-detail .po-line.empty { color: #94a3b8; font-style: italic; padding: 8px 24px; }
+    .po-line .po-tag {
+      display: inline-block; padding: 1px 6px; border-radius: 3px;
+      font-size: 9px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+      background: #e2e8f0; color: #475569; min-width: 64px; text-align: center;
+    }
+    .po-line.receipt  .po-tag { background: #bbf7d0; color: #065f46; }
+    .po-line.remaining .po-tag { background: #fed7aa; color: #9a3412; }
+    .po-line .po-qty { min-width: 80px; text-align: right; font-variant-numeric: tabular-nums; }
+    .po-line .po-date { min-width: 110px; color: #64748b; }
+    .po-line .po-vendor { color: #94a3b8; font-size: 10px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .spinner { animation: spin 0.75s linear infinite; }
+
+    /* Help tooltip. */
+    .pa-tooltip {
+      position: absolute; background: rgba(15, 23, 42, 0.95); color: white;
+      padding: 9px 12px; border-radius: 8px; font-size: 11px; line-height: 1.5;
+      pointer-events: none; z-index: 10000; box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+      opacity: 0; transition: opacity 0.15s ease; max-width: 340px;
+      white-space: pre-line;
+    }
+    .pa-tooltip.show { opacity: 1; }
+    .pa-tooltip .lbl { color: #94a3b8; font-weight: 600; }
+    .pa-tooltip code {
+      background: rgba(255,255,255,0.1); color: #fde68a;
+      padding: 1px 4px; border-radius: 3px; font-family: ui-monospace, monospace;
+    }
+  </style>
+</head>
+<body class="bg-slate-50 flex flex-col">
+
+<div id="paTooltip" class="pa-tooltip"></div>
+
+  <!-- HEADER -->
+  <header class="bg-white border-b border-slate-200 px-5 flex items-center justify-between flex-shrink-0 shadow-sm" style="height:56px;">
+    <div>
+      <h1 class="text-base font-bold text-slate-900 leading-tight">Work Order Parts Availability</h1>
+      <p id="statusLine" class="text-xs text-slate-400 leading-tight">Initialising...</p>
+    </div>
+    <div class="flex items-center gap-2">
+      <button onclick="runReport()" class="hdr-btn">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+        Refresh
+      </button>
+
+      <div class="flex items-center gap-1" style="border:1px solid #e2e8f0;border-radius:8px;padding:4px 10px;background:white;flex-shrink:0;">
+        <svg width="14" height="14" fill="none" stroke="#94a3b8" stroke-width="2" viewBox="0 0 24 24" style="flex-shrink:0;"><path d="M3 6h13M3 12h9M3 18h5" stroke-linecap="round"/></svg>
+        <select id="sortMode" onchange="autoApply()" style="border:none;background:transparent;font-size:12px;color:#475569;font-family:'Inter',sans-serif;cursor:pointer;outline:none;font-weight:500;">
+          <option value="buildable">Buildable date</option>
+          <option value="scheduled" selected>Scheduled start</option>
+          <option value="priority">Priority</option>
+          <option value="wonum">WO #</option>
+        </select>
+      </div>
+
+      <div class="flex" style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;flex-shrink:0;">
+        <button onclick="saveCurrentSettings()" class="hdr-btn" style="border:none;border-radius:0;border-right:1px solid #e2e8f0;" title="Save settings">
+          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+          Save
+        </button>
+        <button onclick="resetSettings()" class="hdr-btn" style="border:none;border-radius:0;" title="Reset to defaults">
+          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+          Reset
+        </button>
+      </div>
+
+      <div class="w-px h-6 bg-slate-200 mx-1"></div>
+
+      <button onclick="exportCSV()" class="hdr-btn">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+        CSV
+      </button>
+    </div>
+  </header>
+
+  <!-- FILTERS -->
+  <div id="filtersBar">
+    <div class="fl-group">
+      <span class="fl-label">WO #</span>
+      <input type="text" id="filterWoNum" placeholder="contains..." style="width:160px;" />
+    </div>
+    <div class="fl-divider"></div>
+    <div class="fl-group">
+      <span class="fl-label">Location Group</span>
+      <div class="ms-container" id="lg-ms">
+        <div class="ms-trigger" id="lgTrigger"><span class="ms-placeholder" id="lgPlaceholder">All location groups</span></div>
+        <div class="ms-dropdown hidden" id="lgDropdown">
+          <div class="ms-actions"><span id="lgAll">Select All</span><span id="lgClear">Clear All</span></div>
+          <div class="ms-list" id="lgList"></div>
+        </div>
+      </div>
+    </div>
+    <div class="fl-divider"></div>
+    <div class="fl-group">
+      <span class="fl-label">Status</span>
+      <label class="fl-checkbox"><input type="checkbox" id="ckEntered" value="10" checked /> Entered</label>
+      <label class="fl-checkbox"><input type="checkbox" id="ckStarted" value="30" checked /> Started</label>
+      <label class="fl-checkbox"><input type="checkbox" id="ckFulfilled" value="40" /> Fulfilled</label>
+    </div>
+    <div class="fl-divider"></div>
+    <label class="fl-checkbox"><input type="checkbox" id="ckHideOk" /> Hide buildable-now WOs</label>
+    <label class="fl-checkbox"><input type="checkbox" id="ckIncludeUnmemo" checked /> Include open POs not linked via memo</label>
+    <button type="button" tabindex="-1" id="filterHelpBtn"
+            class="flex items-center justify-center rounded-full text-slate-400 hover:text-blue-600 hover:bg-blue-50 transition-colors cursor-help"
+            style="width:18px; height:18px; border:1px solid #e2e8f0; flex-shrink:0;"
+            aria-label="Help">
+      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"/>
+        <line x1="12" y1="16" x2="12" y2="12"/>
+        <line x1="12" y1="8" x2="12.01" y2="8"/>
+      </svg>
+    </button>
+  </div>
+
+  <!-- KPI summary bar — total / buildable now / waiting / unmet. -->
+  <div id="kpiBar">
+    <div class="kpi"      id="kpiTotal"><span class="kpi-label">Total WOs</span><span class="kpi-value">—</span></div>
+    <div class="kpi ok"   id="kpiOk"   ><span class="kpi-label">Buildable now</span><span class="kpi-value">—</span></div>
+    <div class="kpi warn" id="kpiWait" ><span class="kpi-label">Waiting</span><span class="kpi-value">—</span></div>
+    <div class="kpi late" id="kpiUnmet"><span class="kpi-label">Unmet</span><span class="kpi-value">—</span></div>
+  </div>
+
+  <!-- SPLIT PANE — cards left (≈ 2/3), detail right (≈ 1/3). -->
+  <div id="splitPane">
+    <div id="cardScroll">
+      <div id="loadingOverlay" style="display:none; position:sticky; top:0; left:0; right:0; height:0; z-index:30; overflow:visible;">
+        <div style="display:flex; align-items:center; justify-content:center; flex-direction:column; gap:10px; height:60vh; background:rgba(248,250,252,0.85);">
+          <svg class="spinner" width="36" height="36" viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="10" stroke="#e2e8f0" stroke-width="3"/>
+            <path d="M12 2a10 10 0 0 1 10 10" stroke="#3b82f6" stroke-width="3" stroke-linecap="round"/>
+          </svg>
+          <span style="font-size:13px; color:#64748b; font-family:'Inter',sans-serif; font-weight:500;">Loading data...</span>
+        </div>
+      </div>
+      <div id="woCardList">
+        <div style="padding:2rem;color:#9ca3af;text-align:center;">Loading...</div>
+      </div>
+    </div>
+
+    <!-- DETAIL PANE — always visible. Populated on card click. -->
+    <aside id="detailPane" role="region" aria-label="Work order detail">
+      <div id="detailEmpty">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/></svg>
+        <div>Select a work order to see its required parts<br/>and supply trace.</div>
+      </div>
+      <div id="detailContent">
+        <div class="drawer-head">
+          <div>
+            <div class="drawer-head-title" id="drawerTitle">—</div>
+            <div class="drawer-head-sub"   id="drawerSub">—</div>
+          </div>
+        </div>
+        <div class="drawer-meta"   id="drawerMeta"></div>
+        <div class="drawer-body">
+          <h4 id="partsHeading">Required parts</h4>
+          <table class="parts-table">
+            <thead>
+              <tr>
+                <th style="width:18px;"></th>
+                <th>Part</th>
+                <th class="num-cell">Needed</th>
+                <th>On hand</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="drawerPartsBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+<div class="toast-container"></div>
+
+<script>
+/* ── RUNTIME GUARD ── */
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+  document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#475569;"><h2>Not running inside Fishbowl</h2><p>This report requires the Fishbowl BI environment.</p></div>';
+  throw new Error('Fishbowl API not available');
+}
+
+/* ── CONFIG ── */
+const _KEY = 'wo.parts.availability.v1';
+
+const WO_STATUS_MAP = {
+  10:{label:'Entered',  cls:'b10'},
+  30:{label:'Started',  cls:'b20'},
+  40:{label:'Fulfilled',cls:'b40'},
+};
+const PART_TYPE_MAP = {
+  10:'Inventory',
+  30:'Non-Inventory',
+  40:'Internal Use',
+};
+
+/* ── CURRENCY / DATE ── */
+var _currencyLocale = (function() {
+  try { return typeof currencyLocale === 'function' ? currencyLocale() : {locale:'en-US',symbol:'$'}; }
+  catch(e) { return {locale:'en-US',symbol:'$'}; }
+})();
+var _currSym    = _currencyLocale.symbol || '$';
+var _localeCode = _currencyLocale.locale || 'en-US';
+
+var _dateFmt = 'MM/DD/YYYY';
+(function() {
+  try {
+    var jf = typeof getProperty === 'function' ? getProperty('DateFormatShort','MM/dd/yyyy') : 'MM/dd/yyyy';
+    _dateFmt = jf.replace(/yyyy/g,'YYYY').replace(/dd/g,'DD');
+  } catch(e) {}
+})();
+
+function formatDate(s) {
+  if (!s || String(s).length < 10) return '';
+  var str = String(s);
+  return _dateFmt.replace('YYYY',str.substring(0,4)).replace('MM',str.substring(5,7)).replace('DD',str.substring(8,10));
+}
+function isoDate(s) {
+  if (!s || String(s).length < 10) return '';
+  return String(s).substring(0, 10);
+}
+function todayIso() {
+  var d = new Date();
+  var mm = String(d.getMonth() + 1).padStart(2, '0');
+  var dd = String(d.getDate()).padStart(2, '0');
+  return d.getFullYear() + '-' + mm + '-' + dd;
+}
+function formatQty(v) {
+  if (v == null || isNaN(v)) return '';
+  return v % 1 === 0 ? String(Math.round(v)) : parseFloat(v).toFixed(4).replace(/\.?0+$/,'');
+}
+function escSQL(s) { return String(s).replace(/'/g,"''"); }
+
+/* ── STATE ── */
+let _woRows   = [];        // open WOs from query 1, sorted by priority
+let _reqByMo  = new Map(); // moid → [{partid, partnum, parttype, qtytofulfill, qtyfulfilled, uomcode}]
+let _onhand   = new Map(); // partid → onhand qty (inventory parts only)
+let _partType = new Map(); // partid → typeId (10 = inventory, 30/40 = non-inventory)
+let _supplyByPart = new Map(); // partid → [{poid, ponum, postatus, vendor, poitemid, dateScheduledFulfillment, qtyOutstanding, qtyTotal, receipts: [{rid, date, qty}], momemo}]
+let _drawerWoId = null;            // currently-open WO in the side drawer
+let _drawerExpandedParts = new Set();  // partids expanded within the open drawer
+let _lgList = [], _selLg = new Set();
+let _activeMS = null;
+let _statusSuffix = '';
+
+/* ── INIT ── */
+async function init() {
+  setStatus('Loading...');
+  loadSavedSettings();
+  await populateLG();
+  buildMS('lg');
+  wireFilterHelp();
+  wireAutoApply();
+  document.addEventListener('click', e => {
+    if (_activeMS) {
+      const ms = document.getElementById(_activeMS + '-ms');
+      if (ms && !ms.contains(e.target)) closeMS(_activeMS);
+    }
+  });
+  // ESC closes the side drawer.
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && _drawerWoId != null) { closeDrawer(); }
+  });
+  await runReport();
+}
+
+/* ── SETTINGS ── */
+function loadSavedSettings() {
+  try {
+    const raw = loadSettings(_KEY);
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    if (s.v !== 1) return;
+    if (s.filterWoNum) { const el = document.getElementById('filterWoNum'); if (el) el.value = s.filterWoNum; }
+    if (Array.isArray(s.selLg)) _selLg = new Set(s.selLg);
+    if (s.statuses && Array.isArray(s.statuses)) {
+      ['ckEntered','ckStarted','ckFulfilled'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.checked = s.statuses.includes(el.value);
+      });
+    }
+    if (typeof s.hideOk === 'boolean') document.getElementById('ckHideOk').checked = s.hideOk;
+    if (typeof s.includeUnmemo === 'boolean') document.getElementById('ckIncludeUnmemo').checked = s.includeUnmemo;
+    if (s.sortMode) { const el = document.getElementById('sortMode'); if (el) el.value = s.sortMode; }
+  } catch(e) { console.warn('loadSettings error', e); }
+}
+
+function saveCurrentSettings() {
+  const s = {
+    v: 1,
+    filterWoNum:   document.getElementById('filterWoNum')?.value || '',
+    selLg:         [..._selLg],
+    statuses:      checkedStatuses().map(String),
+    hideOk:        document.getElementById('ckHideOk').checked,
+    includeUnmemo: document.getElementById('ckIncludeUnmemo').checked,
+    sortMode:      document.getElementById('sortMode')?.value || 'scheduled',
+  };
+  saveSettings(_KEY, JSON.stringify(s));
+  setStatus('Settings saved. ' + _statusSuffix);
+}
+
+function resetSettings() {
+  try { saveSettings(_KEY, ''); } catch(e) {}
+  document.getElementById('filterWoNum').value = '';
+  _selLg.clear(); updateMSTrigger('lg');
+  document.getElementById('ckEntered').checked   = true;
+  document.getElementById('ckStarted').checked   = true;
+  document.getElementById('ckFulfilled').checked = false;
+  document.getElementById('ckHideOk').checked    = false;
+  document.getElementById('ckIncludeUnmemo').checked = true;
+  const sm = document.getElementById('sortMode'); if (sm) sm.value = 'scheduled';
+  runReport();
+}
+
+/* ── DROPDOWN POPULATION ── */
+async function populateLG() {
+  const ids = getLocationGroupList();
+  if (!ids.length) return;
+  const rows = await qp(`SELECT id, name FROM locationgroup WHERE id IN (${ids.join(',')}) AND activeFlag = 1 ORDER BY name`);
+  _lgList = rows.map(r => ({val: String(r.id), lbl: r.name}));
+}
+
+/* ── MULTI-SELECT (location group only) ── */
+function msData(type) {
+  const map = { lg: { list: _lgList, sel: _selLg } };
+  return map[type] || { list: [], sel: new Set() };
+}
+function buildMS(type) {
+  const {list, sel} = msData(type);
+  const listEl = document.getElementById(type + 'List');
+  renderMSList(type, list, sel, listEl);
+  updateMSTrigger(type);
+  document.getElementById(type + 'Trigger').addEventListener('click', () => toggleMS(type));
+  document.getElementById(type + 'All').addEventListener('click', () => { list.forEach(o => sel.add(o.val)); renderMSList(type, list, sel, listEl); updateMSTrigger(type); });
+  document.getElementById(type + 'Clear').addEventListener('click', () => { sel.clear(); renderMSList(type, list, sel, listEl); updateMSTrigger(type); });
+}
+function renderMSList(type, list, sel, listEl) {
+  listEl.innerHTML = '';
+  if (!list.length) { listEl.innerHTML = '<div class="ms-empty">No items</div>'; return; }
+  list.forEach(o => {
+    const div = document.createElement('div'); div.className = 'ms-item';
+    const cb  = document.createElement('input'); cb.type = 'checkbox'; cb.checked = sel.has(o.val);
+    const sp  = document.createElement('span'); sp.textContent = o.lbl;
+    div.appendChild(cb); div.appendChild(sp);
+    div.addEventListener('click', () => { sel.has(o.val) ? sel.delete(o.val) : sel.add(o.val); cb.checked = sel.has(o.val); updateMSTrigger(type); });
+    listEl.appendChild(div);
+  });
+}
+function updateMSTrigger(type) {
+  const {list, sel} = msData(type);
+  const trigger = document.getElementById(type + 'Trigger');
+  const ph      = document.getElementById(type + 'Placeholder');
+  trigger.querySelectorAll('.ms-tag').forEach(t => t.remove());
+  if (!sel.size) {
+    ph.textContent = 'All location groups'; ph.style.display = ''; return;
+  }
+  ph.style.display = 'none';
+  const arr = [...sel];
+  arr.slice(0,3).forEach(v => {
+    const item = list.find(o => o.val === v);
+    const tag  = document.createElement('span'); tag.className = 'ms-tag';
+    const lbl  = document.createElement('span'); lbl.textContent = item ? item.lbl : v;
+    const x    = document.createElement('span'); x.className = 'ms-tag-x'; x.textContent = '×';
+    x.addEventListener('click', e => { e.stopPropagation(); sel.delete(v); updateMSTrigger(type); });
+    tag.appendChild(lbl); tag.appendChild(x); trigger.insertBefore(tag, ph);
+  });
+  if (arr.length > 3) {
+    const more = document.createElement('span'); more.className = 'ms-tag'; more.style.cssText = 'background:#e5e7eb;color:#374151;';
+    more.textContent = '+' + (arr.length - 3) + ' more'; trigger.insertBefore(more, ph);
+  }
+}
+function toggleMS(type) {
+  const dd = document.getElementById(type + 'Dropdown');
+  if (_activeMS && _activeMS !== type) closeMS(_activeMS);
+  if (dd.classList.contains('hidden')) {
+    dd.classList.remove('hidden'); _activeMS = type;
+    const {list, sel} = msData(type);
+    renderMSList(type, list, sel, document.getElementById(type + 'List'));
+  } else { closeMS(type); }
+}
+function closeMS(type) {
+  document.getElementById(type + 'Dropdown').classList.add('hidden');
+  if (_activeMS === type) _activeMS = null;
+  if (typeof autoApply === 'function') autoApply();
+}
+
+/* ── TOOLTIP / HELP ── */
+function paTooltipShow(event, html) {
+  const el = document.getElementById('paTooltip');
+  el.innerHTML = html;
+  const tw = 340;
+  const r = event.currentTarget.getBoundingClientRect();
+  const x = Math.min(window.innerWidth - tw - 12, r.left + window.scrollX);
+  const aboveY = r.top + window.scrollY - el.offsetHeight - 8;
+  const belowY = r.bottom + window.scrollY + 8;
+  el.style.left = Math.max(12, x) + 'px';
+  el.style.top = aboveY + 'px';
+  el.classList.add('show');
+  if (aboveY < window.scrollY + 8) el.style.top = belowY + 'px';
+}
+function paTooltipHide() { document.getElementById('paTooltip').classList.remove('show'); }
+function wireFilterHelp() {
+  const btn = document.getElementById('filterHelpBtn');
+  if (!btn) return;
+  const html =
+    '<div><span class="lbl">What this report does:</span><br>' +
+    'Open WOs are listed in priority/scheduled order. The allocator ' +
+    'walks them in order, draining each WO\'s MO-committed POs first, ' +
+    'then the shared on-hand / unmemo pool. The result is each WO\'s ' +
+    '<code>Buildable</code> date — when every required part is covered.</div>' +
+    '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #334155;">' +
+    '<span class="lbl">PO scoping:</span><br>' +
+    'When you click MO→PO, the resulting PO\'s memo records the source ' +
+    'MO. Only WOs of <em>that</em> MO can consume from that PO — so the ' +
+    'drill-down shows just those linked POs (marked <code>MO&nbsp;NNN</code>). ' +
+    'POs memo-linked to a different MO are hidden. Unmemo POs (no linkage) ' +
+    'are shared general supply and appear only if <em>Include open POs not ' +
+    'linked via memo</em> is on.</div>' +
+    '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #334155;">' +
+    '<span class="lbl">Part types:</span><br>' +
+    'Inventory parts show on-hand qty. Non-Inventory and Internal-Use parts ' +
+    'don\'t carry stock; their availability is driven by incoming PO ETAs only.</div>';
+  btn.addEventListener('mouseenter', e => paTooltipShow(e, html));
+  btn.addEventListener('mouseleave', paTooltipHide);
+  btn.addEventListener('focus',      e => paTooltipShow(e, html));
+  btn.addEventListener('blur',       paTooltipHide);
+}
+
+/* ── AUTO-APPLY ── */
+const _autoApplyIds = ['filterWoNum','ckEntered','ckStarted','ckFulfilled','ckHideOk','ckIncludeUnmemo','sortMode'];
+/* Sort mode and hide-OK only affect the rendered view, not the SQL — but
+   it's cheaper to call runReport() once than maintain a "rerender only"
+   path. The queries are sub-second on the dataset sizes this report is
+   designed for. */
+function autoApply() { runReport(); }
+function wireAutoApply() {
+  _autoApplyIds.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('change', autoApply);
+    if (el.tagName === 'INPUT' && el.type === 'text') {
+      el.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); el.blur(); } });
+    }
+  });
+}
+
+/* ── QUERY ── */
+function checkedStatuses() {
+  return ['ckEntered','ckStarted','ckFulfilled']
+    .filter(id => document.getElementById(id)?.checked)
+    .map(id => parseInt(document.getElementById(id).value));
+}
+
+function buildWoSQL() {
+  const statuses = checkedStatuses();
+  if (!statuses.length) return null;
+  const lgIds   = getLocationGroupList();
+  const selLgIds = _selLg.size > 0 ? lgIds.filter(id => _selLg.has(String(id))) : lgIds;
+  const woNumF  = (document.getElementById('filterWoNum')?.value || '').trim();
+
+  const w = [];
+  w.push(`wo.statusId IN (${statuses.join(',')})`);
+  if (selLgIds.length) w.push(`wo.locationGroupId IN (${selLgIds.join(',')})`);
+  if (woNumF) w.push(`wo.num LIKE '%${escSQL(woNumF)}%'`);
+
+  return `SELECT wo.id AS woid, wo.num AS wonum, wo.statusId AS wostatus,
+       wo.dateScheduledToStart, wo.dateScheduled,
+       wo.priorityId, pr.name AS priorityname,
+       wo.qtyTarget,
+       lg.name AS lgname,
+       mo.id AS moid, mo.num AS monum,
+       outpart.num AS outpartnum, outpart.description AS outpartdesc,
+       outitem.description AS outdesc
+FROM wo
+JOIN moitem outitem ON outitem.id = wo.moItemId
+JOIN mo ON mo.id = outitem.moId
+LEFT JOIN part outpart ON outpart.id = outitem.partId
+LEFT JOIN locationgroup lg ON lg.id = wo.locationGroupId
+LEFT JOIN priority pr ON pr.id = wo.priorityId
+WHERE ${w.join('\n  AND ')}
+ORDER BY wo.dateScheduledToStart ASC, wo.priorityId ASC, wo.num
+LIMIT 1000`;
+}
+
+function buildReqSQL(moIds) {
+  if (!moIds.length) return null;
+  return `SELECT mi.moId, mi.partId, p.num AS partnum, p.typeId AS parttype,
+       p.description AS partdesc,
+       mi.qtyToFulfill, mi.qtyFulfilled,
+       uom.code AS uomcode
+FROM moitem mi
+JOIN part p ON p.id = mi.partId
+LEFT JOIN uom ON uom.id = mi.uomId
+WHERE mi.typeId = 20
+  AND mi.moId IN (${moIds.join(',')})`;
+}
+
+function buildOnhandSQL(partIds) {
+  if (!partIds.length) return null;
+  const lgIds   = getLocationGroupList();
+  const selLgIds = _selLg.size > 0 ? lgIds.filter(id => _selLg.has(String(id))) : lgIds;
+  const lgFilter = selLgIds.length ? ` AND l.locationGroupId IN (${selLgIds.join(',')})` : '';
+  return `SELECT t.partId, SUM(t.qty) AS onhand
+FROM tag t
+JOIN location l ON l.id = t.locationId
+WHERE t.typeId IN (30, 40)
+  AND l.countedAsAvailable = 1
+  AND t.partId IN (${partIds.join(',')})
+  ${lgFilter}
+GROUP BY t.partId`;
+}
+
+function buildSupplySQL(partIds, moNumList) {
+  if (!partIds.length) return null;
+  const moNumPredicate = moNumList.length
+    ? `OR EXISTS (SELECT 1 FROM memo m WHERE m.recordId = po.id AND m.memo IN (${moNumList.map(n => `'Created from manufacture order number: ${escSQL(n)}'`).join(',')}))`
+    : '';
+  // Match the memo text both for exact equality and for "Created from manufacture order number: X" followed by a non-digit (newline, space, etc.)
+  // to avoid 11 matching 115. Done in JS post-filter for simplicity.
+  return `SELECT po.id AS poid, po.num AS ponum, po.statusId AS postatus,
+       v.name AS vendor,
+       pi.id AS poitemid, pi.partId,
+       pi.qtyToFulfill, pi.qtyFulfilled,
+       pi.dateScheduledFulfillment,
+       (SELECT m.memo FROM memo m
+         WHERE m.recordId = po.id
+           AND m.memo LIKE 'Created from manufacture order number: %'
+         LIMIT 1) AS momemo
+FROM poitem pi
+JOIN po ON po.id = pi.poId
+LEFT JOIN vendor v ON v.id = po.vendorId
+WHERE pi.partId IN (${partIds.join(',')})
+  AND po.statusId IN (20, 25)
+  AND pi.qtyToFulfill > pi.qtyFulfilled`;
+}
+
+function buildReceiptsSQL(poitemIds) {
+  if (!poitemIds.length) return null;
+  return `SELECT ri.poItemId, ri.id AS rid,
+       ri.dateReceived, ri.qty,
+       r.id AS receiptid, r.statusId AS rstatus,
+       po.num AS ponum
+FROM receiptitem ri
+JOIN receipt r ON r.id = ri.receiptId
+LEFT JOIN po ON po.id = r.poId
+WHERE ri.poItemId IN (${poitemIds.join(',')})
+  AND ri.dateReceived IS NOT NULL
+ORDER BY ri.dateReceived ASC`;
+}
+
+async function runReport() {
+  setStatus('Loading...');
+  showSpinner();
+  const t0 = Date.now();
+  try {
+    // 1. Open WOs
+    const woSql = buildWoSQL();
+    if (!woSql) { setStatus('Select at least one WO status.'); _woRows = []; renderBoard(); return; }
+    _woRows = await qp(woSql);
+    if (!_woRows.length) {
+      _statusSuffix = `0 WOs (${((Date.now()-t0)/1000).toFixed(1)}s)`;
+      setStatus(_statusSuffix);
+      renderBoard();
+      return;
+    }
+
+    // 2. Requirements per MO
+    const moIds   = [...new Set(_woRows.map(r => r.moid).filter(v => v != null))];
+    const moNums  = [...new Set(_woRows.map(r => r.monum).filter(v => v != null))];
+    const reqRows = await qp(buildReqSQL(moIds));
+
+    _reqByMo = new Map();
+    _partType = new Map();
+    reqRows.forEach(r => {
+      if (!_reqByMo.has(r.moid)) _reqByMo.set(r.moid, []);
+      _reqByMo.get(r.moid).push(r);
+      _partType.set(r.partid, r.parttype);
+    });
+
+    // 3. On-hand for inventory parts
+    const invPartIds = [...new Set(reqRows.filter(r => r.parttype === 10).map(r => r.partid))];
+    const allPartIds = [...new Set(reqRows.map(r => r.partid))];
+
+    const [onhandRows, supplyRows] = await Promise.all([
+      invPartIds.length ? qp(buildOnhandSQL(invPartIds)) : Promise.resolve([]),
+      allPartIds.length ? qp(buildSupplySQL(allPartIds, moNums)) : Promise.resolve([]),
+    ]);
+
+    _onhand = new Map();
+    onhandRows.forEach(r => _onhand.set(r.partid, parseFloat(r.onhand) || 0));
+
+    // 4. Receipts per poitem (only for outstanding poitems we found)
+    const poitemIds = [...new Set(supplyRows.map(r => r.poitemid))];
+    const receiptRows = poitemIds.length ? await qp(buildReceiptsSQL(poitemIds)) : [];
+    const receiptsByPoitem = new Map();
+    receiptRows.forEach(r => {
+      if (!receiptsByPoitem.has(r.poitemid)) receiptsByPoitem.set(r.poitemid, []);
+      receiptsByPoitem.get(r.poitemid).push({rid: r.rid, date: isoDate(r.datereceived), qty: parseFloat(r.qty) || 0});
+    });
+
+    // Bucket supply by part. Every row carries `linkedMoNum` (the MO num
+    // the PO memo links to, or null). Per-WO scoping happens later in
+    // computeAvailability() and the drill-down render — we no longer drop
+    // unmemo rows up front; we just tag them.
+    _supplyByPart = new Map();
+    supplyRows.forEach(r => {
+      const linkedMoNum = parseMemoMoNum(r.momemo);
+      if (!_supplyByPart.has(r.partid)) _supplyByPart.set(r.partid, []);
+      const outstanding = (parseFloat(r.qtytofulfill) || 0) - (parseFloat(r.qtyfulfilled) || 0);
+      _supplyByPart.get(r.partid).push({
+        poid: r.poid, ponum: r.ponum, postatus: r.postatus, vendor: r.vendor || '',
+        poitemid: r.poitemid,
+        ordered: parseFloat(r.qtytofulfill) || 0,
+        fulfilled: parseFloat(r.qtyfulfilled) || 0,
+        outstanding: outstanding,
+        eta: isoDate(r.datescheduledfulfillment),
+        receipts: receiptsByPoitem.get(r.poitemid) || [],
+        momemo: r.momemo || '',
+        linkedMoNum: linkedMoNum,
+      });
+    });
+
+    // Compute per-WO availability (FIFO allocation in already-sorted WO order).
+    computeAvailability();
+
+    const ms = Date.now() - t0;
+    _statusSuffix = `${_woRows.length.toLocaleString()} WOs, ${reqRows.length.toLocaleString()} part requirements (${(ms/1000).toFixed(1)}s)`;
+    setStatus(_statusSuffix);
+    renderBoard();
+  } catch(e) {
+    setStatus('Error: ' + (e.message || String(e)));
+    console.error(e);
+  } finally { hideSpinner(); }
+}
+
+/* Parse a PO memo and return the MO number it links to, as a string,
+   or null if the memo doesn't follow the "Created from manufacture
+   order number: NNN" pattern. The MO number is captured with a digit
+   class so "11" doesn't get confused with "115" when used downstream
+   for equality matching. */
+function parseMemoMoNum(memoText) {
+  if (!memoText) return null;
+  const m = String(memoText).match(/^Created from manufacture order number:\s*(\d+)/);
+  return m ? m[1] : null;
+}
+
+/* ── ALLOCATION ALGORITHM ──
+   Per-MO scoped allocation. Each PO line is either memo-committed to one
+   specific MO (the trigger of MO→PO) or unmemo (general open supply).
+
+   For each part we maintain two supply pools:
+     • moPool[partid][monum] — events from POs whose memo points at THAT
+       MO. Only consumable by WOs of that same MO (sibling WOs share it).
+     • generalPool[partid]   — on-hand + (if toggle on) unmemo PO events.
+       Shared across all WOs.
+
+   PO lines memo-linked to ANOTHER MO are not available to this WO at all.
+
+   Walk WOs in priority/scheduled order. For each required part:
+     1. Drain MO-specific pool first (committed to wo.monum)
+     2. Then drain general pool (shared FIFO across all WOs)
+   Each consumption's date becomes that part's availableBy for the WO;
+   WO buildableDate = max(part.availableBy). */
+function computeAvailability() {
+  const today = todayIso();
+  const includeUnmemo = document.getElementById('ckIncludeUnmemo').checked;
+
+  const generalPool = new Map();              // partid → events[]
+  const moPool      = new Map();              // partid → Map<monum, events[]>
+
+  function dateSort(events) { events.sort((a,b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0); }
+
+  function ensureGeneral(partid) {
+    if (!generalPool.has(partid)) {
+      const events = [];
+      const onhand = _onhand.get(partid) || 0;
+      if (onhand > 0) events.push({date: today, qty: onhand});
+      if (includeUnmemo) {
+        const isInventory = (_partType.get(partid) === 10);
+        (_supplyByPart.get(partid) || []).forEach(s => {
+          if (s.linkedMoNum != null) return;   // skip memo-linked rows here
+          // Past receipts already roll into on-hand for inventory parts;
+          // for non-inventory tags don't apply — receipts ARE supply.
+          s.receipts.forEach(rcv => {
+            if (!isInventory) {
+              const d = rcv.date && rcv.date <= today ? today : rcv.date;
+              events.push({date: d || today, qty: rcv.qty});
+            }
+          });
+          if (s.outstanding > 0) {
+            const eta = s.eta && s.eta >= today ? s.eta : today;
+            events.push({date: eta, qty: s.outstanding});
+          }
+        });
+      }
+      dateSort(events);
+      generalPool.set(partid, events);
+    }
+    return generalPool.get(partid);
+  }
+
+  function ensureMoPool(partid, monum) {
+    if (!moPool.has(partid)) moPool.set(partid, new Map());
+    const inner = moPool.get(partid);
+    if (!inner.has(monum)) {
+      const events = [];
+      const isInventory = (_partType.get(partid) === 10);
+      (_supplyByPart.get(partid) || []).forEach(s => {
+        if (s.linkedMoNum !== monum) return;   // only THIS MO's committed supply
+        s.receipts.forEach(rcv => {
+          if (!isInventory) {
+            const d = rcv.date && rcv.date <= today ? today : rcv.date;
+            events.push({date: d || today, qty: rcv.qty});
+          }
+        });
+        if (s.outstanding > 0) {
+          const eta = s.eta && s.eta >= today ? s.eta : today;
+          events.push({date: eta, qty: s.outstanding});
+        }
+      });
+      dateSort(events);
+      inner.set(monum, events);
+    }
+    return inner.get(monum);
+  }
+
+  function consume(queue, remaining, allocated) {
+    let availableBy = today;
+    while (remaining > 0 && queue.length) {
+      const ev = queue[0];
+      const take = Math.min(remaining, ev.qty);
+      allocated.push({date: ev.date, qty: take});
+      ev.qty -= take; remaining -= take;
+      if (ev.date > availableBy) availableBy = ev.date;
+      if (ev.qty <= 0.000001) queue.shift();
+    }
+    return {remaining, availableBy};
+  }
+
+  _woRows.forEach(wo => {
+    const reqs = _reqByMo.get(wo.moid) || [];
+    let woDate = today;
+    let unmet = false;
+    let waitingParts = [];
+
+    const perPart = [];
+    reqs.forEach(req => {
+      const need = (parseFloat(req.qtytofulfill) || 0) - (parseFloat(req.qtyfulfilled) || 0);
+      if (need <= 0) {
+        perPart.push({partid: req.partid, partnum: req.partnum, parttype: req.parttype, partdesc: req.partdesc, uomcode: req.uomcode, need: 0, availableBy: today, allocated: [], unmet: false, onhand: req.parttype === 10 ? (_onhand.get(req.partid) || 0) : null});
+        return;
+      }
+
+      const allocated = [];
+      let availableBy = today;
+
+      // Stage 1: MO-committed pool (only WOs of this MO can use it).
+      if (wo.monum) {
+        const moQ = ensureMoPool(req.partid, String(wo.monum));
+        const r1 = consume(moQ, need, allocated);
+        if (r1.availableBy > availableBy) availableBy = r1.availableBy;
+        var remaining = r1.remaining;
+      } else {
+        var remaining = need;
+      }
+
+      // Stage 2: shared general pool (on-hand + unmemo, if toggle on).
+      if (remaining > 0) {
+        const genQ = ensureGeneral(req.partid);
+        const r2 = consume(genQ, remaining, allocated);
+        if (r2.availableBy > availableBy) availableBy = r2.availableBy;
+        remaining = r2.remaining;
+      }
+
+      let partUnmet = false;
+      if (remaining > 0.000001) {
+        partUnmet = true; unmet = true; availableBy = null;
+      }
+      perPart.push({
+        partid: req.partid, partnum: req.partnum, parttype: req.parttype,
+        partdesc: req.partdesc, uomcode: req.uomcode,
+        need: need, availableBy: availableBy, allocated: allocated, unmet: partUnmet,
+        // For inventory parts (typeId 10) we always show on-hand, even
+        // when it's zero. Non-inventory shows null → "no stock tracking".
+        onhand: req.parttype === 10 ? (_onhand.get(req.partid) || 0) : null,
+      });
+      if (availableBy && availableBy > woDate) woDate = availableBy;
+      if (partUnmet || (availableBy && availableBy > today)) waitingParts.push(req.partnum);
+    });
+
+    wo._perPart      = perPart;
+    wo._unmet        = unmet;
+    wo._buildable    = unmet ? null : woDate;
+    wo._waiting      = waitingParts;
+    wo._buildableNow = !unmet && woDate <= today;
+  });
+}
+
+/* ── RENDER ── */
+function setStatus(msg) { document.getElementById('statusLine').textContent = msg; }
+function showSpinner() { document.getElementById('loadingOverlay').style.display = 'block'; }
+function hideSpinner() { document.getElementById('loadingOverlay').style.display = 'none'; }
+
+/* Sort comparators keyed by the #sortMode select. The dataset comes back
+   from SQL pre-sorted by scheduled start; we re-sort in-place per the
+   user's pick. */
+function sortRowsFor(rows) {
+  const mode = document.getElementById('sortMode')?.value || 'scheduled';
+  const today = todayIso();
+  const cmp = (a, b) => {
+    const A = (x) => x == null || x === '' ? '￿' : String(x);
+    if (mode === 'priority')   return (a.priorityid - b.priorityid) || A(a.datescheduledtostart).localeCompare(A(b.datescheduledtostart));
+    if (mode === 'wonum')      return String(a.wonum||'').localeCompare(String(b.wonum||''), undefined, {numeric:true});
+    if (mode === 'buildable')  {
+      // Unmet last; otherwise by computed buildable date ascending; ties → priority.
+      const ax = a._unmet ? '￿' : (a._buildable || today);
+      const bx = b._unmet ? '￿' : (b._buildable || today);
+      return A(ax).localeCompare(A(bx)) || (a.priorityid - b.priorityid);
+    }
+    // default 'scheduled'
+    return A(a.datescheduledtostart).localeCompare(A(b.datescheduledtostart)) || (a.priorityid - b.priorityid);
+  };
+  return [...rows].sort(cmp);
+}
+
+function renderBoard() {
+  // KPI counters first.
+  updateKpis();
+
+  const list = document.getElementById('woCardList');
+  list.innerHTML = '';
+  const hideOk = document.getElementById('ckHideOk').checked;
+  let rows = hideOk ? _woRows.filter(w => !w._buildableNow) : _woRows;
+  rows = sortRowsFor(rows);
+  if (!rows.length) {
+    list.innerHTML = '<div style="padding:2rem;color:#9ca3af;text-align:center;">No matching work orders.</div>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  rows.forEach(wo => frag.appendChild(buildWoCard(wo)));
+  list.appendChild(frag);
+}
+
+function updateKpis() {
+  const total = _woRows.length;
+  let ok = 0, waiting = 0, unmet = 0;
+  _woRows.forEach(w => {
+    if (w._unmet) unmet++;
+    else if (w._buildableNow) ok++;
+    else waiting++;
+  });
+  document.querySelector('#kpiTotal .kpi-value').textContent = total.toLocaleString();
+  document.querySelector('#kpiOk    .kpi-value').textContent = ok.toLocaleString();
+  document.querySelector('#kpiWait  .kpi-value').textContent = waiting.toLocaleString();
+  document.querySelector('#kpiUnmet .kpi-value').textContent = unmet.toLocaleString();
+}
+
+/* WO card — one row in the main list. Click anywhere outside an inner
+   link to slide the detail drawer in. */
+function buildWoCard(wo) {
+  const card = document.createElement('div');
+  card.className = 'wo-card' + (wo.woid === _drawerWoId ? ' is-open' : '');
+  card.dataset.woid = wo.woid;
+
+  // 1. ID column — WO# + WO status sub-line.
+  const idCol = document.createElement('div'); idCol.className = 'wo-card-id';
+  const woLink = document.createElement('a');
+  woLink.className = 'row-link wo-card-num'; woLink.href = '#'; woLink.textContent = wo.wonum;
+  woLink.addEventListener('click', e => { e.stopPropagation(); e.preventDefault(); openModule('Work Order', wo.wonum); });
+  idCol.appendChild(woLink);
+  const status = WO_STATUS_MAP[wo.wostatus] || {label:'', cls:'b10'};
+  const sub = document.createElement('div'); sub.className = 'wo-card-sub';
+  sub.innerHTML = `<span class="badge ${status.cls}">${status.label}</span> &middot; MO ${wo.monum ? escHtml(wo.monum) : '—'}`;
+  idCol.appendChild(sub);
+  card.appendChild(idCol);
+
+  // 2. Output column — output part num + description.
+  const outCol = document.createElement('div'); outCol.className = 'wo-card-output';
+  const op = document.createElement('div'); op.className = 'wo-card-output-part';
+  op.textContent = wo.outpartnum || wo.outdesc || '—';
+  outCol.appendChild(op);
+  if (wo.outpartdesc) {
+    const od = document.createElement('div'); od.className = 'wo-card-output-desc';
+    od.textContent = wo.outpartdesc; od.title = wo.outpartdesc;
+    outCol.appendChild(od);
+  }
+  card.appendChild(outCol);
+
+  // 3. Meta column — scheduled + priority + qty + location group.
+  const metaCol = document.createElement('div'); metaCol.className = 'wo-card-meta-grid';
+  const schedTxt = wo.datescheduledtostart ? formatDate(String(wo.datescheduledtostart))
+                  : wo.datescheduled ? formatDate(String(wo.datescheduled)) : '—';
+  metaCol.innerHTML =
+    `<div><span class="lbl">Start</span>${escHtml(schedTxt)}</div>` +
+    `<div><span class="lbl">Prio</span>${escHtml(String(wo.priorityname || wo.priorityid || '—'))} &middot; <span class="lbl">Qty</span>${formatQty(parseFloat(wo.qtytarget)||0)}</div>` +
+    (wo.lgname ? `<div><span class="lbl">LG</span>${escHtml(wo.lgname)}</div>` : '');
+  card.appendChild(metaCol);
+
+  // 4. Parts progress column — bar + text summary.
+  const partsCol = document.createElement('div'); partsCol.className = 'wo-card-parts';
+  const total = (wo._perPart || []).length;
+  const ready = (wo._perPart || []).filter(p => !p.unmet && p.availableBy && p.availableBy <= todayIso()).length;
+  const pct = total ? Math.round((ready / total) * 100) : 0;
+  const fillCls = wo._unmet ? 'late' : wo._buildableNow ? '' : 'warn';
+  partsCol.innerHTML =
+    `<div>${ready} of ${total} ready` + (wo._waiting && wo._waiting.length ? ` &middot; <span style="color:#b45309;">${wo._waiting.length} waiting</span>` : '') + `</div>` +
+    `<div class="wo-card-parts-bar"><div class="wo-card-parts-fill ${fillCls}" style="width:${pct}%;"></div></div>`;
+  card.appendChild(partsCol);
+
+  // 5. Status column — big availability badge + chevron.
+  const statCol = document.createElement('div'); statCol.className = 'wo-card-status';
+  statCol.appendChild(buildAvailBadge(wo, true));
+  const chev = document.createElement('div'); chev.className = 'wo-card-chev'; chev.innerHTML = '›';
+  statCol.appendChild(chev);
+  card.appendChild(statCol);
+
+  card.addEventListener('click', e => { if (e.target.closest('a')) return; openDrawer(wo.woid); });
+  return card;
+}
+
+function buildAvailBadge(wo, large) {
+  const sp = document.createElement('span');
+  sp.className = 'badge' + (large ? ' badge-lg' : '');
+  if (wo._unmet) { sp.className += ' b-late'; sp.textContent = 'Unmet'; return sp; }
+  if (wo._buildableNow) { sp.className += ' b-ok'; sp.textContent = 'Buildable now'; return sp; }
+  sp.className += ' b-warn';
+  sp.textContent = wo._buildable ? ('Buildable ' + formatDate(wo._buildable)) : 'Pending';
+  return sp;
+}
+
+/* ── DETAIL PANE ── */
+function openDrawer(woid) {
+  const wo = _woRows.find(w => w.woid === woid);
+  if (!wo) return;
+  _drawerWoId = woid;
+  _drawerExpandedParts.clear();
+  document.getElementById('detailContent').classList.add('open');
+  document.getElementById('detailEmpty').style.display = 'none';
+  renderDrawerDetail(wo);
+  // Highlight the selected card without a full re-render.
+  document.querySelectorAll('.wo-card').forEach(c => {
+    c.classList.toggle('is-open', String(c.dataset.woid) === String(woid));
+  });
+}
+
+function closeDrawer() {
+  _drawerWoId = null;
+  document.getElementById('detailContent').classList.remove('open');
+  document.getElementById('detailEmpty').style.display = '';
+  document.querySelectorAll('.wo-card.is-open').forEach(c => c.classList.remove('is-open'));
+}
+
+function renderDrawerDetail(wo) {
+  const status = WO_STATUS_MAP[wo.wostatus] || {label:'', cls:'b10'};
+  document.getElementById('drawerTitle').textContent = wo.wonum || '';
+
+  // Sub-header line: clickable WO + MO links + status badge.
+  const sub = document.getElementById('drawerSub');
+  sub.innerHTML = '';
+  const woA = document.createElement('a'); woA.href = '#'; woA.textContent = 'Open WO'; woA.style.color = '#bfdbfe'; woA.style.textDecoration = 'underline';
+  woA.addEventListener('click', e => { e.preventDefault(); openModule('Work Order', wo.wonum); });
+  sub.appendChild(woA);
+  if (wo.monum) {
+    sub.appendChild(document.createTextNode('  ·  '));
+    const moA = document.createElement('a'); moA.href = '#'; moA.textContent = 'Open MO ' + wo.monum; moA.style.color = '#bfdbfe'; moA.style.textDecoration = 'underline';
+    moA.addEventListener('click', e => { e.preventDefault(); openModule('Manufacture Order', wo.monum); });
+    sub.appendChild(moA);
+  }
+
+  // Meta strip.
+  const schedTxt = wo.datescheduledtostart ? formatDate(String(wo.datescheduledtostart))
+                  : wo.datescheduled ? formatDate(String(wo.datescheduled)) : '—';
+  const buildBadge = wo._unmet
+    ? '<span class="badge b-late">Unmet</span>'
+    : wo._buildableNow
+      ? '<span class="badge b-ok">Buildable now</span>'
+      : `<span class="badge b-warn">Buildable ${wo._buildable ? formatDate(wo._buildable) : ''}</span>`;
+  document.getElementById('drawerMeta').innerHTML =
+    `<div><span class="lbl">Output</span><span class="val">${escHtml(wo.outpartnum || '—')}</span></div>` +
+    `<div><span class="lbl">Qty Target</span><span class="val">${formatQty(parseFloat(wo.qtytarget)||0)}</span></div>` +
+    `<div><span class="lbl">Scheduled</span><span class="val">${escHtml(schedTxt)}</span></div>` +
+    `<div><span class="lbl">Priority</span><span class="val">${escHtml(String(wo.priorityname || wo.priorityid || '—'))}</span></div>` +
+    `<div><span class="lbl">Loc. Group</span><span class="val">${escHtml(wo.lgname || '—')}</span></div>` +
+    `<div><span class="lbl">WO Status</span><span class="val"><span class="badge ${status.cls}">${status.label}</span></span></div>` +
+    `<div><span class="lbl">Buildable</span><span class="val">${buildBadge}</span></div>`;
+
+  document.getElementById('partsHeading').textContent = `Required parts (${(wo._perPart || []).length})`;
+
+  const body = document.getElementById('drawerPartsBody');
+  body.innerHTML = '';
+  const parts = wo._perPart || [];
+  if (!parts.length) {
+    body.innerHTML = '<tr><td colspan="5" style="padding:1.5rem;color:#9ca3af;text-align:center;">No raw-material requirements found for this MO.</td></tr>';
+    return;
+  }
+  parts.forEach(part => {
+    body.appendChild(buildPartRow(wo, part));
+    if (_drawerExpandedParts.has(part.partid)) {
+      body.appendChild(buildPoDetailRow(wo, part));
+    }
+  });
+}
+
+function buildPartRow(wo, part) {
+  const tr = document.createElement('tr');
+  tr.className = 'part-main' + (_drawerExpandedParts.has(part.partid) ? ' is-open' : '');
+
+  // Toggle.
+  const tdT = document.createElement('td');
+  tdT.innerHTML = `<span class="part-toggle ${_drawerExpandedParts.has(part.partid) ? 'is-open' : ''}">${_drawerExpandedParts.has(part.partid) ? '▼' : '▶'}</span>`;
+  tr.appendChild(tdT);
+
+  // Part identity + type + description.
+  const tdP = document.createElement('td');
+  const pa = document.createElement('a'); pa.className = 'row-link part-num'; pa.href = '#'; pa.textContent = part.partnum;
+  pa.addEventListener('click', e => { e.stopPropagation(); e.preventDefault(); openModule('Part', part.partnum); });
+  tdP.appendChild(pa);
+  const ptype = document.createElement('span');
+  ptype.className = 'badge ' + (part.parttype === 10 ? 'b20' : 'b10');
+  ptype.textContent = PART_TYPE_MAP[part.parttype] || ('Type ' + part.parttype);
+  ptype.style.marginLeft = '8px';
+  tdP.appendChild(ptype);
+  if (part.partdesc) {
+    const desc = document.createElement('div'); desc.className = 'part-sub'; desc.textContent = part.partdesc; desc.title = part.partdesc;
+    tdP.appendChild(desc);
+  }
+  tr.appendChild(tdP);
+
+  // Needed.
+  const tdN = document.createElement('td'); tdN.className = 'num-cell part-need';
+  tdN.textContent = formatQty(part.need) + (part.uomcode ? ' ' + part.uomcode : '');
+  tr.appendChild(tdN);
+
+  // On hand.
+  const tdO = document.createElement('td'); tdO.className = 'part-stock';
+  tdO.textContent = part.onhand != null ? formatQty(part.onhand) : '—';
+  if (part.onhand == null) tdO.title = 'Non-inventory part — no stock tracking';
+  tr.appendChild(tdO);
+
+  // Status.
+  const tdS = document.createElement('td');
+  const sp = document.createElement('span'); sp.className = 'badge';
+  if (part.unmet)                              { sp.className += ' b-late'; sp.textContent = 'Unmet'; }
+  else if (part.availableBy && part.availableBy <= todayIso()) { sp.className += ' b-ok';   sp.textContent = 'Available'; }
+  else if (part.availableBy)                   { sp.className += ' b-warn'; sp.textContent = 'By ' + formatDate(part.availableBy); }
+  else                                         { sp.className += ' b10';    sp.textContent = '—'; }
+  tdS.appendChild(sp);
+  tr.appendChild(tdS);
+
+  tr.addEventListener('click', e => { if (e.target.closest('a')) return; togglePart(part.partid); });
+  return tr;
+}
+
+function buildPoDetailRow(wo, part) {
+  const tr = document.createElement('tr');
+  const td = document.createElement('td'); td.colSpan = 5; td.className = 'po-detail'; td.style.padding = '0';
+  const inner = document.createElement('div'); inner.className = 'po-detail';
+  const allSupply = _supplyByPart.get(part.partid) || [];
+  const includeUnmemo = document.getElementById('ckIncludeUnmemo').checked;
+  const myMoNum = wo.monum ? String(wo.monum) : null;
+
+  // Show only supplies relevant to THIS WO:
+  //   • memo-linked to this WO's MO  → always
+  //   • unmemo (no linkage)          → only if toggle is on (shared pool)
+  //   • memo-linked to a different MO → never (committed elsewhere)
+  const supply = allSupply.filter(s => {
+    if (s.linkedMoNum === myMoNum) return true;
+    if (s.linkedMoNum == null)     return includeUnmemo;
+    return false;
+  });
+
+  if (!supply.length) {
+    const line = document.createElement('div'); line.className = 'po-line empty';
+    const otherMos = allSupply.filter(s => s.linkedMoNum != null && s.linkedMoNum !== myMoNum).length;
+    if (otherMos > 0 && !allSupply.some(s => s.linkedMoNum === myMoNum)) {
+      line.textContent = `No PO linked to MO ${myMoNum || '—'} for this part. (${otherMos} PO line${otherMos!==1?'s':''} memo-linked to other MOs.)`;
+    } else {
+      line.textContent = 'No open purchase orders found for this part.';
+    }
+    inner.appendChild(line);
+  } else {
+    supply.forEach(sup => {
+      sup.receipts.forEach(rcv => inner.appendChild(buildPoLine(sup, rcv, null, myMoNum)));
+      if (sup.outstanding > 0) inner.appendChild(buildPoLine(sup, null, 'remaining', myMoNum));
+    });
+  }
+  td.appendChild(inner);
+  tr.appendChild(td);
+  return tr;
+}
+
+function buildPoLine(sup, rcv, kind, myMoNum) {
+  const line = document.createElement('div');
+  line.className = 'po-line' + (rcv ? ' receipt' : kind === 'remaining' ? ' remaining' : '');
+
+  // Left tag.
+  const tag = document.createElement('span'); tag.className = 'po-tag';
+  tag.textContent = rcv ? 'Received' : 'Open';
+  line.appendChild(tag);
+
+  // PO link + optional MO badge + (for receipt) open-receipt link.
+  const poLink = document.createElement('a'); poLink.className = 'row-link'; poLink.href = '#'; poLink.textContent = 'PO ' + sup.ponum;
+  poLink.addEventListener('click', e => { e.stopPropagation(); e.preventDefault(); openModule('Purchase Order', sup.ponum); });
+  line.appendChild(poLink);
+  if (sup.linkedMoNum && sup.linkedMoNum === myMoNum) {
+    const b = document.createElement('span'); b.className = 'badge b-mo'; b.textContent = 'MO ' + sup.linkedMoNum;
+    b.title = sup.momemo || ('Memo-linked to MO ' + sup.linkedMoNum);
+    line.appendChild(b);
+  }
+  if (rcv) {
+    const rl = document.createElement('a'); rl.className = 'row-link'; rl.href = '#'; rl.textContent = 'open receipt'; rl.style.fontSize = '10px';
+    rl.addEventListener('click', e => { e.stopPropagation(); e.preventDefault(); openModule('Receiving', 'P' + sup.ponum); });
+    line.appendChild(rl);
+  }
+
+  // Vendor.
+  const v = document.createElement('span'); v.className = 'po-vendor'; v.textContent = sup.vendor || '';
+  line.appendChild(v);
+
+  // Qty.
+  const q = document.createElement('span'); q.className = 'po-qty';
+  q.textContent = rcv ? formatQty(rcv.qty) : (kind === 'remaining' ? formatQty(sup.outstanding) : formatQty(sup.ordered));
+  line.appendChild(q);
+
+  // Date.
+  const d = document.createElement('span'); d.className = 'po-date';
+  if (rcv) d.textContent = 'Received ' + formatDate(rcv.date);
+  else if (kind === 'remaining') d.textContent = 'ETA ' + (sup.eta ? formatDate(sup.eta) : 'TBD');
+  line.appendChild(d);
+
+  return line;
+}
+
+function togglePart(partid) {
+  if (_drawerExpandedParts.has(partid)) _drawerExpandedParts.delete(partid);
+  else _drawerExpandedParts.add(partid);
+  const wo = _woRows.find(w => w.woid === _drawerWoId);
+  if (wo) renderDrawerDetail(wo);
+}
+
+/* ── EXPORT CSV ──
+   One row per (WO, required part). Allocation events flattened into the
+   row's `Available By` column. */
+function exportCSV() {
+  const hdrs = ['WO #','WO Status','MO #','Output Part','Qty Target','Priority','Scheduled Start','Loc. Group','Buildable Date','Part #','Part Type','Description','Qty Needed','UOM','On Hand','Available By','Unmet?'];
+  const lines = [hdrs.map(esc).join(',')];
+  _woRows.forEach(wo => {
+    const status = WO_STATUS_MAP[wo.wostatus] || {label:''};
+    const sched  = wo.datescheduledtostart ? isoDate(wo.datescheduledtostart) : (wo.datescheduled ? isoDate(wo.datescheduled) : '');
+    const builds = wo._unmet ? 'Unmet' : (wo._buildable || '');
+    const parts  = wo._perPart || [{partnum:'',parttype:'',partdesc:'',need:0,uomcode:'',onhand:'',availableBy:'',unmet:false}];
+    if (!parts.length) parts.push({partnum:'',parttype:'',partdesc:'',need:0,uomcode:'',onhand:'',availableBy:'',unmet:false});
+    parts.forEach(p => {
+      lines.push([
+        wo.wonum, status.label, wo.monum, wo.outpartnum, formatQty(parseFloat(wo.qtytarget)||0),
+        wo.priorityname || wo.priorityid, sched, wo.lgname || '',
+        builds,
+        p.partnum, PART_TYPE_MAP[p.parttype] || '', p.partdesc, formatQty(p.need), p.uomcode || '',
+        p.onhand != null ? formatQty(p.onhand) : '',
+        p.availableBy || '', p.unmet ? 'Y' : ''
+      ].map(esc).join(','));
+    });
+  });
+  const blob = new Blob(['﻿' + lines.join('\r\n')], {type:'text/csv;charset=utf-8;'});
+  const url  = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'WO_Parts_Availability_' + todayIso() + '.csv';
+  a.click(); URL.revokeObjectURL(url);
+}
+function esc(v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; }
+function escHtml(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+/* ── HELPERS ── */
+async function qp(sql) {
+  try { return normalise(await runQueryAsync(sql)); }
+  catch(e) { try { return normalise(runQuery(sql)); } catch(e2) { throw e2; } }
+}
+function normalise(r) {
+  if (r == null) return [];
+  if (typeof r === 'string') { try { var p = JSON.parse(r); return Array.isArray(p) ? p : []; } catch(_) { return []; } }
+  return Array.isArray(r) ? r : [];
+}
+
+init();
+</script>
+</body>
+</html>
