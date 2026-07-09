@@ -1,0 +1,1962 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  REPORT: Delivery Route Planner
+  PATH:   SalesOrder/Delivery_Route_Planner.htm
+  --------------------------------------------------------------------------------
+  Turns the day's Fishbowl shipments into an optimized single-vehicle
+  ROUND-TRIP from the warehouse. It reads each shipment's ship-to address,
+  geocodes it, asks OpenRouteService (ORS) for the best stop order + the road
+  route, draws it on a Leaflet/OSM map, and exports the run as a Google Maps
+  deep-link, GPX, KML, CSV manifest, or a printed run-sheet.
+
+  Cloned from Template/Core_Dashboard_Template.htm — reuses the shared fb-lib /
+  fb-styles chrome (header, drawers, settings persistence, debug drawer) and the
+  Blob-download + new-window print patterns. Domain layer (SQL, ORS, map,
+  exports) is this report's own.
+
+  DEFAULTS: "Shipped today" — ship.statusId=30 AND DATE(ship.dateShipped)=today.
+            Packed (statusId 20) is a manual option, matched on dateLastModified
+            (approximate — Fishbowl has no packed timestamp).
+
+  PREREQUISITE: the Fishbowl client machine needs outbound internet to reach
+  api.openrouteservice.org and OSM tiles. On a locked-down network the mapping
+  is unavailable; the report degrades to an unordered stop list + CSV/print.
+
+  The shared fb-lib is inlined once (inside the inline script near the top of
+  head) and fb-styles once (in the style block). Never repeat either directive
+  placeholder anywhere else in this file — Fishbowl expands every occurrence.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Delivery Route Planner — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script>
+
+    <!-- Leaflet (map). CDN — consistent with the ORS internet requirement.
+         Can be inlined for fully locked-down networks. -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <!-- Shared Fishbowl BI lib — inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Shared Fishbowl BI stylesheet — inlined from the saved "fb-styles"
+         Style. Source of truth: scripts/fb-styles.css. Must come BEFORE the
+         inline block so per-report rules win the cascade. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <style>
+        * { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; height: 100%; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            font-size: 13px; color: #1e293b; background: #f8fafc;
+            display: flex; flex-direction: column; min-height: 100vh;
+            padding-bottom: var(--debug-drawer-h, 0px);
+            transition: padding-bottom 0.12s ease;
+        }
+        /* Keep the header (and its dropdowns) above the Leaflet map, which
+           otherwise paints over the top-bar selectors in the embedded browser. */
+        header { position: relative; z-index: 1100; }
+        header h1 { font-size: 16px; font-weight: 700; color: #0f172a; margin: 0; line-height: 1.15; }
+        #statusLine { font-size: 12px; color: #94a3b8; line-height: 1.15; margin: 2px 0 0; }
+        .hdr-actions { display: flex; align-items: center; gap: 8px; }
+
+        /* Drawer grid + fields (from the template). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 220px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #475569; border-bottom: 1px solid #e2e8f0; padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+        .fb-field label { font-size: 11px; font-weight: 600; color: #475569; }
+        .fb-field select, .fb-field input[type=text], .fb-field input[type=date], .fb-field input[type=password] {
+            padding: 4px 8px; font-size: 12px; border: 1px solid #e2e8f0; border-radius: 6px; background: #f9fafb; font-family: inherit; color: #374151;
+        }
+        .fb-field input[type=date] { background: #fff; }
+        .fb-help { font-size: 10.5px; color: #94a3b8; line-height: 1.35; }
+
+        /* Settings drawer only: pack the groups into ≥4 narrow columns so the
+           dropdowns/inputs don't stretch to half the drawer width. (Scoped to
+           #setOverlay so the Help drawer's wider flex groups are untouched.) */
+        #setOverlay .fb-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px 22px; align-items: start; }
+        #setOverlay .fb-group { flex: none; min-width: 0; }
+        #setOverlay .fb-field select, #setOverlay .fb-field input[type=text] { width: 100%; }
+        @media (max-width: 900px) { #setOverlay .fb-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+        @media (max-width: 520px) { #setOverlay .fb-grid { grid-template-columns: 1fr; } }
+
+        /* Dim the page behind an open Settings/Help drawer (modal-style scrim).
+           The scrim sits above all app chrome; the open drawer is lifted above
+           the scrim so it stays crisp. Click the scrim to close. */
+        .drawer-scrim { position: fixed; inset: 0; background: rgba(15, 23, 42, 0.45); z-index: 1150; display: none; }
+        .drawer-scrim.show { display: block; }
+        .fb-drawer.open { position: relative; z-index: 1200; }
+
+        /* Ship-status filter pills (multi-select toggles). */
+        .status-pills { display: flex; flex-wrap: wrap; gap: 6px; }
+        .fs-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #94a3b8; }
+        .fs-sep { width: 1px; align-self: stretch; background: #e2e8f0; margin: 0 6px; }
+        .fs-date { display: inline-flex; align-items: center; gap: 6px; }
+        .fs-date select, .fs-date input[type=date] { height: 28px; border: 1px solid #cbd5e1; border-radius: 6px; padding: 0 8px; font-size: 12px; font-family: inherit; background: #fff; color: #334155; cursor: pointer; }
+        .fs-date input[type=date] { cursor: text; }
+        .spill-btn { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 12px; border-radius: 999px; border: 1px solid #cbd5e1; background: #fff; color: #475569; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
+        .spill-btn:hover { background: #f1f5f9; }
+        .spill-btn.on { color: #fff; }
+        .spill-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+
+        /* Carrier multi-select dropdown (self-contained, inline-onclick — the
+           fb-lib MultiSelect's listeners don't fire in this embedded browser). */
+        .cdrop { position: relative; display: inline-block; }
+        .cdrop-trigger { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; color: #334155; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; max-width: 240px; }
+        .cdrop-trigger:hover { background: #f1f5f9; }
+        .cdrop-trigger svg { width: 13px; height: 13px; color: #64748b; flex-shrink: 0; }
+        .cdrop-trigger .lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .cdrop-panel { position: absolute; z-index: 30; top: calc(100% + 3px); left: 0; min-width: 220px; max-width: 320px; background: #fff; border: 1px solid #d1d5db; border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.14); display: flex; flex-direction: column; max-height: 320px; }
+        .cdrop-panel.hidden { display: none; }
+        .cdrop-actions { display: flex; gap: 12px; padding: 6px 10px; border-bottom: 1px solid #f1f5f9; font-size: 11px; }
+        .cdrop-actions span { color: #2563eb; cursor: pointer; }
+        .cdrop-actions span:hover { text-decoration: underline; }
+        .cdrop-list { overflow-y: auto; }
+        .cdrop-item { display: flex; align-items: center; gap: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; color: #334155; }
+        .cdrop-item:hover { background: #eff6ff; }
+        .cdrop-item.on { color: #1e40af; font-weight: 600; }
+        .cdrop-check { width: 14px; text-align: center; color: #2563eb; flex-shrink: 0; }
+
+        .ds-btn { padding: 7px 13px; font-size: 12px; border-radius: 7px; border: 1px solid #cbd5e1; background: #fff; cursor: pointer; font-family: inherit; font-weight: 600; color: #334155; }
+        .ds-btn:hover { background: #f1f5f9; }
+        .ds-btn-primary { background: var(--color-primary); color: #fff; border-color: var(--color-primary); }
+        .ds-btn-primary:hover { background: var(--color-primary-dark); }
+        .ds-btn-admin { background: #fef3c7; border-color: #f59e0b; color: #7c2d12; margin-right: 6px; }
+        .ds-lock-badge { background: #fef3c7; color: #92400e; border: 1px solid #f59e0b; padding: 7px 10px; border-radius: 7px; font-size: 12px; margin-bottom: 14px; }
+
+        /* Multi-select widget (carrier filter). */
+        .ms-container { position: relative; }
+        .ms-trigger { display: flex; align-items: center; flex-wrap: nowrap; gap: 3px; border: 1px solid #e2e8f0; border-radius: 6px; padding: 3px 8px; background: #fff; height: 30px; overflow: hidden; cursor: pointer; font-size: 12px; }
+        .ms-trigger:hover { border-color: #9ca3af; }
+        .ms-tag { background: #dbeafe; color: #1d4ed8; padding: 1px 5px; border-radius: 3px; font-size: 11px; display: flex; align-items: center; gap: 2px; white-space: nowrap; }
+        .ms-tag-x { cursor: pointer; font-weight: bold; }
+        .ms-placeholder { color: #9ca3af; }
+        .ms-dropdown { position: absolute; z-index: 500; top: calc(100% + 2px); left: 0; right: 0; min-width: 220px; background: #fff; border: 1px solid #d1d5db; border-radius: 6px; box-shadow: 0 6px 20px rgba(0,0,0,0.13); display: flex; flex-direction: column; max-height: 280px; }
+        .ms-dropdown.hidden { display: none; }
+        .ms-search { padding: 6px 8px; border-bottom: 1px solid #f3f4f6; }
+        .ms-search input { width: 100%; border: 1px solid #d1d5db; border-radius: 4px; padding: 4px 8px; font-size: 12px; outline: none; font-family: inherit; }
+        .ms-actions { padding: 3px 10px; border-bottom: 1px solid #f3f4f6; display: flex; gap: 10px; font-size: 11px; }
+        .ms-actions span { color: #3b82f6; cursor: pointer; }
+        .ms-actions span:hover { text-decoration: underline; }
+        .ms-list { overflow-y: auto; flex: 1; }
+        .ms-item { display: flex; align-items: center; gap: 8px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
+        .ms-item:hover { background: #eff6ff; }
+        .ms-empty { padding: 12px; color: #9ca3af; font-size: 12px; text-align: center; }
+
+        /* Header export menu. */
+        .menu-wrap { position: relative; display: inline-block; }
+        .menu { position: absolute; top: calc(100% + 4px); right: 0; background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.13); min-width: 200px; z-index: 600; display: none; overflow: hidden; }
+        .menu.open { display: block; }
+        .menu button { display: flex; width: 100%; gap: 9px; align-items: center; padding: 9px 12px; background: none; border: none; font: inherit; font-size: 12px; color: #334155; cursor: pointer; text-align: left; }
+        .menu button:hover { background: #f1f5f9; }
+        .menu button svg { width: 15px; height: 15px; flex-shrink: 0; color: #64748b; }
+        .menu .sep { height: 1px; background: #f1f5f9; }
+
+        /* App shell + KPI strip. */
+        .app-shell { width: 100%; margin: 0; padding: 0; flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+        .kpi-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 12px; background: #fff; border-bottom: 1px solid #e2e8f0; flex-shrink: 0; position: relative; z-index: 1050; }
+        .kpi-tile { display: inline-flex; align-items: center; gap: 6px; padding: 5px 11px; border-radius: 999px; font-size: 11px; font-weight: 600; border: 1px solid; line-height: 1.4; }
+        .kpi-tile.total { background: #eff6ff; border-color: #bfdbfe; color: #1e40af; }
+        .kpi-tile.dist  { background: #ecfeff; border-color: #a5f3fc; color: #155e75; }
+        .kpi-tile.time  { background: #f5f3ff; border-color: #ddd6fe; color: #5b21b6; }
+        .kpi-tile.warn  { background: #fef3c7; border-color: #fcd34d; color: #92400e; }
+        .kpi-tile .lbl  { opacity: 0.85; }
+        .kpi-tile .num  { font-weight: 800; }
+
+        /* Two-pane route workspace. */
+        .route-wrap { flex: 1 1 auto; display: flex; min-height: 0; }
+        .stops-pane { width: 440px; flex-shrink: 0; border-right: 1px solid #e2e8f0; display: flex; flex-direction: column; background: #fff; overflow: hidden; }
+        .stops-head { padding: 9px 12px; border-bottom: 1px solid #e2e8f0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .stops-head .sum { font-size: 11.5px; color: #475569; font-weight: 600; }
+        .stops-list { overflow: auto; flex: 1 1 auto; min-height: 0; }
+        .map-pane { flex: 1 1 auto; min-width: 0; position: relative; background: #eef2f6; }
+        #mapEl { position: absolute; inset: 0; }
+        .map-msg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center; color: #64748b; font-size: 13px; padding: 24px; }
+        @media (max-width: 860px) {
+            .route-wrap { flex-direction: column; }
+            .stops-pane { width: auto; height: 45%; border-right: none; border-bottom: 1px solid #e2e8f0; }
+            .map-pane { height: 55%; }
+        }
+
+        .stop { display: flex; gap: 10px; padding: 9px 12px; border-bottom: 1px solid #f1f5f9; cursor: pointer; }
+        .stop:hover { background: #f8fafc; }
+        .stop.active { background: #eff6ff; }
+        .stop-seq { width: 24px; height: 24px; border-radius: 50%; background: #1e3a5f; color: #fff; font-weight: 700; font-size: 12px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+        .stop-seq.depot { background: #059669; }
+        .stop-seq.unmapped { background: #b91c1c; }
+        .stop-body { min-width: 0; flex: 1; }
+        .stop-cust { font-weight: 600; font-size: 12.5px; color: #0f172a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .stop-addr { font-size: 11.5px; color: #64748b; }
+        .stop-meta { margin-top: 3px; display: flex; flex-wrap: wrap; gap: 4px; }
+        .stop-chip { font-size: 12px; background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 4px; padding: 1px 7px; color: #475569; }
+        .stop-chip a { color: #2d9cdb; text-decoration: none; }
+        .stop-chip a:hover { text-decoration: underline; }
+        .stops-section { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #94a3b8; padding: 8px 12px 4px; background: #f8fafc; border-bottom: 1px solid #f1f5f9; }
+        .stop.excluded-row { opacity: 0.5; }
+        .stop-chk { width: 15px; height: 15px; flex-shrink: 0; margin: 3px 0 0; accent-color: var(--color-primary); cursor: pointer; }
+        .stop-chk-spacer { width: 15px; flex-shrink: 0; }
+        .stop.dragging { opacity: 0.4; }
+        .stop.dragover { box-shadow: inset 0 2px 0 var(--color-primary); }
+        .stop-grip { margin-left: 8px; align-self: center; flex-shrink: 0; color: #cbd5e1; cursor: grab; display: flex; }
+        .stop-grip:hover { color: #94a3b8; }
+        .stop-grip:active { cursor: grabbing; }
+        .stop-grip svg { width: 16px; height: 16px; }
+
+        /* QR slide-up drawer below the stop list (only shown once routed). */
+        .qr-drawer { flex-shrink: 0; border-top: 1px solid #e2e8f0; background: #fff; }
+        .qr-drawer-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px; cursor: pointer; user-select: none; font-size: 12px; font-weight: 700; color: #334155; }
+        .qr-drawer-head:hover { background: #f8fafc; }
+        .qr-drawer-head svg { width: 15px; height: 15px; color: #64748b; }
+        .qr-drawer-head .chev { margin-left: auto; color: #94a3b8; transition: transform .2s; }
+        .qr-drawer.collapsed .qr-drawer-head .chev { transform: rotate(180deg); }
+        .qr-drawer-body { max-height: 210px; overflow: hidden; transition: max-height .2s ease; }
+        .qr-drawer.collapsed .qr-drawer-body { max-height: 0; }
+        .qr-body-inner { padding: 4px 12px 12px; display: flex; gap: 12px; align-items: center; }
+        .qr-imgwrap { width: 118px; height: 118px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: #94a3b8; font-size: 11px; text-align: center; border: 1px solid #e2e8f0; border-radius: 6px; }
+        .qr-imgwrap img { width: 116px; height: 116px; display: block; }
+        .qr-cap { font-size: 11.5px; color: #475569; line-height: 1.4; }
+        .qr-cap strong { color: #0f172a; }
+        .qr-cap a { color: #2d9cdb; word-break: break-all; }
+
+        /* Header left cluster: title + LG selector + round-trip toggle. */
+        .hdr-left { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+        .hdr-lg { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: #475569; }
+        .hdr-lg select { height: 34px; border: 1px solid #cbd5e1; border-radius: 6px; padding: 0 8px; font-size: 12px; font-family: inherit; background: #fff; color: #334155; max-width: 190px; cursor: pointer; }
+        .hdr-ms { min-width: 165px; max-width: 240px; }
+        .hdr-ms .ms-trigger { height: 34px; border-color: #cbd5e1; }
+        .rt-seg { display: inline-flex; border: 1px solid #cbd5e1; border-radius: 7px; overflow: hidden; }
+        .rt-seg button { border: none; background: #fff; color: #475569; font: inherit; font-size: 12px; font-weight: 600; padding: 7px 12px; cursor: pointer; }
+        .rt-seg button + button { border-left: 1px solid #cbd5e1; }
+        .rt-seg button.active { background: var(--color-primary); color: #fff; }
+
+        /* Busy overlay (route optimisation in progress). */
+        .busy-overlay { position: absolute; inset: 0; z-index: 800; background: rgba(255,255,255,0.62); display: flex; align-items: center; justify-content: center; }
+        .busy-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; box-shadow: 0 6px 20px rgba(0,0,0,0.12); padding: 16px 22px; text-align: center; font-size: 12.5px; color: #334155; font-weight: 600; }
+        .spinner { border: 3px solid #e2e8f0; border-top-color: var(--color-primary); border-radius: 50%; width: 34px; height: 34px; animation: spin 1s linear infinite; margin: 0 auto 8px; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Numbered map pin. */
+        .map-pin { background: #1e3a5f; color: #fff; border-radius: 50% 50% 50% 0; transform: rotate(-45deg); width: 26px; height: 26px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 11px; border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.4); }
+        .map-pin span { transform: rotate(45deg); }
+        .map-pin.depot { background: #059669; }
+
+        /* Toast (hand-rolled against fb-styles .toast classes). */
+        .toast-container { position: fixed; bottom: 16px; right: 16px; z-index: 12000; display: flex; flex-direction: column; gap: 8px; }
+
+        .empty-msg { padding: 40px 20px; text-align: center; color: #94a3b8; font-size: 13px; }
+
+        @media print {
+            header, .fb-drawer, .fblib-debug-drawer, .kpi-row, .stops-head { display: none !important; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- ==================================================================== HEADER -->
+<header>
+    <div class="hdr-left">
+        <div>
+            <h1>Delivery Route Planner</h1>
+            <p id="statusLine">Loading…</p>
+        </div>
+        <label class="hdr-lg" title="Show shipments from this location group (also the route's start/end depot)">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M12 21s-6-5.686-6-10a6 6 0 1112 0c0 4.314-6 10-6 10z"/><circle cx="12" cy="11" r="2"/></svg>
+            <select id="lgSel" onchange="onLgChange()"></select>
+        </label>
+        <div class="rt-seg" id="rtSeg" title="Round-trip returns to the depot; one-way ends at the last stop">
+            <button type="button" data-rt="1" onclick="setRoundTripUi(true)">Round-trip</button>
+            <button type="button" data-rt="0" onclick="setRoundTripUi(false)">One-way</button>
+        </div>
+    </div>
+    <div class="hdr-actions">
+        <button id="refreshBtn" class="hdr-btn" type="button" onclick="loadAll()" title="Reload shipments">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span style="width:1px; height:18px; background:#e2e8f0; margin:0 4px;"></span>
+        <button id="helpBtn" class="hdr-btn" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How to use this report">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            Help
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ==================================================================== SETTINGS -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div id="dsLockBadge" class="ds-lock-badge" style="display:none;">Locked by admin — your changes won't be saved.</div>
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Vehicle</div>
+                <div class="fb-field">
+                    <label for="setProfile">Vehicle profile</label>
+                    <select id="setProfile" onchange="onRouteSettingChange()">
+                        <option value="driving-car">Car / van</option>
+                        <option value="driving-hgv">Truck (HGV)</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Trip start</div>
+                <div class="fb-field">
+                    <label for="setDepotMode">Depot (start / end)</label>
+                    <select id="setDepotMode" onchange="onRouteSettingChange()">
+                        <option value="company">Company address book (per location group)</option>
+                        <option value="manual">Manual override</option>
+                    </select>
+                    <span class="fb-help">Company = the selected location group's own address. Manual = the override below.</span>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Manual depot</div>
+                <div class="fb-field">
+                    <label for="setDepotAddress">Address</label>
+                    <input type="text" id="setDepotAddress" placeholder="e.g. 12 Depot Rd, Springfield IL 62701" onchange="onRouteSettingChange()" />
+                </div>
+                <div class="fb-field">
+                    <label for="setDepotLatLng">…or exact coordinates (lat,lng)</label>
+                    <input type="text" id="setDepotLatLng" placeholder="e.g. 39.7817,-89.6501" onchange="onRouteSettingChange()" />
+                    <span class="fb-help">Used only when Depot = Manual override. Coordinates win over the address.</span>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setRememberFilters" onchange="onSettingsChange()" />
+                        <span>Remember filter selections</span>
+                    </label>
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setShowDebug" onchange="onSettingsChange()" />
+                        <span>Show debug console</span>
+                    </label>
+                </div>
+            </div>
+        </div>
+
+        <!-- Admin-only: the shared OpenRouteService API key is published to the
+             master payload so every user shares it. -->
+        <div id="dsAdminSection" style="display:none; margin-top:14px; padding-top:14px; border-top: 1px dashed #cbd5e1;">
+            <div class="fb-group-title">Admin — OpenRouteService</div>
+            <ol style="font-size:11.5px; color:#334155; padding-left:18px; margin:4px 0 10px; line-height:1.5;">
+                <li>Create a free account at <strong>openrouteservice.org</strong> (Sign up).</li>
+                <li>Open your API key page: <a href="https://account.heigit.org/manage/key" target="_blank" rel="noopener" style="color:#2d9cdb;">account.heigit.org/manage/key</a> and copy the token.</li>
+                <li>Paste it below and click <strong>Save org key</strong> — it's stored in the shared BI settings for everyone who uses this report.</li>
+            </ol>
+            <div class="fb-field" style="max-width:460px;">
+                <label for="setOrsKey">ORS API key (shared org-wide)</label>
+                <input type="text" id="setOrsKey" placeholder="Paste your OpenRouteService API key" />
+                <span class="fb-help">Published to all users of this report (visible to them). Needed for geocoding, optimization and routing. The free tier covers typical daily delivery runs.</span>
+            </div>
+            <button type="button" class="ds-btn ds-btn-admin" onclick="saveOrgKey()">Save org key</button>
+            <button type="button" class="ds-btn ds-btn-admin" onclick="publishDefaults()">Publish defaults for everyone</button>
+            <button type="button" class="ds-btn ds-btn-admin" id="dsLockBtn" onclick="toggleUserEditing()">Lock user editing</button>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn" onclick="resetSettings()">Reset to defaults</button>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ==================================================================== HELP -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How to Use This Report</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group" style="flex:1 1 320px;">
+                <div class="fb-group-title">What it does</div>
+                <p style="font-size:12px; color:#334155;">Loads the day's shipments (default: <strong>packed &amp; shipped today</strong>), reads each ship-to address, and builds the best single-vehicle <strong>round-trip</strong> from your warehouse. Click <strong>Optimise Route</strong> to (re)plan.</p>
+                <p style="font-size:12px; color:#334155;">Stops list on the left, route + numbered pins on the map. Click a stop to focus it on the map; the <strong>SO</strong> link opens the sales order in Fishbowl.</p>
+                <ul style="font-size:12px; color:#334155; padding-left:18px; margin:6px 0;">
+                    <li><strong>Ship status</strong> pills (toolbar) — pick which statuses to include. Keep <strong>Packed</strong> on to pre-build the run while orders are still being packed and marked shipped.</li>
+                    <li><strong>Carrier</strong> dropdown (toolbar) — pick one, or several to combine multiple drivers' runs into one route.</li>
+                    <li><strong>Tick / untick</strong> any stop — even <em>before</em> routing — to choose which shipments are included. Excluded stops drop off the map and out of the run.</li>
+                    <li><strong>Optimise Route</strong> finds the <em>best</em> stop order and draws the road route.</li>
+                    <li><strong>Drag</strong> the grip handle to set your <em>own</em> priority order (instant, no waiting), then click <strong>Plan Route</strong> to draw the road route for that exact sequence — it does <em>not</em> re-optimize, so your order is kept.</li>
+                    <li><strong>Reverse</strong> flips the current order; <strong>tick / untick</strong> a stop to include/exclude it. Both update instantly — click <strong>Plan Route</strong> to draw the road route.</li>
+                    <li><strong>Optimise Route</strong> vs <strong>Plan Route</strong>: Optimise picks the order for you; Plan keeps the order you set.</li>
+                    <li><strong>Round-trip / One-way</strong> toggle (top-left) — one-way ends at the last stop instead of returning to the depot.</li>
+                </ul>
+            </div>
+            <div class="fb-group" style="flex:1 1 320px;">
+                <div class="fb-group-title">Exports</div>
+                <ul style="font-size:12px; color:#334155; padding-left:18px; margin:4px 0;">
+                    <li><strong>Google Maps</strong> — opens the ordered route for phone GPS</li>
+                    <li><strong>QR code</strong> — scan to open the route on a phone (also printed on the run-sheet)</li>
+                    <li><strong>GPX / KML</strong> — for in-vehicle GPS units and Google Earth</li>
+                    <li><strong>CSV manifest</strong> — the driver's run-sheet</li>
+                    <li><strong>Print</strong> — a clean printable run-sheet</li>
+                </ul>
+            </div>
+            <div class="fb-group" style="flex:1 1 320px;">
+                <div class="fb-group-title">Setup &amp; limits</div>
+                <p style="font-size:12px; color:#334155;">Needs internet access from the Fishbowl PC. An admin pastes a free <strong>OpenRouteService</strong> key under Settings ▸ Admin. Geocoded addresses are cached so repeat runs are fast.</p>
+                <p style="font-size:12px; color:#334155;">If the map service is unreachable, the report falls back to a nearest-neighbour order and still lets you export CSV / print.</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ==================================================================== MAIN -->
+<div class="app-shell">
+    <div class="kpi-row" id="kpiRow">
+        <span class="fs-label" title="Which ship statuses to include in the run">Ship status</span>
+        <div class="status-pills" id="statusPills"></div>
+        <span class="fs-sep"></span>
+        <span class="fs-date">
+            <span class="fs-label">Date</span>
+            <select id="dateRangeSel" onchange="onDateRangeChange()">
+                <option value="today" selected>Today</option>
+                <option value="yesterday">Yesterday</option>
+                <option value="last7">Last 7 days</option>
+                <option value="custom">Custom range…</option>
+            </select>
+            <span id="customDateInputs" class="fs-date hidden">
+                <input type="date" id="startDate" onchange="loadAll()" />
+                <span style="color:#94a3b8;">→</span>
+                <input type="date" id="endDate" onchange="loadAll()" />
+            </span>
+        </span>
+        <span class="fs-sep"></span>
+        <span class="fs-label" title="Filter by carrier — pick several to combine drivers' runs into one route">Carriers</span>
+        <div class="cdrop" id="carrierDrop">
+            <button type="button" class="cdrop-trigger" id="carrierDropBtn" onclick="carrierDropToggle(event)" title="Filter by carrier — pick several to combine drivers' runs">
+                <span class="lbl" id="carrierDropLabel">All carriers</span>
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
+            </button>
+            <div class="cdrop-panel hidden" id="carrierDropPanel">
+                <div class="cdrop-actions"><span onclick="carrierSelectAll()">Select all</span><span onclick="carrierClearAll()">Clear</span></div>
+                <div class="cdrop-list" id="carrierDropList"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="route-wrap">
+        <div class="stops-pane">
+            <div class="stops-head">
+                <span class="sum" id="routeSummary">No route yet</span>
+                <span style="flex:1;"></span>
+                <button id="optimizeBtn" class="ds-btn ds-btn-primary" type="button" style="padding:5px 10px;" onclick="planRoute()" title="Find the best stop order and draw the road route">
+                    <svg fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" style="width:14px;height:14px;vertical-align:-2px;"><path d="m21.64 3.64-1.28-1.28a1.21 1.21 0 0 0-1.72 0L2.36 18.64a1.21 1.21 0 0 0 0 1.72l1.28 1.28a1.2 1.2 0 0 0 1.72 0L21.64 5.36a1.2 1.2 0 0 0 0-1.72Z"/><path d="m14 7 3 3"/><path d="M5 6v4"/><path d="M19 14v4"/><path d="M10 2v2"/><path d="M7 8H3"/><path d="M21 16h-4"/><path d="M11 3H9"/></svg>
+                    Optimise Route
+                </button>
+                <button id="routeOrderBtn" class="ds-btn" type="button" style="padding:5px 10px;display:none;" onclick="routeManualOrder()" title="Draw the road route following YOUR current order (does not re-optimize)">
+                    <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="width:14px;height:14px;vertical-align:-2px;"><path d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"/></svg>
+                    Plan Route
+                </button>
+                <button id="reverseBtn" class="ds-btn" type="button" style="padding:5px 8px;display:none;" onclick="psReverseRoute()" title="Reverse the route direction (drive the loop the other way)" aria-label="Reverse route direction">
+                    <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="width:15px;height:15px;display:block;"><path d="M8 7h11M8 7l3-3M8 7l3 3M16 17H5m11 0l-3-3m3 3l-3 3"/></svg>
+                </button>
+                <div class="menu-wrap" id="exportWrap" style="display:none;">
+                    <button id="exportBtn" class="ds-btn" type="button" style="padding:5px 8px;" onclick="toggleExportMenu(event)" title="Export the route" aria-label="Export the route">
+                        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="width:15px;height:15px;display:block;"><path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3"/></svg>
+                    </button>
+                    <div class="menu" id="exportMenu">
+                        <button type="button" onclick="openGmaps()"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17.657 16.657L13.414 20.9a2 2 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"/><circle cx="12" cy="11" r="3"/></svg>Open in Google Maps</button>
+                        <div class="sep"></div>
+                        <button type="button" onclick="exportGpx()"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>Download GPX</button>
+                        <button type="button" onclick="exportKml()"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>Download KML</button>
+                        <button type="button" onclick="exportCsv()"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 17v-2a2 2 0 012-2h2a2 2 0 012 2v2M7 7h10M7 3h10a2 2 0 012 2v14a2 2 0 01-2 2H7a2 2 0 01-2-2V5a2 2 0 012-2z"/></svg>Download CSV manifest</button>
+                        <div class="sep"></div>
+                        <button type="button" onclick="printRunSheet()"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>Print run-sheet</button>
+                    </div>
+                </div>
+            </div>
+            <div class="stops-list" id="stopsList">
+                <div class="empty-msg">Loading shipments…</div>
+            </div>
+            <!-- QR slide-up drawer — appears once a route is created; collapsible. -->
+            <div class="qr-drawer collapsed" id="qrDrawer" style="display:none;">
+                <div class="qr-drawer-head" onclick="qrToggleDrawer()" title="Show / hide the route QR code">
+                    <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 14h2v2h-2zM14 18h2v2h-2zM18 18h2v2h-2z"/></svg>
+                    Route QR code
+                    <span class="chev"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="width:15px;height:15px;"><path d="M18 15l-6-6-6 6"/></svg></span>
+                </div>
+                <div class="qr-drawer-body">
+                    <div class="qr-body-inner">
+                        <div class="qr-imgwrap" id="qrImgWrap">…</div>
+                        <div class="qr-cap">
+                            <strong>Scan to open in Google Maps</strong><br>
+                            Point a phone camera at the code to start turn-by-turn navigation.<br>
+                            <a id="qrLink" href="#" target="_blank" rel="noopener" style="display:none;">Open route link</a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="map-pane">
+            <div id="mapEl"></div>
+            <div class="map-msg hidden" id="mapMsg"></div>
+            <div class="busy-overlay" id="busyOverlay" style="display:none;">
+                <div class="busy-card"><div class="spinner"></div><div id="busyMsg">Optimizing route…</div></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Dim-the-background scrim shown behind an open Settings/Help drawer. -->
+<div class="drawer-scrim" id="drawerScrim"></div>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<script>
+// ============================================================================
+//  BAIL EARLY  — needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#475569;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report requires the Fishbowl embedded browser environment. ' +
+        'Open it from the Fishbowl client\'s BI module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+// ============================================================================
+//  FB-LIB FEATURE CHECK
+// ============================================================================
+(function () {
+    var missing = [];
+    if (!window.FBLib)                                                                 missing.push('window.FBLib');
+    if (window.FBLib && !FBLib.Common)                                                 missing.push('FBLib.Common');
+    if (window.FBLib && FBLib.Common && typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common.toggleDrawer');
+    if (!missing.length) return;
+    function showBanner() {
+        var b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#fee2e2;color:#991b1b;border-bottom:1px solid #fca5a5;padding:10px 16px;font:13px/1.4 -apple-system,Segoe UI,sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: <code style="background:#fff;padding:1px 5px;border-radius:3px;">' +
+            missing.join('</code>, <code style="background:#fff;padding:1px 5px;border-radius:3px;">') +
+            '</code>. Confirm a script named exactly <code>fb-lib</code> exists with the current contents of <code>scripts/fb-lib.js</code>, then re-save this report.';
+        document.body.appendChild(b);
+        try { console.error('[Delivery Route Planner] fb-lib feature check failed:', missing); } catch (_) {}
+    }
+    if (document.body) showBanner(); else document.addEventListener('DOMContentLoaded', showBanner);
+})();
+
+// ============================================================================
+//  SETTINGS INIT
+// ============================================================================
+try {
+    FBLib.Settings.init({
+        userKey:   'cdx.bi.routeplanner.user.v1',
+        masterKey: 'cdx.bi.routeplanner.master.v1',
+        defaults: {
+            v: 1,
+            orsApiKey: '',            // master-published by an admin
+            profile: 'driving-car',
+            roundTrip: true,          // false = one-way run ending at the last stop
+            depotMode: 'company',     // 'company' | 'manual'
+            depotAddress: '',
+            depotLatLng: '',
+            rememberFilters: true,
+            showDebug: false,
+            lgId: '',                 // remembered location-group selection
+            carrierIds: [],           // remembered carrier selection (multi)
+            statusIds: ['20', '30'],  // ship statuses to include (Packed + Shipped)
+            geoCache: {}              // per-user geocode cache (kept out of the report-data slot)
+        },
+        propFallback: {
+            showDebug: { name: 'BI_SHOW_DEBUG', dflt: 'false', parse: function (v) { return v === 'true'; } }
+        }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+var _resolve = function (key, dflt) {
+    try { var v = FBLib.Settings.resolve(key); return (v === undefined || v === null) ? dflt : v; }
+    catch (_) { return dflt; }
+};
+var _setUserKey = function (key, value) {
+    try { FBLib.Settings.setUserKey(key, value); FBLib.Settings.saveUser(); } catch (_) {}
+};
+var debugLog = function (msg, kind) { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+function setStatus(msg) { var el = document.getElementById('statusLine'); if (el) el.textContent = msg || ''; }
+// Spinner overlay (ref-counted so nested route ops don't flicker it off early).
+function setBusy(on, msg) {
+    _busy = Math.max(0, _busy + (on ? 1 : -1));
+    var el = document.getElementById('busyOverlay'); if (!el) return;
+    if (_busy > 0) {
+        if (msg) { var m = document.getElementById('busyMsg'); if (m) m.textContent = msg; }
+        el.style.display = 'flex';
+    } else { el.style.display = 'none'; }
+}
+
+// ============================================================================
+//  STATE
+// ============================================================================
+var GMAPS_MAX = 23;            // Google Maps deep-link waypoint cap
+var _shipments = [];           // raw SQL rows
+var _stops = [];               // grouped-by-address stops
+var _orderedStops = [];        // stops in optimized order (mapped only)
+var _depot = null;             // { lon, lat, label, lgName } — resolved (geocoded) trip start
+var _depotPreview = null;      // { label, lgName } — DB-only trip-start info shown before Optimize
+var _route = null;             // { geometry:[[lon,lat]...], distance(m), duration(s) }
+var _lgId = null;              // selected location group id (null = all accessible)
+var _planned = false;          // true once Optimize has geocoded stops + drawn a route
+var _carriers = [];            // [{id,name}] active carriers (carrier filter pills)
+var _carrierSel = new Set();   // included carrier ids (empty = all carriers)
+var _statusSel = new Set(['20', '30']);  // included ship statuses (Packed + Shipped)
+// Ship statuses offered as filter pills (Cancelled=40 omitted — never delivered).
+var SHIP_STATUSES = [
+    { id: '10', name: 'Entered', color: '#64748b' },
+    { id: '20', name: 'Packed',  color: '#d97706' },
+    { id: '30', name: 'Shipped', color: '#059669' }
+];
+var _accessibleLgs = null;     // cached getLocationGroupList()
+var _geoCache = {};            // { addressKey: [lon,lat] }
+var _map = null, _mapLayer = null;
+var _loadToken = 0;
+var _manualOrder = false;      // true after a reverse/drag — route follows the manual order, not ORS optimize
+var _dragKey = null;           // key of the stop currently being drag-reordered
+var _busy = 0;                 // ref-count of in-flight route operations (drives the spinner overlay)
+var _qrOpen = true;            // QR slide-up drawer expanded? (defaults open on first route)
+
+// ============================================================================
+//  RUNQUERY NORMALISER
+// ============================================================================
+async function runQueryP(sql) {
+    if (typeof runQueryAsync === 'function') {
+        var r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    var raw = runQuery(sql);
+    if (!raw) return [];
+    try { var p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// ============================================================================
+//  TOASTS  (hand-rolled against the fb-styles .toast classes)
+// ============================================================================
+function showToast(msg, kind, ms) {
+    kind = kind || 'info';
+    var c = document.getElementById('toastContainer');
+    if (!c) return;
+    var t = document.createElement('div');
+    t.className = 'toast ' + kind;
+    var icon = ({ success: '✓', error: '✕', warn: '⚠', info: 'ℹ' })[kind] || 'ℹ';
+    t.innerHTML = '<span class="toast-icon">' + icon + '</span><span class="toast-msg"></span><span class="toast-x">&times;</span>';
+    t.querySelector('.toast-msg').textContent = msg;
+    t.querySelector('.toast-x').onclick = function () { t.remove(); };
+    c.appendChild(t);
+    setTimeout(function () { t.style.opacity = '0'; t.style.transition = 'opacity .3s'; setTimeout(function () { t.remove(); }, 300); }, ms || 3500);
+}
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+function safeDate(s) { return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ''; }
+function xmlEsc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&apos;' })[c]; }); }
+function orsKey() { return String(_resolve('orsApiKey', '')).trim(); }
+function orsProfile() { var p = _resolve('profile', 'driving-car'); return (p === 'driving-hgv') ? 'driving-hgv' : 'driving-car'; }
+function isRoundTrip() { return _resolve('roundTrip', true) !== false; }
+// Geocode a set of stops concurrently (cache-first), capped so we stay polite to
+// the provider. Much faster than awaiting each one in series on a cold cache.
+async function geocodeStopsConcurrent(stops, concurrency) {
+    var pending = stops.filter(function (s) { return !s.coord; });
+    if (!pending.length) return;
+    var cap = concurrency || 5, i = 0;
+    async function worker() {
+        while (i < pending.length) {
+            var s = pending[i++];
+            try { s.coord = await geocodeCached(s.key, (function (st) { return function () { return orsGeocodeStructured(st); }; })(s)) || null; }
+            catch (ge) { debugLog('geocode failed (' + s.key + '): ' + ge.message, 'warn'); s.coord = null; }
+        }
+    }
+    var workers = [];
+    for (var w = 0; w < Math.min(cap, pending.length); w++) workers.push(worker());
+    await Promise.all(workers);
+}
+function accessibleLgIds() {
+    if (_accessibleLgs) return _accessibleLgs;
+    try { _accessibleLgs = (typeof getLocationGroupList === 'function' ? getLocationGroupList() : []) || []; }
+    catch (_) { _accessibleLgs = []; }
+    return _accessibleLgs;
+}
+function depotLgId() {
+    if (_lgId != null && !isNaN(_lgId)) return _lgId;
+    var a = accessibleLgIds();
+    return a.length ? a[0] : null;
+}
+// Display name of the currently-selected location group (the trip start), read
+// from the header selector. Null when "All accessible" is selected.
+function currentLgName() {
+    var sel = document.getElementById('lgSel');
+    if (sel && sel.value !== '' && sel.selectedOptions && sel.selectedOptions[0]) return sel.selectedOptions[0].textContent;
+    return null;
+}
+function haversine(a, b) { // [lon,lat] → metres
+    var R = 6371000, toRad = function (d) { return d * Math.PI / 180; };
+    var dLat = toRad(b[1] - a[1]), dLon = toRad(b[0] - a[0]);
+    var s = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+            Math.cos(toRad(a[1])) * Math.cos(toRad(b[1])) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    return 2 * R * Math.asin(Math.sqrt(s));
+}
+function fmtKm(m) { if (m == null) return '—'; return (m / 1000).toFixed(m < 100000 ? 1 : 0) + ' km'; }
+function fmtDur(s) {
+    if (s == null) return '—';
+    var m = Math.round(s / 60), h = Math.floor(m / 60); m = m % 60;
+    return h ? (h + 'h ' + m + 'm') : (m + 'm');
+}
+
+// ============================================================================
+//  GEOCODE CACHE  (persisted per-user via FBLib.Settings)
+//  ----
+//  Stored in the USER settings payload (saveSettings-backed), NOT saveReportData.
+//  The admin-published master (which holds the shared ORS key) also lives in the
+//  report-data slot, so writing the cache there would clobber the key — hence
+//  this uses the user store instead.
+// ============================================================================
+function loadGeoCache() {
+    try { var g = _resolve('geoCache', null); return (g && typeof g === 'object') ? g : {}; }
+    catch (_) { return {}; }
+}
+function saveGeoCache() {
+    try { FBLib.Settings.setUserKey('geoCache', _geoCache); FBLib.Settings.saveUser(); } catch (_) {}
+}
+async function geocodeCached(key, fn) {
+    if (_geoCache[key]) { debugLog('geocode cache hit: ' + key, 'info'); return _geoCache[key]; }
+    var c = await fn();
+    if (c) { _geoCache[key] = c; saveGeoCache(); }
+    return c;
+}
+
+// ============================================================================
+//  OPENROUTESERVICE  (browser fetch — external API)
+// ============================================================================
+async function orsGeocodeStructured(a) {
+    var p = new URLSearchParams({ api_key: orsKey(), size: '1' });
+    if (a.address) p.set('address', a.address);
+    if (a.city)    p.set('locality', a.city);
+    if (a.state)   p.set('region', a.state);
+    if (a.zip)     p.set('postalcode', a.zip);
+    if (a.country) p.set('country', a.country);
+    var res = await fetch('https://api.openrouteservice.org/geocode/search/structured?' + p.toString());
+    if (!res.ok) throw new Error('geocode HTTP ' + res.status);
+    var j = await res.json();
+    var f = j && j.features && j.features[0];
+    return f ? f.geometry.coordinates : null; // [lon,lat]
+}
+async function orsGeocodeText(text) {
+    var p = new URLSearchParams({ api_key: orsKey(), text: text, size: '1' });
+    var res = await fetch('https://api.openrouteservice.org/geocode/search?' + p.toString());
+    if (!res.ok) throw new Error('geocode HTTP ' + res.status);
+    var j = await res.json();
+    var f = j && j.features && j.features[0];
+    return f ? f.geometry.coordinates : null;
+}
+// ORS optimize + geometry in ONE call. options.g=true makes VROOM return the
+// road geometry (encoded polyline) and distance alongside the optimized order,
+// so we skip the separate /directions round-trip. Returns { order, route }.
+async function orsPlan(depot, stops) {
+    var jobs = stops.map(function (s, i) { return { id: i, location: s.coord }; });
+    // Round-trip → vehicle has start AND end at the depot. One-way → start only,
+    // so VROOM leaves the route open (it ends at the last delivery).
+    var veh = { id: 1, profile: orsProfile(), start: [depot.lon, depot.lat] };
+    if (isRoundTrip()) veh.end = [depot.lon, depot.lat];
+    var body = { jobs: jobs, vehicles: [veh], options: { g: true } };
+    var res = await fetch('https://api.openrouteservice.org/optimization', {
+        method: 'POST', headers: { 'Authorization': orsKey(), 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    });
+    if (!res.ok) throw new Error('optimization HTTP ' + res.status);
+    var j = await res.json();
+    var route = j && j.routes && j.routes[0];
+    if (!route) throw new Error('no route returned');
+    var order = [];
+    (route.steps || []).forEach(function (st) { if (st.type === 'job') { var s = stops[st.job]; if (s && order.indexOf(s) < 0) order.push(s); } });
+    stops.forEach(function (s) { if (order.indexOf(s) < 0) order.push(s); }); // any unassigned → end
+    var out = { order: order, route: null };
+    var geom = route.geometry ? decodePolyline(route.geometry) : null;   // [[lon,lat]...]
+    if (geom && geom.length) out.route = { geometry: geom, distance: (route.distance != null ? route.distance : null), duration: (route.duration != null ? route.duration : null) };
+    // Fallback: if g:true didn't return geometry, fetch it the old way.
+    if (!out.route) { try { out.route = await orsDirections(depot, order); } catch (_) { out.route = null; } }
+    return out;
+}
+async function orsDirections(depot, order) {
+    var coords = [[depot.lon, depot.lat]].concat(order.map(function (s) { return s.coord; }));
+    if (isRoundTrip()) coords.push([depot.lon, depot.lat]);   // close the loop only on round-trips
+    // We only draw the line + show total distance/time, so ask ORS to skip the
+    // turn-by-turn instructions and simplify the geometry — smaller payload, less
+    // server work, faster response on the shared free tier.
+    var res = await fetch('https://api.openrouteservice.org/v2/directions/' + orsProfile() + '/geojson', {
+        method: 'POST', headers: { 'Authorization': orsKey(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ coordinates: coords, instructions: false, geometry_simplify: true })
+    });
+    if (!res.ok) throw new Error('directions HTTP ' + res.status);
+    var j = await res.json();
+    var f = j && j.features && j.features[0];
+    if (!f) throw new Error('no directions');
+    return { geometry: f.geometry.coordinates, distance: f.properties.summary.distance, duration: f.properties.summary.duration };
+}
+// Fallback: nearest-neighbour order on straight-line distance (offline-safe once coords exist).
+function nnOrder(depot, stops) {
+    var remaining = stops.slice(), order = [], cur = [depot.lon, depot.lat];
+    while (remaining.length) {
+        var bi = 0, bd = Infinity;
+        for (var i = 0; i < remaining.length; i++) { var d = haversine(cur, remaining[i].coord); if (d < bd) { bd = d; bi = i; } }
+        cur = remaining[bi].coord; order.push(remaining.splice(bi, 1)[0]);
+    }
+    return order;
+}
+// Decode a Google/VROOM encoded polyline (precision 5) → [[lon,lat]...].
+function decodePolyline(str, precision) {
+    var index = 0, lat = 0, lng = 0, out = [], factor = Math.pow(10, precision === undefined ? 5 : precision), byte, shift, result;
+    while (index < str.length) {
+        shift = 0; result = 0;
+        do { byte = str.charCodeAt(index++) - 63; result |= (byte & 0x1f) << shift; shift += 5; } while (byte >= 0x20);
+        lat += (result & 1) ? ~(result >> 1) : (result >> 1);
+        shift = 0; result = 0;
+        do { byte = str.charCodeAt(index++) - 63; result |= (byte & 0x1f) << shift; shift += 5; } while (byte >= 0x20);
+        lng += (result & 1) ? ~(result >> 1) : (result >> 1);
+        out.push([lng / factor, lat / factor]);
+    }
+    return out;
+}
+
+// NOTE: Google Maps was evaluated as an alternative provider but removed — the
+// Fishbowl client serves BI reports from a data: URL (page origin "null"), and
+// Google's Directions/Geocoding services reject that opaque origin (UNKNOWN_ERROR),
+// which cannot be fixed from the API key or spoofed from JS. OpenRouteService
+// works because it allows any origin (CORS *). If this report is ever served
+// from a genuine https:// origin, a Google provider could be reintroduced.
+
+// ============================================================================
+//  DEPOT RESOLUTION
+//  ----
+//  Company mode uses the SELECTED location group's own Ship-To address from the
+//  `address` table (address.accountId = the company's account AND
+//  address.locationGroupId = the selected LG). Address type IDs are
+//  install-specific (in this DB Ship To=10, Bill To=20, Main Office=50), so we
+//  rank by the addresstype NAME — prefer "Ship To", then "Main Office", and push
+//  "Bill To"/"Remit" last — but strictly WITHIN that LG. If the LG has no address
+//  we fail with a clear message rather than borrowing another LG's address (the
+//  old getCompanyAddress() fell back to the LG *name*, e.g. "Perth", which
+//  geocoded to the wrong city). The fielded result is geocoded via the structured
+//  endpoint (address/city/region/postalcode/country).
+// ============================================================================
+var _companyAcctPromise = null;
+function companyAccountId() {
+    // Home-company account id (default company). Falls back to 1 if unresolved.
+    if (!_companyAcctPromise) {
+        _companyAcctPromise = (async function () {
+            try {
+                var rows = await runQueryP('SELECT accountid FROM company ORDER BY (defaultflag + 0) DESC, id LIMIT 1');
+                var id = rows.length ? parseInt(rows[0].accountid, 10) : NaN;
+                return isNaN(id) ? 1 : id;
+            } catch (_) { return 1; }
+        })();
+    }
+    return _companyAcctPromise;
+}
+
+async function loadDepotAddress(lg) {
+    var acctId = await companyAccountId();
+    var hasLg = (lg != null && !isNaN(lg));
+    var sql = [
+        'SELECT a.address, a.city, a.zip, st.code AS state, cc.abbreviation AS country,',
+        '       a.typeid AS type_id, t.name AS type_name, a.locationgroupid AS lg_id',
+        'FROM address a',
+        'LEFT JOIN stateconst st ON st.id = a.stateid',
+        'LEFT JOIN countryconst cc ON cc.id = a.countryid',
+        'LEFT JOIN addresstype t ON t.id = a.typeid',
+        'WHERE a.accountid = ' + acctId,
+        // Strictly scope to the selected location group (when one is chosen) so
+        // the depot is THAT LG's own address — never another LG's.
+        hasLg ? ('  AND a.locationgroupid = ' + lg) : '',
+        // Within the LG, rank by addresstype NAME (install-independent): Ship To
+        // first, then Main Office, pushing Bill To / Remit last; then default-flag.
+        "ORDER BY (LOWER(t.name) LIKE '%ship%') DESC, " +
+                 "(LOWER(t.name) LIKE '%main%') DESC, " +
+                 "(LOWER(t.name) LIKE '%bill%' OR LOWER(t.name) LIKE '%remit%'), " +
+                 '(a.defaultflag + 0) DESC, a.id',
+        'LIMIT 1'
+    ].filter(Boolean).join('\n');
+    var rows = await runQueryP(sql);
+    if (!rows.length) return null;
+    var r = rows[0];
+    return {
+        address: r.address || '', city: r.city || '', state: r.state || '', zip: r.zip || '', country: r.country || '',
+        typeName: r.type_name || ('type ' + r.type_id),
+        lgMatch: hasLg && r.lg_id != null && String(r.lg_id) === String(lg)
+    };
+}
+
+async function resolveDepot() {
+    var mode = _resolve('depotMode', 'company');
+    if (mode === 'manual') {
+        var ll = String(_resolve('depotLatLng', '')).trim();
+        if (ll) {
+            var m = ll.split(','); var lat = parseFloat(m[0]), lon = parseFloat(m[1]);
+            if (isFinite(lat) && isFinite(lon)) return { lon: lon, lat: lat, label: 'Manual coordinates', lgName: 'Trip start (manual)' };
+        }
+        var addr = String(_resolve('depotAddress', '')).trim();
+        if (addr) {
+            var c = await geocodeCached('depot|' + addr, function () { return orsGeocodeText(addr); });
+            if (c) return { lon: c[0], lat: c[1], label: addr, lgName: 'Trip start (manual)' };
+        }
+        throw new Error('Manual depot is selected but no valid coordinates/address are set in Settings.');
+    }
+    var lg = depotLgId();
+    var lgName = currentLgName() || ('Location group ' + lg);
+    var da = await loadDepotAddress(lg);
+    if (!da || !(da.address || da.city || da.zip)) {
+        throw new Error('Location group "' + lgName + '" has no address in the address book. Add a Ship-To address to this location group in Fishbowl, pick a different location group, or set a manual depot in Settings.');
+    }
+    var label = [da.address, da.city, da.state, da.zip].filter(Boolean).join(', ');
+    debugLog('Trip start (company acct, LG ' + lg + ' "' + lgName + '", ' + da.typeName + (da.lgMatch ? '' : ' — no LG-specific address') + '): ' + label, 'info');
+    var cc = await geocodeCached('depot|lg' + lg + '|' + label, function () { return orsGeocodeStructured(da); });
+    if (!cc) throw new Error('Could not geocode the trip-start address (' + label + ') — set a manual depot in Settings.');
+    return { lon: cc[0], lat: cc[1], label: label, lgName: lgName };
+}
+
+// DB-only trip-start info (name + address), NO geocode / network. Lets the tile
+// show the location group's address the moment an LG is picked.
+async function depotPreview() {
+    var mode = _resolve('depotMode', 'company');
+    if (mode === 'manual') {
+        var ll = String(_resolve('depotLatLng', '')).trim();
+        if (ll) return { lgName: 'Trip start (manual)', label: 'Manual coordinates' };
+        var addr = String(_resolve('depotAddress', '')).trim();
+        return addr ? { lgName: 'Trip start (manual)', label: addr } : null;
+    }
+    var lg = depotLgId();
+    var lgName = currentLgName() || ('Location group ' + lg);
+    var da = await loadDepotAddress(lg);
+    if (!da || !(da.address || da.city || da.zip)) return { lgName: lgName, label: 'No address in the address book for this location group' };
+    return { lgName: lgName, label: [da.address, da.city, da.state, da.zip].filter(Boolean).join(', ') };
+}
+
+// Populate the trip-start for display: always the DB address (instant), plus the
+// geocoded _depot (with coords → map pin) when an ORS key is available. Never
+// throws — a missing address just leaves the tile with a friendly note.
+async function resolveDepotForDisplay() {
+    try { _depotPreview = await depotPreview(); } catch (e) { _depotPreview = null; debugLog('depot preview: ' + e.message, 'warn'); }
+    if (orsKey()) {
+        try { _depot = await resolveDepot(); }
+        catch (e) { _depot = null; debugLog('depot geocode (pre-optimize): ' + e.message, 'warn'); }
+    }
+}
+
+// ============================================================================
+//  FILTERS + DATA
+// ============================================================================
+function getDateRange() {
+    var sel = document.getElementById('dateRangeSel').value;
+    var today = moment().format('YYYY-MM-DD');
+    if (sel === 'today')     return { start: today, end: today };
+    if (sel === 'yesterday') { var y = moment().subtract(1, 'day').format('YYYY-MM-DD'); return { start: y, end: y }; }
+    if (sel === 'last7')     return { start: moment().subtract(6, 'days').format('YYYY-MM-DD'), end: today };
+    if (sel === 'custom')    return { start: document.getElementById('startDate').value, end: document.getElementById('endDate').value };
+    return { start: today, end: today };
+}
+function onDateRangeChange() {
+    var sel = document.getElementById('dateRangeSel').value;
+    document.getElementById('customDateInputs').classList.toggle('hidden', sel !== 'custom');
+    if (sel !== 'custom') loadAll();
+}
+function onLgChange() {
+    var v = document.getElementById('lgSel').value;
+    _lgId = (v === '') ? null : parseInt(v, 10);
+    if (_resolve('rememberFilters', true)) _setUserKey('lgId', v);
+    loadAll();
+}
+// Render the ship-status filter pills from _statusSel (selected = solid fill).
+function renderStatusPills() {
+    var host = document.getElementById('statusPills'); if (!host) return;
+    host.innerHTML = SHIP_STATUSES.map(function (s) {
+        var on = _statusSel.has(s.id);
+        var st = on ? 'background:' + s.color + ';border-color:' + s.color + ';color:#fff' : '';
+        var dot = 'background:' + (on ? '#fff' : s.color);
+        return '<button type="button" class="spill-btn' + (on ? ' on' : '') + '" style="' + st + '" ' +
+            'onclick="psToggleShipStatus(\'' + s.id + '\')" title="' + (on ? 'Exclude' : 'Include') + ' ' + s.name + ' shipments">' +
+            '<span class="spill-dot" style="' + dot + '"></span>' + s.name + '</button>';
+    }).join('');
+}
+function psToggleShipStatus(id) {
+    if (_statusSel.has(id)) _statusSel.delete(id); else _statusSel.add(id);
+    renderStatusPills();
+    if (_resolve('rememberFilters', true)) _setUserKey('statusIds', Array.from(_statusSel));
+    loadAll();
+}
+// Carrier multi-select DROPDOWN (self-contained; inline onclick only — the fb-lib
+// MultiSelect's listeners don't fire in this embedded browser). Empty = all
+// carriers. The panel stays open while ticking several; closes on outside click.
+function renderCarrierMenu() {
+    var lbl = document.getElementById('carrierDropLabel');
+    if (lbl) {
+        var names = _carriers.filter(function (c) { return _carrierSel.has(String(c.id)); }).map(function (c) { return c.name; });
+        lbl.textContent = names.length ? names.join(', ') : 'All carriers';
+    }
+    var list = document.getElementById('carrierDropList'); if (!list) return;
+    if (!_carriers.length) { list.innerHTML = '<div class="cdrop-item" style="color:#94a3b8;cursor:default;">No carriers</div>'; return; }
+    list.innerHTML = _carriers.map(function (c) {
+        var id = String(c.id);
+        var on = _carrierSel.has(id);
+        return '<div class="cdrop-item' + (on ? ' on' : '') + '" onclick="psToggleCarrier(\'' + id + '\')">' +
+            '<span class="cdrop-check">' + (on ? '&#10003;' : '') + '</span>' + xmlEsc(c.name) + '</div>';
+    }).join('');
+}
+function carrierDropToggle(e) {
+    if (e) e.stopPropagation();
+    var p = document.getElementById('carrierDropPanel'); if (p) p.classList.toggle('hidden');
+}
+function carrierDropClose() {
+    var p = document.getElementById('carrierDropPanel'); if (p) p.classList.add('hidden');
+}
+function psToggleCarrier(id) {
+    id = String(id);
+    if (_carrierSel.has(id)) _carrierSel.delete(id); else _carrierSel.add(id);
+    renderCarrierMenu();
+    if (_resolve('rememberFilters', true)) _setUserKey('carrierIds', Array.from(_carrierSel));
+    loadAll();
+}
+function carrierSelectAll() {
+    _carrierSel = new Set(_carriers.map(function (c) { return String(c.id); }));
+    renderCarrierMenu();
+    if (_resolve('rememberFilters', true)) _setUserKey('carrierIds', Array.from(_carrierSel));
+    loadAll();
+}
+function carrierClearAll() {
+    _carrierSel = new Set();
+    renderCarrierMenu();
+    if (_resolve('rememberFilters', true)) _setUserKey('carrierIds', []);
+    loadAll();
+}
+function clearFilters() {
+    _statusSel = new Set(['20', '30']);
+    renderStatusPills();
+    _carrierSel = new Set();
+    renderCarrierMenu();
+    document.getElementById('dateRangeSel').value = 'today';
+    document.getElementById('customDateInputs').classList.add('hidden');
+    if (_resolve('rememberFilters', true)) { _setUserKey('carrierIds', []); _setUserKey('statusIds', ['20', '30']); }
+    loadAll();
+}
+
+async function loadFilters() {
+    try {
+        var carriers = await runQueryP('SELECT id, name FROM carrier WHERE activeflag = 1 ORDER BY name');
+        _carriers = carriers.map(function (r) { return { id: r.id, name: r.name }; });
+        debugLog('carriers loaded: ' + _carriers.length, _carriers.length ? 'info' : 'warn');
+        // Restore the remembered carrier selection (ids present in the current list).
+        if (_resolve('rememberFilters', true)) {
+            var savedC = _resolve('carrierIds', []);
+            if (Array.isArray(savedC)) _carrierSel = new Set(savedC.map(String));
+        }
+        renderCarrierMenu();
+    } catch (e) { debugLog('loadFilters: carrier failed: ' + e.message, 'warn'); }
+
+    // Location groups the user can access → the LG select (first = depot default).
+    try {
+        var ids = accessibleLgIds();
+        var sql = 'SELECT id, name FROM locationgroup WHERE activeflag = 1' +
+                  (ids.length ? ' AND id IN (' + ids.map(Number).filter(function (n) { return !isNaN(n); }).join(',') + ')' : '') +
+                  ' ORDER BY name';
+        var lgs = await runQueryP(sql);
+        var sel = document.getElementById('lgSel');
+        // Single-select only — a route always starts from ONE location group's
+        // depot. (Multi-LG runs, e.g. start at LG1 with LG2 as a stop en route,
+        // are a future enhancement.) No "All accessible" option.
+        sel.innerHTML = lgs.map(function (r) { return '<option value="' + r.id + '">' + xmlEsc(r.name) + '</option>'; }).join('');
+        var saved = _resolve('rememberFilters', true) ? _resolve('lgId', '') : '';
+        if (saved !== '' && sel.querySelector('option[value="' + saved + '"]')) { sel.value = saved; }
+        else if (lgs.length) { sel.value = String(lgs[0].id); }   // default to first LG so a depot exists
+        _lgId = (sel.value === '') ? null : parseInt(sel.value, 10);
+    } catch (e) { debugLog('loadFilters: locationgroup failed: ' + e.message, 'warn'); }
+}
+
+function buildSQL() {
+    var r = getDateRange();
+    var dateOk = r.start && r.end && safeDate(r.start) && safeDate(r.end);
+    var conds = [];
+
+    // One OR-group per selected ship status. Shipped (30) filters on the ship
+    // date; Packed (20) / Entered (10) have no true timestamp so match on
+    // last-modified (approximate). No status selected → return nothing.
+    var sids = Array.from(_statusSel).filter(function (id) { return /^\d+$/.test(id); });
+    if (sids.length) {
+        var statusConds = sids.map(function (id) {
+            var dateCol = (id === '30') ? 'ship.dateshipped' : 'ship.datelastmodified';
+            return '(ship.statusid = ' + Number(id) + (dateOk ? " AND DATE(" + dateCol + ") BETWEEN '" + r.start + "' AND '" + r.end + "'" : '') + ')';
+        });
+        conds.push('(' + statusConds.join(' OR ') + ')');
+    } else {
+        conds.push('1 = 0');   // nothing selected → no rows
+    }
+
+    var cs = Array.from(_carrierSel).map(Number).filter(function (n) { return !isNaN(n); });
+    if (cs.length) conds.push('ship.carrierid IN (' + cs.join(',') + ')');
+    if (_lgId != null && !isNaN(_lgId)) {
+        conds.push('ship.locationgroupid = ' + _lgId);
+    } else {
+        var lgs = accessibleLgIds().map(Number).filter(function (n) { return !isNaN(n); });
+        if (lgs.length) conds.push('ship.locationgroupid IN (' + lgs.join(',') + ')');
+    }
+
+    return [
+        // Prefer the SHIP record's own ship-to (the actual destination for this
+        // shipment) and fall back to the SO's ship-to only when a ship field is
+        // blank. NULLIF turns empty strings into NULL so COALESCE can skip them.
+        'SELECT ship.id AS ship_id, ship.num AS ship_num, ship.statusid AS status_id,',
+        '       ship.dateshipped AS date_shipped, ship.cartoncount AS cartons,',
+        '       ship.locationgroupid AS lg_id,',
+        '       so.num AS so_num, so.id AS so_id, c.name AS customer,',
+        '       COALESCE(NULLIF(ship.shiptoname, \'\'), so.shiptoname) AS ship_to_name,',
+        '       COALESCE(NULLIF(ship.shiptoaddress, \'\'), so.shiptoaddress) AS ship_to_address,',
+        '       COALESCE(NULLIF(ship.shiptocity, \'\'), so.shiptocity) AS ship_to_city,',
+        '       COALESCE(NULLIF(ship.shiptozip, \'\'), so.shiptozip) AS ship_to_zip,',
+        '       st.code AS ship_to_state, cc.abbreviation AS ship_to_country',
+        '       , carrier.name AS carrier',
+        'FROM ship',
+        'JOIN so ON so.id = ship.soid AND ship.ordertypeid = 20',
+        'JOIN customer c ON c.id = so.customerid',
+        'JOIN carrier ON carrier.id = ship.carrierid',
+        'LEFT JOIN stateconst st ON st.id = COALESCE(ship.shiptostateid, so.shiptostateid)',
+        'LEFT JOIN countryconst cc ON cc.id = COALESCE(ship.shiptocountryid, so.shiptocountryid)',
+        'WHERE ' + conds.join(' AND '),
+        'ORDER BY ship.num',
+        'LIMIT 2000'
+    ].join('\n');
+}
+
+// Group shipment rows into unique delivery stops (one per ship-to address).
+function groupStops(rows) {
+    var byKey = {};
+    var stops = [];
+    rows.forEach(function (r) {
+        var addr1 = String(r.ship_to_address || '').split(/[\r\n]+/)[0].trim();
+        var key = [addr1, r.ship_to_city, r.ship_to_state, r.ship_to_zip, r.ship_to_country]
+            .map(function (x) { return String(x || '').toLowerCase().trim(); }).join('|');
+        var s = byKey[key];
+        if (!s) {
+            s = {
+                key: key,
+                name: r.ship_to_name || r.customer || '',
+                customer: r.customer || '',
+                address: addr1,
+                city: r.ship_to_city || '',
+                state: r.ship_to_state || '',
+                zip: r.ship_to_zip || '',
+                country: r.ship_to_country || '',
+                shipments: [],
+                coord: _geoCache[key] || null,
+                seq: null
+            };
+            byKey[key] = s; stops.push(s);
+        }
+        s.shipments.push({ ship_num: r.ship_num, so_num: r.so_num, carrier: r.carrier, cartons: r.cartons });
+    });
+    return stops;
+}
+
+async function loadAll() {
+    var tok = ++_loadToken;
+    setStatus('Loading shipments…');
+    if (_resolve('rememberFilters', true)) {
+        _setUserKey('dateRangeSel', document.getElementById('dateRangeSel').value);
+    }
+    try {
+        var sql = buildSQL();
+        debugLog('SQL: ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+        var rows = await runQueryP(sql);
+        if (tok !== _loadToken) { debugLog('loadAll [' + tok + ']: superseded', 'warn'); return; }
+        _shipments = rows;
+        _stops = groupStops(rows);
+        _orderedStops = [];
+        _route = null;
+        _depot = null;       // re-resolve the depot for the (possibly new) location group
+        _planned = false;    // back to the preview list until Optimize runs again
+        _manualOrder = false;
+        // Resolve the trip-start straight from the DB (and geocode it if a key is
+        // set) so the tile shows the LG address AND the start pin appears on the
+        // map immediately — no Optimize required.
+        await resolveDepotForDisplay();
+        if (tok !== _loadToken) return;
+        // Geocode every stop up-front (cache-first) so ALL delivery pins appear on
+        // the map immediately as a preview. Optimize then just orders them + fetches
+        // the road route. Renders once with what's cached, then again once geocoded.
+        debugLog('Loaded ' + rows.length + ' shipments → ' + _stops.length + ' stops', 'success');
+        setStatus(rows.length.toLocaleString() + ' shipment' + (rows.length === 1 ? '' : 's') + ' · ' + _stops.length + ' stop' + (_stops.length === 1 ? '' : 's') + (_stops.length ? ' — deselect any, then Optimise Route' : ''));
+        renderAll();
+        if (_stops.length && orsKey()) {
+            await geocodeStopsConcurrent(_stops, 5);
+            if (tok !== _loadToken) return;
+            renderAll();
+        }
+    } catch (e) {
+        debugLog('loadAll error: ' + e.message, 'error');
+        setStatus('Error — see debug console');
+        showToast('Failed to load shipments: ' + e.message, 'error', 6000);
+    }
+}
+
+// ============================================================================
+//  ROUTE PLANNING
+// ============================================================================
+async function planRoute() {
+    if (!_stops.length) { showToast('No shipments to route.', 'info'); return; }
+    if (!orsKey()) { showToast('No OpenRouteService API key set (Settings ▸ Admin).', 'error', 6000); return; }
+    var btn = document.getElementById('optimizeBtn'); if (btn) btn.disabled = true;
+    setStatus('Planning route…'); setBusy(true, 'Planning route…');
+    try {
+        _depot = await resolveDepot();
+
+        // Geocode every stop concurrently (cache-first) so the include/exclude
+        // checkboxes and any later re-optimize work without re-hitting the geocoder.
+        await geocodeStopsConcurrent(_stops, 5);
+        if (!_stops.some(function (x) { return x.coord && !x.excluded; })) {
+            _orderedStops = []; _route = null; renderAll();
+            showToast('No routable stops — none geocoded, or all are deselected.', 'error', 6000);
+            return;
+        }
+        await computeRoute();
+    } catch (e) {
+        debugLog('planRoute: ' + e.message, 'error');
+        showToast(e.message, 'error', 7000);
+        setStatus('Route planning failed — see debug console');
+        renderAll();
+    } finally {
+        if (btn) btn.disabled = false;
+        setBusy(false);
+    }
+}
+
+// Optimize + draw the INCLUDED (checked) geocoded stops. Assumes the depot is
+// resolved and stops are geocoded (planRoute does that once). Re-run cheaply
+// whenever the selection changes — no depot re-resolve, no re-geocode.
+async function computeRoute() {
+    if (!_depot) return;
+    _planned = true;        // switch the stop list from preview to the planned view
+    _manualOrder = false;   // optimizing discards any manual (reverse/drag) order
+    var mapped = _stops.filter(function (s) { return s.coord && !s.excluded; });
+    if (!mapped.length) {
+        _orderedStops = []; _route = null; renderAll();
+        setStatus('No stops selected for the route');
+        return;
+    }
+    setBusy(true, 'Optimizing route…');
+    try {
+        var order, route = null;
+        try {
+            var plan = await orsPlan(_depot, mapped);   // optimize + road geometry in one ORS call
+            order = plan.order; route = plan.route;
+        } catch (oe) {
+            debugLog('Route optimization failed → nearest-neighbour: ' + oe.message, 'warn');
+            showToast('Optimization unavailable — using nearest-neighbour order.', 'warn', 5000);
+            order = nnOrder(_depot, mapped); route = null;
+        }
+        order.forEach(function (st, ix) { st.seq = ix + 1; });
+        _orderedStops = order;
+        _route = route;
+        if (!route) showToast('Road route unavailable — showing straight-line legs.', 'warn', 5000);
+
+        var unmapped = _stops.filter(function (s) { return !s.coord; }).length;
+        renderAll();
+        setStatus(order.length + ' stop' + (order.length === 1 ? '' : 's') + ' routed' + (unmapped ? (' · ' + unmapped + ' unmapped') : ''));
+    } finally { setBusy(false); }
+}
+
+// Redraw after a reverse / drag-reorder / include-exclude toggle. INSTANT and
+// OFFLINE — shows the new order as a straight-line preview, fires NO network
+// calls. The road route for this exact sequence is fetched only when the user
+// clicks "Route order" (routeManualOrder). This keeps multiple edits snappy and
+// never spins on a slow/failed directions call mid-drag.
+function manualRedraw() {
+    if (!_depot) { renderStops(); return; }
+    var order = _orderedStops.filter(function (s) { return s.coord && !s.excluded; });
+    _stops.forEach(function (s) { if (s.coord && !s.excluded && order.indexOf(s) < 0) order.push(s); });
+    _orderedStops = order;
+    _orderedStops.forEach(function (s, i) { s.seq = i + 1; });
+    _manualOrder = true;
+    _route = null;   // straight-line preview until the user clicks "Route order"
+    renderAll();
+    var n = _orderedStops.length;
+    setStatus(n ? (n + ' stop' + (n === 1 ? '' : 's') + ' · your order — click "Route order" for the road route') : 'No stops selected');
+}
+// Explicit: draw the road route that FOLLOWS the current (manual) order. Does NOT
+// re-optimize — the sequence is fixed. Triggered by the "Route order" button.
+async function routeManualOrder() {
+    if (!_orderedStops.length) { showToast('Nothing to route — reorder or include some stops first.', 'info'); return; }
+    if (!_depot) { showToast('Trip start not resolved yet.', 'info'); return; }
+    if (!orsKey()) { showToast('No OpenRouteService API key set (Settings ▸ Admin).', 'error', 6000); return; }
+    var order = _orderedStops.filter(function (s) { return s.coord; });
+    if (!order.length) { showToast('No geocoded stops to route.', 'info'); return; }
+    var tok = _loadToken;   // cancel the redraw if the data reloads mid-flight
+    var btn = document.getElementById('routeOrderBtn'); if (btn) btn.disabled = true;
+    setBusy(true, 'Routing your order…'); setStatus('Routing your order…');
+    try {
+        var route = await orsDirections(_depot, order);
+        if (tok !== _loadToken) return;   // superseded by a reload
+        _route = route;
+        _manualOrder = true;
+        renderAll();
+        setStatus(order.length + ' stop' + (order.length === 1 ? '' : 's') + ' · your order · ' + fmtKm(route.distance) + ' · ' + fmtDur(route.duration));
+    } catch (e) {
+        debugLog('routeManualOrder (directions) failed: ' + e.message, 'warn');
+        showToast('Routing failed: ' + e.message, 'error', 6000);
+        setStatus('Routing failed — see debug console');
+    } finally {
+        if (btn) btn.disabled = false;
+        setBusy(false);
+    }
+}
+
+// Reverse the manual order (drive the loop the other way). No ORS.
+function psReverseRoute() {
+    if (!_orderedStops.length) return;
+    _orderedStops.reverse();
+    manualRedraw();
+}
+
+// Include/exclude a single stop — instant, no ORS. Before optimising this just
+// re-renders the preview (map pins + list); after a route exists it re-draws the
+// current order straight-line. Either way, "Route order"/Optimise commit it.
+function psToggleStop(key) {
+    var s = _stops.filter(function (x) { return x.key === key; })[0];
+    if (!s) return;
+    s.excluded = !s.excluded;
+    if (_planned) manualRedraw();
+    else renderAll();   // preview: update pins + list only, no routing
+}
+
+// ── Drag-and-drop reorder of the included stops (manual priority order) ──
+function psDragStart(e, row) {
+    _dragKey = row.getAttribute('data-key');
+    row.classList.add('dragging');
+    try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', _dragKey); } catch (_) {}
+}
+function psDragOver(e, row) {
+    if (!_dragKey || row.getAttribute('data-key') === _dragKey) return;
+    e.preventDefault();
+    try { e.dataTransfer.dropEffect = 'move'; } catch (_) {}
+    row.classList.add('dragover');
+}
+function psDragLeave(e, row) { row.classList.remove('dragover'); }
+function psDragEnd(e, row) {
+    _dragKey = null;
+    document.querySelectorAll('#stopsList .stop').forEach(function (el) { el.classList.remove('dragging', 'dragover'); });
+}
+function psDrop(e, row) {
+    e.preventDefault();
+    row.classList.remove('dragover');
+    var targetKey = row.getAttribute('data-key');
+    if (!_dragKey || _dragKey === targetKey) return;
+    var from = _orderedStops.findIndex(function (s) { return s.key === _dragKey; });
+    if (from < 0) return;
+    var rect = row.getBoundingClientRect();
+    var after = (e.clientY - rect.top) > rect.height / 2;
+    var item = _orderedStops.splice(from, 1)[0];
+    var idx = _orderedStops.findIndex(function (s) { return s.key === targetKey; });
+    if (idx < 0) idx = _orderedStops.length; else if (after) idx += 1;
+    _orderedStops.splice(idx, 0, item);
+    _dragKey = null;
+    manualRedraw();   // instant straight-line reorder; "Route order" re-routes on demand
+}
+
+// ============================================================================
+//  RENDER
+// ============================================================================
+function renderAll() { renderStops(); renderMap(); renderKpis(); }
+
+function renderKpis() {
+    var mapped = _orderedStops.length ? _orderedStops : _stops.filter(function (s) { return s.coord && !s.excluded; });
+    var dist = _route ? _route.distance : (mapped.length && _depot ? straightDistance(mapped) : null);
+    var unmapped = _stops.filter(function (s) { return !s.coord; }).length;
+    var excludedCount = _stops.filter(function (s) { return s.coord && s.excluded; }).length;
+    // Route-order + Reverse + Export appear only once a route is planned; QR too.
+    var routed = _orderedStops.length > 0;
+    // "Route order" is offered whenever the on-screen order isn't yet drawn as a
+    // road route (i.e. a manual edit is pending) so the user can commit it.
+    var rob = document.getElementById('routeOrderBtn'); if (rob) rob.style.display = (routed && !_route) ? '' : 'none';
+    var rb = document.getElementById('reverseBtn'); if (rb) rb.style.display = routed ? '' : 'none';
+    var ew = document.getElementById('exportWrap'); if (ew) ew.style.display = routed ? '' : 'none';
+    var qd = document.getElementById('qrDrawer');
+    if (qd) {
+        qd.style.display = routed ? '' : 'none';
+        qd.classList.toggle('collapsed', !_qrOpen);
+        if (routed && _qrOpen) renderQr();
+    }
+    // The route summary (below the toolbar) is the single home for the metrics.
+    var sum = document.getElementById('routeSummary');
+    var unmap = unmapped ? ' · ' + unmapped + ' unmapped' : '';
+    var excl = excludedCount ? ' · ' + excludedCount + ' excluded' : '';
+    if (_orderedStops.length) sum.textContent = _orderedStops.length + ' stops · ' + fmtKm(dist) + (_route ? ' · ' + fmtDur(_route.duration) : ' (approx)') + unmap;
+    else sum.textContent = mapped.length ? (mapped.length + ' stop' + (mapped.length === 1 ? '' : 's') + ' — click Optimise Route' + excl + unmap) : (_stops.length ? ('0 stops selected' + excl + unmap) : 'No route yet');
+}
+function straightDistance(order) {
+    if (!_depot || !order.length) return null;
+    var total = 0, cur = [_depot.lon, _depot.lat];
+    order.forEach(function (s) { total += haversine(cur, s.coord); cur = s.coord; });
+    if (isRoundTrip()) total += haversine(cur, [_depot.lon, _depot.lat]);
+    return total;
+}
+
+function stopRowHtml(s, seqLabel, cls, drag) {
+    var addr = [s.address, s.city, s.state, s.zip].filter(Boolean).join(', ');
+    // SO and Ship each get their OWN pill; both open their module in Fishbowl
+    // (SO → Sales Order, Ship → Shipping).
+    var chips = s.shipments.slice(0, 6).map(function (sh) {
+        var out = '';
+        if (sh.so_num) {
+            var soEsc = xmlEsc(String(sh.so_num).replace(/'/g, "\\'"));
+            out += '<span class="stop-chip"><a href="#" onclick="event.preventDefault();event.stopPropagation();openModule(\'Sales Order\',\'' + soEsc + '\')">SO ' + xmlEsc(sh.so_num) + '</a></span>';
+        }
+        if (sh.ship_num) {
+            var shEsc = xmlEsc(String(sh.ship_num).replace(/'/g, "\\'"));
+            out += '<span class="stop-chip"><a href="#" onclick="event.preventDefault();event.stopPropagation();openModule(\'Shipping\',\'' + shEsc + '\')">Ship ' + xmlEsc(sh.ship_num) + '</a></span>';
+        }
+        return out;
+    }).join('');
+    var more = s.shipments.length > 6 ? '<span class="stop-chip">+' + (s.shipments.length - 6) + ' more</span>' : '';
+    var carrier = s.shipments[0] && s.shipments[0].carrier ? '<span class="stop-chip">' + xmlEsc(s.shipments[0].carrier) + '</span>' : '';
+    // Routable (geocoded) stops get an include/exclude checkbox — available in
+    // the preview too, so the run can be curated BEFORE optimising. Unmapped rows
+    // (and stops with no coord yet) show a spacer for alignment.
+    var routable = s.coord && cls !== 'unmapped-row';
+    var chk = routable
+        ? '<input type="checkbox" class="stop-chk" ' + (s.excluded ? '' : 'checked') + ' title="Include this stop in the route" onclick="event.stopPropagation();psToggleStop(this.closest(\'.stop\').dataset.key)">'
+        : '<span class="stop-chk-spacer"></span>';
+    // Included, planned rows can be reordered via the grip handle on the right.
+    // The row is the drop target; only the grip initiates the drag.
+    var dropAttrs = drag
+        ? ' ondragover="psDragOver(event,this)" ondragleave="psDragLeave(event,this)" ondrop="psDrop(event,this)"'
+        : '';
+    var grip = drag
+        ? '<span class="stop-grip" draggable="true" title="Drag to reorder" onclick="event.stopPropagation()" ondragstart="psDragStart(event,this.closest(\'.stop\'))" ondragend="psDragEnd(event,this.closest(\'.stop\'))"><svg fill="currentColor" viewBox="0 0 24 24"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span>'
+        : '';
+    return '<div class="stop ' + (cls || '') + '" data-key="' + xmlEsc(s.key) + '"' + dropAttrs + ' onclick="focusStop(this.dataset.key)">' +
+        chk +
+        '<div class="stop-seq ' + (cls === 'unmapped-row' ? 'unmapped' : (cls === 'excluded-row' ? 'unmapped' : '')) + '">' + seqLabel + '</div>' +
+        '<div class="stop-body">' +
+            '<div class="stop-cust">' + xmlEsc(s.name || s.customer) + '</div>' +
+            '<div class="stop-addr">' + xmlEsc(addr || '(no address)') + '</div>' +
+            '<div class="stop-meta">' + carrier + chips + more + '</div>' +
+        '</div>' + grip + '</div>';
+}
+
+function renderStops() {
+    var host = document.getElementById('stopsList');
+    if (!_stops.length) { host.innerHTML = '<div class="empty-msg">No shipments match the current filters.</div>'; return; }
+    var html = '';
+    // Trip-start tile — named after the location group with its address, resolved
+    // from the DB as soon as an LG is picked (no Optimize needed).
+    var start = _depot || _depotPreview;
+    var startName = (start && start.lgName) || currentLgName() || 'Trip start';
+    var startAddr = (start && start.label) || 'Select a location group';
+    var startChip = isRoundTrip() ? 'Trip start &amp; end' : 'Trip start';
+    html += '<div class="stop">' +
+        '<span class="stop-chk-spacer"></span>' +
+        '<div class="stop-seq depot" title="Trip start">&#9654;</div>' +
+        '<div class="stop-body">' +
+            '<div class="stop-cust">' + xmlEsc(startName) + '</div>' +
+            '<div class="stop-addr">' + xmlEsc(startAddr) + '</div>' +
+            '<div class="stop-meta"><span class="stop-chip">' + startChip + '</span></div>' +
+        '</div>' +
+    '</div>';
+
+    var planned = _planned;   // Optimize has geocoded the stops + drawn a route
+    if (!planned) {
+        // Preview before optimising — list stops in load order with include/
+        // exclude checkboxes so the run can be curated FIRST. Deselected stops
+        // drop to an "Excluded" group; un-geocoded ones to "Unmapped".
+        var pIncluded = _stops.filter(function (s) { return s.coord && !s.excluded; });
+        pIncluded.forEach(function (s, i) { html += stopRowHtml(s, i + 1, ''); });
+        var pExcluded = _stops.filter(function (s) { return s.coord && s.excluded; });
+        if (pExcluded.length) {
+            html += '<div class="stops-section">Excluded — won\'t be routed (' + pExcluded.length + ')</div>';
+            pExcluded.forEach(function (s) { html += stopRowHtml(s, '—', 'excluded-row'); });
+        }
+        var pUnmapped = _stops.filter(function (s) { return !s.coord; });
+        if (pUnmapped.length) {
+            html += '<div class="stops-section">Unmapped (' + pUnmapped.length + ') — being located…</div>';
+            pUnmapped.forEach(function (s) { html += stopRowHtml(s, '!', 'unmapped-row'); });
+        }
+    } else {
+        // Included, geocoded stops — optimized order when available, else load
+        // order. Draggable only when a real route exists (there's an order to edit).
+        var included = _orderedStops.length ? _orderedStops : _stops.filter(function (s) { return s.coord && !s.excluded; });
+        var canDrag = _orderedStops.length > 0;
+        included.forEach(function (s, i) { html += stopRowHtml(s, s.seq || (i + 1), '', canDrag); });
+        // Deselected (still geocoded) stops — greyed, checkbox unticked to re-add.
+        var excluded = _stops.filter(function (s) { return s.coord && s.excluded; });
+        if (excluded.length) {
+            html += '<div class="stops-section">Excluded from route (' + excluded.length + ')</div>';
+            excluded.forEach(function (s) { html += stopRowHtml(s, '—', 'excluded-row'); });
+        }
+        // Stops that couldn't be geocoded.
+        var unmapped = _stops.filter(function (s) { return !s.coord; });
+        if (unmapped.length) {
+            html += '<div class="stops-section">Unmapped (' + unmapped.length + ') — not on the route</div>';
+            unmapped.forEach(function (s) { html += stopRowHtml(s, '!', 'unmapped-row'); });
+        }
+    }
+    host.innerHTML = html;
+}
+
+function ensureMap() {
+    if (_map) return _map;
+    if (typeof L === 'undefined') { showMapMsg('Map library unavailable (no internet). The stop list and CSV/print still work.'); return null; }
+    hideMapMsg();
+    _map = L.map('mapEl', { zoomControl: true }).setView([39.5, -98.35], 4);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(_map);
+    _mapLayer = L.layerGroup().addTo(_map);
+    return _map;
+}
+function showMapMsg(t) { var m = document.getElementById('mapMsg'); if (m) { m.textContent = t; m.classList.remove('hidden'); } }
+function hideMapMsg() { var m = document.getElementById('mapMsg'); if (m) m.classList.add('hidden'); }
+
+function pin(num, isDepot) {
+    return L.divIcon({ className: '', html: '<div class="map-pin' + (isDepot ? ' depot' : '') + '"><span>' + num + '</span></div>', iconSize: [26, 26], iconAnchor: [13, 26] });
+}
+function renderMap() {
+    var map = ensureMap();
+    if (!map) return;
+    _mapLayer.clearLayers();
+    var pts = [];
+    if (_depot) {
+        L.marker([_depot.lat, _depot.lon], { icon: pin('▶', true) }).addTo(_mapLayer).bindPopup('<strong>' + xmlEsc(_depot.lgName || 'Trip start') + '</strong><br>' + xmlEsc(_depot.label || 'Warehouse'));
+        pts.push([_depot.lat, _depot.lon]);
+    }
+    var ordered = _orderedStops.length ? _orderedStops : _stops.filter(function (s) { return s.coord && !s.excluded; });
+    ordered.forEach(function (s) {
+        if (!s.coord) return;
+        var ll = [s.coord[1], s.coord[0]];
+        var addr = [s.address, s.city, s.state, s.zip].filter(Boolean).join(', ');
+        L.marker(ll, { icon: pin(s.seq || '•', false) }).addTo(_mapLayer).bindPopup('<strong>' + xmlEsc(s.name || s.customer) + '</strong><br>' + xmlEsc(addr));
+        pts.push(ll);
+    });
+    // Route line.
+    if (_route && _route.geometry && _route.geometry.length) {
+        var line = _route.geometry.map(function (c) { return [c[1], c[0]]; });
+        L.polyline(line, { color: '#1e3a5f', weight: 4, opacity: 0.75 }).addTo(_mapLayer);
+    } else if (_depot && ordered.length) {
+        var seq = [[_depot.lat, _depot.lon]].concat(ordered.filter(function (s) { return s.coord; }).map(function (s) { return [s.coord[1], s.coord[0]]; }));
+        if (isRoundTrip()) seq.push([_depot.lat, _depot.lon]);
+        L.polyline(seq, { color: '#94a3b8', weight: 3, opacity: 0.7, dashArray: '6 5' }).addTo(_mapLayer);
+    }
+    if (pts.length) { try { map.fitBounds(pts, { padding: [40, 40], maxZoom: 14 }); } catch (_) {} }
+    setTimeout(function () { try { map.invalidateSize(); } catch (_) {} }, 60);
+}
+function focusStop(key) {
+    var s = _stops.filter(function (x) { return x.key === key; })[0];
+    document.querySelectorAll('#stopsList .stop').forEach(function (el) { el.classList.toggle('active', el.getAttribute('data-key') === key); });
+    if (_map && s && s.coord) { _map.setView([s.coord[1], s.coord[0]], 14); }
+}
+
+// ============================================================================
+//  EXPORTS
+// ============================================================================
+function routeReady() {
+    if (!_orderedStops.length || !_depot) { showToast('Optimize the route first.', 'info'); return false; }
+    return true;
+}
+function downloadBlob(name, mime, text) {
+    var blob = new Blob([text], { type: mime });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+}
+function toggleExportMenu(e) { e.stopPropagation(); document.getElementById('exportMenu').classList.toggle('open'); }
+function closeExportMenu() { var m = document.getElementById('exportMenu'); if (m) m.classList.remove('open'); }
+
+// Build the Google Maps directions deep-link for the current optimized route
+// (round-trip: origin = destination = depot). Returns { url, dropped } or null.
+function gmapsUrl() {
+    if (!_orderedStops.length || !_depot) return null;
+    var pts = _orderedStops.filter(function (s) { return s.coord; });
+    if (!pts.length) return null;
+    var ll = function (s) { return s.coord[1] + ',' + s.coord[0]; };
+    var origin = _depot.lat + ',' + _depot.lon;
+    var dest, wp, dropped;
+    if (isRoundTrip()) {
+        dest = origin;                                   // return to depot
+        wp = pts.slice(0, GMAPS_MAX).map(ll);
+        dropped = Math.max(0, pts.length - GMAPS_MAX);
+    } else {
+        dest = ll(pts[pts.length - 1]);                  // end at the last delivery
+        var mid = pts.slice(0, pts.length - 1);
+        wp = mid.slice(0, GMAPS_MAX).map(ll);
+        dropped = Math.max(0, mid.length - GMAPS_MAX);
+    }
+    var url = 'https://www.google.com/maps/dir/?api=1&travelmode=driving&origin=' + origin + '&destination=' + dest +
+              (wp.length ? '&waypoints=' + encodeURIComponent(wp.join('|')) : '');
+    return { url: url, dropped: dropped };
+}
+
+function openGmaps() {
+    closeExportMenu();
+    if (!routeReady()) return;
+    var g = gmapsUrl(); if (!g) return;
+    if (g.dropped) showToast('Google Maps allows ' + GMAPS_MAX + ' stops per link — first ' + GMAPS_MAX + ' of ' + (_orderedStops.filter(function (s) { return s.coord; }).length) + ' included.', 'warn', 6000);
+    try { window.open(g.url, '_blank'); } catch (_) { showToast('Could not open Google Maps (popup blocked).', 'error'); }
+}
+
+// ── QR code (route deep-link) ────────────────────────────────
+// Rendered from the QRServer API and cached as a data-URI so the same image can
+// be shown on screen AND embedded self-contained in the printed run-sheet.
+var _qrCache = {};
+async function qrDataUrl(text) {
+    if (_qrCache[text]) return _qrCache[text];
+    try {
+        var api = 'https://api.qrserver.com/v1/create-qr-code/?size=240x240&margin=1&format=png&data=' + encodeURIComponent(text);
+        var res = await fetch(api);
+        if (!res.ok) throw new Error('QR HTTP ' + res.status);
+        var blob = await res.blob();
+        var dataUrl = await new Promise(function (resolve, reject) {
+            var fr = new FileReader(); fr.onload = function () { resolve(fr.result); }; fr.onerror = reject; fr.readAsDataURL(blob);
+        });
+        _qrCache[text] = dataUrl;
+        return dataUrl;
+    } catch (e) { debugLog('QR generate failed: ' + e.message, 'warn'); return null; }
+}
+function qrToggleDrawer() {
+    _qrOpen = !_qrOpen;
+    var qd = document.getElementById('qrDrawer'); if (qd) qd.classList.toggle('collapsed', !_qrOpen);
+    if (_qrOpen) renderQr();
+}
+async function renderQr() {
+    var g = gmapsUrl();
+    var wrap = document.getElementById('qrImgWrap'), link = document.getElementById('qrLink');
+    if (!wrap) return;
+    if (!g) { wrap.innerHTML = 'Optimize the route first.'; if (link) link.style.display = 'none'; return; }
+    if (link) { link.href = g.url; }
+    wrap.innerHTML = 'Generating…';
+    var data = await qrDataUrl(g.url);
+    if (data) {
+        wrap.innerHTML = '<img alt="Route QR code" src="' + data + '">';
+        if (link) link.style.display = 'none';
+    } else {
+        wrap.innerHTML = '<div style="color:#b45309;font-size:12px;padding:12px">Couldn\'t reach the QR service. Use the link below.</div>';
+        if (link) { link.style.display = 'inline-block'; link.textContent = 'Open route in Google Maps'; }
+    }
+    if (g.dropped) debugLog('QR route capped at ' + GMAPS_MAX + ' waypoints (' + g.dropped + ' dropped)', 'warn');
+}
+function exportGpx() {
+    closeExportMenu();
+    if (!routeReady()) return;
+    var startNm = _depot.lgName || 'Trip start';
+    var pts = [{ name: startNm + ' (start)', lat: _depot.lat, lon: _depot.lon }]
+        .concat(_orderedStops.filter(function (s) { return s.coord; }).map(function (s) { return { name: '#' + s.seq + ' ' + (s.name || s.customer), lat: s.coord[1], lon: s.coord[0] }; }));
+    if (isRoundTrip()) pts.push({ name: startNm + ' (return)', lat: _depot.lat, lon: _depot.lon });
+    var rtept = pts.map(function (p) { return '  <rtept lat="' + p.lat + '" lon="' + p.lon + '"><name>' + xmlEsc(p.name) + '</name></rtept>'; }).join('\n');
+    var gpx = '<?xml version="1.0" encoding="UTF-8"?>\n' +
+        '<gpx version="1.1" creator="Fishbowl BI Delivery Route Planner" xmlns="http://www.topografix.com/GPX/1/1">\n' +
+        '<rte><name>Delivery route ' + moment().format('YYYY-MM-DD') + '</name>\n' + rtept + '\n</rte>\n</gpx>';
+    downloadBlob('delivery_route_' + moment().format('YYYY-MM-DD') + '.gpx', 'application/gpx+xml', gpx);
+    debugLog('Exported GPX (' + _orderedStops.length + ' stops)', 'success');
+}
+function exportKml() {
+    closeExportMenu();
+    if (!routeReady()) return;
+    var placemarks = '<Placemark><name>' + xmlEsc((_depot.lgName || 'Trip start') + ' (start)') + '</name><Point><coordinates>' + _depot.lon + ',' + _depot.lat + ',0</coordinates></Point></Placemark>\n';
+    _orderedStops.filter(function (s) { return s.coord; }).forEach(function (s) {
+        var addr = [s.address, s.city, s.state, s.zip].filter(Boolean).join(', ');
+        placemarks += '<Placemark><name>' + xmlEsc('#' + s.seq + ' ' + (s.name || s.customer)) + '</name>' +
+            '<description>' + xmlEsc(addr) + '</description>' +
+            '<Point><coordinates>' + s.coord[0] + ',' + s.coord[1] + ',0</coordinates></Point></Placemark>\n';
+    });
+    var lineCoords;
+    if (_route && _route.geometry && _route.geometry.length) {
+        lineCoords = _route.geometry.map(function (c) { return c[0] + ',' + c[1] + ',0'; }).join(' ');
+    } else {
+        var seq = [[_depot.lon, _depot.lat]].concat(_orderedStops.filter(function (s) { return s.coord; }).map(function (s) { return s.coord; }));
+        if (isRoundTrip()) seq.push([_depot.lon, _depot.lat]);
+        lineCoords = seq.map(function (c) { return c[0] + ',' + c[1] + ',0'; }).join(' ');
+    }
+    var kml = '<?xml version="1.0" encoding="UTF-8"?>\n' +
+        '<kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>Delivery route ' + moment().format('YYYY-MM-DD') + '</name>\n' +
+        '<Style id="rt"><LineStyle><color>ff5f3a1e</color><width>4</width></LineStyle></Style>\n' +
+        placemarks +
+        '<Placemark><name>Route</name><styleUrl>#rt</styleUrl><LineString><tessellate>1</tessellate><coordinates>' + lineCoords + '</coordinates></LineString></Placemark>\n' +
+        '</Document></kml>';
+    downloadBlob('delivery_route_' + moment().format('YYYY-MM-DD') + '.kml', 'application/vnd.google-earth.kml+xml', kml);
+    debugLog('Exported KML (' + _orderedStops.length + ' stops)', 'success');
+}
+function exportCsv() {
+    closeExportMenu();
+    var ordered = _orderedStops.length ? _orderedStops : _stops;
+    if (!ordered.length) { showToast('No stops to export.', 'info'); return; }
+    var cols = ['Seq', 'Customer', 'Ship To', 'Address', 'City', 'State', 'Zip', 'Country', 'SO #', 'Ship #', 'Carrier', 'Cartons'];
+    var lines = [cols.map(function (c) { return '"' + c + '"'; }).join(',')];
+    ordered.forEach(function (s, i) {
+        var soNums = s.shipments.map(function (x) { return x.so_num; }).filter(Boolean).join('; ');
+        var shNums = s.shipments.map(function (x) { return x.ship_num; }).filter(Boolean).join('; ');
+        var carrier = s.shipments[0] ? (s.shipments[0].carrier || '') : '';
+        var cartons = s.shipments.reduce(function (a, x) { return a + (parseFloat(x.cartons) || 0); }, 0);
+        var vals = [(s.seq || i + 1), s.customer, s.name, s.address, s.city, s.state, s.zip, s.country, soNums, shNums, carrier, cartons];
+        lines.push(vals.map(function (v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; }).join(','));
+    });
+    downloadBlob('delivery_manifest_' + moment().format('YYYY-MM-DD') + '.csv', 'text/csv;charset=utf-8;', lines.join('\r\n'));
+    debugLog('Exported CSV (' + ordered.length + ' stops)', 'success');
+}
+async function printRunSheet() {
+    closeExportMenu();
+    var ordered = _orderedStops.length ? _orderedStops : _stops;
+    if (!ordered.length) { showToast('No stops to print.', 'info'); return; }
+    function e(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' })[c]; }); }
+    var rows = ordered.map(function (s, i) {
+        var addr = [s.address, s.city, s.state, s.zip].filter(Boolean).join(', ');
+        var soNums = s.shipments.map(function (x) { return x.so_num; }).filter(Boolean).join(', ');
+        var carrier = s.shipments[0] ? (s.shipments[0].carrier || '') : '';
+        return '<tr><td class="nc">' + (s.seq || i + 1) + '</td><td>' + e(s.name || s.customer) + '</td><td>' + e(addr) + '</td><td>' + e(soNums) + '</td><td>' + e(carrier) + '</td><td class="nc">&#9723;</td></tr>';
+    }).join('');
+    var totals = 'Start: ' + e(_depot ? ((_depot.lgName ? _depot.lgName + ' — ' : '') + (_depot.label || 'Warehouse')) : 'Warehouse') +
+        (_route ? ' · ' + fmtKm(_route.distance) + ' · ' + fmtDur(_route.duration) : '');
+    // Embed the route QR (data-URI, so the print window is self-contained).
+    var g = gmapsUrl();
+    var qrData = g ? await qrDataUrl(g.url) : null;
+    var qrBlock = qrData
+        ? '<div class="qr"><img src="' + qrData + '" alt="Route QR" width="120" height="120"/><div class="qrcap">Scan for turn-by-turn<br>in Google Maps</div></div>'
+        : '';
+    var html = '<!DOCTYPE html><html><head><meta charset="UTF-8"/><title>Delivery Run-Sheet</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:9pt;margin:.4in;color:#111}' +
+        '.hd{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}' +
+        'h2{font-size:13pt;margin:0 0 2px;color:#1e3a5f}.sub{font-size:8pt;color:#555;margin:0 0 10px}' +
+        '.qr{text-align:center;flex-shrink:0}.qr img{border:1px solid #e5e7eb}.qrcap{font-size:7pt;color:#555;margin-top:2px;line-height:1.3}' +
+        'table{border-collapse:collapse;width:100%}th{background:#1e3a5f;color:#fff;font-size:8pt;padding:5px 6px;text-align:left;-webkit-print-color-adjust:exact;print-color-adjust:exact}' +
+        'td{font-size:8.5pt;padding:5px 6px;border-bottom:1px solid #e5e7eb}tr:nth-child(even) td{background:#f7f9fb;-webkit-print-color-adjust:exact;print-color-adjust:exact}' +
+        '.nc{text-align:center}@page{size:A4 portrait;margin:.4in}</style></head><body>' +
+        '<div class="hd"><div><h2>Delivery Run-Sheet — ' + moment().format('ddd D MMM YYYY') + '</h2>' +
+        '<p class="sub">' + e(totals) + '</p></div>' + qrBlock + '</div>' +
+        '<table><thead><tr><th>#</th><th>Customer</th><th>Address</th><th>SO</th><th>Carrier</th><th>Done</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+        '</body></html>';
+    var w = window.open('', '_blank');
+    if (!w) { showToast('Print popup blocked.', 'error'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+    debugLog('Printed run-sheet (' + ordered.length + ' stops)', 'success');
+}
+
+// ============================================================================
+//  SETTINGS
+// ============================================================================
+// Reflect the round-trip / one-way state on the top-left segmented toggle.
+function syncRtSeg() {
+    var rt = isRoundTrip();
+    var seg = document.getElementById('rtSeg'); if (!seg) return;
+    seg.querySelectorAll('button').forEach(function (b) {
+        b.classList.toggle('active', (b.getAttribute('data-rt') === '1') === rt);
+    });
+}
+// Top-left toggle → persist round-trip + sync the toggle. No auto-optimize: if a
+// route is on screen, refresh the straight-line preview / totals to reflect the
+// return-leg change; the road route updates on the next Optimize click.
+function setRoundTripUi(on) {
+    _setUserKey('roundTrip', !!on);
+    syncRtSeg();
+    if (_orderedStops.length) { _route = null; renderAll(); setStatus(_orderedStops.length + ' stop' + (_orderedStops.length === 1 ? '' : 's') + ' · click Optimize to route'); }
+    else renderStops();   // refresh the trip-start "start / start & end" chip
+}
+
+function _hydrateSettings() {
+    document.getElementById('setProfile').value       = _resolve('profile', 'driving-car');
+    syncRtSeg();
+    document.getElementById('setDepotMode').value     = _resolve('depotMode', 'company');
+    document.getElementById('setDepotAddress').value  = _resolve('depotAddress', '');
+    document.getElementById('setDepotLatLng').value   = _resolve('depotLatLng', '');
+    document.getElementById('setRememberFilters').checked = !!_resolve('rememberFilters', true);
+    document.getElementById('setShowDebug').checked       = !!_resolve('showDebug', false);
+    var ok = document.getElementById('setOrsKey'); if (ok) ok.value = _resolve('orsApiKey', '');
+    // Restore remembered filter selections (status pills + date range).
+    if (_resolve('rememberFilters', true)) {
+        var sids = _resolve('statusIds', null);
+        if (Array.isArray(sids) && sids.length) _statusSel = new Set(sids.map(String));
+        var dr = _resolve('dateRangeSel', ''); if (dr) document.getElementById('dateRangeSel').value = dr;
+        document.getElementById('customDateInputs').classList.toggle('hidden', document.getElementById('dateRangeSel').value !== 'custom');
+    }
+    renderStatusPills();
+}
+// Display-only settings.
+function onSettingsChange() {
+    _setUserKey('rememberFilters', document.getElementById('setRememberFilters').checked);
+    var showDebug = document.getElementById('setShowDebug').checked;
+    _setUserKey('showDebug', showDebug);
+    _applyDebugDrawer(showDebug);
+}
+// Route-affecting settings (profile / depot) — persist only. They take effect
+// the next time the user clicks Optimize (we never auto-optimize).
+function onRouteSettingChange() {
+    _setUserKey('profile', document.getElementById('setProfile').value);
+    _setUserKey('depotMode', document.getElementById('setDepotMode').value);
+    _setUserKey('depotAddress', document.getElementById('setDepotAddress').value.trim());
+    _setUserKey('depotLatLng', document.getElementById('setDepotLatLng').value.trim());
+    if (_orderedStops.length) setStatus('Route settings changed — click Optimize to apply');
+}
+function resetSettings() {
+    if (!confirm('Reset your personal settings to defaults?')) return;
+    try { FBLib.Settings.clearUser(); } catch (_) {}
+    _hydrateSettings();
+    _applyDebugDrawer(!!_resolve('showDebug', false));
+}
+// Admin: publish the shared ORS key into the master payload (merge, don't clobber).
+function saveOrgKey() {
+    if (!FBLib.Settings.isAdmin()) { showToast('Only an admin can set the org key.', 'error'); return; }
+    try {
+        var master = Object.assign({}, FBLib.Settings.getMaster());
+        master.orsApiKey = document.getElementById('setOrsKey').value.trim();
+        FBLib.Settings.publishMaster(master);
+        showToast('OpenRouteService key saved for all users.', 'success');
+        debugLog('ORS org key published', 'success');
+    } catch (e) { showToast('Save failed: ' + e.message, 'error'); }
+}
+function publishDefaults() {
+    if (!FBLib.Settings.isAdmin()) return;
+    if (!confirm('Publish current route settings as the default for all users?')) return;
+    try {
+        var master = Object.assign({}, FBLib.Settings.getMaster());
+        master.profile = document.getElementById('setProfile').value;
+        FBLib.Settings.publishMaster(master);
+        debugLog('Defaults published', 'success');
+        showToast('Defaults published.', 'success');
+    } catch (e) { debugLog('publishDefaults: ' + e.message, 'error'); }
+}
+function toggleUserEditing() {
+    if (!FBLib.Settings.isAdmin()) return;
+    try { var allowed = FBLib.Settings.userEditingAllowed(); FBLib.Settings.setLock(allowed); _refreshAdminUi(); }
+    catch (e) { debugLog('toggleUserEditing: ' + e.message, 'error'); }
+}
+function _refreshAdminUi() {
+    var isAdmin = FBLib.Settings.isAdmin();
+    document.getElementById('dsAdminSection').style.display = isAdmin ? 'block' : 'none';
+    var allowed = FBLib.Settings.userEditingAllowed();
+    document.getElementById('dsLockBadge').style.display = (!allowed && !isAdmin) ? 'block' : 'none';
+    var lockBtn = document.getElementById('dsLockBtn');
+    if (lockBtn) lockBtn.textContent = allowed ? 'Lock user editing' : 'Unlock user editing';
+}
+
+// ============================================================================
+//  DEBUG DRAWER
+// ============================================================================
+var _debugApi = null;
+function _applyDebugDrawer(showIt) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (showIt) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    if (_debugApi.element) _observeDebugDrawer(_debugApi.element);
+}
+function _observeDebugDrawer(el) {
+    if (!el || el._observed) return;
+    el._observed = true;
+    var apply = function () {
+        var visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        var h = (visible && open) ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+        if (_map) setTimeout(function () { try { _map.invalidateSize(); } catch (_) {} }, 60);
+    };
+    apply();
+    if (typeof ResizeObserver === 'function') { try { new ResizeObserver(apply).observe(el); } catch (_) {} }
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async function () {
+  try {
+    FBLib.Common.registerDrawer({ id: 'setOverlay',     triggerId: 'setBtn'     });
+    FBLib.Common.registerDrawer({ id: 'helpOverlay',    triggerId: 'helpBtn'    });
+
+    _geoCache = loadGeoCache();
+    _hydrateSettings();
+    _applyDebugDrawer(!!_resolve('showDebug', false));
+    _refreshAdminUi();
+
+    // Backdrop scrim: dim the page whenever a Settings/Help drawer is open, and
+    // close the open drawer when the scrim is clicked. Driven off the .open class
+    // that FBLib toggles, so it works no matter how the drawer was opened/closed.
+    (function () {
+        var scrim = document.getElementById('drawerScrim');
+        var drawers = ['setOverlay', 'helpOverlay'].map(function (id) { return document.getElementById(id); }).filter(Boolean);
+        if (!scrim || !drawers.length) return;
+        function sync() { scrim.classList.toggle('show', drawers.some(function (d) { return d.classList.contains('open'); })); }
+        drawers.forEach(function (d) { try { new MutationObserver(sync).observe(d, { attributes: true, attributeFilter: ['class'] }); } catch (_) {} });
+        scrim.addEventListener('click', function () {
+            drawers.forEach(function (d) { if (d.classList.contains('open')) { try { FBLib.Common.closeDrawer(d.id); } catch (_) { d.classList.remove('open'); } } });
+            sync();
+        });
+        sync();
+    })();
+
+    // Close the export menu + carrier dropdown on any outside click.
+    document.addEventListener('click', function (e) {
+        if (!e.target.closest('.menu-wrap')) closeExportMenu();
+        if (!e.target.closest('#carrierDrop')) carrierDropClose();
+    });
+    window.addEventListener('resize', function () { if (_map) setTimeout(function () { try { _map.invalidateSize(); } catch (_) {} }, 60); });
+
+    await loadFilters();
+    await loadAll();
+    debugLog('Delivery Route Planner initialised', 'success');
+  } catch (e) {
+    console.error('[Route Planner init] failed:', e);
+    setStatus('Init failed — ' + (e && e.message ? e.message : 'see browser console'));
+    try { FBLib.Common.debugLog('Init failed: ' + (e && e.stack ? e.stack : e), 'error'); } catch (_) {}
+  }
+});
+
+// Expose inline-onclick handlers.
+window.loadAll = loadAll;
+window.planRoute = planRoute;
+window.routeManualOrder = routeManualOrder;
+window.clearFilters = clearFilters;
+window.onDateRangeChange = onDateRangeChange;
+window.onLgChange = onLgChange;
+window.psToggleShipStatus = psToggleShipStatus;
+window.psToggleCarrier = psToggleCarrier;
+window.carrierDropToggle = carrierDropToggle;
+window.carrierSelectAll = carrierSelectAll;
+window.carrierClearAll = carrierClearAll;
+window.onSettingsChange = onSettingsChange;
+window.onRouteSettingChange = onRouteSettingChange;
+window.resetSettings = resetSettings;
+window.saveOrgKey = saveOrgKey;
+window.publishDefaults = publishDefaults;
+window.toggleUserEditing = toggleUserEditing;
+window.toggleExportMenu = toggleExportMenu;
+window.openGmaps = openGmaps;
+window.exportGpx = exportGpx;
+window.exportKml = exportKml;
+window.exportCsv = exportCsv;
+window.printRunSheet = printRunSheet;
+window.focusStop = focusStop;
+window.psToggleStop = psToggleStop;
+window.qrToggleDrawer = qrToggleDrawer;
+window.setRoundTripUi = setRoundTripUi;
+window.psReverseRoute = psReverseRoute;
+window.psDragStart = psDragStart;
+window.psDragOver = psDragOver;
+window.psDragLeave = psDragLeave;
+window.psDragEnd = psDragEnd;
+window.psDrop = psDrop;
+</script>
+
+</body>
+</html>
