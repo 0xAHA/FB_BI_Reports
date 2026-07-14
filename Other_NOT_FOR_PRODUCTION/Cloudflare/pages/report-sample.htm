@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<!--
+    report-sample.htm — a GENERIC Fishbowl BI report demonstrating the portal
+    data transport used by the Cloudflare architecture in this package.
+
+    It lists open sales orders (Order #, Customer, Status, Total, Date Issued)
+    in a sortable table. It runs unchanged in three contexts:
+
+      • fishbowl   — inside the Fishbowl desktop client (native runQuery bridges)
+      • portal     — served from a Cloudflare Pages site behind Access; talks to
+                     same-origin /api/data-query (the Pages Function → Worker →
+                     tunnel → Fishbowl chain). No token in JS; the Access cookie
+                     authenticates.
+      • standalone — anywhere else (opened as a file, LAN dev). No backend →
+                     it falls back to built-in SAMPLE DATA and shows a banner.
+
+    This file contains NO real hostnames, emails, or company data. To wire it to
+    a real portal, add your Pages hostname to PORTAL_HOSTS below.
+
+    See ARCHITECTURE.md for the full request chain.
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Open Sales Orders — Sample</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 13px; color: #334155; background: #f5f5f5; padding: 16px;
+        }
+        h1 { font-size: 18px; font-weight: 700; color: #0f172a; margin-bottom: 2px; }
+        .sub { font-size: 12px; color: #64748b; margin-bottom: 12px; }
+        .banner {
+            display: none; margin-bottom: 12px; padding: 8px 12px; border-radius: 6px;
+            font-size: 12px; background: #fff3cd; color: #856404; border: 1px solid #ffe69c;
+        }
+        .banner.show { display: block; }
+        .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; }
+        table { width: 100%; border-collapse: collapse; }
+        th {
+            background: #f8fafc; text-align: left; padding: 10px 12px; font-size: 11px;
+            font-weight: 600; color: #475569; text-transform: uppercase; letter-spacing: 0.04em;
+            border-bottom: 2px solid #e2e8f0; cursor: pointer; user-select: none; white-space: nowrap;
+        }
+        th:hover { background: #eef2f7; }
+        th .arrow { color: #94a3b8; font-size: 10px; margin-left: 4px; }
+        th.sorted .arrow { color: #2d9cdb; }
+        td { padding: 9px 12px; border-bottom: 1px solid #eef2f7; }
+        td.num { font-weight: 600; color: #1e293b; font-variant-numeric: tabular-nums; }
+        td.money { text-align: right; font-variant-numeric: tabular-nums; }
+        td.date { font-variant-numeric: tabular-nums; white-space: nowrap; }
+        tr:hover td { background: #f8fafc; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+        .b10 { background: #e2e8f0; color: #475569; }   /* Estimate */
+        .b20 { background: #cce5ff; color: #004085; }   /* Issued */
+        .b25 { background: #fff3cd; color: #856404; }   /* In Progress */
+        .b60 { background: #d4edda; color: #155724; }   /* Fulfilled */
+        .empty { padding: 24px; text-align: center; color: #94a3b8; font-style: italic; }
+    </style>
+</head>
+<body>
+    <h1>Open Sales Orders</h1>
+    <div class="sub" id="subtitle">Loading…</div>
+    <div class="banner" id="banner"></div>
+    <div class="card">
+        <table id="tbl">
+            <thead>
+                <tr id="head"></tr>
+            </thead>
+            <tbody id="body">
+                <tr><td class="empty" colspan="5">Loading…</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+    // ── Mode detection ───────────────────────────────────────────────
+    // Add your Cloudflare Pages hostname(s) here so the page detects
+    // portal mode when served from behind Access.
+    const PORTAL_HOSTS = ['your-portal.pages.dev', 'portal.example.com'];
+    const MODE = (typeof runQuery === 'function'
+               || typeof runQueryAsync === 'function'
+               || typeof runRestApiAsync === 'function') ? 'fishbowl'
+           : PORTAL_HOSTS.includes(location.hostname) ? 'portal'
+           : 'standalone';
+
+    // Connection object. In portal mode baseUrl is empty (same-origin) and the
+    // Cloudflare Access cookie authenticates automatically — no token in JS.
+    // In standalone mode you'd log in via /api/login and hold a Bearer token;
+    // this sample doesn't, so standalone falls through to sample data.
+    const _conn = { baseUrl: '', token: null };
+    if (MODE === 'standalone') { _conn.baseUrl = 'http://localhost:2456'; }
+
+    // ── Data transport (trimmed from the production report) ───────────
+    function lowercaseKeys(rows) {
+        return (rows || []).map(r => {
+            if (!r || typeof r !== 'object') return r;
+            const out = {};
+            for (const k of Object.keys(r)) out[k.toLowerCase()] = r[k];
+            return out;
+        });
+    }
+
+    // qp() picks the best available transport, in priority order:
+    //   runQueryAsync / runQuery  → Fishbowl desktop bridges
+    //   runRestApiAsync           → Fishbowl mobile app bridge
+    //   httpQuery()               → portal (same-origin) / standalone (Bearer)
+    async function qp(sql) {
+        if (typeof runQueryAsync === 'function') {
+            const r = await runQueryAsync(sql);
+            return Array.isArray(r) ? r : (typeof r === 'string' ? JSON.parse(r) : []);
+        }
+        if (typeof runQuery === 'function') {
+            const r = runQuery(sql);
+            return typeof r === 'string' ? JSON.parse(r) : (Array.isArray(r) ? r : []);
+        }
+        if (typeof runRestApiAsync === 'function') {
+            const raw = await runRestApiAsync({
+                method: 'GET', path: '/api/data-query',
+                queryParameters: [['query', sql]],
+            });
+            const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            const rows = Array.isArray(data) ? data : (data && (data.rows || data.data || data.results)) || [];
+            return lowercaseKeys(rows);
+        }
+        return await httpQuery(sql);
+    }
+
+    // HTTP transport for /api/data-query.
+    //   portal:     same-origin fetch; Access cookie rides along automatically.
+    //   standalone: cross-origin fetch with a Bearer token (not set in this sample).
+    async function httpQuery(sql) {
+        if (MODE === 'standalone' && !_conn.token) {
+            const err = new Error('Standalone mode with no token — connect a backend to load live data.');
+            err.code = 'NO_TOKEN';
+            throw err;
+        }
+        const url = _conn.baseUrl.replace(/\/$/, '') + '/api/data-query?query=' + encodeURIComponent(sql);
+        const headers = {};
+        if (_conn.token) headers.Authorization = 'Bearer ' + _conn.token;
+        const res = await fetch(url, { headers });
+        if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + res.statusText);
+        const data = await res.json();
+        const rows = Array.isArray(data) ? data : (data.rows || data.data || data.results || []);
+        return lowercaseKeys(rows);
+    }
+
+    // ── Query + rendering ─────────────────────────────────────────────
+    const SQL =
+        "SELECT so.num AS num, c.name AS customer, sostatus.name AS status, " +
+        "       so.statusid AS statusid, so.dateissued AS dateissued, " +
+        "       so.totalprice AS totalprice " +
+        "FROM so " +
+        "JOIN customer c   ON c.id = so.customerid " +
+        "JOIN sostatus     ON sostatus.id = so.statusid " +
+        "WHERE so.statusid IN (20, 25) " +
+        "ORDER BY so.dateissued DESC " +
+        "LIMIT 200";
+
+    // Trimmed status map (matches Fishbowl's sostatus ids).
+    const STATUS_MAP = { 10: 'Estimate', 20: 'Issued', 25: 'In Progress', 60: 'Fulfilled' };
+
+    // Built-in sample data — used when no Fishbowl backend is reachable so the
+    // page renders anywhere. NOT real data.
+    const MOCK = [
+        { num: 'SO-1042', customer: 'Acme Widgets',        statusid: 20, status: 'Issued',      dateissued: '2026-07-02', totalprice: 4820.00 },
+        { num: 'SO-1043', customer: 'Globex Supplies',     statusid: 25, status: 'In Progress', dateissued: '2026-07-03', totalprice: 15230.50 },
+        { num: 'SO-1044', customer: 'Initech Pty Ltd',     statusid: 20, status: 'Issued',      dateissued: '2026-07-05', totalprice: 990.00 },
+        { num: 'SO-1045', customer: 'Umbrella Trading',    statusid: 25, status: 'In Progress', dateissued: '2026-07-05', totalprice: 27640.75 },
+        { num: 'SO-1046', customer: 'Wayne Distribution',  statusid: 20, status: 'Issued',      dateissued: '2026-07-08', totalprice: 3125.00 },
+        { num: 'SO-1047', customer: 'Stark Wholesale',     statusid: 20, status: 'Issued',      dateissued: '2026-07-09', totalprice: 8410.20 },
+        { num: 'SO-1048', customer: 'Hooli Retail',        statusid: 25, status: 'In Progress', dateissued: '2026-07-10', totalprice: 560.00 },
+        { num: 'SO-1049', customer: 'Cyberdyne Systems',   statusid: 20, status: 'Issued',      dateissued: '2026-07-11', totalprice: 19875.00 }
+    ];
+
+    const COLS = [
+        { key: 'num',        label: 'Order #',     cls: 'num',   type: 'str' },
+        { key: 'customer',   label: 'Customer',    cls: '',      type: 'str' },
+        { key: 'statusid',   label: 'Status',      cls: '',      type: 'num', badge: true },
+        { key: 'totalprice', label: 'Total',       cls: 'money', type: 'num', money: true },
+        { key: 'dateissued', label: 'Date Issued', cls: 'date',  type: 'date' }
+    ];
+
+    let _rows = [];
+    let _sortKey = 'dateissued';
+    let _sortDir = 'desc';
+
+    function fmtMoney(n) {
+        const v = parseFloat(n);
+        if (isNaN(v)) return '';
+        return '$' + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+    function fmtDate(s) {
+        if (!s) return '';
+        const d = new Date(String(s).split('T')[0] + 'T00:00:00');
+        if (isNaN(d.getTime())) return String(s);
+        const mm = String(d.getMonth() + 1).padStart(2, '0');
+        const dd = String(d.getDate()).padStart(2, '0');
+        return mm + '/' + dd + '/' + d.getFullYear();
+    }
+    function esc(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+            ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    function renderHead() {
+        document.getElementById('head').innerHTML = COLS.map(c => {
+            const sorted = c.key === _sortKey;
+            const arrow = sorted ? (_sortDir === 'asc' ? '▲' : '▼') : '⇅';
+            const align = c.cls === 'money' ? ' style="text-align:right;"' : '';
+            return '<th class="' + (sorted ? 'sorted' : '') + '" data-key="' + c.key + '"' + align + '>'
+                 + esc(c.label) + '<span class="arrow">' + arrow + '</span></th>';
+        }).join('');
+        document.querySelectorAll('#head th').forEach(th =>
+            th.addEventListener('click', () => onSort(th.getAttribute('data-key'))));
+    }
+
+    function onSort(key) {
+        if (_sortKey === key) _sortDir = (_sortDir === 'asc') ? 'desc' : 'asc';
+        else { _sortKey = key; _sortDir = 'asc'; }
+        renderHead();
+        renderBody();
+    }
+
+    function sorted(rows) {
+        const col = COLS.find(c => c.key === _sortKey) || COLS[0];
+        const mult = _sortDir === 'asc' ? 1 : -1;
+        return rows.slice().sort((a, b) => {
+            let av = a[_sortKey], bv = b[_sortKey];
+            if (col.type === 'num')  { av = parseFloat(av) || 0; bv = parseFloat(bv) || 0; return (av - bv) * mult; }
+            if (col.type === 'date') { av = String(av || ''); bv = String(bv || ''); return av.localeCompare(bv) * mult; }
+            return String(av || '').toLowerCase().localeCompare(String(bv || '').toLowerCase()) * mult;
+        });
+    }
+
+    function renderBody() {
+        const body = document.getElementById('body');
+        if (!_rows.length) {
+            body.innerHTML = '<tr><td class="empty" colspan="' + COLS.length + '">No open sales orders.</td></tr>';
+            return;
+        }
+        body.innerHTML = sorted(_rows).map(r => '<tr>' + COLS.map(c => {
+            if (c.badge) {
+                const id = parseInt(r.statusid, 10);
+                const label = STATUS_MAP[id] || r.status || id;
+                return '<td><span class="badge b' + id + '">' + esc(label) + '</span></td>';
+            }
+            if (c.money) return '<td class="money">' + fmtMoney(r[c.key]) + '</td>';
+            if (c.type === 'date') return '<td class="date">' + fmtDate(r[c.key]) + '</td>';
+            return '<td class="' + c.cls + '">' + esc(r[c.key]) + '</td>';
+        }).join('') + '</tr>').join('');
+    }
+
+    function showBanner(msg) {
+        const b = document.getElementById('banner');
+        b.textContent = msg;
+        b.classList.add('show');
+    }
+
+    async function load() {
+        renderHead();
+        try {
+            const rows = await qp(SQL);
+            _rows = rows;
+            document.getElementById('subtitle').textContent =
+                rows.length + ' open order' + (rows.length === 1 ? '' : 's') + ' · mode: ' + MODE;
+            renderBody();
+        } catch (e) {
+            // No backend reachable → show sample data so the page still demos.
+            console.warn('Live load failed, using sample data:', e);
+            _rows = MOCK;
+            document.getElementById('subtitle').textContent = MOCK.length + ' sample orders · mode: ' + MODE;
+            showBanner('Sample data — not connected to Fishbowl. When deployed behind the Cloudflare portal '
+                + '(mode: portal), this table loads live open sales orders via /api/data-query.');
+            renderBody();
+        }
+    }
+
+    load();
+    </script>
+</body>
+</html>
