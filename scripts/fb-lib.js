@@ -90,12 +90,14 @@
 //   });
 //   table.render();
 //
-//   // 5. Multi-select dropdown filter:
+//   // 5. Multi-select dropdown filter (re-query once per dropdown session
+//   //    via onClose — onChange fires per checkbox, so don't query there):
 //   FBLib.Common.MultiSelect.create({
 //       containerId: 'statusMs',     // host <div> with the canonical markup
 //       items:       [{ value: 20, label: 'Issued' }, { value: 25, label: 'In Progress' }],
 //       placeholder: 'All statuses',
-//       onChange:    selected => loadDashboard()
+//       onChange:    selected => { /* sync report state only */ },
+//       onClose:     selected => loadDashboard()
 //   });
 //
 // HOW STYLES ARE INJECTED
@@ -283,7 +285,7 @@ window.FBLib = (function () {
             svg.setAttribute('fill', 'currentColor');
             svg.style.width = '20px';
             svg.style.height = '20px';
-            const colors = { blue: '#2d9cdb', orange: '#f59e0b', red: '#ef4444' };
+            const colors = { blue: '#2d9cdb', orange: '#F69133', red: '#C43046' };
             if (colors[scheduleStatus]) svg.style.color = colors[scheduleStatus];
             const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
             path.setAttribute('d', 'M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm1 10.414V7a1 1 0 10-2 0v6a1 1 0 00.293.707l3 3a1 1 0 001.414-1.414L13 12.414z');
@@ -307,7 +309,7 @@ window.FBLib = (function () {
                 svg.setAttribute('class', 'status-icon-padlock');
                 svg.setAttribute('viewBox', '0 0 16 16');
                 svg.setAttribute('fill', 'currentColor');
-                svg.style.color = '#f59e0b';
+                svg.style.color = '#F69133';
                 svg.setAttribute('title', title);
                 const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
                 path.setAttribute('fill-rule', 'evenodd');
@@ -391,26 +393,26 @@ window.FBLib = (function () {
                 'font-family:\'Inter\',-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;' +
                 'background:transparent;display:none}' +
             '.fblib-debug-drawer.is-visible{display:block}' +
-            '.fblib-debug-drawer .fblib-debug-resize{height:5px;background:transparent;cursor:ns-resize;border-top:2px solid #e2e8f0}' +
-            '.fblib-debug-drawer .fblib-debug-shell{background:#fff;box-shadow:0 -4px 24px rgba(0,0,0,.12)}' +
+            '.fblib-debug-drawer .fblib-debug-resize{height:5px;background:transparent;cursor:ns-resize;border-top:2px solid #E3E3E3}' +
+            '.fblib-debug-drawer .fblib-debug-shell{background:#fff;box-shadow:0 -4px 24px rgba(16,16,16,.12)}' +
             '.fblib-debug-drawer .fblib-debug-toggle{width:100%;padding:8px 16px;display:flex;align-items:center;' +
                 'justify-content:space-between;background:none;border:none;cursor:pointer;text-align:left;font-family:inherit}' +
-            '.fblib-debug-drawer .fblib-debug-toggle:hover{background:#f8fafc}' +
+            '.fblib-debug-drawer .fblib-debug-toggle:hover{background:#F7F7F7}' +
             '.fblib-debug-drawer .fblib-debug-titlegrp{display:flex;align-items:center;gap:8px}' +
-            '.fblib-debug-drawer .fblib-debug-title{font-size:12px;font-weight:600;color:#475569}' +
-            '.fblib-debug-drawer .fblib-debug-subtitle{font-size:11px;color:#94a3b8;font-weight:400}' +
+            '.fblib-debug-drawer .fblib-debug-title{font-size:12px;font-weight:600;color:#506872}' +
+            '.fblib-debug-drawer .fblib-debug-subtitle{font-size:11px;color:#8FA1A7;font-weight:400}' +
             '.fblib-debug-drawer .fblib-debug-chevron{transition:transform .2s ease;transform:rotate(180deg)}' +
             '.fblib-debug-drawer.is-open .fblib-debug-chevron{transform:rotate(0deg)}' +
-            '.fblib-debug-drawer .fblib-debug-content{display:none;border-top:1px solid #e2e8f0;background:#fff}' +
+            '.fblib-debug-drawer .fblib-debug-content{display:none;border-top:1px solid #E3E3E3;background:#fff}' +
             '.fblib-debug-drawer.is-open .fblib-debug-content{display:block}' +
-            '.fblib-debug-drawer .fblib-debug-diag{background:#1e293b;padding:6px 14px;' +
-                'display:flex;align-items:center;justify-content:space-between;color:#cbd5e1}' +
-            '.fblib-debug-drawer .fblib-debug-diag-label{font-size:11px;font-family:ui-monospace,\'Courier New\',monospace;color:#94a3b8}' +
+            '.fblib-debug-drawer .fblib-debug-diag{background:#0E3646;padding:6px 14px;' +
+                'display:flex;align-items:center;justify-content:space-between;color:#C6D0D4}' +
+            '.fblib-debug-drawer .fblib-debug-diag-label{font-size:11px;font-family:ui-monospace,\'Courier New\',monospace;color:#8FA1A7}' +
             '.fblib-debug-drawer .fblib-debug-diag-actions{display:flex;align-items:center;gap:10px}' +
-            '.fblib-debug-drawer .fblib-debug-action{font-size:11px;color:#94a3b8;background:none;border:none;' +
+            '.fblib-debug-drawer .fblib-debug-action{font-size:11px;color:#8FA1A7;background:none;border:none;' +
                 'cursor:pointer;padding:0;display:inline-flex;align-items:center;gap:4px;font-family:inherit}' +
             '.fblib-debug-drawer .fblib-debug-action:hover{color:#fff}' +
-            '.fblib-debug-drawer #debugLog{background:#0f172a;color:#e2e8f0;padding:10px 14px;' +
+            '.fblib-debug-drawer #debugLog{background:#0B3140;color:#e2e8f0;padding:10px 14px;' +
                 'font-family:ui-monospace,\'Courier New\',monospace;font-size:11px;' +
                 'height:200px;overflow-y:auto;line-height:1.5;white-space:pre-wrap}';
 
@@ -429,12 +431,12 @@ window.FBLib = (function () {
             '<div class="fblib-debug-shell">' +
                 '<button type="button" class="fblib-debug-toggle">' +
                     '<span class="fblib-debug-titlegrp">' +
-                        '<svg width="14" height="14" fill="none" stroke="#64748b" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">' +
+                        '<svg width="14" height="14" fill="none" stroke="#506872" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">' +
                             '<path d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"/></svg>' +
                         '<span class="fblib-debug-title">Debug Console</span>' +
                         '<span class="fblib-debug-subtitle">Auto-scrolls to latest entry</span>' +
                     '</span>' +
-                    '<svg class="fblib-debug-chevron" width="16" height="16" fill="none" stroke="#94a3b8" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">' +
+                    '<svg class="fblib-debug-chevron" width="16" height="16" fill="none" stroke="#8FA1A7" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">' +
                         '<path d="M19 9l-7 7-7-7"/></svg>' +
                 '</button>' +
                 '<div class="fblib-debug-content">' +
@@ -555,25 +557,25 @@ window.FBLib = (function () {
         //
         // CANONICAL CSS  (copy into the report's <style> block)
         //   .fb-drawer {
-        //       background: #f8fafc; border-bottom: 1px solid #e2e8f0;
-        //       box-shadow: 0 6px 12px -8px rgba(15,23,42,0.18);
+        //       background: #F7F7F7; border-bottom: 1px solid #E3E3E3;
+        //       box-shadow: 0 6px 12px -8px rgba(16,16,16,0.14);
         //       display: none; flex-shrink: 0;
         //   }
         //   .fb-drawer.open { display: block; }
         //   .fb-drawer-head {
         //       display: flex; justify-content: space-between; align-items: center;
-        //       padding: 10px 18px; border-bottom: 1px solid #e2e8f0;
-        //       background: var(--color-primary); color: #fff;
+        //       padding: 10px 18px; border-bottom: 1px solid #E3E3E3;
+        //       background: var(--menu-bg); color: #fff;   /* brand navy band */
         //   }
         //   .fb-drawer-head h2 { margin:0; font-size:14px; color:#fff; font-weight:700; }
         //   .fb-drawer-close { background: transparent; border: none; font-size: 22px;
         //       cursor: pointer; color: #fff; line-height: 1; padding: 0 6px; opacity: 0.9; }
         //   .fb-drawer-close:hover { opacity: 1; }
         //   .fb-drawer-body { padding: 14px 18px; max-height: 65vh; overflow-y: auto; }
-        //   .fb-drawer-foot { padding: 10px 18px; border-top: 1px solid #e2e8f0;
+        //   .fb-drawer-foot { padding: 10px 18px; border-top: 1px solid #E3E3E3;
         //       background: #fff; display: flex; gap: 8px; justify-content: space-between;
         //       align-items: center; flex-wrap: wrap; }
-        //   .hdr-btn.active { background: #eff6ff; border-color: #bfdbfe;
+        //   .hdr-btn.active { background: #DEEAF4; border-color: #CBE5FB;
         //       color: var(--color-primary-dark); }
         //
         // CANONICAL MARKUP  (drawer must be a SIBLING of <header>, NOT a child of body root only)
@@ -713,14 +715,23 @@ window.FBLib = (function () {
         //       items: [{ value: 20, label: 'Issued' }, { value: 25, label: 'In Progress' }],
         //       selected: [20],         // optional initial selection
         //       placeholder: 'All statuses',
-        //       searchable: true,        // omit the search box by setting false
         //       maxTags: 3,              // how many tags to show before "+N more"
-        //       onChange: selected => { /* called whenever the selection changes */ }
+        //       onChange: selected => { /* every selection mutation */ },
+        //       onOpen:   api => { /* optional — fires as the dropdown opens */ },
+        //       onClose:  selected => { /* optional — fires once per real close */ },
+        //       flipUp:   true           // optional — panel flips above the trigger
+        //                                // when it would run past the viewport bottom
         //   });
         //   ms.getSelected();           // → array of values
         //   ms.setSelected([20, 25]);   // replace selection programmatically
         //   ms.setItems(newItems);      // swap the option list (e.g. cascading dropdowns)
         //   ms.open() / ms.close();
+        //   FBLib.Common.MultiSelect.get(containerId);   // registry lookup
+        //   FBLib.Common.MultiSelect.closeAll();         // close every instance
+        //
+        //   NOTE: there is no `searchable` option — search is enabled by
+        //   simply including the `-search` input in the markup (omit the
+        //   .ms-search block for a searchless dropdown).
         //
         // BEHAVIOUR
         //   • Only one multi-select is open at a time (clicking another closes the previous).
@@ -728,6 +739,9 @@ window.FBLib = (function () {
         //   • The search input filters the list case-insensitively on .label.
         //   • Selected values render as inline tags on the trigger; clicking a tag's × removes it.
         //   • onChange fires on every selection mutation including Select-All / Clear-All / tag-x.
+        //     Do NOT run a query in onChange (it fires per checkbox) — use onClose for
+        //     "query once per dropdown session" semantics.
+        //   • setSelected / setItems do NOT fire onChange (hydration-safe).
         // ================================================================
         const _msRegistry = {};
         let _msActive = null;
@@ -754,8 +768,10 @@ window.FBLib = (function () {
             // The host may provide either the canonical id-suffix form
             // (`statusMs-trigger`) or the legacy positional form (the
             // PurchaseOrderSummary pattern uses `statusTrigger`). We accept
-            // either by stripping a trailing "Ms" if present.
-            const idBase = containerId.replace(/Ms$/i, '');
+            // either by stripping a trailing "Ms" / "-ms" / "_ms" if present
+            // (the summary reports use hyphenated container ids like
+            // `cust-ms` with children `custTrigger`, `custList`, …).
+            const idBase = containerId.replace(/[-_]?ms$/i, '');
             function q(suffix) {
                 return document.getElementById(containerId + '-' + suffix)
                     || document.getElementById(idBase + suffix.charAt(0).toUpperCase() + suffix.slice(1));
@@ -776,8 +792,24 @@ window.FBLib = (function () {
             const placeholder = opts.placeholder || 'Select…';
             const maxTags = (opts.maxTags == null) ? 3 : opts.maxTags;
             const onChange = typeof opts.onChange === 'function' ? opts.onChange : function () {};
+            const onOpen  = typeof opts.onOpen  === 'function' ? opts.onOpen  : null;
+            const onClose = typeof opts.onClose === 'function' ? opts.onClose : null;
+            const flipUp = !!opts.flipUp;
             let lastFilter = '';
 
+            // Standalone (not only an api method) — _emit() and close() call it
+            // directly. It previously existed ONLY on the api object, so the
+            // bare reference in _emit threw a swallowed ReferenceError and
+            // onChange never received the selection (fixed 2026-07).
+            function getSelected() {
+                const out = [];
+                selected.forEach(function (v) {
+                    // Round-trip back to the original value type where possible.
+                    const item = items.find(function (o) { return String(o.value) === v; });
+                    out.push(item ? item.value : v);
+                });
+                return out;
+            }
             function _emit() { try { onChange(getSelected()); } catch (_) {} }
             function _filteredItems() {
                 if (!lastFilter) return items;
@@ -857,7 +889,7 @@ window.FBLib = (function () {
                 if (arr.length > maxTags) {
                     const more = document.createElement('span');
                     more.className = 'ms-tag';
-                    more.style.cssText = 'background:#e5e7eb;color:#374151;';
+                    more.style.cssText = 'background:#E3E3E3;color:#415157;';
                     more.textContent = '+' + (arr.length - maxTags) + ' more';
                     if (placeholderEl) triggerEl.insertBefore(more, placeholderEl);
                     else triggerEl.appendChild(more);
@@ -868,15 +900,34 @@ window.FBLib = (function () {
                     const prev = _msRegistry[_msActive];
                     if (prev) prev.close();
                 }
+                if (onOpen) { try { onOpen(api); } catch (_) {} }
                 _msActive = containerId;
                 dropdownEl.classList.remove('hidden');
                 lastFilter = '';
                 if (searchEl) { searchEl.value = ''; setTimeout(function () { searchEl.focus(); }, 0); }
                 _renderList();
+                // Opt-in flip-up: when the panel would run past the bottom of
+                // the viewport, anchor it above the trigger instead. Inline
+                // top/bottom are reset on close so the default returns.
+                if (flipUp) {
+                    dropdownEl.style.top = '';
+                    dropdownEl.style.bottom = '';
+                    const rect = dropdownEl.getBoundingClientRect();
+                    if (rect.bottom > window.innerHeight - 8) {
+                        dropdownEl.style.top = 'auto';
+                        dropdownEl.style.bottom = 'calc(100% + 2px)';
+                    }
+                }
             }
             function close() {
+                const wasOpen = !dropdownEl.classList.contains('hidden');
                 dropdownEl.classList.add('hidden');
+                if (flipUp) { dropdownEl.style.top = ''; dropdownEl.style.bottom = ''; }
                 if (_msActive === containerId) _msActive = null;
+                // onClose fires only on a real open→closed transition, so a
+                // host wiring "re-query on close" isn't spammed by redundant
+                // close() calls (e.g. closeAll during another widget's open).
+                if (wasOpen && onClose) { try { onClose(getSelected()); } catch (_) {} }
             }
             function toggle() {
                 if (dropdownEl.classList.contains('hidden')) open();
@@ -900,15 +951,7 @@ window.FBLib = (function () {
             _msEnsureOutsideClick();
 
             const api = {
-                getSelected: function () {
-                    const out = [];
-                    selected.forEach(function (v) {
-                        // Round-trip back to the original value type where possible.
-                        const item = items.find(function (o) { return String(o.value) === v; });
-                        out.push(item ? item.value : v);
-                    });
-                    return out;
-                },
+                getSelected: getSelected,
                 setSelected: function (vals) {
                     selected.clear();
                     (vals || []).forEach(function (v) { selected.add(String(v)); });
@@ -944,7 +987,16 @@ window.FBLib = (function () {
 
         function _msGet(containerId) { return _msRegistry[containerId] || null; }
 
-        const MultiSelect = { create: _msCreate, get: _msGet };
+        // Close every registered multi-select. Lets a host's OTHER dropdown
+        // widgets (e.g. a report's legacy CF-value dropdown) enforce mutual
+        // exclusion against the fb-lib ones.
+        function _msCloseAll() {
+            Object.keys(_msRegistry).forEach(function (id) {
+                try { _msRegistry[id].close(); } catch (_) {}
+            });
+        }
+
+        const MultiSelect = { create: _msCreate, get: _msGet, closeAll: _msCloseAll };
 
         // Public entry point. Idempotent — first call builds + wires the
         // drawer and returns its API; subsequent calls return the cached
@@ -1013,6 +1065,15 @@ window.FBLib = (function () {
         let _propFallback = {};
         let _defaultTileOrder = [];
         let _tileToTable = {};
+        // Admin "master" layer is backed by Fishbowl's loadReportData/saveReportData,
+        // which only work on a SAVED report. Pages that run WITHOUT a saved-report
+        // context (embedded/opened with no report ID, or an editor preview) make the
+        // client throw a native "Loading data is only available on reports" dialog on
+        // the very first read — the try/catch below swallows the JS return but cannot
+        // suppress the native modal. Such pages pass `useReportDataMaster: false` to
+        // skip that layer entirely (per-user loadSettings/saveSettings are unaffected —
+        // they are account-scoped, not report-scoped, so they never trigger it).
+        let _useReportDataMaster = true;
 
         let USER = {};
         let MASTER = {};
@@ -1031,13 +1092,13 @@ window.FBLib = (function () {
             try { localStorage.setItem(key, value); } catch (_) {}
         }
         function _readMaster() {
-            if (typeof loadReportData === 'function') {
+            if (_useReportDataMaster && typeof loadReportData === 'function') {
                 try { return loadReportData(); } catch (_) { return null; }
             }
             try { return localStorage.getItem(_masterKey); } catch (_) { return null; }
         }
         function _writeMaster(value) {
-            if (typeof saveReportData === 'function') {
+            if (_useReportDataMaster && typeof saveReportData === 'function') {
                 try { saveReportData(value); return; } catch (_) {}
             }
             try { localStorage.setItem(_masterKey, value); } catch (_) {}
@@ -1059,6 +1120,9 @@ window.FBLib = (function () {
             _propFallback = config.propFallback || {};
             _defaultTileOrder = (config.defaultTileOrder || []).slice();
             _tileToTable = Object.assign({}, config.tileToTable || {});
+            // Default ON (every saved report keeps the admin-master layer). Pages with
+            // no saved-report context pass useReportDataMaster:false to skip it.
+            _useReportDataMaster = (config.useReportDataMaster !== false);
 
             USER   = _loadJson(_readSettings(_userKey))   || {};
             MASTER = _loadJson(_readMaster())             || {};
@@ -1889,7 +1953,7 @@ window.FBLib = (function () {
     //   .fb-table-container { overflow:auto; }
     //   table.fb-table { width:100%; border-collapse:collapse; font-size:12px; table-layout:fixed; }
     //   table.fb-table th {
-    //       background:#1e3a5f; color:#fff; font-weight:500;
+    //       background:var(--menu-bg); color:#fff; font-weight:500;   /* brand navy #0B3140 */
     //       padding:7px 10px; text-align:left; white-space:nowrap;
     //       cursor:grab; user-select:none; position:sticky; top:0; z-index:10;
     //       position:relative;
@@ -1897,18 +1961,18 @@ window.FBLib = (function () {
     //   table.fb-table th:active { cursor:grabbing; }
     //   table.fb-table th.sort-asc::after  { content:' ▲'; opacity:0.8; }
     //   table.fb-table th.sort-desc::after { content:' ▼'; opacity:0.8; }
-    //   table.fb-table th.col-drag-over { background:#1a4f8a; border-left:3px solid #60a5fa; }
+    //   table.fb-table th.col-drag-over { background:#164A5F; border-left:3px solid #CBE5FB; }
     //   table.fb-table tr.filter-row th {
-    //       top:34px; z-index:9; background:#eff6ff; cursor:default;
+    //       top:34px; z-index:9; background:#DEEAF4; cursor:default;
     //       padding:4px 6px;
     //   }
     //   table.fb-table tr.filter-row input, table.fb-table tr.filter-row select {
-    //       width:100%; padding:3px 6px; font-size:11px; border:1px solid #cbd5e1;
+    //       width:100%; padding:3px 6px; font-size:11px; border:1px solid #C6D0D4;
     //       border-radius:4px; background:#fff;
     //   }
-    //   table.fb-table td { padding:4px 10px; border-bottom:1px solid #e5e7eb; white-space:nowrap; }
-    //   table.fb-table tr:nth-child(even) td { background:#f9fafb; }
-    //   table.fb-table tr:hover td { background:#eff6ff !important; }
+    //   table.fb-table td { padding:4px 10px; border-bottom:1px solid #E3E3E3; white-space:nowrap; }
+    //   table.fb-table tr:nth-child(even) td { background:#F7F7F7; }
+    //   table.fb-table tr:hover td { background:#DEEAF4 !important; }
     //   .fb-col-resize {
     //       position:absolute; right:0; top:0; width:6px; height:100%;
     //       cursor:col-resize; user-select:none;
@@ -2268,7 +2332,7 @@ window.FBLib = (function () {
                     const tr = document.createElement('tr');
                     const td = document.createElement('td');
                     td.colSpan = vis.length;
-                    td.style.cssText = 'padding:2rem;color:#9ca3af;text-align:center;';
+                    td.style.cssText = 'padding:2rem;color:#8FA1A7;text-align:center;';
                     td.textContent = all.length ? 'No rows match the current filters.' : 'No data to display.';
                     tr.appendChild(td);
                     tbodyEl.appendChild(tr);
