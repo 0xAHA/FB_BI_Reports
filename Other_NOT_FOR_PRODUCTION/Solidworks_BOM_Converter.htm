@@ -1092,16 +1092,19 @@
         }
 
         // Process BOM Data AFTER mappings are configured
-        function processBOMData() {
+        async function processBOMData() {
             debugLog('info', 'Processing BOM data with configured mappings...');
-            showMessage('Processing BOM data...', 'info');
+
+            if (!rawCSVContent) {
+                showMessage('No CSV file loaded', 'danger');
+                return;
+            }
+
+            // Progress spinner while the (synchronous) parse + structure analysis runs.
+            showProgress('Processing BOM structure…', 40, true);
+            await new Promise(function (r) { setTimeout(r, 0); });
 
             try {
-                if (!rawCSVContent) {
-                    showMessage('No CSV file loaded', 'danger');
-                    return;
-                }
-
                 // Parse CSV into rows
                 const lines = rawCSVContent.split('\n').map(line => line.trim()).filter(line => line.length > 0);
 
@@ -1183,6 +1186,8 @@
             } catch (error) {
                 debugLog('error', 'Error processing BOM data', error.toString());
                 showMessage('Error processing BOM data: ' + error.message, 'danger');
+            } finally {
+                hideProgress();
             }
         }
 
@@ -2171,34 +2176,53 @@
         function loadSavedMappings() {
             try {
                 const mappingData = _resolve('fieldMappings', null);
-                if (mappingData && mappingData.mappings) {
-                    debugLog('info', 'Found saved mappings from ' + (mappingData.timestamp || 'a previous session'));
+                if (!mappingData || !mappingData.mappings) return;
 
-                    // Check if the columns match
-                    const savedCols = mappingData.solidworksColumns || [];
-                    const currentCols = solidworksColumns;
+                debugLog('info', 'Found saved mappings from ' + (mappingData.timestamp || 'a previous session'));
 
-                    const colsMatch = savedCols.length === currentCols.length &&
-                        savedCols.every((col, i) => col === currentCols[i]);
+                // Match saved mappings by COLUMN NAME, not by requiring the CSV's
+                // column array to be byte-identical (same length AND order) to when
+                // they were saved. Two exports of the same report often differ in
+                // column order or carry extra columns; the old strict check made
+                // auto-import silently fail in those cases. Keep every saved mapping
+                // whose source column is still present, and only fall back to manual
+                // configuration when a REQUIRED field's column is genuinely gone.
+                const saved = mappingData.mappings || {};
+                const currentCols = solidworksColumns || [];
+                const usable = {};
+                const droppedOptional = [];
+                Object.keys(saved).forEach(function (field) {
+                    const col = saved[field];
+                    if (col && currentCols.indexOf(col) !== -1) usable[field] = col;
+                    else if (col) droppedOptional.push(field);
+                });
 
-                    if (colsMatch) {
-                        debugLog('success', 'Saved mappings match current CSV columns - auto-loading');
-                        fieldMappings = mappingData.mappings;
+                const requiredMissing = Object.keys(bomFieldDefinitions).filter(function (f) {
+                    return bomFieldDefinitions[f].required && !usable[f];
+                });
 
-                        // Apply mappings to UI dropdowns
-                        applyMappingsToUI();
+                if (Object.keys(usable).length === 0 || requiredMissing.length > 0) {
+                    debugLog('warning', 'Saved mappings do not cover this CSV — missing required: ' + (requiredMissing.join(', ') || '(none usable)'));
+                    showMessage('Saved mappings don\'t match this CSV\'s columns — please configure field mapping.', 'warning');
+                    return;
+                }
 
-                        showMessage('Loaded saved field mappings from previous session', 'success');
+                fieldMappings = usable;
+                // No-op if the mapping modal isn't built yet; processBOMData reads
+                // fieldMappings directly, so auto-processing still works.
+                applyMappingsToUI();
 
-                        // Auto-process if we have CSV
-                        if (rawCSVContent) {
-                            debugLog('info', 'Auto-processing BOM with saved mappings');
-                            setTimeout(() => processBOMData(), 500);
-                        }
-                    } else {
-                        debugLog('warning', 'Saved mappings do not match current CSV columns');
-                        showMessage('Found saved mappings but column structure has changed', 'warning');
-                    }
+                if (droppedOptional.length) {
+                    debugLog('info', 'Saved mappings applied; optional field(s) not found in this CSV: ' + droppedOptional.join(', '));
+                    showMessage('Loaded saved field mappings (optional column(s) not found: ' + droppedOptional.join(', ') + ')', 'info');
+                } else {
+                    debugLog('success', 'Saved mappings applied to current CSV');
+                    showMessage('Loaded saved field mappings from a previous session', 'success');
+                }
+
+                if (rawCSVContent) {
+                    debugLog('info', 'Auto-processing BOM with saved mappings');
+                    setTimeout(function () { processBOMData(); }, 300);
                 }
             } catch (e) {
                 debugLog('error', 'Error loading saved mappings', e.toString());
@@ -2810,8 +2834,8 @@
             }
         }
 
-        function importBOMsToFishbowl() {
-            debugLog('info', 'Starting direct BOM import to Fishbowl...');
+        async function importBOMsToFishbowl() {
+            debugLog('info', 'Starting direct BOM import to Fishbowl (batched by level)...');
 
             if (bomsToCreate.length === 0) {
                 showMessage('No BOMs to import', 'warning');
@@ -2849,93 +2873,97 @@
             }
 
             try {
-                const rows = [];
+                // ── Batch by BOM level, DEEPEST first ─────────────────────────────
+                // Some Fishbowl versions won't resolve a StageBOMNumber that points at
+                // a BOM being created in the SAME ImportRq. So rather than one big
+                // import, send one ImportRq per level depth, deepest sub-assemblies
+                // first: each wave is committed before the (shallower) BOMs that stage
+                // it are imported, and the whole payload stays small (helps large/deep
+                // structures and import size limits too). Depth = number of dotted
+                // segments in the BOM's level; the optional filename-wrapper BOM
+                // (level '0') is forced shallowest so it lands in the final wave.
+                const depthOf = function (bom) {
+                    const lvl = String(bom.level == null ? '' : bom.level);
+                    return lvl === '0' ? 0 : lvl.split('.').length;
+                };
+                const byDepth = new Map();
+                bomsToCreate.forEach(function (bom) {
+                    const d = depthOf(bom);
+                    if (!byDepth.has(d)) byDepth.set(d, []);
+                    byDepth.get(d).push(bom);
+                });
+                const depths = Array.from(byDepth.keys()).sort(function (a, b) { return b - a; }); // deepest first
 
-                // Row 1: BOM-level headers (exactly as from API)
-                rows.push(bomLevelHeaders.map(h => `"${h}"`).join(','));
+                const headerRow1 = bomLevelHeaders.map(function (h) { return `"${h}"`; }).join(',');
+                const headerRow2 = itemLevelHeaders.map(function (h) { return `"${h}"`; }).join(',');
 
-                // Row 2: Item-level headers (exactly as from API)
-                rows.push(itemLevelHeaders.map(h => `"${h}"`).join(','));
+                debugLog('info', `Importing ${bomsToCreate.length} BOM(s) across ${depths.length} level-wave(s): ` +
+                    depths.map(function (d) { return `L${d}×${byDepth.get(d).length}`; }).join(', '));
 
-                // Generate BOM rows
-                for (let i = 0; i < bomsToCreate.length; i++) {
-                    const bom = bomsToCreate[i];
+                let waveOk = 0, bomsOk = 0;
 
-                    // Log first BOM as example
-                    if (i === 0) {
-                        debugLog('info', `Adding BOM to import (example): ${bom.partNumber}`);
+                for (let w = 0; w < depths.length; w++) {
+                    const depth = depths[w];
+                    const group = byDepth.get(depth);
+
+                    // Each wave is a self-contained BOM import CSV (its own two header
+                    // rows + this level's BOM / finished-good / item rows).
+                    const rows = [headerRow1, headerRow2];
+                    group.forEach(function (bom) {
+                        rows.push(generateBOMRow(bom));
+                        rows.push(generateFinishedGoodRow(bom));
+                        bom.items.forEach(function (item) { rows.push(generateItemRow(bom, item)); });
+                    });
+
+                    const payload = { "ImportRq": { "Type": "ImportBillOfMaterials", "Rows": { "Row": rows } } };
+
+                    showProgress(`Importing level ${depth} — ${group.length} BOM${group.length === 1 ? '' : 's'} (wave ${w + 1} of ${depths.length})…`,
+                        Math.round((w / depths.length) * 100), true);
+                    // Yield so the progress bar/spinner repaints between the (blocking) API calls.
+                    await new Promise(function (r) { setTimeout(r, 0); });
+
+                    debugLog('info', `Wave ${w + 1}/${depths.length}: importing ${group.length} level-${depth} BOM(s)`,
+                        group.map(function (b) { return b.partNumber; }));
+
+                    let ok = false, msg = '';
+                    try {
+                        const response = runApiRequest('ImportRq', JSON.stringify(payload));
+                        if (!response) {
+                            msg = 'No response from API';
+                        } else {
+                            const result = typeof response === 'string' ? JSON.parse(response) : response;
+                            // Log the raw response so the debug console shows the exact
+                            // line numbers / messages Fishbowl reported for this wave.
+                            debugLog('query', `Wave ${w + 1} raw API response`, result);
+                            if (result && result.ImportRs && (result.ImportRs.statusCode === 1000 || result.ImportRs.statusCode === '1000')) {
+                                ok = true;
+                            } else {
+                                msg = (result && result.ImportRs && result.ImportRs.statusMessage) || 'Unexpected response format';
+                            }
+                        }
+                    } catch (waveErr) {
+                        msg = waveErr && waveErr.message ? waveErr.message : String(waveErr);
                     }
 
-                    // BOM-level row (Flag = "BOM")
-                    const bomRow = generateBOMRow(bom);
-                    rows.push(bomRow);
-
-                    // First item: Finished Good output
-                    const finishedGoodRow = generateFinishedGoodRow(bom);
-                    rows.push(finishedGoodRow);
-
-                    // Item-level rows (Flag = "Item") for each component
-                    for (const item of bom.items) {
-                        const itemRow = generateItemRow(bom, item);
-                        rows.push(itemRow);
+                    if (ok) {
+                        waveOk++; bomsOk += group.length;
+                        debugLog('success', `Wave ${w + 1} committed (${group.length} level-${depth} BOM(s))`);
+                    } else {
+                        // A wave failed — the shallower waves stage these BOMs, so stop
+                        // here rather than push parents whose stage links will dangle.
+                        hideProgress();
+                        debugLog('error', `Wave ${w + 1} (level ${depth}) failed: ${msg}`);
+                        showMessage(`BOM import stopped at level ${depth} (wave ${w + 1} of ${depths.length}): ${msg}. ` +
+                            `${bomsOk} deeper BOM(s) were committed; the ${group.length} level-${depth} BOM(s) and anything above were not. ` +
+                            `Fix the reported item and re-run — already-created BOMs are simply updated.`, 'danger');
+                        return;
                     }
                 }
-
-                // Build API request payload
-                const payload = {
-                    "ImportRq": {
-                        "Type": "ImportBillOfMaterials",
-                        "Rows": {
-                            "Row": rows
-                        }
-                    }
-                };
-
-                debugLog('info', `Importing ${bomsToCreate.length} BOMs to Fishbowl...`);
-
-                showMessage(`Importing ${bomsToCreate.length} BOMs to Fishbowl...`, 'info');
-                showProgress('Importing BOMs to Fishbowl...', 50);
-
-                // Call the Fishbowl API
-                const response = runApiRequest('ImportRq', JSON.stringify(payload));
 
                 hideProgress();
-
-                if (!response) {
-                    showMessage('BOM import failed: No response from API', 'danger');
-                    debugLog('error', 'BOM import failed: No response from API');
-                    return;
-                }
-
-                // Parse response
-                const result = typeof response === 'string' ? JSON.parse(response) : response;
-
-                // Log the raw response so the debug console shows the exact line
-                // numbers / messages Fishbowl reported (e.g. partId FK failures).
-                debugLog('query', 'BOM import raw API response', result);
-
-                // Check for errors in response
-                if (result && result.ImportRs) {
-                    const importRs = result.ImportRs;
-
-                    // statusCode can be either number or string
-                    if (importRs.statusCode === 1000 || importRs.statusCode === '1000') {
-                        // Success
-                        showMessage(`✓ Successfully imported ${bomsToCreate.length} BOMs to Fishbowl!`, 'success');
-                        debugLog('success', `BOM import successful - ${bomsToCreate.length} BOMs created`);
-
-                        // Update UI to show BOMs were imported
-                        updateBOMsStatus('imported');
-                    } else {
-                        // Error
-                        const errorMsg = importRs.statusMessage || 'Unknown error';
-                        showMessage(`BOM import failed: ${errorMsg}`, 'danger');
-                        debugLog('error', `BOM import failed: ${errorMsg}`);
-                    }
-                } else {
-                    showMessage('Unexpected response format from API', 'warning');
-                    debugLog('warning', 'Unexpected response format');
-                }
+                showMessage(`✓ Imported ${bomsOk} BOM(s) to Fishbowl across ${waveOk} level-wave(s).`, 'success');
+                debugLog('success', `BOM import complete — ${bomsOk} BOM(s) in ${waveOk} wave(s)`);
+                updateBOMsStatus('imported');
 
             } catch (error) {
                 hideProgress();
@@ -2967,14 +2995,18 @@
             }
         }
 
-        // Show/hide progress indicator
-        function showProgress(message, percent) {
+        // Show/hide progress indicator. Pass spinner=true to prepend a small spinning
+        // indicator to the message (used for open-ended work like BOM processing).
+        function showProgress(message, percent, spinner) {
             const progressSection = document.getElementById('progressSection');
             const progressText = document.getElementById('progressText');
             const progressBar = document.getElementById('progressBar');
 
-            progressText.textContent = message;
-            progressBar.style.width = percent + '%';
+            var spin = spinner
+                ? '<span class="spin" style="display:inline-block;width:12px;height:12px;border:2px solid rgba(0,0,0,0.15);border-top-color:var(--color-primary);border-radius:50%;margin-right:8px;vertical-align:-2px;"></span>'
+                : '';
+            progressText.innerHTML = spin + String(message == null ? '' : message).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+            progressBar.style.width = (percent == null ? 0 : percent) + '%';
             progressSection.classList.remove('hidden');
         }
 
@@ -3149,6 +3181,14 @@
                 }
             } catch (error) {
                 debugLog('warning', 'Could not persist settings: ' + error);
+            }
+
+            // A settings change can alter the computed structure (part type, filename
+            // wrapper, auto-create type, UOM defaults…), so re-run the analysis if a
+            // sheet is already loaded and mapped.
+            if (rawCSVContent && fieldMappings && Object.keys(fieldMappings).length > 0) {
+                debugLog('info', 'Setting changed — reprocessing loaded BOM');
+                processBOMData();
             }
         }
 
