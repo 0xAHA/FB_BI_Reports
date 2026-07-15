@@ -291,6 +291,32 @@
         .ms-item .sub { color: var(--muted-2); font-size: 11px; }
         .ms-empty { padding: 12px; color: #9ca3af; font-size: 12px; text-align: center; }
 
+        /* ── Nested Category (product-tree) filter rows ─────────────────
+           Rendered by renderTreeFilterList into #treeList. Adjacency-tree
+           of producttree; checking a node cascades to all descendants. */
+        .ms-tree-row {
+            display: flex; align-items: center; gap: 6px;
+            padding: 4px 8px 4px 0; font-size: 12px; cursor: default;
+        }
+        .ms-tree-row:hover { background: #eff6ff; }
+        .ms-tree-caret {
+            width: 14px; flex-shrink: 0; text-align: center; cursor: pointer;
+            color: var(--muted-2); font-size: 10px; user-select: none;
+        }
+        .ms-tree-row input[type=checkbox] { flex-shrink: 0; margin: 0; }
+        .ms-tree-label { flex: 1; min-width: 0; cursor: pointer;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .ms-tree-label .sub { color: var(--muted-2); font-size: 11px; }
+
+        /* Group-header rows in the list / list+img views (group-by-tree). */
+        .list-table tr.group-row td {
+            background: #eef2f7; color: #334155; font-weight: 700;
+            text-transform: uppercase; letter-spacing: 0.04em; font-size: 11px;
+            padding: 6px 10px; border-bottom: 1px solid #cbd5e1;
+        }
+        .list-table tr.group-row:hover td { background: #eef2f7; }
+        .list-table td.catpath-cell { color: #475569; }
+
         /* ── Filters panel (toggled by header Filters button) ────────────── */
         #filtersPanel, #settingsPanel, #helpPanel {
             background: white; border-bottom: 1px solid var(--border-default);
@@ -1904,6 +1930,13 @@
                     <rect x="17" y="10" width="4" height="11"/>
                 </svg>
             </button>
+            <button id="groupByTreeToggleBtn" onclick="toggleGroupByTree()" class="hdr-btn hdr-btn-icon" title="Group the List / List+Img views by main product category" aria-label="Group by category">
+                <!-- Folder/tree glyph — reads as "group by category". -->
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/>
+                    <path d="M7 13h4M7 16h7"/>
+                </svg>
+            </button>
             <button id="favouritesToggleBtn" onclick="toggleFavouritesOnly()" class="hdr-btn hdr-btn-icon" title="Favourites filter — click cycles: customer → user → both → off" aria-label="Favourites filter">
                 <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                     <defs>
@@ -2365,7 +2398,22 @@ let _groupPrimary = new Map();
 let _groupedHidden = new Set();
 let _customers = [];            // [{id, num, name, taxrateid, defaultsalesmanid, defaultpaymenttermsid, ...}]
 let _selectedCustomer = null;
-let _productTrees = [];         // [{id, name}]
+let _productTrees = [];         // [{id, name, parentId}]  (adjacency tree)
+// Client-side product-tree hierarchy, built by buildTreeIndex() from
+// _productTrees. Fishbowl's producttree is an adjacency list (parentId,
+// with a single synthetic root "Product" id=1). We index it so the
+// Category filter can render nested folders with cascade selection, and
+// so list/print grouping can resolve a tag → its MAIN (top-level) category.
+let _treeById   = new Map();    // id → { id, name, parentId, children:[] }
+let _treeRoots  = [];           // nodes with no parent (parentId null/0)
+let _treeExpanded = new Set();  // expanded node ids in the Category filter
+// List / List+Img: group rows under their MAIN (top-level) product
+// category. Persisted. Products tagged across multiple main categories
+// appear under each (per user spec). Tile view is never grouped.
+let _groupByTree = false;
+// Count of items currently paginated (products in tile view; expanded
+// rows in a grouped list view) — drives renderPagination / goToPage.
+let _pageItemCount = 0;
 let _activeRules = [];          // pricing rules pre-filtered for the selected customer
 let _customerParts = new Map(); // productId -> {lastprice, datelastpurchased, lastqty} — soitem-derived, for display/history
 // Authoritative per-customer last price from the `customerparts` denorm
@@ -2575,13 +2623,14 @@ const LIST_COL_DEFS = [
     { key: 'thumb',   label: 'Image (List+Img view)' },
     { key: 'num',     label: 'Product #' },
     { key: 'desc',    label: 'Description' },
+    { key: 'catpath', label: 'Category', defVis: false },  // full path "Main › Sub"; off by default
     { key: 'last',    label: 'Last purchased' },
     { key: 'stock',   label: 'Stock' },
     { key: 'lead',    label: 'Lead time' },
     { key: 'onorder', label: 'On order' },
     { key: 'price',   label: 'Price' },
 ];
-let _listCols = LIST_COL_DEFS.map(c => ({ key: c.key, vis: true }));
+let _listCols = LIST_COL_DEFS.map(c => ({ key: c.key, vis: c.defVis !== false }));
 let _colDragIdx = null;   // drag source index while reordering the panel
 
 // ── Product image cache ──────────────────────────────────────────────
@@ -2804,6 +2853,7 @@ function loadSavedState() {
         // v2 has a tri-state favouritesMode (null|'customer'|'user').
         // Old `true` → 'user' (the closest analogue without a customer ref).
         if (typeof s.groupByPart === 'boolean') _groupByPart = s.groupByPart;
+        if (typeof s.groupByTree === 'boolean') _groupByTree = s.groupByTree;
         if (typeof s.groupPreferredUOM === 'string') _groupPreferredUOM = s.groupPreferredUOM || 'ea';
         if (typeof s.favouriteWholePart === 'boolean') _favouriteWholePart = s.favouriteWholePart;
         if (typeof s.showDebug === 'boolean') DEBUG = s.showDebug;
@@ -2836,7 +2886,7 @@ function loadSavedState() {
                 .map(c => ({ key: c.key, vis: c.vis !== false }));
             const extras = LIST_COL_DEFS
                 .filter(d => !savedByKey[d.key])
-                .map(d => ({ key: d.key, vis: true }));
+                .map(d => ({ key: d.key, vis: d.defVis !== false }));
             if (reordered.length) _listCols = [...reordered, ...extras];
         }
         if (s.filters) {
@@ -2895,6 +2945,7 @@ function saveState() {
         autoCreateFavCf: _autoCreateFavCf,
         userFavourites: [..._userFavourites],
         groupByPart: _groupByPart,
+        groupByTree: _groupByTree,
         groupPreferredUOM: _groupPreferredUOM,
         favouriteWholePart: _favouriteWholePart,
         showDebug: DEBUG,
@@ -3881,12 +3932,14 @@ function buildMS(type) {
         e.stopPropagation();
         const d = msData(type); d.list.forEach(it => d.sel.add(it.val));
         updateMSTrigger(type); renderMSList(type, search ? search.value : '');
+        if (type === 'tree' || type === 'lg') applyAllFilters();
     };
     const clr = document.getElementById(type + 'Clear');
     if (clr) clr.onclick = (e) => {
         e.stopPropagation();
         msData(type).sel.clear();
         updateMSTrigger(type); renderMSList(type, search ? search.value : '');
+        if (type === 'tree' || type === 'lg') applyAllFilters();
     };
 }
 
@@ -3920,6 +3973,17 @@ function updateMSTrigger(type) {
         trig.innerHTML = `${iconHtml}${activeDot}${labelHtml}<span class="ms-placeholder">${d.ph}</span><span style="color:#9ca3af;font-size:10px;margin-left:auto;">▾</span>`;
         return;
     }
+    // Category tree: the selection Set holds cascaded descendant ids, so
+    // the flat-tag rendering below would spam dozens of tags. Show only
+    // the "top" selected nodes (a selected node whose parent isn't
+    // selected) as tags instead.
+    if (type === 'tree') {
+        const tops = selectedTreeTops();
+        const tags = tops.slice(0, 3).map(n => `<span class="ms-tag">${escapeHtml(n.name)}</span>`);
+        if (tops.length > 3) tags.push(`<span class="ms-tag">+${tops.length - 3}</span>`);
+        trig.innerHTML = iconHtml + activeDot + labelHtml + tags.join('') + '<span style="color:#9ca3af;font-size:10px;margin-left:auto;">▾</span>';
+        return;
+    }
     if (d.single) {
         const v = [...d.sel][0];
         const item = d.list.find(it => it.val === v);
@@ -3951,6 +4015,9 @@ function updateMSTrigger(type) {
 function renderMSList(type, search) {
     const listEl = document.getElementById(type + 'List');
     if (!listEl) return;
+    // Category filter renders as a nested folder tree with cascade
+    // selection, not a flat checkbox list.
+    if (type === 'tree') { renderTreeFilterList(listEl, search); return; }
     const d = msData(type);
     const term = (search || '').toLowerCase();
     const filtered = d.list.filter(it => {
@@ -3986,6 +4053,10 @@ function renderMSList(type, search) {
                 const dd = msData(t);
                 if (cb.checked) dd.sel.add(v); else dd.sel.delete(v);
                 updateMSTrigger(t);
+                // Re-apply live so the catalogue reflects the change
+                // without needing to close the dropdown (the historical
+                // bug: filters never re-ran on multi-select change).
+                if (t === 'tree' || t === 'lg') applyAllFilters();
             };
         });
     }
@@ -4406,9 +4477,238 @@ async function loadCustomerAddresses(customer) {
 }
 
 async function loadProductTrees() {
-    const rows = await qp(`SELECT id, name FROM producttree ORDER BY name`);
-    _productTrees = rows;
+    const rows = await qp(`SELECT id, name, parentId FROM producttree ORDER BY name`);
+    _productTrees = rows.map(r => ({
+        id: intOf(r.id), name: r.name || '',
+        parentId: r.parentid != null ? intOf(r.parentid) : null,
+    })).filter(t => t.id != null);
+    buildTreeIndex();
     updateMSTrigger('tree');
+}
+
+// Build the client-side hierarchy index from _productTrees (adjacency
+// list). Populates _treeById (with children arrays) + _treeRoots.
+function buildTreeIndex() {
+    _treeById = new Map();
+    _treeRoots = [];
+    for (const t of _productTrees) {
+        _treeById.set(t.id, { id: t.id, name: t.name, parentId: t.parentId, children: [] });
+    }
+    for (const node of _treeById.values()) {
+        const pid = node.parentId;
+        const parent = (pid != null && pid > 0) ? _treeById.get(pid) : null;
+        if (parent) parent.children.push(node);
+        else _treeRoots.push(node);
+    }
+    const byName = (a, b) => String(a.name).localeCompare(String(b.name), undefined, { sensitivity: 'base', numeric: true });
+    _treeRoots.sort(byName);
+    for (const node of _treeById.values()) node.children.sort(byName);
+}
+
+// Top level shown in the Category filter. Fishbowl ships a single
+// synthetic root "Product" (id 1) that contains every real category, so
+// when there's exactly one root with children we render ITS CHILDREN as
+// the top level (the real "main" categories) and hide the redundant
+// root. Otherwise render the roots directly.
+function treeTopLevel() {
+    if (_treeRoots.length === 1 && _treeRoots[0].children.length) return _treeRoots[0].children;
+    return _treeRoots;
+}
+
+// Ancestor chain [root … node] of node objects for a tree id.
+function treeAncestryChain(id) {
+    const chain = [];
+    let cur = _treeById.get(intOf(id));
+    let guard = 0;
+    while (cur && guard++ < 64) {
+        chain.unshift(cur);
+        cur = (cur.parentId != null && cur.parentId > 0) ? _treeById.get(cur.parentId) : null;
+    }
+    return chain;
+}
+
+// MAIN (top-level) category for a tag id — the child-of-root ancestor
+// (i.e. skip the synthetic "Product" root). Returns {id,name} or null.
+function treeMainOf(id) {
+    const chain = treeAncestryChain(id);
+    if (!chain.length) return null;
+    const main = chain.length > 1 ? chain[1] : chain[0];
+    return { id: main.id, name: main.name };
+}
+
+// Full display path "Main › Sub › Leaf" for a tag id (excludes the
+// synthetic root).
+function treePathStr(id) {
+    const chain = treeAncestryChain(id);
+    if (!chain.length) return '';
+    const nodes = chain.length > 1 ? chain.slice(1) : chain;
+    return nodes.map(n => n.name).join(' › ');
+}
+
+// Set of {node id + all descendant ids} as STRINGS — used for cascade
+// selection and for expanding a selected branch into a filter id set.
+function treeDescendants(id) {
+    const out = new Set();
+    const node = _treeById.get(intOf(id));
+    if (!node) { out.add(String(id)); return out; }
+    (function walk(n) { out.add(String(n.id)); n.children.forEach(walk); })(node);
+    return out;
+}
+
+// Selection state of a node for the tri-state checkbox: checked when the
+// whole subtree is selected, indeterminate when only part of it is.
+function treeNodeSelState(node) {
+    const desc = treeDescendants(node.id);
+    let sel = 0, tot = 0;
+    for (const idStr of desc) { tot++; if (_filters.productTreeIds.has(idStr)) sel++; }
+    if (sel === 0) return { checked: false, indeterminate: false };
+    if (sel === tot) return { checked: true, indeterminate: false };
+    return { checked: false, indeterminate: true };
+}
+
+// Cascade a node on/off: add or remove the node + every descendant id.
+function treeToggleNode(node, on) {
+    const desc = treeDescendants(node.id);
+    if (on) desc.forEach(id => _filters.productTreeIds.add(id));
+    else    desc.forEach(id => _filters.productTreeIds.delete(id));
+}
+
+// The "top" selected nodes — a selected node whose parent isn't selected.
+// Used for the concise trigger summary (one tag per chosen branch).
+function selectedTreeTops() {
+    const res = [];
+    for (const idStr of _filters.productTreeIds) {
+        const node = _treeById.get(parseInt(idStr, 10));
+        if (!node) continue;
+        const pid = node.parentId;
+        const parentSelected = pid != null && pid > 0 && _filters.productTreeIds.has(String(pid));
+        if (!parentSelected) res.push(node);
+    }
+    res.sort((a, b) => String(a.name).localeCompare(String(b.name), undefined, { sensitivity: 'base', numeric: true }));
+    return res;
+}
+
+// Render the nested Category filter into #treeList. Collapsed by default
+// (only the main categories show); carets expand branches; checking a
+// node cascades to its whole subtree. A search term flattens to matching
+// nodes (with their path) — checkboxes still cascade.
+function renderTreeFilterList(listEl, search) {
+    listEl.innerHTML = '';
+    if (!_treeById.size) { listEl.innerHTML = '<div class="ms-empty">No categories</div>'; return; }
+    const term = (search || '').trim().toLowerCase();
+
+    const makeRow = (node, depth, showPath) => {
+        const row = document.createElement('div');
+        row.className = 'ms-tree-row';
+        row.style.paddingLeft = (6 + depth * 16) + 'px';
+
+        const hasKids = node.children && node.children.length;
+        const caret = document.createElement('span');
+        caret.className = 'ms-tree-caret';
+        if (hasKids && !term) {
+            const open = _treeExpanded.has(node.id);
+            caret.textContent = open ? '▾' : '▸';
+            caret.onclick = (e) => {
+                e.stopPropagation();
+                if (_treeExpanded.has(node.id)) _treeExpanded.delete(node.id);
+                else _treeExpanded.add(node.id);
+                renderTreeFilterList(listEl, search);
+            };
+        } else {
+            caret.innerHTML = '&nbsp;';
+        }
+        row.appendChild(caret);
+
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        const st = treeNodeSelState(node);
+        cb.checked = st.checked;
+        cb.indeterminate = st.indeterminate;
+        cb.onchange = () => {
+            treeToggleNode(node, cb.checked);
+            updateMSTrigger('tree');
+            renderTreeFilterList(listEl, search);   // refresh parent/child states
+            applyAllFilters();
+        };
+        row.appendChild(cb);
+
+        const lbl = document.createElement('span');
+        lbl.className = 'ms-tree-label';
+        lbl.textContent = node.name;
+        if (showPath) {
+            const s = document.createElement('span');
+            s.className = 'sub';
+            s.textContent = ' · ' + treePathStr(node.id);
+            lbl.appendChild(s);
+        }
+        lbl.onclick = () => { cb.checked = !cb.checked; cb.onchange(); };
+        row.appendChild(lbl);
+
+        listEl.appendChild(row);
+
+        if (hasKids && !term && _treeExpanded.has(node.id)) {
+            node.children.forEach(ch => makeRow(ch, depth + 1, false));
+        }
+    };
+
+    if (term) {
+        const matches = [..._treeById.values()]
+            .filter(n => n.name.toLowerCase().includes(term))
+            .sort((a, b) => String(a.name).localeCompare(String(b.name), undefined, { sensitivity: 'base', numeric: true }));
+        if (!matches.length) { listEl.innerHTML = '<div class="ms-empty">No matches</div>'; return; }
+        matches.forEach(n => makeRow(n, 0, true));
+    } else {
+        treeTopLevel().forEach(n => makeRow(n, 0, false));
+    }
+}
+
+// ── Category paths for a product (list grouping + Category column) ────
+// A product (producttotree) can carry several tags. productCatPaths
+// returns one {mainId, mainName, pathStr} per distinct tagged path;
+// productMainCats collapses those to distinct MAIN categories (the level
+// list/print grouping uses). Untagged products fall under "Uncategorised".
+function productCatPaths(product) {
+    const ids = (product && product.treeIds) || [];
+    const out = [];
+    const seen = new Set();
+    for (const id of ids) {
+        const main = treeMainOf(id);
+        const pathStr = treePathStr(id) || (main ? main.name : '');
+        if (!pathStr || seen.has(pathStr)) continue;
+        seen.add(pathStr);
+        out.push({ mainId: main ? main.id : null, mainName: main ? main.name : 'Uncategorised', pathStr });
+    }
+    if (!out.length) out.push({ mainId: null, mainName: 'Uncategorised', pathStr: 'Uncategorised' });
+    return out;
+}
+function productMainCats(product) {
+    const seen = new Map();
+    for (const p of productCatPaths(product)) {
+        const k = p.mainId == null ? '~' : String(p.mainId);
+        if (!seen.has(k)) seen.set(k, { id: p.mainId, name: p.mainName });
+    }
+    return [...seen.values()];
+}
+// Product-level sort key for the Category column — its alphabetically
+// first path so ungrouped sort-by-category is stable.
+function productCatSortKey(product) {
+    let k = null;
+    for (const p of productCatPaths(product)) {
+        if (k === null || p.pathStr.localeCompare(k, undefined, { sensitivity: 'base', numeric: true }) < 0) k = p.pathStr;
+    }
+    return k || '';
+}
+
+// List/List+Img grouping toggle.
+function toggleGroupByTree() {
+    _groupByTree = !_groupByTree;
+    updateGroupByTreeBtn();
+    saveState();
+    renderProducts();
+}
+function updateGroupByTreeBtn() {
+    const btn = document.getElementById('groupByTreeToggleBtn');
+    if (btn) btn.classList.toggle('active', _groupByTree);
 }
 
 // Company-level defaults — used as a fallback when a customer record has
@@ -5442,7 +5742,10 @@ async function selectCustomer(c, skipSave) {
 
 // ── Filtering / sorting / pagination ─────────────────────────────────
 function applyAllFilters() {
-    closeMS();
+    // NB: does NOT close the filter dropdowns. Multi-select filters
+    // (Category / Stock LG) call this on every checkbox tick so the
+    // catalogue updates live while the dropdown stays open for more
+    // selections. Single-select pickers close themselves explicitly.
     // Pull values from inputs
     _filters.search = (document.getElementById('searchInput').value || '').trim().toLowerCase();
 
@@ -5527,6 +5830,8 @@ function sortFiltered() {
             r = String(da).localeCompare(String(db));
         } else if (field === 'desc') {
             r = String(a.description || '').localeCompare(String(b.description || ''));
+        } else if (field === 'catpath') {
+            r = productCatSortKey(a).localeCompare(productCatSortKey(b), undefined, { sensitivity: 'base', numeric: true });
         } else {
             // 'name' (fallback): use description-or-num so blank descriptions don't all cluster.
             r = String(a.description || a.num).localeCompare(String(b.description || b.num));
@@ -6324,10 +6629,33 @@ function setViewMode(mode) {
 }
 
 // ── Product rendering ────────────────────────────────────────────────
-function pagedProducts() {
-    if (_pageSize >= 9999) return _filteredProducts;
+// Paginate any array against the current page size / index.
+function pagedList(arr) {
+    if (_pageSize >= 9999) return arr;
     const start = _pageIndex * _pageSize;
-    return _filteredProducts.slice(start, start + _pageSize);
+    return arr.slice(start, start + _pageSize);
+}
+
+// Row descriptors for the list views. Ungrouped → one row per product.
+// Grouped (_groupByTree) → one row per (product × distinct MAIN
+// category); rows are ordered so each main category is contiguous
+// (alphabetical, "Uncategorised" last) while preserving the current
+// sort within each group. renderListTable emits a header when the main
+// changes.
+function buildListDescriptors() {
+    if (!_groupByTree) return _filteredProducts.map(p => ({ product: p, main: null }));
+    const rows = [];
+    _filteredProducts.forEach((p, idx) => {
+        productMainCats(p).forEach(m => rows.push({ product: p, main: m, _idx: idx }));
+    });
+    rows.sort((a, b) => {
+        const an = a.main ? a.main.name : '', bn = b.main ? b.main.name : '';
+        const au = an === 'Uncategorised' ? 1 : 0, bu = bn === 'Uncategorised' ? 1 : 0;
+        if (au !== bu) return au - bu;
+        const c = an.localeCompare(bn, undefined, { sensitivity: 'base', numeric: true });
+        return c !== 0 ? c : a._idx - b._idx;   // keep current sort within a group
+    });
+    return rows;
 }
 
 function renderProducts(skipSideDataReload) {
@@ -6338,14 +6666,23 @@ function renderProducts(skipSideDataReload) {
         renderPagination();
         return;
     }
-    const products = pagedProducts();
+    let visibleIds;
     if (_viewMode === 'tile') {
+        _pageItemCount = _filteredProducts.length;
+        const products = pagedList(_filteredProducts);
         host.innerHTML = '<div class="tile-grid"></div>';
         const grid = host.querySelector('.tile-grid');
         products.forEach(p => grid.appendChild(renderTile(p)));
+        visibleIds = products.map(p => p.id);
     } else {
+        // List / List+Img: page over row descriptors (which may expand a
+        // product across several main-category groups when grouping is on).
+        const descriptors = buildListDescriptors();
+        _pageItemCount = descriptors.length;
+        const pageRows = pagedList(descriptors);
         host.innerHTML = '';
-        host.appendChild(renderListTable(products, _viewMode === 'list-image'));
+        host.appendChild(renderListTable(pageRows, _viewMode === 'list-image'));
+        visibleIds = [...new Set(pageRows.map(d => d.product.id))];
     }
     renderPagination();
     armLazyImages(host);
@@ -6353,7 +6690,7 @@ function renderProducts(skipSideDataReload) {
     // suppresses the second render that fires when the load finishes (used when
     // we're already re-rendering because new data just arrived).
     if (!skipSideDataReload) {
-        loadSideDataForVisible(products.map(p => p.id)).catch(e => console.warn('Side-data load failed:', e));
+        loadSideDataForVisible(visibleIds).catch(e => console.warn('Side-data load failed:', e));
     }
 }
 
@@ -6562,14 +6899,14 @@ function activeListCols(withImage) {
     return _listCols.filter(c => c.vis && (withImage || c.key !== 'thumb'));
 }
 
-function renderListTable(products, withImage) {
+function renderListTable(rows, withImage) {
     const table = document.createElement('table');
     table.className = 'list-table';
     // Default widths in px. Resizable columns get a data-col key so we
     // can persist user-adjusted widths in _colWidths under saveState().
     const dw = {
         fav: 52, thumb: 48,
-        num: 110, desc: 220, last: 140, stock: 70, lead: 60,
+        num: 110, desc: 220, catpath: 180, last: 140, stock: 70, lead: 60,
         onorder: 170, price: 130, qty: 110, action: 70,
     };
     // Authoritative column widths via <colgroup>. With `table-layout: fixed`,
@@ -6605,7 +6942,7 @@ function renderListTable(products, withImage) {
     // sort-clicked (image, qty input, action). The `lead` column has no
     // matching sortField yet; keep it pure-resize.
     const sortByCol = {
-        num: 'num', desc: 'desc', last: 'last-purchased',
+        num: 'num', desc: 'desc', catpath: 'catpath', last: 'last-purchased',
         stock: 'stock', price: 'price',
     };
     const { field: activeField, dir: activeDir } = parseSort();
@@ -6627,6 +6964,7 @@ function renderListTable(products, withImage) {
         thumb:   () => '<th data-col="thumb" class="thumb-cell"></th>',
         num:     () => cellHtml('num', 'Product #'),
         desc:    () => cellHtml('desc', 'Description'),
+        catpath: () => cellHtml('catpath', 'Category'),
         last:    () => cellHtml('last', 'Last purchased'),
         stock:   () => cellHtml('stock', 'Stock', 'right'),
         lead:    () => '<th data-col="lead" style="text-align:right;">Lead</th>',
@@ -6663,7 +7001,21 @@ function renderListTable(products, withImage) {
     }, 0);
     table.appendChild(thead);
     const tbody = document.createElement('tbody');
-    products.forEach(p => tbody.appendChild(renderListRow(p, withImage, dataCols)));
+    const totalCols = dataCols.length + 2;   // + qty + action (pinned)
+    let lastMain;                            // undefined until first row
+    rows.forEach(d => {
+        if (_groupByTree) {
+            const mainName = d.main ? d.main.name : 'Uncategorised';
+            if (lastMain === undefined || mainName !== lastMain) {
+                lastMain = mainName;
+                const hr = document.createElement('tr');
+                hr.className = 'group-row';
+                hr.innerHTML = `<td colspan="${totalCols}">${escapeHtml(mainName)}</td>`;
+                tbody.appendChild(hr);
+            }
+        }
+        tbody.appendChild(renderListRow(d.product, withImage, dataCols, d.main));
+    });
     table.appendChild(tbody);
     // Initial fit + observe parent for resize so the table always
     // matches productArea's current width (e.g. when the cart panel
@@ -6673,7 +7025,7 @@ function renderListTable(products, withImage) {
     return table;
 }
 
-function renderListRow(product, withImage, dataCols) {
+function renderListRow(product, withImage, dataCols, groupMain) {
     if (!dataCols) dataCols = activeListCols(withImage);
     const tr = document.createElement('tr');
     const inCart = _cart.get(product.id);
@@ -6706,6 +7058,17 @@ function renderListRow(product, withImage, dataCols) {
         thumb:   () => `<td class="thumb-cell"><div class="thumb"><img class="product-img" data-product-id="${product.id}" src="${PLACEHOLDER_SVG}" alt=""></div></td>`,
         num:     () => `<td class="num-cell"><a class="row-link" href="#" data-open-product title="Open ${escapeHtml(product.num)} in the Product module">${escapeHtml(product.num)}</a></td>`,
         desc:    () => `<td>${escapeHtml(product.description || '')}</td>`,
+        catpath: () => {
+            // Full category path(s). In a grouped row, show only the
+            // path(s) under the current group's main category; otherwise
+            // show every tagged path. Joined with " · " when several.
+            const paths = productCatPaths(product);
+            const shown = groupMain
+                ? paths.filter(x => (x.mainId == null ? '~' : String(x.mainId)) === (groupMain.id == null ? '~' : String(groupMain.id)))
+                : paths;
+            const txt = (shown.length ? shown : paths).map(x => x.pathStr).join(' · ') || '—';
+            return `<td class="catpath-cell" title="${escapeHtml(txt)}">${escapeHtml(txt)}</td>`;
+        },
         last:    () => `<td>${lastPurchase}</td>`,
         stock:   () => `<td class="stock-badge" data-stock-pid="${product.id}" style="text-align:right;color:${stockColor};font-weight:600;cursor:help;">${stock.toLocaleString()}</td>`,
         lead:    () => `<td style="text-align:right;" title="${escapeHtml(partInfo?.vendorName || '')}">${leadTime != null ? leadTime + 'd' : '<span class="text-slate-400">—</span>'}</td>`,
@@ -7089,19 +7452,24 @@ function applyThumb(img, data) {
 function renderPagination() {
     const el = document.getElementById('pagination');
     if (!el) return;
-    if (_pageSize >= 9999 || _filteredProducts.length <= _pageSize) {
+    // Count of paginated items: products (tile / ungrouped list) or
+    // expanded rows (grouped list). Set by renderProducts each paint.
+    const n = _pageItemCount || _filteredProducts.length;
+    if (_pageSize >= 9999 || n <= _pageSize) {
         el.innerHTML = '';
         return;
     }
-    const total = Math.ceil(_filteredProducts.length / _pageSize);
+    const total = Math.ceil(n / _pageSize);
+    const noun = (_viewMode !== 'tile' && _groupByTree) ? 'rows' : 'products';
     el.innerHTML = `
         <button class="hdr-btn" ${_pageIndex === 0 ? 'disabled' : ''} onclick="goToPage(${_pageIndex - 1})">◂ Prev</button>
-        <span>Page <strong>${_pageIndex + 1}</strong> of ${total} · ${_filteredProducts.length} products</span>
+        <span>Page <strong>${_pageIndex + 1}</strong> of ${total} · ${n} ${noun}</span>
         <button class="hdr-btn" ${_pageIndex + 1 >= total ? 'disabled' : ''} onclick="goToPage(${_pageIndex + 1})">Next ▸</button>
     `;
 }
 function goToPage(p) {
-    const total = Math.ceil(_filteredProducts.length / _pageSize);
+    const n = _pageItemCount || _filteredProducts.length;
+    const total = Math.ceil(n / _pageSize);
     _pageIndex = Math.max(0, Math.min(p, total - 1));
     renderProducts();
     document.getElementById('productArea').scrollTop = 0;
@@ -8311,20 +8679,26 @@ async function printCustomerFavourites() {
         };
     });
 
-    // Group by FIRST product tree (or "Uncategorised"). Products in
-    // multiple trees end up under just one — matches what the rep
-    // would expect on a printed sheet.
-    const groups = new Map();
+    // Group by MAIN (top-level) product category. Per the customer's
+    // request the order form groups by main categories only — subcategories
+    // fragmented "like" products and broke the alphabetical run. A product
+    // tagged across several main categories appears under EACH (chosen so
+    // nothing silently drops off one section of the form).
+    const groups = new Map();   // mainName → [products]
     for (const p of favProducts) {
-        let treeName = 'Uncategorised';
-        if (p.treeIds && p.treeIds.length) {
-            const t = _productTrees.find(x => x.id === p.treeIds[0]);
-            if (t) treeName = t.name;
+        const mains = (p.treeIds && p.treeIds.length)
+            ? productMainCats(p)                       // distinct mains for this product
+            : [{ id: null, name: 'Uncategorised' }];
+        for (const m of mains) {
+            if (!groups.has(m.name)) groups.set(m.name, []);
+            groups.get(m.name).push(p);
         }
-        if (!groups.has(treeName)) groups.set(treeName, []);
-        groups.get(treeName).push(p);
     }
-    const sortedGroups = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    // Sort groups alphabetically, "Uncategorised" last; products by num.
+    const sortedGroups = [...groups.entries()].sort((a, b) => {
+        const au = a[0] === 'Uncategorised' ? 1 : 0, bu = b[0] === 'Uncategorised' ? 1 : 0;
+        return au !== bu ? au - bu : a[0].localeCompare(b[0], undefined, { numeric: true });
+    });
     for (const [, prods] of sortedGroups) {
         prods.sort((a, b) => String(a.num).localeCompare(String(b.num), undefined, { numeric: true }));
     }
@@ -8343,27 +8717,38 @@ async function printCustomerFavourites() {
         if (DEBUG) qoDebug('printCustomerFavourites: company lookup failed: ' + e.message, 'warn');
     }
 
-    // Build the table rows. Category cell uses rowspan so the group
-    // name spans every product row in that group, matching the sample.
-    let bodyRows = '';
-    for (const [treeName, prods] of sortedGroups) {
+    const uomOf = p => p.uomCode || p.uomName || '';
+
+    // ── GROUPED body (by main category; rowspan cat cell) ─────────────
+    let groupedBodyRows = '';
+    for (const [mainName, prods] of sortedGroups) {
         prods.forEach((p, i) => {
             const catCell = i === 0
-                ? `<td class="cat" rowspan="${prods.length}">${escapeHtml(treeName)}</td>`
+                ? `<td class="cat" rowspan="${prods.length}">${escapeHtml(mainName)}</td>`
                 : '';
-            // UOM displayed = uomCode (e.g. "box") with uomName as fallback
-            // (e.g. "Box of 12"). Description is the product's own — never
-            // substituted from the part record.
-            const uomText = p.uomCode || p.uomName || '';
-            bodyRows += `<tr>${catCell}` +
+            groupedBodyRows += `<tr>${catCell}` +
                 `<td class="num">${escapeHtml(p.num)}</td>` +
                 `<td class="desc">${escapeHtml(p.description || '')}</td>` +
-                `<td class="uom">${escapeHtml(uomText)}</td>` +
+                `<td class="uom">${escapeHtml(uomOf(p))}</td>` +
                 `<td class="qty"></td><td class="qty"></td><td class="qty"></td><td class="qty"></td>` +
                 `</tr>`;
         });
     }
-    if (!bodyRows) {
+
+    // ── FLAT body (no categories; one row per product, by num) ────────
+    const flatProducts = favProducts.slice().sort((a, b) =>
+        String(a.num).localeCompare(String(b.num), undefined, { numeric: true }));
+    let flatBodyRows = '';
+    for (const p of flatProducts) {
+        flatBodyRows += `<tr>` +
+            `<td class="num">${escapeHtml(p.num)}</td>` +
+            `<td class="desc">${escapeHtml(p.description || '')}</td>` +
+            `<td class="uom">${escapeHtml(uomOf(p))}</td>` +
+            `<td class="qty"></td><td class="qty"></td><td class="qty"></td><td class="qty"></td>` +
+            `</tr>`;
+    }
+
+    if (!groupedBodyRows && !flatBodyRows) {
         showToast('No favourites resolved — the customer\'s favourite products may have been removed', 'info', 5000);
         return;
     }
@@ -8429,8 +8814,23 @@ async function printCustomerFavourites() {
         }
         .print-bar .hint { color: #94a3b8; font-size: 12px; }
     }
+    /* Category-mode toggle — both tables render into the page; the
+       print-bar radios flip body.show-flat to choose which one shows
+       (and prints). Default = grouped by main category. */
+    #flatWrap { display: none; }
+    body.show-flat #groupedWrap { display: none; }
+    body.show-flat #flatWrap    { display: block; }
+    col.num-col-flat  { width: 20%; }
+    col.desc-col-flat { width: 48%; }
+    col.uom-col-flat  { width: 10%; }
+    @media screen {
+        .print-bar label { color: #fff; font-size: 13px; display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+        .print-bar .sep { width: 1px; height: 20px; background: rgba(255,255,255,0.25); margin: 0 2px; }
+    }
     @media print {
         .print-bar { display: none !important; }
+        body.show-flat #groupedWrap { display: none; }
+        body:not(.show-flat) #flatWrap { display: none; }
     }
 </style>
 </head>
@@ -8438,7 +8838,10 @@ async function printCustomerFavourites() {
     <div class="print-bar">
         <button onclick="window.print()">Print</button>
         <button onclick="window.close()" style="background:transparent;color:white;border:1px solid rgba(255,255,255,0.3);">Close</button>
-        <span class="hint">Tip: in the print dialog, set destination to "Save as PDF" to download.</span>
+        <span class="sep"></span>
+        <label><input type="radio" name="catmode" checked onclick="document.body.classList.remove('show-flat')"> Grouped by category</label>
+        <label><input type="radio" name="catmode" onclick="document.body.classList.add('show-flat')"> No categories</label>
+        <span class="hint">Tip: set the print destination to "Save as PDF" to download.</span>
     </div>
     <h1>ORDER SHEET</h1>
     <h2>${escapeHtml(_selectedCustomer.name)}</h2>
@@ -8447,6 +8850,9 @@ async function printCustomerFavourites() {
         ${companyName ? escapeHtml(companyName) + ' · ' : ''}
         Printed ${escapeHtml(moment().format(MOMENT_FMT))} · ${totalProducts} product${totalProducts === 1 ? '' : 's'}
     </div>
+
+    <!-- Grouped by main category (default). -->
+    <div id="groupedWrap">
     <table>
         <colgroup>
             <col class="cat-col"><col class="num-col"><col class="desc-col"><col class="uom-col">
@@ -8458,8 +8864,27 @@ async function printCustomerFavourites() {
                 <th class="dates" colspan="4">Dates / Quantities</th>
             </tr>
         </thead>
-        <tbody>${bodyRows}</tbody>
+        <tbody>${groupedBodyRows}</tbody>
     </table>
+    </div>
+
+    <!-- No categories (flat, one row per product). -->
+    <div id="flatWrap">
+    <table>
+        <colgroup>
+            <col class="num-col-flat"><col class="desc-col-flat"><col class="uom-col-flat">
+            <col class="qty-col"><col class="qty-col"><col class="qty-col"><col class="qty-col">
+        </colgroup>
+        <thead>
+            <tr>
+                <th></th><th></th><th>UOM</th>
+                <th class="dates" colspan="4">Dates / Quantities</th>
+            </tr>
+        </thead>
+        <tbody>${flatBodyRows}</tbody>
+    </table>
+    </div>
+
     <div class="footer">
         <span>Date columns: write the order date at the top of each column, qty below.</span>
     </div>
@@ -8660,6 +9085,7 @@ async function init() {
     updatePrevPurchasedBtn();
     updateFavouritesBtn();
     updateInStockOnlyBtn();
+    updateGroupByTreeBtn();
     setViewMode(_viewMode);
 
     buildMS('cust');
