@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  body { font-family: sans-serif; padding: 14px; color:#0f172a; }
+  h2 { margin:0 0 4px; font-size:16px; }
+  .sub { color:#64748b; font-size:12px; margin-bottom:12px; }
+  input { font-family: monospace; padding:4px 8px; font-size:13px; }
+  button { font-family: inherit; padding:6px 12px; font-size:13px; cursor:pointer;
+           background:#2d9cdb; color:#fff; border:none; border-radius:6px; }
+  button.warn { background:#b45309; }
+  table { border-collapse:collapse; margin-top:10px; font-size:12px; width:100%; }
+  th,td { border:1px solid #e2e8f0; padding:5px 8px; text-align:left; }
+  th { background:#1e3a5f; color:#fff; }
+  td.num { font-variant-numeric:tabular-nums; text-align:right; }
+  .lab { background:#fffbeb; }
+  pre { background:#0f172a; color:#e2e8f0; padding:10px; border-radius:8px;
+        font-size:11px; white-space:pre-wrap; word-break:break-word; margin-top:10px; }
+  .msg { margin-left:8px; font-size:12px; }
+</style>
+</head>
+<body>
+  <h2>WO Labour Used + Scrap — SaveWorkOrderRq probe</h2>
+  <div class="sub">
+    Tests whether a labour line's <b>QtyUsed</b> can be adjusted via a standalone
+    <b>SaveWorkOrderRq</b> (target left untouched), then reads the DB row back to
+    confirm what actually persisted. Also tests the <b>QtyScrapped</b> field on the WO
+    save (bottom section) as a possible replacement for the separate ImportScrapData
+    CSV scrap flow — checking whether it actually moves on-hand stock or is cosmetic.
+    Read-only until you click a Save/Fulfil button, which writes to the WO — demo DB only.
+  </div>
+
+  <div>
+    WO #: <input id="wo" value="219:001" />
+    <button onclick="loadWo()">Load</button>
+    <span class="msg" id="msg"></span>
+  </div>
+
+  <div id="grid"></div>
+
+  <div id="saveWrap" style="display:none; margin-top:12px;">
+    <button class="warn" onclick="saveWo()">Save labour QtyUsed &rarr; then re-read DB</button>
+    <button onclick="startWo()" style="background:#0f766e; margin-left:8px;">Start WO (StatusID&rarr;30)</button>
+    <span class="msg" id="saveMsg"></span>
+    <div class="sub" style="margin-top:6px;">
+      To isolate the mechanism: on a fresh <b>Entered</b> WO, click <b>Save labour QtyUsed</b> and note
+      whether the DB read-back persists (0&rarr;N or 0&rarr;0). Then click <b>Start WO</b> and Save again —
+      if it only persists once Started, the report must pre-store labour AFTER the WO is started.
+    </div>
+  </div>
+
+  <div id="fulfilWrap" style="display:none; margin-top:10px; padding-top:10px; border-top:1px dashed #cbd5e1;">
+    <button class="warn" onclick="fulfilWo()" style="background:#b91c1c;">Fulfil WO (status&rarr;40), labour UNTOUCHED &rarr; re-read DB</button>
+    <span class="msg" id="fulfilMsg"></span>
+    <div class="sub" style="margin-top:6px;">
+      Decisive test: sets StatusID=40 and FG QtyUsed=target (a finish), but leaves the labour
+      lines' QtyUsed exactly as already stored. If the stored values survive, the fix is
+      "set labour while open, then fulfil". Only run on a disposable OPEN test WO (e.g. 220:001).
+    </div>
+  </div>
+
+  <div id="scrapWrap" style="display:none; margin-top:10px; padding-top:10px; border-top:1px dashed #cbd5e1;">
+    <button class="warn" onclick="runScrapTest(false)" style="background:#7c2d12;">Save QtyScrapped (current status) &rarr; re-read DB + on-hand</button>
+    <button class="warn" onclick="runScrapTest(true)" style="background:#b91c1c; margin-left:8px;">Fulfil WO (status&rarr;40) + apply QtyScrapped &rarr; re-read DB + on-hand</button>
+    <span class="msg" id="scrapMsg"></span>
+    <div class="sub" style="margin-top:6px;">
+      Tests whether setting a component line's <b>QtyScrapped</b> in the SaveWorkOrderRq
+      actually scraps stock — the alternative to the separate <code>ImportScrapData</code> CSV
+      flow used in Production_Scheduling. The <b>on-hand delta</b> (tag qty, typeid 30/40) is the
+      decisive check: <b>[STOCK MOVED]</b> means a plain WO save can replace the CSV path;
+      <b>[no change]</b> means QtyScrapped is cosmetic and the ImportScrapData flow is still
+      required. Enter a New QtyScrapped on an <i>inventory raw-material</i> line (scrapping
+      labour/non-inventory has no stock to move). Run the finish variant on a disposable OPEN WO.
+    </div>
+    <div class="sub" style="margin-top:6px; color:#8A1E30;">
+      <b>RESULT (2026-07-25, DB-verified):</b> COSMETIC. Setting <code>woitem.QtyScrapped</code>
+      via SaveWorkOrderRq (at Entered <i>and</i> at status&rarr;40) wrote the DB field but created
+      <b>zero</b> inventorylog transactions and moved <b>no</b> on-hand stock (LID-501 stayed 92,
+      committed 0). It does NOT replace the ImportScrapData flow — actual scrap needs a real
+      inventory transaction. Caveat: the finish variant went status&rarr;40 without committing a
+      pick, so it didn't test scrap during a real finish; but the field fired nothing either way,
+      and ImportScrapData scraps from general stock (no pick needed) so it's strictly more capable.
+    </div>
+  </div>
+
+  <div id="moWrap" style="display:none; margin-top:10px; padding-top:10px; border-top:1px dashed #cbd5e1;">
+    <div>
+      MO #: <input id="moNum" value="" style="width:90px" />
+      <button onclick="loadMo()" style="background:#7c3aed;">Load MO (REST)</button>
+      <span class="msg" id="moMsg"></span>
+    </div>
+    <div id="moGrid"></div>
+    <div id="moSaveWrap" style="display:none; margin-top:8px;">
+      <button class="warn" onclick="saveMoItems()" style="background:#7c3aed;">Save MO item quantityFulfilled (REST POST) &rarr; re-read DB</button>
+      <span class="msg" id="moSaveMsg"></span>
+    </div>
+    <div class="sub" style="margin-top:6px;">
+      Tests the REST <b>Update a manufacture order</b> endpoint (each config item has
+      <code>quantity</code> + <code>quantityFulfilled</code>). Per the docs, <b>configurations only
+      update when the MO status is "Entered"</b>, and SO-linked MOs are skipped — so this can't set a
+      <i>finished</i> WO's labour. After POST it re-GETs the MO and re-reads the WO's labour
+      <code>woitem.qtyUsed</code> to show whether an MO-item change flows to the WO. Demo DB only.
+    </div>
+  </div>
+
+  <pre id="out" style="display:none;"></pre>
+
+  <script>
+    var _items = [];   // labour line descriptors { woitemId, part, target, apiUsed }
+    var _scrap = [];   // component line descriptors { apiIndex, woitemId, part, partId } — for the QtyScrapped test
+
+    function q(sql) { return JSON.parse(runQuery(sql)); }
+
+    function dbRows(woNum) {
+      // qtyTarget / qtyUsed / qtyScrapped straight from the DB for every line, plus
+      // the part id (for the on-hand stock check) and the woitem type (10 = finished-
+      // good output, 20 = component — raw material or labour/service).
+      return q(
+        "SELECT wi.id AS woitem_id, wi.partid AS part_id, wi.typeid AS wo_item_type, " +
+        "       p.num AS part_num, p.typeid AS part_typeid, " +
+        "       wi.qtytarget, wi.qtyused, wi.qtyscrapped " +
+        "FROM wo JOIN woitem wi ON wi.woid=wo.id " +
+        "LEFT JOIN part p ON p.id=wi.partid " +
+        "WHERE wo.num='" + woNum.replace(/'/g, "''") + "' ORDER BY wi.sortid"
+      );
+    }
+
+    // Total on-hand (tag qty, typeid 30/40) per part — the decisive stock-movement
+    // check for the scrap test. Parts with no tags (labour/service) just don't appear.
+    function onHandByPart(partIds) {
+      var ids = (partIds || []).filter(function (v) { return v != null && v !== ''; });
+      if (!ids.length) return {};
+      var m = {};
+      try {
+        q("SELECT partid, COALESCE(SUM(qty),0) AS oh FROM tag WHERE typeid IN (30,40) AND partid IN (" +
+          ids.join(',') + ") GROUP BY partid").forEach(function (r) { m[String(r.partid)] = r.oh; });
+      } catch (e) { /* best-effort */ }
+      return m;
+    }
+
+    function loadWo() {
+      var woNum = document.getElementById('wo').value.trim();
+      var msg = document.getElementById('msg');
+      var grid = document.getElementById('grid');
+      msg.textContent = ''; grid.innerHTML = '';
+      document.getElementById('saveWrap').style.display = 'none';
+      document.getElementById('fulfilWrap').style.display = 'none';
+      document.getElementById('scrapWrap').style.display = 'none';
+      document.getElementById('out').style.display = 'none';
+      if (typeof runApiRequest !== 'function') { msg.textContent = 'Run inside Fishbowl.'; return; }
+      try {
+        var rs = JSON.parse(runApiRequest('GetWorkOrderRq',
+          JSON.stringify({ GetWorkOrderRq: { WorkOrderNumber: woNum } })));
+        var g = rs.GetWorkOrderRs || {};
+        if (g.statusCode !== 1000 || !g.WO) { msg.textContent = 'Get failed: ' + g.statusCode + ' ' + (g.statusMessage||''); return; }
+        var raw = g.WO.WOItems && g.WO.WOItems.WOItem;
+        var apiItems = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+        var db = dbRows(woNum);
+        var dbByPartAndTarget = {};   // fallback index
+        var dbById = {};
+        db.forEach(function(r){ dbById[String(r.woitem_id)] = r; });
+
+        // On-hand (total tag qty, typeid 30/40) per part — shown per line + used by the scrap test.
+        var ohNow = onHandByPart(db.map(function (r) { return r.part_id; }));
+
+        var rows = '<table><tr><th>API WOItem.ID</th><th>Part</th><th>partType</th>' +
+                   '<th>Target</th><th>Used (API)</th><th>Scrap (API)</th>' +
+                   '<th>DB used</th><th>DB scrap</th><th>On hand</th>' +
+                   '<th>Labour?</th><th>New QtyUsed</th><th>New QtyScrapped</th></tr>';
+        _items = []; _scrap = [];
+        apiItems.forEach(function(wi, i){
+          var idA = wi.ID != null ? wi.ID : (wi.WOItemID != null ? wi.WOItemID : '');
+          var pnum = wi.PartNum || (wi.Part && wi.Part.Num) || '?';
+          var ptype = wi.Part && wi.Part.TypeID != null ? wi.Part.TypeID : '?';
+          var isFg = wi.TypeID === 10;                                     // finished-good output line
+          var isComponent = !isFg;                                        // raw material OR labour/service
+          var isLabour = isComponent && ptype !== 10 && ptype !== '?';    // non-inventory component
+          var dbr = dbById[String(idA)] || {};
+          var oh = (dbr.part_id != null && ohNow[String(dbr.part_id)] != null) ? ohNow[String(dbr.part_id)] : '—';
+          var usedInput  = isLabour    ? '<input id="nu_' + i + '" style="width:80px" placeholder="used" />'  : '';
+          var scrapInput = isComponent ? '<input id="sc_' + i + '" style="width:80px" placeholder="scrap" />' : '';
+          rows += '<tr class="' + (isLabour ? 'lab' : '') + '">' +
+                  '<td>' + idA + '</td><td>' + pnum + '</td><td class="num">' + ptype + '</td>' +
+                  '<td class="num">' + wi.QtyToFulfill + '</td>' +
+                  '<td class="num">' + wi.QtyUsed + '</td>' +
+                  '<td class="num">' + (wi.QtyScrapped != null ? wi.QtyScrapped : '—') + '</td>' +
+                  '<td class="num">' + (dbr.qtyused != null ? dbr.qtyused : '—') + '</td>' +
+                  '<td class="num">' + (dbr.qtyscrapped != null ? dbr.qtyscrapped : '—') + '</td>' +
+                  '<td class="num">' + oh + '</td>' +
+                  '<td>' + (isLabour ? 'YES' : '') + '</td>' +
+                  '<td>' + usedInput + '</td>' +
+                  '<td>' + scrapInput + '</td></tr>';
+          if (isLabour)    _items.push({ apiIndex: i, woitemId: idA, part: pnum });
+          if (isComponent) _scrap.push({ apiIndex: i, woitemId: idA, part: pnum, partId: dbr.part_id });
+        });
+        rows += '</table>';
+        grid.innerHTML = rows;
+        // Stash the fresh API WO so Save reuses the exact object shape.
+        window._apiWo = g.WO;
+        window._apiItems = apiItems;
+        if (_items.length) {
+          document.getElementById('saveWrap').style.display = '';
+          document.getElementById('fulfilWrap').style.display = '';
+        }
+        if (_scrap.length) document.getElementById('scrapWrap').style.display = '';
+        msg.textContent = 'Loaded. ' + _items.length + ' labour line(s), ' + _scrap.length + ' component line(s). WO status=' + g.WO.StatusID + '.';
+
+        // Resolve the WO's MO so the REST MO-endpoint test can target it.
+        try {
+          var moInfo = q("SELECT mo.num AS mo_num, mo.statusid AS mo_status " +
+            "FROM wo JOIN moitem ON wo.moitemid=moitem.id JOIN mo ON moitem.moid=mo.id " +
+            "WHERE wo.num='" + woNum.replace(/'/g, "''") + "' LIMIT 1")[0];
+          if (moInfo) {
+            document.getElementById('moNum').value = moInfo.mo_num;
+            document.getElementById('moWrap').style.display = '';
+            document.getElementById('moGrid').innerHTML = '';
+            document.getElementById('moSaveWrap').style.display = 'none';
+            document.getElementById('moMsg').textContent = 'MO ' + moInfo.mo_num + ' (status ' + moInfo.mo_status + ') — click Load MO.';
+          }
+        } catch (e) { /* MO resolve is best-effort */ }
+      } catch (e) { msg.textContent = 'ERR: ' + (e && e.message || e); }
+    }
+
+    function saveWo() {
+      var woNum = document.getElementById('wo').value.trim();
+      var saveMsg = document.getElementById('saveMsg');
+      var out = document.getElementById('out');
+      saveMsg.textContent = '';
+      try {
+        // Re-GET fresh so we hold the current version/shape.
+        var rs = JSON.parse(runApiRequest('GetWorkOrderRq',
+          JSON.stringify({ GetWorkOrderRq: { WorkOrderNumber: woNum } })));
+        var wo = rs.GetWorkOrderRs && rs.GetWorkOrderRs.WO;
+        if (!wo) { saveMsg.textContent = 'Re-Get failed.'; return; }
+        var raw = wo.WOItems && wo.WOItems.WOItem;
+        var items = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+
+        var dbBefore = dbRows(woNum);
+
+        var applied = [];
+        _items.forEach(function(it){
+          var inp = document.getElementById('nu_' + it.apiIndex);
+          if (!inp || inp.value.trim() === '') return;
+          var v = parseFloat(inp.value.trim());
+          if (!isFinite(v)) return;
+          var wi = items[it.apiIndex];
+          if (!wi) return;
+          // ONLY set QtyUsed. Leave QtyToFulfill / OriginalQtyToFulfill untouched.
+          wi.QtyUsed = String(v);
+          applied.push(it.part + ' (WOItem ' + it.woitemId + ') QtyUsed=' + v);
+        });
+        if (!applied.length) { saveMsg.textContent = 'Enter at least one New QtyUsed.'; return; }
+
+        var saveRs = JSON.parse(runApiRequest('SaveWorkOrderRq',
+          JSON.stringify({ SaveWorkOrderRq: { WO: wo } })));
+        var s = saveRs.SaveWorkOrderRs || {};
+
+        var dbAfter = dbRows(woNum);
+
+        var report = 'Sent: ' + applied.join('  |  ') + '\n' +
+                     'SaveWorkOrderRs statusCode=' + s.statusCode + '  ' + (s.statusMessage || '') + '\n\n' +
+                     'DB qtyUsed BEFORE -> AFTER (labour lines):\n';
+        var beforeById = {}; dbBefore.forEach(function(r){ beforeById[String(r.woitem_id)] = r; });
+        dbAfter.forEach(function(r){
+          if (String(r.part_typeid) === '10') return;
+          var b = beforeById[String(r.woitem_id)] || {};
+          report += '  ' + r.part_num + ' (id ' + r.woitem_id + '): target=' + r.qtytarget +
+                    '  used ' + (b.qtyused != null ? b.qtyused : '?') + ' -> ' + r.qtyused + '\n';
+        });
+        out.style.display = 'block';
+        out.textContent = report;
+        saveMsg.textContent = s.statusCode === 1000 ? 'Save returned 1000. Check the DB read-back below.' : 'Save returned ' + s.statusCode;
+      } catch (e) { saveMsg.textContent = 'ERR: ' + (e && e.message || e); }
+    }
+
+    // Transition an OPEN WO to Started (StatusID 30) via SaveWorkOrderRq, then
+    // reload — so the standalone labour-save test can be run at Entered vs Started
+    // without touching the report's pick machinery.
+    function startWo() {
+      var woNum = document.getElementById('wo').value.trim();
+      var saveMsg = document.getElementById('saveMsg');
+      saveMsg.textContent = '';
+      try {
+        var rs = JSON.parse(runApiRequest('GetWorkOrderRq',
+          JSON.stringify({ GetWorkOrderRq: { WorkOrderNumber: woNum } })));
+        var wo = rs.GetWorkOrderRs && rs.GetWorkOrderRs.WO;
+        if (!wo) { saveMsg.textContent = 'Re-Get failed.'; return; }
+        if (wo.StatusID === 40) { saveMsg.textContent = 'Already fulfilled — cannot start.'; return; }
+        var before = wo.StatusID;
+        wo.StatusID = 30;
+        var sr = JSON.parse(runApiRequest('SaveWorkOrderRq',
+          JSON.stringify({ SaveWorkOrderRq: { WO: wo } })));
+        var s = sr.SaveWorkOrderRs || {};
+        saveMsg.textContent = 'Start save (StatusID ' + before + '->30) returned ' + s.statusCode + '  ' + (s.statusMessage || '') + '. Reloading…';
+        loadWo();
+      } catch (e) { saveMsg.textContent = 'ERR: ' + (e && e.message || e); }
+    }
+
+    function fulfilWo() {
+      var woNum = document.getElementById('wo').value.trim();
+      var fulfilMsg = document.getElementById('fulfilMsg');
+      var out = document.getElementById('out');
+      fulfilMsg.textContent = '';
+      try {
+        var rs = JSON.parse(runApiRequest('GetWorkOrderRq',
+          JSON.stringify({ GetWorkOrderRq: { WorkOrderNumber: woNum } })));
+        var wo = rs.GetWorkOrderRs && rs.GetWorkOrderRs.WO;
+        if (!wo) { fulfilMsg.textContent = 'Re-Get failed.'; return; }
+        if (wo.StatusID === 40) { fulfilMsg.textContent = 'Already fulfilled (status 40) — run this on an OPEN test WO.'; return; }
+        var raw = wo.WOItems && wo.WOItems.WOItem;
+        var items = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+
+        var dbBefore = dbRows(woNum);
+
+        // Mimic a finish: fulfil the WO + receive the finished good(s), but
+        // do NOT touch any non-FG line — the labour lines keep whatever
+        // qtyUsed is already stored. This isolates whether the status->40
+        // transition preserves or recomputes pre-stored labour consumption.
+        wo.StatusID = 40;
+        items.forEach(function (wi) {
+          if (wi.TypeID === 10) {
+            var tgt = wi.QtyToFulfill != null ? wi.QtyToFulfill : wi.QtyUsed;
+            wi.QtyUsed = String(tgt);
+          }
+          // non-FG (raw + labour): left exactly as returned by Get.
+        });
+
+        var saveRs = JSON.parse(runApiRequest('SaveWorkOrderRq',
+          JSON.stringify({ SaveWorkOrderRq: { WO: wo } })));
+        var s = saveRs.SaveWorkOrderRs || {};
+
+        var dbAfter = dbRows(woNum);
+        var beforeById = {}; dbBefore.forEach(function(r){ beforeById[String(r.woitem_id)] = r; });
+        var report = 'FULFIL test (status->40, labour untouched)\n' +
+                     'SaveWorkOrderRs statusCode=' + s.statusCode + '  ' + (s.statusMessage || '') + '\n\n' +
+                     'DB qtyUsed BEFORE -> AFTER (labour lines):\n';
+        dbAfter.forEach(function(r){
+          if (String(r.part_typeid) === '10') return;
+          var b = beforeById[String(r.woitem_id)] || {};
+          var kept = (b.qtyused != null && String(b.qtyused) === String(r.qtyused));
+          report += '  ' + r.part_num + ' (id ' + r.woitem_id + '): target=' + r.qtytarget +
+                    '  used ' + (b.qtyused != null ? b.qtyused : '?') + ' -> ' + r.qtyused +
+                    '   ' + (kept ? '[PRESERVED]' : '[CHANGED]') + '\n';
+        });
+        out.style.display = 'block';
+        out.textContent = report;
+        fulfilMsg.textContent = 'Done — see PRESERVED/CHANGED below.';
+      } catch (e) { fulfilMsg.textContent = 'ERR: ' + (e && e.message || e); }
+    }
+
+    // ── QtyScrapped test — scrap via SaveWorkOrderRq (vs the ImportScrapData CSV flow) ──
+    // Sets wi.QtyScrapped on component lines that carry a New QtyScrapped value, leaving
+    // QtyToFulfill / QtyUsed untouched so we can see whether Fishbowl adjusts Used or moves
+    // stock on its own. Returns { applied[], partIds[] } for the report + on-hand check.
+    function applyScrap(items) {
+      var applied = [], partIds = [];
+      _scrap.forEach(function (it) {
+        var inp = document.getElementById('sc_' + it.apiIndex);
+        if (!inp || inp.value.trim() === '') return;
+        var v = parseFloat(inp.value.trim());
+        if (!isFinite(v)) return;
+        var wi = items[it.apiIndex];
+        if (!wi) return;
+        wi.QtyScrapped = String(v);
+        applied.push(it.part + ' (WOItem ' + it.woitemId + ') QtyScrapped=' + v);
+        if (it.partId != null) partIds.push(it.partId);
+      });
+      return { applied: applied, partIds: partIds };
+    }
+
+    // Core scrap test. finish=false → save at the current status; finish=true → also set
+    // StatusID=40 + FG QtyUsed=target (scrap AT finish, the production flow's moment). It
+    // snapshots DB woitem (target/used/scrap) AND part on-hand before/after, so the report
+    // shows both what the woitem recorded AND — the decisive bit — whether stock actually
+    // moved. [STOCK MOVED] → QtyScrapped can replace the ImportScrapData CSV path;
+    // [no change] → the field is cosmetic and the CSV flow is still required.
+    function runScrapTest(finish) {
+      var woNum = document.getElementById('wo').value.trim();
+      var scrapMsg = document.getElementById('scrapMsg');
+      var out = document.getElementById('out');
+      scrapMsg.textContent = '';
+      try {
+        var rs = JSON.parse(runApiRequest('GetWorkOrderRq',
+          JSON.stringify({ GetWorkOrderRq: { WorkOrderNumber: woNum } })));
+        var wo = rs.GetWorkOrderRs && rs.GetWorkOrderRs.WO;
+        if (!wo) { scrapMsg.textContent = 'Re-Get failed.'; return; }
+        if (finish && wo.StatusID === 40) { scrapMsg.textContent = 'Already fulfilled — run the finish-scrap test on an OPEN WO.'; return; }
+        var raw = wo.WOItems && wo.WOItems.WOItem;
+        var items = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+
+        var dbBefore = dbRows(woNum);
+        var partIds = dbBefore.map(function (r) { return r.part_id; }).filter(function (v) { return v != null; });
+        var ohBefore = onHandByPart(partIds);
+
+        if (finish) {
+          wo.StatusID = 40;
+          items.forEach(function (wi) {
+            if (wi.TypeID === 10) { var tgt = wi.QtyToFulfill != null ? wi.QtyToFulfill : wi.QtyUsed; wi.QtyUsed = String(tgt); }
+          });
+        }
+
+        var ap = applyScrap(items);
+        if (!ap.applied.length) { scrapMsg.textContent = 'Enter at least one New QtyScrapped (on an inventory raw-material line).'; return; }
+
+        var saveRs = JSON.parse(runApiRequest('SaveWorkOrderRq',
+          JSON.stringify({ SaveWorkOrderRq: { WO: wo } })));
+        var s = saveRs.SaveWorkOrderRs || {};
+
+        var dbAfter = dbRows(woNum);
+        var ohAfter = onHandByPart(partIds);
+        var beforeById = {}; dbBefore.forEach(function (r) { beforeById[String(r.woitem_id)] = r; });
+        var numById = {}; dbAfter.forEach(function (r) { numById[String(r.part_id)] = r.part_num; });
+
+        var report = 'SCRAP test' + (finish ? ' (status->40 + FG used=target)' : ' (current status, no finish)') + '\n' +
+                     'Sent: ' + ap.applied.join('  |  ') + '\n' +
+                     'SaveWorkOrderRs statusCode=' + s.statusCode + '  ' + (s.statusMessage || '') + '\n\n' +
+                     'DB woitem BEFORE -> AFTER (component lines):\n';
+        dbAfter.forEach(function (r) {
+          if (String(r.wo_item_type) === '10') return;   // skip the FG output line
+          var b = beforeById[String(r.woitem_id)] || {};
+          report += '  ' + r.part_num + ' (id ' + r.woitem_id + '): target=' + r.qtytarget +
+                    '  used ' + (b.qtyused != null ? b.qtyused : '?') + '->' + r.qtyused +
+                    '  scrap ' + (b.qtyscrapped != null ? b.qtyscrapped : '?') + '->' + r.qtyscrapped + '\n';
+        });
+        report += '\nOn-hand (tag qty, typeid 30/40) BEFORE -> AFTER for scrapped parts (decisive):\n';
+        var seen = {};
+        ap.partIds.forEach(function (pid) {
+          if (seen[String(pid)]) return; seen[String(pid)] = 1;
+          var b = ohBefore[String(pid)], a = ohAfter[String(pid)];
+          var moved = String(b == null ? 0 : b) !== String(a == null ? 0 : a);
+          report += '  part ' + (numById[String(pid)] || ('#' + pid)) + ': ' +
+                    (b != null ? b : 0) + ' -> ' + (a != null ? a : 0) +
+                    '   ' + (moved ? '[STOCK MOVED]' : '[no change — cosmetic]') + '\n';
+        });
+        out.style.display = 'block';
+        out.textContent = report;
+        scrapMsg.textContent = s.statusCode === 1000 ? 'Save returned 1000. Check the on-hand delta below.' : 'Save returned ' + s.statusCode;
+      } catch (e) { scrapMsg.textContent = 'ERR: ' + (e && e.message || e); }
+    }
+
+    // ── REST "Update a manufacture order" endpoint test ──────────────────────
+    // GET /api/manufacture-orders/:id → show each configuration item's quantity +
+    // quantityFulfilled → let the user edit quantityFulfilled on a non-FG (labour/
+    // overhead/raw) item → POST the whole MO back → re-GET the MO + re-read the WO's
+    // labour woitem.qtyUsed, to see whether an MO-item change flows through to the WO.
+    async function loadMo() {
+      var moNum = document.getElementById('moNum').value.trim();
+      var moMsg = document.getElementById('moMsg');
+      var moGrid = document.getElementById('moGrid');
+      moMsg.textContent = ''; moGrid.innerHTML = '';
+      document.getElementById('moSaveWrap').style.display = 'none';
+      if (typeof runRestApiAsync !== 'function') { moMsg.textContent = 'runRestApiAsync unavailable (REST not enabled).'; return; }
+      if (!moNum) { moMsg.textContent = 'Enter an MO #.'; return; }
+      var info;
+      try { info = q("SELECT id, statusid FROM mo WHERE num='" + moNum.replace(/'/g, "''") + "' LIMIT 1")[0]; }
+      catch (e) { moMsg.textContent = 'DB lookup failed: ' + (e && e.message || e); return; }
+      if (!info) { moMsg.textContent = 'MO ' + moNum + ' not found.'; return; }
+      var moId = parseInt(info.id, 10);
+      try {
+        var full = await runRestApiAsync({ method: 'GET', path: '/api/manufacture-orders/' + moId });
+        window._moId = moId; window._moNum = moNum; window._moItemMap = {};
+        var st = (full && full.status) || ('status ' + info.statusid);
+        var rows = '<table><tr><th>Item ID</th><th>Config</th><th>Part</th><th>Type</th>' +
+                   '<th>quantity</th><th>quantityFulfilled</th><th>New qtyFulfilled</th></tr>';
+        (full.configurations || []).forEach(function (cfg, ci) {
+          (cfg.items || []).forEach(function (it, ii) {
+            var pid = it.id;
+            window._moItemMap[String(pid)] = { ci: ci, ii: ii, part: (it.part && it.part.name) || '?' };
+            var isFg = (it.type === 'Finished Good');
+            rows += '<tr class="' + (isFg ? '' : 'lab') + '">' +
+              '<td>' + pid + '</td><td class="num">' + (cfg.id != null ? cfg.id : ci) + '</td>' +
+              '<td>' + ((it.part && it.part.name) || '?') + '</td><td>' + (it.type || '?') + '</td>' +
+              '<td class="num">' + it.quantity + '</td><td class="num">' + it.quantityFulfilled + '</td>' +
+              '<td>' + (isFg ? '' : '<input id="mf_' + pid + '" style="width:90px" placeholder="e.g. 2" />') + '</td></tr>';
+          });
+        });
+        rows += '</table>';
+        moGrid.innerHTML = rows;
+        document.getElementById('moSaveWrap').style.display = '';
+        var warn = String(st).toLowerCase() !== 'entered'
+          ? ' — NOTE: status is not "Entered", so configurations will NOT update (docs).' : '';
+        moMsg.textContent = 'MO ' + moNum + ' loaded. status=' + st + warn;
+      } catch (e) { moMsg.textContent = 'REST GET failed: ' + ((e && (e.message || e.status)) || e); }
+    }
+
+    async function saveMoItems() {
+      var woNum = document.getElementById('wo').value.trim();
+      var moSaveMsg = document.getElementById('moSaveMsg');
+      var out = document.getElementById('out');
+      moSaveMsg.textContent = '';
+      var moId = window._moId;
+      if (moId == null) { moSaveMsg.textContent = 'Load the MO first.'; return; }
+      try {
+        // Fresh GET so we hold the current shape/version, then apply edits.
+        var full = await runRestApiAsync({ method: 'GET', path: '/api/manufacture-orders/' + moId });
+        var applied = [];
+        Object.keys(window._moItemMap || {}).forEach(function (pid) {
+          var inp = document.getElementById('mf_' + pid);
+          if (!inp || inp.value.trim() === '') return;
+          var v = parseFloat(inp.value.trim());
+          if (!isFinite(v)) return;
+          var m = window._moItemMap[pid];
+          var it = full.configurations[m.ci] && full.configurations[m.ci].items[m.ii];
+          if (!it) return;
+          it.quantityFulfilled = String(v);
+          applied.push(m.part + ' (item ' + pid + ') quantityFulfilled=' + v);
+        });
+        if (!applied.length) { moSaveMsg.textContent = 'Enter at least one New qtyFulfilled.'; return; }
+
+        var dbBefore = dbRows(woNum);
+
+        var res = await runRestApiAsync({ method: 'POST', path: '/api/manufacture-orders/' + moId, body: JSON.stringify(full) });
+
+        // Re-GET the MO to see the persisted item quantityFulfilled.
+        var after = await runRestApiAsync({ method: 'GET', path: '/api/manufacture-orders/' + moId });
+        var afterById = {};
+        (after.configurations || []).forEach(function (cfg) { (cfg.items || []).forEach(function (it) { afterById[String(it.id)] = it; }); });
+
+        var dbAfter = dbRows(woNum);
+        var beforeById = {}; dbBefore.forEach(function (r) { beforeById[String(r.woitem_id)] = r; });
+
+        var report = 'MO REST POST — set item quantityFulfilled\n' +
+                     'Sent: ' + applied.join('  |  ') + '\n' +
+                     'POST result: ' + (typeof res === 'string' ? res.slice(0, 160) : JSON.stringify({ id: res && res.id, status: res && res.status })) + '\n\n' +
+                     'MO item quantityFulfilled AFTER (re-GET):\n';
+        Object.keys(window._moItemMap).forEach(function (pid) {
+          var inp = document.getElementById('mf_' + pid);
+          if (!inp || inp.value.trim() === '') return;
+          var it = afterById[String(pid)] || {};
+          report += '  ' + window._moItemMap[pid].part + ' (item ' + pid + '): quantityFulfilled -> ' + (it.quantityFulfilled != null ? it.quantityFulfilled : '?') + '\n';
+        });
+        report += '\nWO ' + woNum + ' non-FG woitem.qtyUsed BEFORE -> AFTER:\n';
+        dbAfter.forEach(function (r) {
+          if (String(r.part_typeid) === '10') return;
+          var b = beforeById[String(r.woitem_id)] || {};
+          report += '  ' + r.part_num + ' (id ' + r.woitem_id + '): target=' + r.qtytarget +
+                    '  used ' + (b.qtyused != null ? b.qtyused : '?') + ' -> ' + r.qtyused + '\n';
+        });
+        out.style.display = 'block';
+        out.textContent = report;
+        moSaveMsg.textContent = 'Done — see the read-back below.';
+      } catch (e) { moSaveMsg.textContent = 'REST error: ' + ((e && (e.message || e.status)) || e); }
+    }
+
+    loadWo();
+  </script>
+</body>
+</html>

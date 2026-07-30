@@ -620,6 +620,33 @@ window.FBLib = (function () {
                      close: function () { closeDrawer(cfg.id); },
                      toggle: function () { toggleDrawer(cfg.id); } };
         }
+        // Shared, lazily-created scrim that greys the page behind an open drawer.
+        // Reused across every registered drawer; clicking it closes them all.
+        function _fbDrawerScrim() {
+            var s = document.getElementById('fbDrawerScrim');
+            if (!s && document.body) {
+                s = document.createElement('div');
+                s.id = 'fbDrawerScrim';
+                s.className = 'fb-drawer-scrim';
+                s.addEventListener('click', function () { closeAllDrawers(); });
+                document.body.appendChild(s);
+            }
+            return s;
+        }
+        // Sync --fb-drawer-top to the live header/topbar height so the fixed drawer
+        // + scrim drop just below the header (which stays clear + clickable).
+        // offsetHeight is layout px — matches the fixed `top` and stays correct
+        // under a page's body-zoom.
+        function _fbSyncDrawerTop() {
+            var hdr = document.querySelector('.topbar') || document.querySelector('header');
+            var top = hdr ? hdr.offsetHeight : 56;
+            try { document.documentElement.style.setProperty('--fb-drawer-top', top + 'px'); } catch (_) {}
+        }
+        function _fbAnyDrawerOpen() {
+            return Object.keys(_drawers).some(function (k) {
+                var e = document.getElementById(k); return e && e.classList.contains('open');
+            });
+        }
         function openDrawer(id) {
             // Close every other registered drawer first — only one open at a time.
             Object.keys(_drawers).forEach(function (other) {
@@ -628,7 +655,13 @@ window.FBLib = (function () {
             const cfg = _drawers[id];
             try { if (cfg && cfg.onBeforeOpen) cfg.onBeforeOpen(); } catch (_) {}
             const el = document.getElementById(id);
-            if (el) el.classList.add('open');
+            if (el) {
+                el.classList.add('open');
+                // Overlay behaviour: position under the header + grey the page behind.
+                _fbSyncDrawerTop();
+                var scrim = _fbDrawerScrim();
+                if (scrim) scrim.classList.add('open');
+            }
             if (cfg && cfg.triggerId) {
                 const btn = document.getElementById(cfg.triggerId);
                 if (btn) btn.classList.add('active');
@@ -641,6 +674,11 @@ window.FBLib = (function () {
             if (cfg && cfg.triggerId) {
                 const btn = document.getElementById(cfg.triggerId);
                 if (btn) btn.classList.remove('active');
+            }
+            // Hide the shared scrim once the last drawer has closed.
+            if (!_fbAnyDrawerOpen()) {
+                var scrim = document.getElementById('fbDrawerScrim');
+                if (scrim) scrim.classList.remove('open');
             }
             try { if (cfg && cfg.onAfterClose) cfg.onAfterClose(); } catch (_) {}
         }
