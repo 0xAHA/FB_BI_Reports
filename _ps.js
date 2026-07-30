@@ -1,1635 +1,4 @@
-<!DOCTYPE html>
-<!--
-================================================================================
-  REPORT: Production Schedule (v1.2 — "Workspace" redesign)
-  PATH:   Manufacturing/Production_Scheduling_v1.2.htm
-  --------------------------------------------------------------------------------
-  v1.2 — DESIGN + LAYOUT REDESIGN. Rebuilds v1.1 into the "Workspace"
-  app-shell from the Claude Design wireframe (Manufacturing/Temp/
-  ProdSched_vA.htm): a slim icon rail, a top bar, tabbed navigation,
-  six views, a slide-in WO detail drawer, and the Fishbowl Design
-  System token palette (--fb-blue #2d9cdb).
 
-    - Timeline view reuses the proven v1.1 D3 Gantt engine (drag →
-      saveWODates writeback, dependency arrows + conflict rules,
-      lane-packing, topological sort, zoom, undo/redo), reskinned to
-      the DS tokens. The five other views are authored in plain
-      DOM/CSS: Dashboard (KPIs + issue panels), Board (kanban by WO
-      status), Work Orders (FBLib.Table), Calendar (month grid), and
-      User Load (capacity heatmap with a Category <-> User toggle).
-    - User dimension is real: wo.userId -> sysuser
-      (CONCAT(firstName,' ',lastName); initials for avatar chips).
-      Priority is real: wo.priorityId -> priority.name.
-    - Settings persistence stays on FBLib.Settings (userproperties),
-      reusing v1.1's user/master keys so existing prefs carry over;
-      the legacy _settingsCapacityPlanner one-shot migration is kept.
-
-  Carried forward (pre-v1.1):
-    Commit 98ef2b9 (2026-01-16): Customer PO on MO tooltips, View-by
-    WO#/BOM# dropdown for calendar/capacity tiles.
-    2026-03-09: Right-click WO tile -> two date pickers; saveWODates
-    enforces start < finish (defaults 06:00-18:00 on same-day
-    collision); ESC / click-outside closes context menu.
-================================================================================
--->
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Production Schedule (v1.2)</title>
-
-    <!-- Tailwind CSS -->
-    <script src="https://cdn.tailwindcss.com"></script>
-
-    <!-- D3.js -->
-    <script src="https://d3js.org/d3.v7.min.js"></script>
-
-    <!-- Moment.js — loads BEFORE fb-lib so its Common.formatDate sees
-         moment (fb-lib formats dates against the install's
-         DateFormatShort property when moment is present). -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script>
-
-    <!-- Shared Fishbowl BI lib. Inlined by Fishbowl from the saved
-         "fb-lib" script (source: scripts/fb-lib.js). Must sit BEFORE
-         the fb-styles directive so window.FBLib is defined by the
-         time any inline code in <body> runs. -->
-    <script>
-      {% Script fb-lib %}
-    </script>
-
-    <!-- Shared chrome: fb-styles (source: scripts/fb-styles.css). Owns
-         header/hdr-btn family, .fb-drawer, .btn family, toasts, and
-         debug-drawer chrome. -->
-    <style>
-      {% Style fb-styles %}
-    </style>
-
-    <!-- Google Fonts — Inter (UI) + Space Mono (WO numbers / .mono).
-         Falls back to system fonts on offline/on-prem networks. -->
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
-
-    <style>
-        html, body {
-            height: 100%;
-            margin: 0;
-            padding: 0;
-            overflow: hidden;
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-        }
-        /* v1.1: shrink the app wrapper by the current debug-drawer
-           height so the fb-lib drawer sits under the app rather than
-           overlapping the bottom of the calendar/gantt content. The
-           observer in applyDebugDrawer() writes --debug-drawer-h to
-           <body>; when the drawer is hidden the value is 0px and the
-           calc collapses to 100vh. */
-        /* Divide the viewport height by --ps-zoom (set by psApplyZoom). Body `zoom`
-           shrinks the whole subtree WITHOUT rescaling vh, so a plain 100vh app
-           renders short at zoom<1 — dividing here makes layout-height × zoom land
-           back on the real viewport, so the content still fills to the bottom.
-           --ps-zoom defaults to 1, so this is a no-op at 100%. */
-        .h-screen {
-            height: calc((100vh - var(--debug-drawer-h, 0px)) / var(--ps-zoom, 1)) !important;
-            transition: height 0.12s ease;
-        }
-
-        /* ── Design tokens come from fb-styles (the SINGLE source of truth
-           for the palette — colors, radii, shadows, --link, --menu-bg…).
-           Do NOT redeclare shared tokens here: a local copy silently
-           overrides fb-styles and the report stops following theme
-           updates. Only report-specific additions live below.
-           REQUIRES the current fb-styles to be saved on the server —
-           re-save the fb-styles Style before re-saving this report. */
-        :root {
-            /* Legacy accent names this report references (fb-styles ships
-               purple/sage instead) — values track the brand accent pairs. */
-            --acc-magenta:#845EEB; --acc-magenta-bg:#D9CEF7; --acc-magenta-con:#3D2380;
-            --acc-teal:#4CA585; --acc-teal-bg:#C3D9CE; --acc-teal-con:#1B7A46;
-            /* Fonts (fb-styles sets a font-family on body, not tokens). */
-            --font:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-            --mono:'Space Mono',ui-monospace,'Consolas',monospace;
-            /* Back-compat aliases onto fb-styles tokens. */
-            --color-sidebar: var(--menu-bg);
-            --color-sidebar-hover: var(--menu-bg-2);
-        }
-
-        /* Custom Scrollbar */
-        .custom-scrollbar::-webkit-scrollbar { width: 8px; height: 8px; }
-        .custom-scrollbar::-webkit-scrollbar-track { background: #EBEEED; border-radius: 4px; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: #C6D0D4; border-radius: 4px; }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #8FA1A7; }
-
-        /* Override Tailwind indigo with custom blue */
-        .bg-indigo-600 { background-color: var(--color-primary) !important; }
-        .bg-indigo-50 { background-color: rgba(45,156,219, 0.1) !important; }
-        .text-indigo-600 { color: var(--color-primary) !important; }
-        .text-indigo-700 { color: var(--color-primary-dark) !important; }
-        .border-indigo-200 { border-color: rgba(45,156,219, 0.3) !important; }
-        .hover\:text-indigo-600:hover { color: var(--color-primary) !important; }
-        .hover\:bg-indigo-50:hover { background-color: rgba(45,156,219, 0.1) !important; }
-        .focus\:ring-indigo-100:focus { --tw-ring-color: rgba(45,156,219, 0.2) !important; }
-        .shadow-indigo-900\/20 { box-shadow: 0 10px 15px -3px rgba(45,156,219, 0.2) !important; }
-
-        /* Sidebar colors */
-        .bg-slate-900 { background-color: var(--color-sidebar) !important; }
-        .bg-slate-800 { background-color: var(--color-sidebar-hover) !important; }
-
-        /* Gantt Chart Styles */
-        .wo-bar {
-            cursor: move;
-            transition: opacity 0.2s ease;
-        }
-        .wo-bar:hover { opacity: 0.9; }
-        .wo-bar.dragging { opacity: 0.6; }
-
-        .dependency-arrow { pointer-events: none; }
-        .dependency-arrow.conflict { stroke: #C43046; }
-
-        /* Capacity Table */
-        .capacity-table-wrapper {
-            cursor: grab;
-            user-select: none;
-        }
-        .capacity-table-wrapper:active { cursor: grabbing; }
-
-        .capacity-wo-bar {
-            cursor: move;
-            transition: transform 0.2s;
-        }
-        .capacity-wo-bar:hover {
-            transform: translateY(-2px);
-        }
-
-        /* Toast Container */
-        .toast-container {
-            position: fixed;
-            bottom: 1rem;
-            right: 1rem;
-            z-index: 9999;
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-        }
-
-        .toast {
-            min-width: 300px;
-            padding: 1rem;
-            background: white;
-            border-radius: 0.75rem;
-            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
-            border-left: 4px solid;
-            animation: slideIn 0.3s ease-out;
-        }
-
-        @keyframes slideIn {
-            from { transform: translateX(400px); opacity: 0; }
-            to { transform: translateX(0); opacity: 1; }
-        }
-
-        .toast.success { border-color: #1B7A46; }
-        .toast.error { border-color: #C43046; }
-        .toast.info { border-color: #2d9cdb; }
-
-        /* Modal/Offcanvas */
-        .modal-overlay {
-            position: fixed;
-            top: 0; left: 0;
-            width: calc(100vw / var(--ps-zoom, 1));
-            height: calc(100vh / var(--ps-zoom, 1));
-            background: rgba(0, 0, 0, 0.5);
-            z-index: 9998;
-            display: none;
-            backdrop-filter: blur(4px);
-        }
-
-        .modal-overlay.show { display: block; }
-
-        .offcanvas {
-            position: fixed;
-            top: 0;
-            right: -500px;
-            width: 500px;
-            height: 100%;
-            background: white;
-            z-index: 9999;
-            transition: right 0.3s ease-out;
-            box-shadow: -10px 0 25px rgba(0, 0, 0, 0.1);
-        }
-
-        .offcanvas.show { right: 0; }
-
-        /* Loading Spinner */
-        .spinner {
-            border: 3px solid #E3E3E3;
-            border-top-color: #2d9cdb;
-            border-radius: 50%;
-            width: 40px;
-            height: 40px;
-            animation: spin 1s linear infinite;
-        }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
-        /* Sidebar transition */
-        .sidebar-collapsed { width: 5rem; }
-        .sidebar-expanded { width: 16rem; }
-
-        /* Custom Tooltips */
-        .wo-tooltip {
-            position: absolute;
-            background: rgba(11,49,64, 0.95);
-            color: white;
-            padding: 0.75rem;
-            border-radius: 0.5rem;
-            font-size: 0.75rem;
-            line-height: 1.5;
-            pointer-events: none;
-            z-index: 10000;
-            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3), 0 4px 6px -2px rgba(0, 0, 0, 0.15);
-            opacity: 0;
-            transition: opacity 0.2s ease;
-            max-width: 300px;
-            /* white-space normal (was pre-line): the WO / calendar /
-               capacity tooltip strings are built as multi-line
-               template literals, so pre-line was inflating each row
-               with the indentation newlines. Since each field is a
-               block-level <div>, natural block layout gives one row
-               per field — no need to preserve source whitespace. */
-            white-space: normal;
-        }
-        .wo-tooltip.show { opacity: 1; }
-        .wo-tooltip-label {
-            font-weight: 600;
-            color: #8FA1A7;
-            margin-right: 0.5rem;
-        }
-        .wo-tooltip-value {
-            color: #ffffff;
-        }
-
-        /* v1.1: Settings drawer layout — tighter version of the
-           Work_Order_WIP pattern. The base .fb-drawer chrome comes
-           from fb-styles; these local classes lay out grouped fields
-           so they stack densely inside the drop-down without the
-           original p-4 / rounded-xl / space-y-4 whitespace. */
-        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 20px; align-items: flex-start; }
-        /* Grouped-settings columns: don't grow (flex-grow 0) so groups left-pack
-           into several tidy ~250px columns instead of stretching into two very
-           wide ones on a wide drawer; they still wrap on a narrow one. */
-        .fb-group { flex: 0 1 250px; min-width: 230px; max-width: 340px; }
-        .fb-group-title {
-            font-size: 11px; font-weight: 700; text-transform: uppercase;
-            letter-spacing: 0.05em; color: #506872;
-            border-bottom: 1px solid #E3E3E3;
-            padding-bottom: 4px; margin-bottom: 6px;
-        }
-        .fb-field { margin-bottom: 6px; }
-        .ds-toggle-row {
-            display: flex; align-items: center; gap: 10px;
-            padding: 6px 10px;
-            background: #F7F7F7; border: 1px solid #E3E3E3; border-radius: 6px;
-            cursor: pointer; font-size: 12px; color: #415157;
-            transition: background 0.12s ease, border-color 0.12s ease;
-        }
-        .ds-toggle-row:hover { background: #EBEEED; border-color: #C6D0D4; }
-        .ds-toggle-row input[type=checkbox] {
-            width: 15px; height: 15px; flex-shrink: 0; margin: 0;
-            accent-color: var(--color-primary);
-            cursor: pointer;
-        }
-        .ds-toggle-body { flex: 1; min-width: 0; }
-        .ds-toggle-title { font-weight: 500; font-size: 12px; line-height: 1.3; color: #101010; }
-        .ds-toggle-help  { font-size: 11px; color: #506872; margin-top: 1px; line-height: 1.25; }
-        .ds-lock-badge {
-            padding: 6px 10px; margin-bottom: 10px;
-            background: #F5E7DD; color: #8A4E10; border: 1px solid #F69133;
-            border-radius: 6px; font-size: 12px;
-        }
-        /* Admin-only buttons — subtle amber tint so they don't look
-           like default actions but stay accessible. Matches the
-           .ds-btn-admin family used in Core_Dashboard_Template. */
-        .ds-btn-admin {
-            padding: 6px 11px; font-size: 12px; border-radius: 6px;
-            border: 1px solid #F69133; background: #F5E7DD; color: #7c2d12;
-            cursor: pointer; font-family: inherit; font-weight: 600;
-            margin-right: 6px;
-            transition: background 0.12s ease;
-        }
-        .ds-btn-admin:hover { background: #fde68a; }
-
-        /* Settings ▸ Display — tab visibility + reorder control. A trigger button
-           opens an inline panel of drag-reorderable rows (grip + checkbox + name),
-           modelled on the PurchaseOrderSummary column selector. Inline (not an
-           absolute popup) so it never clips inside the scrolling settings drawer. */
-        .tabsel { position: relative; }
-        .tabsel-btn { display:flex; align-items:center; justify-content:space-between; gap:8px; width:100%;
-            height:32px; border:1px solid #C6D0D4; border-radius:6px; padding:0 8px; font-size:12px;
-            font-family:inherit; color:#101010; background:#fff; cursor:pointer; }
-        .tabsel-btn:hover { border-color:var(--fb-neutral); }
-        .tabsel-btn svg { width:14px; height:14px; color:#64748b; flex-shrink:0; transition:transform .15s; }
-        .tabsel.open .tabsel-btn svg.caret { transform:rotate(180deg); }
-        .tabsel-panel { margin-top:6px; border:1px solid #d1d5db; border-radius:8px; background:#fff;
-            box-shadow:var(--sh1); max-height:280px; overflow:auto; }
-        .tabsel-panel.hidden { display:none; }
-        .tabsel-head { padding:6px 10px; font-size:10.5px; font-weight:700; text-transform:uppercase;
-            letter-spacing:.04em; color:#94a3b8; border-bottom:1px solid #f1f5f9; position:sticky; top:0; background:#fff; }
-        .tabsel-row { display:flex; align-items:center; gap:8px; padding:6px 10px; border-bottom:1px solid #f3f4f6;
-            cursor:grab; user-select:none; }
-        .tabsel-row:last-child { border-bottom:none; }
-        .tabsel-row:active { cursor:grabbing; }
-        .tabsel-row.drag-over { background:#eff6ff; box-shadow:inset 0 2px 0 var(--fb-blue); }
-        .tabsel-row.dragging { opacity:.4; }
-        .tabsel-row .tab-grip { color:#94a3b8; cursor:grab; flex-shrink:0; display:flex; }
-        .tabsel-row .tab-grip svg { width:13px; height:13px; }
-        .tabsel-row input[type=checkbox] { width:14px; height:14px; flex-shrink:0; accent-color:var(--color-primary); cursor:pointer; }
-        .tabsel-row input[type=checkbox]:disabled { cursor:not-allowed; }
-        .tabsel-name { font-size:12px; color:#374151; flex:1; }
-
-        /* Gantt Context Menu */
-        .gantt-context-menu {
-            position: fixed;
-            background: white;
-            border: 1px solid #E3E3E3;
-            border-radius: 0.75rem;
-            box-shadow: 0 10px 25px -5px rgba(0,0,0,0.15), 0 4px 10px -5px rgba(0,0,0,0.1);
-            padding: 1rem;
-            z-index: 10002;
-            min-width: 230px;
-            display: none;
-        }
-        .gantt-context-menu.show { display: block; }
-        .gantt-context-menu input[type="date"],
-        .gantt-context-menu select {
-            width: 100%;
-            border: 1px solid #C6D0D4;
-            border-radius: 0.5rem;
-            padding: 0.375rem 0.625rem;
-            font-size: 0.8125rem;
-            color: #415157;
-            outline: none;
-            background: white;
-        }
-        .gantt-context-menu input[type="date"]:focus,
-        .gantt-context-menu select:focus {
-            border-color: var(--color-primary);
-            box-shadow: 0 0 0 3px rgba(45,156,219,0.15);
-        }
-
-        /* ============================================================
-           v1.2 "WORKSPACE" SHELL + VIEWS (adapted from ProdSched_vA).
-           The wireframe's bare `table`/`thead th` selectors are scoped
-           under .tbl-wrap/.heat here so they don't clobber the D3 Gantt
-           or the capacity table. Its `.btn` is renamed .ps-btn to avoid
-           colliding with the fb-styles .btn family.
-           ============================================================ */
-        .app { display:flex; height:100%; overflow:hidden; background:var(--bg-2); }
-
-        /* Icon rail */
-        .rail { width:60px; background:var(--menu-bg); display:flex; flex-direction:column;
-            align-items:center; padding:14px 0; gap:6px; flex-shrink:0; }
-        .rail .logo { width:34px; height:34px; border-radius:8px;
-            background:linear-gradient(160deg,#4FB0E4,#2d9cdb);
-            display:flex; align-items:center; justify-content:center; color:#fff;
-            font-weight:800; font-size:17px; margin-bottom:12px; }
-        .rail-btn { width:40px; height:40px; border-radius:9px; border:none; background:transparent;
-            color:#8FA1A7; display:flex; align-items:center; justify-content:center;
-            transition:all .15s; cursor:pointer; }
-        .rail-btn:hover { background:rgba(255,255,255,.08); color:#fff; }
-        .rail-btn.active { background:var(--fb-blue); color:#fff; }
-        .rail-btn svg { width:20px; height:20px; }
-        .rail .spacer { flex:1; }
-
-        /* Main column */
-        .main { flex:1; display:flex; flex-direction:column; min-width:0; background:var(--bg-1); }
-
-        /* Top bar, .ps-btn, .tabs, .filterbar/.fchip/.grpseg and the .fdrop
-           dropdown family all ship from fb-styles (§22–26) — no local copies.
-           Re-save the fb-styles Style BEFORE re-saving this report. */
-
-        /* Compact action buttons everywhere. fb-styles ships .ps-btn at 36px;
-           this report standardises ALL of them on the 28px "sm" size (the WO
-           drawer / top-bar look) so no control towers over the rest. The search
-           box matches. Buttons that need a specific larger height keep it via a
-           more-specific selector below (e.g. the drawer inline-edit Apply/Cancel
-           sized to their 34px date inputs — .dedit-actions .ps-btn). */
-        .ps-btn { height:28px; padding:0 10px; font-size:12px; }
-        /* Keep glyphs at 16px (not the sm-default 14px) so icon buttons stay
-           recognisable in the 28px box — overrides both fb-styles' .ps-btn svg
-           and .ps-btn.sm svg. */
-        .ps-btn svg, .ps-btn.sm svg { width:16px; height:16px; }
-        .ps-btn.icon { width:28px; padding:0; }
-        /* Joined icon-button pair (Timeline undo/redo) — reads as one segmented
-           unit like the .grpseg toggle beside it: square the inner corners and
-           overlap the shared 1px border so the two buttons abut seamlessly. Keeps
-           every .ps-btn behaviour (icon sizing, :hover, :disabled opacity). */
-        .ps-seg { display:inline-flex; }
-        .ps-seg .ps-btn { border-radius:0; }
-        .ps-seg .ps-btn:first-child { border-top-left-radius:var(--r-btn); border-bottom-left-radius:var(--r-btn); }
-        .ps-seg .ps-btn:last-child { border-top-right-radius:var(--r-btn); border-bottom-right-radius:var(--r-btn); margin-left:-1px; }
-        /* Lift the hovered button so its full border shows over its neighbour. */
-        .ps-seg .ps-btn:hover:not(:disabled) { position:relative; z-index:1; }
-        .search input { height:28px; }
-        .search svg { top:6px; }
-
-        /* Top-bar ZOOM control (± / %). Drives document.body.style.zoom so the
-           whole report scales to fit sub-1920 screens (JxBrowser exposes no user
-           zoom). See psZoomInit/psApplyZoom. */
-        .ps-zoom { display:inline-flex; align-items:center; gap:2px; }
-        .ps-zoom-lbl { min-width:46px; height:28px; padding:0 6px; border:1px solid var(--border-strong);
-            border-radius:var(--r-btn); background:#fff; color:var(--c-secondary); font-size:12px; font-weight:700;
-            font-family:inherit; cursor:pointer; text-align:center; font-variant-numeric:tabular-nums; }
-        .ps-zoom-lbl:hover { background:var(--bg-1); border-color:var(--fb-neutral); color:var(--fb-blue); }
-        /* Safety for very narrow screens where even min zoom can't fit all the
-           tabs: let the strip scroll horizontally instead of clipping the header. */
-        .topbar .tabs { overflow-x:auto; overflow-y:hidden; }
-        .topbar .tabs::-webkit-scrollbar { height:4px; }
-        .topbar .tabs::-webkit-scrollbar-thumb { background:var(--border-strong); border-radius:2px; }
-        /* While a settings/help fb-drawer is open, the shared scrim starts BELOW
-           the full topbar (fb-lib keeps the header clickable), so the view-tab
-           strip stayed live behind the drawer. Lock + dim it in step with the
-           greyed page so tabs can't be switched under an open drawer. The rest of
-           the header (gear/help/search) stays interactive on purpose. Toggled by
-           the registerDrawer onBeforeOpen/onAfterClose hooks (body.ps-drawer-open). */
-        body.ps-drawer-open .topbar .tabs { pointer-events:none; opacity:.5; }
-
-        /* Custom-Field filters drawer controls (reuses .detail chrome). */
-        .cf-row { margin-bottom:14px; }
-        .cf-rowhead { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:4px; }
-        .cf-name { font-size:12.5px; font-weight:600; color:var(--c-primary); }
-        .cf-type { font-size:9.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--c-tertiary); background:var(--bg-2); border-radius:var(--r-pill); padding:1px 7px; flex-shrink:0; }
-        .cf-input { width:100%; box-sizing:border-box; height:32px; border:1px solid var(--border-strong); border-radius:var(--r-btn); padding:0 8px; font-size:13px; font-family:inherit; color:var(--c-primary); background:#fff; outline:none; }
-        .cf-input:focus { border-color:var(--fb-blue); box-shadow:0 0 0 3px rgba(45,156,219,.15); }
-        .cf-search { width:100%; box-sizing:border-box; height:28px; border:1px solid var(--border-strong); border-radius:var(--r-btn); padding:0 8px; font-size:12px; font-family:inherit; color:var(--c-primary); background:#fff; margin-bottom:4px; outline:none; }
-        .cf-search:focus { border-color:var(--fb-blue); box-shadow:0 0 0 3px rgba(45,156,219,.15); }
-        .cf-range { display:flex; align-items:center; gap:8px; }
-        .cf-range .cf-input { flex:1; }
-        .cf-dash { color:var(--c-tertiary); flex-shrink:0; }
-        .cf-ms { border:1px solid var(--border); border-radius:var(--r-card); max-height:180px; overflow:auto; background:#fff; }
-        .cf-opt { display:flex; align-items:center; gap:8px; padding:5px 9px; font-size:12.5px; color:var(--c-primary); cursor:pointer; border-bottom:1px solid var(--bg-2); }
-        .cf-opt:last-child { border-bottom:none; }
-        .cf-opt:hover { background:var(--bg-1); }
-        .cf-opt.sel { background:#DEEAF4; }
-        .cf-opt input { margin:0; flex-shrink:0; width:14px; height:14px; accent-color:var(--fb-blue); }
-        .cf-empty { padding:8px 9px; color:var(--c-tertiary); font-size:12px; }
-        /* CF filters drawer — collapsible, drag-reorderable object groups. */
-        .cf-drawer-hint { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--c-tertiary); margin:0 0 12px; }
-        .cf-drawer-hint svg { width:14px; height:14px; flex-shrink:0; }
-        .cf-group { border:1px solid var(--border); border-radius:var(--r-card); background:#fff; margin-bottom:10px; overflow:hidden; }
-        .cf-group.dragover { border-color:var(--fb-blue); box-shadow:0 0 0 2px rgba(45,156,219,.2); }
-        .cf-group.dragging { opacity:.45; }
-        .cf-group-head { display:flex; align-items:center; gap:8px; padding:9px 11px; background:var(--bg-1); border-bottom:1px solid var(--border); cursor:pointer; user-select:none; }
-        .cf-group.collapsed .cf-group-head { border-bottom:none; }
-        .cf-group-head:hover { background:var(--bg-2); }
-        .cf-drag { display:inline-flex; align-items:center; color:var(--c-tertiary); cursor:grab; flex-shrink:0; }
-        .cf-drag:active { cursor:grabbing; }
-        .cf-drag svg { width:14px; height:14px; }
-        .cf-group-chev { display:inline-flex; color:var(--c-secondary); flex-shrink:0; transition:transform .12s; }
-        .cf-group-chev svg { width:15px; height:15px; }
-        .cf-group.collapsed .cf-group-chev { transform:rotate(-90deg); }
-        .cf-group-name { font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--c-primary); flex:1; }
-        .cf-group-count { font-size:10.5px; font-weight:700; color:var(--c-secondary); background:var(--bg-2); border-radius:var(--r-pill); padding:1px 8px; flex-shrink:0; }
-        .cf-group-count.on { background:#DEEAF4; color:var(--fb-blue); }
-        .cf-group-body { padding:11px 11px 1px; }
-
-        /* Content host */
-        .content { flex:1; overflow:auto; padding:20px 22px; min-height:0; }
-        .content.flush { padding:0; }
-
-        /* status pill / tag / priority / flag */
-        .pill { display:inline-flex; align-items:center; gap:5px; height:22px; padding:0 9px;
-            border-radius:var(--r-pill); font-size:11.5px; font-weight:700; letter-spacing:.01em; white-space:nowrap; }
-        .pill .dot { width:7px; height:7px; border-radius:50%; background:currentColor; }
-        .pri { display:inline-flex; align-items:center; gap:4px; font-size:11px; font-weight:700; }
-        .tag { display:inline-flex; align-items:center; gap:5px; height:20px; padding:0 8px;
-            border-radius:var(--r-pill); font-size:11px; font-weight:600; }
-        /* .mono lives in fb-styles. */
-        .flag { display:inline-flex; align-items:center; gap:4px; min-height:20px; padding:2px 7px; border-radius:4px;
-            font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.03em;
-            white-space:nowrap; line-height:1; flex-shrink:0; }
-        .flag svg { width:12px; height:12px; flex-shrink:0; }
-        .flag.late { background:#F0D7DD; color:var(--fb-negative); }
-        .flag.block { background:var(--acc-magenta-bg); color:var(--acc-magenta-con); }
-        .flag.short { background:var(--acc-yellow-bg); color:var(--acc-yellow-con); }
-        .flag.cap { background:#F5E7DD; color:var(--fb-warning); }
-        .flag.pick { background:#DBE8E1; color:var(--acc-teal-con); }
-        .flag.picking { background:#DEEAF4; color:var(--fb-blue-accent); }
-        .flag.nopick { background:var(--bg-2); color:var(--c-secondary); }
-
-        /* .spill status pills + the icon-chip .kpi-tile family (and its
-           responsive .kpis 6/3/2 grid) ship from fb-styles (§27–28). */
-
-        /* Dashboard */
-        /* Dashboard panels — capped at 3 columns (not auto-fit, which packs ~5
-           across on a 1920px monitor and orphans the 6th). 3 wide → 2 → 1. */
-        .dash-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; align-items:start; }
-        @media (max-width:1100px){ .dash-grid { grid-template-columns:repeat(2,1fr); } }
-        @media (max-width:700px){ .dash-grid { grid-template-columns:1fr; } }
-        .panel { background:#fff; border:1px solid var(--border); border-radius:var(--r-card); box-shadow:var(--sh1); overflow:hidden; }
-        .panel-head { display:flex; align-items:center; justify-content:space-between; padding:13px 16px; border-bottom:1px solid var(--border); cursor:pointer; user-select:none; }
-        .panel-head h3 { font-size:14px; font-weight:700; margin:0; display:flex; align-items:center; gap:8px; color:var(--c-primary); }
-        /* Collapsible-panel disclosure chevron (click the whole head bar to fold). */
-        .panel-chev { display:inline-flex; color:var(--c-tertiary); flex-shrink:0; }
-        .panel-chev svg { width:15px; height:15px; }
-        .panel-head:hover .panel-chev { color:var(--fb-blue); }
-        .panel-head .count { font-size:12px; font-weight:700; color:#fff; background:var(--fb-negative); border-radius:var(--r-pill); padding:1px 8px; }
-        .panel-head .count.warn { background:var(--fb-warning); }
-        .panel-head .count.info { background:var(--fb-neutral); }
-        /* Scrollable body for the dashboard issue/load panels so every related
-           WO is reachable without stretching the panel. */
-        .panel-scroll { max-height:340px; overflow-y:auto; }
-        .issue { display:flex; align-items:center; gap:12px; padding:11px 16px; border-bottom:1px solid var(--bg-2); cursor:pointer; transition:.12s; }
-        .issue:last-child { border-bottom:none; }
-        .issue:hover { background:var(--bg-1); }
-        .issue .wo { font-family:var(--mono); font-weight:700; font-size:12.5px; color:var(--link); width:88px; flex-shrink:0; }
-        .issue .desc { flex:1; min-width:0; }
-        .issue .desc .t { font-size:13px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-        .issue .desc .m { font-size:11.5px; color:var(--c-secondary); margin-top:1px; }
-        .util-row { display:flex; align-items:center; gap:12px; padding:11px 16px; border-bottom:1px solid var(--bg-2); }
-        .util-row:last-child { border-bottom:none; }
-        .util-row .name { width:150px; font-size:12.5px; font-weight:600; flex-shrink:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-        .util-bar { flex:1; height:20px; background:var(--bg-2); border-radius:var(--r-pill); overflow:hidden; position:relative; }
-        .util-fill { height:100%; border-radius:var(--r-pill); }
-        .util-row .pct { width:52px; text-align:right; font-size:12.5px; font-weight:700; font-family:var(--mono); flex-shrink:0; }
-
-        /* Board / Kanban */
-        .board { display:flex; gap:14px; align-items:flex-start; min-height:100%; }
-        .board-col { width:300px; flex-shrink:0; background:var(--bg-2); border-radius:var(--r-card); display:flex; flex-direction:column; max-height:100%; }
-        .col-head { display:flex; align-items:center; gap:8px; padding:11px 13px; font-weight:700; font-size:13px; }
-        .col-head .accent { width:9px; height:9px; border-radius:50%; }
-        .col-head .n { font-size:11.5px; color:var(--c-secondary); font-weight:700; background:#fff; border-radius:var(--r-pill); padding:1px 8px; }
-        .col-body { padding:0 8px 10px; display:flex; flex-direction:column; gap:8px; overflow:auto; }
-        .card { background:#fff; border:1px solid var(--border); border-radius:var(--r-card); padding:11px 12px;
-            box-shadow:var(--sh1); cursor:pointer; transition:.12s; border-left:4px solid var(--fb-blue); }
-        .card:hover { box-shadow:var(--sh2); transform:translateY(-1px); }
-        .card .row1 { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px; }
-        .card .wo { font-family:var(--mono); font-weight:700; font-size:12px; color:var(--link); }
-        .card .part { font-size:13.5px; font-weight:700; line-height:1.25; margin-bottom:3px; color:var(--c-primary); }
-        .card .partd { font-size:12px; color:var(--c-secondary); margin-bottom:9px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-        .card .meta { display:flex; align-items:center; justify-content:space-between; gap:6px; font-size:11.5px; color:var(--c-secondary); }
-        .card .flags { display:flex; gap:4px; flex-wrap:wrap; margin-top:8px; }
-        .avatar { width:22px; height:22px; border-radius:50%; background:var(--bg-3); color:var(--c-secondary);
-            font-size:10px; font-weight:700; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
-
-        /* Table view — the .tbl-wrap dashboard table tier ships from
-           fb-styles (§30). Only this report's extensions stay local. */
-        /* Full-bleed fill: the table scrolls within the remaining viewport height
-           (bottom-pinned scrollbar) and runs edge-to-edge — no side borders/radius. */
-        .tbl-fill { flex:1; min-height:0; max-height:none !important; border-radius:0; border-left:none; border-right:none; }
-        /* Fill wrapper for a table view that carries a subhead above the table:
-           the wrapper fills its (flex-filled) host, its subhead stays fixed, and
-           the .tbl-fill table flexes to the viewport bottom. */
-        .pv-fill { display:flex; flex-direction:column; flex:1; min-height:0; width:100%; }
-        .pv-fill .proc-subhead, .pv-fill .proc-subtitle { padding-left:22px; padding-right:22px; flex-shrink:0; }
-        .tbl-wrap tbody tr { cursor:pointer; transition:.1s; }
-        .tbl-wrap td .wo { font-family:var(--mono); font-weight:700; color:var(--link); }
-        .rowflags { display:inline-flex; gap:4px; }
-        /* ── Narrow / zoomed-out fit (Work Orders table, .wt-table) ──────────
-           fb-styles §30 sets cells nowrap but with NO overflow clip, so a long
-           value (e.g. a user or customer name) bleeds into the next column on a
-           tight/zoomed layout. Clip + ellipsis the data cells so text truncates
-           to its column (hover shows the full value via the cell title). Group-
-           header rows are exempt (their .grp-line manages its own wrapping).
-           Pill columns (.wt-pills) instead WRAP their badges onto extra lines —
-           the row grows taller rather than clipping a pill. ── */
-        .wt-table tbody tr:not(.grp-head) td { overflow:hidden; text-overflow:ellipsis; }
-        .wt-table tbody tr:not(.grp-head) td > div { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-        .wt-table td.wt-pills { white-space:normal; }
-        .wt-table td.wt-pills .rowflags { display:flex; flex-wrap:wrap; gap:4px; }
-        /* A single over-wide pill (e.g. a long category name) wraps its own label
-           to multiple lines rather than bleed — scoped to these cells only so the
-           shared .spill/.tag/.pill shape is unchanged elsewhere. */
-        .wt-table td.wt-pills .spill,
-        .wt-table td.wt-pills .tag,
-        .wt-table td.wt-pills .pill { height:auto; min-height:20px; white-space:normal; }
-        /* Work Orders table — collapsible group header rows (group-by control).
-           A full-width band above each group's WO rows: chevron + name + count,
-           plus (MO grouping) the finished good, customer, and an editable MO
-           due-date field. Click the band to fold/unfold; the date input stops
-           propagation so editing it doesn't toggle the group. */
-        .tbl-wrap tbody tr.grp-head { cursor:pointer; background:var(--bg-1); }
-        .tbl-wrap tbody tr.grp-head:hover { background:var(--bg-2); }
-        .tbl-wrap tbody tr.grp-head td { padding:8px 14px; border-bottom:1px solid var(--border);
-            border-top:1px solid var(--border); }
-        .tbl-wrap tbody tr.grp-head .grp-line { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-        .tbl-wrap .grp-chev { display:inline-flex; color:var(--c-secondary); flex-shrink:0; }
-        .tbl-wrap .grp-chev svg { width:15px; height:15px; }
-        .tbl-wrap tbody tr.grp-head:hover .grp-chev { color:var(--fb-blue); }
-        .tbl-wrap .grp-name { font-size:13px; font-weight:700; color:var(--c-primary); }
-        .tbl-wrap .grp-count { font-size:11px; font-weight:700; color:#fff; background:var(--fb-neutral);
-            border-radius:var(--r-pill); padding:1px 8px; }
-        .tbl-wrap .grp-meta { font-size:12px; color:var(--c-secondary); }
-        /* Collapse/expand-all +/- button in the MO column header (navy header,
-           so white outline/text). Sits before the "MO" label. */
-        .tbl-wrap thead .grp-allbtn { display:inline-flex; align-items:center; justify-content:center;
-            width:16px; height:16px; margin-right:5px; padding:0; border:1px solid rgba(255,255,255,.45);
-            background:transparent; color:#fff; border-radius:3px; font-size:13px; font-weight:700;
-            line-height:1; cursor:pointer; vertical-align:middle; font-family:inherit; }
-        .tbl-wrap thead .grp-allbtn:hover { background:rgba(255,255,255,.18); }
-        .tbl-wrap .grp-due { display:inline-flex; align-items:center; gap:5px; font-size:11px; font-weight:700;
-            color:var(--c-secondary); text-transform:uppercase; letter-spacing:.03em; }
-        .tbl-wrap .grp-due.late { color:var(--fb-negative); }
-        .tbl-wrap .grp-due input { height:26px; border:1px solid var(--border-strong); border-radius:var(--r-btn);
-            padding:0 6px; font-size:12px; font-family:inherit; color:var(--c-primary); background:#fff; outline:none; }
-        .tbl-wrap .grp-due input:focus { border-color:var(--fb-blue); box-shadow:0 0 0 3px rgba(45,156,219,.15); }
-
-        /* Procurement tab — vendor groups + shared cell styling. */
-        .proc-vgrp { margin-bottom:16px; }
-        .proc-vhead { display:flex; align-items:center; gap:8px; font-size:12px; font-weight:700;
-            text-transform:uppercase; letter-spacing:.03em; color:var(--c-secondary); margin:0 0 5px; }
-        .proc-vcount { font-size:11px; font-weight:700; color:#fff; background:var(--fb-neutral); border-radius:var(--r-pill); padding:1px 7px; }
-        .proc-desc { font-size:11.5px; color:var(--c-secondary); }
-        /* Compact procurement rows: description gets its own column (single-line,
-           ellipsised) and the row padding is tightened to save vertical space. */
-        .tbl-wrap.proc-tbl tbody td { padding:5px 12px; }
-        .tbl-wrap.proc-tbl thead th { padding:7px 12px; }
-        .proc-desccell { max-width:240px; overflow:hidden; text-overflow:ellipsis; color:var(--c-secondary); font-size:11.5px; }
-        /* Blocked-work-orders cell — table-like column alignment WITHOUT a nested
-           <table>: one CSS grid with four cells per WO (scheduled start · WO# ·
-           finished good · qty) so values line up down the column. Capped to 5 rows
-           (.blk-cap) and expanded on click via psBlkToggle. */
-        .proc-blk { display:grid; grid-template-columns:auto auto minmax(0,1fr) auto; gap:2px 10px; align-items:baseline; line-height:18px; }
-        .proc-blk.blk-cap { max-height:100px; overflow:hidden; }
-        .proc-blk .bwo { font-family:var(--mono); font-weight:700; font-size:11.5px; color:var(--link); text-decoration:none; white-space:nowrap; }
-        .proc-blk .bwo:hover { text-decoration:underline; }
-        .proc-blk .bdate { font-size:11px; color:var(--c-secondary); white-space:nowrap; font-variant-numeric:tabular-nums; }
-        .proc-blk .bfg { font-size:11.5px; color:var(--c-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
-        .proc-blk .bqty { font-size:11.5px; color:var(--c-secondary); text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }
-        .blk-toggle { cursor:pointer; }
-        .blk-more { margin-top:4px; font-size:10.5px; color:var(--link); user-select:none; }
-        /* To Purchase / To Manufacture tab switch (sub-tabs within the
-           Procurement view — an underline tab strip like the top view tabs). */
-        .proc-tabbar { display:flex; gap:2px; align-items:flex-end; margin-bottom:16px; border-bottom:1px solid var(--border); }
-        .proc-tab { height:38px; padding:0 16px; border:none; background:transparent; color:var(--c-secondary);
-            font-size:14px; font-weight:700; display:inline-flex; align-items:center; gap:8px;
-            border-bottom:2px solid transparent; margin-bottom:-1px; cursor:pointer; font-family:inherit; transition:.15s; }
-        .proc-tab:hover { color:var(--c-primary); }
-        .proc-tab.active { color:var(--fb-blue); border-bottom-color:var(--fb-blue); }
-        .proc-tabn { font-size:11px; font-weight:700; background:var(--bg-2); color:var(--c-secondary);
-            border-radius:var(--r-pill); padding:1px 8px; min-width:20px; text-align:center; }
-        .proc-tab.active .proc-tabn { background:#DEEAF4; color:var(--fb-blue); }
-        /* Per-tab header row (description + tab-level action button) + subtitle. */
-        .proc-subhead { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:0 0 12px; }
-        .proc-subtitle { font-size:12px; color:var(--c-secondary); margin:0 0 12px; }
-        /* Create MO drawer form. */
-        .mo-form { display:flex; flex-direction:column; gap:10px; }
-        .mo-form label, .mo-form .mo-cf { display:flex; flex-direction:column; gap:3px; }
-        .mo-form label > span:first-child, .mo-cf-lbl { font-size:11px; font-weight:700; color:var(--c-secondary); }
-        .mo-form input, .mo-form select, .mo-form textarea { box-sizing:border-box; height:34px;
-            border:1px solid var(--border-strong); border-radius:var(--r-btn); padding:0 8px; font-size:13px;
-            font-family:inherit; color:var(--c-primary); background:#fff; outline:none; }
-        .mo-form textarea { height:auto; padding:6px 8px; resize:vertical; }
-        .mo-form input:focus, .mo-form select:focus, .mo-form textarea:focus { border-color:var(--fb-blue); box-shadow:0 0 0 3px rgba(45,156,219,.15); }
-
-        /* Timeline / Gantt (plain-DOM, vA style) */
-        /* The gantt fills its host (a flex-filled, full-bleed view container set
-           up in setView) as a flex column: fixed toolbar on top, the scroll track
-           flexing to the remaining height. Edge-to-edge — no side borders/radius —
-           so it reads as one continuous table to the screen edges. */
-        .gantt { background:#fff; border-top:1px solid var(--border); border-bottom:1px solid var(--border);
-            overflow:hidden; box-shadow:var(--sh1); display:flex; flex-direction:column; flex:1; min-height:0; }
-        .gantt-toolbar { display:flex; align-items:center; gap:8px; padding:10px 14px; border-bottom:1px solid var(--border); flex-wrap:wrap; flex-shrink:0; }
-        /* flex:1 + min-height:0 so the track fills to the viewport bottom and its
-           horizontal scrollbar pins there (was a fixed max-height that pushed the
-           scrollbar off-screen). overflow-x:scroll (not auto) keeps the horizontal
-           bar ALWAYS visible — on Chromium/JxBrowser an auto bar hides until hover.
-           The webkit rules give it a visible, styled track/thumb. */
-        .gantt-scroll { overflow-x:scroll; overflow-y:auto; flex:1; min-height:0; position:relative; }
-        .gantt-scroll::-webkit-scrollbar { width:12px; height:12px; }
-        .gantt-scroll::-webkit-scrollbar-track { background:var(--bg-2); border-radius:6px; }
-        .gantt-scroll::-webkit-scrollbar-thumb { background:var(--border-strong); border-radius:6px; border:2px solid var(--bg-2); }
-        .gantt-scroll::-webkit-scrollbar-thumb:hover { background:var(--fb-neutral); }
-        .gantt-scroll::-webkit-scrollbar-corner { background:var(--bg-2); }
-        /* Sticky month band above the day columns — keeps the current month(s)
-           labelled while scrolling (the per-day header only marks the 1st). */
-        .g-monthrow { display:flex; position:sticky; top:0; z-index:23; background:#fff; }
-        .g-monthlabelhead { width:220px; min-width:220px; position:sticky; left:0; z-index:24; background:var(--menu-bg); }
-        /* No overflow:hidden — that would trap the sticky label's scroll context;
-           it must stick relative to #ganttScroll. */
-        .g-monthcell { flex-shrink:0; height:20px; border-right:1px solid var(--border); border-bottom:1px solid var(--bg-2);
-            background:var(--bg-1); font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em;
-            color:var(--c-secondary); display:flex; align-items:center; white-space:nowrap; }
-        .g-monthcell span { position:sticky; left:226px; padding:0 4px; }
-        .gantt-grid { position:relative; }
-        /* top:20px so the day row sticks just under the 20px month band. */
-        .g-headrow { display:flex; position:sticky; top:20px; z-index:20; background:#fff; box-shadow:0 1px 0 var(--border); }
-        .g-labelhead { width:220px; min-width:220px; position:sticky; left:0; z-index:22; background:var(--menu-bg); color:#D5E4E8;
-            font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; display:flex; align-items:center; justify-content:space-between; gap:6px; padding:0 14px; }
-        /* Collapse/expand-all control in the label-column header. */
-        .g-labelhead .ghall { display:inline-flex; align-items:center; gap:4px; background:transparent; border:none;
-            color:#8FA1A7; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.05em;
-            cursor:pointer; font-family:inherit; padding:2px 4px; border-radius:4px; }
-        .g-labelhead .ghall:hover { color:#fff; background:rgba(255,255,255,.08); }
-        .g-labelhead .ghall svg { width:14px; height:14px; }
-        .g-daycol { border-right:1px solid var(--bg-2); text-align:center; padding:6px 0; flex-shrink:0; }
-        .g-daycol.wknd { background:#FCFBF4; }
-        .g-daycol.today { background:#F7E9ED; }
-        .g-daycol .dow { font-size:9.5px; color:var(--c-tertiary); font-weight:700; text-transform:uppercase; }
-        .g-daycol .dnum { font-size:13px; font-weight:700; color:var(--c-primary); }
-        .g-daycol .mon { font-size:9px; color:var(--c-tertiary); font-weight:700; height:11px; }
-        .g-grouphead { display:flex; align-items:center; gap:8px; background:var(--bg-1); border-bottom:1px solid var(--border);
-            border-top:1px solid var(--border); padding:7px 0; position:sticky; left:0; font-size:12.5px; font-weight:700; z-index:8; }
-        /* Inner label sticks to the viewport-left so the MO/group name stays
-           visible while the track scrolls horizontally. */
-        .g-grouphead .ghlabel { position:sticky; left:0; display:inline-flex; align-items:center; gap:8px;
-            padding:0 14px; background:var(--bg-1); }
-        .g-grouphead.clickable .ghlabel { cursor:pointer; }
-        .g-grouphead.clickable:hover .ghlabel { color:var(--fb-blue); }
-        .g-grouphead .gtag { font-size:10.5px; font-weight:700; color:#fff; border-radius:4px; padding:1px 7px; }
-        .g-grouphead .gc { color:var(--c-secondary); font-weight:600; font-size:11.5px; }
-        /* Collapse/expand disclosure — leading affordance, before the MO pill.
-           Its 22px box + the label's 8px gap = the 30px the WO rows indent by
-           so WO numbers line up under the MO number pill. */
-        .g-grouphead .ghtoggle { flex-shrink:0; width:22px; height:22px; margin-left:-2px; border-radius:4px;
-            display:inline-flex; align-items:center; justify-content:center;
-            color:var(--c-secondary); cursor:pointer; transition:.12s; }
-        .g-grouphead .ghtoggle:hover { background:var(--bg-2); color:var(--fb-blue); }
-        .g-grouphead .ghtoggle svg { width:15px; height:15px; }
-        .g-row { display:flex; position:relative; height:38px; border-bottom:1px solid var(--bg-2); }
-        .g-row:hover { background:var(--bg-1); }
-        /* Left padding = 14px base + 30px (chevron 22 + gap 8) so the WO number
-           lines up under the MO number pill in the group header. */
-        .g-rowlabel { width:220px; min-width:220px; position:sticky; left:0; z-index:6; background:#fff;
-            display:flex; align-items:center; gap:8px; padding:0 14px 0 44px; border-right:1px solid var(--border); }
-        .g-row:hover .g-rowlabel { background:var(--bg-1); }
-        .g-rowlabel .wo { font-family:var(--mono); font-weight:700; font-size:11.5px; color:var(--link); flex-shrink:0; cursor:pointer; }
-        .g-rowlabel .pt { font-size:12px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--c-primary); }
-        .g-track { position:relative; flex:1; }
-        .g-bar { position:absolute; top:7px; height:24px; border-radius:5px; cursor:grab; display:flex; align-items:center;
-            padding:0 8px; font-size:11px; font-weight:700; box-shadow:var(--sh1); overflow:hidden;
-            border:1px solid rgba(0,0,0,.12); user-select:none; transition:box-shadow .12s; }
-        .g-bar:hover { box-shadow:var(--sh2); z-index:4; }
-        .g-bar.dragging { cursor:grabbing; opacity:.85; box-shadow:var(--sh3); z-index:10; }
-        .g-bar .prog { position:absolute; left:0; top:0; bottom:0; background:rgba(255,255,255,.28); }
-        .g-bar .lbl { position:relative; z-index:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-        /* Late = a single thin red border (no heavy outer ring). */
-        .g-bar.late { border-color:var(--fb-negative); }
-        /* Edge resize handles — grab the left/right 7px to change start/finish.
-           Invisible until the bar is hovered, then a faint grip shows so the
-           affordance is discoverable. */
-        .g-bar .g-resize { position:absolute; top:0; bottom:0; width:7px; cursor:ew-resize; z-index:5; transition:background .12s; }
-        .g-bar .g-resize.l { left:0; border-radius:5px 0 0 5px; }
-        .g-bar .g-resize.r { right:0; border-radius:0 5px 5px 0; }
-        .g-bar:hover .g-resize { background:rgba(255,255,255,.4); box-shadow:inset 0 0 0 1px rgba(0,0,0,.12); }
-        .g-bar:hover .g-resize:hover { background:rgba(255,255,255,.65); }
-        /* Availability signal dot — a sibling of the bar (NOT a child; the bar
-           has overflow:hidden which would clip it). Its centre is snapped to the
-           tile's top-right corner via translate(-50%,-50%) and it sits in front of
-           the bar (z-index above it). No white ring — a faint shadow gives depth. */
-        .g-bardot { position:absolute; width:9px; height:9px; border-radius:50%; z-index:6;
-            transform:translate(-50%,-50%); box-shadow:var(--sh1); }
-        .g-today-line { position:absolute; top:0; bottom:0; width:2px; background:var(--fb-negative); z-index:3; opacity:.55; pointer-events:none; }
-        /* MO due-date marker on the group header (MO grouping only). A small
-           diamond positioned on the MO's scheduled (due) date; drag it to
-           reschedule the MO. Red when the due date is in the past. Sits in the
-           track area beyond the sticky label; the .g-grouphead is positioned
-           (sticky), so this abs-positioned child is placed relative to it. */
-        .g-grouphead .g-modue { position:absolute; top:50%; width:13px; height:13px;
-            background:var(--fb-blue); border:2px solid #fff; border-radius:3px; box-shadow:var(--sh1);
-            transform:translate(-50%,-50%) rotate(45deg); cursor:grab; z-index:9; }
-        .g-grouphead .g-modue:hover { box-shadow:var(--sh2); }
-        .g-grouphead .g-modue.late { background:var(--fb-negative); }
-        .g-grouphead .g-modue.dragging { cursor:grabbing; box-shadow:var(--sh3); opacity:.9; }
-
-        /* Calendar (month grid) */
-        .cal { background:#fff; border:1px solid var(--border); border-radius:var(--r-card); overflow:hidden; box-shadow:var(--sh1); }
-        .cal-head { display:grid; grid-template-columns:repeat(7,1fr); background:var(--menu-bg); }
-        .cal-head div { padding:9px; color:#D5E4E8; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; text-align:center; }
-        .cal-grid { display:grid; grid-template-columns:repeat(7,1fr); }
-        .cal-cell { min-height:118px; border-right:1px solid var(--bg-2); border-bottom:1px solid var(--bg-2); padding:6px; position:relative; }
-        .cal-cell.oth { background:var(--bg-1); }
-        .cal-cell.today { background:#F7E9ED; }
-        .cal-cell .dn { font-size:12px; font-weight:700; color:var(--c-secondary); margin-bottom:5px; }
-        .cal-cell.today .dn { color:var(--fb-negative); }
-        .cal-chip { display:block; font-size:10.5px; font-weight:700; color:#fff; border-radius:4px; padding:2px 6px;
-            margin-bottom:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; }
-        .cal-more { font-size:10.5px; color:var(--c-secondary); font-weight:600; cursor:pointer; }
-        /* Per-day "show on Timeline" button — top-right of each cell, revealed on
-           hover so it doesn't clutter the grid. */
-        .cal-cell .cal-tl { position:absolute; top:4px; right:4px; width:20px; height:20px; padding:0; border:none;
-            background:transparent; color:var(--c-tertiary); border-radius:4px; display:inline-flex; align-items:center;
-            justify-content:center; cursor:pointer; opacity:0; transition:opacity .12s, background .12s, color .12s; }
-        .cal-cell:hover .cal-tl { opacity:1; }
-        .cal-cell .cal-tl:hover { background:var(--bg-2); color:var(--fb-blue); }
-        .cal-cell .cal-tl svg { width:14px; height:14px; }
-
-        /* Resource-load heatmap */
-        .heat { background:#fff; border:1px solid var(--border); border-radius:var(--r-card); overflow:auto; box-shadow:var(--sh1); }
-        .heat table { border-collapse:separate; border-spacing:0; }
-        .heat th.wc { position:sticky; left:0; z-index:3; text-align:left; min-width:170px; }
-        .heat th { background:var(--menu-bg); color:#D5E4E8; font-size:10.5px; padding:8px 6px; font-weight:700; position:sticky; top:0; z-index:2; }
-        .heat th.wknd { color:#8FA1A7; }
-        .heat td.wc { position:sticky; left:0; background:#fff; z-index:1; font-weight:700; font-size:12.5px; padding:0 12px;
-            border-right:1px solid var(--border); border-bottom:1px solid var(--bg-2); }
-        .heat td.cell { width:54px; height:46px; text-align:center; border-right:1px solid #fff; border-bottom:1px solid #fff;
-            font-size:11px; font-weight:700; position:relative; }
-        .heat .cap-cap { font-size:9px; font-weight:600; opacity:.7; }
-        .heat-legend { display:flex; align-items:center; gap:16px; margin-top:12px; font-size:12px; color:var(--c-secondary); flex-wrap:wrap; }
-        .heat-legend .sw { display:inline-flex; align-items:center; gap:6px; }
-        .heat-legend .box { width:14px; height:14px; border-radius:3px; }
-
-        /* Detail drawer (right slide-in) */
-        /* top/left:0 + width/height ÷ --ps-zoom (not inset:0) so the backdrop still
-           covers the whole screen under body zoom — a fixed inset:0 box renders
-           short/narrow at zoom<1, same as the app shell above. */
-        .scrim { position:fixed; top:0; left:0; width:calc(100vw / var(--ps-zoom,1)); height:calc(100vh / var(--ps-zoom,1)); background:rgba(16,16,16,.35); opacity:0; pointer-events:none; transition:.2s; z-index:10001; }
-        .scrim.on { opacity:1; pointer-events:auto; }
-        /* height ÷ --ps-zoom so the side drawer still runs full-height under body
-           zoom (top:0 + explicit height overrides bottom:0). Width stays fixed —
-           a proportionally narrower side panel at zoom<1 is fine. */
-        .detail { position:fixed; top:0; right:0; bottom:0; height:calc(100vh / var(--ps-zoom,1)); width:560px; max-width:94vw; background:#fff; z-index:10002;
-            box-shadow:var(--sh3); transform:translateX(100%); transition:transform .22s cubic-bezier(.2,0,0,1);
-            display:flex; flex-direction:column; }
-        .detail.on { transform:translateX(0); }
-        .detail-head { padding:16px 20px; border-bottom:1px solid var(--border); }
-        /* Header is a two-column row: the text block (WO#, title, sub, pills) on
-           the left and the action stack on the right, both top-aligned — so the
-           title stays at the top and the buttons never push it down. */
-        .detail-head .top { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
-        .detail-head-main { flex:1; min-width:0; }
-        /* Top-right action stack — close-X on top, then the compact record actions
-           (To WO · To Pick · Timeline). align-items:stretch makes all three
-           buttons share one width (the widest short label) so they line up as an
-           even block; the close-X overrides with align-self:flex-end to keep its
-           own square size, top-right. */
-        .detail-actions { display:flex; flex-direction:column; align-items:stretch; gap:6px; flex-shrink:0; }
-        .detail-actions .close-x { align-self:flex-end; }
-        .detail-actions .ps-btn { justify-content:center; white-space:nowrap; }
-        /* .ps-btn.sm ships from fb-styles (§23). */
-        .detail-head .wo { font-family:var(--mono); font-weight:700; font-size:13px; color:var(--link); }
-        .detail-head h2 { font-size:19px; font-weight:800; margin:0; letter-spacing:-.01em; color:var(--c-primary); }
-        .detail-head .sub { font-size:13px; color:var(--c-secondary); margin-top:3px; }
-        /* flex:1 + min-height:0 is required so the body actually scrolls on short
-           (low-resolution) screens — without min-height:0 a flex child refuses to
-           shrink below its content height and the overflow never engages, hiding
-           the lower sections (raw goods, FG tracking, footer buttons). */
-        .detail-body { padding:16px 20px; overflow-y:auto; overflow-x:hidden; flex:1 1 auto; min-height:0; }
-        /* .ps-btn.success ships from fb-styles (§23). */
-        .dsec { margin-bottom:16px; }
-        .dsec h4 { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; color:var(--c-tertiary); margin:0 0 10px; }
-        /* Section header with a trailing action/edit affordance (pencil or Finish WO). */
-        .dsec h4.dsec-h { display:flex; align-items:center; justify-content:space-between; gap:8px; min-height:28px; }
-        .dsec h4.dsec-h .ps-btn { text-transform:none; letter-spacing:normal; font-weight:600; }
-        .ps-edit { width:24px; height:24px; border-radius:var(--r-btn); border:1px solid var(--border); background:#fff;
-            color:var(--c-secondary); display:inline-flex; align-items:center; justify-content:center; cursor:pointer; flex-shrink:0; }
-        .ps-edit:hover { background:var(--bg-1); border-color:var(--fb-neutral); color:var(--fb-blue); }
-        .ps-edit svg { width:13px; height:13px; }
-        .dgrid { display:grid; grid-template-columns:1fr 1fr; gap:12px 16px; }
-        .dfield .k { font-size:11px; color:var(--c-secondary); font-weight:600; margin-bottom:2px; }
-        .dfield .v { font-size:14px; font-weight:600; color:var(--c-primary); }
-        /* Inline date/time + category editor at the top of the WO drawer. */
-        /* Two-column grid: [Start][Finish] on row 1, [Category][Apply+Cancel] on
-           row 2 — so Category matches the Start field width and the buttons sit
-           squarely under the Finish field. */
-        .dedit { display:grid; grid-template-columns:1fr 1fr; gap:10px; align-items:end; }
-        .dedit label { display:flex; flex-direction:column; gap:3px; font-size:11px; font-weight:600; color:var(--c-secondary); min-width:0; }
-        .dedit input, .dedit select { width:100%; box-sizing:border-box; height:34px; border:1px solid var(--border-strong); border-radius:var(--r-btn);
-            padding:0 8px; font-size:13px; font-family:inherit; color:var(--c-primary); background:#fff; outline:none; }
-        .dedit input:focus, .dedit select:focus { border-color:var(--fb-blue); box-shadow:0 0 0 3px rgba(45,156,219,.15); }
-        /* Apply + Cancel share the row-2 cell under Finish, side by side. */
-        .dedit-actions { display:flex; gap:8px; }
-        .dedit-actions .ps-btn { flex:1; height:34px; }
-        /* .close-x base (28px) ships from fb-styles (§33); this report's
-           drawers use the larger 32px variant everywhere. */
-        .close-x { width:32px; height:32px; }
-        .close-x svg { width:18px; height:18px; }
-        .dprogress { height:8px; background:var(--bg-2); border-radius:var(--r-pill); overflow:hidden; margin-top:6px; }
-        .dprogress div { height:100%; background:var(--fb-blue); border-radius:var(--r-pill); }
-        .alert-box { display:flex; gap:10px; padding:11px 13px; border-radius:var(--r-card); margin-bottom:8px; font-size:12.5px; font-weight:600; }
-        .alert-box svg { width:18px; height:18px; flex-shrink:0; margin-top:1px; }
-
-        /* Component availability (detail drawer) — collapsible header + raw-goods table. */
-        .avail-head { display:flex; align-items:center; gap:8px; cursor:pointer; padding:8px 10px;
-            background:var(--bg-1); border:1px solid var(--border); border-radius:var(--r-card); }
-        .avail-head:hover { background:var(--bg-2); }
-        .avail-chevron { display:inline-flex; color:var(--c-secondary); flex-shrink:0; }
-        .avail-chevron svg { width:16px; height:16px; }
-        .avail-note { font-size:11px; color:var(--c-tertiary); margin-left:auto; text-align:right; }
-        /* Raw-goods list scrolls within its own box (capped height) so a long
-           parts list never pushes the drawer footer off-screen. */
-        .avail-parts { margin-top:8px; border:1px solid var(--border); border-radius:var(--r-card); max-height:300px; overflow:auto; }
-        .avail-parts table { width:100%; border-collapse:collapse; font-size:12px; }
-        .avail-parts th { background:var(--bg-1); color:var(--c-secondary); text-align:left; font-size:10px; font-weight:700;
-            text-transform:uppercase; letter-spacing:.04em; padding:6px 8px; border-bottom:1px solid var(--border);
-            position:sticky; top:0; z-index:1; }
-        .avail-parts td { padding:7px 8px; border-bottom:1px solid var(--bg-2); vertical-align:top; }
-        .avail-parts tr:last-child td { border-bottom:none; }
-        .avail-parts td.num, .avail-parts th.num { text-align:right; font-variant-numeric:tabular-nums; }
-        /* Availability cell — allow its content to wrap within the cell
-           instead of overflowing the drawer; right-aligned to match the
-           numeric columns. */
-        .avail-parts .apstat { display:flex; flex-wrap:wrap; gap:4px; align-items:center; justify-content:flex-end; }
-        .avail-parts .apn { font-weight:700; color:var(--c-primary); }
-        .avail-parts .apd { font-size:10.5px; color:var(--c-secondary); max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-
-        .ps-empty { text-align:center; color:var(--c-tertiary); padding:60px 20px; font-size:14px; }
-        .hint { font-size:11.5px; color:var(--c-tertiary); display:inline-flex; align-items:center; gap:5px; }
-        .hint svg { width:14px; height:14px; }
-
-        /* ============================================================
-           v1.2 WO FINISH — ported from Work_Order_WIP.htm
-           Two extra drawer tiers stacked in front of the detail drawer,
-           plus the finish/serial/FG-tracking panel styles (re-skinned
-           from the source's .finish-* / .serial-modal-* / .fg-modal-*
-           families onto this report's token palette).
-           ============================================================ */
-        /* Finish drawer (tier 2) — sits in front of the detail drawer. */
-        #finishScrim { z-index:10003; }
-        #finishPanel { z-index:10004; width:620px; }
-        /* Tracking drawer (tier 3) — slides in over the finish drawer,
-           its own scrim dims the finish drawer beneath it. */
-        #trackScrim  { z-index:10005; }
-        #trackPanel  { z-index:10006; width:560px; }
-        /* Create MO drawer (Procurement tab) — sits above the detail drawer. */
-        #moScrim { z-index:10007; }
-        #moPanel { z-index:10008; width:560px; }
-        /* Create PO drawer (Procurement tab). */
-        #poScrim { z-index:10009; }
-        #poPanel { z-index:10010; width:600px; }
-        /* The finish/track drawers reuse .detail chrome (.detail-head,
-           .detail-body, .dsec, etc.) already defined above. */
-
-        /* Finish banner (preflight strip + primary action). */
-        .pf-banner { display:flex; align-items:center; gap:12px; flex-wrap:wrap;
-            padding:11px 13px; border-radius:var(--r-card); border-left:4px solid var(--fb-neutral);
-            background:var(--bg-1); margin-bottom:14px; }
-        .pf-banner.ok   { border-left-color:#A9CDBA; background:#F1F7F3; }
-        .pf-banner.warn { border-left-color:#EBC49B; background:#FBF4EC; }
-        .pf-banner.late { border-left-color:#D9A4B2; background:#F7ECEF; }
-        .pf-banner .pf-summary { flex:1; display:flex; flex-wrap:wrap; gap:6px 10px; align-items:center; }
-        .pf-banner .pf-actions { display:flex; gap:6px; align-items:center; flex-shrink:0; }
-        .pf-banner .ps-btn.primary:disabled { opacity:.5; cursor:not-allowed; }
-        .pf-blocker-list { margin:2px 0 14px 18px; padding:0; font-size:12px; color:#8A1E30; }
-        .pf-blocker-list li { margin:3px 0; }
-        .pf-steps { display:inline-flex; flex-wrap:wrap; gap:4px; }
-
-        /* Raw-goods / FG table inside the finish drawer — reuse the
-           .avail-parts look (scroll box + sticky header). */
-        .pf-table { width:100%; border-collapse:collapse; font-size:12px; }
-        .pf-tablewrap { margin-top:8px; border:1px solid var(--border); border-radius:var(--r-card); max-height:320px; overflow:auto; }
-        .pf-table th { background:var(--bg-1); color:var(--c-secondary); text-align:left; font-size:10px; font-weight:700;
-            text-transform:uppercase; letter-spacing:.04em; padding:6px 8px; border-bottom:1px solid var(--border);
-            position:sticky; top:0; z-index:1; }
-        .pf-table td { padding:7px 8px; border-bottom:1px solid var(--bg-2); vertical-align:top; }
-        .pf-table tr:last-child td { border-bottom:none; }
-        .pf-table td.num, .pf-table th.num { text-align:right; font-variant-numeric:tabular-nums; }
-        .pf-table input[type="number"] { width:80px; height:26px; padding:2px 6px; border:1px solid var(--border-strong);
-            border-radius:5px; font-family:inherit; font-size:12px; text-align:right; font-variant-numeric:tabular-nums;
-            background:#fff; color:var(--c-primary); }
-        .pf-table input[type="number"]:focus { outline:none; border-color:var(--fb-blue); box-shadow:0 0 0 2px rgba(45,156,219,.15); }
-        .pf-table input[type="number"].dirty { border-color:var(--fb-warning); background:#FBF4EC; }
-        /* Scrap-location hint under the Scrapped input. */
-        .pf-table .pf-scrap-hint { font-size:10px; line-height:1.3; margin-top:3px; color:var(--c-secondary); white-space:normal; max-width:140px; }
-        .pf-table .pf-scrap-hint.ok { color:#1B7A46; }
-        .pf-table .pf-scrap-hint.warn { color:#8A4E10; }
-        .pf-table .pf-partn { font-weight:700; color:var(--c-primary); }
-        .pf-table .pf-desc { font-size:10.5px; color:var(--c-secondary); }
-        .pf-table .pf-ro { color:var(--c-secondary); font-style:italic; }
-
-        /* FG tracking + source-serial panels. */
-        .pf-fg { margin-top:6px; }
-        .pf-fg .pf-fg-field { margin-bottom:10px; }
-        .pf-fg .pf-fg-field label { display:block; font-size:11px; font-weight:700; color:var(--c-secondary); margin-bottom:3px; }
-        .pf-fg .pf-fg-row { display:flex; align-items:center; gap:6px; }
-        .pf-fg input[type="text"], .pf-fg input[type="date"] { flex:1; min-width:0; height:32px; padding:4px 8px;
-            border:1px solid var(--border-strong); border-radius:var(--r-btn); font-family:inherit; font-size:13px;
-            color:var(--c-primary); background:#fff; }
-        .pf-fg input:focus { outline:none; border-color:var(--fb-blue); box-shadow:0 0 0 3px rgba(45,156,219,.15); }
-        .pf-fg input[readonly] { background:var(--bg-1); color:var(--c-secondary); }
-        .pf-fg textarea.pf-serials { width:100%; min-height:66px; padding:5px 8px; border:1px solid var(--border-strong);
-            border-radius:var(--r-btn); font-family:var(--mono); font-size:12px; color:var(--c-primary); background:#fff;
-            resize:vertical; line-height:1.45; box-sizing:border-box; }
-        .pf-fg textarea.pf-serials[readonly] { background:var(--bg-1); color:var(--c-secondary); }
-        .pf-fg .pf-count { font-size:11px; color:var(--c-secondary); margin-top:2px; font-variant-numeric:tabular-nums; }
-        .pf-fg .pf-count.ok { color:#1B7A46; font-weight:600; }
-        .pf-fg .pf-count.warn { color:#8A4E10; font-weight:600; }
-        .pf-fg .pf-count.fail { color:#A32439; font-weight:600; }
-        .pf-fg .pf-fg-detail { flex-shrink:0; font-size:10.5px; white-space:nowrap; }
-
-        .pf-sr-row { display:flex; align-items:center; gap:10px; padding:7px 10px; background:#fff;
-            border:1px solid var(--border); border-radius:var(--r-card); margin-bottom:6px; font-size:12px; }
-        .pf-sr-row .pf-sr-part { flex:1; min-width:0; }
-        .pf-sr-row .pf-sr-count { font-size:11px; font-variant-numeric:tabular-nums; }
-        .pf-sr-row .pf-sr-count.ok { color:#1B7A46; font-weight:600; }
-        .pf-sr-row .pf-sr-count.warn { color:#8A4E10; font-weight:600; }
-        .pf-sr-row .pf-sr-count.fail { color:#A32439; font-weight:600; }
-
-        /* Tracking drawer body — searchable checkbox list. */
-        .pf-tk-toolbar { display:flex; gap:10px; align-items:center; font-size:11px; margin-bottom:8px; flex-wrap:wrap; }
-        .pf-tk-toolbar input[type=text] { flex:1; min-width:140px; padding:5px 8px; border:1px solid var(--border-strong);
-            border-radius:var(--r-btn); font-family:inherit; font-size:13px; height:32px; }
-        .pf-tk-toolbar input[type=text]:focus { outline:none; border-color:var(--fb-blue); box-shadow:0 0 0 3px rgba(45,156,219,.15); }
-        .pf-tk-toolbar a { color:var(--link); cursor:pointer; text-decoration:none; font-weight:600; }
-        .pf-tk-toolbar a:hover { text-decoration:underline; }
-        .pf-tk-toolbar .sep { color:var(--border-strong); }
-        .pf-tk-list { border:1px solid var(--border); border-radius:var(--r-card); background:#fff;
-            overflow-y:auto; user-select:none; flex:1; min-height:120px; }
-        .pf-tk-item { display:flex; align-items:center; gap:10px; padding:7px 12px; font-size:12px; color:var(--c-primary);
-            cursor:pointer; line-height:1.4; border-bottom:1px solid var(--bg-2); }
-        .pf-tk-item:last-child { border-bottom:none; }
-        .pf-tk-item:hover { background:var(--bg-1); }
-        .pf-tk-item.selected { background:#DEEAF4; }
-        .pf-tk-item.readonly { cursor:default; }
-        .pf-tk-item .pf-tk-sn { font-family:var(--mono); font-weight:500; flex:1; }
-        .pf-tk-item .pf-tk-meta { color:var(--c-secondary); font-size:10.5px; font-variant-numeric:tabular-nums; }
-        .pf-tk-item input[type="checkbox"] { margin:0; pointer-events:none; flex-shrink:0; accent-color:var(--color-primary); }
-        .pf-tk-empty { padding:16px; color:var(--c-tertiary); font-size:12px; text-align:center; font-style:italic; }
-        .pf-tk-group { padding:8px 12px 4px; font-size:11px; color:var(--c-secondary); background:var(--bg-1);
-            border-top:1px solid var(--border); position:sticky; top:0; z-index:1; }
-        .pf-tk-group:first-child { border-top:none; }
-        .pf-tk-count { font-size:13px; font-weight:600; font-variant-numeric:tabular-nums; }
-        .pf-tk-count.ok { color:#1B7A46; } .pf-tk-count.warn { color:#8A4E10; } .pf-tk-count.fail { color:#A32439; }
-    </style>
-</head>
-<body class="bg-slate-50">
-    <!-- Toast Container -->
-    <div class="toast-container"></div>
-
-    <!-- Full-screen loading overlay. Defaults to visible so the very first
-         paint shows the spinner while the report boots + runs its initial
-         queries; loadWorkOrders() hides it when data is ready. -->
-    <div id="psLoadingOverlay" style="position:fixed;top:0;left:0;width:calc(100vw / var(--ps-zoom,1));height:calc(100vh / var(--ps-zoom,1));z-index:10099;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:rgba(247,247,247,.82);backdrop-filter:blur(2px)">
-        <div class="spinner"></div>
-        <div id="psLoadingMsg" style="font-size:13px;font-weight:600;color:#506872">Loading…</div>
-    </div>
-
-    <!-- WO Context Menu -->
-    <div id="woContextMenu" class="gantt-context-menu">
-        <div class="text-sm font-semibold text-slate-800 mb-3 flex items-center gap-2">
-            <svg class="w-4 h-4 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
-            </svg>
-            <span id="woContextMenuTitle">Set WO Dates</span>
-        </div>
-        <div class="space-y-3 mb-4">
-            <div>
-                <label class="block text-xs font-medium text-slate-500 mb-1">Start Date</label>
-                <input type="date" id="woContextMenuStart">
-            </div>
-            <div>
-                <label class="block text-xs font-medium text-slate-500 mb-1">End Date</label>
-                <input type="date" id="woContextMenuEnd">
-            </div>
-            <div>
-                <label class="block text-xs font-medium text-slate-500 mb-1">Category</label>
-                <select id="woContextMenuCategory">
-                    <!-- Populated dynamically from capacitySettings.categories -->
-                </select>
-            </div>
-        </div>
-        <div class="flex gap-2">
-            <button onclick="applyWOContextMenu()" class="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg py-1.5 text-xs font-semibold transition-colors">Apply</button>
-            <button onclick="hideAllContextMenus()" class="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg py-1.5 text-xs font-semibold transition-colors">Cancel</button>
-        </div>
-    </div>
-
-    <!-- Tooltip Container -->
-    <div id="woTooltip" class="wo-tooltip"></div>
-
-    <!-- Modal Overlay (retained for other modals; the settings +
-         instructions offcanvases are gone — replaced by fb-drawer
-         drop-downs inline in the flex flow below the header.) -->
-    <div class="modal-overlay" id="modalOverlay"></div>
-
-    <!-- ================================================================
-         v1.2 APP SHELL — single main column (the icon rail was removed;
-         Help + Settings live in the top bar). The former `.h-screen flex`
-         wrapper is reused as `.app` so the div nesting balance is
-         unchanged.
-         ================================================================ -->
-    <div class="app h-screen">
-        <!-- Main column -->
-        <main class="main">
-            <!-- ================================================================
-                 TOP BAR — breadcrumb + title, global search, refresh,
-                 primary action, and the tabbed view switcher.
-                 ================================================================ -->
-            <div class="topbar">
-                <div class="topbar-row1">
-                    <div class="title-wrap">
-                        <span class="crumb">Manufacturing · Planning</span>
-                        <h1>Production Schedule</h1>
-                        <p id="statusLine" style="display:none;">Initialising…</p>
-                    </div>
-                    <div class="top-actions">
-                        <div class="ps-zoom" title="Zoom the whole report to fit your screen. Click the % to auto-fit.">
-                            <button class="ps-btn icon sm" type="button" onclick="psZoomStep(-1)" title="Zoom out"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M5 12h14"/></svg></button>
-                            <button type="button" class="ps-zoom-lbl" id="psZoomLabel" onclick="psZoomAuto()" title="Click to auto-fit to this screen">100%</button>
-                            <button class="ps-btn icon sm" type="button" onclick="psZoomStep(1)" title="Zoom in"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M12 5v14M5 12h14"/></svg></button>
-                        </div>
-                        <div class="search">
-                            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path stroke-linecap="round" d="M21 21l-4-4"/></svg>
-                            <input type="text" id="searchInput" placeholder="Search WO, part, MO, customer…" style="padding-right:30px" />
-                            <button type="button" id="searchClear" onclick="psClearSearch()" title="Clear search" style="display:none;position:absolute;right:8px;top:50%;transform:translateY(-50%);align-items:center;justify-content:center;border:none;background:transparent;cursor:pointer;color:#8FA1A7;padding:0;margin:0;line-height:0">
-                                <svg style="position:static;left:auto;top:auto;width:15px;height:15px" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></svg>
-                            </button>
-                        </div>
-                        <button class="ps-btn icon sm" id="refreshBtn" type="button" onclick="loadWorkOrders()" title="Refresh data">
-                            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v6h6M20 20v-6h-6M20 8a8 8 0 00-14.9-2M4 16a8 8 0 0014.9 2"/></svg>
-                        </button>
-                        <button class="ps-btn primary sm" type="button" onclick="openModule('Manufacture Order')" title="Open the Manufacture Order module">
-                            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 5v14M5 12h14"/></svg>New MO
-                        </button>
-                        <button class="ps-btn icon sm" id="helpBtn" type="button" title="Instructions" onclick="FBLib.Common.toggleDrawer('instructionsOverlay')">
-                            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093M12 17h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
-                        </button>
-                        <button class="ps-btn icon sm" id="setBtn" type="button" title="Settings" onclick="FBLib.Common.toggleDrawer('settingsOverlay')">
-                            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"></path></svg>
-                        </button>
-                    </div>
-                </div>
-                <div class="tabs" id="viewTabs"></div>
-            </div>
-
-            <!-- ================================================================
-                 SETTINGS — fb-drawer style (sits in flex flow between
-                 header and content, per the canonical .fb-drawer pattern).
-                 Content inside is the same Schedule Options + Display
-                 toggles the offcanvas had; fb-lib registerDrawer wires
-                 open/close/ESC.
-                 ================================================================ -->
-            <div id="settingsOverlay" class="fb-drawer">
-                <div class="fb-drawer-head">
-                    <h2>⚙ Settings</h2>
-                    <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('settingsOverlay')" aria-label="Close">&times;</button>
-                </div>
-                <div class="fb-drawer-body">
-                    <div id="dsLockBadge" class="ds-lock-badge" style="display:none;">
-                        Locked by admin — your changes won't be saved.
-                    </div>
-                    <div class="fb-grid">
-                        <div class="fb-group">
-                            <div class="fb-group-title">Schedule Options</div>
-                            <div class="fb-field">
-                                <label class="ds-toggle-row">
-                                    <input type="checkbox" id="sameDayStartsToggle">
-                                    <div class="ds-toggle-body">
-                                        <div class="ds-toggle-title">Allow Same-Day Dependency Starts</div>
-                                        <div class="ds-toggle-help">Dependent WOs can start on the same day the preceding WO finishes</div>
-                                    </div>
-                                </label>
-                            </div>
-                            <div class="fb-field">
-                                <label style="display:flex; flex-direction:column; gap:4px; padding:6px 10px; font-size:12px; color:#415157;">
-                                    <span class="ds-toggle-title">Shift Dependent WOs on Drag</span>
-                                    <span class="ds-toggle-help" style="margin-bottom:2px;">When you drag a WO, move the WOs that depend on it by the same amount</span>
-                                    <select id="shiftDependentModeSelect" style="height:32px; border:1px solid #C6D0D4; border-radius:6px; padding:0 8px; font-size:12px; font-family:inherit; color:#101010; background:#fff; cursor:pointer;">
-                                        <option value="off">Off — never shift dependents</option>
-                                        <option value="later">Move later only — push dependents when a WO moves out</option>
-                                        <option value="both">Move earlier and later — shift dependents both ways</option>
-                                    </select>
-                                </label>
-                            </div>
-                            <div class="fb-field">
-                                <label class="ds-toggle-row">
-                                    <input type="checkbox" id="skipWeekendsToggle">
-                                    <div class="ds-toggle-body">
-                                        <div class="ds-toggle-title">Skip Weekends When Scheduling</div>
-                                        <div class="ds-toggle-help">Auto-skip weekends when dragging or resizing WOs</div>
-                                    </div>
-                                </label>
-                            </div>
-                        </div>
-                        <div class="fb-group">
-                            <div class="fb-group-title">Display</div>
-                            <div class="fb-field">
-                                <label class="ds-toggle-row">
-                                    <input type="checkbox" id="showArrowsToggle" checked>
-                                    <div class="ds-toggle-body">
-                                        <div class="ds-toggle-title">Show Dependency Arrows</div>
-                                    </div>
-                                </label>
-                            </div>
-                            <div class="fb-field">
-                                <label class="ds-toggle-row">
-                                    <input type="checkbox" id="showCompletedWOsToggle" checked>
-                                    <div class="ds-toggle-body">
-                                        <div class="ds-toggle-title">Show Completed WOs</div>
-                                        <div class="ds-toggle-help">Include completed WOs in Capacity + Calendar views</div>
-                                    </div>
-                                </label>
-                            </div>
-                            <div class="fb-field">
-                                <label style="display:flex; flex-direction:column; gap:4px; padding:6px 10px; font-size:12px; color:#415157;">
-                                    <span class="ds-toggle-title">Default tab on open</span>
-                                    <span class="ds-toggle-help" style="margin-bottom:2px;">Which view the report opens on</span>
-                                    <select id="defaultViewSelect" style="height:32px; border:1px solid #C6D0D4; border-radius:6px; padding:0 8px; font-size:12px; font-family:inherit; color:#101010; background:#fff; cursor:pointer;">
-                                        <option value="last">Last used view</option>
-                                        <option value="dashboard">Dashboard</option>
-                                        <option value="timeline">Timeline</option>
-                                        <option value="board">Board</option>
-                                        <option value="table">Work Orders</option>
-                                        <option value="calendar">Calendar</option>
-                                        <option value="load">User Load</option>
-                                        <option value="procure">Procurement</option>
-                                    </select>
-                                </label>
-                            </div>
-                            <div class="fb-field">
-                                <div style="padding:6px 10px 2px; font-size:12px; color:#415157;">
-                                    <div class="ds-toggle-title">Visible tabs &amp; order</div>
-                                    <div class="ds-toggle-help">Show or hide tabs, and drag to reorder the tab strip. Only tabs enabled for this install are listed.</div>
-                                </div>
-                                <div class="tabsel" id="tabSelWrap" style="padding:0 10px 4px;">
-                                    <button type="button" class="tabsel-btn" id="tabSelBtn" onclick="psTabSelToggle(event)" title="Choose which tabs show, and their order">
-                                        <span id="tabSelLabel">All tabs</span>
-                                        <svg class="caret" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 9l6 6 6-6"/></svg>
-                                    </button>
-                                    <div class="tabsel-panel hidden" id="tabSelPanel">
-                                        <div class="tabsel-head">Show / Reorder</div>
-                                        <div class="tabsel-list" id="tabSelList"></div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="fb-group">
-                            <div class="fb-group-title">Procurement</div>
-                            <div class="fb-field">
-                                <label style="display:flex; flex-direction:column; gap:4px; padding:6px 10px; font-size:12px; color:#415157;">
-                                    <span class="ds-toggle-title">Default MO status</span>
-                                    <span class="ds-toggle-help" style="margin-bottom:2px;">Status new manufacture orders are created with</span>
-                                    <select id="dsMoStatusSelect" style="height:32px; border:1px solid #C6D0D4; border-radius:6px; padding:0 8px; font-size:12px; font-family:inherit; color:#101010; background:#fff; cursor:pointer;">
-                                        <option value="Issued">Issued (live)</option>
-                                        <option value="Entered">Entered (suggestion)</option>
-                                    </select>
-                                </label>
-                            </div>
-                            <div class="fb-field">
-                                <label style="display:flex; flex-direction:column; gap:4px; padding:6px 10px; font-size:12px; color:#415157;">
-                                    <span class="ds-toggle-title">Default PO status</span>
-                                    <span class="ds-toggle-help" style="margin-bottom:2px;">Status new purchase orders are created with</span>
-                                    <select id="dsPoStatusSelect" style="height:32px; border:1px solid #C6D0D4; border-radius:6px; padding:0 8px; font-size:12px; font-family:inherit; color:#101010; background:#fff; cursor:pointer;">
-                                        <option value="Issued">Issued</option>
-                                        <option value="Bid Request">Bid Request</option>
-                                    </select>
-                                </label>
-                            </div>
-                        </div>
-                        <div class="fb-group">
-                            <div class="fb-group-title">Diagnostics</div>
-                            <div class="fb-field">
-                                <label class="ds-toggle-row">
-                                    <input type="checkbox" id="dsDebug">
-                                    <div class="ds-toggle-body">
-                                        <div class="ds-toggle-title">Show debug console</div>
-                                    </div>
-                                </label>
-                            </div>
-                        </div>
-
-                        <!-- Admin-only controls — a dedicated right-end column of the
-                             settings grid (moved out of the old full-width block that
-                             sat under the grid). margin-left:auto pushes it to the far
-                             right; a dashed left border separates it. Visible only when
-                             FBLib.Settings.isAdmin() (toggled by refreshAdminUi, which
-                             sets display:block/none — margin-left:auto survives). -->
-                        <div id="dsAdminSection" class="fb-group" style="display:none; margin-left:auto; padding-left:20px; border-left:1px dashed #C6D0D4;">
-                            <div class="fb-group-title">Admin</div>
-                            <div class="fb-field">
-                                <label class="ds-toggle-row">
-                                    <input type="checkbox" id="dsEnableFinishWO">
-                                    <div class="ds-toggle-body">
-                                        <div class="ds-toggle-title">Enable "Finish WO" button</div>
-                                        <div class="ds-toggle-help">Shows the Finish WO action in the work-order drawer (published org-wide). Off by default.</div>
-                                    </div>
-                                </label>
-                            </div>
-                            <div class="fb-field">
-                                <label style="display:flex; flex-direction:column; gap:4px; padding:6px 10px; font-size:12px; color:#415157;">
-                                    <span class="ds-toggle-title">Finish WO — visible to</span>
-                                    <span class="ds-toggle-help" style="margin-bottom:2px;">Restrict the button to one user group (applies only when enabled above). "All users" shows it to everyone.</span>
-                                    <select id="dsFinishWOGroup" onchange="setFinishWOGroup(this.value)" style="height:32px; border:1px solid #C6D0D4; border-radius:6px; padding:0 8px; font-size:12px; font-family:inherit; color:#101010; background:#fff; cursor:pointer;">
-                                        <option value="">All users</option>
-                                    </select>
-                                </label>
-                            </div>
-                            <div class="fb-field">
-                                <label class="ds-toggle-row">
-                                    <input type="checkbox" id="dsAllowFinishShort">
-                                    <div class="ds-toggle-body">
-                                        <div class="ds-toggle-title">Allow finishing WOs with short raw goods</div>
-                                        <div class="ds-toggle-help">Lets the Finish WO flow complete a work order even when raw materials are short of stock (published org-wide). A styled warning confirms first, and whatever stock IS available is still consumed; serial/tracking issues always block. Off by default.</div>
-                                    </div>
-                                </label>
-                            </div>
-                            <!-- AI Planner (premium POC) admin controls — master-published, so
-                                 the toggle + key + anonymise flag apply org-wide. -->
-                            <div class="fb-field">
-                                <label class="ds-toggle-row">
-                                    <input type="checkbox" id="dsEnableAiPlanner">
-                                    <div class="ds-toggle-body">
-                                        <div class="ds-toggle-title">Enable "AI Planner" tab</div>
-                                        <div class="ds-toggle-help">Shows the AI Planner tab (Claude-powered reschedule / PO / MO suggestions), published org-wide. Requires a Claude API key below. Off by default. Proof-of-concept.</div>
-                                    </div>
-                                </label>
-                            </div>
-                            <div class="fb-field">
-                                <label style="display:flex; flex-direction:column; gap:4px; padding:6px 10px; font-size:12px; color:#415157;">
-                                    <span class="ds-toggle-title">Claude API key</span>
-                                    <span class="ds-toggle-help" style="margin-bottom:2px;">Used only when the AI Planner tab runs. Stored in the shared (master) settings and readable by any user's client — acceptable for a demo/POC, not for production. Get a key at console.anthropic.com.</span>
-                                    <span style="display:flex; gap:6px; align-items:center;">
-                                        <input type="password" id="dsClaudeApiKey" placeholder="sk-ant-…" autocomplete="off" style="flex:1; min-width:0; height:32px; border:1px solid #C6D0D4; border-radius:6px; padding:0 8px; font-size:12px; font-family:inherit; color:#101010; background:#fff;">
-                                        <button type="button" class="ds-btn-admin" style="margin-right:0" onclick="setClaudeApiKey(document.getElementById('dsClaudeApiKey').value)">Save key</button>
-                                    </span>
-                                </label>
-                            </div>
-                            <div class="fb-field">
-                                <label class="ds-toggle-row">
-                                    <input type="checkbox" id="dsAiPlannerAnonymise">
-                                    <div class="ds-toggle-body">
-                                        <div class="ds-toggle-title">Anonymise data sent to Claude</div>
-                                        <div class="ds-toggle-help">Replaces WO/part numbers and customer/user/vendor names with tokens (W1, P1, C1…) before sending; the response is de-tokenised locally. On by default.</div>
-                                    </div>
-                                </label>
-                            </div>
-                            <div class="fb-field" style="display:flex; flex-direction:column; gap:6px; margin-top:2px;">
-                                <button type="button" class="ds-btn-admin" style="margin-right:0" onclick="publishDefaults()">Publish as default for everyone</button>
-                                <button type="button" class="ds-btn-admin" id="dsLockBtn" style="margin-right:0" onclick="toggleUserEditing()">Lock user editing</button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                <div class="fb-drawer-foot">
-                    <button type="button" class="btn" onclick="resetSettingsToDefaults()">Reset to defaults</button>
-                    <button type="button" class="btn btn-primary" onclick="FBLib.Common.closeDrawer('settingsOverlay')">Done</button>
-                </div>
-            </div>
-
-            <!-- Instructions drawer (was: offcanvas; now fb-drawer) -->
-            <div id="instructionsOverlay" class="fb-drawer">
-                <div class="fb-drawer-head">
-                    <h2>📖 Instructions</h2>
-                    <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('instructionsOverlay')" aria-label="Close">&times;</button>
-                </div>
-                <div class="fb-drawer-body">
-                    <div style="display: flex; flex-wrap: wrap; gap: 14px 22px;">
-                        <div style="flex: 1 1 320px; min-width: 300px;">
-                            <div style="font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #506872; border-bottom: 1px solid #E3E3E3; padding-bottom: 4px; margin-bottom: 8px;">About</div>
-                            <p style="font-size: 12px; color: #415157;">Two interactive views for visualizing and managing WO schedules:</p>
-                            <ul style="font-size: 12px; color: #415157; padding-left: 18px; margin: 6px 0;">
-                                <li><strong>MO Gantt View:</strong> Groups work orders by Manufacturing Order</li>
-                                <li><strong>Capacity Planning:</strong> Weekly calendar with drag-and-drop scheduling and capacity tracking</li>
-                            </ul>
-                            <div style="font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #506872; border-bottom: 1px solid #E3E3E3; padding-bottom: 4px; margin-bottom: 8px; margin-top: 14px;">Gantt View</div>
-                            <ul style="font-size: 12px; color: #415157; padding-left: 18px; margin: 6px 0;">
-                                <li><strong>Drag WO:</strong> Reschedule by dragging the bar</li>
-                                <li><strong>Resize:</strong> Drag the left/right edge to change start/finish</li>
-                                <li><strong>Click a WO:</strong> Opens the detail drawer — set exact start/finish (with time) and category there</li>
-                                <li><strong>Navigate:</strong> Scroll timeline, prev/next week buttons</li>
-                                <li><strong>Zoom:</strong> Toolbar zoom controls (persists across sessions)</li>
-                                <li><strong>Collapse MOs:</strong> Chevron on the MO row folds it; "All" in the column header folds every group</li>
-                                <li><strong>Undo/Redo:</strong> Toolbar buttons (50-step history)</li>
-                                <li><strong>Shift dependent WOs:</strong> When you drag a WO, the WOs that depend on it (its downstream stages) can follow. Choose the behaviour in Settings:
-                                    <ul style="margin:3px 0 0; padding-left:16px;">
-                                        <li><strong>Off</strong> — dependents never move.</li>
-                                        <li><strong>Move later only</strong> — pushing a WO to a later date drags its dependents out by the same amount, but pulling a WO earlier leaves them where they are.</li>
-                                        <li><strong>Move earlier and later</strong> — dependents follow in both directions (pulling a WO earlier drags them earlier too).</li>
-                                    </ul>
-                                    (With "Skip weekends" on, a shifted dependent that lands on a Sat/Sun snaps to the following Monday.)</li>
-                            </ul>
-                        </div>
-                        <div style="flex: 1 1 320px; min-width: 300px;">
-                            <div style="font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #506872; border-bottom: 1px solid #E3E3E3; padding-bottom: 4px; margin-bottom: 8px;">Capacity Planning</div>
-                            <ul style="font-size: 12px; color: #415157; padding-left: 18px; margin: 6px 0;">
-                                <li><strong>Weekly:</strong> Drag horizontally (dates) or vertically (categories)</li>
-                                <li><strong>Monthly:</strong> Drag WOs across days; nav with month buttons or Today</li>
-                                <li><strong>Categories:</strong> Sorted alphabetically</li>
-                                <li><strong>Capacity limits:</strong> Gear icon inside the capacity view sets daily labor hours per category (auto-saves)</li>
-                                <li><strong>Color coding:</strong> Green = under, Orange = at, Red = over capacity</li>
-                            </ul>
-                            <div style="font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #506872; border-bottom: 1px solid #E3E3E3; padding-bottom: 4px; margin-bottom: 8px; margin-top: 14px;">Settings</div>
-                            <ul style="font-size: 12px; color: #415157; padding-left: 18px; margin: 6px 0;">
-                                <li><strong>Auto-save:</strong> Every toggle change writes to your Fishbowl user account via <code>saveSettings</code> — no fake-part rows anymore.</li>
-                                <li><strong>First load migration:</strong> If you had settings on the older report, they'll be read from the legacy <code>_settingsCapacityPlanner</code> part once and carried forward automatically.</li>
-                            </ul>
-                        </div>
-                    </div>
-
-                    <!-- Timeline tile signals legend — sample bars with the corner
-                         availability dot, one per colour, as a visual key. -->
-                    <div style="font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #506872; border-bottom: 1px solid #E3E3E3; padding-bottom: 4px; margin: 16px 0 10px;">Timeline tile signals</div>
-                    <p style="font-size: 12px; color: #415157; margin: 0 0 10px;">Each work-order tile can carry a small dot on its top-right corner — the material-availability signal for that WO. Hover a dot on the Timeline for the detail.</p>
-                    <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px 20px;">
-                        <div style="display:flex; align-items:center; gap:12px;">
-                            <span style="position:relative; display:inline-block; width:104px; height:24px; border-radius:5px; background:#2d9cdb; border:1px solid rgba(0,0,0,.12); box-shadow:var(--sh1); flex-shrink:0;">
-                                <span style="position:absolute; left:8px; top:0; bottom:0; display:flex; align-items:center; font-size:11px; font-weight:700; color:#fff;">WO 1234</span>
-                            </span>
-                            <span style="font-size:12px; color:#415157;"><strong>No dot</strong> — buildable now; every component is on hand.</span>
-                        </div>
-                        <div style="display:flex; align-items:center; gap:12px;">
-                            <span style="position:relative; display:inline-block; width:104px; height:24px; border-radius:5px; background:#2d9cdb; border:1px solid rgba(0,0,0,.12); box-shadow:var(--sh1); flex-shrink:0;">
-                                <span style="position:absolute; left:8px; top:0; bottom:0; display:flex; align-items:center; font-size:11px; font-weight:700; color:#fff;">WO 1234</span>
-                                <span style="position:absolute; top:0; right:0; transform:translate(50%,-50%); width:9px; height:9px; border-radius:50%; background:var(--acc-yellow); box-shadow:var(--sh1);"></span>
-                            </span>
-                            <span style="font-size:12px; color:#415157;"><strong>Yellow</strong> — buildable on a future date (waiting on incoming stock or a producing WO).</span>
-                        </div>
-                        <div style="display:flex; align-items:center; gap:12px;">
-                            <span style="position:relative; display:inline-block; width:104px; height:24px; border-radius:5px; background:#2d9cdb; border:1px solid rgba(0,0,0,.12); box-shadow:var(--sh1); flex-shrink:0;">
-                                <span style="position:absolute; left:8px; top:0; bottom:0; display:flex; align-items:center; font-size:11px; font-weight:700; color:#fff;">WO 1234</span>
-                                <span style="position:absolute; top:0; right:0; transform:translate(50%,-50%); width:9px; height:9px; border-radius:50%; background:var(--fb-warning); box-shadow:var(--sh1);"></span>
-                            </span>
-                            <span style="font-size:12px; color:#415157;"><strong>Orange</strong> — stock is on hand but claimed by earlier-scheduled WOs (contested). Reprioritise this WO to secure it.</span>
-                        </div>
-                        <div style="display:flex; align-items:center; gap:12px;">
-                            <span style="position:relative; display:inline-block; width:104px; height:24px; border-radius:5px; background:#2d9cdb; border:1px solid rgba(0,0,0,.12); box-shadow:var(--sh1); flex-shrink:0;">
-                                <span style="position:absolute; left:8px; top:0; bottom:0; display:flex; align-items:center; font-size:11px; font-weight:700; color:#fff;">WO 1234</span>
-                                <span style="position:absolute; top:0; right:0; transform:translate(50%,-50%); width:9px; height:9px; border-radius:50%; background:var(--acc-magenta); box-shadow:var(--sh1);"></span>
-                            </span>
-                            <span style="font-size:12px; color:#415157;"><strong>Purple</strong> — blocked by an upstream WO (a WO it depends on finishes after this one starts).</span>
-                        </div>
-                        <div style="display:flex; align-items:center; gap:12px;">
-                            <span style="position:relative; display:inline-block; width:104px; height:24px; border-radius:5px; background:#2d9cdb; border:1px solid rgba(0,0,0,.12); box-shadow:var(--sh1); flex-shrink:0;">
-                                <span style="position:absolute; left:8px; top:0; bottom:0; display:flex; align-items:center; font-size:11px; font-weight:700; color:#fff;">WO 1234</span>
-                                <span style="position:absolute; top:0; right:0; transform:translate(50%,-50%); width:9px; height:9px; border-radius:50%; background:var(--fb-negative); box-shadow:var(--sh1);"></span>
-                            </span>
-                            <span style="font-size:12px; color:#415157;"><strong>Red</strong> — raw goods can't be met from stock or open POs; needs purchasing or a new MO.</span>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- ================================================================
-                 FILTER STRIP — status + category chips, Clear, and a
-                 view-specific group-by / dimension segmented control.
-                 Rendered by renderFilterbar() per active view.
-                 ================================================================ -->
-            <div class="filterbar" id="filterBar"></div>
-
-            <!-- Content Area — single view host. switchView() shows exactly
-                 one of the child view containers below. -->
-            <div class="flex-1 overflow-y-auto custom-scrollbar" id="viewContent" style="padding:20px 22px;">
-                <!-- Dashboard view (KPIs + issue panels) -->
-                <div id="dashboardView" style="display:none;"></div>
-                <!-- Board view (kanban by WO status) -->
-                <div id="boardView" style="display:none;"></div>
-                <!-- Work Orders table view -->
-                <div id="tableView" style="display:none;"></div>
-                <!-- Calendar view (month grid) -->
-                <div id="calendarView" style="display:none;"></div>
-                <!-- Legacy KPI target kept hidden so updateKPIs() never throws;
-                     the Dashboard view renders its own KPI cards. -->
-                <div id="kpiCards" style="display:none;"></div>
-
-                <!-- Timeline view — existing D3 Gantt (mo/category/user grouping) -->
-                <!-- Gantt/Category View Container -->
-                <!-- Timeline view — plain-DOM Gantt rendered by renderGanttChart() -->
-                <div id="ganttContainer" style="display:none;"></div>
-
-                <!-- Capacity Planning View Container -->
-                <div id="capacityContainer" style="display: none;">
-                    <!-- Monthly Calendar View - Always Visible -->
-                    <div class="bg-white rounded-2xl shadow-md border border-slate-300 mb-4 p-6">
-                        <div class="flex items-center justify-between mb-4">
-                            <div class="flex items-center gap-2">
-                                <svg class="w-5 h-5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
-                                </svg>
-                                <h3 class="text-lg font-bold text-slate-800">Monthly Calendar</h3>
-                                <span id="calendarMonthDisplay" class="text-sm font-semibold text-slate-600 ml-2"></span>
-                            </div>
-                            <div class="flex items-center gap-2">
-                                <button onclick="changeCalendarMonth(-1)" class="px-3 py-2 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-lg text-sm font-medium transition-colors">
-                                    <svg class="w-4 h-4 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 19l-7-7 7-7m8 14l-7-7 7-7"></path>
-                                    </svg>
-                                    Month
-                                </button>
-                                <button onclick="goToCalendarToday()" class="px-3 py-2 bg-indigo-50 hover:bg-indigo-100 border border-indigo-300 rounded-lg text-sm font-semibold text-indigo-700 transition-colors">
-                                    Today
-                                </button>
-                                <button onclick="changeCalendarMonth(1)" class="px-3 py-2 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-lg text-sm font-medium transition-colors">
-                                    Month
-                                    <svg class="w-4 h-4 inline ml-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 5l7 7-7 7M5 5l7 7-7 7"></path>
-                                    </svg>
-                                </button>
-                                <div class="ml-2 border-l border-slate-300 pl-2">
-                                    <select id="calendarColorModeSelect" onchange="toggleCalendarColorMode()" class="px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                                        <option value="status">Color by Status</option>
-                                        <option value="category">Color by Category</option>
-                                    </select>
-                                </div>
-                                <div class="ml-2 border-l border-slate-300 pl-2">
-                                    <select id="viewByModeSelect" onchange="toggleViewByMode()" class="px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                                        <option value="wo_num">View by WO#</option>
-                                        <option value="bom_num">View by BOM#</option>
-                                    </select>
-                                </div>
-                            </div>
-                        </div>
-                        <div id="monthCalendar" class="relative" style="min-height: 400px; margin-left: 82px;">
-                            <!-- Calendar will be rendered here (inset to align with capacity planning days) -->
-                        </div>
-                    </div>
-
-                    <div class="bg-white rounded-2xl shadow-md border border-slate-300 p-6">
-                        <div class="flex items-center justify-between mb-4">
-                            <h3 class="text-lg font-bold text-slate-800">Weekly Capacity Planning</h3>
-                            <div class="flex items-center gap-2">
-                                <button onclick="openCapacitySettingsModal()" class="px-3 py-2 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-lg text-sm font-medium transition-colors" title="Capacity Settings">
-                                    <svg class="w-4 h-4 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
-                                    </svg>
-                                    Settings
-                                </button>
-                                <button onclick="changeCapacityWeek(-1)" class="px-3 py-2 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-lg text-sm font-medium transition-colors">
-                                    <svg class="w-4 h-4 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 19l-7-7 7-7m8 14l-7-7 7-7"></path>
-                                    </svg>
-                                    Week
-                                </button>
-                                <button onclick="goToCapacityToday()" class="px-3 py-2 bg-indigo-50 hover:bg-indigo-100 border border-indigo-300 rounded-lg text-sm font-semibold text-indigo-700 transition-colors">
-                                    Today
-                                </button>
-                                <span id="capacityWeekDisplay" class="text-sm font-semibold text-slate-600 px-4"></span>
-                                <button onclick="changeCapacityWeek(1)" class="px-3 py-2 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-lg text-sm font-medium transition-colors">
-                                    Week
-                                    <svg class="w-4 h-4 inline ml-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 5l7 7-7 7M5 5l7 7-7 7"></path>
-                                    </svg>
-                                </button>
-                            </div>
-                        </div>
-
-                        <div class="capacity-table-wrapper overflow-auto custom-scrollbar" style="max-height: 800px;">
-                            <table id="capacityTable" class="w-full border-collapse">
-                                <!-- Will be populated dynamically -->
-                            </table>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- User Load heatmap — shown for the "User" dimension of the
-                     User Load tab (the Category dimension keeps the interactive
-                     capacity heatmap for both dimensions). Rendered by renderLoad(). -->
-                <div id="userLoadView" style="display:none;"></div>
-
-                <!-- Materials view — at-risk work orders (raw goods unmet / stock
-                     contested) from the availability engine. Read-only report;
-                     rendered by renderMaterials(). -->
-                <div id="materialsView" style="display:none;"></div>
-
-                <!-- Procurement view — schedule-derived shortage worklist: raw goods
-                     to purchase vs manufacturable parts needing an MO/WO. Rendered
-                     by renderProcure() from the same availability engine. -->
-                <div id="procureView" style="display:none;"></div>
-
-                <!-- Planning view (premium — PS_TABS_ENABLED.planning) — what-if
-                     rescheduler: pull each WO to its earliest material-ready date
-                     (availability engine) pushed for user+category capacity, then
-                     Apply writes via saveWODates(). Rendered by renderPlanning(). -->
-                <div id="planningView" style="display:none;"></div>
-
-                <!-- AI Planner view (premium — PS_TABS_ENABLED.aiplanner + admin
-                     master flag enableAiPlanner) — sends the schedule/availability/
-                     capacity snapshot to Claude and maps its reschedule / PO / MO
-                     suggestions back onto the existing review-then-apply paths.
-                     Rendered by renderAiPlanner(). -->
-                <div id="aiPlannerView" style="display:none;"></div>
-
-                <!-- Rostering view (premium + ADMIN-ONLY — PS_TABS_ENABLED.roster) —
-                     org roster/capacity editor: business hours, holidays/closures,
-                     per-user hours + work-days. Persists rosterConfig to master.
-                     Rendered by renderRoster(). -->
-                <div id="rosterView" style="display:none;"></div>
-
-                <!-- Debug Console is now mounted by fb-lib's
-                     mountDebugDrawer() as a fixed bottom drawer. The
-                     inline `#debugLog` element that this report's
-                     debugLog() function targets is provided by that
-                     drawer, so existing debugLog(...) calls keep
-                     working with no code change. Applied via
-                     applyDebugDrawer() in INIT below. -->
-            </div>
-        </main>
-    </div>
-
-    <!-- WO detail drawer (right slide-in) -->
-    <div class="scrim" id="detailScrim" onclick="closeDetail()"></div>
-    <aside class="detail" id="detailPanel"></aside>
-
-    <!-- v1.2 WO FINISH — ported from Work_Order_WIP.htm -->
-    <!-- Finish drawer (tier 2): consume raw materials + receive finished good. -->
-    <div class="scrim" id="finishScrim" onclick="PSFinish.closeTop()"></div>
-    <aside class="detail" id="finishPanel"></aside>
-    <!-- Tracking drawer (tier 3): serial/lot selection, in front of finish. -->
-    <div class="scrim" id="trackScrim" onclick="PSFinish.closeTop()"></div>
-    <aside class="detail" id="trackPanel"></aside>
-
-    <!-- Create MO drawer (Procurement tab): collect order details for a new MO. -->
-    <div class="scrim" id="moScrim" onclick="psCloseMoDrawer()"></div>
-    <aside class="detail" id="moPanel"></aside>
-
-    <!-- Create PO drawer (Procurement tab): confirm qty/pricing for a new PO per vendor. -->
-    <div class="scrim" id="poScrim" onclick="psClosePoDrawer()"></div>
-    <aside class="detail" id="poPanel"></aside>
-
-    <!-- Custom-Field filters drawer (BOM/MO/WO/Part): type-aware filter controls. -->
-    <div class="scrim" id="cfScrim" onclick="psCloseCfFilters()"></div>
-    <aside class="detail" id="cfPanel"></aside>
-
-<script>
 // ============================================
 // DEBUG MODE CONFIGURATION
 // ============================================
@@ -1673,12 +42,11 @@ let ganttEndDate = null; // Will be initialized in DOMContentLoaded
 
 // Settings
 let allowSameDayStarts = false;
-let shiftDependentMode = 'off'; // When dragging a WO in gantt view, shift dependent WOs: 'off' | 'later' (only when pushed to a later date) | 'both' (earlier and later)
+let shiftDependentWOs = false; // When dragging a WO in gantt view, shift dependent WOs relatively
 let skipWeekends = false; // When dragging/resizing WOs in gantt view, skip weekends to land on weekdays
 let showArrows = true;
 let calendarColorMode = 'status'; // 'status' or 'category'
 let viewByMode = 'wo_num'; // 'wo_num' or 'bom_num' - controls label display in calendar and capacity tiles
-let ganttBarLabel = 'wo';  // Timeline WO-tile text: 'wo' = WO number, 'fg' = Finished Good part number
 let showCompletedWOs = true; // Show completed WOs in capacity planning and calendar views
 let scrollToDateAfterRender = null; // Used to scroll to a specific date after render completes
 let activeStatusFilters = new Set(['10', '30', '40', 'conflict']); // Track current status filters (multi-select)
@@ -1782,8 +150,7 @@ function psDiag(msg) {
         if (!debugLogInitialized) { el.innerHTML = ''; debugLogInitialized = true; }
         const div = document.createElement('div');
         div.className = 'text-amber-300 py-0.5';
-        const ts = (typeof moment === 'function') ? moment().format('HH:mm:ss.SSS') : '';
-        div.textContent = (ts ? '[' + ts + '] ' : '') + '[DIAG] ' + msg;
+        div.textContent = '[DIAG] ' + msg;
         el.appendChild(div);
         el.scrollTop = el.scrollHeight;
     } catch (_) {}
@@ -1832,79 +199,6 @@ function psHideLoading() {
     if (o) o.style.display = 'none';
 }
 
-// ============================================
-// UI ZOOM — app-level zoom for sub-1920 screens
-// ----
-// The Fishbowl embedded browser (JxBrowser) exposes no user-facing zoom, and the
-// report is laid out for ~1920px, so on a 1366-wide laptop the tabs don't fit and
-// tables squash. We apply CSS `zoom` to <body> so the ENTIRE report — including
-// the fixed slide-in drawers, scrims, toasts and overlays — scales together and
-// REFLOWS (scrollbars, sticky headers and the Gantt drag math all keep working).
-// `transform: scale()` was rejected: it would break the fixed drawers and desync
-// the coordinate-based Gantt/calendar drag. On load we auto-fit to ~1920 of
-// content (never magnify a larger screen); the ± / % control in the top bar
-// overrides that and is remembered per user (uiZoom/uiZoomMode). Clicking the %
-// returns to auto-fit and re-fits on window resize.
-// ============================================
-const PS_ZOOM_MIN = 0.5, PS_ZOOM_MAX = 1.3, PS_ZOOM_STEP = 0.05, PS_ZOOM_TARGET_W = 1920;
-let psZoom = 1, psZoomMode = 'auto';
-// Snap a zoom factor to the nearest PS_ZOOM_STEP (5%) grid mark and clamp to the
-// [MIN,MAX] range, so the % only ever lands on clean 5%/10% values. The extra
-// ×100/100 clears binary-float dust (e.g. 0.7500000001 → 0.75).
-function psSnapZoom(z) {
-    const snapped = Math.round((Number(z) || 1) / PS_ZOOM_STEP) * PS_ZOOM_STEP;
-    return Math.max(PS_ZOOM_MIN, Math.min(PS_ZOOM_MAX, Math.round(snapped * 100) / 100));
-}
-function psComputeAutoZoom() {
-    const w = window.innerWidth || document.documentElement.clientWidth || PS_ZOOM_TARGET_W;
-    // Only ever zoom OUT to fit — never magnify a large screen (cap at 1). Snap
-    // DOWN to the nearest 5% (floor) so auto-fit stays on the grid AND still fits
-    // (rounding up could overshoot the viewport width). psSnapZoom then clamps it.
-    const raw = Math.min(1, w / PS_ZOOM_TARGET_W);
-    return psSnapZoom(Math.floor(raw / PS_ZOOM_STEP) * PS_ZOOM_STEP);
-}
-function psApplyZoom(z) {
-    // Always snap to the 5% grid — so a manual step, a restored saved value, or an
-    // auto-fit result can never leave the control on an off-grid % (e.g. 79%).
-    psZoom = psSnapZoom(z);
-    try { document.body.style.zoom = psZoom; } catch (_) {}
-    document.documentElement.style.setProperty('--ps-zoom', String(psZoom));
-    const lbl = document.getElementById('psZoomLabel');
-    if (lbl) lbl.textContent = Math.round(psZoom * 100) + '%';
-}
-function psZoomPersist() {
-    try {
-        FBLib.Settings.setUserKey('uiZoomMode', psZoomMode);
-        FBLib.Settings.setUserKey('uiZoom', psZoom);
-        FBLib.Settings.saveUser();
-    } catch (_) {}
-}
-// ± buttons switch to manual mode (a fixed zoom the user picked, remembered).
-function psZoomStep(dir) { psZoomMode = 'manual'; psApplyZoom(psZoom + dir * PS_ZOOM_STEP); psZoomPersist(); }
-// Clicking the % returns to auto-fit (recomputed each load + on resize).
-function psZoomAuto() {
-    psZoomMode = 'auto'; psApplyZoom(psComputeAutoZoom()); psZoomPersist();
-    try { showToast('Zoom auto-fit to ' + Math.round(psZoom * 100) + '%', 'info', 1800); } catch (_) {}
-}
-function psZoomInit() {
-    let mode = 'auto', saved = null;
-    try { mode = FBLib.Settings.resolve('uiZoomMode') || 'auto'; saved = FBLib.Settings.resolve('uiZoom'); } catch (_) {}
-    psZoomMode = (mode === 'manual') ? 'manual' : 'auto';
-    if (psZoomMode === 'manual' && saved) psApplyZoom(Number(saved) || 1);
-    else { psZoomMode = 'auto'; psApplyZoom(psComputeAutoZoom()); }
-    // Re-fit on resize while in auto mode (debounced). window.innerWidth is the
-    // browser viewport and is unaffected by our body zoom, so this stays stable.
-    if (!psZoomInit._wired) {
-        psZoomInit._wired = true;
-        let t = null;
-        window.addEventListener('resize', () => {
-            if (psZoomMode !== 'auto') return;
-            clearTimeout(t);
-            t = setTimeout(() => { if (psZoomMode === 'auto') psApplyZoom(psComputeAutoZoom()); }, 160);
-        });
-    }
-}
-
 // Styled confirmation modal — a themed replacement for the browser's built-in
 // confirm() so destructive prompts (e.g. the MO un-issue/re-issue reschedule)
 // match the report chrome. Returns a Promise<boolean> (OK → true, Cancel /
@@ -1926,7 +220,7 @@ function psConfirm(opts) {
             ? '<circle cx="12" cy="12" r="9"/><path stroke-linecap="round" d="M12 11v5m0-8h.01"/>'
             : '<path stroke-linecap="round" stroke-linejoin="round" d="M10.29 3.86 1.82 18a1.5 1.5 0 0 0 1.29 2.25h17.78A1.5 1.5 0 0 0 22.18 18L13.71 3.86a1.5 1.5 0 0 0-2.42 0z"/><path stroke-linecap="round" d="M12 9v4m0 4h.01"/>';
         const scrim = document.createElement('div');
-        scrim.setAttribute('style', 'position:fixed;top:0;left:0;width:calc(100vw / var(--ps-zoom,1));height:calc(100vh / var(--ps-zoom,1));z-index:10120;display:flex;align-items:center;justify-content:center;background:rgba(16,16,16,.45);backdrop-filter:blur(2px);padding:20px');
+        scrim.setAttribute('style', 'position:fixed;inset:0;z-index:10120;display:flex;align-items:center;justify-content:center;background:rgba(16,16,16,.45);backdrop-filter:blur(2px);padding:20px');
         scrim.innerHTML =
             '<div role="dialog" aria-modal="true" style="background:#fff;border-radius:var(--r-card);box-shadow:var(--sh3);max-width:440px;width:100%;overflow:hidden">' +
               '<div style="display:flex;gap:14px;padding:20px 20px 4px">' +
@@ -2187,9 +481,7 @@ function loadWorkOrders(opts) {
     _loadWorkOrdersImpl(background);
 }
 
-let _psLoadGen = 0;   // load-generation token — a rapid re-load invalidates the prior background enrichment's repaint
 async function _loadWorkOrdersImpl(background) {
-    const gen = ++_psLoadGen;
     debugLog('info', 'Loading work orders from Fishbowl...');
     setStatus('Loading work orders…');
     document.getElementById('refreshBtn').style.opacity = '0.5';
@@ -2313,48 +605,35 @@ async function _loadWorkOrdersImpl(background) {
         WHERE wo.num IS NOT NULL
             AND wo.statusid IN (10, 30, 40)
             AND moitem.typeid = 50
-            AND mo.statusid < 60
+            AND (mo.statusid NOT IN (60, 70, 80)
+                 OR COALESCE(wo.datefinished, moitem.datescheduled) >= DATE_SUB(CURDATE(), INTERVAL 180 DAY))
         ORDER BY mo.num, wo.num
     `;
 
-    // Staging dependencies (producer WO → consumer WO within one MO) link a WO to
-    // the WO that builds one of its raw components. STRUCTURAL match via the MO's
-    // moitem tree, NOT by part name: a nested sub-assembly is a typeid=50 build
-    // header (producer_mi) whose parent is the consumer's typeid=20 component line
-    // (comp_line), whose parent is the consumer's typeid=50 build header
-    // (consumer_mi). Each WO joins to its build header via wo.moItemId.
-    //   producer_mi(t50) → parent comp_line(t20) → parent consumer_mi(t50)
-    // WHY NOT part name: an MO with two configurations of the same finished good
-    // (e.g. MO 1010: two PROD-1000 builds) builds the SAME parts twice, so a
-    // part-name match cross-linked the two chains (WO 004 read as a producer for
-    // both 003 AND 007). The moitem-tree link keeps each configuration's chain
-    // separate — DB-verified the structural edge set is a strict subset of the old
-    // one, dropping only those phantom cross-links (demodb: 34 → 19 edges, 0 new).
-    // part_num = the consumed component part (comp_line.partid) — the same value
-    // the old query returned, so psLoadAvailability's stagedByWo mapping is unchanged.
     const depQuery = `
         SELECT DISTINCT
-            consumer_wo.id AS wo_id,
-            consumer_wo.num AS wo_num,
-            producer_wo.id AS staging_wo_id,
-            producer_wo.num AS staging_wo_num,
-            COALESCE(producer_wo.datescheduled, producer_mi.datescheduled) AS staging_wo_finish,
-            COALESCE(consumer_wo.datescheduledtostart, consumer_mi.datescheduledtostart) AS wo_start,
-            comp_part.num AS part_num
-        FROM moitem AS producer_mi
-        INNER JOIN moitem AS comp_line ON comp_line.id = producer_mi.parentid AND comp_line.typeid = 20
-        INNER JOIN moitem AS consumer_mi ON consumer_mi.id = comp_line.parentid AND consumer_mi.typeid = 50
-        INNER JOIN mo ON mo.id = producer_mi.moid
-        INNER JOIN wo AS producer_wo ON producer_wo.moitemid = producer_mi.id
-        INNER JOIN wo AS consumer_wo ON consumer_wo.moitemid = consumer_mi.id
-        LEFT JOIN part AS comp_part ON comp_part.id = comp_line.partid
-        WHERE producer_mi.typeid = 50
-            AND producer_wo.num IS NOT NULL
-            AND consumer_wo.num IS NOT NULL
-            AND producer_wo.statusid IN (10, 30, 40)
-            AND consumer_wo.statusid IN (10, 30, 40)
-            AND producer_wo.id != consumer_wo.id
-            AND mo.statusid < 60
+            wo.id AS wo_id,
+            wo.num AS wo_num,
+            staging_wo.id AS staging_wo_id,
+            staging_wo.num AS staging_wo_num,
+            COALESCE(staging_wo.datescheduled, staging_moitem.datescheduled) AS staging_wo_finish,
+            COALESCE(wo.datescheduledtostart, current_moitem.datescheduledtostart) AS wo_start,
+            part.num AS part_num
+        FROM wo
+        LEFT JOIN moitem AS current_moitem ON wo.moitemid = current_moitem.id
+        LEFT JOIN mo AS current_mo ON current_moitem.moid = current_mo.id
+        LEFT JOIN woitem ON woitem.woid = wo.id AND woitem.typeid = 20
+        LEFT JOIN part ON woitem.partid = part.id
+        LEFT JOIN woitem AS staging_woitem ON staging_woitem.partid = part.id AND staging_woitem.typeid = 10
+        LEFT JOIN wo AS staging_wo ON staging_woitem.woid = staging_wo.id
+        LEFT JOIN moitem AS staging_moitem ON staging_wo.moitemid = staging_moitem.id
+        LEFT JOIN mo AS staging_mo ON staging_moitem.moid = staging_mo.id
+        WHERE wo.num IS NOT NULL
+            AND wo.statusid IN (10, 30, 40)
+            AND staging_wo.num IS NOT NULL
+            AND staging_wo.id != wo.id
+            AND current_mo.id = staging_mo.id
+            AND current_mo.statusid NOT IN (60, 70, 80)
     `;
 
     const moQuery = `
@@ -2387,13 +666,16 @@ async function _loadWorkOrdersImpl(background) {
                 LEFT JOIN moitem ON wo.moitemid = moitem.id
                 LEFT JOIN mo ON moitem.moid = mo.id
                 WHERE wo.num IS NOT NULL AND wo.statusid IN (10, 30, 40)
-                  AND mo.statusid < 60
+                  AND (mo.statusid NOT IN (60, 70, 80)
+                       OR COALESCE(wo.datefinished, moitem.datescheduled) >= DATE_SUB(CURDATE(), INTERVAL 180 DAY))
             )
         ORDER BY mo.num
     `;
 
     try {
         debugLog('info', 'Starting to load work orders...');
+
+        let usingMockData = false;
 
         // The three primary queries are independent — run them concurrently.
         // runQueryAsync resolves to an already-parsed array (no JSON.parse).
@@ -2431,14 +713,129 @@ async function _loadWorkOrdersImpl(background) {
         });
         categories = Array.from(catMap.values());
 
-        // ── TIER 1 (sync): LG + Location dimensions + provisional per-WO defaults
-        //    so the schedule paints immediately. The assigned-user dimension is
-        //    SEEDED from the primary assignee (wo.userId, already in the core query)
-        //    so By-User grouping/filter work at first paint; Tier 2's woassignedusers
-        //    query augments each WO with its co-assignees. Everything heavier
-        //    (priority/CF dims, pick/short flags) loads in the background via
-        //    _loadEnrichments(); availability follows in the background too
-        //    (psEnsureAvailability), rendering when ready.
+        // v1.2 (multi-assignee fix): a WO can have several assigned users via the
+        // woassignedusers table (woId ↔ userId, one row per assignment). wo.userId
+        // is only the PRIMARY assignee — so the User dimension, filter, grouping and
+        // load must union EVERY assigned user, not just the primary. Load the
+        // assignment rows and attach an id/name list to each WO.
+        const assignedByWo = new Map();   // wo_id → [{id,name,initials}]
+        try {
+            const auIds = allWorkOrders.map(w => w.wo_id).filter(v => v != null);
+            if (auIds.length) {
+                const auRows = await runQueryAsync(`
+                    SELECT wau.woid AS wo_id, wau.userid AS user_id,
+                           TRIM(CONCAT(COALESCE(su.firstName, ''), ' ', COALESCE(su.lastName, ''))) AS user_name,
+                           COALESCE(su.initials, '') AS user_initials
+                    FROM woassignedusers wau
+                    LEFT JOIN sysuser su ON su.id = wau.userid
+                    WHERE wau.woid IN (${auIds.join(',')})
+                `);
+                auRows.forEach(r => {
+                    if (!assignedByWo.has(r.wo_id)) assignedByWo.set(r.wo_id, []);
+                    assignedByWo.get(r.wo_id).push({
+                        id: (r.user_id != null ? parseInt(r.user_id, 10) : 0) || 0,
+                        name: (r.user_name || '').trim(),
+                        initials: (r.user_initials || '').trim()
+                    });
+                });
+                debugLog('success', `WO assigned users: ${auRows.length} assignment(s) across ${assignedByWo.size} WO(s)`);
+            }
+        } catch (e) {
+            debugLog('warn', 'woassignedusers load failed — falling back to wo.userId only: ' + (e && e.message));
+        }
+        // Attach the deduped assigned-user list to each WO. Fall back to the primary
+        // wo.userId when a WO has no explicit assignment rows; a WO with neither
+        // buckets under the synthetic Unassigned user (id 0).
+        allWorkOrders.forEach(wo => {
+            let list = (assignedByWo.get(wo.wo_id) || []).slice();
+            if (!list.length && wo.user_id) {
+                list = [{ id: parseInt(wo.user_id, 10) || 0, name: (wo.assigned_user || '').trim(), initials: (wo.user_initials || '').trim() }];
+            }
+            const seen = new Set(), uniq = [];
+            list.forEach(u => { const k = String(u.id); if (!seen.has(k)) { seen.add(k); uniq.push(u); } });
+            wo._assignedUsers = uniq;                                   // [{id,name,initials}]
+            wo._userIds = uniq.length ? uniq.map(u => String(u.id)) : ['0'];  // string ids for the filter
+        });
+
+        // Build the User dimension from the UNION of all assigned users (id 0 =
+        // Unassigned) so every assignee — primary or co-assigned — is filterable.
+        const userMap = new Map();
+        allWorkOrders.forEach(wo => {
+            const src = (wo._assignedUsers && wo._assignedUsers.length) ? wo._assignedUsers : [{ id: 0, name: '', initials: '' }];
+            src.forEach(u => {
+                const uid = u.id || 0;
+                if (!userMap.has(uid)) {
+                    const name = (u.name && u.name.trim()) ? u.name.trim() : (uid === 0 ? 'Unassigned' : ('User ' + uid));
+                    const initials = (u.initials && u.initials.trim())
+                        ? u.initials.trim().toUpperCase()
+                        : name.split(/\s+/).map(s => s[0]).join('').slice(0, 2).toUpperCase();
+                    userMap.set(uid, { id: uid, name, initials });
+                }
+            });
+        });
+        users = Array.from(userMap.values()).sort((a, b) => a.name.localeCompare(b.name));
+
+        // v1.2: priority dimension → filter-strip priority pills. Load the FULL
+        // priority table so EVERY priority is offered as a filter — even ones no
+        // currently-loaded WO uses (e.g. 2-High). Fall back to deriving the set
+        // from the loaded WOs only if the table query fails.
+        try {
+            const priRows = await runQueryAsync('SELECT id, name FROM priority ORDER BY name');
+            priorities = priRows.map(r => ({ id: r.id, name: (r.name || '').trim() })).filter(p => p.name);
+            debugLog('success', `Loaded ${priorities.length} priorities from the priority table`);
+        } catch (e) {
+            debugLog('warn', 'Priority table load failed — deriving from WOs: ' + (e && e.message));
+            const priMap = new Map();
+            allWorkOrders.forEach(wo => {
+                const pid = wo.priority_id;
+                const pname = (wo.priority_name || '').trim();
+                if (pid != null && pname && !priMap.has(String(pid))) {
+                    priMap.set(String(pid), { id: pid, name: pname });
+                }
+            });
+            priorities = Array.from(priMap.values()).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+        }
+
+        // v1.2 (Integrity Foods): active BOM/MO/WO/Part custom fields, loaded in ONE
+        // guarded query so an install without the CustomFieldByName UDF (or with no
+        // custom fields) still loads the schedule — CF values simply come back blank.
+        // Mirrors the material-shortage / pick-status guarded blocks. psLoadCfDefs()
+        // discovers the CF set + each field's type (reusing the PurchaseOrderSummary
+        // tablereference⋈customfield pattern). d.expr is a plain column read for
+        // bom/mo/wo and a finished-good Part correlated subquery for obj='part' —
+        // this is how the customer's "Allergen" surfaces: a Part CF, not hardcoded.
+        try {
+            await psLoadCfDefs();
+            const cfSel = psCfDefs.map(d => ', ' + d.expr + ' AS ' + d.key).join('');
+            const attrRows = await runQueryAsync(`
+                SELECT wo.id AS wo_id${cfSel}
+                FROM wo
+                LEFT JOIN moitem ON wo.moitemid = moitem.id
+                LEFT JOIN mo ON moitem.moid = mo.id
+                LEFT JOIN bom ON moitem.bomid = bom.id
+                WHERE wo.num IS NOT NULL AND wo.statusid IN (10, 30, 40) AND moitem.typeid = 50
+                  AND (mo.statusid NOT IN (60, 70, 80)
+                       OR COALESCE(wo.datefinished, moitem.datescheduled) >= DATE_SUB(CURDATE(), INTERVAL 180 DAY))
+            `);
+            const attrByWo = new Map();
+            attrRows.forEach(r => attrByWo.set(String(r.wo_id), r));
+            allWorkOrders.forEach(wo => {
+                const a = attrByWo.get(String(wo.wo_id)) || {};
+                wo._cf = {};
+                psCfDefs.forEach(d => { const v = a[d.key]; wo._cf[d.key] = (v != null ? String(v).trim() : ''); });
+            });
+            debugLog('success', `${psCfDefs.length} custom field(s) loaded`);
+        } catch (e) {
+            // UDF missing / discovery failed — disable CF dimensions cleanly.
+            psCfDefs = [];
+            allWorkOrders.forEach(wo => { wo._cf = wo._cf || {}; });
+            debugLog('warn', 'Custom-field load failed (feature disabled): ' + (e && e.message));
+        }
+
+        // v1.2: LG (location group) + Location (machine/resource) dimensions
+        // (filter dropdowns + Timeline grouping). LG = location group; Location =
+        // wo.locationId or the BOM's default location for the WO's LG
+        // (bomtolocation), resolved in woQuery.
         const siteMap = new Map(), resMap = new Map();
         allWorkOrders.forEach(wo => {
             const sid = (wo.location_group_id != null ? String(wo.location_group_id) : '0');
@@ -2446,21 +843,117 @@ async function _loadWorkOrdersImpl(background) {
             const rid = (wo.resource_id != null && String(wo.resource_id).length) ? String(wo.resource_id) : '0';
             wo._resourceId = rid;
             if (!resMap.has(rid)) resMap.set(rid, { id: rid, name: (wo.resource_name && String(wo.resource_name).trim()) || 'Unassigned location' });
-            // provisional enrichment defaults (Tier 2 overwrites):
-            wo._cf = wo._cf || {};
-            const uid = parseInt(wo.user_id, 10) || 0;
-            wo._assignedUsers = uid ? [{ id: uid, name: (wo.assigned_user || '').trim(), initials: (wo.user_initials || '').trim() }] : [];
-            wo._userIds = uid ? [String(uid)] : ['0'];
         });
         sites = Array.from(siteMap.values()).sort((a, b) => a.name.localeCompare(b.name));
         resources = Array.from(resMap.values()).sort((a, b) => a.id === '0' ? 1 : b.id === '0' ? -1 : a.name.localeCompare(b.name));
-        psBuildUserDimension();
+        // Per-CF distinct in-data values — the fallback option list for a list CF
+        // that has no customlistitem (the drawer prefers d.options when present).
+        psCfDefs.forEach(d => {
+            const vs = new Set();
+            allWorkOrders.forEach(wo => { const v = wo._cf && wo._cf[d.key]; if (v) vs.add(v); });
+            d.values = Array.from(vs).sort((a, b) => String(a).localeCompare(String(b)));
+        });
 
-        // Availability is stale until recomputed. The (heavy) engine runs in the
-        // BACKGROUND after Tier 2 (see psEnsureAvailability) so the first paint of
-        // the schedule never waits on it; the availability dots/badges/tabs fill in
-        // when it lands, or on demand if an availability tab is opened first.
-        psAvailReady = false;
+        // v1.2: demand-driver flag — mark WOs whose finished good has a min/max
+        // reorder point in the WO's location group (partreorder). Combined with the
+        // MO's SO link (psMoForWO → so_num) this drives the demand-driver tag
+        // (SO / Min/Max / Manual). Guarded — a failure just omits the Min/Max tag.
+        try {
+            const woIds = allWorkOrders.map(w => w.wo_id).filter(v => v != null);
+            if (woIds.length) {
+                const roRows = await runQueryAsync(`
+                    SELECT DISTINCT wo.id AS wo_id
+                    FROM wo
+                    INNER JOIN woitem woi ON woi.woid = wo.id AND woi.typeid = 10
+                    INNER JOIN partreorder pr ON pr.partid = woi.partid
+                       AND pr.locationgroupid = wo.locationgroupid AND pr.reorderpoint > 0
+                    WHERE wo.id IN (${woIds.join(',')})`);
+                const roSet = new Set(roRows.map(r => String(r.wo_id)));
+                allWorkOrders.forEach(wo => { wo._reorder = roSet.has(String(wo.wo_id)); });
+                debugLog('success', `Reorder-driven WOs: ${roSet.size}`);
+            }
+        } catch (e) { debugLog('warn', 'Reorder flag query failed (Min/Max tag disabled): ' + (e && e.message)); }
+
+        // v1.2: material-shortage flag. One batched query returns the
+        // wo_ids that have at least one raw-material line (woitem
+        // typeid=20) whose still-needed qty (target − used) exceeds
+        // pickable on-hand of that part in the MO's location group.
+        // Wrapped in try/catch so a slow/failed availability scan never
+        // blocks the schedule from loading — WOs just render without
+        // the shortage flag. The availability subquery reproduces the
+        // qty-on-hand calc inline (avoids the TEMPTABLE quantity views).
+        try {
+            const shortageQuery = `
+                SELECT DISTINCT woi.woid AS wo_id
+                FROM woitem woi
+                INNER JOIN wo ON wo.id = woi.woid
+                INNER JOIN part wp ON wp.id = woi.partid
+                INNER JOIN moitem mi ON wo.moitemid = mi.id
+                INNER JOIN mo ON mi.moid = mo.id
+                LEFT JOIN (
+                    SELECT t.partid AS partid, l.locationgroupid AS lgid,
+                           SUM(GREATEST(t.qty - COALESCE(t.qtycommitted, 0), 0)) AS avail
+                    FROM tag t
+                    INNER JOIN location l ON l.id = t.locationid
+                    WHERE t.typeid IN (30, 40)
+                      AND l.countedasavailable = 1
+                      AND l.pickable = 1
+                    GROUP BY t.partid, l.locationgroupid
+                ) av ON av.partid = woi.partid AND av.lgid = mo.locationgroupid
+                WHERE woi.typeid = 20
+                  AND wp.typeid = 10
+                  AND wo.statusid IN (10, 30)
+                  AND mo.statusid NOT IN (60, 70, 80)
+                  AND GREATEST(COALESCE(woi.qtytarget, 0) - COALESCE(woi.qtyused, 0), 0) > COALESCE(av.avail, 0)
+            `;
+            const shortRows = await runQueryAsync(shortageQuery);
+            const shortSet = new Set(shortRows.map(r => r.wo_id));
+            allWorkOrders.forEach(wo => { wo._materialShort = shortSet.has(wo.wo_id); });
+            debugLog('success', `Material shortage: ${shortSet.size} WO(s) flagged`);
+        } catch (e) {
+            debugLog('warn', 'Material shortage query failed (flag disabled): ' + (e && e.message));
+        }
+
+        // v1.2: per-WO pick status. Picks link to a WO through
+        // pickitem.woItemId → woitem.woId (same path Work_Order_WIP uses).
+        // We take the MIN pick status across the WO's picks as the
+        // representative "how far along picking is" (least-done wins):
+        //   10 Entered · 20 Started · 30 Committed · 40 Finished.
+        // Also carry the pick count + numbers so the detail drawer can
+        // deep-link into the Picking module.
+        try {
+            const pickQuery = `
+                SELECT woi.woid AS wo_id,
+                       MIN(p.statusid) AS pick_status,
+                       COUNT(DISTINCT p.id) AS pick_count,
+                       GROUP_CONCAT(DISTINCT p.num ORDER BY p.num SEPARATOR ',') AS pick_nums
+                FROM pickitem pi
+                INNER JOIN woitem woi ON woi.id = pi.woitemid
+                INNER JOIN pick p ON p.id = pi.pickid
+                INNER JOIN wo ON wo.id = woi.woid
+                INNER JOIN moitem mi ON wo.moitemid = mi.id
+                INNER JOIN mo ON mi.moid = mo.id
+                WHERE wo.statusid IN (10, 30, 40)
+                  AND mo.statusid NOT IN (60, 70, 80)
+                GROUP BY woi.woid
+            `;
+            const pickRows = await runQueryAsync(pickQuery);
+            const pickMap = new Map();
+            pickRows.forEach(r => pickMap.set(String(r.wo_id), r));
+            allWorkOrders.forEach(wo => {
+                const p = pickMap.get(String(wo.wo_id));
+                wo._pickStatus = p ? parseInt(p.pick_status, 10) : null;
+                wo._pickCount = p ? parseInt(p.pick_count, 10) : 0;
+                wo._pickNums = (p && p.pick_nums) ? String(p.pick_nums).split(',') : [];
+            });
+            debugLog('success', `Pick status: ${pickRows.length} WO(s) have picks`);
+        } catch (e) {
+            debugLog('warn', 'Pick status query failed (pick flags disabled): ' + (e && e.message));
+        }
+
+        // v1.2: component availability (raw materials + incoming POs + staged
+        // BOM tree) → per-WO buildable date. Self-guarded; disables on failure.
+        await psLoadAvailability();
 
         filteredWorkOrders = [...allWorkOrders];
 
@@ -2502,16 +995,23 @@ async function _loadWorkOrdersImpl(background) {
             currentCapacityWeek = moment().startOf('isoWeek');
         }
 
-        renderCurrentView();   // ← FIRST PAINT (schedule visible now)
+        renderCurrentView();
 
-        showToast(`✓ Loaded ${allWorkOrders.length} work orders from Fishbowl`, 'success');
-        setStatus(`${allWorkOrders.length} work orders · ${manufacturingOrders.length} MOs`);
+        // Show appropriate message based on data source
+        const statusTitle = document.getElementById('systemStatusTitle');
+        const statusText = document.getElementById('systemStatusText');
 
-        // ── TIER 2 (background): load the remaining enrichments in parallel and,
-        //    if the open tab needs it, availability. Fire-and-forget so first paint
-        //    is not blocked; the finally below clears the loading overlay now. `gen`
-        //    lets a newer re-load invalidate this one's late repaint.
-        _loadEnrichments(background, gen);
+        if (usingMockData) {
+            showToast(`⚠ Using MOCK DATA (${allWorkOrders.length} WOs) - Fishbowl not connected`, 'info', 5000);
+            setStatus(`Mock data — ${allWorkOrders.length} WOs`);
+            if (statusTitle) statusTitle.className = 'flex items-center gap-2 text-xs font-semibold mb-2 text-amber-400';
+            if (statusText) statusText.textContent = 'Mock Data Mode';
+        } else {
+            showToast(`✓ Loaded ${allWorkOrders.length} work orders from Fishbowl`, 'success');
+            setStatus(`${allWorkOrders.length} work orders · ${manufacturingOrders.length} MOs`);
+            if (statusTitle) statusTitle.className = 'flex items-center gap-2 text-xs font-semibold mb-2 text-emerald-400';
+            if (statusText) statusText.textContent = 'Fishbowl Connected';
+        }
     } catch (error) {
         debugLog('error', 'Failed to load work orders', error);
         setStatus('Load failed — ' + (error && error.message));
@@ -2520,278 +1020,6 @@ async function _loadWorkOrdersImpl(background) {
         document.getElementById('refreshBtn').style.opacity = '1';
         psHideLoading();
     }
-}
-
-// ============================================
-// TIERED LOAD — background enrichments + background availability
-// ----
-// Tier 1 (in _loadWorkOrdersImpl) paints the schedule from the 3 core queries.
-// Tier 2 (_loadEnrichments) loads the remaining per-WO enrichments IN PARALLEL
-// (they were serial before) and repaints, then kicks off Tier 3. Tier 3
-// (psEnsureAvailability) runs the heavy availability engine in the BACKGROUND
-// (render-when-ready) so the first paint never waits on it; it also runs on demand
-// if an availability tab is opened before the background run lands. Every render
-// path already guards these (psAvailReady, optional _pickStatus/_cf/_av), so
-// painting before they arrive is safe and just fills in a beat later.
-// ============================================
-
-// Build the User filter/group dimension from the union of every WO's assigned
-// users (id 0 = Unassigned). Called with provisional (primary-only) data at first
-// paint (Tier 1) and again once the woassignedusers query augments each WO (Tier 2).
-function psBuildUserDimension() {
-    const userMap = new Map();
-    allWorkOrders.forEach(wo => {
-        const src = (wo._assignedUsers && wo._assignedUsers.length) ? wo._assignedUsers : [{ id: 0, name: '', initials: '' }];
-        src.forEach(u => {
-            const uid = u.id || 0;
-            if (!userMap.has(uid)) {
-                const name = (u.name && u.name.trim()) ? u.name.trim() : (uid === 0 ? 'Unassigned' : ('User ' + uid));
-                const initials = (u.initials && u.initials.trim())
-                    ? u.initials.trim().toUpperCase()
-                    : name.split(/\s+/).map(s => s[0]).join('').slice(0, 2).toUpperCase();
-                userMap.set(uid, { id: uid, name, initials });
-            }
-        });
-    });
-    users = Array.from(userMap.values()).sort((a, b) => a.name.localeCompare(b.name));
-}
-
-// TIER 2 — background enrichments. Each is independent (only needs the WO-id list
-// from Tier 1) and self-guarded, so they run in PARALLEL (was serial), then a
-// repaint follows once all settle. Availability (Tier 3) is then kicked off in the
-// background so it renders when ready.
-async function _loadEnrichments(background, gen) {
-    const woIds = allWorkOrders.map(w => w.wo_id).filter(v => v != null);
-    await Promise.all([
-        _enrichAssignedUsers(woIds),
-        _enrichPriorities(),
-        _enrichCustomFields(),
-        _enrichReorder(woIds),
-        _enrichShortage(),
-        _enrichPickStatus()
-    ]);
-    if (gen != null && gen !== _psLoadGen) return;   // a newer load superseded us — skip the stale repaint
-    // Repaint so the newly-loaded pills/flags/dimensions appear.
-    try { applyActiveFilters(); updateKPIs(); renderTabs(); renderFilterbar(); renderActiveView(); } catch (_) {}
-    // Tier 3 — compute availability in the BACKGROUND now (render-when-ready) so the
-    // Timeline availability dots, Materials/Procurement badge counts and the
-    // availability tabs fill in without waiting for a tab to be opened. Guarded
-    // against the setView lazy trigger double-running it (_psAvailLoading); a newer
-    // load re-guards via gen.
-    if (gen == null || gen === _psLoadGen) psEnsureAvailability();
-}
-
-// woassignedusers — a WO can carry several assigned users (wo.userId is only the
-// PRIMARY). Union every assignment so By-User grouping/filter/load reflect all of
-// them. On failure the Tier-1 primary-only dimension stands.
-async function _enrichAssignedUsers(woIds) {
-    if (!woIds.length) return;
-    let auRows;
-    try {
-        auRows = await runQueryAsync(`
-            SELECT wau.woid AS wo_id, wau.userid AS user_id,
-                   TRIM(CONCAT(COALESCE(su.firstName, ''), ' ', COALESCE(su.lastName, ''))) AS user_name,
-                   COALESCE(su.initials, '') AS user_initials
-            FROM woassignedusers wau
-            LEFT JOIN sysuser su ON su.id = wau.userid
-            WHERE wau.woid IN (${woIds.join(',')})
-        `);
-    } catch (e) {
-        debugLog('warn', 'woassignedusers load failed — keeping primary assignee only: ' + (e && e.message));
-        return;
-    }
-    const assignedByWo = new Map();
-    auRows.forEach(r => {
-        if (!assignedByWo.has(r.wo_id)) assignedByWo.set(r.wo_id, []);
-        assignedByWo.get(r.wo_id).push({
-            id: (r.user_id != null ? parseInt(r.user_id, 10) : 0) || 0,
-            name: (r.user_name || '').trim(),
-            initials: (r.user_initials || '').trim()
-        });
-    });
-    debugLog('success', `WO assigned users: ${auRows.length} assignment(s) across ${assignedByWo.size} WO(s)`);
-    allWorkOrders.forEach(wo => {
-        let list = (assignedByWo.get(wo.wo_id) || []).slice();
-        if (!list.length && wo.user_id) {
-            list = [{ id: parseInt(wo.user_id, 10) || 0, name: (wo.assigned_user || '').trim(), initials: (wo.user_initials || '').trim() }];
-        }
-        const seen = new Set(), uniq = [];
-        list.forEach(u => { const k = String(u.id); if (!seen.has(k)) { seen.add(k); uniq.push(u); } });
-        wo._assignedUsers = uniq;
-        wo._userIds = uniq.length ? uniq.map(u => String(u.id)) : ['0'];
-    });
-    psBuildUserDimension();
-}
-
-// Priority dimension → filter-strip pills. Load the FULL priority table so every
-// priority is offered even when no loaded WO uses it; derive from WOs on failure.
-async function _enrichPriorities() {
-    try {
-        const priRows = await runQueryAsync('SELECT id, name FROM priority ORDER BY name');
-        priorities = priRows.map(r => ({ id: r.id, name: (r.name || '').trim() })).filter(p => p.name);
-        debugLog('success', `Loaded ${priorities.length} priorities from the priority table`);
-    } catch (e) {
-        debugLog('warn', 'Priority table load failed — deriving from WOs: ' + (e && e.message));
-        const priMap = new Map();
-        allWorkOrders.forEach(wo => {
-            const pid = wo.priority_id, pname = (wo.priority_name || '').trim();
-            if (pid != null && pname && !priMap.has(String(pid))) priMap.set(String(pid), { id: pid, name: pname });
-        });
-        priorities = Array.from(priMap.values()).sort((a, b) => String(a.name).localeCompare(String(b.name)));
-    }
-}
-
-// Active BOM/MO/WO/Part custom fields (Integrity Foods) — discover the CF set +
-// types, read each WO's values, then compute the per-CF distinct-value fallback
-// list. Guarded so an install without the CustomFieldByName UDF still loads.
-async function _enrichCustomFields() {
-    try {
-        await psLoadCfDefs();
-        const cfSel = psCfDefs.map(d => ', ' + d.expr + ' AS ' + d.key).join('');
-        const attrRows = await runQueryAsync(`
-            SELECT wo.id AS wo_id${cfSel}
-            FROM wo
-            LEFT JOIN moitem ON wo.moitemid = moitem.id
-            LEFT JOIN mo ON moitem.moid = mo.id
-            LEFT JOIN bom ON moitem.bomid = bom.id
-            WHERE wo.num IS NOT NULL AND wo.statusid IN (10, 30, 40) AND moitem.typeid = 50
-              AND mo.statusid < 60
-        `);
-        const attrByWo = new Map();
-        attrRows.forEach(r => attrByWo.set(String(r.wo_id), r));
-        allWorkOrders.forEach(wo => {
-            const a = attrByWo.get(String(wo.wo_id)) || {};
-            wo._cf = {};
-            psCfDefs.forEach(d => { const v = a[d.key]; wo._cf[d.key] = (v != null ? String(v).trim() : ''); });
-        });
-        psCfDefs.forEach(d => {
-            const vs = new Set();
-            allWorkOrders.forEach(wo => { const v = wo._cf && wo._cf[d.key]; if (v) vs.add(v); });
-            d.values = Array.from(vs).sort((a, b) => String(a).localeCompare(String(b)));
-        });
-        debugLog('success', `${psCfDefs.length} custom field(s) loaded`);
-    } catch (e) {
-        psCfDefs = [];
-        allWorkOrders.forEach(wo => { wo._cf = wo._cf || {}; });
-        debugLog('warn', 'Custom-field load failed (feature disabled): ' + (e && e.message));
-    }
-}
-
-// Demand-driver flag — WOs whose finished good has a min/max reorder point in the
-// WO's LG (partreorder) drive the Min/Max demand tag. Guarded.
-async function _enrichReorder(woIds) {
-    if (!woIds.length) return;
-    try {
-        const roRows = await runQueryAsync(`
-            SELECT DISTINCT wo.id AS wo_id
-            FROM wo
-            INNER JOIN woitem woi ON woi.woid = wo.id AND woi.typeid = 10
-            INNER JOIN partreorder pr ON pr.partid = woi.partid
-               AND pr.locationgroupid = wo.locationgroupid AND pr.reorderpoint > 0
-            WHERE wo.id IN (${woIds.join(',')})`);
-        const roSet = new Set(roRows.map(r => String(r.wo_id)));
-        allWorkOrders.forEach(wo => { wo._reorder = roSet.has(String(wo.wo_id)); });
-        debugLog('success', `Reorder-driven WOs: ${roSet.size}`);
-    } catch (e) { debugLog('warn', 'Reorder flag query failed (Min/Max tag disabled): ' + (e && e.message)); }
-}
-
-// Crude material-shortage flag (one batched query) — the coarse indicator the
-// Timeline dot / Dashboard shortages fall back to when availability isn't computed.
-// Reproduces qty-on-hand inline (avoids the TEMPTABLE quantity views).
-async function _enrichShortage() {
-    try {
-        const shortageQuery = `
-            SELECT DISTINCT woi.woid AS wo_id
-            FROM woitem woi
-            INNER JOIN wo ON wo.id = woi.woid
-            INNER JOIN part wp ON wp.id = woi.partid
-            INNER JOIN moitem mi ON wo.moitemid = mi.id
-            INNER JOIN mo ON mi.moid = mo.id
-            LEFT JOIN (
-                SELECT t.partid AS partid, l.locationgroupid AS lgid,
-                       SUM(GREATEST(t.qty - COALESCE(t.qtycommitted, 0), 0)) AS avail
-                FROM tag t
-                INNER JOIN location l ON l.id = t.locationid
-                WHERE t.typeid IN (30, 40)
-                  AND l.countedasavailable = 1
-                  AND l.pickable = 1
-                GROUP BY t.partid, l.locationgroupid
-            ) av ON av.partid = woi.partid AND av.lgid = mo.locationgroupid
-            WHERE woi.typeid = 20
-              AND wp.typeid = 10
-              AND wo.statusid IN (10, 30)
-              AND mo.statusid < 60
-              AND GREATEST(COALESCE(woi.qtytarget, 0) - COALESCE(woi.qtyused, 0), 0) * COALESCE(
-                    (SELECT uc.multiply / uc.factor FROM uomconversion uc WHERE uc.fromuomid = woi.uomid AND uc.touomid = wp.uomid LIMIT 1),
-                    (SELECT uc.factor / uc.multiply FROM uomconversion uc WHERE uc.fromuomid = wp.uomid AND uc.touomid = woi.uomid LIMIT 1),
-                    1
-                  ) > COALESCE(av.avail, 0)
-        `;
-        const shortRows = await runQueryAsync(shortageQuery);
-        const shortSet = new Set(shortRows.map(r => r.wo_id));
-        allWorkOrders.forEach(wo => { wo._materialShort = shortSet.has(wo.wo_id); });
-        debugLog('success', `Material shortage: ${shortSet.size} WO(s) flagged`);
-    } catch (e) {
-        debugLog('warn', 'Material shortage query failed (flag disabled): ' + (e && e.message));
-    }
-}
-
-// Per-WO pick status — MIN pick status across the WO's picks (least-done wins) +
-// pick count / numbers for the drawer deep-links. Guarded.
-async function _enrichPickStatus() {
-    try {
-        const pickQuery = `
-            SELECT woi.woid AS wo_id,
-                   MIN(p.statusid) AS pick_status,
-                   COUNT(DISTINCT p.id) AS pick_count,
-                   GROUP_CONCAT(DISTINCT p.num ORDER BY p.num SEPARATOR ',') AS pick_nums
-            FROM pickitem pi
-            INNER JOIN woitem woi ON woi.id = pi.woitemid
-            INNER JOIN pick p ON p.id = pi.pickid
-            INNER JOIN wo ON wo.id = woi.woid
-            INNER JOIN moitem mi ON wo.moitemid = mi.id
-            INNER JOIN mo ON mi.moid = mo.id
-            WHERE wo.statusid IN (10, 30, 40)
-              AND mo.statusid < 60
-            GROUP BY woi.woid
-        `;
-        const pickRows = await runQueryAsync(pickQuery);
-        const pickMap = new Map();
-        pickRows.forEach(r => pickMap.set(String(r.wo_id), r));
-        allWorkOrders.forEach(wo => {
-            const p = pickMap.get(String(wo.wo_id));
-            wo._pickStatus = p ? parseInt(p.pick_status, 10) : null;
-            wo._pickCount = p ? parseInt(p.pick_count, 10) : 0;
-            wo._pickNums = (p && p.pick_nums) ? String(p.pick_nums).split(',') : [];
-        });
-        debugLog('success', `Pick status: ${pickRows.length} WO(s) have picks`);
-    } catch (e) {
-        debugLog('warn', 'Pick status query failed (pick flags disabled): ' + (e && e.message));
-    }
-}
-
-// TIER 3 — availability. The heavy engine (raw materials + incoming POs + staged
-// BOM tree → per-WO buildable date) runs in the BACKGROUND after Tier 2 (kicked by
-// _loadEnrichments) and ALSO on demand if an availability tab is opened first
-// (setView) — whichever fires first wins; a repaint then fills in the dots/ETA/tabs.
-// Guarded against concurrent + repeat runs; cheap no-op once psAvailReady.
-const PS_AVAIL_TABS = { materials: 1, procure: 1, planning: 1, aiplanner: 1 };
-function psTabNeedsAvailability(v) { return !!PS_AVAIL_TABS[v]; }
-let _psAvailLoading = false;
-async function psEnsureAvailability() {
-    if (psAvailReady || _psAvailLoading) return;
-    _psAvailLoading = true;
-    // Show the "Computing…" state now ONLY on an availability tab (its body is
-    // otherwise empty). When this runs in the BACKGROUND on another tab (e.g. the
-    // Timeline), stay silent so we don't disturb the current view mid-interaction.
-    if (psTabNeedsAvailability(psView)) { try { renderActiveView(); } catch (_) {} }
-    try { await psLoadAvailability(); }         // sets psAvailReady=true on success
-    catch (_) {}
-    _psAvailLoading = false;
-    // Preserve the Timeline's horizontal scroll across the repaint (a Gantt
-    // re-render otherwise snaps back to today).
-    try { const _sc = document.getElementById('ganttScroll'); if (_sc) psKeepScroll = _sc.scrollLeft; } catch (_) {}
-    try { applyActiveFilters(); renderTabs(); renderActiveView(); } catch (_) {}
 }
 
 // ============================================
@@ -3504,14 +1732,12 @@ let psOpenDropdown = null;        // filter strip: which multi-select dropdown i
 let psDayW = 44;                  // current Gantt day-column width (set by renderGanttChart)
 let psKeepScroll = null;          // when set, the next Gantt render keeps this scrollLeft (drag/resize)
 let psFocusWO = null;             // when set, the next Gantt render scrolls to + highlights this wo_id (drawer "Timeline" button)
-let psFocusDate = null;           // when set (YYYY-MM-DD), the next Gantt render scrolls to that date (Calendar tab per-day button)
 let psShowFulfilled = false;      // Work Orders view only: include Fulfilled (status 40) WOs
 let psGroupKeys = [];             // group keys of the last Timeline render (for collapse-all)
 let psAvailReady = false;         // true once component-availability has been computed
 let psAvailExpanded = false;      // detail drawer: raw-goods list expanded?
 let psMakePartIds = new Set();    // partIds that are a BOM finished good (manufacturable) — Procurement tab make/buy split
 let psPartVendor = new Map();     // partId → { id, name } — default vendor (To Purchase grouping)
-let psPendingPo = new Map();      // "pid|lg" → [{ponum,statusId,statusName,outstanding,eta}] — Bid Request / Pending Approval POs (NOT confirmed supply; shown as "On order" in the Procurement worklist)
 let psMakeBom = new Map();        // partId → { bomId, bomNum } — default/first active BOM (To Manufacture → MO)
 let psProcureSel = new Set();     // partIds ticked in the To Manufacture list (Create MO selection)
 let psProcTab = 'buy';            // Procurement: active tab ('buy' | 'make')
@@ -3532,11 +1758,6 @@ let currentUserGroupIds = new Set(); // group ids the logged-in user belongs to 
 
 // Scroll the Timeline horizontally to a pixel offset within the track.
 function psTimelineScrollTo(px){ const sc=document.getElementById('ganttScroll'); if(sc) sc.scrollLeft=Math.max(0, px-160); }
-
-// Calendar tab per-day button — jump to the Timeline scrolled to a given date.
-// renderGanttChart honours psFocusDate (deterministic scroll, re-asserted across
-// rAFs so the default scroll-to-today doesn't override it).
-function psTimelineToDate(dateStr){ psFocusDate = dateStr; psKeepScroll = null; setView('timeline'); }
 
 // Drawer "Timeline" button — jump to the Timeline and scroll to THIS WO's bar.
 // Expands the WO's group under the active grouping (so its row renders even if the
@@ -3573,7 +1794,6 @@ const PS_VIEWS = [
     { id: 'planning',  name: 'Planning',  container: 'planningView' },
     { id: 'materials', name: 'Materials', container: 'materialsView' },
     { id: 'procure',   name: 'Procurement', container: 'procureView' },
-    { id: 'aiplanner', name: 'AI Planner', container: 'aiPlannerView' },
     { id: 'roster',    name: 'Rostering', container: 'rosterView', adminOnly: true }
 ];
 // ── PER-CUSTOMER FEATURE GATING (licensing) ────────────────────────────────
@@ -3583,140 +1803,13 @@ const PS_VIEWS = [
 // of those consult. 'roster' additionally requires FBLib.Settings.isAdmin().
 // This is honour-system config for a client-side report, NOT a security
 // boundary (the source is visible to a customer admin).
-const PS_TABS_ENABLED = { materials: true, procure: true, planning: true, roster: true, aiplanner: true };
+const PS_TABS_ENABLED = { materials: true, procure: true, planning: true, roster: true };
 function psTabEnabled(id) {
     const v = PS_VIEWS.find(x => x.id === id);
     if (!v) return false;
     if (Object.prototype.hasOwnProperty.call(PS_TABS_ENABLED, id) && !PS_TABS_ENABLED[id]) return false;
     if (v.adminOnly && !(window.FBLib && FBLib.Settings && FBLib.Settings.isAdmin())) return false;
-    // AI Planner is a premium tab that an admin turns on org-wide (master flag).
-    // Honour-system visibility gate; the real gate on the Claude call is key presence.
-    if (id === 'aiplanner' && !(window.FBLib && FBLib.Settings && FBLib.Settings.resolve('enableAiPlanner'))) return false;
     return true;
-}
-// ── PER-USER TAB VISIBILITY + ORDER (Settings ▸ Display) ───────────────────
-// A user preference layered ON TOP of the psTabEnabled licensing/admin gate:
-// the user can hide tabs + reorder the strip, but only among tabs the core
-// PS_TABS_ENABLED / psTabEnabled logic already allows (a disabled/premium-off
-// tab never appears in the selector or the strip). Persisted per user via
-// FBLib.Settings (tabOrder + tabHidden). Mirrors the CF-drawer drag-reorder and
-// the PurchaseOrderSummary column selector.
-let psTabOrder = PS_VIEWS.map(function (v) { return v.id; });   // display order (persisted)
-let psTabHidden = new Set();                                     // user-hidden tab ids (persisted)
-let _tabDragId = null;                                           // id being drag-reordered
-// The tabs eligible to appear anywhere (hard licensing/admin gate).
-function psAllowedViews() { return PS_VIEWS.filter(function (v) { return psTabEnabled(v.id); }); }
-// The user's order restricted to allowed ids, with any newly-allowed tab (not yet
-// in the saved order) appended so a new tab still shows. Mirrors psCfEffectiveOrder.
-function psEffectiveTabOrder() {
-    const allowed = psAllowedViews().map(function (v) { return v.id; });
-    const seen = new Set(), ordered = [];
-    (psTabOrder || []).forEach(function (id) { if (allowed.indexOf(id) >= 0 && !seen.has(id)) { seen.add(id); ordered.push(id); } });
-    allowed.forEach(function (id) { if (!seen.has(id)) ordered.push(id); });
-    return ordered;
-}
-// Allowed AND not hidden by the user.
-function psTabVisible(id) { return psTabEnabled(id) && !psTabHidden.has(id); }
-// The ordered list of tab ids the strip should render. Never empty — if the user
-// somehow hid everything, fall back to all allowed (the strip is always usable).
-function psOrderedVisibleViews() {
-    const vis = psEffectiveTabOrder().filter(function (id) { return !psTabHidden.has(id); });
-    return vis.length ? vis : psEffectiveTabOrder();
-}
-function psSaveTabPrefs() {
-    try {
-        FBLib.Settings.setUserKey('tabOrder', psEffectiveTabOrder());
-        FBLib.Settings.setUserKey('tabHidden', Array.from(psTabHidden));
-        FBLib.Settings.saveUser();
-    } catch (_) {}
-}
-// Settings-drawer control: trigger button + inline panel of reorderable rows.
-function psTabSelSummary() {
-    const order = psEffectiveTabOrder();
-    const shown = order.filter(function (id) { return !psTabHidden.has(id); }).length;
-    return shown + ' of ' + order.length + ' tab' + (order.length === 1 ? '' : 's') + ' shown';
-}
-function psTabSelToggle(e) {
-    if (e) e.stopPropagation();
-    const wrap = document.getElementById('tabSelWrap'), p = document.getElementById('tabSelPanel');
-    if (!p) return;
-    const willOpen = p.classList.contains('hidden');
-    if (willOpen) psRenderTabSelector();
-    p.classList.toggle('hidden', !willOpen);
-    if (wrap) wrap.classList.toggle('open', willOpen);
-}
-function psTabSelClose() {
-    const wrap = document.getElementById('tabSelWrap'), p = document.getElementById('tabSelPanel');
-    if (p) p.classList.add('hidden');
-    if (wrap) wrap.classList.remove('open');
-}
-function psRenderTabSelector() {
-    const list = document.getElementById('tabSelList');
-    const lbl = document.getElementById('tabSelLabel');
-    if (lbl) lbl.textContent = psTabSelSummary();
-    if (!list) return;
-    const byId = {}; PS_VIEWS.forEach(function (v) { byId[v.id] = v; });
-    const order = psEffectiveTabOrder();
-    const visCount = order.filter(function (id) { return !psTabHidden.has(id); }).length;
-    list.innerHTML = order.map(function (id) {
-        const v = byId[id]; if (!v) return '';
-        const on = !psTabHidden.has(id);
-        // Keep at least one tab visible: the last remaining checkbox is locked on.
-        const lockOff = on && visCount <= 1;
-        return '<div class="tabsel-row" draggable="true" data-id="' + id + '" ' +
-            'ondragstart="psTabDragStart(event,this)" ondragend="psTabDragEnd(event,this)" ' +
-            'ondragover="psTabDragOver(event,this)" ondragleave="psTabDragLeave(event,this)" ondrop="psTabDrop(event,this)" ' +
-            'title="Drag to reorder">' +
-            '<span class="tab-grip">' + PS_CF_GRIP_SVG + '</span>' +
-            '<input type="checkbox"' + (on ? ' checked' : '') + (lockOff ? ' disabled title="At least one tab must stay visible"' : '') +
-                ' onclick="event.stopPropagation();psTabToggleVisible(\'' + id + '\')">' +
-            '<span class="tabsel-name">' + psEsc(v.name) + '</span></div>';
-    }).join('');
-}
-function psTabToggleVisible(id) {
-    if (psTabHidden.has(id)) {
-        psTabHidden.delete(id);
-    } else {
-        const visCount = psEffectiveTabOrder().filter(function (x) { return !psTabHidden.has(x); }).length;
-        if (visCount <= 1) { showToast('At least one tab must stay visible', 'info', 2500); return; }
-        psTabHidden.add(id);
-    }
-    psSaveTabPrefs();
-    psRenderTabSelector();
-    // If the active view was just hidden, hop to the first still-visible tab.
-    if (!psTabVisible(psView)) { const vis = psOrderedVisibleViews(); if (vis.length) { setView(vis[0]); return; } }
-    renderTabs();
-}
-function psTabDragStart(e, row) {
-    _tabDragId = row.getAttribute('data-id'); row.classList.add('dragging');
-    try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', _tabDragId); } catch (_) {}
-}
-function psTabDragEnd() {
-    _tabDragId = null;
-    const l = document.getElementById('tabSelList');
-    if (l) l.querySelectorAll('.tabsel-row').forEach(function (r) { r.classList.remove('dragging', 'drag-over'); });
-}
-function psTabDragOver(e, row) {
-    if (!_tabDragId || row.getAttribute('data-id') === _tabDragId) return;
-    e.preventDefault(); try { e.dataTransfer.dropEffect = 'move'; } catch (_) {}
-    row.classList.add('drag-over');
-}
-function psTabDragLeave(e, row) { row.classList.remove('drag-over'); }
-function psTabDrop(e, row) {
-    e.preventDefault(); row.classList.remove('drag-over');
-    const targetId = row.getAttribute('data-id');
-    if (!_tabDragId || _tabDragId === targetId) return;
-    const order = psEffectiveTabOrder().filter(function (id) { return id !== _tabDragId; });
-    const rect = row.getBoundingClientRect();
-    const after = (e.clientY - rect.top) > rect.height / 2;
-    let idx = order.indexOf(targetId);
-    if (idx < 0) idx = order.length; else if (after) idx += 1;
-    order.splice(idx, 0, _tabDragId);
-    psTabOrder = order;
-    _tabDragId = null;
-    psSaveTabPrefs();
-    psRenderTabSelector();
-    renderTabs();
 }
 const PS_VIEWICON = {
     dashboard:'<path stroke-linecap="round" stroke-linejoin="round" d="M4 13h6V4H4zM14 21h6v-9h-6zM14 8h6V4h-6zM4 21h6v-4H4z"/>',
@@ -3728,7 +1821,6 @@ const PS_VIEWICON = {
     materials:'<path stroke-linecap="round" stroke-linejoin="round" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/>',
     procure:'<path stroke-linecap="round" stroke-linejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/>',
     planning:'<path stroke-linecap="round" stroke-linejoin="round" d="M4 6h10M4 12h7M4 18h5"/><path stroke-linecap="round" stroke-linejoin="round" d="M16 8v10m0 0l3-3m-3 3l-3-3"/>',
-    aiplanner:'<path stroke-linecap="round" stroke-linejoin="round" d="M9 4l1.3 3.4L13.7 8.7 10.3 10 9 13.4 7.7 10 4.3 8.7 7.7 7.4z"/><path stroke-linecap="round" stroke-linejoin="round" d="M17 13l.8 2.1 2.1.8-2.1.8-.8 2.1-.8-2.1-2.1-.8 2.1-.8z"/>',
     roster:'<path stroke-linecap="round" stroke-linejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/>'
 };
 // WO status → canonical tone. Entered = not started (neutral), Started =
@@ -3983,14 +2075,10 @@ function renderTabs(){
                 materials:filteredWorkOrders.filter(w=>w._av && (w._av._unmet||w._av._contended)).length,
                 procure:(_pd.buy.length+_pd.make.length),
                 load:(psLoadDim==='user'?users.length:(capacitySettings.categories||[]).length)};
-    // Render only the tabs the user has kept visible, in the user's order — both
-    // scoped to psTabEnabled (a disabled tab can never appear). See psOrderedVisibleViews.
-    const byId = {}; PS_VIEWS.forEach(v => { byId[v.id] = v; });
-    el.innerHTML=psOrderedVisibleViews().map(id=>{
-        const v = byId[id]; if (!v) return '';
-        const c = (id==='dashboard'||id==='planning'||id==='roster'||id==='aiplanner') ? '' : '<span class="cnt">'+(cnts[id]||0)+'</span>';
-        return '<button class="tab'+(psView===id?' active':'')+'" onclick="setView(\''+id+'\')">'+
-            '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">'+PS_VIEWICON[id]+'</svg>'+v.name+c+'</button>';
+    el.innerHTML=PS_VIEWS.filter(v=>psTabEnabled(v.id)).map(v=>{
+        const c = (v.id==='dashboard'||v.id==='planning'||v.id==='roster') ? '' : '<span class="cnt">'+(cnts[v.id]||0)+'</span>';
+        return '<button class="tab'+(psView===v.id?' active':'')+'" onclick="setView(\''+v.id+'\')">'+
+            '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">'+PS_VIEWICON[v.id]+'</svg>'+v.name+c+'</button>';
     }).join('');
 }
 function renderFilterbar(){
@@ -4080,11 +2168,6 @@ function renderFilterbar(){
             '<button class="'+(psTableGroup==='site'?'active':'')+'" onclick="psSetTableGroup(\'site\')">By LG</button>'+
             '<button class="'+(psTableGroup==='resource'?'active':'')+'" onclick="psSetTableGroup(\'resource\')">By Location</button>'+
             '<button class="'+(psTableGroup==='user'?'active':'')+'" onclick="psSetTableGroup(\'user\')">By User</button></div>';
-    } else if(psView==='planning'){
-        // Planning: hide/show WOs whose material is Not Available.
-        right+='<span class="filter-sep"></span><button class="fchip'+(psPlanHideUnavail?' on':'')+'" onclick="psPlanToggleUnavail()" title="Hide work orders whose material is Not Available">'+
-            '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>'+
-            (psPlanHideUnavail?'Show unavailable':'Hide unavailable')+'</button>';
     }
     el.innerHTML = chips + clear + '<span class="spring"></span>' + right;
     psSyncDropdowns();
@@ -4093,12 +2176,9 @@ function psToggleStatus(id){ if(psStatusFilter.has(id)) psStatusFilter.delete(id
 function psToggleCat(id){ id=String(id); if(psCatFilter.has(id)) psCatFilter.delete(id); else psCatFilter.add(id); renderCurrentView(); }
 function psTogglePriority(id){ id=String(id); if(psPriorityFilter.has(id)) psPriorityFilter.delete(id); else psPriorityFilter.add(id); renderCurrentView(); }
 function psToggleFlag(k){ if(psFlagFilter.has(k)) psFlagFilter.delete(k); else psFlagFilter.add(k); renderCurrentView(); }
-function psClearFilters(){ psStatusFilter.clear(); psCatFilter.clear(); psUserFilter.clear(); psPriorityFilter.clear(); psSiteFilter.clear(); psResourceFilter.clear(); psCfFilter={}; psFlagFilter.clear(); psSearch=''; psOpenDropdown=null; const si=document.getElementById('searchInput'); if(si) si.value=''; psSyncSearchClear();
+function psClearFilters(){ psStatusFilter.clear(); psCatFilter.clear(); psUserFilter.clear(); psPriorityFilter.clear(); psSiteFilter.clear(); psResourceFilter.clear(); psCfFilter={}; psFlagFilter.clear(); psSearch=''; psOpenDropdown=null; const si=document.getElementById('searchInput'); if(si) si.value='';
     if(psDateRange){ psDateRange.key='all'; psComputeRange(); try{ FBLib.Settings.setUserKey('dashRangeKey','all'); FBLib.Settings.saveUser(); }catch(_){} }
     renderCurrentView(); }
-// Top-right search box "X" — show it only when there's text, and clear on click.
-function psSyncSearchClear(){ const btn=document.getElementById('searchClear'); const si=document.getElementById('searchInput'); if(btn) btn.style.display=(si && si.value)?'inline-flex':'none'; }
-function psClearSearch(){ const si=document.getElementById('searchInput'); if(si){ si.value=''; si.focus(); } psSearch=''; psSyncSearchClear(); applyActiveFilters(); updateKPIs(); renderCurrentView(); }
 function psSetGroup(g){ psTimelineGroup=g; viewMode=g; try{ FBLib.Settings.setUserKey('timelineGroupBy',g); FBLib.Settings.saveUser(); }catch(_){} renderCurrentView(); }
 function psSetLoadDim(d){ psLoadDim=d; try{ FBLib.Settings.setUserKey('loadDim',d); FBLib.Settings.saveUser(); }catch(_){} renderCurrentView(); }
 function psSetDashLoad(d){ psDashLoadDim=d; renderDashboard(); }
@@ -4360,10 +2440,7 @@ function psClearDrop(which){
 function psToggleDashPanel(key){ psDashCollapsed[key]=!psDashCollapsed[key]; renderDashboard(); }
 
 function setView(v){
-    // Disabled/premium-off tab → fall back to the first visible tab (not a
-    // hardcoded dashboard, which the user may have hidden). A hidden-but-enabled
-    // tab is still reachable via cross-link buttons (e.g. "Procurement →").
-    if(!psTabEnabled(v)){ const _vis = psOrderedVisibleViews(); v = _vis.length ? _vis[0] : 'dashboard'; }
+    if(!psTabEnabled(v)) v = 'dashboard';   // premium/admin tab disabled or non-admin → fall back
     psView = v;
     psKeepScroll = null;   // drop any stale drag-scroll so a manual switch centres normally
     if(v==='timeline') viewMode = psTimelineGroup;
@@ -4379,8 +2456,8 @@ function setView(v){
     // / Materials are single-table fills. Procurement stacks multiple vendor
     // cards/tables, so it keeps the normal padded content flow (its tab bar,
     // vendor names and Create-PO buttons stay inset, not jammed to the edge).
-    const FLUSH = { timeline:1, table:1, materials:1, planning:1, aiplanner:1 };
-    const FILL  = { timeline:1, table:1, materials:1, planning:1, aiplanner:1 };
+    const FLUSH = { timeline:1, table:1, materials:1, planning:1 };
+    const FILL  = { timeline:1, table:1, materials:1, planning:1 };
     const flush = !!FLUSH[v], fill = !!FILL[v];
     const vcEl = document.getElementById('viewContent');
     if(vcEl){
@@ -4410,11 +2487,6 @@ function setView(v){
     renderFilterbar();
     renderActiveView();
     const vc=document.getElementById('viewContent'); if(vc) vc.scrollTop=0;
-    // On-demand availability fallback: the engine normally runs in the background
-    // after Tier 2, but if an availability-dependent tab (Materials/Procurement/
-    // Planning/AI) is opened before that lands, compute now. No-op once ready or
-    // already loading.
-    if(psTabNeedsAvailability(v) && !psAvailReady) psEnsureAvailability();
 }
 
 // Render just the active view's body (assumes visibility already set).
@@ -4427,7 +2499,6 @@ function renderActiveView(){
     else if(psView==='materials') renderMaterials();
     else if(psView==='procure') renderProcure();
     else if(psView==='planning') renderPlanning();
-    else if(psView==='aiplanner') renderAiPlanner();
     else if(psView==='roster') renderRoster();
     else if(psView==='load'){
         // v1.2: the Load page is the vA-style heatmap for BOTH dimensions.
@@ -4833,24 +2904,22 @@ function renderTable(){
             else if(ai.state==='overdue')   readyCell=psSpill('critical','Overdue');
             else                            readyCell=psSpill('active', psFmtDate(w._av._buildable));
         }
-        const custN = psCustomer(w) || '';
-        const partTitle = (w.part_num || '') + (w.description ? ' — ' + w.description : '');
         return '<tr onclick="openDetail('+w.wo_id+')">'+
             '<td><span class="wo">'+psEsc(w.wo_num)+'</span></td>'+
             '<td class="mono" style="font-size:12px">'+psEsc(w.mo_num)+'</td>'+
-            '<td title="'+psEsc(partTitle)+'"><div style="font-weight:600">'+psEsc(w.part_num||'—')+'</div><div style="font-size:11.5px;color:var(--c-secondary)">'+psEsc(w.description||'')+'</div></td>'+
-            '<td title="'+psEsc(custN)+'">'+psEsc(custN||'—')+'</td>'+
-            '<td class="wt-pills">'+psTagHTML(w)+'</td>'+
-            '<td title="'+psEsc(w.site_name||'')+'">'+psEsc(w.site_name||'—')+'</td>'+
-            '<td title="'+psEsc(w.resource_name||'')+'">'+psEsc(w.resource_name||'—')+'</td>'+
-            '<td title="'+psEsc(psUserName(w))+'">'+psEsc(psUserName(w))+'</td>'+
-            '<td class="wt-pills">'+psPillHTML(w.wo_status)+'</td>'+
+            '<td><div style="font-weight:600">'+psEsc(w.part_num||'—')+'</div><div style="font-size:11.5px;color:var(--c-secondary)">'+psEsc(w.description||'')+'</div></td>'+
+            '<td>'+psEsc(psCustomer(w)||'—')+'</td>'+
+            '<td>'+psTagHTML(w)+'</td>'+
+            '<td>'+psEsc(w.site_name||'—')+'</td>'+
+            '<td>'+psEsc(w.resource_name||'—')+'</td>'+
+            '<td>'+psEsc(psUserName(w))+'</td>'+
+            '<td>'+psPillHTML(w.wo_status)+'</td>'+
             '<td>'+psFmtDate(w.date_scheduled_start)+' → '+psFmtDate(w.date_scheduled)+'</td>'+
             '<td style="'+(late?'color:var(--fb-negative);font-weight:700':'')+'">'+psFmtDate(psDue(w))+'</td>'+
-            '<td class="wt-pills">'+readyCell+'</td>'+
+            '<td>'+readyCell+'</td>'+
             '<td class="num">'+psEsc(w.qty_target!=null?w.qty_target:'')+'</td>'+
-            '<td class="wt-pills">'+psPickPill(w,true)+'</td>'+
-            '<td class="wt-pills"><span class="rowflags">'+(psFlagsHTML(w,blocked)||'<span style="color:var(--acc-teal-con)">—</span>')+'</span></td>'+
+            '<td>'+psPickPill(w,true)+'</td>'+
+            '<td><span class="rowflags">'+(psFlagsHTML(w,blocked)||'<span style="color:var(--acc-teal-con)">—</span>')+'</span></td>'+
         '</tr>';
     };
     let bodyHtml;
@@ -4889,7 +2958,7 @@ function renderTable(){
             return headRow + (collapsed ? '' : gr.items.map(rowHtml).join(''));
         }).join('');
     }
-    host.innerHTML='<div class="tbl-wrap tbl-fill wt-table"><table style="table-layout:fixed">'+colgroup+'<thead><tr>'+head+'</tr></thead><tbody>'+bodyHtml+'</tbody></table></div>';
+    host.innerHTML='<div class="tbl-wrap tbl-fill"><table style="table-layout:fixed">'+colgroup+'<thead><tr>'+head+'</tr></thead><tbody>'+bodyHtml+'</tbody></table></div>';
 }
 function psSortTable(k){ if(psTableSort.key===k) psTableSort.dir=psTableSort.dir==='asc'?'desc':'asc'; else {psTableSort.key=k;psTableSort.dir='asc';} renderTable(); }
 function psSetTableGroup(g){ psTableGroup=g; try{ FBLib.Settings.setUserKey('tableGroupBy',g); FBLib.Settings.saveUser(); }catch(_){} renderCurrentView(); }
@@ -4966,18 +3035,6 @@ function psProcureData(){
         });
     }
     const all = Array.from(agg.values());
-    // Attach any Bid Request / Pending Approval POs covering each part in the
-    // shortage's LG(s) — surfaced as an "On order" indicator so a raised-but-not-
-    // issued bid is visible (it isn't counted as supply, so the row still shows Short).
-    all.forEach(e => {
-        const lgs = (e.lgIds && e.lgIds.size) ? Array.from(e.lgIds) : (e.lgId ? [e.lgId] : []);
-        const seen = new Set(), pend = [];
-        lgs.forEach(lg => (psPendingPo.get(String(e.partId) + '|' + String(lg)) || []).forEach(po => {
-            if (seen.has(po.ponum)) return; seen.add(po.ponum); pend.push(po);
-        }));
-        e.pendingPos = pend;
-        e.pendingQty = pend.reduce((s, p) => s + (p.outstanding || 0), 0);
-    });
     const isMake = r => psMakePartIds && psMakePartIds.has(String(r.partId));
     // Sort most-urgent first (earliest need date), then part number.
     const bySort = (a,b)=>{ const av=a.earliest?a.earliest.valueOf():Infinity, bv=b.earliest?b.earliest.valueOf():Infinity; return (av-bv) || String(a.partNum).localeCompare(String(b.partNum)); };
@@ -4995,7 +3052,7 @@ function psMatSortBy(k){ if(psMatSort.key===k) psMatSort.dir=(psMatSort.dir==='a
 function renderMaterials(){
     const host=document.getElementById('materialsView'); if(!host) return;
     if(!psAvailReady){
-        host.innerHTML='<div class="ps-empty">'+(_psAvailLoading?'Computing component availability…':'Component availability hasn’t been computed, so at-risk work orders can’t be listed. Refresh, or enable the debug console for details.')+'</div>';
+        host.innerHTML='<div class="ps-empty">Component availability hasn’t been computed, so at-risk work orders can’t be listed. Refresh, or enable the debug console for details.</div>';
         return;
     }
     const list=filteredWorkOrders.filter(w=> w._av && (w._av._unmet || w._av._contended || w._av._overdue));
@@ -5056,7 +3113,7 @@ function renderMaterials(){
         '<div class="proc-subhead" style="padding-top:14px">'+
           '<span class="proc-subtitle" style="margin:0">'+unmetN+' work order'+(unmetN===1?'':'s')+' short of raw goods'+(overdueN?(' · '+overdueN+' waiting on overdue supply'):'')+(contN?(' · '+contN+' with contested stock'):'')+' — click a row for detail, or use Procurement to raise POs/MOs.</span>'+
           '<span style="flex:1"></span>'+
-          (psTabVisible('procure') ? '<button class="ps-btn sm" onclick="setView(\'procure\')" title="Go to the Procurement worklist">Procurement →</button>' : '')+
+          '<button class="ps-btn sm" onclick="setView(\'procure\')" title="Go to the Procurement worklist">Procurement →</button>'+
         '</div>'+
         '<div class="tbl-wrap tbl-fill"><table><thead><tr>'+matHead+'</tr></thead><tbody>'+rows+'</tbody></table></div>'+
       '</div>';
@@ -5065,7 +3122,7 @@ function renderMaterials(){
 function renderProcure(){
     const host=document.getElementById('procureView'); if(!host) return;
     if(!psAvailReady){
-        host.innerHTML='<div class="ps-empty">'+(_psAvailLoading?'Computing component availability…':'Component availability hasn’t been computed, so shortages can’t be listed. Refresh, or enable the debug console for details.')+'</div>';
+        host.innerHTML='<div class="ps-empty">Component availability hasn’t been computed, so shortages can’t be listed. Refresh, or enable the debug console for details.</div>';
         return;
     }
     const { buy, make } = psProcureData();
@@ -5083,19 +3140,6 @@ function renderProcure(){
     const shortCell = r => '<td class="num" style="color:var(--fb-negative);font-weight:700">'+psEsc(psFmtQty(r.short))+(r.uom?' '+psEsc(r.uom):'')+'</td>';
     const ohCell    = r => '<td class="num">'+(r.onhand!=null?psEsc(psFmtQty(r.onhand)):'—')+'</td>';
     const needCell  = r => '<td>'+(r.earliest?psFmtDate(r.earliest):'—')+'</td>';
-    // "On order" — Bid Request / Pending Approval POs covering this part (not yet
-    // confirmed supply). Each links to the PO; an amber chip = Bid Request.
-    const pendingCell = r => {
-        const pend = r.pendingPos || [];
-        if (!pend.length) return '<td><span style="color:var(--c-tertiary)">—</span></td>';
-        const links = pend.map(p => {
-            const numJs = String(p.ponum).replace(/'/g, "\\'");
-            const tone = p.statusId === 10 ? 'caution' : 'active';
-            const lbl = 'PO ' + p.ponum + ' · ' + p.statusName + (p.outstanding ? (' ×' + psFmtQty(p.outstanding)) : '');
-            return '<a href="#" onclick="event.preventDefault();event.stopPropagation();openModule(\'Purchase Order\',\'' + numJs + '\')" style="text-decoration:none;display:inline-block;margin:1px 0" title="' + psEsc(p.statusName) + ' — ' + psEsc(psFmtQty(p.outstanding)) + ' on order (not yet confirmed supply)">' + psSpill(tone, lbl) + '</a>';
-        }).join(' ');
-        return '<td>' + links + '</td>';
-    };
     // Description cell also surfaces the shortage's Location Group — so it's clear
     // which LG a PO/MO must be created in (supply is matched to demand per-LG). An
     // amber "+N more" flags a part short across more than one LG (needs supply in each).
@@ -5145,7 +3189,7 @@ function renderProcure(){
     //    vendor-to-vendor. Each named vendor gets a Create PO button. ──
     // Shared column widths so every vendor sub-table is uniform (Part · Description
     // · Short by · On hand · Needed by · Blocked work orders).
-    const PROC_BUY_COLS = '<colgroup><col style="width:11%"><col style="width:16%"><col style="width:9%"><col style="width:8%"><col style="width:10%"><col style="width:14%"><col style="width:32%"></colgroup>';
+    const PROC_BUY_COLS = '<colgroup><col style="width:12%"><col style="width:20%"><col style="width:10%"><col style="width:9%"><col style="width:11%"><col style="width:38%"></colgroup>';
     let buyHtml = '';
     if(buy.length){
         const groups = new Map();
@@ -5157,7 +3201,7 @@ function renderProcure(){
             const body=rows.map(r=>'<tr>'+
                 '<td>'+partLink(r)+'</td>'+
                 descCell(r)+
-                shortCell(r)+ohCell(r)+needCell(r)+pendingCell(r)+blockedCell(r)+
+                shortCell(r)+ohCell(r)+needCell(r)+blockedCell(r)+
             '</tr>').join('');
             // Named vendors get a Create PO button in the group header; the
             // "no default vendor" bucket can't (no vendor to raise a PO against).
@@ -5165,7 +3209,7 @@ function renderProcure(){
             const createBtn = (k==='__NOVENDOR__') ? '' :
                 '<button class="ps-btn primary sm" style="margin-left:auto;text-transform:none" onclick="psOpenCreatePo(\''+vkJs+'\')" title="Create a purchase order for this vendor"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 5v14M5 12h14"/></svg>Create PO</button>';
             buyBody += '<div class="proc-vgrp"><div class="proc-vhead">'+psEsc(vlabel)+'<span class="proc-vcount">'+rows.length+'</span>'+createBtn+'</div>'+
-                '<div class="tbl-wrap proc-tbl"><table style="table-layout:fixed">'+PROC_BUY_COLS+'<thead><tr><th>Part</th><th>Description</th><th style="text-align:right">Short by</th><th style="text-align:right">On hand</th><th>Needed by</th><th>On order</th><th>Blocked work orders</th></tr></thead><tbody>'+body+'</tbody></table></div></div>';
+                '<div class="tbl-wrap proc-tbl"><table style="table-layout:fixed">'+PROC_BUY_COLS+'<thead><tr><th>Part</th><th>Description</th><th style="text-align:right">Short by</th><th style="text-align:right">On hand</th><th>Needed by</th><th>Blocked work orders</th></tr></thead><tbody>'+body+'</tbody></table></div></div>';
         });
         buyHtml = '<div class="proc-subtitle">Raw goods short of stock and open POs — grouped by default vendor.</div>'+buyBody;
     }
@@ -5496,16 +3540,10 @@ function psOpenCreatePo(vendorKey){
     try { const ids=(typeof getLocationGroupList==='function'?getLocationGroupList():[])||[];
           lgList = JSON.parse(runQuery('SELECT id, name FROM locationgroup WHERE activeflag = 1'+(ids.length?(' AND id IN ('+ids.join(',')+')'):'')+' ORDER BY name')); }
     catch(_){ lgList=[]; }
-    // Default scheduled date = the WEEKDAY before the earliest line is needed, so
-    // the goods are expected the working day prior to the requirement (skipping
-    // Sat/Sun). Falls back to the weekday before today when no line has a need-by.
-    // The user can override it in the drawer; it applies to every poItem on submit.
+    // Default scheduled date = the earliest line need-by across the group (falls
+    // back to today when no line has one). The user can override it in the drawer;
+    // it is applied to every poItem's dateScheduled on submit.
     let schedDef=null; parts.forEach(p=>{ if(p.needBy && (!schedDef || p.needBy.isBefore(schedDef))) schedDef=p.needBy.clone(); });
-    let poSched=(schedDef||moment()).clone().subtract(1,'day');
-    while(poSched.day()===0 || poSched.day()===6) poSched.subtract(1,'day');
-    // Default order status from the user's Procurement setting (Issued | Bid Request).
-    let poStatus0='Issued';
-    try { const s=FBLib.Settings.resolve('poCreateStatus'); if(s==='Bid Request'||s==='Issued') poStatus0=s; } catch(_){}
     // Default the PO's LG to the LG the shortage actually sits in (the earliest-
     // needed row's lgId — which is the consuming WO's location_group_id, the SAME
     // field the availability engine consumes on). This guarantees the incoming
@@ -5517,8 +3555,8 @@ function psOpenCreatePo(vendorKey){
     psPoDraft = {
         vendorId: vRow.vendorId, vendorName: (vendorKey==='__NOVENDOR__'?'':vendorKey),
         parts, lgList, lgId:poLg,
-        poStatus:poStatus0,   // 'Bid Request' | 'Issued' — default from the Procurement setting
-        dateScheduled:poSched.format('YYYY-MM-DD'),
+        poStatus:'Issued',   // 'Bid Request' | 'Issued'
+        dateScheduled:(schedDef||moment()).format('YYYY-MM-DD'),
         note:'',
         state:'idle', error:null, result:null
     };
@@ -5612,8 +3650,6 @@ async function psSubmitPo(){
     });
     if(!items.length){ d.error='Enter a quantity (>0) for at least one line.'; psRenderPoDrawer(); return; }
     if(typeof runRestApiAsync!=='function'){ d.error='REST API unavailable — open this report inside Fishbowl with REST enabled to create POs.'; psRenderPoDrawer(); return; }
-    // Remember the chosen status as the user's Create-PO default for next time.
-    try { FBLib.Settings.setUserKey('poCreateStatus', d.poStatus === 'Bid Request' ? 'Bid Request' : 'Issued'); FBLib.Settings.saveUser(); } catch(_){}
     const payload={ vendor:{ id:d.vendorId }, status:d.poStatus, locationGroup:{ id:d.lgId }, poItems:items };
     if(d.note && d.note.trim()) payload.note=d.note.trim();
     d.state='submitting'; d.error=null; psRenderPoDrawer();
@@ -5671,9 +3707,7 @@ function renderCalendarView(){
             return '<span class="cal-chip" style="background:'+c+';color:'+psReadableText(c)+(late?';box-shadow:inset 0 0 0 2px var(--fb-negative)':'')+'" onclick="event.stopPropagation();openDetail('+w.wo_id+')">'+psEsc(w.wo_num)+' '+psEsc(w.part_num||'')+'</span>';
         }).join('');
         const more=dayWOs.length>3?'<span class="cal-more">+'+(dayWOs.length-3)+' more</span>':'';
-        const dstr=d.format('YYYY-MM-DD');
-        const tlBtn=psTabVisible('timeline')?'<button class="cal-tl" onclick="event.stopPropagation();psTimelineToDate(\''+dstr+'\')" title="Show this day on the Timeline"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h12M4 12h16M4 18h9"/></svg></button>':'';
-        cells+='<div class="cal-cell'+(oth?' oth':'')+(today?' today':'')+'">'+tlBtn+'<div class="dn">'+d.date()+'</div>'+chips+more+'</div>';
+        cells+='<div class="cal-cell'+(oth?' oth':'')+(today?' today':'')+'"><div class="dn">'+d.date()+'</div>'+chips+more+'</div>';
     }
     host.innerHTML=navBar+
         '<div class="cal"><div class="cal-head">'+dows.map(x=>'<div>'+x+'</div>').join('')+'</div>'+
@@ -5691,10 +3725,6 @@ function openDetail(woId){
     if(psIsShort(w)) alerts+='<div class="alert-box" style="background:'+psHexA('#F7C23A',.16)+';color:var(--acc-yellow-con)"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7"/></svg>Raw goods short — check purchasing.</div>';
     const field=(k,v)=>'<div class="dfield"><div class="k">'+k+'</div><div class="v">'+v+'</div></div>';
     const woNumJs = String(w.wo_num).replace(/'/g,"\\'");
-    // First pick number for the drawer's "To Pick" action (button shown only when
-    // the WO actually has a pick). openModule('Picking', num) opens that pick.
-    const firstPickNum = (w._pickNums && w._pickNums.length) ? w._pickNums[0] : '';
-    const firstPickJs = String(firstPickNum).replace(/'/g,"\\'");
     const pk = psPickInfo(w);
     const pickLinks = (w._pickNums && w._pickNums.length)
         ? w._pickNums.map(n => '<a href="#" onclick="event.preventDefault();openModule(\'Picking\',\'' + String(n).replace(/'/g, "\\'") + '\')" style="color:var(--link);font-family:var(--mono)">' + psEsc(n) + '</a>').join(', ')
@@ -5777,9 +3807,8 @@ function openDetail(woId){
         '</div>'+
         '<div class="detail-actions">'+
           '<button class="close-x" onclick="closeDetail()"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></svg></button>'+
-          '<button class="ps-btn primary sm" onclick="openModule(\'Work Order\',\''+woNumJs+'\')" title="Open this WO in the Work Order module"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M14 5l7 7-7 7M3 12h18"/></svg>To WO</button>'+
-          (firstPickNum ? '<button class="ps-btn sm" onclick="openModule(\'Picking\',\''+firstPickJs+'\')" title="Open this WO’s pick in the Picking module"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/></svg>To Pick</button>' : '')+
-          (psTabVisible('timeline') ? '<button class="ps-btn sm" onclick="psShowWOOnTimeline('+w.wo_id+')" title="Show this WO on the Timeline"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h12M4 12h16M4 18h9"/></svg>Timeline</button>' : '')+
+          '<button class="ps-btn primary sm" onclick="openModule(\'Work Order\',\''+woNumJs+'\')" title="Open this WO in Fishbowl"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M14 5l7 7-7 7M3 12h18"/></svg>Open in Fishbowl</button>'+
+          '<button class="ps-btn sm" onclick="psShowWOOnTimeline('+w.wo_id+')" title="Show this WO on the Timeline"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h12M4 12h16M4 18h9"/></svg>Timeline</button>'+
         '</div>'+
       '</div></div>'+
       '<div class="detail-body">'+
@@ -6121,103 +4150,8 @@ const PSFinish = (function () {
         });
         return { allocations: sigOrder.map(function (s) { return groupsBySig[s]; }), covered: true };
     }
-
-    // ── Manual scrap selection (Serials + Lots) ─────────────────────────────
-    // A raw line that carries ANY tracking requires the operator to choose which
-    // serials / lot-tags are scrapped (Finish blocks until they do — see
-    // buildScrapPlan). These pools list every candidate at the resolved scrap
-    // location, and the row-builders emit the SAME shapes the FIFO allocators do
-    // (kind:'serial-group' / kind:'lot') so postScrapImport is unchanged. Selection
-    // is scoped to the one location resolveScrapLocation picks (default loc, else the
-    // oldest tag location with enough) — matching the FIFO engine's one-location model.
-    function scrapNeedsSelection(line) { return !line.isLabour && !!(line.isSerialTracked || line.hasTracking); }
-
-    // All uncommitted serial units at a location, each with its serial value(s) +
-    // the tag's lot fields (for grouping) — the candidate pool for the serial picker.
-    async function scrapSerialPool(partId, locId) {
-        var lotSql =
-            "SELECT * FROM (SELECT t.id AS tag_id, ttv.parttrackingid AS ptid, ttv.name AS tname, ttv.abbr AS tabbr, ttv.info AS tinfo, ttv.infoformatted AS tfmt, ttv.sortorder AS tsort" +
-            "  FROM tag t LEFT JOIN tagtrackingview ttv ON ttv.tagid = t.id AND ttv.typeid <> 40" +
-            "  WHERE t.partid = " + parseInt(partId, 10) + " AND t.locationid = " + parseInt(locId, 10) +
-            "    AND t.typeid IN (30,40) AND (t.qty - COALESCE(t.qtycommitted,0)) > 0" +
-            "  ORDER BY t.datecreated, t.id, ttv.sortorder) AS wl";
-        var serSql =
-            "SELECT * FROM (SELECT t.id AS tag_id, t.num AS tag_num, t.datecreated AS dc, s.id AS sid, tsv.parttrackingid AS ptid, tsv.name AS sname, tsv.abbr AS sabbr, tsv.serialnum AS sn, tsv.sortorder AS ssort" +
-            "  FROM tag t JOIN serial s ON s.tagid = t.id AND s.committedFlag = 0 JOIN tagserialview tsv ON tsv.serialid = s.id" +
-            "  WHERE t.partid = " + parseInt(partId, 10) + " AND t.locationid = " + parseInt(locId, 10) + " AND t.typeid IN (30,40)" +
-            "  ORDER BY t.datecreated, t.id, s.id, tsv.sortorder) AS ws";
-        var lotRows = [], serRows = [];
-        lotRows = await qp(lotSql); serRows = await qp(serSql);
-        var tagLot = {};
-        lotRows.forEach(function (r) {
-            var id = parseInt(r.tag_id, 10); if (!id) return;
-            if (!tagLot[id]) tagLot[id] = [];
-            if (r.ptid != null && r.tabbr != null) {
-                var val = r.tfmt != null ? r.tfmt : (r.tinfo != null ? r.tinfo : '');
-                if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}[ T]/.test(val)) val = val.slice(0, 10);
-                tagLot[id].push({ name: r.tname || '', abbr: r.tabbr || '', info: val, ptid: parseInt(r.ptid, 10) });
-            }
-        });
-        var units = {}, order = [], fieldMap = {};
-        serRows.forEach(function (r) {
-            var sid = parseInt(r.sid, 10); if (!sid) return;
-            if (!units[sid]) { units[sid] = { sid: sid, tagId: parseInt(r.tag_id, 10) || 0, tagNum: r.tag_num == null ? '' : String(r.tag_num), valsByPtid: {} }; order.push(sid); }
-            var ptid = parseInt(r.ptid, 10) || 0;
-            if (ptid) { units[sid].valsByPtid[ptid] = r.sn == null ? '' : String(r.sn); if (!fieldMap[ptid]) fieldMap[ptid] = { ptid: ptid, name: r.sname || '', abbr: r.sabbr || '', sort: r.ssort || 0 }; }
-        });
-        var serialFields = Object.keys(fieldMap).map(function (k) { return fieldMap[k]; }).sort(function (a, b) { return (a.sort || 0) - (b.sort || 0); });
-        var list = order.map(function (sid) {
-            var u = units[sid]; var lot = tagLot[u.tagId] || [];
-            u.lotFields = lot;
-            u.label = serialFields.map(function (f) { return u.valsByPtid[f.ptid] || ''; }).filter(Boolean).join(' / ') || ('#' + sid);
-            u.lotLabel = lot.map(function (f) { return (f.abbr || f.name) + ':' + f.info; }).filter(Boolean).join(', ');
-            return u;
-        });
-        return { serialFields: serialFields, units: list };
-    }
-    // All tags with available qty at a location — the candidate pool for the lot picker.
-    async function scrapLotPool(partId, locId) {
-        var sql =
-            "SELECT * FROM (SELECT t.id AS tag_id, t.num AS tag_num, GREATEST(t.qty - COALESCE(t.qtycommitted,0),0) AS avail, t.datecreated AS dc," +
-            "  ttv.parttrackingid AS ptid, ttv.name AS tname, ttv.abbr AS tabbr, ttv.info AS tinfo, ttv.infoformatted AS tfmt, ttv.sortorder AS tsort" +
-            "  FROM tag t LEFT JOIN tagtrackingview ttv ON ttv.tagid = t.id AND ttv.typeid <> 40" +
-            "  WHERE t.partid = " + parseInt(partId, 10) + " AND t.locationid = " + parseInt(locId, 10) +
-            "    AND t.typeid IN (30,40) AND (t.qty - COALESCE(t.qtycommitted,0)) > 0" +
-            "  ORDER BY t.datecreated, t.id, ttv.sortorder) AS wl";
-        var rows = await qp(sql);
-        var byTag = {}, order = [];
-        rows.forEach(function (r) {
-            var id = parseInt(r.tag_id, 10); if (!id) return;
-            if (!byTag[id]) { byTag[id] = { tagId: id, tagNum: r.tag_num == null ? '' : String(r.tag_num), avail: parseFloat(r.avail) || 0, fields: [] }; order.push(id); }
-            if (r.ptid != null && r.tabbr != null) {
-                var val = r.tfmt != null ? r.tfmt : (r.tinfo != null ? r.tinfo : '');
-                if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}[ T]/.test(val)) val = val.slice(0, 10);
-                byTag[id].fields.push({ name: r.tname || '', abbr: r.tabbr || '', info: val });
-            }
-        });
-        return order.map(function (id) { var t = byTag[id]; t.lotLabel = t.fields.map(function (f) { return (f.abbr || f.name) + ':' + f.info; }).filter(Boolean).join(', ') || ('Tag ' + t.tagNum); return t; });
-    }
-    // Group picked serial units by lot signature → kind:'serial-group' scrap rows.
-    function buildScrapSerialRows(partNum, location, pickedUnits, serialFields) {
-        var bySig = {}, order = [];
-        pickedUnits.forEach(function (u) {
-            var sig = (u.lotFields || []).map(function (f) { return f.ptid + '=' + (f.info || ''); }).join('|') || '__none__';
-            if (!bySig[sig]) { bySig[sig] = { partNum: partNum, location: location, kind: 'serial-group', qty: 0,
-                fields: (u.lotFields || []).map(function (f) { return { name: f.name, abbr: f.abbr, info: f.info }; }),
-                serialFields: serialFields.map(function (f) { return { ptid: f.ptid, name: f.name, abbr: f.abbr }; }), serials: [] }; order.push(sig); }
-            bySig[sig].serials.push({ sid: u.sid, vals: serialFields.map(function (f) { return { ptid: f.ptid, name: f.name, abbr: f.abbr, value: u.valsByPtid[f.ptid] || '' }; }) });
-            bySig[sig].qty++;
-        });
-        return order.map(function (s) { return bySig[s]; });
-    }
-    // Picked lot tags + per-tag qty → kind:'lot' scrap rows.
-    function buildScrapLotRows(partNum, location, pickedTags) {
-        return pickedTags.map(function (t) { return { partNum: partNum, location: location, kind: 'lot', tagId: t.tagId, tagNum: t.tagNum, qty: t.qty, fields: t.fields || [] }; });
-    }
-
-    // Build the scrap plan: per line with a scrap qty — TRACKED lines use the
-    // operator's manual serial/lot selection (required); non-tracked lines resolve a
-    // location + FIFO-allocate. Returns { rows, blockers }.
+    // Build the scrap plan: for every line with a scrap qty, resolve its location
+    // + FIFO-allocate tags/serials. Returns { rows, blockers }.
     async function buildScrapPlan(fs, wo) {
         var out = { rows: [], blockers: [] };
         if (!fs || !fs.lines) return out;
@@ -6230,20 +4164,6 @@ const PSFinish = (function () {
             if (qty <= 0) continue;
             if (line.isSerialTracked && Math.abs(qty - Math.floor(qty)) > 1e-9) {
                 out.blockers.push(line.partNum + ': serial-tracked scrap qty must be a whole number (got ' + fmtQty(qty) + ')');
-                continue;
-            }
-            // Tracked lines: require the operator's manual serial/lot selection.
-            if (scrapNeedsSelection(line)) {
-                var sel = fs.scrapSel && fs.scrapSel[i];
-                if (!sel || !sel.rows || !sel.rows.length) {
-                    out.blockers.push(line.partNum + ': choose which ' + (line.isSerialTracked ? 'serials' : 'lots') + ' to scrap (' + fmtQty(qty) + ' required) — use the Choose button on the Scrap column');
-                    continue;
-                }
-                if (Math.abs((sel.qty || 0) - qty) > 1e-6) {
-                    out.blockers.push(line.partNum + ': scrap selection is ' + fmtQty(sel.qty || 0) + ' but the scrap qty is ' + fmtQty(qty) + ' — reselect');
-                    continue;
-                }
-                sel.rows.forEach(function (r) { out.rows.push(Object.assign({ note: note }, r)); });
                 continue;
             }
             var loc = await resolveScrapLocation(line, lgId, qty);
@@ -6592,25 +4512,12 @@ const PSFinish = (function () {
             var reqPick = Math.max(0, toNumber(item.Quantity, lineRows[0].pickitem_qty || 0));
             var targetWhole = Math.max(0, Math.floor(reqPick + EPSILON));
             var buckets = new Map();
-            // DEVIATION from the verbatim WO_WIP engine (bug fix): the stock query
-            // aggregates serial_json per part+LOCATION, so when a part has more than
-            // one tag in the same location every stock row carries the identical
-            // serial list. The original loop matched a selected serial once per
-            // duplicate row → allocPick was inflated (e.g. 1 picked serial counted
-            // twice) → a false "Too many serials selected" blocker. Dedupe each
-            // selected serial by its key so it's counted once, and attribute it to
-            // its OWN tag's stock row (rowByTag) so the committed SavePick decrements
-            // the correct source tag.
-            var consumed = new Set(), rowByTag = new Map();
-            lineRows.forEach(function (row) { var tk = String(row.tag_id); if (!rowByTag.has(tk)) rowByTag.set(tk, row); });
             lineRows.forEach(function (row) {
                 ensureArray(row.serial_json).forEach(function (serial) {
                     var k = serialKey(item.PickItemID, row, serial);
-                    if (!selectedSerialKeys.has(k) || consumed.has(k)) return;
-                    consumed.add(k);
-                    var tgtRow = rowByTag.get(String(serial.TagID)) || row;
-                    var bk = poolKey(tgtRow) + '|' + tgtRow.location_id;
-                    if (!buckets.has(bk)) buckets.set(bk, { row: tgtRow, serials: [] });
+                    if (!selectedSerialKeys.has(k)) return;
+                    var bk = poolKey(row) + '|' + row.location_id;
+                    if (!buckets.has(bk)) buckets.set(bk, { row: row, serials: [] });
                     buckets.get(bk).serials.push(serial);
                 });
             });
@@ -6666,13 +4573,6 @@ const PSFinish = (function () {
                 else msgs.push(l.partnum + ': short ' + fmtQty(l.shortfallPickUom) + ' (only ' + fmtQty(l.allocatedPickUom) + ' of ' + fmtQty(l.requiredPickUom) + ')');
             });
             return msgs;
-        }
-        // A line's failure that is PURELY a raw-goods shortage — overridable when the
-        // admin has allowed finishing short. Serial/tracking failures (SELECT_SERIALS,
-        // PARTIAL_SERIAL_SELECTION, TOO_MANY_SERIALS) and SUB_MINIMUM are NEVER
-        // overridable and always hard-block.
-        function isShortageReason(reason) {
-            return reason === 'INSUFFICIENT_STOCK' || reason === 'NO_STOCK_THIS_LOCATION';
         }
 
         function findPartTracking(part, ti) {
@@ -6911,35 +4811,11 @@ const PSFinish = (function () {
             if (CFG.useByRule === 'days') return isoDatePlusDays(CFG.shelfDays);
             return '';
         }
-        // usedByWoItem: [{ woItemId, partId, partNum, qty }] — the consumed (Used) qty
-        // for the NON-inventory raw lines (labour/service/overhead/internal-use/non-
-        // inventory). Those parts aren't consumed through a pick, so Fishbowl won't
-        // populate their QtyUsed on finish — every such line's consumed qty (target by
-        // default, or the operator's value) is set directly on the woitem here.
-        //
-        // MATCHING: the legacy GetWorkOrderRs WOItem shape is not guaranteed (the id
-        // field name in particular varies), so each override is indexed by woitem id,
-        // part id AND part number, and each WOItem is matched against all three in turn
-        // — whichever the payload actually carries wins. The FG line proves SaveWorkOrder
-        // honours a QtyUsed we send (it's matched purely by TypeID===10, no id needed),
-        // so a labour line finishing at 0 means the id match failed — hence the fall-
-        // through to part number, plus a diagnostic that dumps the real WOItem keys when
-        // nothing matches (visible with the debug console open). Inventory lines are NOT
-        // in this list — their Used comes from the pick (applyUsedOverrides).
-        function buildCompleteWorkOrder(wo, fgDefs, usedByWoItem) {
+        function buildCompleteWorkOrder(wo, fgDefs) {
             var n = deepClone(wo), now = nowFishbowl();
             n.DateScheduled = n.DateScheduled || now;
             n.DateScheduledToStart = n.DateScheduledToStart || now;
             n.StatusID = 40;
-            var usedById = {}, usedByPart = {}, usedByPartNum = {};
-            (usedByWoItem || []).forEach(function (o) {
-                if (o == null || o.qty == null) return;
-                if (o.woItemId != null) usedById[String(o.woItemId)] = o.qty;
-                if (o.partId != null)   usedByPart[String(o.partId)] = o.qty;
-                if (o.partNum)          usedByPartNum[String(o.partNum).toLowerCase()] = o.qty;
-            });
-            var haveOverrides = Object.keys(usedById).length || Object.keys(usedByPart).length || Object.keys(usedByPartNum).length;
-            var diag = haveOverrides && (typeof psDiag === 'function');
             var items = ensureArray(n.WOItems && n.WOItems.WOItem);
             items.forEach(function (wi) {
                 if (toNumber(wi.TypeID, -1) === 10) {
@@ -6947,124 +4823,10 @@ const PSFinish = (function () {
                     wi.QtyUsed = toQuantityString(qty);
                     var tracking = buildFgTrackingBlock(wi.Part, fgDefs || []);
                     if (tracking) wi.Tracking = tracking;
-                } else {
-                    // Raw-material line: apply the non-inventory consumed qty (Used) sent
-                    // for this line. Match on woitem id → part id → part number, trying
-                    // every field-name variant, so an unknown WOItem shape still resolves.
-                    var idA  = toNumber(wi.WOItemID, 0) || toNumber(wi.WoItemID, 0) || toNumber(wi.WoItemId, 0) || toNumber(wi.Id, 0) || toNumber(wi.ID, 0);
-                    var pid  = toNumber(wi.PartID, 0) || (wi.Part ? toNumber(wi.Part.PartID, 0) : 0);
-                    var pnum = (wi.PartNum != null ? String(wi.PartNum) : (wi.Part && wi.Part.Num != null ? String(wi.Part.Num) : '')).toLowerCase();
-                    var ov   = (idA && usedById[String(idA)] != null) ? usedById[String(idA)]
-                             : (pid && usedByPart[String(pid)] != null) ? usedByPart[String(pid)]
-                             : (pnum && usedByPartNum[pnum] != null) ? usedByPartNum[pnum] : null;
-                    if (ov != null) {
-                        var ovStr = toQuantityString(ov);
-                        // On the finish (status→40) save, Fishbowl RECOMPUTES a non-inventory
-                        // (labour/service/overhead) line's consumed qtyUsed to ITS TARGET
-                        // (QtyToFulfill) — overwriting a committed value AND ignoring the
-                        // QtyUsed / OriginalQtyToFulfill we send. DB-PROVEN via WO 1002 debug
-                        // trace: pre-store persisted qtyUsed=3 (READ-BACK confirmed) and the
-                        // fulfilling save sent QtyUsed=3 + OriginalQtyToFulfill=3, yet the DB
-                        // landed at target 1 = QtyToFulfill.
-                        // So the ONLY way to make it consume the override is to set the TARGET
-                        // itself: write QtyToFulfill = the override so the recompute lands there.
-                        // This DOES change the line's planned target to the override value
-                        // (used == target on the finished line) — the accepted trade-off (the
-                        // finish can't hold used ≠ target for a labour line via this API).
-                        // Only lines the operator actually overrode reach here (a blank Used
-                        // resolves to the existing target, so ovStr == target and this is inert).
-                        wi.QtyToFulfill = ovStr;
-                        if (wi.OriginalQtyToFulfill != null) wi.OriginalQtyToFulfill = ovStr;
-                        wi.QtyUsed = ovStr;
-                        if (diag) psDiag('Finish: set WOItem "' + (pnum || idA || pid) + '" QtyToFulfill=' + ovStr + ' + QtyUsed=' + ovStr + ' (typeid ' + toNumber(wi.TypeID, -1) + '; target set to override so the finish recompute lands on it)');
-                    } else if (diag) {
-                        psDiag('Finish: WOItem typeid ' + toNumber(wi.TypeID, -1) + ' id=' + idA + ' pid=' + pid + ' num="' + pnum + '" — no Used override matched; keys=' + JSON.stringify(Object.keys(wi)));
-                    }
                 }
             });
             n.WOItems = { WOItem: items };
             return { WO: n };
-        }
-
-        // Stamp non-inventory (labour/service/overhead/…) consumed quantities onto the
-        // woitem WHILE THE WO IS STILL OPEN, via a status-preserving SaveWorkOrderRq.
-        // This is HALF of the override: on finish Fishbowl recomputes a labour line's
-        // consumed qty from its OriginalQtyToFulfill, so the override only sticks when
-        // BOTH this open pre-store (QtyUsed) AND the OriginalQtyToFulfill write on the
-        // fulfilling save (buildCompleteWorkOrder) are done — DB-proven WO 220 (both →
-        // qtyUsed=2 kept) vs WO 225 (pre-store but no OriginalQtyToFulfill → recomputed
-        // back to target). Matched by woitem id → part id → part number: two labour
-        // lines can share the same part, so the id match is what distinguishes them.
-        // Leaves StatusID, QtyToFulfill/QtyTarget and the FG line(s) untouched. Throws
-        // on a failed save so the finish aborts before anything irreversible (no pick
-        // committed yet). NOTE: forcing a labour line to exactly 0 (full under-consume)
-        // is unconfirmed — a stored 0 may read as "unset"; only non-zero overrides are proven.
-        async function preStoreLabourUsed(woRow, woItemUsed) {
-            var getRs = await legacyRequest('GetWorkOrderRq', { WorkOrderNumber: woRow.wo_num });
-            var wo = getRs.WO || getRs.Wo || getRs.WorkOrder;
-            if (!wo) throw new Error('GetWorkOrderRs did not include a WO (pre-store labour used).');
-            if (toNumber(wo.StatusID, 0) === 40) return;   // already fulfilled — can't pre-store
-            var usedById = {}, usedByPart = {}, usedByPartNum = {};
-            (woItemUsed || []).forEach(function (o) {
-                if (o == null || o.qty == null) return;
-                if (o.woItemId != null) usedById[String(o.woItemId)] = o.qty;
-                if (o.partId != null)   usedByPart[String(o.partId)] = o.qty;
-                if (o.partNum)          usedByPartNum[String(o.partNum).toLowerCase()] = o.qty;
-            });
-            var items = ensureArray(wo.WOItems && wo.WOItems.WOItem);
-            var touched = 0;
-            items.forEach(function (wi) {
-                if (toNumber(wi.TypeID, -1) === 10) return;   // finished good — not here
-                var idA  = toNumber(wi.WOItemID, 0) || toNumber(wi.WoItemID, 0) || toNumber(wi.WoItemId, 0) || toNumber(wi.Id, 0) || toNumber(wi.ID, 0);
-                var pid  = toNumber(wi.PartID, 0) || (wi.Part ? toNumber(wi.Part.PartID, 0) : 0);
-                var pnum = (wi.PartNum != null ? String(wi.PartNum) : (wi.Part && wi.Part.Num != null ? String(wi.Part.Num) : '')).toLowerCase();
-                var ov   = (idA && usedById[String(idA)] != null) ? usedById[String(idA)]
-                         : (pid && usedByPart[String(pid)] != null) ? usedByPart[String(pid)]
-                         : (pnum && usedByPartNum[pnum] != null) ? usedByPartNum[pnum] : null;
-                if (ov != null) {
-                    var ovs = toQuantityString(ov);
-                    // Set the TARGET (QtyToFulfill) — this is the value the finish's
-                    // status→40 recompute reads to derive qtyUsed. Committing it HERE, in
-                    // this earlier open save (before the pick + fulfilling save), is what
-                    // makes the recompute land on the override (DB-proven WO 1004: setting
-                    // it only on the fulfilling save was too late — used stayed at the old
-                    // target). QtyUsed is set too (harmless; the finish overwrites it from
-                    // the target). This DOES move the line's planned target to the override
-                    // — the accepted trade-off; a labour finish can't hold used ≠ target.
-                    wi.QtyToFulfill = ovs;
-                    if (wi.OriginalQtyToFulfill != null) wi.OriginalQtyToFulfill = ovs;
-                    wi.QtyUsed = ovs;
-                    touched++;
-                }
-            });
-            if (!touched) return;
-            wo.WOItems = { WOItem: items };
-            if (typeof psDiag === 'function') {
-                psDiag('Finish pre-store labour ' + woRow.wo_num + ' (sending target/used, WO status ' + toNumber(wo.StatusID, -1) + '): ' + items
-                    .filter(function (wi) { return toNumber(wi.TypeID, -1) !== 10; })
-                    .map(function (wi) {
-                        var _pn = (wi.PartNum != null ? wi.PartNum : (wi.Part && wi.Part.Num) || '?');
-                        return _pn + '=' + wi.QtyToFulfill + '/' + wi.QtyUsed;
-                    }).join(', '));
-            }
-            await legacyRequest('SaveWorkOrderRq', { WO: wo });
-            // Read the WO straight back so the debug console SHOWS whether the labour
-            // qtyUsed actually persisted (the crux — a save on a still-Entered WO can
-            // silently drop it). If the read-back doesn't match what we sent, the
-            // pre-store isn't sticking and the ordering/status needs another look.
-            if (typeof psDiag === 'function') {
-                try {
-                    var chkRs = await legacyRequest('GetWorkOrderRq', { WorkOrderNumber: woRow.wo_num });
-                    var chk = chkRs.WO || chkRs.Wo || chkRs.WorkOrder;
-                    var chkItems = ensureArray(chk && chk.WOItems && chk.WOItems.WOItem);
-                    psDiag('Finish pre-store READ-BACK ' + woRow.wo_num + ' (persisted target/used, WO status ' + toNumber(chk && chk.StatusID, -1) + '): ' + chkItems
-                        .filter(function (wi) { return toNumber(wi.TypeID, -1) !== 10; })
-                        .map(function (wi) {
-                            var _pn = (wi.PartNum != null ? wi.PartNum : (wi.Part && wi.Part.Num) || '?');
-                            return _pn + '=' + wi.QtyToFulfill + '/' + wi.QtyUsed;
-                        }).join(', '));
-                } catch (_) {}
-            }
         }
 
         function fgExistingLocationId(fgItem) {
@@ -7124,9 +4886,7 @@ const PSFinish = (function () {
             if (blockers.length) throw new Error(blockers.join('; '));
         }
 
-        // opts: { mode, selectedSerialKeys, fgDefs, usedOverrides, woItemUsed, post, onStep }
-        //   usedOverrides — pick-based Used overrides (inventory lines)
-        //   woItemUsed    — WO-save Used overrides (non-inventory lines) → buildCompleteWorkOrder
+        // opts: { mode, selectedSerialKeys, fgDefs, usedOverrides, post, onStep }
         async function prepareFinish(woRow, opts) {
             opts = opts || {};
             var mode = opts.mode || CFG.mode;
@@ -7146,26 +4906,9 @@ const PSFinish = (function () {
                 out.stockRows = stockRows;
                 var lineResults = buildLineResults(pick, stockRows, mode, selectedSerialKeys);
                 out.lineResults = lineResults;
-                var allBlockers = collectBlockers(lineResults);
-                // Split shortage lines (overridable when opts.allowShort) from HARD
-                // blockers (serial/tracking issues that must be fixed regardless).
-                var shortResults = lineResults.filter(function (l) { return !l.fullyFulfilled && isShortageReason(l.failureReason); });
-                var hardResults  = lineResults.filter(function (l) { return !l.fullyFulfilled && !isShortageReason(l.failureReason); });
-                out.shortLines = shortResults.map(function (l) {
-                    return { partNum: l.partnum, required: l.requiredPickUom, allocated: l.allocatedPickUom, shortfall: l.shortfallPickUom };
-                });
-                var allowShort = !!opts.allowShort;
-                // Blocked when there's ANY hard blocker, or a shortage the policy won't
-                // let us override. Otherwise fall through — either fully fulfilled, or
-                // short-but-overridden (commit whatever stock IS available; the empty /
-                // partial lines are handled by buildCommitSavePick).
-                if (hardResults.length || (shortResults.length && !allowShort)) {
-                    out.blockers = allBlockers;
-                    out.error = allBlockers[0];
-                    return out;
-                }
-                out.blockers = [];
-                out.short = shortResults.length > 0;   // finishing short — caller confirms via a danger modal
+                var blockers = collectBlockers(lineResults);
+                out.blockers = blockers;
+                if (blockers.length) { out.error = blockers[0]; return out; }
                 var fgLocId = await resolveFgLocationId(woRow, null);
                 if (!fgLocId) { out.error = noFgLocationMessage(woRow); out.blockers = [out.error]; return out; }
                 var savePick = buildCommitSavePick(pick, lineResults, { statusId: 40, destinationTagNumMode: 'new' });
@@ -7174,28 +4917,6 @@ const PSFinish = (function () {
                 out.payloads.startPick = (pickStatusId >= 0 && pickStatusId < 20) ? buildStartSavePick(pick) : null;
                 out.ok = true;
                 if (!opts.post) return out;   // preview only
-                // Non-inventory (labour/service/overhead) consumed-qty overrides. On the
-                // finish (status→40) save Fishbowl RECOMPUTES a labour line's qtyUsed from
-                // its TARGET as that target stood BEFORE the fulfilling save — so the new
-                // TARGET (QtyToFulfill) must be committed to the DB in a SEPARATE, EARLIER
-                // save, before the pick + fulfilling save. DB-PROVEN WO 1004: setting
-                // QtyToFulfill=5 ON the fulfilling save moved qtyTarget to 5 but qtyUsed
-                // still landed at 1 (the recompute read the pre-save target of 1). So the
-                // target write must PRECEDE the finish. preStoreLabourUsed now sets the
-                // target; running it here — before the pick commit, while the WO is still
-                // open — means a failure aborts nothing (the pick isn't committed yet).
-                // NON-FATAL: on failure the finish still completes (labour lands at its
-                // original target).
-                if (Array.isArray(opts.woItemUsed) && opts.woItemUsed.length) {
-                    try {
-                        await preStoreLabourUsed(woRow, opts.woItemUsed);
-                        step('Labour target set');
-                    } catch (labErr) {
-                        if (typeof psDiag === 'function') psDiag('Finish pre-store labour FAILED (non-fatal, finish continues): ' + errorMessage(labErr));
-                        dbg('preStoreLabourUsed failed (non-fatal): ' + errorMessage(labErr), 'warn');
-                        step('Labour target set — skipped');
-                    }
-                }
                 if (isPickFinished(pick)) {
                     step('Pick already finished — skipped');
                 } else {
@@ -7216,21 +4937,8 @@ const PSFinish = (function () {
                 var wo = getWoRs.WO || getWoRs.Wo || getWoRs.WorkOrder;
                 if (!wo) throw new Error('GetWorkOrderRs did not include a WO.');
                 var fgDefs = opts.fgDefs || [];
-                var saveWo = buildCompleteWorkOrder(wo, fgDefs, opts.woItemUsed);
+                var saveWo = buildCompleteWorkOrder(wo, fgDefs);
                 out.payloads.saveWo = saveWo;
-                // Diagnostic (debug console only): the exact QtyUsed we're sending per
-                // WOItem, so a labour line still finishing at 0 can be seen in the payload.
-                if (typeof psDiag === 'function' && Array.isArray(opts.woItemUsed) && opts.woItemUsed.length) {
-                    try {
-                        var _wis = ensureArray(saveWo.WO && saveWo.WO.WOItems && saveWo.WO.WOItems.WOItem);
-                        psDiag('Finish SaveWorkOrder ' + woRow.wo_num + ' WOItem Used/Target/OrigTarget: ' + _wis.map(function (x) {
-                            var _pn = (x.PartNum != null ? x.PartNum : (x.Part && x.Part.Num) || '?');
-                            var _tgt = (x.QtyToFulfill != null ? x.QtyToFulfill : (x.QtyTarget != null ? x.QtyTarget : '?'));
-                            var _ot = (x.OriginalQtyToFulfill != null ? x.OriginalQtyToFulfill : '?');
-                            return _pn + '(t' + toNumber(x.TypeID, -1) + ')=' + x.QtyUsed + '/' + _tgt + '/' + _ot;
-                        }).join(', '));
-                    } catch (_) {}
-                }
                 await legacyRequest('SaveWorkOrderRq', saveWo);
                 step('Work order completed');
                 out.posted = true;
@@ -7367,12 +5075,6 @@ const PSFinish = (function () {
         try { return FBLib.Settings.resolve('finishAutoApplyFgDefaults') !== false; }
         catch (_) { return true; }
     }
-    // Admin policy (master-published): may the operator finish a WO whose raw goods
-    // are short? Gates both the preview (button enabled + warning) and the commit.
-    function allowFinishShort() {
-        try { return !!FBLib.Settings.resolve('allowFinishShort'); }
-        catch (_) { return false; }
-    }
 
     // Build woRow (source shape) from a scheduler WO object.
     function woRowFromScheduler(w) {
@@ -7411,12 +5113,9 @@ const PSFinish = (function () {
             var partTypeId = parseInt(r.parttypeid, 10);
             var isLabour = Number.isFinite(partTypeId) && partTypeId !== 10;
             var pickedQty = parseFloat(r.pickedqty) || 0;
-            // Blank by default (the input's placeholder shows the target, i.e.
-            // "consume target"); a WO with a picked qty or an already-recorded
-            // qtyUsed seeds the field. Non-inventory lines follow the SAME rule
-            // now (was: forced to target + read-only) so their Used is adjustable.
             var usedDefault;
-            if (pickedQty > 0)      usedDefault = pickedQty;
+            if (isLabour)           usedDefault = target;
+            else if (pickedQty > 0) usedDefault = pickedQty;
             else if (used > 0)      usedDefault = used;
             else                    usedDefault = null;
             return {
@@ -7491,7 +5190,6 @@ const PSFinish = (function () {
             preview: null, blockers: [], steps: [], lastError: null,
             preflightRun: false,
             serialLines: [], serialSelection: {},
-            scrapSel: {},   // lineIdx → { qty, location, rows[], _sids|_tagQty } — manual scrap picks for tracked lines
         };
     }
 
@@ -7602,13 +5300,10 @@ const PSFinish = (function () {
         Finisher.previewFinish(fs.woRow, {
             mode: Finisher.CFG.mode,
             selectedSerialKeys: collectSelectedSerialKeys(fs),
-            allowShort: allowFinishShort(),
         }).then(function (result) {
             if (active !== fs) return;   // drawer changed underneath us
             fs.preview = result;
             fs.blockers = result.blockers || [];
-            fs.shortLines = result.shortLines || [];
-            fs.isShort = !!result.short;   // short but override-allowed → ready with a warning
             fs.lastError = result.error && !result.ok ? String(result.error) : null;
             fs.serialLines = Finisher.serialLinesFrom(result) || [];
             reconcileSerialSelection(fs);
@@ -7694,14 +5389,8 @@ const PSFinish = (function () {
             actionHtml = '<button class="ps-btn primary sm" disabled title="Resolve blockers below">Finish WO</button>';
             extra = blockerHtml(fs);
         } else if (fs.status === 'ready') {
-            if (fs.isShort) {
-                allocStep = psSpill('caution', 'Raw goods short — override allowed'); tone = 'warn';
-                actionHtml = '<button class="ps-btn primary sm" onclick="PSFinish.finish()" title="Finish with raw goods short — a warning confirms first">Finish short WO</button>';
-                extra = shortWarnHtml(fs);
-            } else {
-                allocStep = psSpill('success', 'Stock allocated'); tone = 'ok';
-                actionHtml = '<button class="ps-btn primary sm" onclick="PSFinish.finish()">Finish WO</button>';
-            }
+            allocStep = psSpill('success', 'Stock allocated'); tone = 'ok';
+            actionHtml = '<button class="ps-btn primary sm" onclick="PSFinish.finish()">Finish WO</button>';
         } else {
             allocStep = psSpill('neutral', 'Not checked yet'); tone = 'warn';
             actionHtml = '<button class="ps-btn primary sm" onclick="PSFinish.recheck()">Check stock</button>';
@@ -7723,39 +5412,6 @@ const PSFinish = (function () {
         if (count > 0) lis.push('<li>' + count + ' raw-material line' + (count === 1 ? '' : 's') + ' short of stock — see the table below.</li>');
         return '<ul class="pf-blocker-list">' + lis.join('') + '</ul>';
     }
-    // Reconcile a preview short line against the Raw Materials table so the
-    // "X of Y will be consumed" figures line up with what the operator sees there.
-    // WHY: the preview's requiredPickUom / allocatedPickUom are on the pick's
-    // REMAINING-TO-SOURCE basis — Fishbowl auto-assigns the pickable-now stock into
-    // the pick on GetPick, so the pick line's Quantity comes back NET of it (e.g.
-    // BRACKET-200 target 6 with 2 on hand → required 4, allocated 0). The Raw
-    // Materials table instead shows the woitem TARGET (6) and Pickable (2), so the
-    // two disagreed. The shortfall IS authoritative (DB-verified = target − pickable),
-    // so anchor on the line's target (= the table's Target column) and derive the
-    // consumable as target − shortfall (= the table's Pickable-now amount).
-    function shortLineFigures(fs, s) {
-        var ln = null;
-        (fs.lines || []).forEach(function (l) { if (l.partNum === s.partNum) ln = l; });
-        var target = ln ? (Number(ln.target) || 0) : (Number(s.required) || 0);
-        var shortfall = Math.min(Math.max(0, Number(s.shortfall) || 0), target);
-        return { target: target, shortfall: shortfall, consumed: Math.max(0, target - shortfall) };
-    }
-    // Amber inline notice shown under the banner when finishing short is ALLOWED and
-    // this WO is short — lists the raw-good lines that won't be fully consumed. This
-    // is informational (the button stays enabled); genuinely-blocking problems use
-    // blockerHtml instead.
-    function shortWarnHtml(fs) {
-        var lines = (fs.shortLines || []);
-        if (!lines.length) return '';
-        var lis = lines.map(function (s) {
-            var f = shortLineFigures(fs, s);
-            return '<li>' + esc(s.partNum) + ' — short ' + fmtQty(f.shortfall) +
-                   ' (' + fmtQty(f.consumed) + ' of ' + fmtQty(f.target) + ' will be consumed)</li>';
-        }).join('');
-        return '<div class="alert-box" style="display:block;background:' + psHexA('#F69133', .14) + ';color:#8A4E10">' +
-               '<div style="font-weight:700;margin-bottom:4px">Finishing short — these raw goods can’t be fully consumed:</div>' +
-               '<ul style="margin:0 0 0 18px;padding:0;font-weight:600">' + lis + '</ul></div>';
-    }
 
     function rawTableHtml(fs) {
         var rows = fs.lines || [];
@@ -7773,49 +5429,26 @@ const PSFinish = (function () {
                 : (line.availableQty >= (line.pendingQty > 0 ? line.pendingQty : target)) ? 'success'
                 : (line.availableQty > 0 ? 'caution' : 'critical');
             var availLabel = line.isLabour ? 'Auto' : fmtQty(line.availableQty);
-            // Used is editable for EVERY line — inventory AND non-inventory
-            // (labour/service/overhead/internal-use/non-inventory). Blank = consume
-            // the target qty. Non-inventory overrides are written to the woitem at
-            // Finish (see buildCompleteWorkOrder); inventory via the pick.
-            var usedCell = editable
+            var usedCell = (editable && !line.isLabour)
                 ? '<input type="number" step="0.001" min="0" value="' + usedRaw + '" placeholder="' + fmtQty(target) + '" ' +
                     'title="Leave blank to consume the target qty (' + fmtQty(target) + ')" ' +
                     'oninput="PSFinish.lineDirty(this)" onchange="PSFinish.lineChange(' + i + ', this)">'
-                : fmtQty(usedEff);
+                : (line.isLabour ? '<span class="pf-ro">' + fmtQty(target) + '</span>' : fmtQty(usedEff));
             // Scrapped input — opt-in qty routed to a stock location via
             // ImportScrapData at Finish. Labour lines can't be scrapped.
             var scrapRaw = (line.scrappedInput == null || line.scrappedInput === '') ? '' : line.scrappedInput;
-            var scrapNow = parseFloat(line.scrappedInput) || 0;
-            var scrapCell;
-            if (editable && !line.isLabour) {
-                var scrapInput = '<input type="number" step="0.001" min="0" value="' + scrapRaw + '" placeholder="0" ' +
+            var scrapCell = (editable && !line.isLabour)
+                ? '<input type="number" step="0.001" min="0" value="' + scrapRaw + '" placeholder="0" ' +
                     'title="Qty to scrap — routed to a stock location via ImportScrapData at Finish" ' +
-                    'oninput="PSFinish.lineDirty(this)" onchange="PSFinish.scrapChange(' + i + ', this)">';
-                if (scrapNeedsSelection(line)) {
-                    // Tracked part — manual serial/lot selection is required (Finish blocks
-                    // until the chosen qty matches the scrap qty). Show a Choose button + status.
-                    var ssel = fs.scrapSel && fs.scrapSel[i];
-                    var selOk = ssel && scrapNow > 0 && Math.abs((ssel.qty || 0) - scrapNow) < 1e-6;
-                    var chBtn = '';
-                    if (scrapNow > 0) {
-                        var chLbl = selOk ? ('✓ ' + fmtQty(ssel.qty) + ' chosen')
-                                  : (ssel && ssel.qty ? ('⚠ ' + fmtQty(ssel.qty) + '/' + fmtQty(scrapNow) + ' — fix')
-                                  : ('Choose ' + (line.isSerialTracked ? 'serials' : 'lots')));
-                        chBtn = '<button class="ps-btn sm' + (selOk ? '' : ' primary') + '" style="margin-top:4px" onclick="PSFinish.openScrapPicker(' + i + ')">' + chLbl + '</button>';
-                    }
-                    scrapCell = scrapInput + chBtn;
-                } else {
-                    scrapCell = scrapInput + scrapHintHtml(line);
-                }
-            } else {
-                scrapCell = (line.isLabour ? '<span class="pf-ro">—</span>' : (scrapEff > 0 ? fmtQty(scrapEff) : '<span class="pf-ro">—</span>'));
-            }
-            // The per-row "Select serials" button was removed — source-serial
-            // selection lives solely in the "Source serial numbers" section below.
-            var descLbl = line.isLabour ? ' <span class="pf-ro">(non-inventory)</span>' : '';
+                    'oninput="PSFinish.lineDirty(this)" onchange="PSFinish.scrapChange(' + i + ', this)">' + scrapHintHtml(line)
+                : (line.isLabour ? '<span class="pf-ro">—</span>' : (scrapEff > 0 ? fmtQty(scrapEff) : '<span class="pf-ro">—</span>'));
+            var serialBtn = (!line.isLabour && line.isSerialTracked)
+                ? '<button class="ps-btn sm" style="margin-top:4px" onclick="PSFinish.openSourceSerials(' + i + ')">Select serials</button>'
+                : '';
+            var descLbl = line.isLabour ? ' <span class="pf-ro">(auto-fulfilled)</span>' : '';
             return '<tr>' +
                 '<td><span class="pf-partn">' + esc(line.partNum) + '</span>' + descLbl +
-                    (line.partDesc ? '<div class="pf-desc">' + esc(line.partDesc) + '</div>' : '') + '</td>' +
+                    (line.partDesc ? '<div class="pf-desc">' + esc(line.partDesc) + '</div>' : '') + serialBtn + '</td>' +
                 '<td>' + esc(line.uom) + '</td>' +
                 '<td class="num">' + psSpill(availTone, availLabel) + '</td>' +
                 '<td class="num">' + fmtQty(target) + '</td>' +
@@ -7914,7 +5547,7 @@ const PSFinish = (function () {
                 fgSectionHtml(fs) +
                 '<div class="dsec" style="display:flex;gap:8px;justify-content:flex-end">' +
                   (fs.status === 'ready'
-                    ? '<button class="ps-btn primary" onclick="PSFinish.finish()">' + (fs.isShort ? 'Finish short WO' : 'Finish WO') + '</button>'
+                    ? '<button class="ps-btn primary" onclick="PSFinish.finish()">Finish WO</button>'
                     : '<button class="ps-btn primary" disabled title="Resolve blockers above">Finish WO</button>') +
                   '<button class="ps-btn" onclick="PSFinish.close()">Cancel</button>' +
                 '</div>' +
@@ -7975,62 +5608,9 @@ const PSFinish = (function () {
         showDrawer('track');
     }
 
-    // Scrap picker (tier-3 drawer, mode 'scrap') — choose which serials / lot-tags
-    // are scrapped for a tracked raw line. Resolves the scrap location, loads the
-    // candidate pool there, and seeds any prior selection for this line.
-    async function openTrackScrap(lineIdx) {
-        var fs = active; if (!fs || !fs.lines[lineIdx]) return;
-        var line = fs.lines[lineIdx];
-        var qty = parseFloat(line.scrappedInput) || 0;
-        if (qty <= 0) { showToast('Enter a scrap qty first', 'info'); return; }
-        if (line.isSerialTracked && Math.abs(qty - Math.floor(qty)) > 1e-9) { showToast('Serial-tracked scrap qty must be a whole number', 'error', 3500); return; }
-        var lgId = parseInt(fs.woRow && fs.woRow.locationgroupid, 10) || 0;
-        var loc;
-        try { loc = await resolveScrapLocation(line, lgId, qty); }
-        catch (e) { showToast('Could not resolve a scrap location: ' + (e && e.message || e), 'error', 4000); return; }
-        if (!loc || !loc.lgName || !loc.locName) { showToast('No single location has ' + fmtQty(qty) + ' of ' + line.partNum + ' available to scrap', 'error', 4500); return; }
-        var prev = (fs.scrapSel && fs.scrapSel[lineIdx]) || null;
-        try {
-            if (line.isSerialTracked) {
-                var pool = await scrapSerialPool(line.partId, loc.locId);
-                track = { mode: 'scrap', isSerial: true, lineIdx: lineIdx, line: line, loc: loc, qty: qty,
-                    serialFields: pool.serialFields, units: pool.units, filter: '',
-                    selectedSids: new Set((prev && prev._sids) || []) };
-            } else {
-                var tags = await scrapLotPool(line.partId, loc.locId);
-                track = { mode: 'scrap', isSerial: false, lineIdx: lineIdx, line: line, loc: loc, qty: qty,
-                    tags: tags, filter: '', tagQty: Object.assign({}, (prev && prev._tagQty) || {}) };
-            }
-        } catch (e) { showToast('Failed to load scrap candidates: ' + (e && e.message || e), 'error', 4000); return; }
-        renderTrackDrawer();
-        showDrawer('track');
-    }
-
     function trackApply() {
         var fs = active;
         if (!track || !fs) return;
-        if (track.mode === 'scrap') {
-            var idx = track.lineIdx, locStr = track.loc.lgName + '-' + track.loc.locName;
-            if (track.isSerial) {
-                var picked = track.units.filter(function (u) { return track.selectedSids.has(u.sid); });
-                if (picked.length !== Math.round(track.qty)) { showToast('Select exactly ' + fmtQty(track.qty) + ' serial' + (track.qty === 1 ? '' : 's'), 'error', 3500); return; }
-                var rows = buildScrapSerialRows(track.line.partNum, locStr, picked, track.serialFields);
-                fs.scrapSel[idx] = { qty: picked.length, location: locStr, rows: rows, _sids: Array.from(track.selectedSids) };
-            } else {
-                var total = 0, pickedTags = [];
-                track.tags.forEach(function (t) {
-                    var q = parseFloat(track.tagQty[t.tagId]) || 0;
-                    if (q > t.avail + 1e-9) q = t.avail;
-                    if (q > 0) { total += q; pickedTags.push({ tagId: t.tagId, tagNum: t.tagNum, qty: q, fields: t.fields }); }
-                });
-                if (Math.abs(total - track.qty) > 1e-6) { showToast('Allocated ' + fmtQty(total) + ' of ' + fmtQty(track.qty) + ' — adjust the lot quantities', 'error', 3800); return; }
-                var rows2 = buildScrapLotRows(track.line.partNum, locStr, pickedTags);
-                fs.scrapSel[idx] = { qty: total, location: locStr, rows: rows2, _tagQty: Object.assign({}, track.tagQty) };
-            }
-            hideDrawer('track'); track = null;
-            renderFinishDrawer();
-            return;
-        }
         if (track.mode === 'source') {
             if (!track.readOnly) {
                 fs.serialSelection[track.line.pickitemId] = Array.from(track.selected);
@@ -8058,63 +5638,7 @@ const PSFinish = (function () {
         var panel = document.getElementById('trackPanel');
         if (!panel || !track) return;
         if (track.mode === 'source') { panel.innerHTML = renderTrackSource(); }
-        else if (track.mode === 'scrap') { panel.innerHTML = renderTrackScrap(); }
         else { panel.innerHTML = renderTrackFg(); }
-    }
-
-    // Scrap picker render — serial mode = checkbox list (choose exactly the scrap
-    // qty); lot mode = per-tag qty inputs (allocate the scrap qty across tags).
-    function renderTrackScrap() {
-        var locStr = track.loc.lgName + '-' + track.loc.locName;
-        if (track.isSerial) {
-            var have = track.selectedSids.size, need = Math.round(track.qty);
-            var cntCls = have === need ? 'ok' : (have === 0 ? 'fail' : 'warn');
-            var f = (track.filter || '').trim().toLowerCase();
-            var items = track.units.filter(function (u) { return !f || (u.label || '').toLowerCase().indexOf(f) !== -1 || (u.lotLabel || '').toLowerCase().indexOf(f) !== -1; });
-            var toolbar =
-                '<div class="pf-tk-toolbar">' +
-                  '<input type="text" placeholder="Filter serial…" oninput="PSFinish.scrapFilter(this.value)">' +
-                  '<a onclick="PSFinish.scrapFirstN()">First ' + need + '</a><span class="sep">·</span>' +
-                  '<a onclick="PSFinish.scrapClear()">Clear</a>' +
-                '</div>';
-            var list = items.length ? items.map(function (u) {
-                var sel = track.selectedSids.has(u.sid);
-                var meta = [];
-                if (u.lotLabel) meta.push(u.lotLabel);
-                if (u.tagNum) meta.push('Tag ' + u.tagNum);
-                return '<div class="pf-tk-item' + (sel ? ' selected' : '') + '" onclick="PSFinish.scrapToggle(' + u.sid + ')">' +
-                    '<input type="checkbox"' + (sel ? ' checked' : '') + '>' +
-                    '<span class="pf-tk-sn">' + esc(u.label) + '</span>' +
-                    '<span class="pf-tk-meta">' + esc(meta.join(' · ')) + '</span></div>';
-            }).join('') : '<div class="pf-tk-empty">No serials available at ' + esc(locStr) + '.</div>';
-            var foot = '<div class="dsec" style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:12px">' +
-                '<span class="pf-tk-count ' + cntCls + '">' + have + ' / ' + need + ' selected</span>' +
-                '<div style="display:flex;gap:6px"><button class="ps-btn primary" onclick="PSFinish.trackApply()">Apply</button>' +
-                '<button class="ps-btn" onclick="PSFinish.closeTop()">Back</button></div></div>';
-            return trackHead('Scrap serials — ' + track.line.partNum, 'Choose ' + need + ' serial' + (need === 1 ? '' : 's') + ' to scrap from ' + locStr) +
-                '<div class="detail-body" style="display:flex;flex-direction:column">' + toolbar +
-                  '<div class="pf-tk-list">' + list + '</div>' + foot + '</div>';
-        }
-        // Lot mode
-        var total = 0; track.tags.forEach(function (t) { total += parseFloat(track.tagQty[t.tagId]) || 0; });
-        var cls = Math.abs(total - track.qty) < 1e-6 ? 'ok' : (total === 0 ? 'fail' : 'warn');
-        var f2 = (track.filter || '').trim().toLowerCase();
-        var tagItems = track.tags.filter(function (t) { return !f2 || (t.lotLabel || '').toLowerCase().indexOf(f2) !== -1 || (t.tagNum || '').toLowerCase().indexOf(f2) !== -1; });
-        var toolbar2 = '<div class="pf-tk-toolbar"><input type="text" placeholder="Filter lot…" oninput="PSFinish.scrapFilter(this.value)"><a onclick="PSFinish.scrapClear()">Clear</a></div>';
-        var rows = tagItems.length ? tagItems.map(function (t) {
-            var q = track.tagQty[t.tagId] == null ? '' : track.tagQty[t.tagId];
-            return '<div class="pf-tk-item" style="cursor:default">' +
-                '<span class="pf-tk-sn">' + esc(t.lotLabel) + '</span>' +
-                '<span class="pf-tk-meta">avail ' + fmtQty(t.avail) + (t.tagNum ? ' · Tag ' + esc(t.tagNum) : '') + '</span>' +
-                '<input type="number" min="0" max="' + t.avail + '" step="0.001" value="' + q + '" placeholder="0" style="width:82px;height:26px;text-align:right" onclick="event.stopPropagation()" onchange="PSFinish.scrapLotQty(' + t.tagId + ', this.value)"></div>';
-        }).join('') : '<div class="pf-tk-empty">No lots available at ' + esc(locStr) + '.</div>';
-        var foot2 = '<div class="dsec" style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:12px">' +
-            '<span class="pf-tk-count ' + cls + '">' + fmtQty(total) + ' / ' + fmtQty(track.qty) + ' allocated</span>' +
-            '<div style="display:flex;gap:6px"><button class="ps-btn primary" onclick="PSFinish.trackApply()">Apply</button>' +
-            '<button class="ps-btn" onclick="PSFinish.closeTop()">Back</button></div></div>';
-        return trackHead('Scrap lots — ' + track.line.partNum, 'Allocate ' + fmtQty(track.qty) + ' to scrap from ' + locStr) +
-            '<div class="detail-body" style="display:flex;flex-direction:column">' + toolbar2 +
-              '<div class="pf-tk-list">' + rows + '</div>' + foot2 + '</div>';
     }
 
     function trackHead(title, sub) {
@@ -8253,73 +5777,22 @@ const PSFinish = (function () {
         var scrapSummary = plan.rows.length
             ? '\n\nAdditionally the following will be scrapped:\n' + plan.rows.map(function (r) { return r.partNum + ' ×' + fmtQty(r.qty) + ' @ ' + r.location; }).join('\n')
             : '';
-        // When the WO is short of raw goods (and the admin has allowed finishing
-        // short), escalate to a styled DANGER warning modal that spells out the
-        // missing materials before completion — the "additional warning" gate. A
-        // fully-stocked WO keeps the normal warn-toned confirm.
-        var isShort = !!fs.isShort;
-        var shortSummary = (isShort && fs.shortLines && fs.shortLines.length)
-            ? '\n\nRAW GOODS SHORT — the WO will finish having consumed less than required:\n' +
-              fs.shortLines.map(function (s) { var f = shortLineFigures(fs, s); return s.partNum + ' — short ' + fmtQty(f.shortfall) + ' (only ' + fmtQty(f.consumed) + ' of ' + fmtQty(f.target) + ' available)'; }).join('\n')
-            : '';
-        // Styled confirmation (psConfirm) instead of the browser's built-in
-        // confirm() so the prompt matches the report chrome. finish() is async,
-        // so we can await it directly.
-        var okFinish = await psConfirm({
-            title: isShort ? ('Finish WO ' + w.wo_num + ' SHORT?') : ('Finish WO ' + w.wo_num + '?'),
-            message: (isShort
-                ? 'This work order is MISSING raw materials. Finishing now completes it with those components under-consumed — on-hand inventory will not reflect a full build, and this cannot be undone from this report.\n\n'
-                : 'This commits the pick and marks the WO Fulfilled. Cannot be undone from this report.') +
-                shortSummary + scrapSummary,
-            confirmLabel: isShort ? 'Finish short anyway' : 'Finish WO',
-            cancelLabel: 'Cancel',
-            tone: isShort ? 'danger' : 'warn'
-        });
-        if (!okFinish) { fs.status = 'ready'; renderFinishDrawer(); return; }
+        var prompt = 'Finish WO ' + w.wo_num + '?\n\nThis commits the pick and marks the WO Fulfilled. Cannot be undone from this report.' + scrapSummary;
+        if (!confirm(prompt)) { fs.status = 'ready'; renderFinishDrawer(); return; }
         _scrapImp = null;   // fresh ImportScrapData header per finish
-        // Used-qty writeback. Inventory lines: a pick-based OVERRIDE only when the
-        // operator's Used diverges from what the pick would consume. Non-inventory
-        // lines: the FULL consumed qty for EVERY line (they have no pick, so Finish
-        // must set it explicitly — see the isLabour branch below).
-        var usedOverrides = [];   // pick-based (any PICKED line: Inventory 10 + Non-Inventory 30) — pickitem.qty deltas
-        var woItemUsed = [];      // WO-save based (NON-picked types: Service/Labor/Overhead/Internal Use/…) — always sent
+        // Used-qty overrides — only where the operator's Used input
+        // diverges from what the pick would consume by default.
+        var usedOverrides = [];
         (fs.lines || []).forEach(function (line) {
-            if (!line.woitemId) return;
-            // Route by whether the line is actually PICKED, NOT by "type 10 only".
-            // Fishbowl generates pick lines for BOTH Inventory (10) and Non-Inventory
-            // (30), and on finish it derives those lines' qtyUsed from the COMMITTED
-            // PICK qty — DB-PROVEN WO 1007: a Non-Inventory line (SP100) had its woitem
-            // QtyToFulfill workaround set to 4 but used still landed on 2 = the pick qty.
-            // So a picked line's Used override must rewrite the PICKITEM qty
-            // (applyUsedOverrides), exactly like an inventory line; the finish then drives
-            // used from the committed pick (used>target overconsume works, and the woitem
-            // target is left untouched — Non-Inventory has no stock so nothing is pulled,
-            // the qty is just recorded). Non-picked types have NO pick line, so their used
-            // is written on the woitem via the QtyToFulfill-target workaround instead.
-            // hasPick is data-driven (the line carries a pickitem: pending or picked qty),
-            // so it needs no hardcoded type list and self-corrects if a customer's config
-            // makes a different type pickable.
-            var hasPick = (line.pendingQty > 0) || (line.pickedQty > 0);
-            if (hasPick) {
-                var raw = line.usedInput;
-                if (raw == null || raw === '') return;              // blank → consume the pick qty
-                var used = parseFloat(raw);
-                if (!Number.isFinite(used) || used < 0) return;
-                var expected = line.pendingQty > 0 ? line.pendingQty : line.pickedQty;
-                if (Math.abs(used - expected) > 1e-6) {
-                    usedOverrides.push({ woItemId: line.woitemId, partNum: line.partNum, qty: used });
-                }
-                return;
+            if (line.isLabour || !line.woitemId) return;
+            var raw = line.usedInput;
+            if (raw == null || raw === '') return;
+            var used = parseFloat(raw);
+            if (!Number.isFinite(used) || used < 0) return;
+            var expected = line.pendingQty > 0 ? line.pendingQty : line.pickedQty;
+            if (Math.abs(used - expected) > 1e-6) {
+                usedOverrides.push({ woItemId: line.woitemId, partNum: line.partNum, qty: used });
             }
-            // Not picked (Service/Labor/Overhead/Internal Use/Capital/Shipping/Tax/Misc):
-            // there is NO pick line, so Fishbowl won't populate the consumed qty for us —
-            // it's written on the woitem via the QtyToFulfill-target workaround. A blank
-            // Used means "consume the target" (effectiveUsedQty resolves blank → target),
-            // so ALWAYS send a value: sending only-when-differing once left blank/at-target
-            // lines finishing at QtyUsed 0 (the "used part not consumed" bug). Setting
-            // QtyUsed = target is idempotent and safe.
-            var lu = effectiveUsedQty(line);
-            if (Number.isFinite(lu) && lu >= 0) woItemUsed.push({ woItemId: line.woitemId, partId: line.partId, partNum: line.partNum, qty: lu });
         });
         fs.status = 'submitting'; fs.steps = []; fs.lastError = null; fs.blockers = [];
         renderFinishDrawer();
@@ -8329,10 +5802,8 @@ const PSFinish = (function () {
                 fgDefs: fs.fg.defs,
                 selectedSerialKeys: collectSelectedSerialKeys(fs),
                 usedOverrides: usedOverrides,
-                woItemUsed: woItemUsed,
                 scrapRows: plan.rows,
                 scrapImporter: postScrapImport,
-                allowShort: allowFinishShort(),
                 post: true,
                 onStep: function (label) { if (active === fs) { fs.steps.push(label); renderFinishDrawer(); } },
             });
@@ -8342,23 +5813,11 @@ const PSFinish = (function () {
                 renderFinishDrawer();
                 showToast('WO ' + w.wo_num + ' finished', 'success');
                 setStatus('WO ' + w.wo_num + ' fulfilled.');
-                // Optimistically flip the WO to Fulfilled in memory so the detail
-                // drawer beneath reflects it IMMEDIATELY. loadWorkOrders() reloads
-                // ASYNCHRONOUSLY (runQueryAsync), so a synchronous openDetail would
-                // otherwise re-read the stale (pre-finish) status and keep showing
-                // the Finish WO button; the background reload reconciles after.
-                try {
-                    var _fw = allWorkOrders.find(function (x) { return String(x.wo_id) === String(fs.woId); });
-                    if (_fw) {
-                        _fw.wo_status = 40;
-                        _fw.date_finished = _fw.date_finished || moment().format('YYYY-MM-DD[T]HH:mm:ss');
-                    }
-                } catch (_) {}
                 if (typeof loadWorkOrders === 'function') loadWorkOrders();
                 // Refresh the detail drawer sitting beneath the finish drawer so it
                 // reflects the now-Fulfilled WO — status pill flips to Fulfilled and
-                // the Finish WO button drops out (openDetail reads the optimistic
-                // status above; the background reload keeps it in sync thereafter).
+                // the Finish WO button drops out. loadWorkOrders() re-queries
+                // allWorkOrders synchronously, so openDetail re-reads the updated WO.
                 try {
                     var dp = document.getElementById('detailPanel');
                     if (dp && dp.classList.contains('on') && String(_avDetailWoId) === String(fs.woId) && typeof openDetail === 'function') {
@@ -8414,35 +5873,7 @@ const PSFinish = (function () {
             if (raw === '') fs.lines[idx].scrappedInput = null;
             else { var n = parseFloat(raw); fs.lines[idx].scrappedInput = (!Number.isFinite(n) || n < 0) ? 0 : n; }
             fs.lines[idx].dirty = true;
-            if (fs.scrapSel) delete fs.scrapSel[idx];   // qty changed → a tracked line must reselect
             renderFinishDrawer();
-        },
-        // Scrap serial/lot picker (tracked lines).
-        openScrapPicker: openTrackScrap,
-        scrapFilter: function (v) { if (track && track.mode === 'scrap') { track.filter = v; renderTrackDrawer(); } },
-        scrapToggle: function (sid) {
-            if (!track || track.mode !== 'scrap' || !track.isSerial) return;
-            sid = Number(sid);
-            if (track.selectedSids.has(sid)) track.selectedSids.delete(sid); else track.selectedSids.add(sid);
-            renderTrackDrawer();
-        },
-        scrapFirstN: function () {
-            if (!track || track.mode !== 'scrap' || !track.isSerial) return;
-            track.selectedSids.clear();
-            var need = Math.round(track.qty);
-            for (var i = 0; i < track.units.length && track.selectedSids.size < need; i++) track.selectedSids.add(track.units[i].sid);
-            renderTrackDrawer();
-        },
-        scrapClear: function () {
-            if (!track || track.mode !== 'scrap') return;
-            if (track.isSerial) track.selectedSids.clear(); else track.tagQty = {};
-            renderTrackDrawer();
-        },
-        scrapLotQty: function (tagId, val) {
-            if (!track || track.mode !== 'scrap' || track.isSerial) return;
-            var n = parseFloat(val);
-            track.tagQty[tagId] = (!Number.isFinite(n) || n < 0) ? 0 : n;
-            renderTrackDrawer();
         },
         // FG tracking field handlers.
         fgTextInput: function (ptId, value) {
@@ -8703,30 +6134,14 @@ async function psLoadAvailability() {
         const today = moment().format('YYYY-MM-DD');
 
         // 1) Per-WO raw requirements (woitem typeid=20).
-        // NOTE ON UNITS: tag.qty (on-hand), pickitem.qty (committed), poitem qty
-        // (incoming PO) and wo.qtyTarget (WO output) are all stored in the PART's
-        // base UOM, but the woitem raw-material line (the demand) is in its OWN
-        // UOM (woi.uomid) — e.g. a part stocked in "4.8m" lengths consumed by a WO
-        // in "mm". So the whole engine POOLS + COMPARES in the part base UOM and
-        // converts the demand into base before allocating; per-part results are
-        // converted back to the line UOM only for display. line_to_base = the
-        // factor to turn a line-UOM qty into a base-UOM qty (Fishbowl convention:
-        // value_to = value_from × multiply/factor). base_uom_code labels on-hand.
         const reqRows = await runQueryAsync(`
             SELECT woi.woid AS wo_id, woi.partid AS part_id, p.num AS part_num,
                    p.description AS part_desc, p.typeid AS part_type,
                    COALESCE(woi.qtytarget, 0) AS qty_target, COALESCE(woi.qtyused, 0) AS qty_used,
-                   uom.code AS uom_code, woi.uomid AS line_uom_id, p.uomid AS base_uom_id,
-                   puom.code AS base_uom_code,
-                   COALESCE(
-                     (SELECT uc.multiply / uc.factor FROM uomconversion uc WHERE uc.fromuomid = woi.uomid AND uc.touomid = p.uomid LIMIT 1),
-                     (SELECT uc.factor / uc.multiply FROM uomconversion uc WHERE uc.fromuomid = p.uomid AND uc.touomid = woi.uomid LIMIT 1),
-                     1
-                   ) AS line_to_base
+                   uom.code AS uom_code
             FROM woitem woi
             INNER JOIN part p ON p.id = woi.partid
             LEFT JOIN uom ON uom.id = woi.uomid
-            LEFT JOIN uom puom ON puom.id = p.uomid
             WHERE woi.typeid = 20 AND woi.woid IN (${woIdList.join(',')})
         `);
         const reqByWo = new Map(), partIds = new Set(), partType = new Map(), demandByPart = new Map();
@@ -8878,16 +6293,10 @@ async function psLoadAvailability() {
                 SELECT po.num AS ponum, v.name AS vendor, pi.partid AS part_id, po.locationgroupid AS lgid,
                        COALESCE(pi.qtytofulfill, 0) AS ordered, COALESCE(pi.qtyfulfilled, 0) AS fulfilled,
                        pi.datescheduledfulfillment AS eta,
-                       COALESCE(
-                         (SELECT uc.multiply / uc.factor FROM uomconversion uc WHERE uc.fromuomid = pi.uomid AND uc.touomid = pp.uomid LIMIT 1),
-                         (SELECT uc.factor / uc.multiply FROM uomconversion uc WHERE uc.fromuomid = pp.uomid AND uc.touomid = pi.uomid LIMIT 1),
-                         1
-                       ) AS line_to_base,
                        (SELECT m.memo FROM memo m WHERE m.recordid = po.id
                           AND m.memo LIKE 'Created from manufacture order number: %' LIMIT 1) AS momemo
                 FROM poitem pi INNER JOIN po ON po.id = pi.poid
                 LEFT JOIN vendor v ON v.id = po.vendorid
-                LEFT JOIN part pp ON pp.id = pi.partid
                 WHERE pi.partid IN (${partIdArr.join(',')})
                   AND po.statusid BETWEEN 20 AND 55
                   AND pi.qtytofulfill > pi.qtyfulfilled
@@ -8895,50 +6304,13 @@ async function psLoadAvailability() {
                 const key = String(r.part_id) + '|' + String(r.lgid);
                 if (!supplyByPartLg.has(key)) supplyByPartLg.set(key, []);
                 const mm = r.momemo ? String(r.momemo).match(/Created from manufacture order number:\s*(\d+)/) : null;
-                // Outstanding qty is in the PO line's UOM; convert to the part base
-                // UOM so it pools consistently with on-hand / committed / WO output.
-                const _l2b = parseFloat(r.line_to_base); const l2b = (isFinite(_l2b) && _l2b > 0) ? _l2b : 1;
                 supplyByPartLg.get(key).push({
                     ponum: r.ponum, vendor: r.vendor || '',
-                    outstanding: ((parseFloat(r.ordered) || 0) - (parseFloat(r.fulfilled) || 0)) * l2b,
+                    outstanding: (parseFloat(r.ordered) || 0) - (parseFloat(r.fulfilled) || 0),
                     eta: r.eta ? String(r.eta).substring(0, 10) : '',
                     linkedMoNum: mm ? mm[1] : null
                 });
             });
-        }
-
-        // Pending / unissued PO coverage — Bid Request (10) + Pending Approval (15).
-        // These are NOT confirmed supply (deliberately excluded from availByPartLg /
-        // supplyByPartLg above, so the part still reads Short), but the planner wants
-        // to see that a bid already covers a shortage — otherwise "did I already raise
-        // a PO for this?" is ambiguous. Collect outstanding qty per part+LG so the
-        // Procurement worklist can flag + link it. Self-guarded so a failure just
-        // leaves the indicator blank rather than disabling availability.
-        psPendingPo = new Map();
-        if (partIdArr.length) {
-            try {
-                (await runQueryAsync(`
-                    SELECT po.num AS ponum, po.statusid AS statusid, ps.name AS status_name,
-                           pi.partid AS part_id, po.locationgroupid AS lgid,
-                           COALESCE(pi.qtytofulfill, 0) AS ordered, COALESCE(pi.qtyfulfilled, 0) AS fulfilled,
-                           pi.datescheduledfulfillment AS eta
-                    FROM poitem pi INNER JOIN po ON po.id = pi.poid
-                    LEFT JOIN postatus ps ON ps.id = po.statusid
-                    WHERE pi.partid IN (${partIdArr.join(',')})
-                      AND po.statusid IN (10, 15)
-                      AND pi.qtytofulfill > pi.qtyfulfilled
-                `)).forEach(r => {
-                    const key = String(r.part_id) + '|' + String(r.lgid);
-                    if (!psPendingPo.has(key)) psPendingPo.set(key, []);
-                    psPendingPo.get(key).push({
-                        ponum: r.ponum, statusId: parseInt(r.statusid, 10),
-                        statusName: r.status_name || 'Pending',
-                        outstanding: (parseFloat(r.ordered) || 0) - (parseFloat(r.fulfilled) || 0),
-                        eta: r.eta ? String(r.eta).substring(0, 10) : ''
-                    });
-                });
-                debugLog('success', `Pending/bid POs: ${psPendingPo.size} part+LG group(s)`);
-            } catch (e) { debugLog('warn', 'Pending-PO scan failed (indicator disabled): ' + (e && e.message)); }
         }
 
         // Staged components: this WO consumes a part produced by another WO.
@@ -9070,30 +6442,22 @@ async function psLoadAvailability() {
             reqs.forEach(req => {
                 const pid = String(req.part_id);
                 const isInv = partType.get(pid) === 10;                        // only Inventory parts carry stock
-                // UOM: the pool math below runs in the part BASE uom (what tag.qty
-                // is stored in); the woitem line (req.uom_code) may differ. Convert
-                // the demand to base for allocation; keep needLine for display.
-                const _l2b = parseFloat(req.line_to_base); const lineToBase = (isFinite(_l2b) && _l2b > 0) ? _l2b : 1;
-                const baseToLine = lineToBase ? (1 / lineToBase) : 1;
-                const toLine = v => (v == null ? v : v * baseToLine);          // base → line (display)
-                const baseUom = req.base_uom_code || '';
-                const needLine = woClosed ? 0 : Math.max(0, (parseFloat(req.qty_target) || 0) - (parseFloat(req.qty_used) || 0)); // display (line uom)
-                const need = needLine * lineToBase;                            // BASE uom — all pooling/compares below
+                const need = woClosed ? 0 : Math.max(0, (parseFloat(req.qty_target) || 0) - (parseFloat(req.qty_used) || 0));
                 const producerId = staged.get(String(req.part_num));
-                const oh = isInv ? getOnhand(pid, lg) : null;                  // base uom (on-hand display)
+                const oh = isInv ? getOnhand(pid, lg) : null;
                 const cRec = isInv ? committedByWoPart.get(wo.wo_id + '|' + pid) : null;
-                const committedQ = (cRec ? cRec.qty : 0) * lineToBase;         // pickitem qty (line) → base
+                const committedQ = cRec ? cRec.qty : 0;
                 const committedStatus = cRec ? cRec.status : 0;   // 40 = Finished, 30 = Committed
                 if (producerId != null) {   // built by another WO — resolved in the tree walk
-                    parts.push({ partId: pid, partNum: req.part_num, partDesc: req.part_desc, need: needLine, uom: req.uom_code || '', baseUom, onhand: null, availableBy: today, unmet: false, staged: true, producerId, nonInv: false, committed: false, committedQty: 0, committedStatus: 0, availQty: 0, contended: false, contendedBy: [] });
+                    parts.push({ partId: pid, partNum: req.part_num, partDesc: req.part_desc, need, uom: req.uom_code || '', onhand: null, availableBy: today, unmet: false, staged: true, producerId, nonInv: false, committed: false, committedQty: 0, committedStatus: 0, availQty: 0, contended: false, contendedBy: [] });
                     return;
                 }
                 if (!isInv) {   // Non-inventory / Internal-use — never stocked, so never "unmet"; shows N/A
-                    parts.push({ partId: pid, partNum: req.part_num, partDesc: req.part_desc, need: needLine, uom: req.uom_code || '', baseUom, onhand: null, availableBy: today, unmet: false, staged: false, nonInv: true, committed: false, committedQty: 0, committedStatus: 0, availQty: null, contended: false, contendedBy: [] });
+                    parts.push({ partId: pid, partNum: req.part_num, partDesc: req.part_desc, need, uom: req.uom_code || '', onhand: null, availableBy: today, unmet: false, staged: false, nonInv: true, committed: false, committedQty: 0, committedStatus: 0, availQty: null, contended: false, contendedBy: [] });
                     return;
                 }
                 if (need <= 0) {
-                    parts.push({ partId: pid, partNum: req.part_num, partDesc: req.part_desc, need: 0, uom: req.uom_code || '', baseUom, onhand: oh, availableBy: today, unmet: false, staged: false, nonInv: false, committed: committedQ > 0, committedQty: toLine(committedQ), committedStatus, availQty: 0, contended: false, contendedBy: [] });
+                    parts.push({ partId: pid, partNum: req.part_num, partDesc: req.part_desc, need: 0, uom: req.uom_code || '', onhand: oh, availableBy: today, unmet: false, staged: false, nonInv: false, committed: committedQ > 0, committedQty: committedQ, committedStatus, availQty: 0, contended: false, contendedBy: [] });
                     return;
                 }
                 const stockKey = pid + '|' + lg;
@@ -9149,7 +6513,7 @@ async function psLoadAvailability() {
                 // means "was due earlier and hasn't arrived" — surface it as Overdue.
                 const etaOverdue = !unmet && !contended && sawOverdue && by === today && availNow < need - 1e-6;
                 if (etaOverdue) rawOverdue = true;
-                parts.push({ partId: pid, partNum: req.part_num, partDesc: req.part_desc, need: needLine, uom: req.uom_code || '', baseUom, onhand: oh, availableBy: by, unmet, staged: false, nonInv: false, committed: committedFull, committedQty: toLine(committedQ), committedStatus, availQty: toLine(availNow), shortfall: toLine(remaining), moPoEta: etaFromMoPo, woEta: etaFromWo, etaOverdue, contended, contendedBy: priorClaims });
+                parts.push({ partId: pid, partNum: req.part_num, partDesc: req.part_desc, need, uom: req.uom_code || '', onhand: oh, availableBy: by, unmet, staged: false, nonInv: false, committed: committedFull, committedQty: committedQ, committedStatus, availQty: availNow, shortfall: remaining, moPoEta: etaFromMoPo, woEta: etaFromWo, etaOverdue, contended, contendedBy: priorClaims });
                 if (by && by > rawBy) rawBy = by;
             });
             wo._av = { parts, rawBy: rawUnmet ? null : rawBy, rawUnmet, rawContended, rawNowOk, rawOverdue };
@@ -9294,28 +6658,19 @@ function psAvailPartsHTML(w) {
             // Available-to-pick now / needed as an X/Y figure, coloured with the
             // pill tone palette: critical = none, caution = partial, success =
             // full. Committed picks render in the active tone.
-            const Y = p.need || 0;
-            // Contested stock is physically on hand NOW — the full uncommitted need
-            // exists in the LG (earlier-scheduled WOs merely have first claim), and
-            // the Finish flow can pick it — so show it as available now (Y/Y) rather
-            // than the schedule-rationed availQty, which read a deceptive 0/Y even
-            // though Finish proceeds. The "In stock · earlier WO" ETA chip still
-            // conveys the contention.
-            const X = p.contended ? Y : (p.availQty || 0);
+            const X = p.availQty || 0, Y = p.need || 0;
             let col;
             if (p.committed) col = '#1e7bb4';       // active
             else if (X >= Y) col = '#1B7A46';       // success
             else if (X > 0) col = '#8A4E10';        // caution
             else col = '#8A1E30';                   // critical
             const ttl = p.committed ? ((p.committedStatus >= 40 ? 'Finished' : 'Committed') + ' — secured to this WO on a pick')
-                : (p.contended ? 'On hand now — but earlier-scheduled WOs have first claim (reprioritise to secure)'
                 : (X >= Y ? 'Full quantity available to pick now'
+                : (p.contended ? 'Physically in stock, but earlier-scheduled WOs have first claim'
                 : (p.etaOverdue ? 'Covered only by an overdue PO / WO — was due before today and has not arrived'
                 : (p.availableBy ? ('Full quantity available by ' + psFmtDate(p.availableBy)) : 'Cannot be fully sourced from stock or open POs'))));
-            // Show just the available-now value in the line (bomitem) UOM — not an
-            // X / Y figure — so it reads cleanly and in the same unit as Need.
             st = '<span style="font-weight:700;font-variant-numeric:tabular-nums;color:' + col + '" title="' + psEsc(ttl) + '">' +
-                 psEsc(psFmtQty(X)) + (p.uom ? ' ' + psEsc(p.uom) : '') + '</span>';
+                 psEsc(psFmtQty(X)) + ' / ' + psEsc(psFmtQty(Y)) + '</span>';
             // ETA / contention indicator.
             if (p.committed) {
                 const isFinished = p.committedStatus >= 40;
@@ -9350,9 +6705,7 @@ function psAvailPartsHTML(w) {
                 eta = '<span style="color:#8A1E30;font-weight:700" title="Cannot be fully sourced from stock or open POs">No ETA</span>';
             }
         }
-        // On hand stays in the part's base UOM (e.g. "4.8m" lengths) — labelled so
-        // it's clear it's a different unit from Need / Avail. now (the line UOM).
-        const oh = p.nonInv ? 'N/A' : (p.onhand != null ? (psFmtQty(p.onhand) + (p.baseUom ? ' ' + psEsc(p.baseUom) : '')) : '—');
+        const oh = p.nonInv ? 'N/A' : (p.onhand != null ? psFmtQty(p.onhand) : '—');
         // Part number links to the Fishbowl Part module.
         const apn = p.partNum
             ? '<a href="#" onclick="event.preventDefault();openModule(\'Part\',\'' + String(p.partNum).replace(/'/g, "\\'") + '\')" style="color:var(--link);text-decoration:none">' + psEsc(p.partNum) + '</a>'
@@ -9477,59 +6830,6 @@ function sortWOsByDependencies(wos) {
 }
 
 // ============================================
-// TIMELINE — CHAIN-MAJOR ROW ORDER (MO grouping)
-// ----
-// Within an MO group, order the WO rows so each dependency CHAIN is contiguous
-// instead of interleaving parallel chains stage-by-stage (the effect of the old
-// start-date sort). An MO with two configurations of the same finished good
-// (e.g. MO 1010: two PROD-1000 builds, each a nested ABC.rev2 → FBL → SUB → PROD
-// chain) then reads as two clean staircases with non-crossing dependency arrows.
-//   1. Split the group's WOs into connected components of the staging-dependency
-//      graph (restricted to this group) — each component is one build chain.
-//   2. Order WITHIN a component by sortWOsByDependencies (producer → consumer,
-//      ties by WO#).
-//   3. Order the components by earliest start date, then lowest WO#.
-//   4. Concatenate.
-// Zero new queries (reuses stagingDependencies). A single-chain MO returns the
-// same order it would have anyway; used only for viewMode==='mo' (dependency
-// arrows only draw there). If two configs ever share a WO they merge into one
-// chain, which is the correct reading.
-function psOrderMoRowsByChain(items) {
-    if (!items || items.length <= 1) return (items || []).slice();
-    const ids = new Set(items.map(w => String(w.wo_id)));
-    const byId = new Map(items.map(w => [String(w.wo_id), w]));
-    // Undirected adjacency from staging deps, restricted to this group's WOs.
-    const adj = new Map();
-    items.forEach(w => adj.set(String(w.wo_id), []));
-    stagingDependencies.forEach(d => {
-        const a = String(d.wo_id), b = String(d.staging_wo_id);
-        if (ids.has(a) && ids.has(b) && a !== b) { adj.get(a).push(b); adj.get(b).push(a); }
-    });
-    // Connected components (each = one build chain), in first-seen order.
-    const seen = new Set(), comps = [];
-    items.forEach(w => {
-        const id = String(w.wo_id);
-        if (seen.has(id)) return;
-        const comp = [], stack = [id]; seen.add(id);
-        while (stack.length) {
-            const cur = stack.pop(); comp.push(byId.get(cur));
-            (adj.get(cur) || []).forEach(n => { if (!seen.has(n)) { seen.add(n); stack.push(n); } });
-        }
-        comps.push(comp);
-    });
-    // Order the chains by earliest start date, then lowest WO#.
-    const startVal = w => { const m = moment(w.date_scheduled_start).valueOf(); return isNaN(m) ? Infinity : m; };
-    const minWoNum = c => c.map(w => String(w.wo_num)).sort((x, y) => x.localeCompare(y, undefined, { numeric: true }))[0] || '';
-    comps.sort((x, y) => {
-        const xs = Math.min.apply(null, x.map(startVal)), ys = Math.min.apply(null, y.map(startVal));
-        if (xs !== ys) return xs - ys;
-        return minWoNum(x).localeCompare(minWoNum(y), undefined, { numeric: true });
-    });
-    // Within each chain: dependency order (producer → consumer). Concatenate.
-    return comps.reduce((acc, c) => acc.concat(sortWOsByDependencies(c)), []);
-}
-
-// ============================================
 // SKIP WEEKENDS HELPER
 // ============================================
 function applySkipWeekends(date) {
@@ -9595,31 +6895,6 @@ function psToggleArrows() {
     try { saveSettingsToDatabase(); } catch (_) {}
 }
 
-// Timeline WO-tile label toggle (# = WO number, ABC = Finished Good part number).
-// Either/or; persisted per user like the other toolbar toggles. Preserves the
-// horizontal scroll through the re-render so the bars you're reading stay put.
-function psSetGanttBarLabel(mode) {
-    const m = (mode === 'fg') ? 'fg' : 'wo';
-    if (m === ganttBarLabel) return;
-    ganttBarLabel = m;
-    const sc = document.getElementById('ganttScroll');
-    if (sc) psKeepScroll = sc.scrollLeft;
-    renderGanttChart();
-    try { saveSettingsToDatabase(); } catch (_) {}
-}
-
-// Shared setter for the "Shift Dependent WOs on Drag" mode — driven by both the
-// Timeline toolbar dropdown and the Settings-drawer select. Normalises the value,
-// keeps both controls in sync, and persists (auto-save).
-function psSetShiftDependentMode(v) {
-    shiftDependentMode = (v === 'later' || v === 'both') ? v : 'off';
-    const s1 = document.getElementById('shiftDependentModeSelect');
-    if (s1) s1.value = shiftDependentMode;
-    const s2 = document.getElementById('ganttShiftDepSelect');
-    if (s2) s2.value = shiftDependentMode;
-    try { saveSettingsToDatabase(); } catch (_) {}
-}
-
 // Collapse / expand a Timeline group (MO / category / user). State lives in
 // collapsedMOs (keyed by group id) and is persisted quietly to userproperties
 // — no toast, and the current scroll position is preserved through the re-render.
@@ -9682,31 +6957,17 @@ function renderGanttChart() {
 
     const toolbar =
         '<div class="gantt-toolbar">' +
-          '<button class="ps-btn icon sm" onclick="prevWeek()" title="Previous week"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/></svg></button>' +
-          '<button class="ps-btn sm" onclick="goToToday()">Today</button>' +
-          '<button class="ps-btn icon sm" onclick="nextWeek()" title="Next week"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg></button>' +
+          '<button class="ps-btn icon" onclick="prevWeek()" title="Previous week"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/></svg></button>' +
+          '<button class="ps-btn" onclick="goToToday()">Today</button>' +
+          '<button class="ps-btn icon" onclick="nextWeek()" title="Next week"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg></button>' +
           '<span class="filter-sep"></span>' +
-          '<span class="hint" style="font-weight:700;text-transform:uppercase;letter-spacing:.05em" title="When you drag a WO, move the WOs that depend on it by the same amount">Dependents</span>' +
-          '<select id="ganttShiftDepSelect" onchange="psSetShiftDependentMode(this.value)" title="When you drag a WO, move the WOs that depend on it: Off · Later only (push out) · Earlier &amp; later (both directions)" style="height:28px;border:1px solid var(--border-strong);border-radius:var(--r-btn);padding:0 6px;font-size:12px;font-family:inherit;color:var(--c-primary);background:#fff;cursor:pointer">' +
-            '<option value="off"' + (shiftDependentMode === 'off' ? ' selected' : '') + '>Off</option>' +
-            '<option value="later"' + (shiftDependentMode === 'later' ? ' selected' : '') + '>Later only</option>' +
-            '<option value="both"' + (shiftDependentMode === 'both' ? ' selected' : '') + '>Earlier &amp; later</option>' +
-          '</select>' +
+          '<button class="ps-btn icon" onclick="zoomOut()" title="Zoom out"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5 12h14"/></svg></button>' +
+          '<button class="ps-btn icon" onclick="zoomIn()" title="Zoom in"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 5v14M5 12h14"/></svg></button>' +
           '<span class="filter-sep"></span>' +
-          '<button class="ps-btn sm' + (showArrows ? ' primary' : '') + '" id="toggleArrowsBtn" onclick="psToggleArrows()" title="Toggle dependency arrows"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 7l5 5m0 0l-5 5m5-5H6"/></svg>Arrows</button>' +
+          '<button class="ps-btn' + (showArrows ? ' primary' : '') + '" id="toggleArrowsBtn" onclick="psToggleArrows()" title="Toggle dependency arrows"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 7l5 5m0 0l-5 5m5-5H6"/></svg>Arrows</button>' +
           '<span class="filter-sep"></span>' +
-          // Undo / redo — joined as one segmented pair (see .ps-seg), matching the
-          // # / ABC label toggle beside it.
-          '<div class="ps-seg">' +
-            '<button class="ps-btn icon sm" id="undoBtn" onclick="undo()" title="Undo"' + (undoStack.length ? '' : ' disabled') + '><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"/></svg></button>' +
-            '<button class="ps-btn icon sm" id="redoBtn" onclick="redo()" title="Redo"' + (redoStack.length ? '' : ' disabled') + '><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 10h-10a8 8 0 00-8 8v2m18-10l-6-6m6 6l-6 6"/></svg></button>' +
-          '</div>' +
-          '<span class="filter-sep"></span>' +
-          // Either/or toggle for the WO-tile label: # = WO number, ABC = Finished Good part number.
-          '<div class="grpseg" title="Show the WO number or the Finished Good part number on each tile">' +
-            '<button class="' + (ganttBarLabel === 'wo' ? 'active' : '') + '" onclick="psSetGanttBarLabel(\'wo\')" title="Label tiles with the WO number">#</button>' +
-            '<button class="' + (ganttBarLabel === 'fg' ? 'active' : '') + '" onclick="psSetGanttBarLabel(\'fg\')" title="Label tiles with the Finished Good part number">ABC</button>' +
-          '</div>' +
+          '<button class="ps-btn icon" id="undoBtn" onclick="undo()" title="Undo"' + (undoStack.length ? '' : ' disabled') + '><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"/></svg></button>' +
+          '<button class="ps-btn icon" id="redoBtn" onclick="redo()" title="Redo"' + (redoStack.length ? '' : ' disabled') + '><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 10h-10a8 8 0 00-8 8v2m18-10l-6-6m6 6l-6 6"/></svg></button>' +
           '<span style="flex:1"></span>' +
           '<span class="hint"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 7l4-4 4 4M8 17l4 4 4-4"/></svg>Drag a bar to reschedule</span>' +
         '</div>';
@@ -9832,11 +7093,7 @@ function renderGanttChart() {
             const di = dm.diff(start, 'days');
             if (di >= 0 && di < nDays) {
                 const lateDue = dm.isBefore(moment().startOf('day'));
-                // Place the diamond at the RIGHT EDGE of the due day (aligned to
-                // where a WO bar finishing that day ends — bar right edge = day
-                // right edge − the 4px inter-bar gap), not the day's centre, so a
-                // WO due on the same day doesn't read as finishing after the MO.
-                const mleft = LBL + (di + 1) * DAYW - 4;
+                const mleft = LBL + di * DAYW + DAYW / 2;
                 const moNumJs = psEsc(String(g.moNum).replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
                 markerHtml = '<div class="g-modue' + (lateDue ? ' late' : '') + '" data-mo-id="' + g.moId + '" data-mo-num="' + moNumJs + '" style="left:' + mleft + 'px" title="MO ' + psEsc(g.moNum) + ' due ' + psFmtDate(g.due) + ' — drag to reschedule"></div>';
             }
@@ -9851,12 +7108,7 @@ function renderGanttChart() {
               (fg ? '<span class="gc">· ' + psEsc(fg) + '</span>' : '') +
             '</span>' + markerHtml + '</div>';
         if (collapsed) return;   // header only — rows hidden
-        // Row order: chain-major for MO grouping (each dependency chain contiguous,
-        // arrows don't cross — see psOrderMoRowsByChain); start-date sort otherwise.
-        const _rowOrder = (viewMode === 'mo')
-            ? psOrderMoRowsByChain(g.items)
-            : g.items.slice().sort((a, b) => moment(a.date_scheduled_start).valueOf() - moment(b.date_scheduled_start).valueOf());
-        _rowOrder.forEach(w => {
+        g.items.slice().sort((a, b) => moment(a.date_scheduled_start).valueOf() - moment(b.date_scheduled_start).valueOf()).forEach(w => {
             const s = moment(w.date_scheduled_start).startOf('day');
             const f = moment(w.date_scheduled).startOf('day');
             const startIdx = s.diff(start, 'days');
@@ -9890,15 +7142,10 @@ function renderGanttChart() {
                     '<div class="g-bar' + (late ? ' late' : '') + '" data-id="' + w.wo_id + '" data-wo-num="' + psEsc(w.wo_num) + '" ' +
                     'style="left:' + left + 'px;width:' + Math.max(width, 6) + 'px;background:' + barColor + ';color:' + txt + '">' +
                         '<div class="prog" style="width:' + pct + '%"></div>' +
-                        '<span class="lbl">' + psEsc(ganttBarLabel === 'fg' ? (w.part_num || w.wo_num) : w.wo_num) + '</span>' +
+                        (dotColor ? '<div class="g-bardot" style="right:-4px;background:' + dotColor + ';border:2px solid #fff"></div>' : '') +
+                        '<span class="lbl">' + psEsc(w.wo_num) + '</span>' +
                         '<div class="g-resize l"></div><div class="g-resize r"></div>' +
-                    '</div>' +
-                    // Availability signal dot — rendered as a SIBLING of the bar (the
-                    // bar has overflow:hidden, which would clip a corner dot). Its
-                    // centre is snapped to the tile's top-right corner and it sits in
-                    // front of the bar (see .g-bardot: translate(-50%,-50%), z-index 6).
-                    (dotColor ? '<div class="g-bardot" title="' + psEsc(dotTitle) + '" style="left:' + (left + Math.max(width, 6)) + 'px;top:7px;background:' + dotColor + '"></div>' : '')
-                    : '') +
+                    '</div>' : '') +
                 '</div></div>';
         });
     });
@@ -10036,9 +7283,9 @@ function renderGanttChart() {
             function mv(ev) {
                 const dx = ev.clientX - sx;
                 if (Math.abs(dx) > 3) moved = true;
-                let di = Math.round((origLeft + dx - LBL - (DAYW - 4)) / DAYW);
+                let di = Math.round((origLeft + dx - LBL - DAYW / 2) / DAYW);
                 di = Math.max(0, Math.min(di, nDays - 1));
-                mk.style.left = (LBL + (di + 1) * DAYW - 4) + 'px';
+                mk.style.left = (LBL + di * DAYW + DAYW / 2) + 'px';
             }
             function up() {
                 document.removeEventListener('mousemove', mv);
@@ -10046,7 +7293,7 @@ function renderGanttChart() {
                 mk.classList.remove('dragging');
                 mk._moved = moved;
                 if (moved && moId) {
-                    const di = Math.round((parseFloat(mk.style.left) - LBL - (DAYW - 4)) / DAYW);
+                    const di = Math.round((parseFloat(mk.style.left) - LBL - DAYW / 2) / DAYW);
                     const nd = start.clone().add(di, 'days');
                     psApplyMoDate(parseInt(moId, 10), moNum, nd.format('YYYY-MM-DD'));
                 }
@@ -10069,18 +7316,6 @@ function renderGanttChart() {
     //   • when filtering/searching to a subset → scroll to the earliest match
     //   • otherwise → centre on today
     const sc = document.getElementById('ganttScroll');
-    // Focus a specific calendar date (Calendar tab per-day Timeline button). The
-    // scroll is computed straight from the date and re-asserted across rAFs so the
-    // default scroll-to-today below doesn't override it.
-    const focusDate = psFocusDate; psFocusDate = null;
-    if (sc && focusDate) {
-        const di = moment(focusDate, 'YYYY-MM-DD').startOf('day').diff(start, 'days');
-        const targetLeft = Math.max(0, di * DAYW - 160);
-        const applyD = () => { const s2 = document.getElementById('ganttScroll'); if (s2) s2.scrollLeft = targetLeft; };
-        applyD();
-        requestAnimationFrame(() => { applyD(); requestAnimationFrame(applyD); });
-        return;
-    }
     // Focus a specific WO (drawer "Timeline" button). HORIZONTAL scroll is computed
     // DETERMINISTICALLY from dates — start the view the day BEFORE the EARLIEST WO
     // in the focused WO's group (so the whole MO's span reads from its start),
@@ -10153,120 +7388,17 @@ function psApplyWODrag(wo, newStartDay, newEndDay) {
     if (undoStack.length > MAX_UNDO_STACK) undoStack.shift();
     redoStack = [];
     const origStart = moment(wo.date_scheduled_start), origEnd = moment(wo.date_scheduled);
-    // "Skip Weekends When Scheduling" — snap the dragged dates off Sat/Sun. On a
-    // MOVE (both edges shift by the same amount) snap the start and carry the span;
-    // on a RESIZE snap whichever edge actually moved. applySkipWeekends() nudges a
-    // weekend date forward to Monday.
-    if (skipWeekends) {
-        const dS0 = newStartDay.clone().startOf('day').diff(origStart.clone().startOf('day'), 'days');
-        const dE0 = newEndDay.clone().startOf('day').diff(origEnd.clone().startOf('day'), 'days');
-        if (dS0 === dE0) {   // move
-            const snapped = moment(applySkipWeekends(newStartDay.toDate()));
-            const adj = snapped.clone().startOf('day').diff(newStartDay.clone().startOf('day'), 'days');
-            newStartDay = snapped;
-            newEndDay = newEndDay.clone().add(adj, 'days');
-        } else {             // resize — snap only the edge that changed
-            if (dS0 !== 0) newStartDay = moment(applySkipWeekends(newStartDay.toDate()));
-            if (dE0 !== 0) newEndDay = moment(applySkipWeekends(newEndDay.toDate()));
-        }
-    }
-    // Whole-day deltas (bars snap to a day). A MOVE shifts start + finish by the
-    // same amount; a RESIZE changes only one edge — so isMove distinguishes them.
-    const deltaStart = newStartDay.clone().startOf('day').diff(origStart.clone().startOf('day'), 'days');
-    const deltaEnd   = newEndDay.clone().startOf('day').diff(origEnd.clone().startOf('day'), 'days');
-    const isMove = deltaStart === deltaEnd;
     const ns = newStartDay.clone().hour(origStart.hour() || 6).minute(origStart.minute()).second(origStart.second() || 0);
     const ne = newEndDay.clone().hour(origEnd.hour() || 18).minute(origEnd.minute()).second(origEnd.second() || 0);
     if (ns.isSameOrAfter(ne)) { ns.hour(6).minute(0).second(0); ne.hour(18).minute(0).second(0); }
     wo.date_scheduled_start = ns.format('YYYY-MM-DD[T]HH:mm:ss');
     wo.date_scheduled = ne.format('YYYY-MM-DD[T]HH:mm:ss');
-    // "Shift Dependent WOs on Drag" — when moving (not resizing) a WO, cascade the
-    // same day-shift onto every WO that (transitively) consumes its output, so an
-    // MO's downstream stages follow the producer. Only on a genuine move with a
-    // non-zero shift. The mode governs direction: 'later' shifts dependents only
-    // when the producer is pushed to a LATER date (deltaStart > 0); 'both' shifts
-    // them for a move in either direction (pulling a WO earlier drags its
-    // dependents earlier too); 'off' never shifts.
-    let shifted = [];
-    if (isMove && deltaStart !== 0 &&
-        (shiftDependentMode === 'both' || (shiftDependentMode === 'later' && deltaStart > 0))) {
-        shifted = psShiftDependents(wo, deltaStart);
-    }
     const sc = document.getElementById('ganttScroll');
     psKeepScroll = sc ? sc.scrollLeft : null;
     renderGanttChart();
     if (typeof updateUndoRedoButtons === 'function') updateUndoRedoButtons();
-    // Persist after paint so the UI feels instant — the dragged WO first, then any
-    // cascaded dependents.
-    setTimeout(() => {
-        psSaveWODatesQuiet(wo.wo_num, newStartDay.format('YYYY-MM-DD'), newEndDay.format('YYYY-MM-DD'));
-        shifted.forEach(s => psSaveWODatesQuiet(s.woNum, s.start, s.finish));
-    }, 0);
-}
-
-// Cascade a whole-day shift onto every WO that (transitively) DEPENDS ON the
-// dragged WO — i.e. consumes a part the dragged WO (or its dependents) produces,
-// per stagingDependencies (staging_wo_id produces → wo_id consumes). Updates each
-// dependent's dates in memory and returns [{woNum,start,finish}] for persistence.
-// Guards against cycles via a seen-set.
-function psShiftDependents(rootWo, deltaDays) {
-    const byId = new Map(allWorkOrders.map(w => [String(w.wo_id), w]));
-    const consumersOf = new Map();   // producer wo_id → [consumer wo_id]
-    stagingDependencies.forEach(d => {
-        const k = String(d.staging_wo_id);
-        if (!consumersOf.has(k)) consumersOf.set(k, []);
-        consumersOf.get(k).push(String(d.wo_id));
-    });
-    const out = [], seen = new Set([String(rootWo.wo_id)]), queue = [String(rootWo.wo_id)];
-    while (queue.length) {
-        const cur = queue.shift();
-        (consumersOf.get(cur) || []).forEach(cid => {
-            if (seen.has(cid)) return;
-            seen.add(cid);
-            const dw = byId.get(cid);
-            if (dw) {
-                let ns = moment(dw.date_scheduled_start).add(deltaDays, 'days');
-                let ne = moment(dw.date_scheduled).add(deltaDays, 'days');
-                // Skip weekends in the cascade too, snapping in the SAME DIRECTION as
-                // the shift. Moving LATER (deltaDays > 0): a weekend landing snaps
-                // forward to Monday (Sat +2, Sun +1) — a WO one day behind a producer
-                // dropped on Friday starts Monday. Moving EARLIER (deltaDays < 0): it
-                // snaps BACK to Friday (Sat −1, Sun −2) — pulling a producer to
-                // Thursday brings a dependent that lands on the weekend forward to
-                // Friday (a forward-only snap would push it back to Monday and cancel
-                // the move — the bug this fixes).
-                if (skipWeekends) {
-                    const dow = ns.day();
-                    let adj = 0;
-                    if (dow === 6)      adj = (deltaDays < 0) ? -1 : 2;   // Sat → Fri (back) / Mon (fwd)
-                    else if (dow === 0) adj = (deltaDays < 0) ? -2 : 1;   // Sun → Fri (back) / Mon (fwd)
-                    if (adj) { ns = ns.clone().add(adj, 'days'); ne = ne.clone().add(adj, 'days'); }
-                }
-                // Preserve the producer→consumer gap. Shifting every dependent by the
-                // raw delta and weekend-snapping each one INDEPENDENTLY can land a
-                // dependent on (or before) the very WO it depends on — e.g. pulling a
-                // producer back to Friday shifts its one-day-behind consumer to Saturday,
-                // which snaps back onto Friday too, collapsing both onto the same day.
-                // `cur` is this dependent's producer in the cascade (BFS processes the
-                // producer first, so its shifted dates are already written), so clamp the
-                // dependent to start no earlier than the producer's shifted finish (+1
-                // working day unless same-day starts are allowed).
-                const prod = byId.get(cur);
-                if (prod) {
-                    let minStart = moment(prod.date_scheduled).startOf('day');
-                    if (!allowSameDayStarts) minStart.add(1, 'day');
-                    if (skipWeekends) { while (minStart.day() === 6 || minStart.day() === 0) minStart.add(1, 'day'); }
-                    const push = minStart.diff(ns.clone().startOf('day'), 'days');
-                    if (push > 0) { ns = ns.clone().add(push, 'days'); ne = ne.clone().add(push, 'days'); }
-                }
-                dw.date_scheduled_start = ns.format('YYYY-MM-DD[T]HH:mm:ss');
-                dw.date_scheduled = ne.format('YYYY-MM-DD[T]HH:mm:ss');
-                out.push({ woNum: dw.wo_num, start: ns.format('YYYY-MM-DD'), finish: ne.format('YYYY-MM-DD') });
-            }
-            queue.push(cid);
-        });
-    }
-    return out;
+    // Persist after paint so the UI feels instant.
+    setTimeout(() => psSaveWODatesQuiet(wo.wo_num, newStartDay.format('YYYY-MM-DD'), newEndDay.format('YYYY-MM-DD')), 0);
 }
 
 // Save WO dates WITHOUT reloading all data (the Timeline updates itself
@@ -10508,22 +7640,10 @@ function psDrawDeps(windowStart) {
     const gr = gridBody.getBoundingClientRect();
     svg.setAttribute('width', gridBody.scrollWidth);
     svg.setAttribute('height', gridBody.scrollHeight);
-    // Body-level CSS `zoom` (psApplyZoom) scales getBoundingClientRect() output,
-    // but the SVG's own coordinate system stays in LAYOUT px (it sizes from
-    // scrollWidth/scrollHeight and is re-scaled by the browser on paint). So the
-    // client-rect deltas must be divided by the actual render scale to land in
-    // layout coords — otherwise the arrows drift off the bars at zoom ≠ 1.
-    // scale = renderedWidth / layoutWidth; ≈ 1 (harmless no-op) at 100% zoom or on
-    // engines where getBoundingClientRect isn't zoom-scaled.
-    const scale = (gridBody.offsetWidth && gr.width) ? (gr.width / gridBody.offsetWidth) : 1;
     const pos = {};
     gridBody.querySelectorAll('.g-bar').forEach(b => {
         const r = b.getBoundingClientRect();
-        pos[String(b.getAttribute('data-id'))] = {
-            x1: (r.left - gr.left) / scale,
-            x2: (r.right - gr.left) / scale,
-            yc: (r.top - gr.top + r.height / 2) / scale
-        };
+        pos[String(b.getAttribute('data-id'))] = { x1: r.left - gr.left, x2: r.right - gr.left, yc: r.top - gr.top + r.height / 2 };
     });
     const blocked = psBlockedSet();
     let paths = '';
@@ -10800,11 +7920,10 @@ function gatherSettings() {
         ganttScale: ganttScale,
         showArrows: showArrows,
         allowSameDayStarts: allowSameDayStarts,
-        shiftDependentMode: shiftDependentMode,
+        shiftDependentWOs: shiftDependentWOs,
         skipWeekends: skipWeekends,
         calendarColorMode: calendarColorMode,
         viewByMode: viewByMode,
-        ganttBarLabel: ganttBarLabel,
         showCompletedWOs: showCompletedWOs,
         calendarExpanded: calendarExpanded,
         collapsedMOs: Array.from(collapsedMOs), // Convert Set to Array for JSON
@@ -10844,15 +7963,12 @@ function applySettings(settings) {
             const sameDayStartsCheckbox = document.getElementById('sameDayStartsToggle');
             if (sameDayStartsCheckbox) sameDayStartsCheckbox.checked = allowSameDayStarts;
         }
-        // Shift-dependent mode ('off'|'later'|'both'). Prefer the new key; migrate
-        // the legacy boolean (true → 'both', the old both-directions behaviour).
-        if (typeof settings.shiftDependentMode === 'string') {
-            shiftDependentMode = settings.shiftDependentMode;
-        } else if (typeof settings.shiftDependentWOs === 'boolean') {
-            shiftDependentMode = settings.shiftDependentWOs ? 'both' : 'off';
+        if (typeof settings.shiftDependentWOs === 'boolean') {
+            shiftDependentWOs = settings.shiftDependentWOs;
+            // Update UI checkbox
+            const shiftDependentWOsCheckbox = document.getElementById('shiftDependentWOsToggle');
+            if (shiftDependentWOsCheckbox) shiftDependentWOsCheckbox.checked = shiftDependentWOs;
         }
-        const shiftDependentModeSelect = document.getElementById('shiftDependentModeSelect');
-        if (shiftDependentModeSelect) shiftDependentModeSelect.value = shiftDependentMode;
         if (typeof settings.skipWeekends === 'boolean') {
             skipWeekends = settings.skipWeekends;
             // Update UI checkbox
@@ -10870,11 +7986,6 @@ function applySettings(settings) {
             // Update UI select
             const viewByModeSelect = document.getElementById('viewByModeSelect');
             if (viewByModeSelect) viewByModeSelect.value = viewByMode;
-        }
-        if (settings.ganttBarLabel && (settings.ganttBarLabel === 'wo' || settings.ganttBarLabel === 'fg')) {
-            ganttBarLabel = settings.ganttBarLabel;
-            // The Timeline toolbar rebuilds its .grpseg on each renderGanttChart(),
-            // so it picks up the restored value on the next paint — nothing to sync here.
         }
         if (typeof settings.showCompletedWOs === 'boolean') {
             showCompletedWOs = settings.showCompletedWOs;
@@ -10897,8 +8008,8 @@ function applySettings(settings) {
         const sameDayStartsCheckbox = document.getElementById('sameDayStartsToggle');
         if (sameDayStartsCheckbox) sameDayStartsCheckbox.checked = allowSameDayStarts;
 
-        const shiftDependentModeSel = document.getElementById('shiftDependentModeSelect');
-        if (shiftDependentModeSel) shiftDependentModeSel.value = shiftDependentMode;
+        const shiftDependentWOsCheckbox = document.getElementById('shiftDependentWOsToggle');
+        if (shiftDependentWOsCheckbox) shiftDependentWOsCheckbox.checked = shiftDependentWOs;
 
         const skipWeekendsCheckbox = document.getElementById('skipWeekendsToggle');
         if (skipWeekendsCheckbox) skipWeekendsCheckbox.checked = skipWeekends;
@@ -10936,9 +8047,9 @@ function saveSettingsToDatabase() {
         // FBLib.Settings.resolve(k) return the right value on the
         // next load. `savedAt` is written last so we can surface it
         // in the toast for confirmation.
-        ['allowSameDayStarts','shiftDependentMode','skipWeekends',
+        ['allowSameDayStarts','shiftDependentWOs','skipWeekends',
          'showArrows','showCompletedWOs','calendarColorMode',
-         'viewByMode','ganttBarLabel','calendarExpanded','ganttScale',
+         'viewByMode','calendarExpanded','ganttScale',
          'collapsedMOs','categoryLimits'].forEach(function (k) {
             if (s[k] !== undefined) FBLib.Settings.setUserKey(k, s[k]);
         });
@@ -10979,12 +8090,10 @@ function loadSettingsFromDatabase() {
             ganttScale:         eff.ganttScale,
             showArrows:         eff.showArrows,
             allowSameDayStarts: eff.allowSameDayStarts,
-            shiftDependentMode: eff.shiftDependentMode,
-            shiftDependentWOs:  eff.shiftDependentWOs,  // legacy — applySettings migrates it if the new key is absent
+            shiftDependentWOs:  eff.shiftDependentWOs,
             skipWeekends:       eff.skipWeekends,
             calendarColorMode:  eff.calendarColorMode,
             viewByMode:         eff.viewByMode,
-            ganttBarLabel:      eff.ganttBarLabel,
             showCompletedWOs:   eff.showCompletedWOs,
             calendarExpanded:   eff.calendarExpanded,
             collapsedMOs:       eff.collapsedMOs || [],
@@ -11020,29 +8129,23 @@ function resetSettingsToDefaults() {
     if (!confirm('Reset your personal settings to defaults?')) return;
     try { FBLib.Settings.clearUser(); } catch (_) {}
     allowSameDayStarts = false;
-    shiftDependentMode = 'off';
+    shiftDependentWOs  = false;
     skipWeekends       = false;
     showArrows         = true;
     showCompletedWOs   = true;
     calendarColorMode  = 'status';
     viewByMode         = 'wo_num';
-    ganttBarLabel      = 'wo';
     calendarExpanded   = false;
     ganttScale         = 80;
     collapsedMOs       = new Set();
     // Sync UI checkboxes
     const sync = (id, val) => { const el = document.getElementById(id); if (el) el.checked = !!val; };
     sync('sameDayStartsToggle',     allowSameDayStarts);
+    sync('shiftDependentWOsToggle', shiftDependentWOs);
     sync('skipWeekendsToggle',      skipWeekends);
-    const sdModeSel = document.getElementById('shiftDependentModeSelect'); if (sdModeSel) sdModeSel.value = shiftDependentMode;
     sync('showArrowsToggle',        showArrows);
     sync('showCompletedWOsToggle',  showCompletedWOs);
     const dvSel = document.getElementById('defaultViewSelect'); if (dvSel) dvSel.value = 'last';
-    // Reset tab visibility + order back to the file default (all allowed, file order).
-    psTabOrder = PS_VIEWS.map(function (v) { return v.id; });
-    psTabHidden = new Set();
-    try { psRenderTabSelector(); } catch (_) {}
-    if (typeof renderTabs === 'function') renderTabs();
     // Re-render so the reset propagates through the visible views
     if (typeof renderCurrentView === 'function') renderCurrentView();
     showToast('Settings reset to defaults', 'success');
@@ -11074,7 +8177,7 @@ function publishDefaults() {
         // personal view state, not org policy.
         FBLib.Settings.publishMaster({
             allowSameDayStarts: allowSameDayStarts,
-            shiftDependentMode: shiftDependentMode,
+            shiftDependentWOs:  shiftDependentWOs,
             skipWeekends:       skipWeekends,
             showArrows:         showArrows,
             showCompletedWOs:   showCompletedWOs,
@@ -11085,14 +8188,9 @@ function publishDefaults() {
             // the whole master payload, so carry the current values through.
             enableFinishWO:     !!FBLib.Settings.resolve('enableFinishWO'),
             finishWOGroupId:    FBLib.Settings.resolve('finishWOGroupId') || '',
-            allowFinishShort:   !!FBLib.Settings.resolve('allowFinishShort'),
             // Likewise carry the org roster/capacity model (owned by the
             // Rostering tab) so publishing display defaults never wipes it.
-            rosterConfig:       FBLib.Settings.resolve('rosterConfig'),
-            // Carry the AI Planner org settings (premium POC) through too.
-            enableAiPlanner:    !!FBLib.Settings.resolve('enableAiPlanner'),
-            claudeApiKey:       FBLib.Settings.resolve('claudeApiKey') || '',
-            aiPlannerAnonymise: FBLib.Settings.resolve('aiPlannerAnonymise') !== false
+            rosterConfig:       FBLib.Settings.resolve('rosterConfig')
         });
         debugLog('success', 'Defaults published for all users');
         showToast('Defaults published for all users', 'success');
@@ -11138,83 +8236,6 @@ function setFinishWOEnabled(on) {
     }
 }
 window.setFinishWOEnabled = setFinishWOEnabled;
-
-// Admin-only: allow/deny finishing a WO whose raw goods are short of stock. Lives
-// in the master payload (merge-then-publish so other master settings survive), so
-// every user reads it via resolve('allowFinishShort') but only an admin flips it.
-function setAllowFinishShort(on) {
-    if (!FBLib.Settings.isAdmin()) { showToast('Only an admin can change this', 'error'); return; }
-    try {
-        const master = Object.assign({}, FBLib.Settings.getMaster());
-        master.allowFinishShort = !!on;
-        const ok = FBLib.Settings.publishMaster(master);
-        if (!ok) { showToast('Could not save — admin only', 'error'); return; }
-        debugLog('success', 'Finish-with-short-raw-goods ' + (on ? 'enabled' : 'disabled') + ' for all users');
-        showToast(on ? 'Finishing WOs with short raw goods is now allowed' : 'Finishing short WOs disabled', 'success');
-    } catch (e) {
-        debugLog('error', 'setAllowFinishShort: ' + (e && e.message));
-        showToast('Failed to update setting: ' + (e && e.message), 'error');
-    }
-}
-window.setAllowFinishShort = setAllowFinishShort;
-
-// Admin-only: enable/disable the AI Planner tab org-wide (master-published, so
-// resolve('enableAiPlanner') gates the tab for every user; see psTabEnabled).
-function setAiPlannerEnabled(on) {
-    if (!FBLib.Settings.isAdmin()) { showToast('Only an admin can change this', 'error'); return; }
-    try {
-        const master = Object.assign({}, FBLib.Settings.getMaster());
-        master.enableAiPlanner = !!on;
-        const ok = FBLib.Settings.publishMaster(master);
-        if (!ok) { showToast('Could not save — admin only', 'error'); return; }
-        debugLog('success', 'AI Planner tab ' + (on ? 'enabled' : 'disabled') + ' for all users');
-        showToast(on ? 'AI Planner tab enabled for all users' : 'AI Planner tab disabled', 'success');
-        try { renderTabs(); } catch (_) {}   // reflect the tab appearing/disappearing now
-    } catch (e) {
-        debugLog('error', 'setAiPlannerEnabled: ' + (e && e.message));
-        showToast('Failed to update setting: ' + (e && e.message), 'error');
-    }
-}
-window.setAiPlannerEnabled = setAiPlannerEnabled;
-
-// Admin-only: store the org Claude API key in the master payload (merge-then-
-// publish). Read via resolve('claudeApiKey') by the AI Planner transport. NOTE:
-// the master payload is readable by any user's client + the DB — acceptable for
-// a demo/POC only.
-function setClaudeApiKey(v) {
-    if (!FBLib.Settings.isAdmin()) { showToast('Only an admin can change this', 'error'); return; }
-    try {
-        const key = (v || '').trim();
-        const master = Object.assign({}, FBLib.Settings.getMaster());
-        master.claudeApiKey = key;
-        const ok = FBLib.Settings.publishMaster(master);
-        if (!ok) { showToast('Could not save — admin only', 'error'); return; }
-        debugLog('success', 'Claude API key ' + (key ? 'saved' : 'cleared') + ' for all users');
-        showToast(key ? 'Claude API key saved' : 'Claude API key cleared', 'success');
-        var el = document.getElementById('dsClaudeApiKey'); if (el) el.value = key;
-    } catch (e) {
-        debugLog('error', 'setClaudeApiKey: ' + (e && e.message));
-        showToast('Failed to save key: ' + (e && e.message), 'error');
-    }
-}
-window.setClaudeApiKey = setClaudeApiKey;
-
-// Admin-only: toggle anonymisation of the data sent to Claude (master-published).
-function setAiPlannerAnonymise(on) {
-    if (!FBLib.Settings.isAdmin()) { showToast('Only an admin can change this', 'error'); return; }
-    try {
-        const master = Object.assign({}, FBLib.Settings.getMaster());
-        master.aiPlannerAnonymise = !!on;
-        const ok = FBLib.Settings.publishMaster(master);
-        if (!ok) { showToast('Could not save — admin only', 'error'); return; }
-        debugLog('success', 'AI Planner anonymise ' + (on ? 'on' : 'off') + ' for all users');
-        showToast(on ? 'AI Planner will anonymise data sent to Claude' : 'AI Planner will send un-anonymised data', 'success');
-    } catch (e) {
-        debugLog('error', 'setAiPlannerAnonymise: ' + (e && e.message));
-        showToast('Failed to update setting: ' + (e && e.message), 'error');
-    }
-}
-window.setAiPlannerAnonymise = setAiPlannerAnonymise;
 
 // Load all Fishbowl user groups (for the admin Finish-WO group picker) + the
 // logged-in user's group memberships (for the gate). usergroup(id,name) +
@@ -11279,8 +8300,6 @@ function refreshAdminUi() {
     if (lockBtn) lockBtn.textContent = allowed ? 'Lock user editing' : 'Unlock user editing';
     var enFinish = document.getElementById('dsEnableFinishWO');
     if (enFinish) enFinish.checked = !!FBLib.Settings.resolve('enableFinishWO');
-    var enShort = document.getElementById('dsAllowFinishShort');
-    if (enShort) enShort.checked = !!FBLib.Settings.resolve('allowFinishShort');
     var grpSel = document.getElementById('dsFinishWOGroup');
     if (grpSel) {
         var curGrp = FBLib.Settings.resolve('finishWOGroupId') || '';
@@ -11289,13 +8308,6 @@ function refreshAdminUi() {
                 return '<option value="' + g.id + '"' + (String(g.id) === String(curGrp) ? ' selected' : '') + '>' + psEsc(g.name) + '</option>';
             }).join('');
     }
-    // AI Planner admin controls (premium POC).
-    var enAi = document.getElementById('dsEnableAiPlanner');
-    if (enAi) enAi.checked = !!FBLib.Settings.resolve('enableAiPlanner');
-    var aiAnon = document.getElementById('dsAiPlannerAnonymise');
-    if (aiAnon) aiAnon.checked = FBLib.Settings.resolve('aiPlannerAnonymise') !== false;
-    var aiKey = document.getElementById('dsClaudeApiKey');
-    if (aiKey) aiKey.value = FBLib.Settings.resolve('claudeApiKey') || '';
 }
 window.refreshAdminUi = refreshAdminUi;
 
@@ -11317,8 +8329,6 @@ function initializeEventListeners() {
     // for genuine outside clicks.)
     document.addEventListener('click', (e) => {
         if (psOpenDropdown && !e.target.closest('.fdrop')) { psOpenDropdown = null; psSyncDropdowns(); }
-        // Close the Settings ▸ Display tab-visibility panel on any click outside it.
-        if (!e.target.closest('#tabSelWrap')) psTabSelClose();
     });
 
     // Close context menus on Escape key
@@ -11331,7 +8341,6 @@ function initializeEventListeners() {
     if (searchInput) {
         searchInput.addEventListener('input', (e) => {
             psSearch = e.target.value || '';
-            psSyncSearchClear();
             applyActiveFilters();
             updateKPIs();
             renderCurrentView();  // re-renders the active view with the filtered set
@@ -11349,12 +8358,13 @@ function initializeEventListeners() {
         debugLog('info', '✓ sameDayStartsToggle event listener attached');
     }
 
-    const shiftDependentModeSelect = document.getElementById('shiftDependentModeSelect');
-    if (shiftDependentModeSelect) {
-        shiftDependentModeSelect.addEventListener('change', (e) => {
-            psSetShiftDependentMode(e.target.value);  // normalises + syncs the Timeline dropdown + auto-saves
+    const shiftDependentWOsToggle = document.getElementById('shiftDependentWOsToggle');
+    if (shiftDependentWOsToggle) {
+        shiftDependentWOsToggle.addEventListener('change', (e) => {
+            shiftDependentWOs = e.target.checked;
+            saveSettingsToDatabase();  // Auto-save when toggled
         });
-        debugLog('info', '✓ shiftDependentModeSelect event listener attached');
+        debugLog('info', '✓ shiftDependentWOsToggle event listener attached');
     }
 
     const skipWeekendsToggle = document.getElementById('skipWeekendsToggle');
@@ -11855,7 +8865,6 @@ function rosterCategoryCap(limits, dayM){
 // the PS_VIEWS 'planning' entry) to strip; this whole block can then be deleted.
 // ═══════════════════════════════════════════════════════════════════════════
 let psPlan = {};                      // wo_id -> { start, finish, reason, over, manual }
-let psPlanHideUnavail = false;        // Planning tab filter pill: hide WOs whose material is Not Available
 const PS_PLAN_HORIZON = 180;          // max days to push a start looking for capacity
 
 function psPlanBaseStart(wo)  { return moment(wo.date_scheduled_start).startOf('day'); }
@@ -12027,10 +9036,8 @@ function psPlanManual(woId, val) {
     renderPlanning();
 }
 function psPlanOpenWO(woId) { const wo = psPlanFindWo(woId); if (wo && typeof openModule === 'function') openModule('Work Order', wo.wo_num); }
-function psPlanToggleUnavail() { psPlanHideUnavail = !psPlanHideUnavail; renderCurrentView(); }
 window.psPlanOne = psPlanOne; window.psPlanAll = psPlanAll; window.psPlanRevert = psPlanRevert;
 window.psPlanRevertAll = psPlanRevertAll; window.psPlanManual = psPlanManual; window.psPlanOpenWO = psPlanOpenWO;
-window.psPlanToggleUnavail = psPlanToggleUnavail;
 
 // Apply — one Get/Save per changed WO (proven date-preservation logic from
 // saveWODates, but without a reload per call); a single loadWorkOrders() at the end.
@@ -12074,12 +9081,9 @@ window.psPlanApply = psPlanApply;
 
 function renderPlanning() {
     const host = document.getElementById('planningView'); if (!host) return;
-    if (!psAvailReady) { host.innerHTML = psEmptyState(_psAvailLoading ? 'Computing material availability…' : 'Component availability will compute now — one moment.'); return; }
-    const listAll = psPlanEligible();
-    if (!listAll.length) { host.innerHTML = psEmptyState('No work orders in the current filter to plan.'); return; }
-    // "Hide unavailable" filter pill — drop WOs whose material is Not Available.
-    const list = psPlanHideUnavail ? listAll.filter(wo => !psPlanMatReady(wo).blocked) : listAll;
-    if (!list.length) { host.innerHTML = psEmptyState('Every work order in view has material unavailable — toggle “Show unavailable” in the filter bar to see them.'); return; }
+    if (!psAvailReady) { host.innerHTML = psEmptyState('Computing material availability… reopen Planning in a moment.'); return; }
+    const list = psPlanEligible();
+    if (!list.length) { host.innerHTML = psEmptyState('No work orders in the current filter to plan.'); return; }
 
     const changeCount = Object.keys(psPlan).filter(id => {
         const wo = allWorkOrders.find(w => String(w.wo_id) === String(id));
@@ -12153,7 +9157,7 @@ function renderPlanning() {
             deltaCell = '';
             reasonCell = blocked ? '<span class="spill critical">Material not available</span>' : '<span class="hint">not planned</span>';
             planBtn = blocked
-                ? (psTabVisible('procure') ? '<button class="ps-btn sm" onclick="setView(\'procure\')">Procurement</button>' : '')
+                ? (psTabEnabled('procure') ? '<button class="ps-btn sm" onclick="setView(\'procure\')">Procurement</button>' : '')
                 : '<button class="ps-btn sm" onclick="psPlanOne(' + wo.wo_id + ')">Plan</button>';
         }
 
@@ -12457,33 +9461,12 @@ function psRosterSave() {
     try {
         // Merge-then-publish: publishMaster REPLACES the whole master payload, so
         // carry the current master forward and set only rosterConfig.
-        const holCount = (psRosterDraft.holidays || []).length;
         const master = Object.assign({}, FBLib.Settings.getMaster());
         master.rosterConfig = psRosterDraft;
         const ok = FBLib.Settings.publishMaster(master);
         if (!ok) { showToast('Could not save — admin only', 'error'); return; }
-        // VERIFY the write actually reached the report-data store. The admin (master)
-        // layer is backed by saveReportData(), which is a SILENT NO-OP on an UNSAVED
-        // report / BI-editor preview — the in-memory publish succeeds but nothing
-        // persists, so the roster + holidays vanish on the next reload (the reported
-        // symptom). Fresh-read the persisted blob and confirm the holiday count
-        // round-tripped; warn (don't fail) if it didn't stick. Wrapped in try/catch
-        // because loadReportData() itself throws in a no-report context.
-        let persistWarn = '';
-        try {
-            if (typeof loadReportData === 'function') {
-                const raw = loadReportData();
-                const disk = raw ? JSON.parse(raw) : null;
-                const dh = (disk && disk.rosterConfig && Array.isArray(disk.rosterConfig.holidays)) ? disk.rosterConfig.holidays.length : null;
-                if (dh === null || dh !== holCount) {
-                    persistWarn = ' but it did NOT persist to disk (holidays saved: ' + (dh === null ? 'none' : dh) + ', expected ' + holCount + '). This report is running unsaved / in the BI-editor preview — org-wide roster settings only persist once the report is SAVED in Fishbowl and reopened from the report list.';
-                    debugLog('warn', 'Roster publish read-back mismatch — disk holidays=' + (dh === null ? 'null' : dh) + ' expected=' + holCount + ' (report likely unsaved/preview)');
-                }
-            }
-        } catch (_) { /* loadReportData threw (no-report context) — can't verify, don't alarm */ }
-        debugLog('success', 'rosterConfig published (' + holCount + ' holiday/closure entr' + (holCount === 1 ? 'y' : 'ies') + ')');
-        if (persistWarn) showToast('Roster saved for this session,' + persistWarn, 'error', 12000);
-        else showToast('Roster published for all users', 'success');
+        debugLog('success', 'rosterConfig published for all users');
+        showToast('Roster published for all users', 'success');
         psRosterDraft = null;
         renderRoster();
         // Refresh capacity-dependent views so new hours/holidays show immediately.
@@ -13718,528 +10701,6 @@ function renderCalendarWOs(table, calendarStart) {
     });
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// AI PLANNER  (premium POC — PS_TABS_ENABLED.aiplanner + admin master flag
-// enableAiPlanner). Sends a schedule / availability / capacity / shortage
-// snapshot to the Claude API and maps its reschedule / PO / MO suggestions back
-// onto the EXISTING review-then-apply paths (psPlanApplyOne for dates, the
-// Create-PO / Create-MO drawers for procurement). No new write code.
-// SELF-CONTAINED: flip PS_TABS_ENABLED.aiplanner=false to hide it everywhere via
-// psTabEnabled; this whole fenced block + the tab/settings hooks marked
-// "AI Planner" can be deleted with no dangling references.
-// ⚠ Honour-system client-side gate, and the key sits in the shared master
-// payload — POC on a demo DB only, not a production security boundary.
-// ═══════════════════════════════════════════════════════════════════════════
-// ===== AI PLANNER (premium) =====
-var AI_ENDPOINT = 'https://api.anthropic.com/v1/messages';
-var AI_MODELS = [{ id: 'claude-opus-4-8', name: 'Claude Opus 4.8' }, { id: 'claude-sonnet-5', name: 'Claude Sonnet 5' }];
-var AI_MAX_WOS = 150;   // cap the snapshot so one run stays bounded in tokens
-var aiState = { status: 'idle', error: null, result: null, maps: null, accepted: {}, subTab: 'reschedule', truncated: false };
-
-// Nullable-number schema fragment (structured outputs support anyOf + null).
-var _AI_NNUM = { anyOf: [{ type: 'number' }, { type: 'null' }] };
-var AI_SCHEMA = {
-    type: 'object', additionalProperties: false,
-    required: ['reschedule', 'purchaseOrders', 'manufactureOrders', 'metrics'],
-    properties: {
-        reschedule: {
-            type: 'array', items: {
-                type: 'object', additionalProperties: false, required: ['wo', 'start', 'finish', 'reason'],
-                properties: { wo: { type: 'string' }, start: { type: 'string' }, finish: { type: 'string' }, reason: { type: 'string' } }
-            }
-        },
-        purchaseOrders: {
-            type: 'array', items: {
-                type: 'object', additionalProperties: false, required: ['vendor', 'needBy', 'reason', 'lines'],
-                properties: {
-                    vendor: { type: 'string' }, needBy: { type: 'string' }, reason: { type: 'string' },
-                    lines: {
-                        type: 'array', items: {
-                            type: 'object', additionalProperties: false, required: ['part', 'qty', 'unitCost'],
-                            properties: { part: { type: 'string' }, qty: { type: 'number' }, unitCost: _AI_NNUM }
-                        }
-                    }
-                }
-            }
-        },
-        manufactureOrders: {
-            type: 'array', items: {
-                type: 'object', additionalProperties: false, required: ['part', 'bomNum', 'qty', 'dateScheduled', 'reason'],
-                properties: { part: { type: 'string' }, bomNum: { type: 'string' }, qty: { type: 'number' }, dateScheduled: { type: 'string' }, reason: { type: 'string' } }
-            }
-        },
-        metrics: {
-            type: 'object', additionalProperties: false, required: ['summary', 'before', 'after', 'improvements'],
-            properties: {
-                summary: { type: 'string' },
-                before: { type: 'object', additionalProperties: false, required: ['onTime', 'overloadedDays', 'unmetWOs', 'latestFinish'], properties: { onTime: _AI_NNUM, overloadedDays: _AI_NNUM, unmetWOs: _AI_NNUM, latestFinish: { type: 'string' } } },
-                after: { type: 'object', additionalProperties: false, required: ['onTime', 'overloadedDays', 'unmetWOs', 'latestFinish'], properties: { onTime: _AI_NNUM, overloadedDays: _AI_NNUM, unmetWOs: _AI_NNUM, latestFinish: { type: 'string' } } },
-                improvements: { type: 'array', items: { type: 'string' } }
-            }
-        }
-    }
-};
-
-var AI_SYSTEM = [
-    'You are a production-scheduling assistant for a Fishbowl manufacturing shop.',
-    'You are given the current OPEN work orders, their material availability, the labour capacity limits, and the current material shortages as JSON. Every identifier (work order, part, vendor, user, customer) is an opaque token — use the tokens exactly as given and never invent new ones.',
-    'Produce ONE JSON plan (matching the provided schema) with four parts:',
-    '1) reschedule — for each work order whose dates should change, a new start and finish (YYYY-MM-DD). HARD rules: never schedule before "today"; a WO cannot start before the work orders it depends on finish (a WO whose avail.shortParts are produced by another WO); keep each day within BOTH the assigned users\' dailyHours AND the WO category\'s dailyLimits (index 0=Mon .. 6=Sun) — never overload a day; preserve each WO\'s original finish-minus-start duration unless a change is unavoidable. Pull work earlier when material + capacity allow; push only as far as needed to clear a conflict. Include ONLY work orders whose dates actually change.',
-    '2) purchaseOrders — for genuinely short purchasable parts (shortages.toPurchase only), grouped by vendor, each line a part + suggested order qty (>= its short qty) + optional unitCost, plus a needBy date.',
-    '3) manufactureOrders — for short manufacturable parts (shortages.toManufacture only), a build qty (>= short) and a dateScheduled that finishes before the earliest consuming WO.',
-    '4) metrics — a short plain-English summary, a before/after snapshot ({onTime, overloadedDays, unmetWOs, latestFinish}) computed from the input as-is vs. your proposed plan, and an improvements list naming what got better (readiness dates, capacity bottlenecks removed, on-time count, shortages resolved).',
-    'Return ONLY the JSON object. All dates are YYYY-MM-DD strings; set unitCost to null when unknown.'
-].join('\n');
-
-function aiModel() { try { var m = FBLib.Settings.resolve('aiPlannerModel'); return AI_MODELS.some(function (x) { return x.id === m; }) ? m : 'claude-opus-4-8'; } catch (_) { return 'claude-opus-4-8'; } }
-function aiSetModel(v) { try { FBLib.Settings.setUserKey('aiPlannerModel', v); FBLib.Settings.saveUser(); } catch (_) {} }
-function aiSetSubTab(t) { aiState.subTab = t; renderAiPlanner(); }
-function aiJs(s) { return String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
-
-// Inject the tab's small CSS once (reuses shared tokens + the existing @keyframes spin).
-function aiEnsureStyles() {
-    if (document.getElementById('aiPlannerStyles')) return;
-    var css = '' +
-        '#aiPlannerView .ai-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:14px 22px 4px}' +
-        '#aiPlannerView .ai-head h2{font-size:17px;font-weight:800;margin:0;color:var(--c-primary)}' +
-        '#aiPlannerView .ai-head .grow{flex:1}' +
-        '#aiPlannerView select.ai-model{height:28px;border:1px solid var(--border-strong);border-radius:var(--r-btn);padding:0 8px;font-size:12px;font-family:inherit;color:var(--c-primary);background:#fff;cursor:pointer}' +
-        '#aiPlannerView .ai-status{font-size:12px;color:var(--c-secondary);display:inline-flex;align-items:center;gap:6px}' +
-        '#aiPlannerView .ai-spin{width:15px;height:15px;border:2px solid var(--bg-2);border-top-color:var(--fb-blue);border-radius:50%;display:inline-block;animation:spin 1s linear infinite}' +
-        '#aiPlannerView .ai-scroll{flex:1;min-height:0;overflow:auto;padding:8px 22px 20px}' +
-        '#aiPlannerView .ai-card{background:#fff;border:1px solid var(--border);border-radius:var(--r-card);box-shadow:var(--sh1);padding:12px 14px;margin:0 0 12px}' +
-        '#aiPlannerView .ai-card h4{margin:0 0 8px;font-size:13px;font-weight:800;color:var(--c-primary);display:flex;align-items:center;gap:8px;flex-wrap:wrap}' +
-        '#aiPlannerView .ai-reason{font-size:11.5px;color:var(--c-secondary);margin-top:2px}' +
-        '#aiPlannerView .ai-mgrid{display:grid;grid-template-columns:auto 1fr 1fr;gap:6px 18px;max-width:560px;font-size:12.5px;align-items:baseline}' +
-        '#aiPlannerView .ai-mgrid .k{color:var(--c-secondary);font-weight:600}' +
-        '#aiPlannerView .ai-mgrid .h{font-weight:700;color:var(--c-primary);text-transform:uppercase;font-size:10.5px;letter-spacing:.04em}' +
-        '#aiPlannerView ul.ai-imp{margin:8px 0 0;padding-left:18px;font-size:12.5px;color:var(--c-primary)}' +
-        '#aiPlannerView ul.ai-imp li{margin:3px 0}' +
-        // Status banners (info / warn / err). `.banner` is NOT a fb-styles class,
-        // so without these rules its inline <svg> icon had no width/height and
-        // rendered full-width — the giant (i) artifact on the initial page and in
-        // the Metrics tab. Flex layout + a sized, non-shrinking icon fixes it.
-        '#aiPlannerView .banner{display:flex;gap:10px;align-items:flex-start;padding:11px 13px;border-radius:var(--r-card);font-size:12.5px;font-weight:600;line-height:1.5;margin:8px 0 0}' +
-        '#aiPlannerView .banner svg{width:18px;height:18px;flex-shrink:0;margin-top:1px}' +
-        '#aiPlannerView .banner.info{background:rgba(45,156,219,.10);color:var(--fb-blue-accent)}' +
-        '#aiPlannerView .banner.warn{background:#FBF4EC;color:#8A4E10}' +
-        '#aiPlannerView .banner.err{background:#F7ECEF;color:#8A1E30}';
-    var st = document.createElement('style'); st.id = 'aiPlannerStyles'; st.textContent = css;
-    document.head.appendChild(st);
-}
-
-// ── Snapshot + (optional) anonymisation ──────────────────────────────────────
-// Builds the JSON sent to Claude plus reverse maps (label → real entity) so the
-// response's tokens resolve back to wo_id / partId / vendor name for write-back.
-// When anonymise is off, the label IS the real number/name (one code path).
-function aiBuildSnapshot() {
-    var anon = FBLib.Settings.resolve('aiPlannerAnonymise') !== false;
-    var today = moment().startOf('day');
-    var maps = { wo: {}, part: {}, vendor: {}, user: {}, customer: {} };
-    var _wo = {}, _part = {}, _vend = {}, _cust = {}, _user = {};
-    var wc = 0, pc = 0, vc = 0, cc = 0, uc = 0;
-    function labelWo(w) { var k = String(w.wo_id); if (_wo[k]) return _wo[k]; var l = anon ? ('W' + (++wc)) : String(w.wo_num || ('#' + w.wo_id)); _wo[k] = l; maps.wo[l] = w; return l; }
-    function labelPart(id, num) { var k = String(id != null ? id : num); if (_part[k]) return _part[k]; var l = anon ? ('P' + (++pc)) : String(num || ('#' + id)); _part[k] = l; maps.part[l] = { partId: id, partNum: num }; return l; }
-    function labelVendor(name) { if (!name) return ''; if (_vend[name]) return _vend[name]; var l = anon ? ('V' + (++vc)) : name; _vend[name] = l; maps.vendor[l] = name; return l; }
-    function labelCust(name) { if (!name) return ''; if (_cust[name]) return _cust[name]; var l = anon ? ('C' + (++cc)) : name; _cust[name] = l; maps.customer[l] = name; return l; }
-    function labelUser(name) { if (!name) return 'Unassigned'; if (_user[name]) return _user[name]; var l = anon ? ('U' + (++uc)) : name; _user[name] = l; maps.user[l] = name; return l; }
-    function d(x) { if (!x) return null; var m = moment(x); return m.isValid() ? m.format('YYYY-MM-DD') : null; }
-
-    var open = (filteredWorkOrders || []).filter(function (w) { return w.wo_status !== 40; });
-    var truncated = open.length > AI_MAX_WOS;
-    if (truncated) open = open.slice(0, AI_MAX_WOS);
-    var wos = open.map(function (w) {
-        var av = w._av || {};
-        var shortParts = ((av.parts) || []).filter(function (p) { return !p.staged && !p.nonInv && p.unmet; }).map(function (p) { return labelPart(p.partId, p.partNum); });
-        var names = (typeof psAssignedNames === 'function') ? psAssignedNames(w) : [];
-        return {
-            wo: labelWo(w),
-            product: w.part_num ? labelPart(null, w.part_num) : '',
-            desc: (w.description || ''),
-            qty: (w.qty_target != null ? Number(w.qty_target) : null),
-            laborHours: Math.round(((parseFloat(w.labor_hours_from_bom) || 0) * (parseFloat(w.qty_target) || 0)) * 100) / 100,
-            start: d(w.date_scheduled_start), finish: d(w.date_scheduled), due: d(psDue(w)),
-            durationDays: (function () { var s = moment(w.date_scheduled_start).startOf('day'), f = moment(w.date_scheduled).startOf('day'); var n = f.diff(s, 'days'); return (isNaN(n) || n < 0) ? 0 : n; })(),
-            category: (w.calendar_category || 'Uncategorized'),
-            users: (names && names.length ? names : ['Unassigned']).map(labelUser),
-            customer: labelCust((typeof psCustomer === 'function') ? psCustomer(w) : ''),
-            lg: (w.site_name || ''),
-            priority: (w.priority_name || ''),
-            status: (w.wo_status_name || String(w.wo_status || '')),
-            avail: { buildable: (av._unmet ? null : d(av._buildable)), unmet: !!av._unmet, contended: !!av._contended, buildableNow: !!av._buildableNow, shortParts: shortParts }
-        };
-    });
-
-    var cfg = (typeof rosterCfg === 'function') ? rosterCfg() : { business: { hoursPerDay: 8, workDays: [1, 1, 1, 1, 1, 0, 0] } };
-    var probe = today.clone(); var g = 0;
-    while (((typeof rosterIsClosed === 'function' && rosterIsClosed(probe)) || probe.day() === 0 || probe.day() === 6) && g < 10) { probe.add(1, 'day'); g++; }
-    var cats = ((capacitySettings && capacitySettings.categories) || []).map(function (c) { return { category: c.name, dailyLimits: c.limits }; });
-    var usersCap = (users || []).filter(function (u) { return String(u.id) !== '0'; }).map(function (u) { return { user: labelUser(u.name), dailyHours: (typeof rosterUserCap === 'function') ? rosterUserCap(u.id, probe) : (cfg.business.hoursPerDay || 8) }; });
-
-    var proc = (typeof psProcureData === 'function') ? psProcureData() : { buy: [], make: [] };
-    var buy = (proc.buy || []).map(function (r) { return { part: labelPart(r.partId, r.partNum), desc: (r.partDesc || ''), short: Number(r.short) || 0, uom: (r.uom || ''), onhand: (r.onhand != null ? Number(r.onhand) : null), vendor: labelVendor(r.vendorName), needBy: (r.earliest ? r.earliest.format('YYYY-MM-DD') : null), lg: (r.lgName || '') }; });
-    var make = (proc.make || []).map(function (r) { return { part: labelPart(r.partId, r.partNum), desc: (r.partDesc || ''), short: Number(r.short) || 0, uom: (r.uom || ''), bomNum: (r.bomNum || ''), needBy: (r.earliest ? r.earliest.format('YYYY-MM-DD') : null), lg: (r.lgName || '') }; });
-
-    var payload = {
-        today: today.format('YYYY-MM-DD'),
-        horizonDays: 90,
-        anonymised: anon,
-        capacity: { businessHoursPerDay: cfg.business.hoursPerDay, workDays: cfg.business.workDays, categories: cats, users: usersCap },
-        workOrders: wos,
-        shortages: { toPurchase: buy, toManufacture: make },
-        notes: truncated ? ('Only the first ' + AI_MAX_WOS + ' work orders are included; more exist.') : ''
-    };
-    return { payload: payload, maps: maps, truncated: truncated };
-}
-
-// ── Claude transport (net-new outbound HTTP; see CORS risk in the plan) ──────
-async function aiCallClaude(payload) {
-    if (typeof fetch !== 'function') throw new Error('This browser has no fetch() — cannot reach the Claude API.');
-    var key = (FBLib.Settings.resolve('claudeApiKey') || '').trim();
-    if (!key) throw new Error('No Claude API key configured (Settings ▸ Admin).');
-    var body = {
-        // EXTENDED THINKING EXPLICITLY DISABLED. On Opus 4.8 / Sonnet 5 thinking is
-        // ON BY DEFAULT (adaptive) — OMITTING the param does NOT turn it off. Proven
-        // twice on this snapshot: with no thinking field the model still burned the
-        // ENTIRE max_tokens on thinking (stop_reason=max_tokens, content=[thinking],
-        // output = 100% thinking_tokens) and never emitted the JSON — at BOTH the 16k
-        // and 32k caps, so raising the cap doesn't help, it just costs more and still
-        // fails. budget_tokens can't throttle adaptive thinking (400 on these models),
-        // so thinking is all-or-nothing: send thinking:{type:'disabled'} (accepted on
-        // Opus 4.8/4.7 + Sonnet 5; only Fable 5 400s on it, which we never offer). This
-        // is a structured-output JSON task the model produces directly without thinking.
-        // max_tokens is only a CEILING (billed on tokens actually generated), so a
-        // generous 16k covers a large plan cheaply.
-        model: aiModel(),
-        max_tokens: 16000,
-        thinking: { type: 'disabled' },
-        system: AI_SYSTEM,
-        messages: [{ role: 'user', content: 'Current production picture (JSON). Produce the plan.\n\n' + JSON.stringify(payload) }],
-        output_config: { format: { type: 'json_schema', schema: AI_SCHEMA } }
-    };
-    var resp = await fetch(AI_ENDPOINT, {
-        method: 'POST',
-        headers: {
-            'content-type': 'application/json',
-            'x-api-key': key,
-            'anthropic-version': '2023-06-01',
-            'anthropic-dangerous-direct-browser-access': 'true'
-        },
-        body: JSON.stringify(body)
-    });
-    if (!resp.ok) {
-        var em = 'HTTP ' + resp.status;
-        try { var ej = await resp.json(); em = (ej && ej.error && ej.error.message) ? ej.error.message : em; } catch (_) {}
-        throw new Error(em);
-    }
-    var data = await resp.json();
-    if (data && data.stop_reason === 'refusal') throw new Error('Claude declined this request (refusal).');
-    var blocks = (data && data.content) || [];
-    var txt = blocks.filter(function (b) { return b && b.type === 'text'; }).map(function (b) { return b.text; }).join('');
-    if (!txt) {
-        // 200 + valid JSON but no text block. Almost always stop_reason=max_tokens
-        // (adaptive thinking used the whole budget) — dump the shape so it's
-        // obvious in the debug console rather than a bare "empty".
-        var sr = (data && data.stop_reason) || '?';
-        var types = blocks.map(function (b) { return (b && b.type) || '?'; }).join(', ') || '(no blocks)';
-        try { psDiag('AI Planner: no text block · stop_reason=' + sr + ' · content=[' + types + '] · usage=' + JSON.stringify((data && data.usage) || {})); } catch (_) {}
-        if (sr === 'max_tokens') throw new Error('Claude hit the token cap before finishing the plan (stop_reason=max_tokens) — raise max_tokens or shrink the snapshot.');
-        throw new Error('No plan text returned (stop_reason=' + sr + ', content blocks=[' + types + ']). See the debug console.');
-    }
-    var parsed; try { parsed = JSON.parse(txt); } catch (e) { throw new Error('Could not parse Claude JSON: ' + (e && e.message)); }
-    return parsed;
-}
-
-// ── Run ──────────────────────────────────────────────────────────────────────
-async function aiRun() {
-    if (aiState.status === 'running') return;
-    var key = (FBLib.Settings.resolve('claudeApiKey') || '').trim();
-    if (!key) { showToast('No Claude API key configured — ask an admin (Settings ▸ Admin).', 'error', 5000); return; }
-    if (!psAvailReady) { showToast('Material availability is still computing — try again in a moment.', 'warn'); return; }
-    aiState.status = 'running'; aiState.error = null; renderAiPlanner();
-    try {
-        var snap = aiBuildSnapshot();
-        aiState.truncated = snap.truncated;
-        if (!snap.payload.workOrders.length) { aiState.status = 'idle'; showToast('No open work orders in the current filter to plan.', 'info'); renderAiPlanner(); return; }
-        psDiag('AI Planner: model ' + aiModel() + ' · ' + snap.payload.workOrders.length + ' WOs · ' + snap.payload.shortages.toPurchase.length + ' buy / ' + snap.payload.shortages.toManufacture.length + ' make · anonymised=' + snap.payload.anonymised);
-        var parsed = await aiCallClaude(snap.payload);
-        aiState.result = parsed; aiState.maps = snap.maps; aiState.accepted = {}; aiState.subTab = 'reschedule';
-        (parsed.reschedule || []).forEach(function (r) { if (r && r.wo) aiState.accepted[r.wo] = true; });
-        aiState.status = 'done';
-        showToast('AI plan ready — review before applying.', 'success');
-        renderAiPlanner();
-    } catch (e) {
-        var msg = (e && e.message) || String(e);
-        if (/failed to fetch|networkerror|load failed|typeerror/i.test(msg))
-            msg = 'Network/CORS error reaching Claude. Fishbowl reports run from a data: URL (opaque origin); the browser or Anthropic CORS may be blocking the direct call. (' + msg + ')';
-        aiState.status = 'error'; aiState.error = msg;
-        debugLog('error', 'AI Planner run failed: ' + msg); psDiag('AI Planner error: ' + msg);
-        showToast('AI Planner failed: ' + msg, 'error', 9000);
-        renderAiPlanner();
-    }
-}
-
-// ── Review-then-apply: reschedules → the proven psPlanApplyOne date writer ────
-function aiToggleAccept(woLabel, on) { aiState.accepted[woLabel] = !!on; }
-function aiAcceptAll(on) { var r = aiState.result; if (!r) return; (r.reschedule || []).forEach(function (row) { if (row && row.wo) aiState.accepted[row.wo] = !!on; }); renderAiPlanner(); }
-async function aiApplyReschedules() {
-    var r = aiState.result; if (!r || !r.reschedule || !aiState.maps) return;
-    var rows = [];
-    r.reschedule.forEach(function (row) {
-        if (!row || !aiState.accepted[row.wo]) return;
-        var wo = aiState.maps.wo[row.wo]; if (!wo) return;
-        var s = moment(row.start, 'YYYY-MM-DD'), f = moment(row.finish, 'YYYY-MM-DD');
-        if (!s.isValid() || !f.isValid()) return;
-        if (f.isBefore(s)) f = s.clone();
-        if (typeof psPlanBaseStart === 'function' && s.format('YYYY-MM-DD') === psPlanBaseStart(wo).format('YYYY-MM-DD') && f.format('YYYY-MM-DD') === psPlanBaseFinish(wo).format('YYYY-MM-DD')) return; // unchanged
-        rows.push({ wo: wo, start: s.format('YYYY-MM-DD'), finish: f.format('YYYY-MM-DD') });
-    });
-    if (!rows.length) { showToast('No accepted date changes to apply.', 'info'); return; }
-    var ok = await psConfirm({ title: 'Apply ' + rows.length + ' AI reschedule' + (rows.length === 1 ? '' : 's') + '?', message: 'Writes the new start/finish dates to Fishbowl via the same Get/Save path the Planning tab uses. Unaccepted rows and existing schedules are left untouched.', confirmLabel: 'Apply', cancelLabel: 'Cancel', tone: 'warn' });
-    if (!ok) return;
-    aiState.status = 'applying'; renderAiPlanner();
-    var okc = 0, fail = 0;
-    for (var i = 0; i < rows.length; i++) { if (typeof psPlanApplyOne === 'function' && await psPlanApplyOne(rows[i].wo, rows[i].start, rows[i].finish)) okc++; else fail++; }
-    showToast('Applied ' + okc + ' reschedule(s)' + (fail ? ', ' + fail + ' failed' : ''), fail ? 'error' : 'success', 5000);
-    aiState.status = 'done';
-    if (typeof loadWorkOrders === 'function') loadWorkOrders();   // refresh; aiState.result persists so the tab re-renders with results
-}
-
-// ── Review-then-apply: PO/MO suggestions → the existing Create drawers ────────
-function aiOpenPoFromSuggestion(idx) {
-    var r = aiState.result; if (!r || !r.purchaseOrders || !r.purchaseOrders[idx] || !aiState.maps) return;
-    var po = r.purchaseOrders[idx];
-    var vendorName = aiState.maps.vendor[po.vendor];
-    if (!vendorName) { showToast('Could not resolve this vendor from the suggestion.', 'error'); return; }
-    if (typeof psOpenCreatePo !== 'function') { showToast('PO drawer unavailable.', 'error'); return; }
-    psOpenCreatePo(vendorName);   // builds psPoDraft from live shortage data + opens the drawer
-    try {
-        if (psPoDraft && Array.isArray(psPoDraft.parts) && Array.isArray(po.lines)) {
-            po.lines.forEach(function (ln) {
-                var pm = aiState.maps.part[ln.part]; if (!pm) return;
-                var tgt = psPoDraft.parts.find(function (p) { return String(p.partId) === String(pm.partId); });
-                if (tgt) { if (ln.qty != null && ln.qty > 0) tgt.qty = String(ln.qty); if (ln.unitCost != null && ln.unitCost >= 0) tgt.unitCost = Number(ln.unitCost).toFixed(2); }
-            });
-            if (typeof psRenderPoDrawer === 'function') psRenderPoDrawer();
-        }
-    } catch (e) { debugLog('warn', 'AI PO overlay failed: ' + (e && e.message)); }
-}
-function aiOpenMoFromSuggestions() {
-    var r = aiState.result; if (!r || !r.manufactureOrders || !r.manufactureOrders.length || !aiState.maps) { showToast('No manufacture-order suggestions.', 'info'); return; }
-    if (typeof psOpenCreateMo !== 'function' || !psProcureSel) { showToast('MO drawer unavailable.', 'error'); return; }
-    var wantQty = {}, earliest = null;
-    psProcureSel.clear();
-    r.manufactureOrders.forEach(function (mo) {
-        var pm = aiState.maps.part[mo.part]; if (!pm || pm.partId == null) return;
-        if (!(psMakePartIds && psMakePartIds.has(String(pm.partId)))) return;   // only currently-manufacturable/short
-        psProcureSel.add(String(pm.partId));
-        if (mo.qty != null && mo.qty > 0) wantQty[String(pm.partId)] = Math.max(1, Math.ceil(Number(mo.qty)));
-        if (mo.dateScheduled) { var dm = moment(mo.dateScheduled, 'YYYY-MM-DD'); if (dm.isValid() && (!earliest || dm.isBefore(earliest))) earliest = dm; }
-    });
-    if (!psProcureSel.size) { showToast('None of the suggested MO parts are currently short/manufacturable.', 'warn', 5000); return; }
-    psOpenCreateMo();
-    try {
-        if (psMoDraft) {
-            if (Array.isArray(psMoDraft.parts)) psMoDraft.parts.forEach(function (p) { var q = wantQty[String(p.partId)]; if (q != null) p.qty = q; });
-            if (earliest) psMoDraft.dateScheduled = earliest.format('YYYY-MM-DD');
-            if (typeof psRenderMoDrawer === 'function') psRenderMoDrawer();
-        }
-    } catch (e) { debugLog('warn', 'AI MO overlay failed: ' + (e && e.message)); }
-}
-
-// ── Render ───────────────────────────────────────────────────────────────────
-function aiWoDisp(l) { var w = aiState.maps && aiState.maps.wo[l]; return w ? String(w.wo_num) : String(l); }
-function aiPartDisp(l) { var p = aiState.maps && aiState.maps.part[l]; return (p && p.partNum) ? String(p.partNum) : String(l); }
-function aiVendDisp(l) { var v = aiState.maps && aiState.maps.vendor[l]; return v ? String(v) : String(l); }
-function aiNum(v) { return (v == null || v === '') ? '—' : String(v); }
-
-// Prepare Claude's free-text (reason / summary / improvements) for display:
-//   1) de-anonymise — the plan references entities by opaque tokens (W#/P#/V#/U#/C#),
-//      so swap each back to the real WO#/part#/vendor/user/customer. A no-op when
-//      anonymisation was off (tokens are already real values; unresolved tokens are
-//      left as-is).
-//   2) localise dates — Claude emits YYYY-MM-DD; render each in the install's short
-//      date format (formatDate → DateFormatShort) so it matches the rest of the UI.
-// Run de-anon first (tokens are letter+digits) then dates (YYYY-MM-DD) — the two
-// patterns don't overlap, so order is safe.
-function aiFmtReason(text) {
-    if (text == null || text === '') return '';
-    var s = String(text), m = aiState.maps;
-    if (m) {
-        s = s.replace(/\b([WPVUC])(\d+)\b/g, function (match, pfx, num) {
-            var t = pfx + num;
-            if (pfx === 'W') { var w = m.wo && m.wo[t]; return w ? String(w.wo_num) : match; }
-            if (pfx === 'P') { var p = m.part && m.part[t]; return (p && p.partNum) ? String(p.partNum) : match; }
-            if (pfx === 'V') { return (m.vendor && m.vendor[t]) ? String(m.vendor[t]) : match; }
-            if (pfx === 'U') { return (m.user && m.user[t]) ? String(m.user[t]) : match; }
-            if (pfx === 'C') { return (m.customer && m.customer[t]) ? String(m.customer[t]) : match; }
-            return match;
-        });
-    }
-    s = s.replace(/\b\d{4}-\d{2}-\d{2}\b/g, function (match) {
-        var dm = moment(match, 'YYYY-MM-DD', true);
-        return dm.isValid() ? formatDate(dm) : match;
-    });
-    return s;
-}
-
-function aiHeaderHtml() {
-    var running = aiState.status === 'running', applying = aiState.status === 'applying';
-    var opts = AI_MODELS.map(function (m) { return '<option value="' + m.id + '"' + (m.id === aiModel() ? ' selected' : '') + '>' + psEsc(m.name) + '</option>'; }).join('');
-    var status = '';
-    if (running) status = '<span class="ai-status"><span class="ai-spin"></span>Asking Claude…</span>';
-    else if (applying) status = '<span class="ai-status"><span class="ai-spin"></span>Applying…</span>';
-    else if (aiState.status === 'error') status = '<span class="ai-status" style="color:var(--fb-negative)">Failed</span>';
-    else if (aiState.status === 'done') status = '<span class="ai-status" style="color:var(--acc-teal-con)">Plan ready</span>';
-    return '<div class="ai-head">' +
-        '<h2>AI Planner</h2>' +
-        '<span class="crumb" style="font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--c-tertiary);background:var(--bg-2);border-radius:var(--r-pill);padding:2px 8px">POC</span>' +
-        '<span class="grow"></span>' +
-        status +
-        '<label style="font-size:11px;font-weight:600;color:var(--c-secondary);display:inline-flex;align-items:center;gap:5px">Model <select class="ai-model" onchange="aiSetModel(this.value)"' + (running ? ' disabled' : '') + '>' + opts + '</select></label>' +
-        '<button class="ps-btn primary sm" type="button" onclick="aiRun()"' + (running || applying ? ' disabled' : '') + '><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11z"/></svg>' + (aiState.result ? 'Re-run' : 'Run AI Planner') + '</button>' +
-        '</div>';
-}
-
-function aiRescheduleHtml() {
-    var r = aiState.result, list = (r && r.reschedule) || [];
-    if (!list.length) return '<div class="ps-empty" style="padding:40px 20px">Claude proposed no reschedules — the current schedule already fits material and capacity.</div>';
-    var body = list.map(function (row) {
-        var wo = aiState.maps.wo[row.wo];
-        var base = wo && typeof psPlanBaseStart === 'function' ? psPlanBaseStart(wo) : null;
-        var dd = base ? moment(row.start, 'YYYY-MM-DD').startOf('day').diff(base, 'days') : null;
-        var delta = dd == null ? '<span class="hint">—</span>' : (dd === 0 ? '<span class="hint">0</span>' : (dd > 0 ? psSpill('caution', '▶ ' + dd + 'd') : psSpill('active', '◀ ' + Math.abs(dd) + 'd')));
-        var acc = aiState.accepted[row.wo] !== false;
-        return '<tr>' +
-            '<td style="text-align:center"><input type="checkbox"' + (acc ? ' checked' : '') + ' onclick="aiToggleAccept(\'' + aiJs(row.wo) + '\',this.checked)"></td>' +
-            '<td><span class="wo">' + psEsc(aiWoDisp(row.wo)) + '</span></td>' +
-            '<td>' + (wo ? psFmtDate(wo.date_scheduled_start) + ' → ' + psFmtDate(wo.date_scheduled) : '—') + '</td>' +
-            '<td style="font-weight:700">' + psEsc(psFmtDate(row.start)) + ' → ' + psEsc(psFmtDate(row.finish)) + '</td>' +
-            '<td>' + delta + '</td>' +
-            '<td style="white-space:normal">' + psEsc(aiFmtReason(row.reason)) + '</td>' +
-        '</tr>';
-    }).join('');
-    var accN = list.filter(function (row) { return aiState.accepted[row.wo] !== false; }).length;
-    return '<div class="proc-subhead" style="padding:0 0 10px">' +
-            '<span class="proc-subtitle" style="margin:0">' + list.length + ' suggested reschedule' + (list.length === 1 ? '' : 's') + ' · ' + accN + ' accepted</span>' +
-            '<span style="flex:1"></span>' +
-            '<button class="ps-btn sm" type="button" onclick="aiAcceptAll(true)">Accept all</button>' +
-            '<button class="ps-btn sm" type="button" onclick="aiAcceptAll(false)">Clear</button>' +
-            '<button class="ps-btn primary sm" type="button" onclick="aiApplyReschedules()">Apply accepted</button>' +
-        '</div>' +
-        '<div class="tbl-wrap"><table><thead><tr><th style="width:34px;text-align:center">✓</th><th>WO</th><th>Current</th><th>Suggested</th><th>Δ</th><th>Reason</th></tr></thead><tbody>' + body + '</tbody></table></div>';
-}
-
-function aiPurchaseHtml() {
-    var r = aiState.result, list = (r && r.purchaseOrders) || [];
-    if (!list.length) return '<div class="ps-empty" style="padding:40px 20px">Claude proposed no purchase orders.</div>';
-    return list.map(function (po, idx) {
-        var lines = (po.lines || []).map(function (ln) {
-            return '<tr><td>' + psEsc(aiPartDisp(ln.part)) + '</td><td class="num">' + psEsc(psFmtQty(ln.qty)) + '</td><td class="num">' + (ln.unitCost != null ? psEsc(Number(ln.unitCost).toFixed(2)) : '<span class="hint">—</span>') + '</td></tr>';
-        }).join('');
-        return '<div class="ai-card">' +
-            '<h4>' + psEsc(aiVendDisp(po.vendor)) + (po.needBy ? '<span class="hint" style="font-weight:600">· needed by ' + psEsc(psFmtDate(po.needBy)) + '</span>' : '') +
-            '<span style="flex:1"></span><button class="ps-btn primary sm" type="button" onclick="aiOpenPoFromSuggestion(' + idx + ')"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2"/></svg>Open PO drawer</button></h4>' +
-            '<div class="tbl-wrap"><table><thead><tr><th>Part</th><th class="num">Qty</th><th class="num">Unit cost</th></tr></thead><tbody>' + lines + '</tbody></table></div>' +
-            (po.reason ? '<div class="ai-reason">' + psEsc(aiFmtReason(po.reason)) + '</div>' : '') +
-        '</div>';
-    }).join('');
-}
-
-function aiManufactureHtml() {
-    var r = aiState.result, list = (r && r.manufactureOrders) || [];
-    if (!list.length) return '<div class="ps-empty" style="padding:40px 20px">Claude proposed no manufacture orders.</div>';
-    var body = list.map(function (mo) {
-        return '<tr><td>' + psEsc(aiPartDisp(mo.part)) + '</td><td class="mono" style="font-size:12px">' + psEsc(mo.bomNum || '—') + '</td><td class="num">' + psEsc(psFmtQty(mo.qty)) + '</td><td>' + (mo.dateScheduled ? psEsc(psFmtDate(mo.dateScheduled)) : '—') + '</td><td style="white-space:normal">' + psEsc(aiFmtReason(mo.reason)) + '</td></tr>';
-    }).join('');
-    return '<div class="proc-subhead" style="padding:0 0 10px">' +
-            '<span class="proc-subtitle" style="margin:0">' + list.length + ' suggested manufacture order' + (list.length === 1 ? '' : 's') + '</span>' +
-            '<span style="flex:1"></span>' +
-            '<button class="ps-btn primary sm" type="button" onclick="aiOpenMoFromSuggestions()"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M12 5v14M5 12h14"/></svg>Open MO drawer (all)</button>' +
-        '</div>' +
-        '<div class="tbl-wrap"><table><thead><tr><th>Part</th><th>BOM</th><th class="num">Qty</th><th>Scheduled</th><th>Reason</th></tr></thead><tbody>' + body + '</tbody></table></div>';
-}
-
-function aiMetricsHtml() {
-    var r = aiState.result, m = (r && r.metrics) || null;
-    if (!m) return '<div class="ps-empty" style="padding:40px 20px">No metrics returned.</div>';
-    var b = m.before || {}, a = m.after || {};
-    function row(k, bv, av) { return '<div class="k">' + psEsc(k) + '</div><div>' + aiNum(bv) + '</div><div>' + aiNum(av) + '</div>'; }
-    // Local cross-check: how many accepted reschedules the capacity model flags as over.
-    var overN = 0, accN = 0;
-    (r.reschedule || []).forEach(function (rr) {
-        if (!aiState.accepted[rr.wo]) return; var wo = aiState.maps && aiState.maps.wo[rr.wo]; if (!wo) return;
-        accN++;
-        if (typeof psPlanCapFits === 'function') {
-            var s = moment(rr.start, 'YYYY-MM-DD').startOf('day'), f = moment(rr.finish, 'YYYY-MM-DD').startOf('day');
-            if (s.isValid() && f.isValid() && !psPlanCapFits(wo, s, f, psPlanBuildUsage(wo.wo_id))) overN++;
-        }
-    });
-    var imp = (m.improvements || []).map(function (x) { return '<li>' + psEsc(aiFmtReason(x)) + '</li>'; }).join('');
-    return '<div class="ai-card">' +
-        '<h4>Claude\'s assessment</h4>' +
-        '<div style="font-size:13px;line-height:1.5;color:var(--c-primary)">' + psEsc(aiFmtReason(m.summary)) + '</div>' +
-        (imp ? '<ul class="ai-imp">' + imp + '</ul>' : '') +
-        '</div>' +
-        '<div class="ai-card"><h4>Before → After</h4><div class="ai-mgrid">' +
-            '<div class="k"></div><div class="h">Before</div><div class="h">After</div>' +
-            row('On-time WOs', b.onTime, a.onTime) +
-            row('Overloaded days', b.overloadedDays, a.overloadedDays) +
-            row('Unmet-material WOs', b.unmetWOs, a.unmetWOs) +
-            row('Latest finish', b.latestFinish, a.latestFinish) +
-        '</div></div>' +
-        '<div class="banner ' + (overN ? 'warn' : 'info') + '" style="margin:0"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path stroke-linecap="round" d="M12 11v5m0-8h.01"/></svg>' +
-            '<div>Local capacity cross-check: of ' + accN + ' accepted reschedule' + (accN === 1 ? '' : 's') + ', ' + overN + ' exceed a resource\'s daily capacity by the report\'s own model' + (overN ? ' — review those before applying.' : '.') + '</div></div>';
-}
-
-function renderAiPlanner() {
-    var host = document.getElementById('aiPlannerView'); if (!host) return;
-    aiEnsureStyles();
-    var key = '';
-    try { key = (FBLib.Settings.resolve('claudeApiKey') || '').trim(); } catch (_) {}
-    var isAdmin = (window.FBLib && FBLib.Settings && FBLib.Settings.isAdmin());
-
-    // No key configured — cannot run.
-    if (!key) {
-        host.innerHTML = aiHeaderHtml() +
-            '<div class="ai-scroll"><div class="banner warn" style="margin:8px 0 0"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M12 9v4m0 4h.01"/><path stroke-linecap="round" stroke-linejoin="round" d="M10.29 3.86 1.82 18a1.5 1.5 0 0 0 1.29 2.25h17.78A1.5 1.5 0 0 0 22.18 18L13.71 3.86a1.5 1.5 0 0 0-2.42 0z"/></svg><div>' +
-            (isAdmin ? 'No Claude API key configured. Add one in <strong>Settings ▸ Admin ▸ Claude API key</strong>, then run.' : 'The AI Planner isn\'t configured yet — ask an admin to add a Claude API key in Settings ▸ Admin.') +
-            '</div></div></div>';
-        return;
-    }
-    // Availability not computed yet.
-    if (!psAvailReady) {
-        host.innerHTML = aiHeaderHtml() + '<div class="ai-scroll">' + psEmptyState(_psAvailLoading ? 'Computing component availability…' : 'Component availability will compute now — one moment, then run the AI Planner.') + '</div>';
-        return;
-    }
-
-    var bodyHtml;
-    if (aiState.status === 'error') {
-        bodyHtml = '<div class="banner err" style="margin:8px 0 0"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path stroke-linecap="round" d="M12 8v4m0 4h.01"/></svg><div><strong>Run failed.</strong> ' + psEsc(aiState.error || '') + '</div></div>';
-    } else if (!aiState.result) {
-        bodyHtml = '<div class="banner info" style="margin:8px 0 0"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path stroke-linecap="round" d="M12 11v5m0-8h.01"/></svg>' +
-            '<div>Sends the current (filtered) work orders, their material availability, the labour capacity model, and open shortages to Claude, then proposes streamlined reschedule dates plus purchase / manufacture orders to clear shortages — with a before/after metrics readout. <strong>Review-then-apply</strong>: nothing is written until you accept it. Click <strong>Run AI Planner</strong>.' +
-            (aiState.truncated ? ' <em>(Only the first ' + AI_MAX_WOS + ' WOs will be sent.)</em>' : '') + '</div></div>';
-    } else {
-        var tab = aiState.subTab || 'reschedule';
-        var counts = {
-            reschedule: (aiState.result.reschedule || []).length,
-            purchase: (aiState.result.purchaseOrders || []).length,
-            manufacture: (aiState.result.manufactureOrders || []).length
-        };
-        function tb(id, label, n) { return '<button class="proc-tab' + (tab === id ? ' active' : '') + '" onclick="aiSetSubTab(\'' + id + '\')">' + label + (n != null ? '<span class="proc-tabn">' + n + '</span>' : '') + '</button>'; }
-        var bar = '<div class="proc-tabbar">' + tb('reschedule', 'Reschedule', counts.reschedule) + tb('purchase', 'Purchase Orders', counts.purchase) + tb('manufacture', 'Manufacture Orders', counts.manufacture) + tb('metrics', 'Metrics', null) + '</div>';
-        var inner = tab === 'purchase' ? aiPurchaseHtml() : tab === 'manufacture' ? aiManufactureHtml() : tab === 'metrics' ? aiMetricsHtml() : aiRescheduleHtml();
-        bodyHtml = bar + inner;
-    }
-    host.innerHTML = aiHeaderHtml() + '<div class="ai-scroll">' + bodyHtml + '</div>';
-}
-
-window.aiRun = aiRun; window.aiSetModel = aiSetModel; window.aiSetSubTab = aiSetSubTab;
-window.aiToggleAccept = aiToggleAccept; window.aiAcceptAll = aiAcceptAll; window.aiApplyReschedules = aiApplyReschedules;
-window.aiOpenPoFromSuggestion = aiOpenPoFromSuggestion; window.aiOpenMoFromSuggestions = aiOpenMoFromSuggestions;
-// ===== /AI PLANNER =====
-
 // ============================================
 // INITIALIZATION
 // ============================================
@@ -14270,24 +10731,14 @@ window.addEventListener('DOMContentLoaded', () => {
     // a sensible value even before saveUser() has ever been called.
     initSettings();
 
-    // Apply the saved / auto-fit UI zoom as early as possible (after settings are
-    // available) so a sub-1920 screen renders fitted from the first paint.
-    psZoomInit();
-
     // Load user groups + the logged-in user's memberships up front so the admin
     // Finish-WO group picker (refreshAdminUi) and the button gate can use them.
     psLoadUserGroups();
 
     // ── Register the drop-down drawers with fb-lib so they get
     // mutual-exclusion + ESC-to-close + trigger-button active state.
-    // While a drawer is open, lock the view-tab strip (see the body.ps-drawer-open
-    // CSS): fb-lib's scrim leaves the header clickable, so without this the tabs
-    // stayed live behind the open Settings/Help drawer. onBeforeOpen/onAfterClose
-    // fire on every open/close path (button, ESC, scrim-click), keeping it in sync.
-    const _lockTabs = () => { try { document.body.classList.add('ps-drawer-open'); } catch (_) {} };
-    const _unlockTabs = () => { try { document.body.classList.remove('ps-drawer-open'); } catch (_) {} };
-    FBLib.Common.registerDrawer({ id: 'settingsOverlay',     triggerId: 'setBtn',  onBeforeOpen: _lockTabs, onAfterClose: _unlockTabs });
-    FBLib.Common.registerDrawer({ id: 'instructionsOverlay', triggerId: 'helpBtn', onBeforeOpen: _lockTabs, onAfterClose: _unlockTabs });
+    FBLib.Common.registerDrawer({ id: 'settingsOverlay',     triggerId: 'setBtn'  });
+    FBLib.Common.registerDrawer({ id: 'instructionsOverlay', triggerId: 'helpBtn' });
 
     // Show / hide the admin section + lock badge based on the
     // logged-in user's role. Called once here because isAdmin() +
@@ -14327,28 +10778,6 @@ window.addEventListener('DOMContentLoaded', () => {
         dsFinishEl.addEventListener('change', () => setFinishWOEnabled(dsFinishEl.checked));
     }
 
-    // Admin-only: "Allow finishing WOs with short raw goods" toggle (master-published).
-    const dsAllowShortEl = document.getElementById('dsAllowFinishShort');
-    if (dsAllowShortEl) {
-        dsAllowShortEl.checked = !!FBLib.Settings.resolve('allowFinishShort');
-        dsAllowShortEl.addEventListener('change', () => setAllowFinishShort(dsAllowShortEl.checked));
-    }
-
-    // Admin-only: AI Planner tab toggle + anonymise toggle (master-published).
-    // The key field uses an explicit Save button, so no change-listener here.
-    const dsEnableAiEl = document.getElementById('dsEnableAiPlanner');
-    if (dsEnableAiEl) {
-        dsEnableAiEl.checked = !!FBLib.Settings.resolve('enableAiPlanner');
-        dsEnableAiEl.addEventListener('change', () => setAiPlannerEnabled(dsEnableAiEl.checked));
-    }
-    const dsAiAnonEl = document.getElementById('dsAiPlannerAnonymise');
-    if (dsAiAnonEl) {
-        dsAiAnonEl.checked = FBLib.Settings.resolve('aiPlannerAnonymise') !== false;
-        dsAiAnonEl.addEventListener('change', () => setAiPlannerAnonymise(dsAiAnonEl.checked));
-    }
-    const dsAiKeyEl = document.getElementById('dsClaudeApiKey');
-    if (dsAiKeyEl) dsAiKeyEl.value = FBLib.Settings.resolve('claudeApiKey') || '';
-
     // Default-tab selector — sets which view the report opens on next time.
     // 'last' keeps the existing remember-last-view behaviour.
     const defViewEl = document.getElementById('defaultViewSelect');
@@ -14359,36 +10788,6 @@ window.addEventListener('DOMContentLoaded', () => {
             FBLib.Settings.setUserKey('defaultView', val);
             FBLib.Settings.saveUser();
             showToast(val === 'last' ? 'Report will open on your last used view' : 'Default tab set — opens on ' + val, 'success', 2500);
-        });
-    }
-
-    // Tab visibility + order control (Settings ▸ Display) — paint its summary label
-    // so it reads correctly before the panel is first opened. Prefs already loaded
-    // in initShell; rows build lazily when the panel opens (psTabSelToggle).
-    try { psRenderTabSelector(); } catch (_) {}
-
-    // Default MO / PO status selectors (Procurement group) — remembered per user
-    // and applied as the initial status in the Create-MO / Create-PO drawers.
-    const moStatusEl = document.getElementById('dsMoStatusSelect');
-    if (moStatusEl) {
-        const cur = FBLib.Settings.resolve('moCreateStatus');
-        moStatusEl.value = (cur === 'Entered') ? 'Entered' : 'Issued';
-        moStatusEl.addEventListener('change', () => {
-            const val = (moStatusEl.value === 'Entered') ? 'Entered' : 'Issued';
-            FBLib.Settings.setUserKey('moCreateStatus', val);
-            FBLib.Settings.saveUser();
-            showToast('New MOs will default to ' + val, 'success', 2500);
-        });
-    }
-    const poStatusEl = document.getElementById('dsPoStatusSelect');
-    if (poStatusEl) {
-        const cur = FBLib.Settings.resolve('poCreateStatus');
-        poStatusEl.value = (cur === 'Bid Request') ? 'Bid Request' : 'Issued';
-        poStatusEl.addEventListener('change', () => {
-            const val = (poStatusEl.value === 'Bid Request') ? 'Bid Request' : 'Issued';
-            FBLib.Settings.setUserKey('poCreateStatus', val);
-            FBLib.Settings.saveUser();
-            showToast('New POs will default to ' + val, 'success', 2500);
         });
     }
 
@@ -14438,15 +10837,6 @@ function initShell(){
         // Restore the CF filters drawer's object-group order (drag-reordered per user).
         const _cfo = FBLib.Settings.resolve('cfGroupOrder');
         if (Array.isArray(_cfo)) { const _k = _cfo.filter(o => PS_CF_OBJ_KEYS.indexOf(o) >= 0); if (_k.length) psCfGroupOrder = _k; }
-        // Restore the user's tab order + hidden set (Settings ▸ Display). Filtered to
-        // real view ids; unknown ids are dropped so a renamed/removed tab can't stick.
-        const _to = FBLib.Settings.resolve('tabOrder');
-        if (Array.isArray(_to)) { const _k2 = _to.filter(id => PS_VIEWS.some(v => v.id === id)); if (_k2.length) psTabOrder = _k2; }
-        const _th = FBLib.Settings.resolve('tabHidden');
-        psTabHidden = new Set(Array.isArray(_th) ? _th.filter(id => PS_VIEWS.some(v => v.id === id)) : []);
-        // If the opening view resolved above is one the user has hidden, open on the
-        // first still-visible tab instead so the strip shows the active pill.
-        if (!psTabVisible(psView)) { const _vis = psOrderedVisibleViews(); if (_vis.length) psView = _vis[0]; }
     } catch (_) {}
     try {
         if (typeof getUser === 'function') {
@@ -14478,13 +10868,12 @@ function initSettings() {
         defaults: {
             v: 1,
             allowSameDayStarts: false,
-            shiftDependentMode: 'off',     // 'off' | 'later' (push dependents only when a WO moves out) | 'both' (shift dependents earlier and later)
+            shiftDependentWOs:  false,
             skipWeekends:       false,
             showArrows:         true,
             showCompletedWOs:   true,
             calendarColorMode:  'status',
             viewByMode:         'wo_num',
-            ganttBarLabel:      'wo',
             calendarExpanded:   false,
             ganttScale:         80,
             collapsedMOs:       [],
@@ -14493,8 +10882,6 @@ function initSettings() {
             // v1.2 workspace prefs (additive — old saved payloads still resolve).
             activeView:         'dashboard',   // dashboard|timeline|board|table|calendar|load — last-used view
             defaultView:        'last',        // which tab the report opens on: 'last' (remember) or a specific view id
-            uiZoom:             1,             // app-level zoom factor (0.5–1.3) — used when uiZoomMode='manual'
-            uiZoomMode:         'auto',        // 'auto' = fit to screen width each load · 'manual' = use saved uiZoom
             timelineGroupBy:    'mo',          // mo|site|resource|category|user
             tableGroupBy:       'none',        // Work Orders table grouping: none|mo|category|site|resource|user
             loadDim:            'cat',         // cat|user
@@ -14509,10 +10896,7 @@ function initSettings() {
                 users:    {}     // { '<userId>': { hoursPerDay?:Number, workDays?:[7] } } — blank inherits business
             },
             moCreateStatus:     'Issued',      // Create-MO default order status: Issued (live) | Entered (suggestion)
-            poCreateStatus:     'Issued',      // Create-PO default order status: Issued | Bid Request
             cfGroupOrder:       ['bom','mo','wo','part'], // CF filters drawer: object-group display order (drag-reorder, persisted)
-            tabOrder:           PS_VIEWS.map(function (v) { return v.id; }), // Settings ▸ Display: tab strip order (drag-reorder, persisted)
-            tabHidden:          [],            // Settings ▸ Display: user-hidden tab ids (only among psTabEnabled tabs)
             // GLOBAL date-range filter (remembered per user; first-run 'all' = no
             // restriction so behaviour is unchanged until a range is chosen).
             dashRangeKey:       'all',         // all|today|tomorrow|week|nextweek|month|nextmonth|custom
@@ -14530,20 +10914,6 @@ function initSettings() {
             // single user group. '' = all users (no restriction). Only applies
             // when enableFinishWO is on.
             finishWOGroupId:    '',
-            // Admin-only, master-published: allow the Finish WO flow to complete a
-            // work order whose raw goods are short of stock. Off by default; when on,
-            // Finish proceeds past shortage blockers (committing whatever stock IS
-            // available) after a styled danger-warning modal. Serial/tracking blockers
-            // are NEVER overridable by this.
-            allowFinishShort:   false,
-            // AI Planner (premium POC). Admin-only, master-published: enable the
-            // tab org-wide, hold the org Claude API key, and toggle anonymisation
-            // of the data sent to Claude. aiPlannerModel is per-user (the tab's
-            // model dropdown). See the AI PLANNER block for the transport.
-            enableAiPlanner:    false,
-            claudeApiKey:       '',
-            aiPlannerAnonymise: true,
-            aiPlannerModel:     'claude-opus-4-8',
         }
     });
 
@@ -14573,6 +10943,3 @@ function initSettings() {
         }
     }
 }
-</script>
-</body>
-</html>
