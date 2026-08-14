@@ -876,10 +876,34 @@ function buildFilterConditions(dateCondOverride) {
 const CAT_SEP       = ' > ';
 const CAT_NONE      = 'No Category';
 const CAT_DEPTH_CAP = 20;       // guard against a corrupt parentId cycle
+// Donut slice budget. Past ~10 wedges the slivers are unreadable, but
+// dropping them with a SQL LIMIT made the chart under-report — the
+// wedges no longer summed to the Revenue KPI. Keep the top N and fold
+// the rest into one clickable "Other" slice instead.
+const PIE_TOP_SLICES = 9;       // real slices; "Other" is the 10th
+
+// Fold a donut's tail into a single "Other" row. Rows must already be
+// sorted by revenue DESC and must be the COMPLETE set — never LIMITed in
+// SQL, or the total is wrong before this ever runs. `fullRows` rides
+// along so renderDonut's CSV export can emit the un-grouped list.
+function rollupDonutTail(rows, noun) {
+  if (rows.length <= PIE_TOP_SLICES + 1) return rows;
+  const head = rows.slice(0, PIE_TOP_SLICES);
+  const tail = rows.slice(PIE_TOP_SLICES);
+  head.push({
+    name: `Other (${tail.length} ${noun})`,
+    revenue: tail.reduce((s, r) => s + parseFloat(r.revenue || 0), 0),
+    isOther: true,
+    members: tail.map(r => r.name)
+  });
+  head.fullRows = rows;
+  return head;
+}
 
 let _catNodes        = new Map();  // treeId → { id, name, parentId, path:[node], depth }
 let _catMaxDepth     = 1;          // deepest branch (system root excluded, 1-based)
 let _catLevel        = 0;          // configured level; 0 = full depth (as assigned)
+let _catLevelLoaded  = false;      // saved catLevel read once (see loadFilters)
 let _catEffLevel     = 1;          // _catLevel resolved against the live tree
 let _catLabelById    = new Map();  // rollup node id → 'Bike Parts > Accessories'
 let _catIdByLabel    = new Map();  // path label     → rollup node id
@@ -1062,7 +1086,11 @@ function renderCatLevelUI() {
   const mk = (val, text) => { const o = document.createElement('option'); o.value = String(val); o.textContent = text; sel.appendChild(o); };
   mk(0, `Full depth (as assigned) — ${max} level${max === 1 ? '' : 's'}`);
   for (let i = 1; i <= max; i++) mk(i, `Level ${i}${i === 1 ? ' — top branch only' : ''}`);
-  sel.value = String(_catLevel);
+  // Clamp only the DISPLAYED value — if the tree is currently shallower
+  // than the configured level there is no matching <option>, and setting
+  // an absent value would blank the select. _catLevel itself is left
+  // alone so the setting survives the tree getting deeper again.
+  sel.value = String(Math.min(_catLevel, max));
   sel.disabled = (!dashUserEditingAllowed() && !FBLib.Settings.isAdmin());
 
   const ex = document.getElementById('dsCatLevelExample');
@@ -1112,15 +1140,27 @@ const Q = {
 
   // Grouped on the rollup NODE ID (§5b); the path label is attached here
   // so the donut, its legend and the drilldown all speak the same string.
+  // No SQL LIMIT here on purpose (§5b PIE_TOP_SLICES): every category is
+  // fetched, the top N are drawn and the tail becomes one "Other" wedge,
+  // so the donut always adds up to the Revenue KPI. `fullRows` carries the
+  // un-grouped list through to the CSV export.
   categoryMix: () => qget('categoryMix', async () => {
-    const sql = `SELECT ${CAT_ID_EXPR} as cat_id, SUM(${REV_EXPR}) as revenue ${BASE_JOIN} ${buildFilterConditions()} GROUP BY cat_id ORDER BY revenue DESC LIMIT 8`;
+    const sql = `SELECT ${CAT_ID_EXPR} as cat_id, SUM(${REV_EXPR}) as revenue ${BASE_JOIN} ${buildFilterConditions()} GROUP BY cat_id ORDER BY revenue DESC`;
     const rows = await runQueryLogged('Category Mix', sql);
-    return rows.map(r => ({ name: catLabel(r.cat_id), revenue: r.revenue }));
+    return rollupDonutTail(
+      rows.map(r => ({ name: catLabel(r.cat_id), revenue: parseFloat(r.revenue || 0) })),
+      'categories'
+    );
   }),
 
-  customerGroups: () => qget('customerGroups', () => {
-    const sql = `SELECT COALESCE(AccountGroup.Name,'No Group') as name, SUM(${REV_EXPR}) as revenue ${BASE_JOIN} ${buildFilterConditions()} GROUP BY name ORDER BY revenue DESC LIMIT 8`;
-    return runQueryLogged('Customer Groups', sql);
+  // No SQL LIMIT — same reconciliation rule as categoryMix above.
+  customerGroups: () => qget('customerGroups', async () => {
+    const sql = `SELECT COALESCE(AccountGroup.Name,'No Group') as name, SUM(${REV_EXPR}) as revenue ${BASE_JOIN} ${buildFilterConditions()} GROUP BY name ORDER BY revenue DESC`;
+    const rows = await runQueryLogged('Customer Groups', sql);
+    return rollupDonutTail(
+      rows.map(r => ({ name: r.name, revenue: parseFloat(r.revenue || 0) })),
+      'groups'
+    );
   }),
 
   topSalespeople: () => qget('topSalespeople', () => {
@@ -1442,7 +1482,10 @@ async function renderDonut(el, dataFn, opts = {}) {
   const W = el.clientWidth, H = el.clientHeight;
   if (W < 80 || H < 50) return;
 
-  const data  = raw.map(d => ({ name: d.name, value: parseFloat(d.revenue||0) }));
+  const data  = raw.map(d => ({ name: d.name, value: parseFloat(d.revenue||0), isOther: !!d.isOther, members: d.members }));
+  // Percentages run against the TRUE arithmetic total (which now equals
+  // the period revenue); the wedge geometry clamps at zero because
+  // d3.pie cannot draw a negative angle for a credit-heavy group.
   const total = d3.sum(data,d=>d.value) || 1;
   const csz   = Math.min(W*0.48, H-4, 220);
   const r     = csz/2;
@@ -1456,14 +1499,16 @@ async function renderDonut(el, dataFn, opts = {}) {
   const svg = svgWrap.append('svg').attr('width',csz).attr('height',csz).append('g').attr('transform',`translate(${r},${r})`);
   const arc     = d3.arc().innerRadius(r*.44).outerRadius(r*.84);
   const arcHov  = d3.arc().innerRadius(r*.44).outerRadius(r*.92);
-  const pie     = d3.pie().value(d=>d.value).sort(null);
+  const pie     = d3.pie().value(d=>Math.max(0,d.value)).sort(null);
 
   svg.selectAll('path').data(pie(data)).join('path').attr('d',arc)
     .attr('fill',d=>color(d.data.name)).attr('stroke','white').attr('stroke-width',2)
     .style('cursor', opts.clickable ? 'pointer' : 'default')
     .on('mouseover', function(ev,d){
       d3.select(this).transition().duration(100).attr('d',arcHov);
-      showTip(ev,`<strong>${d.data.name}</strong><br>${fmt$(d.data.value)}<br>${(d.data.value/total*100).toFixed(1)}% of total${opts.clickable?'<br><em>Click to drill in</em>':''}`);
+      // The Other wedge names what it swallowed — the grouping is never a black box.
+      const members = d.data.members ? `<br><span style="opacity:.7">${d.data.members.join(', ')}</span>` : '';
+      showTip(ev,`<strong>${d.data.name}</strong><br>${fmt$(d.data.value)}<br>${(d.data.value/total*100).toFixed(1)}% of total${members}${opts.clickable?'<br><em>Click to drill in</em>':''}`);
     })
     .on('mousemove',moveTip).on('mouseout', function(){ d3.select(this).transition().duration(100).attr('d',arc); hideTip(); })
     .on('click', opts.clickable ? ((ev,d) => { hideTip(); opts.clickable(d.data); }) : null);
@@ -1479,13 +1524,16 @@ async function renderDonut(el, dataFn, opts = {}) {
     row.append('span').style('color','#506872').style('line-height','1.3').text(`${d.name} (${fmt$(d.value,true)})`);
   });
 
-  // CSV export payload — name + value (§2).
+  // CSV export payload — name + value (§2). Exports `fullRows` when the
+  // data function supplied one, so a rolled-up "Other" wedge still exports
+  // every underlying group rather than the single summary row.
+  const exportSrc = raw.fullRows || raw;
   return {
     columns: [
       { key:'name',  label:'Name' },
       { key:'value', label:'Value' }
     ],
-    rows: data.map(d => ({ name: d.name, value: d.value }))
+    rows: exportSrc.map(d => ({ name: d.name, value: parseFloat((d.revenue != null ? d.revenue : d.value) || 0) }))
   };
 }
 
@@ -1645,16 +1693,16 @@ const WIDGET_REGISTRY = {
     render: (el,cfg) => renderHorizBar(el, Q.topProducts, { fmt:'count', clickable: (d) => drilldownProduct(d.name, d.meta.desc_text) })
   },
   'category-mix': {
-    title:'Sales by Category', description:'Revenue split by product category.', category:'chart',
+    title:'Sales by Category', description:'Revenue split by product category — every category is counted, so the wedges add up to total revenue. Past the top 9 the tail is grouped into "Other"; click it to drill into all of them.', category:'chart',
     icon:'<path d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z"/><path d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z"/>',
     defaultW:4, defaultH:10, hasChartToggle:false,
-    render: (el,cfg) => renderDonut(el, Q.categoryMix, { clickable: (d) => drilldownCategory(d.name) })
+    render: (el,cfg) => renderDonut(el, Q.categoryMix, { clickable: (d) => drilldownCategory(d.name, d.members) })
   },
   'customer-groups': {
-    title:'Customer Groups', description:'Revenue split by customer account group.', category:'chart',
+    title:'Customer Groups', description:'Revenue split by customer account group — every group is counted, so the wedges add up to total revenue. Past the top 9 the tail is grouped into "Other"; click it to drill into all of them.', category:'chart',
     icon:'<path d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/>',
     defaultW:4, defaultH:10, hasChartToggle:false,
-    render: (el,cfg) => renderDonut(el, Q.customerGroups, { clickable: (d) => drilldownCustomerGroup(d.name) })
+    render: (el,cfg) => renderDonut(el, Q.customerGroups, { clickable: (d) => drilldownCustomerGroup(d.name, d.members) })
   },
   'top-salespeople': {
     title:'Top Salespeople', description:'Revenue per salesperson.', category:'chart',
@@ -2544,27 +2592,41 @@ async function drilldownMonth(month) {
 // categoryName is a rollup path label ("Bike Parts > Accessories"), so
 // the drilldown filters on the rollup node id and shows each product's
 // OWN full path — that's where the rolled-up revenue actually came from.
-async function drilldownCategory(categoryName) {
+// memberLabels is set only for the aggregate "Other" wedge — the tail
+// categories it rolled up. It drills into all of them at once so the table
+// and its CSV export show the full underlying data, not a summary row.
+async function drilldownCategory(categoryName, memberLabels) {
   try {
     debugLog(`Drilldown: category "${categoryName}"`, 'click');
-    const rollupId = _catIdByLabel.get(categoryName);
-    if (categoryName !== CAT_NONE && rollupId === undefined) {
+    const isOther = !!(memberLabels && memberLabels.length);
+    const labels  = isOther ? memberLabels : [categoryName];
+    const ids     = [];
+    let wantNone  = false;
+    labels.forEach(l => {
+      if (l === CAT_NONE) wantNone = true;
+      else if (_catIdByLabel.has(l)) ids.push(_catIdByLabel.get(l));
+    });
+    if (!ids.length && !wantNone) {
       showToast(`Category "${categoryName}" is no longer in the product tree`, 'error');
       return;
     }
-    const catCond = (categoryName === CAT_NONE)
-      ? `AND ${CAT_ID_EXPR} IS NULL`
-      : `AND ${CAT_ID_EXPR} = ${rollupId}`;
+    const conds = [];
+    if (ids.length) conds.push(`${CAT_ID_EXPR} IN (${ids.join(',')})`);
+    if (wantNone)   conds.push(`${CAT_ID_EXPR} IS NULL`);
+    const catCond = `AND (${conds.join(' OR ')})`;
+    // "Other" spans several categories, so it needs the larger row budget.
+    const rowCap = isOther ? 500 : 100;
     const sql = `SELECT Product.Num as product_num, Product.Description as product_name,
         ProductTree.Id as tree_id,
         SUM(IF(SoItem.typeId IN (20,21), PostSoItem.Qty*-1, PostSoItem.Qty)) as units_sold,
         SUM(${REV_EXPR}) as total_revenue, AVG(${MARGIN_EXPR}) as avg_margin
       ${BASE_JOIN} ${buildFilterConditions()} ${catCond}
-      GROUP BY Product.Num, Product.Description, ProductTree.Id ORDER BY total_revenue DESC LIMIT 100`;
+      GROUP BY Product.Num, Product.Description, ProductTree.Id ORDER BY total_revenue DESC LIMIT ${rowCap}`;
     const rows = await runQueryP(sql);
     if (!rows.length) { showToast('No products found for this category', 'info'); return; }
     const data = rows.map(r => Object.assign({}, r, { category_path: catFullPath(r.tree_id) }));
-    openDrilldown(`Products in ${categoryName}`, `Sales by Category > ${categoryName}`, data, [
+    const title = isOther ? `Products in ${labels.length} other categories` : `Products in ${categoryName}`;
+    openDrilldown(title, `Sales by Category > ${categoryName}`, data, [
       { key: 'product_num',   label: 'Product #',    type: 'string' },
       { key: 'product_name',  label: 'Product Name', type: 'string' },
       { key: 'category_path', label: 'Category',     type: 'string' },
@@ -2575,24 +2637,36 @@ async function drilldownCategory(categoryName) {
   } catch (e) { _ddFail('drilldownCategory', e); }
 }
 
-async function drilldownCustomerGroup(groupName) {
+// memberNames is set only for the aggregate "Other" wedge — the tail groups
+// it rolled up. Drilling it covers all of them so the table and CSV export
+// show the full underlying data.
+async function drilldownCustomerGroup(groupName, memberNames) {
   try {
     debugLog(`Drilldown: customer group "${groupName}"`, 'click');
-    const grpCond = groupName === 'No Group'
-      ? `AND (AccountGroup.Name IS NULL OR AccountGroup.Name = '')`
-      : `AND AccountGroup.Name = '${escSQL(groupName)}'`;
+    const isOther = !!(memberNames && memberNames.length);
+    const names   = isOther ? memberNames : [groupName];
+    const real    = names.filter(n => n !== 'No Group');
+    const conds   = [];
+    if (real.length) conds.push(`AccountGroup.Name IN (${real.map(n => `'${escSQL(n)}'`).join(',')})`);
+    if (names.length !== real.length) conds.push(`(AccountGroup.Name IS NULL OR AccountGroup.Name = '')`);
+    const grpCond = `AND (${conds.join(' OR ')})`;
+    const rowCap  = isOther ? 500 : 200;   // "Other" spans several groups
     const sql = `SELECT So.Num as order_num, PostSo.DateCreated as order_date, Customer.Name as customer_name,
+        COALESCE(AccountGroup.Name,'No Group') as group_name,
         COUNT(DISTINCT SoItem.Id) as item_count,
         SUM(${REV_EXPR}) as total_revenue,
         (SUM(${REV_EXPR}) - SUM(PostSoItem.PostedTotalCost)) / NULLIF(SUM(${REV_EXPR}), 0) as margin_percent
       ${BASE_JOIN} ${buildFilterConditions()} ${grpCond}
-      GROUP BY So.Num, PostSo.DateCreated, Customer.Name ORDER BY PostSo.DateCreated DESC LIMIT 200`;
+      GROUP BY So.Num, PostSo.DateCreated, Customer.Name, group_name ORDER BY PostSo.DateCreated DESC LIMIT ${rowCap}`;
     const data = await runQueryP(sql);
     if (!data.length) { showToast('No orders found for this group', 'info'); return; }
-    openDrilldown(`Orders for ${groupName}`, `Customer Groups > ${groupName}`, data, [
+    const title = isOther ? `Orders across ${names.length} other groups` : `Orders for ${groupName}`;
+    openDrilldown(title, `Customer Groups > ${groupName}`, data, [
       { key: 'order_num',      label: 'Order #',  type: 'string' },
       { key: 'order_date',     label: 'Date',     type: 'date' },
       { key: 'customer_name',  label: 'Customer', type: 'string' },
+      // Only worth a column when several groups are in play.
+      ...(isOther ? [{ key: 'group_name', label: 'Group', type: 'string' }] : []),
       { key: 'item_count',     label: 'Items',    type: 'number' },
       { key: 'total_revenue',  label: 'Total',    type: 'currency' },
       { key: 'margin_percent', label: 'Margin %', type: 'percent' }
@@ -2688,10 +2762,19 @@ async function loadFilters() {
     // Product categories (§5b): load the tree, resolve the saved rollup
     // level, then derive the option list from the nodes that actually
     // carry products (tid 0 = product sitting outside the tree).
+    // Re-runnable — the Refresh button calls loadFilters() again so an
+    // edit to the Product Tree itself (new / renamed / re-parented node)
+    // is picked up without reopening the report.
     await loadCategoryTree();
-    let savedLevel = 0;
-    try { savedLevel = parseInt(FBLib.Settings.resolve('catLevel')) || 0; } catch (_) {}
-    _catLevel = Math.max(0, Math.min(savedLevel, Math.max(1, _catMaxDepth)));
+    // The saved level is read ONCE. On a refresh keep whatever the user
+    // has set this session, or an unsaved change (e.g. editing locked by
+    // an admin) would silently revert. rebuildCatRollup clamps the level
+    // against the live tree depth, so no clamping is needed here — that
+    // would be lossy if the tree later gets deeper.
+    if (!_catLevelLoaded) {
+      try { _catLevel = parseInt(FBLib.Settings.resolve('catLevel')) || 0; } catch (_) { _catLevel = 0; }
+      _catLevelLoaded = true;
+    }
     rebuildCatRollup();
 
     const catSql = `SELECT DISTINCT COALESCE(pt.ProductTreeId, 0) as tid FROM Product p LEFT JOIN ProductToTree pt ON pt.ProductId = p.Id`;
@@ -2700,6 +2783,10 @@ async function loadFilters() {
     _catUsedIds = tids.filter(t => t > 0);
     _catHasUnassigned = tids.some(t => t === 0);
     rebuildCatFilterOptions();
+    // Pull any live selection onto the rebuilt tree. No-op at init (F is
+    // empty until applyFilterState, which remaps again); on a refresh this
+    // is what keeps a selected category valid after the tree was edited.
+    remapCatSelection();
     debugLog(`Product Categories filter: ${_filterOpts.categories.length} option(s) at level ${_catEffLevel}`,
              _filterOpts.categories.length ? 'success' : 'warning');
 
@@ -2893,7 +2980,26 @@ function clearAllFilters() {
   onFilterChange();
 }
 
-function refreshDashboard() { qclear(); rerenderAll(); updateKPIBadges(); }
+// Topbar ↻ — a FULL refresh: reference data first (Product Tree, customer
+// groups, salespeople), then the figures. Reloading the tree matters because
+// the category rollup CASE is generated from it at load time — without this,
+// a category added or re-parented in Fishbowl stayed invisible until the
+// report was reopened, and its products fell through to "No Category".
+async function refreshDashboard() {
+  const before = [...F.productCategory];
+  await loadFilters();          // ends in renderFilterbar()
+  renderCatLevelUI();           // level list follows the live tree depth
+  // Tell the user if the tree edit invalidated part of their selection —
+  // otherwise the numbers move with no visible cause.
+  const dropped = before.filter(c => !F.productCategory.includes(c));
+  if (dropped.length) {
+    showToast('Product Tree changed — category filter updated (' + dropped.join(', ') + ')', 'info', 5000);
+    debugLog('Refresh dropped stale category selection: ' + dropped.join(', '), 'warning');
+  }
+  qclear();
+  rerenderAll();
+  updateKPIBadges();
+}
 
 // ============================================================
 // 16b. ADMIN CONTROLS

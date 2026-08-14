@@ -774,6 +774,12 @@ function sdClearDim(which) {
 // un-received POs from spend numbers). OPEN_PO_JOIN is the open-book
 // stack for the snapshot tiles.
 // ============================================================
+// Donut slice budget. Past ~10 wedges the slivers are unreadable, but
+// dropping them with a SQL LIMIT made the chart under-report — the wedges
+// no longer summed to the spend KPI. Keep the top N and fold the rest into
+// one clickable "Other" slice instead.
+const PIE_TOP_SLICES = 9;       // real slices; "Other" is the 10th
+
 const PO_BASE_JOIN = `
   FROM postpoitem
   JOIN postpo ON postpoitem.postpoid = postpo.id
@@ -991,17 +997,31 @@ const Q = {
     return runQueryLogged('Top Products', sql);
   }),
 
-  // Old getPurchasesByCategory.
-  purchasesCategory: () => qget('purchasesCategory', () => {
+  // Old getPurchasesByCategory. No SQL LIMIT on purpose: a truncated
+  // category list can never add up to the total spend KPI. Everything past
+  // the top PIE_TOP_SLICES folds into one clickable "Other" wedge, which
+  // still drills into — and exports — the full underlying data.
+  purchasesCategory: () => qget('purchasesCategory', async () => {
     const sql = `SELECT COALESCE(ProductTree.Name, 'Uncategorized') as category_name,
         SUM(postpoitem.postedtotalcost) as total_spend,
         COUNT(DISTINCT po.num) as po_count
       ${PO_BASE_JOIN}
       ${buildFilterConditions()}
       GROUP BY ProductTree.Name
-      ORDER BY total_spend DESC
-      LIMIT 10`;
-    return runQueryLogged('Purchases by Category', sql);
+      ORDER BY total_spend DESC`;
+    const rows = await runQueryLogged('Purchases by Category', sql);
+    if (rows.length <= PIE_TOP_SLICES + 1) return rows;
+    const head = rows.slice(0, PIE_TOP_SLICES);
+    const tail = rows.slice(PIE_TOP_SLICES);
+    head.push({
+      category_name: `Other (${tail.length} categories)`,
+      total_spend: tail.reduce((s, r) => s + parseFloat(r.total_spend || 0), 0),
+      po_count: tail.reduce((s, r) => s + parseInt(r.po_count || 0), 0),
+      isOther: true,
+      members: tail.map(r => r.category_name)
+    });
+    head.fullRows = rows;
+    return head;
   }),
 
   // Old getHighValuePOs.
@@ -1299,7 +1319,12 @@ async function renderDonut(el, dataFn, opts = {}) {
   const fmtVal  = opts.fmtVal || (v => fmt$(v));
   const fmtValCompact = opts.fmtVal || (v => fmt$(v, true));
 
-  const data  = raw.map(d => ({ name: d[nameKey], value: parseFloat(d[vKey]||0), meta: d })).filter(d => d.value > 0);
+  // Drop only the exact zeros (an empty PO status shouldn't occupy a legend
+  // row). Negatives are KEPT — a category that nets negative on credits used
+  // to vanish silently, which made the donut under-report against the spend
+  // KPI. Percentages run against the true total; the wedge geometry clamps
+  // at zero because d3.pie cannot draw a negative angle.
+  const data  = raw.map(d => ({ name: d[nameKey], value: parseFloat(d[vKey]||0), meta: d, isOther: !!d.isOther, members: d.members })).filter(d => d.value !== 0);
   if (!data.length) { el.innerHTML = '<div class="tile-skel"><span class="tile-skel-lbl">No data for period</span></div>'; return; }
   const total = d3.sum(data,d=>d.value) || 1;
   const csz   = Math.min(W*0.48, H-4, 220);
@@ -1314,14 +1339,16 @@ async function renderDonut(el, dataFn, opts = {}) {
   const svg = svgWrap.append('svg').attr('width',csz).attr('height',csz).append('g').attr('transform',`translate(${r},${r})`);
   const arc     = d3.arc().innerRadius(r*.44).outerRadius(r*.84);
   const arcHov  = d3.arc().innerRadius(r*.44).outerRadius(r*.92);
-  const pie     = d3.pie().value(d=>d.value).sort(null);
+  const pie     = d3.pie().value(d=>Math.max(0,d.value)).sort(null);
 
   svg.selectAll('path').data(pie(data)).join('path').attr('d',arc)
     .attr('fill',d=>color(d.data.name)).attr('stroke','white').attr('stroke-width',2)
     .style('cursor', opts.clickable ? 'pointer' : 'default')
     .on('mouseover', function(ev,d){
       d3.select(this).transition().duration(100).attr('d',arcHov);
-      showTip(ev,`<strong>${d.data.name}</strong><br>${fmtVal(d.data.value)}<br>${(d.data.value/total*100).toFixed(1)}% of total${opts.clickable?'<br><em>Click to drill in</em>':''}`);
+      // The Other wedge names what it swallowed — the grouping is never a black box.
+      const members = d.data.members ? `<br><span style="opacity:.7">${d.data.members.join(', ')}</span>` : '';
+      showTip(ev,`<strong>${d.data.name}</strong><br>${fmtVal(d.data.value)}<br>${(d.data.value/total*100).toFixed(1)}% of total${members}${opts.clickable?'<br><em>Click to drill in</em>':''}`);
     })
     .on('mousemove',moveTip).on('mouseout', function(){ d3.select(this).transition().duration(100).attr('d',arc); hideTip(); })
     .on('click', opts.clickable ? ((ev,d) => { hideTip(); opts.clickable(d.data); }) : null);
@@ -1338,7 +1365,13 @@ async function renderDonut(el, dataFn, opts = {}) {
     row.append('span').style('color','#506872').style('line-height','1.3').text(`${d.name} (${fmtValCompact(d.value)})`);
   });
 
-  return { columns:[{key:'name',label:'Name'},{key:'value',label:(opts.valueLabel||'Value')}], rows: data.map(d=>({name:d.name,value:d.value})) };
+  // Export `fullRows` when the data function supplied one, so a rolled-up
+  // "Other" wedge still exports every underlying group, not the summary row.
+  const exportSrc = raw.fullRows || raw;
+  return {
+    columns:[{key:'name',label:'Name'},{key:'value',label:(opts.valueLabel||'Value')}],
+    rows: exportSrc.map(d => ({ name: d[nameKey] != null ? d[nameKey] : d.name, value: parseFloat((d[vKey] != null ? d[vKey] : d.value) || 0) }))
+  };
 }
 
 // ── Sortable table ───────────────────────────────────────────
@@ -1550,12 +1583,12 @@ const WIDGET_REGISTRY = {
     })
   },
   'purchases-category': {
-    title:'Purchases by Category', description:'Received spend split by product category. Click a segment to list the POs.', category:'chart',
+    title:'Purchases by Category', description:'Received spend split by product category — every category is counted, so the wedges add up to total spend. Past the top 9 the tail is grouped into "Other". Click any segment to list the POs.', category:'chart',
     icon:'<path d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/>',
     defaultW:6, defaultH:10, hasChartToggle:false,
     render: (el,cfg) => renderDonut(el, Q.purchasesCategory, {
       nameKey:'category_name', valueKey:'total_spend',
-      clickable: (d) => drilldownCategory(d.name)
+      clickable: (d) => drilldownCategory(d.name, d.members)
     })
   },
   'high-value-pos': {
@@ -2348,26 +2381,38 @@ async function drilldownVendor(vendorName) {
   } catch (e) { _ddFail('drilldownVendor', e); }
 }
 
-async function drilldownCategory(categoryName) {
+// memberNames is set only for the aggregate "Other" wedge — the tail
+// categories it rolled up. It drills into all of them at once so the table
+// and its CSV export show the full underlying data, not a summary row.
+async function drilldownCategory(categoryName, memberNames) {
   try {
     debugLog(`Drilldown: category "${categoryName}"`, 'click');
-    const catCond = categoryName === 'Uncategorized'
-      ? `AND (ProductTree.Name IS NULL OR ProductTree.Name = '')`
-      : `AND ProductTree.Name = '${escSQL(categoryName)}'`;
+    const isOther = !!(memberNames && memberNames.length);
+    const names   = isOther ? memberNames : [categoryName];
+    const real    = names.filter(n => n !== 'Uncategorized');
+    const conds   = [];
+    if (real.length) conds.push(`ProductTree.Name IN (${real.map(n => `'${escSQL(n)}'`).join(',')})`);
+    if (names.length !== real.length) conds.push(`(ProductTree.Name IS NULL OR ProductTree.Name = '')`);
+    const catCond = `AND (${conds.join(' OR ')})`;
+    const rowCap  = isOther ? 500 : 200;   // "Other" spans several categories
     const sql = `SELECT po.num as po_num, vendor.name as vendor_name,
+        COALESCE(ProductTree.Name, 'Uncategorized') as category_name,
         postpo.DateCreated as received_date,
         SUM(postpoitem.postedtotalcost) as po_value
       ${PO_BASE_JOIN}
       ${buildFilterConditions()}
       ${catCond}
-      GROUP BY po.num, vendor.name, postpo.DateCreated
+      GROUP BY po.num, vendor.name, category_name, postpo.DateCreated
       ORDER BY po_value DESC
-      LIMIT 200`;
+      LIMIT ${rowCap}`;
     const data = await runQueryP(sql);
     if (!data.length) { showToast('No POs found for this category', 'info'); return; }
-    openDrilldown(`POs in ${categoryName}`, `Purchases by Category > ${categoryName}`, data, [
+    const title = isOther ? `POs in ${names.length} other categories` : `POs in ${categoryName}`;
+    openDrilldown(title, `Purchases by Category > ${categoryName}`, data, [
       { key: 'po_num',        label: 'PO #',     type: 'string' },
       { key: 'vendor_name',   label: 'Vendor',   type: 'string' },
+      // Only worth a column when several categories are in play.
+      ...(isOther ? [{ key: 'category_name', label: 'Category', type: 'string' }] : []),
       { key: 'received_date', label: 'Received', type: 'date' },
       { key: 'po_value',      label: 'Value',    type: 'currency' }
     ]);
