@@ -852,7 +852,10 @@ window.FBLib = (function () {
             function _filteredItems() {
                 if (!lastFilter) return items;
                 const f = lastFilter.toLowerCase();
-                return items.filter(function (o) { return String(o.label).toLowerCase().indexOf(f) !== -1; });
+                return items.filter(function (o) {
+                    return String(o.label).toLowerCase().indexOf(f) !== -1 ||
+                        (o.sub && String(o.sub).toLowerCase().indexOf(f) !== -1);
+                });
             }
             function _renderList() {
                 const visible = _filteredItems();
@@ -880,10 +883,22 @@ window.FBLib = (function () {
                     const cb = document.createElement('input');
                     cb.type = 'checkbox';
                     cb.checked = selected.has(String(o.value));
-                    const sp = document.createElement('span');
-                    sp.textContent = o.label;
                     row.appendChild(cb);
-                    row.appendChild(sp);
+                    // Optional description sub-line: bold main label + a muted, smaller
+                    // second line (also searchable). Falls back to a plain single line.
+                    if (o.sub) {
+                        const txt = document.createElement('span');
+                        txt.style.cssText = 'display:flex;flex-direction:column;line-height:1.25;min-width:0;';
+                        const main = document.createElement('span'); main.textContent = o.label; main.style.fontWeight = '600';
+                        const sub = document.createElement('span'); sub.textContent = o.sub;
+                        sub.style.cssText = 'font-size:11px;color:#748A94;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+                        txt.appendChild(main); txt.appendChild(sub);
+                        row.appendChild(txt);
+                    } else {
+                        const sp = document.createElement('span');
+                        sp.textContent = o.label;
+                        row.appendChild(sp);
+                    }
                     row.addEventListener('click', function (e) {
                         e.stopPropagation();
                         const key = String(o.value);
@@ -911,7 +926,7 @@ window.FBLib = (function () {
                 arr.slice(0, maxTags).forEach(function (v) {
                     const item = items.find(function (o) { return String(o.value) === v; });
                     const tag = document.createElement('span'); tag.className = 'ms-tag';
-                    const lbl = document.createElement('span'); lbl.textContent = item ? item.label : v;
+                    const lbl = document.createElement('span'); lbl.textContent = item ? (item.tagLabel || item.label) : v;
                     const x = document.createElement('span'); x.className = 'ms-tag-x'; x.textContent = '×';
                     x.addEventListener('click', function (e) {
                         e.stopPropagation();
@@ -974,8 +989,12 @@ window.FBLib = (function () {
 
             // Wire trigger + actions.
             triggerEl.addEventListener('click', function (e) { e.stopPropagation(); toggle(); });
+            // "Select All" acts on the CURRENTLY VISIBLE items — i.e. it respects an
+            // active search filter (type "12:" then Select All ⇒ only the matching
+            // options are selected, not the whole list). With no search active,
+            // _filteredItems() returns every item, so the default behaviour is unchanged.
             if (allEl) allEl.addEventListener('click', function () {
-                items.forEach(function (o) { selected.add(String(o.value)); });
+                _filteredItems().forEach(function (o) { selected.add(String(o.value)); });
                 _renderList(); _renderTrigger(); _emit();
             });
             if (clearEl) clearEl.addEventListener('click', function () {
@@ -1019,6 +1038,12 @@ window.FBLib = (function () {
             return {
                 value: it.value != null ? it.value : it.val,
                 label: it.label != null ? it.label : (it.lbl != null ? it.lbl : String(it.value != null ? it.value : it.val)),
+                // Optional short label for the selected-tag chip (falls back to label).
+                // Lets a caller keep the tag compact ("num") while the list shows more.
+                tagLabel: it.tagLabel != null ? it.tagLabel : null,
+                // Optional muted second line under the label (e.g. a part description);
+                // also matched by the in-dropdown search.
+                sub: it.sub != null ? it.sub : null,
                 group: it.group || it.fieldName || null
             };
         }
@@ -2468,8 +2493,645 @@ window.FBLib = (function () {
         return { init: init };
     })();
 
+    // ====================================================================
+    // FBLib.Export — blob download + CSV + native .xlsx workbook writer
+    // --------------------------------------------------------------------
+    // WHY THIS EXISTS
+    //   1. Every report had its own copy of the `<a download>` blob dance,
+    //      and most copies were subtly broken (see DOWNLOAD below).
+    //   2. "Export Excel" buttons were all emitting CSV. Customers then
+    //      re-format and Save-As on every single export. This module
+    //      writes a real .xlsx so the formatting ships with the file.
+    //
+    // NO THIRD-PARTY LIBRARY ON PURPOSE
+    //   An .xlsx is a ZIP of XML parts, so the whole writer is ~300 lines
+    //   of plain JS. SheetJS's community build cannot write cell styles at
+    //   all (fills/fonts are a paid feature) and ExcelJS is ~280 kB — and
+    //   CLAUDE.md rules out relying on a CDN, because on-premise sites are
+    //   frequently on restricted networks. Hand-rolling keeps reports
+    //   offline-safe and gives us exactly the style vocabulary we need.
+    //   Where `CompressionStream('deflate-raw')` exists we deflate the
+    //   parts; otherwise we emit a store-only ZIP, which Excel opens fine
+    //   (just a larger file).
+    //
+    // DOWNLOAD — the JxBrowser gotchas this module exists to centralise
+    //   * A *detached* <a download> does not reliably fire in JxBrowser.
+    //     The anchor must be appended to document.body before click().
+    //   * Revoking the object URL synchronously after click() races the
+    //     download handler. When the URL dies first, Chromium can no
+    //     longer resolve the `download` filename and falls back to the
+    //     blob's UUID path segment — which is why an export that worked
+    //     once comes back a second time with no file extension. Cleanup
+    //     is therefore deferred by 4s.
+    //   * The native Save-As dialog opens BEHIND the Fishbowl window (or
+    //     on another monitor). That is a client limitation, not a bug in
+    //     report JS — tell users to Alt+Tab if "nothing happens".
+    //
+    // API
+    //   FBLib.Export.download(dataOrBlob, filename, mime)
+    //   FBLib.Export.csv({ filename, cols, rows })                  -> filename
+    //   await FBLib.Export.xlsx({ filename, sheets: [sheet, ...] }) -> filename
+    //       // single-sheet shorthand: pass `sheet:` instead of `sheets:`
+    //
+    //   sheet = {
+    //     name:      'SOA Detail',     // tab name (sanitised, <=31 chars)
+    //     title:     'SOA Report',     // merged banner row (optional)
+    //     subtitle:  ['Group: NSW…'],  // string | string[] under the title
+    //     cols:      [col, ...],
+    //     rows:      [ {…}, … ],       // objects keyed by col.key
+    //     totals:    true,             // SUBTOTAL(109) footer row
+    //     freeze:    true,             // freeze above the data (default true)
+    //     freezeCols:1,                // also pin N leading columns (cross-tabs)
+    //     autoFilter:true,             // (default true)
+    //     landscape: true,             // (default true) fit-to-width printing
+    //     headerFill:'FF1E3A5F'        // ARGB, defaults to the BI table navy
+    //   }
+    //
+    //   col = { key, label, w, type }  where `type` is one of
+    //     'text' | 'int' | 'qty' | 'money' | 'date' | 'percent'.
+    //   The legacy boolean flags reports already carry (`money: true`,
+    //   `qty: true`, `date: true`) are honoured too, so an existing
+    //   `_cols` array can be handed straight in. `w` is the on-screen
+    //   pixel width and is converted to Excel character units.
+    //   `noTotal: true` keeps a numeric column out of the totals row —
+    //   set it on unit prices and other RATES, which must never be summed.
+    //   NOTE: a 'percent' cell wants the FRACTION (0.82), not 82 — Excel's
+    //   percent format multiplies by 100 on display.
+    //
+    //   PER-ROW OVERRIDES (cross-tab reports). A column-level type can't
+    //   describe a cross-tab, where one column holds a currency on one row,
+    //   a percentage on the next and free text on a third. Any row may
+    //   therefore carry two reserved keys:
+    //     __fmt: { colKey: 'percent', otherKey: 'text', … }  per-cell type
+    //     __row: 'total'                                     emphasised row
+    //   Rows flagged __row:'total' are skipped by the sheet-level `totals`
+    //   footer so a section summary is never summed into the grand total.
+    //
+    // WHAT THE FORMATTING BUYS YOU OVER CSV
+    //   Dates land as real Excel date serials and money/qty as real
+    //   numbers, so there are no "text stored as a number" warnings and
+    //   the user can sum a column the moment the file opens. The totals
+    //   row uses SUBTOTAL(109,…) rather than static values, so it follows
+    //   whatever the user picks in the AutoFilter instead of going stale.
+    // ====================================================================
+    const Export = (function () {
+
+        const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+        // ─── DOWNLOAD ────────────────────────────────────────────────
+        function download(data, filename, mime) {
+            const blob = (typeof Blob !== 'undefined' && data instanceof Blob)
+                ? data
+                : new Blob([data], { type: mime || 'application/octet-stream' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename || 'download';
+            a.rel = 'noopener';
+            a.style.display = 'none';
+            document.body.appendChild(a);           // detached anchors don't fire in JxBrowser
+            a.click();
+            // Deferred cleanup — revoking synchronously races the download
+            // handler and costs us the filename (see the block comment).
+            setTimeout(function () {
+                try { document.body.removeChild(a); } catch (_) {}
+                try { URL.revokeObjectURL(url); } catch (_) {}
+            }, 4000);
+            return filename;
+        }
+
+        // ─── SHARED HELPERS ──────────────────────────────────────────
+        function slug(s, fallback) {
+            const out = String(s == null ? '' : s).replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+            return out || (fallback || 'export');
+        }
+        function stamp() {
+            const d = new Date();
+            return d.getFullYear() + '-' +
+                String(d.getMonth() + 1).padStart(2, '0') + '-' +
+                String(d.getDate()).padStart(2, '0');
+        }
+        function withExt(name, ext) {
+            const n = String(name || 'export');
+            return new RegExp('\\.' + ext + '$', 'i').test(n) ? n : n + '.' + ext;
+        }
+
+        // Cell types. The order is positional — it indexes into the cellXfs
+        // blocks built by stylesXml() — so append new types at the END.
+        const _TYPE_ORDER = { text: 0, int: 1, qty: 2, money: 3, date: 4, percent: 5 };
+        const _NTYPES = 6;
+        const _XF_DATA = 5;                        // first data xf (plain rows)
+        const _XF_BAND = _XF_DATA + _NTYPES;       // banded rows
+        const _XF_TOTAL = _XF_BAND + _NTYPES;      // totals row
+
+        function colType(c) {
+            if (c && c.type && _TYPE_ORDER[c.type] != null) return c.type;
+            if (!c) return 'text';
+            if (c.money) return 'money';
+            if (c.qty) return 'qty';
+            if (c.date) return 'date';
+            if (c.int) return 'int';
+            if (c.percent) return 'percent';
+            return 'text';
+        }
+
+        // Per-ROW format override. Cross-tab reports put a percentage, a
+        // count and a free-text note in the same column on different rows,
+        // which a column-level type cannot express. A row may therefore
+        // carry `__fmt: { colKey: 'text' | 'percent' | … }` to override the
+        // column type for that row only, and `__row: 'total'` to render the
+        // whole row in the emphasised totals style.
+        function cellType(row, col, colT) {
+            const o = row && row.__fmt;
+            const t = o && o[col.key];
+            return (t && _TYPE_ORDER[t] != null) ? t : colT;
+        }
+        function dateText(v) {
+            try { return Common.formatDate(v); }
+            catch (_) { return String(v == null ? '' : v).split(' ')[0]; }
+        }
+
+        // ─── CSV ─────────────────────────────────────────────────────
+        // Kept alongside the xlsx path: plenty of downstream systems still
+        // want a plain delimited file, and it is the safe fallback if a
+        // site's Excel is locked down.
+        function csv(opts) {
+            opts = opts || {};
+            const cols = opts.cols || [];
+            const rows = opts.rows || [];
+            const q = function (v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; };
+            const lines = [cols.map(function (c) { return q(c.label || c.key); }).join(',')];
+            rows.forEach(function (r) {
+                lines.push(cols.map(function (c) {
+                    const t = cellType(r, c, colType(c));
+                    let v = r[c.key];
+                    if (t === 'date') v = dateText(v);
+                    else if (t === 'money') v = (parseFloat(v) || 0).toFixed(2);
+                    return q(v);
+                }).join(','));
+            });
+            const name = withExt(opts.filename || 'export', 'csv');
+            // Leading BOM so Excel reads it as UTF-8 rather than ANSI.
+            download(String.fromCharCode(0xFEFF) + lines.join('\r\n'), name, 'text/csv;charset=utf-8;');
+            return name;
+        }
+
+        // ═══ ZIP CONTAINER ═══════════════════════════════════════════
+        const _CRC = (function () {
+            const t = new Uint32Array(256);
+            for (let n = 0; n < 256; n++) {
+                let c = n;
+                for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+                t[n] = c >>> 0;
+            }
+            return t;
+        })();
+        function crc32(buf) {
+            let c = 0xFFFFFFFF;
+            for (let i = 0; i < buf.length; i++) c = _CRC[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+            return (c ^ 0xFFFFFFFF) >>> 0;
+        }
+        function u16(n) { return [n & 255, (n >>> 8) & 255]; }
+        function u32(n) { return [n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255]; }
+        function utf8(s) { return new TextEncoder().encode(s); }
+        function concat(chunks) {
+            let len = 0;
+            chunks.forEach(function (c) { len += c.length; });
+            const out = new Uint8Array(len);
+            let o = 0;
+            chunks.forEach(function (c) { out.set(c, o); o += c.length; });
+            return out;
+        }
+        async function deflateRaw(bytes) {
+            if (typeof CompressionStream !== 'function') return null;
+            try {
+                const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+                const buf = await new Response(stream).arrayBuffer();
+                const out = new Uint8Array(buf);
+                return out.length < bytes.length ? out : null;   // no point if it grew
+            } catch (_) { return null; }
+        }
+
+        // files: [{ name, text }] → Blob of a valid ZIP archive.
+        async function zip(files) {
+            const now = new Date();
+            const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+            const dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+            const local = [], central = [];
+            let offset = 0;
+
+            for (const f of files) {
+                const nameBytes = utf8(f.name);
+                const raw = utf8(f.text);
+                const packed = await deflateRaw(raw);
+                const body = packed || raw;
+                const method = packed ? 8 : 0;
+                const crc = crc32(raw);
+
+                const lh = Uint8Array.from([].concat(
+                    u32(0x04034B50), u16(20), u16(0x0800), u16(method),
+                    u16(dosTime), u16(dosDate),
+                    u32(crc), u32(body.length), u32(raw.length),
+                    u16(nameBytes.length), u16(0)
+                ));
+                local.push(lh, nameBytes, body);
+
+                central.push(Uint8Array.from([].concat(
+                    u32(0x02014B50), u16(20), u16(20), u16(0x0800), u16(method),
+                    u16(dosTime), u16(dosDate),
+                    u32(crc), u32(body.length), u32(raw.length),
+                    u16(nameBytes.length), u16(0), u16(0), u16(0), u16(0),
+                    u32(0), u32(offset)
+                )), nameBytes);
+
+                offset += lh.length + nameBytes.length + body.length;
+            }
+
+            const cd = concat(central);
+            const eocd = Uint8Array.from([].concat(
+                u32(0x06054B50), u16(0), u16(0),
+                u16(files.length), u16(files.length),
+                u32(cd.length), u32(offset), u16(0)
+            ));
+            return new Blob([concat(local), cd, eocd], { type: XLSX_MIME });
+        }
+
+        // ═══ SPREADSHEETML ═══════════════════════════════════════════
+        const XML_HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+
+        // XML 1.0 forbids most C0 control characters outright, and Fishbowl
+        // strips them from inline script anyway — scrub rather than emit.
+        function xesc(s) {
+            return String(s == null ? '' : s)
+                .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, ' ')
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+        function colLetter(i) {                     // 0 -> A, 26 -> AA
+            let s = '';
+            i += 1;
+            while (i > 0) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = (i - m - 1) / 26; }
+            return s;
+        }
+        // Excel serial date — day 0 is 1899-12-30, so 1970-01-01 is 25569.
+        function excelDate(v) {
+            const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(v == null ? '' : v));
+            if (!m) return null;
+            return Date.UTC(+m[1], +m[2] - 1, +m[3]) / 86400000 + 25569;
+        }
+        // px (on-screen column width) → Excel character units.
+        function excelWidth(px) {
+            const n = parseFloat(px);
+            if (!n || n <= 0) return 14;
+            return Math.min(60, Math.max(6, Math.round(((n - 5) / 7) * 100) / 100));
+        }
+        function sheetName(s, i) {
+            let n = String(s == null ? '' : s).replace(/[\[\]\*\?\/\\:]/g, ' ').trim();
+            if (!n) n = 'Sheet' + (i + 1);
+            return n.slice(0, 31);
+        }
+
+        // Java SimpleDateFormat (DateFormatShort) → an Excel number format.
+        // Only the d/M/y tokens and plain separators are portable; anything
+        // exotic falls back to an unambiguous ISO-ish format.
+        function excelDateFormat() {
+            let f = 'dd/MM/yyyy';
+            try { if (Common.FB_DATE_FORMAT) f = Common.FB_DATE_FORMAT; } catch (_) {}
+            return /^[dMy\/\-\. ]+$/.test(f) ? f.toLowerCase() : 'yyyy-mm-dd';
+        }
+        function excelMoneyFormat() {
+            let sym = '$';
+            try { sym = (Common.currency() || {}).symbol || '$'; } catch (_) {}
+            sym = String(sym).replace(/"/g, '');
+            const body = '"' + sym + '"#,##0.00';
+            return body + ';[Red]-' + body;
+        }
+
+        // styles.xml. The cellXfs indices are positional and the writer
+        // below depends on the exact layout, so keep them in step:
+        //   0 body-default   1 title   2 subtitle   3 header   4 header-right
+        //   then three blocks of _NTYPES xfs in _TYPE_ORDER order
+        //   (text,int,qty,money,date,percent): data-plain at _XF_DATA,
+        //   data-banded at _XF_BAND, totals at _XF_TOTAL.
+        //
+        // QTY USES numFmtId 0 ("General") ON PURPOSE. Quantities have to
+        // render 2 as "2" and 1.5 as "1.5" in the same column, and Excel
+        // has no mask that does that: every optional-decimal pattern
+        // (#,##0.####, 0.####, #,##0.###) renders a whole number with a
+        // dangling decimal point — "2." — which was verified in Excel
+        // itself. General is the only format that gets both right. The
+        // cost is no thousands separator on quantities, which is
+        // acceptable at Fishbowl qty magnitudes and matches what
+        // Common.formatQty already shows on screen.
+        function stylesXml(headerFill) {
+            const money = xesc(excelMoneyFormat());
+            const date = xesc(excelDateFormat());
+            const dataXf = function (fill, border) {
+                return [
+                    '<xf numFmtId="0"   fontId="0" fillId="' + fill + '" borderId="' + border + '" applyFill="1" applyBorder="1"/>',
+                    '<xf numFmtId="3"   fontId="0" fillId="' + fill + '" borderId="' + border + '" applyNumberFormat="1" applyFill="1" applyBorder="1"/>',
+                    '<xf numFmtId="0"   fontId="0" fillId="' + fill + '" borderId="' + border + '" applyFill="1" applyBorder="1"/>',
+                    '<xf numFmtId="164" fontId="0" fillId="' + fill + '" borderId="' + border + '" applyNumberFormat="1" applyFill="1" applyBorder="1"/>',
+                    '<xf numFmtId="166" fontId="0" fillId="' + fill + '" borderId="' + border + '" applyNumberFormat="1" applyFill="1" applyBorder="1"/>',
+                    '<xf numFmtId="167" fontId="0" fillId="' + fill + '" borderId="' + border + '" applyNumberFormat="1" applyFill="1" applyBorder="1"/>'
+                ].join('');
+            };
+            const totalXf = [
+                '<xf numFmtId="0"   fontId="4" fillId="4" borderId="2" applyFont="1" applyFill="1" applyBorder="1"/>',
+                '<xf numFmtId="3"   fontId="4" fillId="4" borderId="2" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1"/>',
+                '<xf numFmtId="0"   fontId="4" fillId="4" borderId="2" applyFont="1" applyFill="1" applyBorder="1"/>',
+                '<xf numFmtId="164" fontId="4" fillId="4" borderId="2" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1"/>',
+                '<xf numFmtId="166" fontId="4" fillId="4" borderId="2" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1"/>',
+                '<xf numFmtId="167" fontId="4" fillId="4" borderId="2" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1"/>'
+            ].join('');
+
+            return XML_HEAD +
+                '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+                '<numFmts count="3">' +
+                    '<numFmt numFmtId="164" formatCode="' + money + '"/>' +
+                    '<numFmt numFmtId="166" formatCode="' + date + '"/>' +
+                    // 0.0% rather than Excel's built-in 0.00% so the workbook
+                    // matches the 1-dp percentages the reports show on screen.
+                    '<numFmt numFmtId="167" formatCode="0.0%"/>' +
+                '</numFmts>' +
+                '<fonts count="5">' +
+                    '<font><sz val="11"/><color theme="1"/><name val="Calibri"/><family val="2"/></font>' +
+                    '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/><family val="2"/></font>' +
+                    '<font><b/><sz val="16"/><color rgb="FF0F172A"/><name val="Calibri"/><family val="2"/></font>' +
+                    '<font><i/><sz val="10"/><color rgb="FF64748B"/><name val="Calibri"/><family val="2"/></font>' +
+                    '<font><b/><sz val="11"/><color rgb="FF0F172A"/><name val="Calibri"/><family val="2"/></font>' +
+                '</fonts>' +
+                '<fills count="5">' +
+                    '<fill><patternFill patternType="none"/></fill>' +
+                    '<fill><patternFill patternType="gray125"/></fill>' +
+                    '<fill><patternFill patternType="solid"><fgColor rgb="' + xesc(headerFill) + '"/><bgColor indexed="64"/></patternFill></fill>' +
+                    '<fill><patternFill patternType="solid"><fgColor rgb="FFF8FAFC"/><bgColor indexed="64"/></patternFill></fill>' +
+                    '<fill><patternFill patternType="solid"><fgColor rgb="FFEEF2F7"/><bgColor indexed="64"/></patternFill></fill>' +
+                '</fills>' +
+                '<borders count="3">' +
+                    '<border><left/><right/><top/><bottom/><diagonal/></border>' +
+                    '<border><left/><right/><top/><bottom style="thin"><color rgb="FFE2E8F0"/></bottom><diagonal/></border>' +
+                    '<border><left/><right/><top style="double"><color rgb="' + xesc(headerFill) + '"/></top><bottom/><diagonal/></border>' +
+                '</borders>' +
+                '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
+                '<cellXfs count="' + (_XF_TOTAL + _NTYPES) + '">' +
+                    '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>' +
+                    '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment vertical="center"/></xf>' +
+                    '<xf numFmtId="0" fontId="3" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment vertical="center"/></xf>' +
+                    '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>' +
+                    '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="right" vertical="center" wrapText="1"/></xf>' +
+                    dataXf(0, 1) + dataXf(3, 1) + totalXf +
+                '</cellXfs>' +
+                '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>' +
+                '</styleSheet>';
+        }
+
+        function inlineStrCell(ref, style, text) {
+            if (text == null || text === '') return '<c r="' + ref + '" s="' + style + '"/>';
+            return '<c r="' + ref + '" s="' + style + '" t="inlineStr"><is><t xml:space="preserve">' +
+                xesc(text) + '</t></is></c>';
+        }
+        function numCell(ref, style, n) {
+            return '<c r="' + ref + '" s="' + style + '"><v>' + n + '</v></c>';
+        }
+
+        // Build one worksheet part. Returns { xml, printTitles }.
+        function sheetXml(sheet) {
+            const cols = (sheet.cols || []).filter(Boolean);
+            const rows = sheet.rows || [];
+            const lastCol = colLetter(Math.max(0, cols.length - 1));
+            const subtitles = sheet.subtitle == null ? []
+                : (Array.isArray(sheet.subtitle) ? sheet.subtitle : [sheet.subtitle]).filter(function (s) { return s !== '' && s != null; });
+            const types = cols.map(colType);
+            const body = [];
+            const merges = [];
+            let r = 1;
+
+            // ── banner ───────────────────────────────────────────────
+            if (sheet.title) {
+                body.push('<row r="' + r + '" ht="22" customHeight="1">' + inlineStrCell('A' + r, 1, sheet.title) + '</row>');
+                if (cols.length > 1) merges.push('A' + r + ':' + lastCol + r);
+                r++;
+            }
+            subtitles.forEach(function (s) {
+                body.push('<row r="' + r + '" ht="15" customHeight="1">' + inlineStrCell('A' + r, 2, s) + '</row>');
+                if (cols.length > 1) merges.push('A' + r + ':' + lastCol + r);
+                r++;
+            });
+            if (sheet.title || subtitles.length) r++;          // spacer row
+
+            // ── header ───────────────────────────────────────────────
+            const headerRow = r;
+            body.push('<row r="' + r + '" ht="28" customHeight="1">' +
+                cols.map(function (c, i) {
+                    const numeric = types[i] !== 'text';
+                    return inlineStrCell(colLetter(i) + r, numeric ? 4 : 3, c.label || c.key);
+                }).join('') + '</row>');
+            r++;
+
+            // ── data ─────────────────────────────────────────────────
+            const firstData = r;
+            rows.forEach(function (row, ri) {
+                // Banded rows read better on paper. A row flagged __row:'total'
+                // (cross-tab summary lines) takes the emphasised block instead.
+                const isTotalRow = row && row.__row === 'total';
+                const base = isTotalRow ? _XF_TOTAL : (ri % 2 === 1 ? _XF_BAND : _XF_DATA);
+                const cells = cols.map(function (c, i) {
+                    const ref = colLetter(i) + r;
+                    const t = cellType(row, c, types[i]);
+                    const s = base + _TYPE_ORDER[t];
+                    const v = row[c.key];
+                    if (t === 'date') {
+                        const d = excelDate(v);
+                        return d == null ? inlineStrCell(ref, base, v == null ? '' : String(v)) : numCell(ref, s, d);
+                    }
+                    if (t === 'money' || t === 'qty' || t === 'int' || t === 'percent') {
+                        const n = parseFloat(v);
+                        return isNaN(n) ? '<c r="' + ref + '" s="' + s + '"/>' : numCell(ref, s, n);
+                    }
+                    return inlineStrCell(ref, s, v == null ? '' : String(v));
+                }).join('');
+                body.push('<row r="' + r + '">' + cells + '</row>');
+                r++;
+            });
+            const lastData = r - 1;
+
+            // ── totals ───────────────────────────────────────────────
+            // SUBTOTAL(109,…) rather than SUM so the footer tracks the
+            // user's AutoFilter selection. Rate columns (unit price and
+            // friends) carry noTotal and are deliberately left blank.
+            //
+            // The blank spacer row is load-bearing, not cosmetic: on open
+            // Excel expands an AutoFilter to the whole contiguous block,
+            // which swallows an adjacent totals row (it then shows up in
+            // the filter dropdowns and gets hidden by filtering). A gap
+            // terminates the region and keeps the filter over data only.
+            let totalRow = 0;
+            if (sheet.totals && rows.length) {
+                r++;
+                totalRow = r;
+                const cells = cols.map(function (c, i) {
+                    const ref = colLetter(i) + r;
+                    const t = types[i];
+                    const s = _XF_TOTAL + _TYPE_ORDER[t];
+                    if (i === 0) return inlineStrCell(ref, _XF_TOTAL, 'Total (' + rows.length + ' line' + (rows.length === 1 ? '' : 's') + ')');
+                    if (c.noTotal || (t !== 'money' && t !== 'qty' && t !== 'int')) return '<c r="' + ref + '" s="' + s + '"/>';
+                    let sum = 0;
+                    rows.forEach(function (row) {
+                        if (row && row.__row === 'total') return;   // don't re-sum a section's own summary line
+                        const n = parseFloat(row[c.key]);
+                        if (!isNaN(n)) sum += n;
+                    });
+                    const range = colLetter(i) + firstData + ':' + colLetter(i) + lastData;
+                    return '<c r="' + ref + '" s="' + s + '"><f>SUBTOTAL(109,' + range + ')</f>' +
+                        '<v>' + (Math.round(sum * 1e6) / 1e6) + '</v></c>';
+                }).join('');
+                body.push('<row r="' + r + '" ht="20" customHeight="1">' + cells + '</row>');
+                r++;
+            }
+
+            // ── assemble (element order is fixed by the schema) ──────
+            const freeze = sheet.freeze !== false;
+            // freezeCols pins N leading columns as well as the header rows —
+            // essential for a wide cross-tab, where the row-label column
+            // scrolls out of view otherwise.
+            const xSplit = Math.max(0, parseInt(sheet.freezeCols, 10) || 0);
+            const parts = [];
+            parts.push(XML_HEAD, '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">');
+            parts.push('<sheetPr><tabColor rgb="' + xesc(sheet.headerFill || 'FF1E3A5F') + '"/><pageSetUpPr fitToPage="1"/></sheetPr>');
+            parts.push('<dimension ref="A1:' + lastCol + Math.max(1, r - 1) + '"/>');
+            parts.push('<sheetViews><sheetView showGridLines="0" workbookViewId="0">');
+            if (freeze || xSplit) {
+                const ySplit = freeze ? headerRow : 0;
+                const topLeft = colLetter(xSplit) + (ySplit + 1);
+                // activePane must match which splits are present, or Excel
+                // silently drops the frozen panes.
+                const pane = (ySplit && xSplit) ? 'bottomRight' : (ySplit ? 'bottomLeft' : 'topRight');
+                parts.push('<pane' +
+                    (xSplit ? ' xSplit="' + xSplit + '"' : '') +
+                    (ySplit ? ' ySplit="' + ySplit + '"' : '') +
+                    ' topLeftCell="' + topLeft + '" activePane="' + pane + '" state="frozen"/>' +
+                    '<selection pane="' + pane + '" activeCell="' + topLeft + '" sqref="' + topLeft + '"/>');
+            }
+            parts.push('</sheetView></sheetViews>');
+            parts.push('<sheetFormatPr defaultRowHeight="15"/>');
+            if (cols.length) {
+                parts.push('<cols>' + cols.map(function (c, i) {
+                    return '<col min="' + (i + 1) + '" max="' + (i + 1) + '" width="' + excelWidth(c.w) + '" customWidth="1"/>';
+                }).join('') + '</cols>');
+            }
+            parts.push('<sheetData>' + body.join('') + '</sheetData>');
+            if (sheet.autoFilter !== false && cols.length && rows.length) {
+                parts.push('<autoFilter ref="A' + headerRow + ':' + lastCol + lastData + '"/>');
+            }
+            if (merges.length) {
+                parts.push('<mergeCells count="' + merges.length + '">' +
+                    merges.map(function (m) { return '<mergeCell ref="' + m + '"/>'; }).join('') + '</mergeCells>');
+            }
+            parts.push('<printOptions horizontalCentered="0"/>');
+            parts.push('<pageMargins left="0.3" right="0.3" top="0.5" bottom="0.5" header="0.2" footer="0.2"/>');
+            parts.push('<pageSetup paperSize="9" orientation="' + (sheet.landscape === false ? 'portrait' : 'landscape') +
+                '" fitToWidth="1" fitToHeight="0"/>');
+            parts.push('<headerFooter><oddFooter>&amp;L' + xesc(sheet.title || sheet.name || '') +
+                '&amp;RPage &amp;P of &amp;N</oddFooter></headerFooter>');
+            parts.push('</worksheet>');
+
+            return { xml: parts.join(''), headerRow: headerRow, totalRow: totalRow };
+        }
+
+        // ─── WORKBOOK ────────────────────────────────────────────────
+        async function xlsx(opts) {
+            opts = opts || {};
+            const sheets = (opts.sheets || (opts.sheet ? [opts.sheet] : [])).filter(Boolean);
+            if (!sheets.length) throw new Error('FBLib.Export.xlsx: no sheets supplied.');
+
+            const names = [];
+            const built = sheets.map(function (s, i) {
+                let n = sheetName(s.name, i);
+                let dedupe = 2;
+                while (names.indexOf(n.toLowerCase()) !== -1) { n = sheetName(s.name, i).slice(0, 28) + ' ' + (dedupe++); }
+                names.push(n.toLowerCase());
+                return { name: n, built: sheetXml(Object.assign({ headerFill: opts.headerFill }, s)) };
+            });
+
+            // Repeat the header row at the top of every printed page.
+            const defined = built.map(function (b, i) {
+                return '<definedName name="_xlnm.Print_Titles" localSheetId="' + i + '">' +
+                    '\'' + xesc(b.name.replace(/'/g, "''")) + '\'!$' + b.built.headerRow + ':$' + b.built.headerRow +
+                    '</definedName>';
+            }).join('');
+
+            const files = [
+                {
+                    name: '[Content_Types].xml',
+                    text: XML_HEAD +
+                        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+                        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+                        '<Default Extension="xml" ContentType="application/xml"/>' +
+                        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+                        built.map(function (b, i) {
+                            return '<Override PartName="/xl/worksheets/sheet' + (i + 1) + '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>';
+                        }).join('') +
+                        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' +
+                        '</Types>'
+                },
+                {
+                    name: '_rels/.rels',
+                    text: XML_HEAD +
+                        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+                        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>' +
+                        '</Relationships>'
+                },
+                {
+                    name: 'xl/workbook.xml',
+                    text: XML_HEAD +
+                        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
+                        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+                        '<workbookPr date1904="0"/>' +
+                        '<sheets>' + built.map(function (b, i) {
+                            return '<sheet name="' + xesc(b.name) + '" sheetId="' + (i + 1) + '" r:id="rId' + (i + 1) + '"/>';
+                        }).join('') + '</sheets>' +
+                        (defined ? '<definedNames>' + defined + '</definedNames>' : '') +
+                        // fullCalcOnLoad so the SUBTOTAL footer is live the
+                        // moment the workbook opens.
+                        '<calcPr calcId="171027" fullCalcOnLoad="1"/>' +
+                        '</workbook>'
+                },
+                {
+                    name: 'xl/_rels/workbook.xml.rels',
+                    text: XML_HEAD +
+                        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+                        built.map(function (b, i) {
+                            return '<Relationship Id="rId' + (i + 1) + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet' + (i + 1) + '.xml"/>';
+                        }).join('') +
+                        '<Relationship Id="rId' + (built.length + 1) + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>' +
+                        '</Relationships>'
+                },
+                { name: 'xl/styles.xml', text: stylesXml(opts.headerFill || 'FF1E3A5F') }
+            ];
+            built.forEach(function (b, i) {
+                files.push({ name: 'xl/worksheets/sheet' + (i + 1) + '.xml', text: b.built.xml });
+            });
+
+            const blob = await zip(files);
+            const name = withExt(opts.filename || 'export', 'xlsx');
+            download(blob, name, XLSX_MIME);
+            return name;
+        }
+
+        return {
+            download: download,
+            csv: csv,
+            xlsx: xlsx,
+            // Small utilities reports use when composing a filename.
+            slug: slug,
+            stamp: stamp
+        };
+    })();
+
     return {
         Common: Common,
+        Export: Export,
         Settings: Settings,
         CfCatalog: CfCatalog,
         CfCols: CfCols,

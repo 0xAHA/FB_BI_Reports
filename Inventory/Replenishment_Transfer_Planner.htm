@@ -1,0 +1,3729 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Replenishment Transfer Planner
+  PATH:   Inventory/Replenishment_Transfer_Planner.htm
+  --------------------------------------------------------------------------------
+  Plans and creates inter-location-group replenishment Transfer Orders from a
+  single source location group ("Bendigo"), while showing what each transfer
+  does to the SOURCE's available stock.
+
+  Core idea — a transfer is capped so the source retains a reasonable level:
+
+      cap = min( capPct% x sourceAvailable ,  sourceAvailable - sourceFloor )
+
+  where sourceFloor defaults to the source LG's own reorder point. Whichever
+  constraint binds is reported (capBinding) so the number is explainable.
+
+  Demand the cap will not cover is recorded in a deferred ledger and re-offered
+  at the top of the next planning run, aged, feeding the severity ranking.
+
+  IMPORTANT SCOPE NOTE — a BI report cannot intercept or block a Transfer Order
+  created in Fishbowl's native Transfer Order module. There is no server-side
+  validation hook. The cap is real only because this report is where
+  replenishment TOs are raised; TOs raised natively are caught after the fact by
+  the Monitor tab. To close the loop, restrict the "Transfer Order-Create"
+  access right so replenishment can only be raised here.
+
+  WHY THIS REPORT DOES NOT USE FISHBOWL'S OWN "available" AT THE SOURCE
+  --------------------------------------------------------------------
+  The QTYALLOCATEDTOSEND view (schema/schema-views.sql:207-224) filters on
+  xo.statusID / xoitem.typeID but NOT on whether the transfer actually leaves
+  the location group. Intra-LG movements therefore count as "stock promised
+  out", and because that view feeds QTYALLOCATED -> available, it can zero out
+  the source pool entirely. Measured on demodb LG 1: 15 parts affected, and part
+  0011857 reports 3,316 units promised out of 3,139 on hand (real inter-LG
+  figure: 7).
+
+  The correcting predicate is  xo.fromLGId <> xo.shipToLGId  -- NOT
+  xo.typeId <> 30. All 5,383 contaminating units at LG 1 come from same-LG
+  rows; cross-LG Putaway contributes zero, and Putaway TOs that DO cross
+  location groups are real stock movements that must still count.
+
+  Both numbers are surfaced: avail_adj (corrected, drives the cap) and
+  avail_fb (Fishbowl-identical, read-only reconciliation column) so users can
+  tie back to the native screens.
+
+  Built on the shared fb-lib runtime + fb-styles stylesheet. Chrome uses the
+  60px .topbar/.tabs/.ps-btn dashboard idiom (fb-styles 22-24), tables use
+  .rpt-table (29) for the sticky navy totals footer.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Replenishment Transfer Planner — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script>
+
+    <!-- Shared Fishbowl BI lib — inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. Appears exactly ONCE in
+         this file; Fishbowl text-substitutes at every occurrence anywhere,
+         including comments and JS strings. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Shared Fishbowl BI stylesheet — inlined from the saved "fb-styles"
+         Style. Source of truth: scripts/fb-styles.css. MUST come BEFORE the
+         inline block below so per-report rules win the cascade. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <style>
+        /* =====================================================
+           LAYOUT  — flex column, table fills remaining height.
+           Design tokens all come from fb-styles; no hardcoded hexes.
+           ===================================================== */
+        body {
+            margin: 0; font-family: var(--font); background: var(--bg-1);
+            color: var(--c-primary); display: flex; flex-direction: column;
+            min-height: 100vh; padding-bottom: var(--debug-drawer-h, 0px);
+        }
+        .topbar { position: sticky; top: 0; z-index: 60; }
+        .topbar.tabbar { top: 60px; padding-top: 0; }
+
+        .app-shell { width: 100%; flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+
+        /* Tab panes — only the active one is displayed. */
+        .pane { flex: 1 1 auto; display: none; flex-direction: column; min-height: 0; }
+        .pane.active { display: flex; }
+
+        /* KPI strip (fb-styles 28 tiles in a thin inline row rather than
+           the .kpis responsive grid — this is a table page, not a dashboard). */
+        .kpi-row {
+            display: flex; flex-wrap: wrap; gap: 10px; align-items: stretch;
+            padding: 10px 12px; background: var(--bg-1);
+            border-bottom: 1px solid var(--border); flex-shrink: 0;
+        }
+        .kpi-row .kpi-tile { min-height: 60px; padding: 8px 14px; min-width: 175px; }
+        .kpi-row .kpi-chip { width: 34px; height: 34px; border-radius: 8px; }
+        .kpi-row .kpi-chip svg { width: 17px; height: 17px; }
+        .kpi-row .kpi-val { font-size: 20px; }
+
+        /* Banner strip above the table for policy / blocking messages. */
+        .banner-strip { padding: 0 12px; flex-shrink: 0; }
+        .banner-strip .alert { margin: 10px 0 0; font-size: 12.5px; }
+        .banner-strip:empty { display: none; }
+
+        /* =====================================================
+           TABLE  — FBLib.Table mounts into .fb-table inside the
+           scroll container. .rpt-table brings the sticky navy tfoot
+           (fb-styles 29) which we hand-manage for totals.
+           ===================================================== */
+        .fb-table-container { flex: 1 1 auto; min-height: 0; overflow: auto; background: #fff; }
+        table.fb-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12.5px; }
+        table.fb-table th {
+            position: sticky; top: 0; z-index: 10; background: var(--menu-bg); color: #fff;
+            font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            padding: 8px 10px; text-align: left; white-space: nowrap; cursor: pointer;
+            border-right: 1px solid var(--menu-bg-2); user-select: none;
+        }
+        table.fb-table th.sort-asc::after  { content: ' \25B2'; font-size: 9px; }
+        table.fb-table th.sort-desc::after { content: ' \25BC'; font-size: 9px; }
+        table.fb-table tr.filter-row th { top: 34px; z-index: 9; padding: 3px 6px; background: var(--menu-bg-2); }
+        table.fb-table tr.filter-row input, table.fb-table tr.filter-row select {
+            width: 100%; box-sizing: border-box; padding: 3px 6px; font-size: 11px;
+            border: 1px solid var(--border-strong); border-radius: 4px; font-family: inherit;
+        }
+        table.fb-table td {
+            padding: 5px 10px; border-bottom: 1px solid var(--border); white-space: nowrap;
+            vertical-align: middle;
+        }
+        table.fb-table tbody tr:nth-child(even) td { background: var(--bg-1); }
+        table.fb-table tbody tr:hover td { background: var(--tint-blue); }
+        table.fb-table td.num-cell, table.fb-table th.num-cell { text-align: right; font-variant-numeric: tabular-nums; }
+
+        /* Part-group marker. FBLib.Table has no row-level class hook, so grouping
+           is expressed in cell content: rows of one part repeat an identical
+           source pool + cap, and the band chip alternates per part so adjacent
+           groups stay distinguishable under the default sort. */
+        .pband { display: inline-block; width: 3px; height: 13px; border-radius: 2px; margin-right: 6px; vertical-align: -2px; }
+        .pband.a { background: var(--tint-blue-2); }
+        .pband.b { background: var(--acc-sage); }
+
+        /* Row highlight when the engine reflowed a row the user did NOT edit —
+           visibility, not immobility. */
+        @keyframes reflowFlash {
+            0%   { background: var(--acc-yellow-bg) !important; }
+            100% { background: transparent; }
+        }
+        table.fb-table tbody tr.reflowed td { animation: reflowFlash 900ms ease-out; }
+        .delta-chip {
+            display: inline-block; margin-left: 5px; padding: 0 5px; border-radius: var(--r-pill);
+            font-size: 10px; font-weight: 700; background: var(--acc-yellow-bg); color: var(--acc-yellow-con);
+        }
+        .delta-chip.up   { background: var(--acc-sage);      color: var(--fb-success); }
+        .delta-chip.down { background: var(--acc-maroon-bg); color: #8A1E30; }
+
+        /* =====================================================
+           EDITABLE QTY CELL
+           ----
+           State lives in the MODEL, never the DOM — FBLib.Table with
+           lazy:true recycles chunks and render() wipes tbody, so the
+           input is rebuilt constantly and must always re-seed from the row.
+           ===================================================== */
+        .qty-inp {
+            width: 84px; padding: 3px 6px; font-size: 12px; text-align: right;
+            border: 1px solid var(--border-strong); border-radius: 5px;
+            font-family: inherit; font-variant-numeric: tabular-nums; background: #fff;
+        }
+        .qty-inp:focus { outline: none; border-color: var(--fb-blue); box-shadow: 0 0 0 2px rgba(45,156,219,.20); }
+        .qty-inp:disabled { background: var(--bg-2); color: var(--c-tertiary); cursor: not-allowed; }
+        .qty-inp.over  { border-color: var(--fb-negative); background: var(--acc-maroon-bg); }
+        .qty-inp.pinned { border-color: var(--acc-purple); background: var(--acc-purple-bg); }
+        .qty-wrap { display: inline-flex; align-items: center; gap: 4px; }
+        .pin-btn {
+            border: none; background: none; cursor: pointer; padding: 0 2px; line-height: 0;
+            color: var(--c-tertiary); font-family: inherit;
+            display: inline-flex; align-items: center;
+        }
+        .pin-btn svg { width: 13px; height: 13px; display: block; }
+        .pin-btn.on { color: var(--acc-purple-con); }
+        .pin-btn:hover { color: var(--fb-blue); }
+        .pin-btn:focus-visible { outline: 2px solid var(--fb-blue); outline-offset: 1px; border-radius: 3px; }
+
+        /* Cap / severity micro-visuals. */
+        .sev-bar { display: inline-block; width: 46px; height: 6px; border-radius: 3px; background: var(--bg-3); overflow: hidden; vertical-align: middle; }
+        .sev-bar > i { display: block; height: 100%; background: var(--fb-negative); }
+        .bind-tag {
+            font-size: 9.5px; font-weight: 700; padding: 1px 5px; border-radius: var(--r-pill);
+            text-transform: uppercase; letter-spacing: .03em; margin-left: 5px;
+        }
+        .bind-PCT   { background: var(--tint-blue);     color: var(--fb-blue-accent); }
+        .bind-FLOOR { background: var(--acc-orange-bg); color: var(--acc-orange-con); }
+        .bind-BOTH  { background: var(--acc-purple-bg); color: var(--acc-purple-con); }
+        .bind-NONE  { background: var(--bg-2);          color: var(--fb-neutral); }
+
+        /* Reconciliation hint — the avail_fb vs avail_adj delta. */
+        .recon-flag { color: var(--acc-orange-con); font-weight: 700; cursor: help; margin-left: 4px; }
+
+        /* =====================================================
+           DRAWER internals (mirrors the template's fb-grid helpers).
+           ===================================================== */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 18px; }
+        .fb-grid > .fb-group { flex: 1 1 220px; min-width: 200px; }
+        .fb-grid-cols > .fb-group { flex: 0 1 210px; }
+        .fb-group-title {
+            font-size: 12px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: .04em; color: var(--c-secondary);
+            border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px;
+        }
+        .fb-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+        .fb-field label { font-size: 11px; font-weight: 600; color: var(--c-secondary); }
+        .fb-field select, .fb-field input[type=text], .fb-field input[type=date], .fb-field input[type=number] {
+            padding: 4px 8px; font-size: 12px; border: 1px solid var(--border);
+            border-radius: 6px; background: var(--bg-1); font-family: inherit; color: #415157;
+        }
+        .fb-field input[type=date], .fb-field input[type=number] { background: #fff; }
+        .fb-hint { font-size: 10.5px; color: var(--c-tertiary); line-height: 1.45; margin-top: 2px; }
+
+        .ds-btn { padding: 7px 13px; font-size: 12px; border-radius: 7px; border: 1px solid var(--border-strong); background: #fff; cursor: pointer; font-family: inherit; font-weight: 600; color: #415157; }
+        .ds-btn:hover { background: var(--bg-2); }
+        .ds-btn-primary { background: var(--color-primary); color: #fff; border-color: var(--color-primary); }
+        .ds-btn-primary:hover { background: var(--color-primary-dark); }
+        .ds-btn-primary:disabled { opacity: .45; cursor: not-allowed; }
+        .ds-btn-admin { background: var(--acc-orange-bg); border-color: var(--acc-orange); color: var(--acc-orange-con); margin-right: 6px; }
+        .ds-lock-badge { background: var(--acc-orange-bg); color: var(--acc-orange-con); border: 1px solid var(--acc-orange); padding: 7px 10px; border-radius: 7px; font-size: 12px; margin-bottom: 14px; }
+
+        /* Create-preview drawer — wider, grouped by destination LG. */
+        #createOverlay .fb-drawer-body { max-height: 62vh; overflow: auto; }
+        .grp-card { border: 1px solid var(--border); border-radius: var(--r-card); margin-bottom: 14px; overflow: hidden; }
+        .grp-head {
+            background: var(--bg-2); padding: 8px 12px; font-weight: 700; font-size: 13px;
+            display: flex; align-items: center; justify-content: space-between; gap: 10px;
+        }
+        .grp-card table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        .grp-card th { background: var(--menu-bg); color: #fff; font-size: 10.5px; text-transform: uppercase;
+            letter-spacing: .04em; padding: 5px 9px; text-align: left; }
+        .grp-card td { padding: 4px 9px; border-bottom: 1px solid var(--border); }
+        .grp-card td.num-cell, .grp-card th.num-cell { text-align: right; font-variant-numeric: tabular-nums; }
+        .grp-card tfoot td { background: var(--bg-2); font-weight: 700; }
+
+        /* Policy explainer — the "why is my cap this number" arithmetic. */
+        .calc-tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+        .calc-tbl td { padding: 5px 8px; border-bottom: 1px solid var(--border); }
+        .calc-tbl td:last-child { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+        .calc-tbl tr.rule td { border-top: 2px solid var(--border-strong); font-weight: 800; }
+        .calc-tbl .op { color: var(--c-tertiary); font-family: var(--mono); }
+
+        /* Results modal (post-submit). */
+        .res-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 12.5px; }
+        .res-row .res-lg { flex: 1; font-weight: 600; }
+
+        @media print {
+            .topbar, .fb-drawer, .kpi-row, .toast-container, .banner-strip { display: none !important; }
+            .fb-table-container { overflow: visible !important; }
+            body { padding-bottom: 0 !important; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- ====================================================================
+     TOPBAR  (fb-styles 22/23) — row 1: identity + actions
+     ==================================================================== -->
+<div class="topbar">
+    <div class="topbar-row1">
+        <div class="title-wrap">
+            <div class="crumb">Inventory &#9656; Replenishment</div>
+            <h1>Replenishment Transfer Planner</h1>
+            <div class="subline" id="statusLine">Loading&hellip;</div>
+        </div>
+        <div class="top-actions">
+            <button id="filtersBtn" class="ps-btn sm" type="button" onclick="FBLib.Common.toggleDrawer('filtersOverlay')" title="Source / destination / part filters">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+                Filters
+            </button>
+            <button id="allocBtn" class="ps-btn success sm" type="button" onclick="autoAllocate()" title="Run the allocation engine over every part">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+                Auto-Allocate
+            </button>
+            <button id="resetQtyBtn" class="ps-btn sm" type="button" onclick="resetQuantities()" title="Clear every planned quantity and unpin all rows">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9"/></svg>
+                Reset
+            </button>
+            <button id="createBtn" class="ps-btn primary sm" type="button" onclick="openCreatePreview()" title="Review and create the transfer orders">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 4v16m8-8H4"/></svg>
+                Create Transfers
+            </button>
+            <span style="width:1px; height:18px; background:var(--border); margin:0 2px;"></span>
+            <button id="refreshBtn" class="ps-btn icon sm" type="button" onclick="loadPlanner()" title="Refresh data">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            </button>
+            <button id="xlsxBtn" class="ps-btn icon sm" type="button" onclick="exportXlsx()" title="Export all tabs to Excel">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            </button>
+            <button id="printBtn" class="ps-btn icon sm" type="button" onclick="printReport()" title="Print the active tab">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            </button>
+            <button id="helpBtn" class="ps-btn icon sm" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            </button>
+            <button id="setBtn" class="ps-btn icon sm" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+                <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- TOPBAR row 2 — view tabs (fb-styles 24) -->
+<div class="topbar tabbar">
+    <div class="tabs">
+        <button class="tab active" data-pane="planPane" type="button" onclick="switchTab('planPane')">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7"/></svg>
+            Plan <span class="cnt" id="cntPlan">0</span>
+        </button>
+        <button class="tab" data-pane="impactPane" type="button" onclick="switchTab('impactPane')">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/></svg>
+            Source Impact <span class="cnt" id="cntImpact">0</span>
+        </button>
+        <button class="tab" data-pane="deferPane" type="button" onclick="switchTab('deferPane')">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+            Deferred <span class="cnt" id="cntDefer">0</span>
+        </button>
+        <button class="tab" data-pane="monitorPane" type="button" onclick="switchTab('monitorPane')">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+            Monitor <span class="cnt" id="cntMonitor">0</span>
+        </button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     FILTERS DRAWER
+     ==================================================================== -->
+<div id="filtersOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>Filters</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('filtersOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+
+            <div class="fb-group">
+                <div class="fb-group-title">Source</div>
+                <div class="fb-field">
+                    <label for="srcLgSel">Source location group</label>
+                    <select id="srcLgSel" onchange="onSourceChange()"></select>
+                    <div class="fb-hint">Stock is drawn from here. Admins can publish this as
+                        the organisation default from Settings.</div>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Destinations</div>
+                <div class="fb-field">
+                    <label>Replenish these location groups</label>
+                    <div class="ms-container" id="destMs">
+                        <div class="ms-trigger" id="destMs-trigger">
+                            <span class="ms-placeholder" id="destMs-placeholder">All destinations</span>
+                        </div>
+                        <div class="ms-dropdown hidden" id="destMs-dropdown">
+                            <div class="ms-search"><input type="text" id="destMs-search" placeholder="Search&hellip;" /></div>
+                            <div class="ms-actions"><span id="destMs-all">Select All</span><span id="destMs-clear">Clear All</span></div>
+                            <div class="ms-list" id="destMs-list"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Parts</div>
+                <div class="fb-field">
+                    <label>Part number</label>
+                    <input type="text" id="filterPartNum" placeholder="contains&hellip;" />
+                </div>
+                <div class="fb-field">
+                    <label>Description</label>
+                    <input type="text" id="filterPartDesc" placeholder="contains&hellip;" />
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="filterOnlyShort" checked />
+                        <span>Only parts below their reorder point</span>
+                    </label>
+                    <div class="fb-hint">Untick to also plan parts that are adequately stocked
+                        (useful for a pre-season push).</div>
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="filterCwFallback" />
+                        <span>Use company-wide reorder points as fallback</span>
+                    </label>
+                    <div class="fb-hint" id="cwFallbackHint">A company-wide reorder point applied per
+                        location group systematically over-orders, because each destination
+                        independently tries to reach the <em>company</em> order-up-to level.</div>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Scheduling</div>
+                <div class="fb-field">
+                    <label for="schedDaysOut">Schedule transfers (days out)</label>
+                    <input type="number" id="schedDaysOut" min="0" max="365" step="1" value="0" />
+                </div>
+                <div class="fb-field">
+                    <label for="monitorLookback">Monitor lookback (days)</label>
+                    <input type="number" id="monitorLookback" min="1" max="730" step="1" value="30" />
+                </div>
+            </div>
+
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn" onclick="clearFilters()">Clear filters</button>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="applyFilters()">Apply</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS DRAWER
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div id="dsLockBadge" class="ds-lock-badge" style="display:none;">Locked by admin &mdash; your changes won't be saved.</div>
+        <div class="fb-grid fb-grid-cols">
+
+            <div class="fb-group">
+                <div class="fb-group-title">Transfer cap</div>
+                <div class="fb-field">
+                    <label for="setCapPct">Maximum % of source available</label>
+                    <input type="number" id="setCapPct" min="1" max="100" step="1" onchange="onSettingsChange()" />
+                </div>
+                <div class="fb-field">
+                    <label for="setPoolMode">Cap is a % of&hellip;</label>
+                    <select id="setPoolMode" onchange="onSettingsChange()">
+                        <option value="available">Available (net of allocations)</option>
+                        <option value="availToPick">Available to pick (physically grabbable)</option>
+                        <option value="physical">On hand less not-available</option>
+                    </select>
+                    <div class="fb-hint"><strong>Available</strong> is what Fishbowl's own screens show
+                        and is already net of open outbound transfers, so the cap is naturally
+                        rolling and cannot be drip-fed around.</div>
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setCountDrafts" onchange="onSettingsChange()" />
+                        <span>Count unissued (Entered/Request) transfers</span>
+                    </label>
+                    <div class="fb-hint">Fishbowl does not allocate stock for unissued transfers.
+                        Leave ticked, or a draft you saved will let the same stock be planned twice.</div>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Source retention floor</div>
+                <div class="fb-field">
+                    <label for="setFloorMode">Never take the source below&hellip;</label>
+                    <select id="setFloorMode" onchange="onSettingsChange()">
+                        <option value="rop">Its own reorder point</option>
+                        <option value="oul">Its own order-up-to level</option>
+                        <option value="ropMultiple">A multiple of its reorder point</option>
+                        <option value="fixed">A fixed quantity</option>
+                        <option value="none">No floor (% cap only)</option>
+                    </select>
+                </div>
+                <div class="fb-field" id="floorMultWrap" style="display:none;">
+                    <label for="setFloorMult">Reorder point multiple</label>
+                    <input type="number" id="setFloorMult" min="0" step="0.1" onchange="onSettingsChange()" />
+                </div>
+                <div class="fb-field" id="floorFixedWrap" style="display:none;">
+                    <label for="setFloorFixed">Fixed quantity to retain</label>
+                    <input type="number" id="setFloorFixed" min="0" step="1" onchange="onSettingsChange()" />
+                </div>
+                <div class="fb-hint">The floor is <strong>hard</strong>: the engine will never plan a
+                    transfer that breaches it, even to satisfy a minimum transfer quantity.</div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Sharing between destinations</div>
+                <div class="fb-field">
+                    <label for="setAllocPolicy">When several sites want one part</label>
+                    <select id="setAllocPolicy" onchange="onSettingsChange()">
+                        <option value="severity">Most critical site first</option>
+                        <option value="coverThenTopUp">Everyone to reorder point, then top up</option>
+                        <option value="proRata">Pro-rata by shortfall</option>
+                        <option value="equalShare">Equal shares with spillover</option>
+                        <option value="priority">Fixed location-group ranking</option>
+                        <option value="manual">Manual only (cap acts as a clamp)</option>
+                    </select>
+                    <div class="fb-hint" id="policyHint"></div>
+                </div>
+                <div class="fb-field">
+                    <label for="setNeedBasis">Replenish each site up to</label>
+                    <select id="setNeedBasis" onchange="onSettingsChange()">
+                        <option value="oul">Its order-up-to level</option>
+                        <option value="rop">Its reorder point only</option>
+                    </select>
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setIncludeInbound" onchange="onSettingsChange()" />
+                        <span>Count stock already in transit to the destination</span>
+                    </label>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Quantities</div>
+                <div class="fb-field">
+                    <label for="setMinQty">Minimum transfer quantity</label>
+                    <input type="number" id="setMinQty" min="0" step="1" onchange="onSettingsChange()" />
+                </div>
+                <div class="fb-field">
+                    <label for="setMinQtyPolicy">If the cap rounds below that</label>
+                    <select id="setMinQtyPolicy" onchange="onSettingsChange()">
+                        <option value="bump">Send the minimum anyway (if the floor allows)</option>
+                        <option value="defer">Send nothing and defer it</option>
+                    </select>
+                </div>
+                <div class="fb-field">
+                    <label for="setReflowMode">After I type a quantity</label>
+                    <select id="setReflowMode" onchange="onSettingsChange()">
+                        <option value="unpinnedOnly">Rebalance the other sites (highlighted)</option>
+                        <option value="pinAll">Leave the other sites exactly as they are</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Transfer orders</div>
+                <div class="fb-field">
+                    <label for="setToType">Transfer type</label>
+                    <select id="setToType" onchange="onSettingsChange()">
+                        <option value="Move">Move (internal &mdash; no addresses)</option>
+                        <option value="Ship">Ship (requires an address on every location group)</option>
+                    </select>
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setAutoIssue" onchange="onSettingsChange()" />
+                        <span>Issue immediately after creating</span>
+                    </label>
+                    <div class="fb-hint">Issuing triggers pick creation. Leave off to review the
+                        orders in Fishbowl first.</div>
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setDryRun" onchange="onSettingsChange()" />
+                        <span>Dry run (log payloads, create nothing)</span>
+                    </label>
+                </div>
+                <div class="fb-field">
+                    <label for="setCapEnforcement">If a plan exceeds the cap</label>
+                    <select id="setCapEnforcement" onchange="onSettingsChange()">
+                        <option value="hard">Block creation</option>
+                        <option value="warn">Warn but allow</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setShowDebug" onchange="onSettingsChange()" />
+                        <span>Show debug console</span>
+                    </label>
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setShowRecon" onchange="onSettingsChange()" />
+                        <span>Show Fishbowl's own availability column</span>
+                    </label>
+                    <div class="fb-hint">Adds a read-only column so you can reconcile against the
+                        native Inventory Availability screen.</div>
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setDeferEnabled" onchange="onSettingsChange()" />
+                        <span>Keep a deferred-demand ledger</span>
+                    </label>
+                </div>
+            </div>
+
+        </div>
+
+        <div id="dsAdminSection" style="display:none; margin-top:14px; padding-top:14px; border-top: 1px dashed var(--border-strong);">
+            <div class="fb-group-title">Admin</div>
+            <button type="button" class="ds-btn ds-btn-admin" onclick="publishDefaults()">Publish as default for everyone</button>
+            <button type="button" class="ds-btn ds-btn-admin" id="dsLockBtn" onclick="toggleUserEditing()">Lock user editing</button>
+            <div class="fb-hint" style="margin-top:8px;">Publishing writes the source location group,
+                cap, floor, sharing policy and transfer-order options as the organisation default.
+                Personal display preferences are never published.</div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn" onclick="resetSettings()">Reset to defaults</button>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     POLICY EXPLAINER DRAWER  — "why is my cap this number"
+     ==================================================================== -->
+<div id="policyOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2 id="policyTitle">How this cap was calculated</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('policyOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body" id="policyBody"></div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('policyOverlay')">Close</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     CREATE PREVIEW DRAWER
+     ==================================================================== -->
+<div id="createOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>Review transfers</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('createOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body" id="createBody"></div>
+    <div class="fb-drawer-foot">
+        <span id="createSummary" style="flex:1; font-size:12px; color:var(--c-secondary);"></span>
+        <button type="button" class="ds-btn" onclick="FBLib.Common.closeDrawer('createOverlay')">Cancel</button>
+        <button type="button" class="ds-btn ds-btn-primary" id="createConfirmBtn" onclick="submitTransfers()">Create transfer orders</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP DRAWER
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body" style="font-size:13px; line-height:1.6; max-width:860px;">
+        <p><strong>What it does.</strong> Finds parts that have fallen below their reorder point at
+        the destination location groups, works out how much each needs, and plans transfers from the
+        source location group &mdash; while showing what each transfer does to the source's available
+        stock.</p>
+
+        <div class="fb-group-title" style="margin-top:14px;">The cap</div>
+        <p>A transfer is limited to the smaller of two numbers:</p>
+        <ul>
+            <li><strong>A percentage of source available</strong> (default 35%), and</li>
+            <li><strong>whatever sits above the source's own retention floor</strong> (default: the
+                source's own reorder point).</li>
+        </ul>
+        <p>The <em>Cap</em> column tags which of the two bound it &mdash; <span class="bind-tag bind-PCT">pct</span>
+        or <span class="bind-tag bind-FLOOR">floor</span>. Click any cap to see the full arithmetic.
+        If the source is already at or below its own reorder point the cap is zero and the report
+        will refuse to strip it further.</p>
+
+        <div class="fb-group-title" style="margin-top:14px;">When several sites want the same part</div>
+        <p>They share one capped pool. The default policy fills the site furthest below its reorder
+        point first. Change this in Settings &#9656; Sharing between destinations.</p>
+
+        <div class="fb-group-title" style="margin-top:14px;">Typing your own quantities</div>
+        <p>Editing a quantity <strong>pins</strong> that row &mdash; the engine will never move it again.
+        Remaining sites rebalance around it and any row whose quantity changed as a result is
+        highlighted with a delta chip, so nothing moves silently. Click the pin icon to release a row.</p>
+
+        <div class="fb-group-title" style="margin-top:14px;">Demand the cap will not cover</div>
+        <p>The shortfall is written to a deferred ledger and re-offered at the top of your next
+        planning run with its age shown. A deferral is an <em>urgency signal, not extra demand</em> &mdash;
+        next run's quantity is always recalculated from live stock, so a site short 100 last week and
+        80 today needs 80, not 180.</p>
+
+        <div class="fb-group-title" style="margin-top:14px;">Why the numbers differ from Fishbowl</div>
+        <p>Fishbowl's <em>available</em> counts intra-warehouse putaway transfers as stock leaving the
+        location group, which can drive the source pool to zero on parts that are in fact well
+        stocked. This report only counts transfers that genuinely cross location groups. Tick
+        <em>Show Fishbowl's own availability column</em> in Settings to see both side by side.</p>
+
+        <div class="fb-group-title" style="margin-top:14px;">An important limitation</div>
+        <p>This report cannot stop someone creating a transfer directly in Fishbowl's Transfer Order
+        module &mdash; there is no way for a report to intercept that. The <strong>Monitor</strong> tab
+        catches those after the fact and flags any that exceeded the cap. To make the cap binding,
+        restrict the <em>Transfer Order-Create</em> access right so replenishment is only raised here.</p>
+    </div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('helpOverlay')">Close</button>
+    </div>
+</div>
+
+<!-- Results modal (post-submit) -->
+<div class="modal-overlay" id="resultsModal">
+    <div class="modal-card" style="max-width:640px;">
+        <div class="modal-head"><h2 id="resultsTitle">Transfer orders created</h2></div>
+        <div class="modal-body" id="resultsBody"></div>
+        <div class="modal-foot">
+            <div class="left-grp"><button type="button" class="ds-btn" id="retryBtn" style="display:none;" onclick="retryFailed()">Retry failed</button></div>
+            <div class="right-grp"><button type="button" class="ds-btn ds-btn-primary" onclick="closeResults()">Done</button></div>
+        </div>
+    </div>
+</div>
+
+<div class="toast-container"></div>
+
+<!-- ====================================================================
+     MAIN
+     ==================================================================== -->
+<div class="app-shell">
+
+    <div class="kpi-row" id="kpiRow"></div>
+    <div class="banner-strip" id="bannerStrip"></div>
+
+    <div class="pane active" id="planPane">
+        <div class="fb-table-container">
+            <table class="fb-table rpt-table" id="planTable"><thead></thead><tbody></tbody><tfoot id="planFoot"></tfoot></table>
+        </div>
+    </div>
+
+    <div class="pane" id="impactPane">
+        <div class="fb-table-container">
+            <table class="fb-table rpt-table" id="impactTable"><thead></thead><tbody></tbody><tfoot id="impactFoot"></tfoot></table>
+        </div>
+    </div>
+
+    <div class="pane" id="deferPane">
+        <div class="fb-table-container">
+            <table class="fb-table rpt-table" id="deferTable"><thead></thead><tbody></tbody><tfoot id="deferFoot"></tfoot></table>
+        </div>
+    </div>
+
+    <div class="pane" id="monitorPane">
+        <div class="fb-table-container">
+            <table class="fb-table rpt-table" id="monitorTable"><thead></thead><tbody></tbody><tfoot id="monitorFoot"></tfoot></table>
+        </div>
+    </div>
+
+</div>
+
+<script>
+// ============================================================================
+//  BAIL EARLY — this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report requires the Fishbowl embedded browser environment. ' +
+        'Open it from the Fishbowl client\'s BI module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+// ============================================================================
+//  FB-LIB FEATURE CHECK
+// ============================================================================
+(function () {
+    var missing = [];
+    if (!window.FBLib) missing.push('FBLib');
+    else {
+        if (!FBLib.Common) missing.push('FBLib.Common');
+        else {
+            if (typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common.toggleDrawer');
+            if (!FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+        }
+        if (!FBLib.Table)    missing.push('FBLib.Table');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export)   missing.push('FBLib.Export');
+    }
+    if (!missing.length) return;
+    var b = document.createElement('div');
+    b.style.cssText = 'background:#C43046;color:#fff;padding:10px 14px;font:13px sans-serif;';
+    b.textContent = 'fb-lib is missing or out of date — not available: ' + missing.join(', ') +
+        '. Re-save the fb-lib Script in Fishbowl, then re-save this report.';
+    document.body.insertBefore(b, document.body.firstChild);
+})();
+
+// ============================================================================
+//  SETTINGS
+//  ----
+//  Layered: user payload -> admin master -> defaults. POLICY_KEYS are the
+//  subset an admin publishes org-wide; everything else is personal.
+// ============================================================================
+var POLICY_KEYS = [
+    'sourceLgId', 'capPct', 'poolMode', 'countDraftTos', 'floorMode', 'floorMult', 'floorFixed',
+    'allocPolicy', 'needBasis', 'includeInbound', 'minTransferQty', 'minQtyPolicy',
+    'toType', 'autoIssue', 'capEnforcement', 'dryRun', 'deferEnabled', 'useCwFallback'
+];
+
+try {
+    FBLib.Settings.init({
+        userKey:   'cdx.bi.rplto.user.v1',
+        masterKey: 'cdx.bi.rplto.master.v1',
+        defaults: {
+            v: 1,
+            // ---- policy (admin-publishable) ----
+            sourceLgId:     null,      // must be chosen before the report will plan
+            capPct:         35,
+            poolMode:       'available',
+            countDraftTos:  true,
+            floorMode:      'rop',
+            floorMult:      1,
+            floorFixed:     0,
+            allocPolicy:    'severity',
+            needBasis:      'oul',
+            includeInbound: true,
+            minTransferQty: 1,
+            minQtyPolicy:   'bump',
+            toType:         'Move',
+            autoIssue:      false,
+            capEnforcement: 'hard',
+            dryRun:         false,
+            deferEnabled:   true,
+            useCwFallback:  false,
+            // ---- personal ----
+            destLgIds:           [],
+            reflowMode:          'unpinnedOnly',
+            schedDaysOut:        0,
+            monitorLookbackDays: 30,
+            onlyShort:           true,
+            showRecon:           false,
+            showDebug:           false,
+            tablePrefsPlan:    null,
+            tablePrefsImpact:  null,
+            tablePrefsDefer:   null,
+            tablePrefsMonitor: null
+        },
+        propFallback: {
+            showDebug: { name: 'BI_SHOW_DEBUG', dflt: 'false', parse: function (v) { return v === 'true'; } }
+        }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+var _resolve = function (key, dflt) {
+    try { var v = FBLib.Settings.resolve(key); return (v === undefined || v === null) ? dflt : v; }
+    catch (_) { return dflt; }
+};
+var _setUserKey = function (key, value) {
+    try { FBLib.Settings.setUserKey(key, value); FBLib.Settings.saveUser(); } catch (_) {}
+};
+var debugLog = function (msg, kind) { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// Current effective config, refreshed by readConfig(). The engine is pure and
+// takes this as an argument, so nothing reads settings mid-calculation.
+var _cfg = {};
+
+function readConfig() {
+    _cfg = {
+        sourceLgId:     _resolve('sourceLgId', null),
+        capPct:         Number(_resolve('capPct', 35)) || 0,
+        poolMode:       _resolve('poolMode', 'available'),
+        countDraftTos:  !!_resolve('countDraftTos', true),
+        floorMode:      _resolve('floorMode', 'rop'),
+        floorMult:      Number(_resolve('floorMult', 1)) || 0,
+        floorFixed:     Number(_resolve('floorFixed', 0)) || 0,
+        floorOverrideByPart: {},
+        allocPolicy:    _resolve('allocPolicy', 'severity'),
+        lgPriority:     _resolve('lgPriority', []) || [],
+        needBasis:      _resolve('needBasis', 'oul'),
+        includeInbound: !!_resolve('includeInbound', true),
+        minTransferQty: Number(_resolve('minTransferQty', 1)) || 0,
+        minQtyPolicy:   _resolve('minQtyPolicy', 'bump'),
+        qtyDecimals:    4,
+        capEnforcement: _resolve('capEnforcement', 'hard'),
+        reflowMode:     _resolve('reflowMode', 'unpinnedOnly'),
+        toType:         _resolve('toType', 'Move'),
+        autoIssue:      !!_resolve('autoIssue', false),
+        dryRun:         !!_resolve('dryRun', false),
+        deferEnabled:   !!_resolve('deferEnabled', true),
+        useCwFallback:  !!_resolve('useCwFallback', false),
+        showRecon:      !!_resolve('showRecon', false)
+    };
+    return _cfg;
+}
+
+// ============================================================================
+//  STATE
+// ============================================================================
+var ORDER_MARKER = '[RPL v1]';
+var DEFER_LEDGER_KEY = 'cdx.bi.rplto.ledger.v1';
+
+var _model     = { srcLgId: null, srcLgName: '', parts: [], byPart: {}, lines: [] };
+var _lgs       = [];       // [{id,name,isDefault}]
+var _carrierId = null;
+var _carrierName = '';
+var _lgReordering = true;
+var _addrByLg  = {};       // lgId -> address object|null (Ship validation)
+var _monitorRows = [];
+var _deferRows   = [];
+var _impactRows  = [];
+var _ledger      = {};     // "partId|destLgId" -> {qty, srcLgId, asOf, runId}
+var _lastResults = [];
+var _loadToken   = 0;
+var _submitting  = false;
+
+var _planTable = null, _impactTable = null, _deferTable = null, _monitorTable = null;
+var _destMs = null;
+var _activePane = 'planPane';
+
+// ============================================================================
+//  RUNQUERY NORMALISER
+// ============================================================================
+async function runQueryP(sql) {
+    if (typeof runQueryAsync === 'function') {
+        var r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    var raw = runQuery(sql);
+    if (!raw) return [];
+    try { var p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// ============================================================================
+//  NUMERIC PRIMITIVES
+//  ----
+//  decimal(28,9) columns arrive as STRINGS; SQL-computed expressions arrive as
+//  numbers. Everything goes through num(). Every arithmetic result goes through
+//  q() to strip IEEE noise, and comparisons use the EPS helpers rather than
+//  bare operators — 0.1 + 0.2 > 0.3 is true in IEEE754, and against a hard
+//  retention floor that means shipping one unit too many.
+// ============================================================================
+var EPS = 1e-4;
+function num(v) { var n = parseFloat(v); return isFinite(n) ? n : 0; }
+function q(n)   { return Number(n.toFixed(4)); }
+function gt(a, b) { return a - b >  EPS; }
+function ge(a, b) { return a - b > -EPS; }
+function eq(a, b) { return Math.abs(a - b) <= EPS; }
+
+// Floor to `d` decimals. The inner toFixed(6) is load-bearing: without it
+// Math.floor(2.9999999999999996) is 2, and a user who typed 3 gets 2.
+function rdown(n, d) {
+    var p = Math.pow(10, d);
+    return Math.floor(Number((n * p).toFixed(6))) / p;
+}
+function decimalsFor(partRow, cfg) {
+    return partRow.uomIntegral ? 0 : (cfg.qtyDecimals != null ? cfg.qtyDecimals : 4);
+}
+
+function escSQL(s) { return FBLib.Common.escSQL(String(s == null ? '' : s)); }
+function fmtQty(v)  { return FBLib.Common.formatQty(v); }
+function intList(a) {
+    var out = (a || []).map(function (x) { return parseInt(x, 10); })
+                       .filter(function (n) { return !isNaN(n); });
+    return out.length ? out : null;
+}
+
+function showToast(message, type, duration) {
+    type = type || 'info';
+    var container = document.querySelector('.toast-container');
+    if (!container) return;
+    var toast = document.createElement('div');
+    toast.className = 'toast ' + type;
+    var icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '⚠' : 'ℹ';
+    var ic = document.createElement('span'); ic.className = 'toast-icon'; ic.textContent = icon;
+    var ms = document.createElement('span'); ms.className = 'toast-msg';  ms.textContent = message;
+    toast.appendChild(ic); toast.appendChild(ms);
+    container.appendChild(toast);
+    setTimeout(function () {
+        toast.style.opacity = '0';
+        setTimeout(function () { if (toast.parentNode) toast.remove(); }, 300);
+    }, duration || 3200);
+}
+
+// ============================================================================
+//  ALLOCATION ENGINE
+//  ============================================================================
+//  allocate(partRow, destRows, cfg) is PURE — no I/O, no Date, no Math.random,
+//  no mutation of its inputs. Same inputs always produce identical output, so
+//  it is safe and cheap to re-run on every keystroke (O(n log n) over 3-10
+//  destinations). All quantities are in the PART'S BASE UOM.
+// ============================================================================
+
+// --- pool: how much of the source is genuinely in play -----------------------
+function computePool(partRow, cfg) {
+    var draft = cfg.countDraftTos ? num(partRow.srcOutDraft) : 0;
+    if (cfg.poolMode === 'availToPick') {
+        // availToPick nets only committed picks, so open outbound transfers
+        // must be subtracted explicitly here.
+        return q(Math.max(0, num(partRow.srcAvailToPick) - num(partRow.srcOutReal) - draft));
+    }
+    if (cfg.poolMode === 'physical') {
+        return q(Math.max(0, num(partRow.srcOnHand) - num(partRow.srcNotAvail) - draft));
+    }
+    // 'available' is ALREADY net of srcOutReal (open outbound transfers are a
+    // component of QTYALLOCATED). Do NOT subtract it again — that double-counts.
+    return q(Math.max(0, num(partRow.srcAvailable) - draft));
+}
+
+// --- floor: what the source must always retain ------------------------------
+function computeFloor(partRow, cfg) {
+    var ovr = cfg.floorOverrideByPart && cfg.floorOverrideByPart[partRow.partId];
+    if (ovr != null) return { floor: q(Math.max(0, num(ovr))), basis: 'override' };
+    switch (cfg.floorMode) {
+        case 'oul':         return { floor: q(Math.max(0, num(partRow.srcOul))), basis: 'oul' };
+        case 'ropMultiple': return { floor: q(Math.max(0, num(partRow.srcRop) * num(cfg.floorMult))), basis: 'ropMultiple' };
+        case 'fixed':       return { floor: q(Math.max(0, num(cfg.floorFixed))), basis: 'fixed' };
+        case 'none':        return { floor: 0, basis: 'none' };
+        case 'rop':
+        default:            return { floor: q(Math.max(0, num(partRow.srcRop))), basis: 'rop' };
+    }
+}
+
+// --- severity + a TOTAL order (a partial order would let a manual edit
+//     reshuffle rows non-deterministically) ---------------------------------
+function severityOf(d) {
+    var rop = num(d.rop);
+    if (!gt(rop, 0)) return 0;              // no reorder point -> unranked, lowest
+    var have = num(d.available) + num(d.inbound);
+    return q(Math.max(0, (rop - have) / rop));
+}
+
+function orderDests(dests, cfg) {
+    var rank = {};
+    (cfg.lgPriority || []).forEach(function (id, i) { rank[id] = i; });
+    var BIG = Number.MAX_SAFE_INTEGER;
+    return dests.slice().sort(function (a, b) {
+        var s = severityOf(b) - severityOf(a);
+        if (Math.abs(s) > EPS) return s > 0 ? 1 : -1;
+        // deferral age escalates a repeatedly-starved destination
+        var g = num(b.deferAgeDays) - num(a.deferAgeDays);
+        if (Math.abs(g) > EPS) return g > 0 ? 1 : -1;
+        var ra = (rank[a.lgId] === undefined) ? BIG : rank[a.lgId];
+        var rb = (rank[b.lgId] === undefined) ? BIG : rank[b.lgId];
+        if (ra !== rb) return ra - rb;
+        return a.lgId - b.lgId;
+    });
+}
+
+// --- policies: (orderedDests, budget, dec, cfg) -> { lgId: qty } -------------
+function _zeroMap(ordered) {
+    var out = {};
+    ordered.forEach(function (d) { out[d.lgId] = 0; });
+    return out;
+}
+
+// Most critical site first, filled to its full need before moving on.
+function policySeverity(ordered, budget, dec) {
+    var out = _zeroMap(ordered), left = budget;
+    ordered.forEach(function (d) {
+        if (!gt(left, 0)) return;
+        var want = rdown(Math.min(num(d.need), left), dec);
+        if (gt(want, 0)) { out[d.lgId] = want; left = q(left - want); }
+    });
+    return out;
+}
+
+// Severity order, but pass 1 only fills to the REORDER POINT so no site is
+// starved while the worst one climbs all the way to its order-up-to level;
+// pass 2 distributes whatever is left toward full need.
+function policyCoverThenTopUp(ordered, budget, dec) {
+    var out = _zeroMap(ordered), left = budget;
+    ordered.forEach(function (d) {
+        if (!gt(left, 0)) return;
+        var want = rdown(Math.min(num(d.needToRop), left), dec);
+        if (gt(want, 0)) { out[d.lgId] = want; left = q(left - want); }
+    });
+    var resid = ordered.map(function (d) { return { d: d, r: Math.max(0, q(num(d.need) - out[d.lgId])) }; });
+    var tot = resid.reduce(function (s, x) { return s + x.r; }, 0);
+    if (gt(left, 0) && gt(tot, 0)) {
+        var pot = left;
+        resid.forEach(function (x) {
+            if (!gt(left, 0) || !gt(x.r, 0)) return;
+            var share = rdown(Math.min(x.r, pot * x.r / tot, left), dec);
+            if (gt(share, 0)) { out[x.d.lgId] = q(out[x.d.lgId] + share); left = q(left - share); }
+        });
+        // hand out the rounding remainder in severity order so floor() never
+        // silently loses units
+        resid.forEach(function (x) {
+            if (!gt(left, 0)) return;
+            var room = Math.max(0, q(num(x.d.need) - out[x.d.lgId]));
+            var add = rdown(Math.min(room, left), dec);
+            if (gt(add, 0)) { out[x.d.lgId] = q(out[x.d.lgId] + add); left = q(left - add); }
+        });
+    }
+    return out;
+}
+
+function policyProRata(ordered, budget, dec) {
+    var out = _zeroMap(ordered);
+    var tot = ordered.reduce(function (s, d) { return s + num(d.need); }, 0);
+    if (!gt(tot, 0) || !gt(budget, 0)) return out;
+    var left = budget;
+    ordered.forEach(function (d) {
+        var share = rdown(Math.min(num(d.need), budget * num(d.need) / tot, left), dec);
+        if (gt(share, 0)) { out[d.lgId] = share; left = q(left - share); }
+    });
+    ordered.forEach(function (d) {                 // remainder, severity order
+        if (!gt(left, 0)) return;
+        var room = Math.max(0, q(num(d.need) - out[d.lgId]));
+        var add = rdown(Math.min(room, left), dec);
+        if (gt(add, 0)) { out[d.lgId] = q(out[d.lgId] + add); left = q(left - add); }
+    });
+    return out;
+}
+
+// Water-filling: equal shares, and any site needing less than its share
+// releases the surplus back to the others. Iterates to a fixpoint.
+function policyEqualShare(ordered, budget, dec) {
+    var out = _zeroMap(ordered), left = budget, guard = 0;
+    var active = ordered.filter(function (d) { return gt(num(d.need), 0); });
+    while (gt(left, 0) && active.length && guard++ < 200) {
+        var share = left / active.length, moved = 0;
+        active.forEach(function (d) {
+            var room = Math.max(0, q(num(d.need) - out[d.lgId]));
+            var take = rdown(Math.min(room, share, left), dec);
+            if (gt(take, 0)) { out[d.lgId] = q(out[d.lgId] + take); left = q(left - take); moved += take; }
+        });
+        active = active.filter(function (d) { return gt(q(num(d.need) - out[d.lgId]), 0); });
+        if (!gt(moved, 0)) break;
+    }
+    return out;
+}
+
+function policyPriority(ordered, budget, dec, cfg) {
+    var rank = {};
+    (cfg.lgPriority || []).forEach(function (id, i) { rank[id] = i; });
+    var BIG = Number.MAX_SAFE_INTEGER;
+    var byPri = ordered.slice().sort(function (a, b) {
+        var ra = (rank[a.lgId] === undefined) ? BIG : rank[a.lgId];
+        var rb = (rank[b.lgId] === undefined) ? BIG : rank[b.lgId];
+        return ra !== rb ? ra - rb : a.lgId - b.lgId;
+    });
+    return policySeverity(byPri, budget, dec);
+}
+
+function policyManual(ordered) { return _zeroMap(ordered); }
+
+var POLICIES = {
+    severity:       policySeverity,
+    coverThenTopUp: policyCoverThenTopUp,
+    proRata:        policyProRata,
+    equalShare:     policyEqualShare,
+    priority:       policyPriority,
+    manual:         policyManual
+};
+
+var POLICY_HINTS = {
+    severity:       'Fills the site furthest below its reorder point first. The most critical site gets a useful quantity rather than everyone getting a token amount — but one very short site can consume the whole cap.',
+    coverThenTopUp: 'Everyone reaches their reorder point first, then leftovers top up toward the order-up-to level. Avoids starving a site while another climbs to target.',
+    proRata:        'Each site gets a share of the cap proportional to its shortfall. Predictable, but nobody may get enough to clear their shortfall.',
+    equalShare:     'Equal split; any site needing less than its share releases the surplus to the others.',
+    priority:       'Fills strictly down your location-group ranking, ignoring how urgent each site actually is.',
+    manual:         'Nothing is allocated automatically. You type every quantity; the cap only acts as a clamp.'
+};
+
+function sumVals(o) {
+    var s = 0;
+    for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) s = q(s + o[k]);
+    return s;
+}
+
+/**
+ * The engine. See the return-shape contract in the header comment.
+ * Never refuses to compute — it always returns a coherent result plus the
+ * reasons it is unhappy, which keeps it pure and unit-testable.
+ */
+function allocate(partRow, destRows, cfg) {
+    var dec  = decimalsFor(partRow, cfg);
+    var pool = computePool(partRow, cfg);
+    var fl   = computeFloor(partRow, cfg);
+    var violations = [];
+
+    var capPct   = q(pool * (num(cfg.capPct) / 100));
+    var capFloor = q(Math.max(0, pool - fl.floor));
+    var cap      = rdown(Math.max(0, Math.min(capPct, capFloor)), dec);
+    var capBinding = !gt(cap, 0) ? 'NONE'
+                   : eq(capPct, capFloor) ? 'BOTH'
+                   : (capPct < capFloor ? 'PCT' : 'FLOOR');
+
+    // 1. pinned rows are law — they come out of the cap before anything else
+    var pinnedTotal = 0;
+    destRows.forEach(function (d) {
+        if (d.pinned) pinnedTotal = q(pinnedTotal + Math.max(0, num(d.pinnedQty)));
+    });
+
+    // 2. the policy plays with whatever is left
+    var budget   = rdown(Math.max(0, q(cap - pinnedTotal)), dec);
+    var unpinned = destRows.filter(function (d) { return !d.pinned; });
+    var ordered  = orderDests(unpinned, cfg);
+    var fn       = POLICIES[cfg.allocPolicy] || POLICIES.severity;
+    var assigned = fn(ordered, budget, dec, cfg);
+
+    // 3. minimum-transfer-quantity escape hatch.
+    //    Fires ONLY when the cap itself rounds below a usable quantity — e.g.
+    //    pool 2 at 35% is 0.7, which floors to 0 on a whole-unit part, so a
+    //    genuinely needed part would ship nothing forever.
+    //    It deliberately does NOT fire when the cap is healthy but exhausted by
+    //    more urgent destinations: that is the sharing policy working as
+    //    intended, and bumping the starved tail would both defeat the policy and
+    //    breach the cap. Only the single most urgent unfunded site is rescued.
+    //    A bump MAY breach the cap (flagged) but must NEVER breach the floor.
+    var bumped = {};
+    if (cfg.minQtyPolicy === 'bump' && gt(num(cfg.minTransferQty), 0) && cap < num(cfg.minTransferQty)) {
+        for (var bi = 0; bi < ordered.length; bi++) {
+            var bd = ordered[bi];
+            if (!gt(num(bd.need), 0) || gt(assigned[bd.lgId] || 0, 0)) continue;
+            var want  = Math.min(num(cfg.minTransferQty), num(bd.need));
+            var spent = q(sumVals(assigned) + pinnedTotal);
+            if (ge(q(pool - spent - want), fl.floor)) {
+                assigned[bd.lgId] = rdown(want, dec);
+                bumped[bd.lgId] = true;
+            } else {
+                violations.push({ lgId: bd.lgId, code: 'BELOW_MIN_QTY', severity: 'warn',
+                    message: 'The cap rounds below the minimum transfer quantity here, and sending the ' +
+                             'minimum anyway would breach the source retention floor. Nothing can be sent.',
+                    value: want, limit: q(Math.max(0, pool - spent - fl.floor)) });
+            }
+            break;
+        }
+    }
+
+    // 4. assemble in the CALLER'S display order
+    var totalAllocated = 0, totalRequested = 0, running = pool;
+    var allocations = destRows.map(function (d) {
+        var requested = q(Math.max(0, num(d.need)));
+        var raw = d.pinned ? Math.max(0, num(d.pinnedQty)) : (assigned[d.lgId] || 0);
+        var allocated = rdown(raw, dec);
+        totalAllocated = q(totalAllocated + allocated);
+        totalRequested = q(totalRequested + requested);
+        running = q(running - allocated);
+
+        var rop = num(d.rop), oul = num(d.oul);
+        var destAfter = q(num(d.available) + num(d.inbound) + allocated);
+
+        if (d.pinned) {
+            if (num(d.pinnedQty) < 0)
+                violations.push({ lgId: d.lgId, code: 'NEGATIVE_QTY', severity: 'error',
+                    message: 'Quantity cannot be negative.', value: num(d.pinnedQty), limit: 0 });
+            if (gt(allocated, requested))
+                violations.push({ lgId: d.lgId, code: 'OVER_NEED', severity: 'warn',
+                    message: 'More than ' + d.lgName + ' needs to reach its target level.',
+                    value: allocated, limit: requested });
+            if (partRow.uomIntegral && !eq(allocated, Math.round(allocated)))
+                violations.push({ lgId: d.lgId, code: 'FRACTIONAL_QTY', severity: 'warn',
+                    message: partRow.uomCode + ' is a whole-unit UOM; this will be rounded down.',
+                    value: allocated, limit: Math.floor(allocated) });
+        }
+        if (!gt(rop, 0))
+            violations.push({ lgId: d.lgId, code: 'NO_ROP_AT_DEST', severity: 'warn',
+                message: 'No reorder point for this part at ' + d.lgName + ' — its demand is unranked.',
+                value: 0, limit: 0 });
+
+        var stateAfter;
+        if (!gt(rop, 0) || !gt(oul, 0))              stateAfter = 'norop';
+        else if (gt(destAfter, oul))                 stateAfter = 'over';
+        else if (destAfter < rop - EPS)              stateAfter = 'critical';
+        else if (ge(rop + 0.2 * (oul - rop), destAfter)) stateAfter = 'alert';
+        else                                         stateAfter = 'good';
+
+        return {
+            lgId: d.lgId, lgName: d.lgName,
+            requested: requested,
+            requestedToRop: q(Math.max(0, num(d.needToRop))),
+            allocated: allocated,
+            deferred: q(Math.max(0, requested - allocated)),
+            pinned: !!d.pinned,
+            bumped: !!bumped[d.lgId],
+            severity: severityOf(d),
+            fillPct: gt(requested, 0) ? q(allocated / requested) : 1,
+            destAfter: destAfter,
+            destStateAfter: stateAfter,
+            runningSourceAfter: running
+        };
+    });
+
+    var sourceAfter = q(pool - totalAllocated);
+    var capBreached = gt(totalAllocated, cap);
+    var anyBump     = Object.keys(bumped).length > 0;
+
+    // "Breached" means THIS PLAN pushed the source under its floor. If the
+    // source was already below the floor before we planned anything, that is a
+    // pre-existing condition, not something the plan caused — reporting it as a
+    // breach would block creation and show a misleading "would take it below".
+    var sourceBelowFloor = pool < fl.floor - EPS;
+    var floorBreached    = gt(totalAllocated, 0) && sourceAfter < fl.floor - EPS;
+
+    // A cap breach caused solely by the deliberate minimum-quantity bump is
+    // intentional, so it warns rather than blocking.
+    var capBreachIsBump = capBreached && anyBump && ge(q(cap + num(cfg.minTransferQty)), totalAllocated);
+    var sev = (cfg.capEnforcement === 'warn') ? 'warn' : 'error';
+
+    if (sourceAfter < -EPS)
+        violations.push({ lgId: null, code: 'EXCEEDS_POOL', severity: 'error',
+            message: 'Planned total exceeds the stock available at the source.',
+            value: totalAllocated, limit: pool });
+    if (capBreached)
+        violations.push({ lgId: null, code: 'CAP_BREACHED', severity: capBreachIsBump ? 'warn' : sev,
+            message: capBreachIsBump ? 'Cap exceeded to honour the minimum transfer quantity.'
+                                     : 'Planned total exceeds the transfer cap.',
+            value: totalAllocated, limit: cap });
+    if (floorBreached)
+        violations.push({ lgId: null, code: 'FLOOR_BREACHED', severity: sev,
+            message: 'This plan would take the source below its retention floor.',
+            value: sourceAfter, limit: fl.floor });
+    else if (sourceBelowFloor && gt(totalRequested, 0))
+        violations.push({ lgId: null, code: 'SOURCE_BELOW_FLOOR', severity: 'warn',
+            message: 'The source is already at or below its retention floor for this part, so nothing ' +
+                     'can be released. The demand is being carried as deferred.',
+            value: pool, limit: fl.floor });
+
+    return {
+        partId: partRow.partId, partNum: partRow.partNum,
+        uomCode: partRow.uomCode, uomIntegral: !!partRow.uomIntegral,
+        pool: pool, poolBasis: cfg.poolMode,
+        floor: fl.floor, floorBasis: fl.basis,
+        capPct: capPct, capFloor: capFloor, cap: cap, capBinding: capBinding,
+        allocations: allocations,
+        totalRequested: totalRequested, totalAllocated: totalAllocated,
+        totalDeferred: q(Math.max(0, totalRequested - totalAllocated)),
+        sourceBefore: pool, sourceAfter: sourceAfter,
+        sourceAfterFb: q(num(partRow.srcAvailFb) - totalAllocated),
+        sourceRopAfter: q(sourceAfter - num(partRow.srcRop)),
+        capBreached: capBreached, capBreachIsBump: capBreachIsBump,
+        floorBreached: floorBreached, sourceBelowFloor: sourceBelowFloor,
+        violations: violations
+    };
+}
+
+// ============================================================================
+//  SQL
+//  ============================================================================
+//  Two phases. Phase 1 discovers the candidate part set from `partreorder`
+//  (a tiny table), so there is no id list to marshal. Phase 2 fetches the
+//  expensive facts for exactly those parts, chunked at 1000 ids.
+//
+//  Derived tables throughout — NOT CTEs. No report in this repo uses WITH and
+//  Fishbowl's read-only guard is unverified against it.
+// ============================================================================
+var ID_CHUNK = 1000;
+
+// --- Q1a: candidate (part, destination LG) pairs with their effective ROP/OUL
+function sqlCandidates(destIds, useCwFallback) {
+    var D = destIds.join(',');
+    var sql =
+    " SELECT pr.partid AS part_id, pr.locationgroupid AS lgid," +
+    "        MAX(pr.reorderpoint) AS rop, MAX(pr.orderuptolevel) AS oul, 'LG' AS ropsource" +
+    " FROM partreorder pr" +
+    " JOIN part p ON p.id = pr.partid AND p.typeid = 10 AND p.activeflag = 1" +
+    " WHERE pr.locationgroupid IN (" + D + ")" +
+    "   AND pr.reorderpoint > 0 AND pr.orderuptolevel > 0" +
+    " GROUP BY pr.partid, pr.locationgroupid";
+
+    if (useCwFallback) {
+        // Company-wide rows spread over destination LGs that have no per-LG row
+        // of their own. MAX() guards duplicates: UNIQUE(partId, locationGroupId)
+        // permits multiple NULLs, so >1 company-wide row per part is reachable.
+        sql +=
+        " UNION ALL" +
+        " SELECT pr.partid, lg.id, MAX(pr.reorderpoint), MAX(pr.orderuptolevel), 'COMPANY'" +
+        " FROM partreorder pr" +
+        " JOIN part p ON p.id = pr.partid AND p.typeid = 10 AND p.activeflag = 1" +
+        " CROSS JOIN locationgroup lg" +
+        " WHERE pr.locationgroupid IS NULL" +
+        "   AND pr.reorderpoint > 0 AND pr.orderuptolevel > 0" +
+        "   AND lg.id IN (" + D + ") AND lg.activeflag = 1" +
+        "   AND NOT EXISTS (SELECT 1 FROM partreorder pr2" +
+        "                   WHERE pr2.partid = pr.partid AND pr2.locationgroupid = lg.id)" +
+        " GROUP BY pr.partid, lg.id";
+    }
+    return sql;
+}
+
+// --- the intra-LG / draft transfer correction ------------------------------
+//  QTYALLOCATEDTOSEND does not check whether a transfer actually LEAVES the
+//  location group, so same-LG movements count as "promised out" and can drive
+//  available to zero. This block isolates the two portions we need to add back:
+//    intra  — same-LG (fromLGId = shipToLGId). Never real outbound stock.
+//    draft  — Entered/Request headers, which Fishbowl does not allocate at all.
+//  Note the predicate is fromlgid <> shiptolgid, NOT typeid <> 30: a Putaway
+//  that genuinely crosses location groups IS real stock movement and must count.
+function sqlTransferBuckets(idsCsv, lgCsv) {
+    return (
+    " SELECT xi.partid AS partid, xo.fromlgid AS lgid," +
+    "   COALESCE(SUM(CASE WHEN xo.statusid IN (20,30,40,50,60) AND xo.fromlgid =  xo.shiptolgid" +
+    "        THEN " + UOMQ('xi') + " ELSE 0 END),0) AS out_intra," +
+    "   COALESCE(SUM(CASE WHEN xo.statusid IN (20,30,40,50,60) AND xo.fromlgid <> xo.shiptolgid" +
+    "        THEN " + UOMQ('xi') + " ELSE 0 END),0) AS out_real," +
+    "   COALESCE(SUM(CASE WHEN xo.statusid IN (10,15) AND xo.fromlgid <> xo.shiptolgid" +
+    "        THEN " + UOMQ('xi') + " ELSE 0 END),0) AS out_draft" +
+    " FROM xoitem xi" +
+    " JOIN xo ON xo.id = xi.xoid" +
+    " JOIN part xp ON xp.id = xi.partid" +
+    " LEFT JOIN uomconversion xuc ON xuc.touomid = xp.uomid AND xuc.fromuomid = xi.uomid" +
+    " WHERE xi.typeid = 10 AND xi.statusid IN (10,20,30,40,50)" +
+    "   AND xo.statusid IN (10,15,20,30,40,50,60)" +
+    "   AND xo.fromlgid IN (" + lgCsv + ") AND xi.partid IN (" + idsCsv + ")" +
+    " GROUP BY xi.partid, xo.fromlgid");
+}
+
+// UOM-normalise an xoitem remaining qty into the part's base UOM.
+function UOMQ(a) {
+    return "CASE WHEN " + a + ".uomid <> xp.uomid AND xuc.id > 0" +
+           " THEN (" + a + ".qtytofulfill - " + a + ".qtyfulfilled) * xuc.multiply / xuc.factor" +
+           " ELSE " + a + ".qtytofulfill - " + a + ".qtyfulfilled END";
+}
+
+// --- inbound stock already on its way TO each destination -------------------
+//  Derived from SEND lines + xo.shipToLGId, because this schema can carry zero
+//  typeId=20 (Receive) rows. The NOT EXISTS keeps it correct on installs that
+//  DO have Receive lines: where one exists for the same order+part we defer
+//  to it rather than double-counting the Send line.
+function sqlInbound(idsCsv, lgCsv) {
+    return (
+    " SELECT xi.partid AS partid, xo.shiptolgid AS lgid," +
+    "   COALESCE(SUM(" + UOMQ('xi') + "),0) AS inbound" +
+    " FROM xoitem xi" +
+    " JOIN xo ON xo.id = xi.xoid" +
+    " JOIN part xp ON xp.id = xi.partid" +
+    " LEFT JOIN uomconversion xuc ON xuc.touomid = xp.uomid AND xuc.fromuomid = xi.uomid" +
+    " WHERE xi.statusid IN (10,20,30,40,50)" +
+    "   AND xo.statusid IN (20,30,40,50,60)" +
+    "   AND xo.fromlgid <> xo.shiptolgid" +
+    "   AND xo.shiptolgid IN (" + lgCsv + ") AND xi.partid IN (" + idsCsv + ")" +
+    "   AND ( xi.typeid = 20 OR ( xi.typeid = 10 AND NOT EXISTS (" +
+    "       SELECT 1 FROM xoitem xr WHERE xr.xoid = xi.xoid" +
+    "         AND xr.partid = xi.partid AND xr.typeid = 20 ) ) )" +
+    " GROUP BY xi.partid, xo.shiptolgid");
+}
+
+// --- Q1b: per-part per-LG facts --------------------------------------------
+//  avail_fb  reproduces Fishbowl exactly (reconciliation column)
+//  avail_adj adds back the intra-LG contamination (drives the cap)
+//  availtopick is computed inline from tag+location per
+//  PurchaseOrder/WO_Parts_Availability.htm:1624-1633
+function sqlFacts(partIds, lgIds) {
+    var ids = partIds.join(','), lgs = lgIds.join(',');
+    return (
+    " SELECT p.id AS part_id, p.num AS part_num, p.description AS part_desc," +
+    "        p.uomid AS uom_id, COALESCE(u.code,'') AS uom_code, u.integral + 0 AS uom_integral," +
+    "        lg.id AS lgid, lg.name AS lg_name," +
+    "        COALESCE(qi.qtyonhand,0)      AS onhand," +
+    "        COALESCE(qi.qtyallocated,0)   AS allocated," +
+    "        COALESCE(qi.qtynotavailable,0) AS notavail," +
+    "        COALESCE(qi.qtydropship,0)    AS dropship," +
+    "        COALESCE(qi.qtyonorder,0)     AS onorder," +
+    "        COALESCE(tg.availtopick,0)    AS availtopick," +
+    "        COALESCE(xb.out_intra,0)      AS out_intra," +
+    "        COALESCE(xb.out_real,0)       AS out_real," +
+    "        COALESCE(xb.out_draft,0)      AS out_draft," +
+    "        COALESCE(ib.inbound,0)        AS inbound," +
+    "        GREATEST(COALESCE(qi.qtyonhand,0) - COALESCE(qi.qtyallocated,0)" +
+    "                 - COALESCE(qi.qtynotavailable,0) + COALESCE(qi.qtydropship,0), 0) AS avail_fb," +
+    "        GREATEST(COALESCE(qi.qtyonhand,0)" +
+    "                 - (COALESCE(qi.qtyallocated,0) - COALESCE(xb.out_intra,0))" +
+    "                 - COALESCE(qi.qtynotavailable,0) + COALESCE(qi.qtydropship,0), 0) AS avail_adj," +
+    "        COALESCE(tk.trackflag,0) AS tracked" +
+    " FROM part p" +
+    " JOIN uom u ON u.id = p.uomid" +
+    " CROSS JOIN locationgroup lg" +
+    " LEFT JOIN qtyinventorytotals qi ON qi.partid = p.id AND qi.locationgroupid = lg.id" +
+    " LEFT JOIN (" +
+    "   SELECT t.partid, l.locationgroupid AS lgid," +
+    "     COALESCE(SUM(CASE WHEN t.typeid IN (30,40) AND l.countedasavailable = 1" +
+    "                        AND l.typeid <> 100 AND t.woitemid IS NULL" +
+    "                  THEN GREATEST(t.qty - COALESCE(t.qtycommitted,0),0) ELSE 0 END),0) AS availtopick" +
+    "   FROM tag t JOIN location l ON l.id = t.locationid" +
+    "   WHERE t.partid IN (" + ids + ") AND l.locationgroupid IN (" + lgs + ")" +
+    "   GROUP BY t.partid, l.locationgroupid" +
+    " ) tg ON tg.partid = p.id AND tg.lgid = lg.id" +
+    " LEFT JOIN (" + sqlTransferBuckets(ids, lgs) + ") xb ON xb.partid = p.id AND xb.lgid = lg.id" +
+    " LEFT JOIN (" + sqlInbound(ids, lgs) + ") ib ON ib.partid = p.id AND ib.lgid = lg.id" +
+    // Serial/lot-tracked parts: create is fine, but issuing/picking may demand
+    // tracking data, so the grid badges them rather than silently planning them.
+    " LEFT JOIN (" +
+    "   SELECT ptt.partid, 1 AS trackflag FROM parttotracking ptt" +
+    "   WHERE ptt.partid IN (" + ids + ") GROUP BY ptt.partid" +
+    " ) tk ON tk.partid = p.id" +
+    " WHERE p.id IN (" + ids + ") AND lg.id IN (" + lgs + ")");
+}
+
+// --- Q1c: the SOURCE LG's own reorder point / order-up-to (drives the floor)
+function sqlSourceReorder(partIds, srcId) {
+    var ids = partIds.join(',');
+    return (
+    " SELECT s.part_id, MAX(s.rop) AS rop, MAX(s.oul) AS oul FROM (" +
+    "   SELECT pr.partid AS part_id, pr.reorderpoint AS rop, pr.orderuptolevel AS oul" +
+    "   FROM partreorder pr" +
+    "   WHERE pr.locationgroupid = " + srcId + " AND pr.partid IN (" + ids + ")" +
+    "   UNION ALL" +
+    "   SELECT pr.partid, pr.reorderpoint, pr.orderuptolevel" +
+    "   FROM partreorder pr" +
+    "   WHERE pr.locationgroupid IS NULL AND pr.partid IN (" + ids + ")" +
+    "     AND NOT EXISTS (SELECT 1 FROM partreorder pr2" +
+    "                     WHERE pr2.partid = pr.partid AND pr2.locationgroupid = " + srcId + ")" +
+    " ) s GROUP BY s.part_id");
+}
+
+// --- Q2: open outbound transfers from the source (Monitor tab) -------------
+//  Header status set is deliberately WIDER than the allocation maths uses:
+//  the monitor must show unissued drafts, while the cap arithmetic must match
+//  Fishbowl's own allocation semantics (which start at Issued).
+function sqlMonitor(srcId, lookbackDays) {
+    return (
+    " SELECT xo.id AS to_id, xo.num AS to_num, xo.statusid AS to_statusid," +
+    "        COALESCE(xs.name,'') AS to_status, COALESCE(xt.name,'') AS to_type," +
+    "        xo.shiptolgid AS dest_lg_id, COALESCE(tlg.name,'') AS dest_lg," +
+    "        DATE(xo.datescheduled) AS date_scheduled, DATE(xo.datecreated) AS date_created," +
+    "        COALESCE(su.username,'') AS created_by," +
+    "        COALESCE(LEFT(xo.note,160),'') AS to_note," +
+    "        xi.id AS line_id, xi.lineitem," +
+    "        COALESCE(xis.name,'') AS line_status," +
+    "        p.id AS part_id, p.num AS part_num, p.description AS part_desc," +
+    "        COALESCE(pu.code,'') AS uom_code," +
+    "        " + UOMQ('xi') + " AS qty_remaining," +
+    "        xi.qtytofulfill, xi.qtyfulfilled, xi.qtypicked," +
+    "        CASE WHEN xi.uomid = xp.uomid OR xuc.id > 0 THEN 1 ELSE 0 END AS uom_ok," +
+    "        CASE WHEN xo.statusid IN (10,15) THEN 1 ELSE 0 END AS is_draft" +
+    " FROM xoitem xi" +
+    " JOIN xo ON xo.id = xi.xoid" +
+    " JOIN part p  ON p.id = xi.partid" +          // never xoitem.partNum: stale snapshot
+    " JOIN part xp ON xp.id = xi.partid" +
+    " LEFT JOIN uom pu ON pu.id = xp.uomid" +
+    " LEFT JOIN uomconversion xuc ON xuc.touomid = xp.uomid AND xuc.fromuomid = xi.uomid" +
+    " LEFT JOIN xostatus xs ON xs.id = xo.statusid" +
+    " LEFT JOIN xotype   xt ON xt.id = xo.typeid" +
+    " LEFT JOIN xoitemstatus xis ON xis.id = xi.statusid" +
+    " LEFT JOIN locationgroup tlg ON tlg.id = xo.shiptolgid" +
+    " LEFT JOIN sysuser su ON su.id = xo.userid" +
+    " WHERE xo.fromlgid = " + srcId +
+    "   AND xo.fromlgid <> xo.shiptolgid" +       // the validated correctness predicate
+    "   AND xo.statusid IN (10,15,20,30,40,50,60)" +
+    "   AND xi.statusid IN (10,20,30,40,50)" +
+    "   AND xi.typeid = 10" +
+    "   AND xi.qtytofulfill > xi.qtyfulfilled" +
+    "   AND xo.datecreated >= DATE_SUB(NOW(), INTERVAL " + (parseInt(lookbackDays, 10) || 30) + " DAY)" +
+    " ORDER BY xo.num, xi.lineitem");
+}
+
+// ============================================================================
+//  DEFERRED LEDGER
+//  ----
+//  Stored per Fishbowl user via the saveSettings/loadSettings builtins under
+//  their OWN key — deliberately NOT inside the FBLib.Settings master payload,
+//  which is admin-gated (publishMaster calls isAdmin) and replaced wholesale on
+//  every publish. A non-admin planner must be able to record a deferral.
+//
+//  A deferral is an URGENCY signal, not additive demand: next run's quantity is
+//  always recomputed from live stock. A site short 100 last week and 80 today
+//  needs 80, not 180. The stored qty is shown for context and its AGE feeds the
+//  severity tiebreak so a repeatedly-starved site climbs the queue.
+// ============================================================================
+function ledgerLoad() {
+    _ledger = {};
+    try {
+        var raw = loadSettings(DEFER_LEDGER_KEY);
+        if (raw) {
+            var o = JSON.parse(raw);
+            if (o && typeof o === 'object') _ledger = o;
+        }
+    } catch (e) { debugLog('ledgerLoad: ' + e.message, 'warn'); }
+    return _ledger;
+}
+
+function ledgerSave() {
+    try { saveSettings(DEFER_LEDGER_KEY, JSON.stringify(_ledger)); }
+    catch (e) { debugLog('ledgerSave: ' + e.message, 'error'); }
+}
+
+function ledgerKey(partId, lgId) { return partId + '|' + lgId; }
+
+function ledgerAgeDays(entry, todayIso) {
+    if (!entry || !entry.asOf) return 0;
+    var a = Date.parse(entry.asOf + 'T00:00:00');
+    var b = Date.parse(todayIso + 'T00:00:00');
+    if (isNaN(a) || isNaN(b)) return 0;
+    return Math.max(0, Math.round((b - a) / 86400000));
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+function todayIso() {
+    var d = new Date();
+    return d.getFullYear() + '-' +
+           String(d.getMonth() + 1).padStart(2, '0') + '-' +
+           String(d.getDate()).padStart(2, '0');
+}
+
+function isoPlusDays(n) {
+    var d = new Date();
+    d.setDate(d.getDate() + (parseInt(n, 10) || 0));
+    return d.getFullYear() + '-' +
+           String(d.getMonth() + 1).padStart(2, '0') + '-' +
+           String(d.getDate()).padStart(2, '0');
+}
+
+function setStatus(text) {
+    var el = document.getElementById('statusLine');
+    if (el) el.textContent = text;
+}
+
+async function loadPlanner() {
+    var tok = ++_loadToken;
+    readConfig();
+
+    var srcId = parseInt(_cfg.sourceLgId, 10);
+    if (!srcId) {
+        _model = { srcLgId: null, srcLgName: '', parts: [], byPart: {}, lines: [] };
+        _monitorRows = []; _impactRows = []; _deferRows = [];
+        renderAll();
+        setStatus('Choose a source location group to begin');
+        renderBanners([{ kind: 'info', text: 'Pick the source location group in Filters. An admin can publish it as the organisation default from Settings.' }]);
+        return;
+    }
+
+    var destIds = (_resolve('destLgIds', []) || []).map(Number).filter(function (n) {
+        return n && n !== srcId;
+    });
+    if (!destIds.length) {
+        destIds = _lgs.map(function (l) { return l.id; }).filter(function (id) { return id !== srcId; });
+    }
+    if (!destIds.length) {
+        setStatus('No destination location groups available');
+        renderBanners([{ kind: 'warning', text: 'There are no destination location groups you can transfer to. Check your location group access.' }]);
+        return;
+    }
+
+    setStatus('Loading…');
+    showLoading(true);
+
+    try {
+        var srcLg = _lgs.filter(function (l) { return l.id === srcId; })[0];
+        _model.srcLgId = srcId;
+        _model.srcLgName = srcLg ? srcLg.name : ('LG ' + srcId);
+
+        // ---- phase 1: candidates ------------------------------------------
+        var candSql = sqlCandidates(destIds, _cfg.useCwFallback);
+        debugLog('Q1a candidates: ' + candSql.replace(/\s+/g, ' ').trim(), 'query');
+        var cands = await runQueryP(candSql);
+        if (tok !== _loadToken) { debugLog('load superseded', 'warn'); return; }
+
+        if (!cands.length) {
+            _model.parts = []; _model.byPart = {}; _model.lines = [];
+            _monitorRows = await loadMonitor(srcId);
+            renderAll();
+            setStatus('No parts have a reorder point at the selected destinations');
+            renderBanners([{ kind: 'info', text: 'No reorder points are configured for the selected destination location groups.' +
+                (_cfg.useCwFallback ? '' : ' Try enabling company-wide reorder point fallback in Filters.') }]);
+            showLoading(false);
+            return;
+        }
+
+        var partIds = [];
+        var seen = {};
+        cands.forEach(function (r) {
+            var pid = parseInt(r.part_id, 10);
+            if (pid && !seen[pid]) { seen[pid] = 1; partIds.push(pid); }
+        });
+
+        // ---- phase 2: facts, chunked --------------------------------------
+        var lgSet = [srcId].concat(destIds);
+        var facts = [];
+        for (var i = 0; i < partIds.length; i += ID_CHUNK) {
+            var chunk = partIds.slice(i, i + ID_CHUNK);
+            var fSql = sqlFacts(chunk, lgSet);
+            if (i === 0) debugLog('Q1b facts: ' + fSql.replace(/\s+/g, ' ').trim().substring(0, 900) + '…', 'query');
+            var got = await runQueryP(fSql);
+            if (tok !== _loadToken) { debugLog('load superseded', 'warn'); return; }
+            facts = facts.concat(got);
+            await new Promise(function (res) { setTimeout(res, 0); });   // keep the UI alive
+        }
+
+        var srcRop = [];
+        for (var j = 0; j < partIds.length; j += ID_CHUNK) {
+            var got2 = await runQueryP(sqlSourceReorder(partIds.slice(j, j + ID_CHUNK), srcId));
+            if (tok !== _loadToken) return;
+            srcRop = srcRop.concat(got2);
+        }
+
+        _monitorRows = await loadMonitor(srcId);
+        if (tok !== _loadToken) return;
+
+        buildModel(cands, facts, srcRop, srcId, destIds);
+        autoAllocate(true);            // silent first pass
+        renderAll();
+        showLoading(false);
+
+    } catch (e) {
+        showLoading(false);
+        console.error('[loadPlanner]', e);
+        debugLog('loadPlanner error: ' + (e && e.message ? e.message : e), 'error');
+        setStatus('Error — see debug console');
+        renderBanners([{ kind: 'danger', text: 'Could not load the plan: ' + (e && e.message ? e.message : 'unknown error') }]);
+    }
+}
+
+async function loadMonitor(srcId) {
+    try {
+        var days = _resolve('monitorLookbackDays', 30);
+        var rows = await runQueryP(sqlMonitor(srcId, days));
+        return rows || [];
+    } catch (e) {
+        debugLog('loadMonitor: ' + (e && e.message), 'warn');
+        return [];
+    }
+}
+
+// ============================================================================
+//  MODEL
+//  ----
+//  _model.lines ARE the row objects handed to FBLib.Table.getRows(). Because
+//  a column's format() callback receives the live row object, an <input> built
+//  inside it closes over the model — the DOM is a VIEW, never the truth.
+// ============================================================================
+function buildModel(cands, facts, srcRop, srcId, destIds) {
+    var cfg = _cfg;
+    var today = todayIso();
+    ledgerLoad();
+
+    // index facts by part|lg
+    var F = {}, meta = {};
+    facts.forEach(function (r) {
+        var pid = parseInt(r.part_id, 10), lg = parseInt(r.lgid, 10);
+        F[pid + '|' + lg] = r;
+        if (!meta[pid]) {
+            meta[pid] = {
+                partId: pid,
+                partNum: r.part_num || '',
+                description: r.part_desc || '',
+                uomId: parseInt(r.uom_id, 10),
+                uomCode: r.uom_code || '',
+                uomIntegral: String(r.uom_integral) === '1',
+                tracked: String(r.tracked) === '1'
+            };
+        }
+    });
+
+    var SR = {};
+    (srcRop || []).forEach(function (r) {
+        SR[parseInt(r.part_id, 10)] = { rop: num(r.rop), oul: num(r.oul) };
+    });
+
+    var onlyShort = !!_resolve('onlyShort', true);
+    var parts = {}, order = [];
+
+    cands.forEach(function (c) {
+        var pid = parseInt(c.part_id, 10), lg = parseInt(c.lgid, 10);
+        var m = meta[pid];
+        if (!m) return;                       // part not returned by facts (inactive/non-inventory)
+        if (lg === srcId) return;             // source can never be its own destination
+
+        var dk = F[pid + '|' + lg] || {};
+        var sk = F[pid + '|' + srcId] || {};
+
+        var rop = num(c.rop), oul = num(c.oul);
+        var destAvail   = num(dk.avail_adj);
+        var destInbound = cfg.includeInbound ? num(dk.inbound) : 0;
+        var have        = q(destAvail + destInbound);
+
+        if (onlyShort && ge(have, rop)) return;
+
+        var needToRop = q(Math.max(0, rop - have));
+        var need      = (cfg.needBasis === 'rop') ? needToRop : q(Math.max(0, oul - have));
+        if (!gt(need, 0)) return;
+
+        if (!parts[pid]) {
+            var s = SR[pid] || { rop: 0, oul: 0 };
+            parts[pid] = {
+                partId: pid,
+                partNum: m.partNum,
+                description: m.description,
+                uomId: m.uomId,
+                uomCode: m.uomCode,
+                uomIntegral: m.uomIntegral,
+                tracked: m.tracked,
+                srcOnHand:      num(sk.onhand),
+                srcAvailable:   num(sk.avail_adj),
+                srcAvailFb:     num(sk.avail_fb),
+                srcAvailToPick: num(sk.availtopick),
+                srcNotAvail:    num(sk.notavail),
+                srcOutReal:     num(sk.out_real),
+                srcOutIntra:    num(sk.out_intra),
+                srcOutDraft:    num(sk.out_draft),
+                srcOnOrder:     num(sk.onorder),
+                srcRop: s.rop, srcOul: s.oul,
+                dests: [],
+                result: null
+            };
+            order.push(pid);
+        }
+
+        var led = _ledger[ledgerKey(pid, lg)];
+        parts[pid].dests.push({
+            lgId: lg,
+            lgName: dk.lg_name || ('LG ' + lg),
+            rop: rop, oul: oul, ropSource: c.ropsource || 'LG',
+            available: destAvail,
+            availableFb: num(dk.avail_fb),
+            onHand: num(dk.onhand),
+            inbound: destInbound,
+            need: need,
+            needToRop: needToRop,
+            deferPrev: led ? num(led.qty) : 0,
+            deferAgeDays: led ? ledgerAgeDays(led, today) : 0,
+            pinned: false,
+            pinnedQty: 0
+        });
+    });
+
+    // Stable display order: worst-served part first, then part number.
+    order.sort(function (a, b) {
+        var sa = Math.max.apply(null, parts[a].dests.map(severityOf).concat([0]));
+        var sb = Math.max.apply(null, parts[b].dests.map(severityOf).concat([0]));
+        if (Math.abs(sb - sa) > EPS) return sb - sa;
+        return String(parts[a].partNum).localeCompare(String(parts[b].partNum));
+    });
+
+    _model.parts = order.map(function (id) { return parts[id]; });
+    _model.byPart = parts;
+    rebuildLines();
+}
+
+// Flatten the part tree into table rows, stamping the group banding.
+function rebuildLines() {
+    var lines = [], band = 0;
+    _model.parts.forEach(function (pn) {
+        band ^= 1;
+        pn.dests.forEach(function (d, i) {
+            lines.push({
+                _k: pn.partId + '|' + d.lgId,
+                _pn: pn, _d: d,
+                _band: band, _first: i === 0,
+                partid: pn.partId, partnum: pn.partNum, description: pn.description,
+                uomcode: pn.uomCode, tracked: pn.tracked,
+                destlgid: d.lgId, destlg: d.lgName,
+                rop: d.rop, oul: d.oul, ropsource: d.ropSource,
+                destavail: d.available, destinbound: d.inbound,
+                need: d.need, needtorop: d.needToRop,
+                deferprev: d.deferPrev, deferage: d.deferAgeDays,
+                // stamped by recomputePart()
+                qty: 0, deferqty: 0, pinned: false, bumped: false,
+                srcavail: 0, srcavailfb: pn.srcAvailFb, cap: 0, capbinding: 'NONE',
+                srcafter: 0, srcafterpct: 0, sharepct: 0, destafter: 0, deststate: '',
+                severity: 0, fillpct: 0, overcap: false, floorbreach: false,
+                state: 'neutral', locked: false, createdto: ''
+            });
+        });
+    });
+    _model.lines = lines;
+}
+
+// ============================================================================
+//  RECOMPUTE
+//  ----
+//  Only allocate() computes numbers. The UI never mutates srcafter, never does
+//  -= on a running total, never patches a derived value by hand. That makes a
+//  displayed "source after" that disagrees with the allocations structurally
+//  impossible.
+// ============================================================================
+function recomputePart(pn, keepPinnedQty) {
+    var res = allocate(pn, pn.dests, _cfg);
+    pn.result = res;
+
+    var byLg = {};
+    res.allocations.forEach(function (a) { byLg[a.lgId] = a; });
+
+    _model.lines.forEach(function (row) {
+        if (row.partid !== pn.partId) return;
+        var a = byLg[row.destlgid];
+        if (!a) return;
+        var prev = row.qty;
+        row.qty         = a.allocated;
+        row.deferqty    = a.deferred;
+        row.pinned      = a.pinned;
+        row.bumped      = a.bumped;
+        row.severity    = a.severity;
+        row.fillpct     = a.fillPct;
+        row.destafter   = a.destAfter;
+        row.deststate   = a.destStateAfter;
+        row.srcavail    = res.pool;
+        row.cap         = res.cap;
+        row.capbinding  = res.capBinding;
+        row.srcafter    = res.sourceAfter;
+        row.srcafterpct = gt(res.pool, 0) ? q((res.sourceAfter / res.pool) * 100) : 0;
+        row.sharepct    = gt(res.pool, 0) ? q((a.allocated / res.pool) * 100) : 0;
+        row.overcap     = res.capBreached;
+        row.floorbreach = res.floorBreached;
+        row.state = row.locked ? 'blocked'
+                  : (res.capBreached || res.floorBreached) ? 'critical'
+                  : !gt(a.allocated, 0) ? 'neutral'
+                  : gt(a.deferred, 0) ? 'caution'
+                  : 'success';
+        row._changed = !eq(prev, row.qty);
+        if (keepPinnedQty) row._changed = false;
+    });
+    return res;
+}
+
+function recomputeAll() {
+    _model.parts.forEach(function (pn) { recomputePart(pn, true); });
+}
+
+// ============================================================================
+//  CELL BUILDERS
+//  ----
+//  Derived cells stamp data-k / data-f so they can be patched in place without
+//  re-rendering (which would destroy a focused input). Rows not currently
+//  mounted are simply skipped — when the user scrolls them in, format() runs
+//  again and re-seeds straight from the model, so they render already-correct.
+// ============================================================================
+var DERIVED = ['need', 'deferqty', 'srcafter', 'sharepct', 'destafter', 'cap', 'state'];
+
+function derivedCell(field) {
+    return function (v, row) {
+        var s = document.createElement('span');
+        s.dataset.k = row._k;
+        s.dataset.f = field;
+        paintDerived(s, field, row);
+        return s;
+    };
+}
+
+function paintDerived(el, field, row) {
+    el.className = '';
+    el.title = '';
+    switch (field) {
+        case 'need':
+            el.textContent = fmtQty(row.need);
+            if (gt(row.deferprev, 0)) {
+                var chip = document.createElement('span');
+                chip.className = 'delta-chip';
+                chip.textContent = 'deferred ' + row.deferage + 'd';
+                chip.title = 'Deferred ' + fmtQty(row.deferprev) + ' ' + row.uomcode +
+                    ' on ' + row.deferage + ' day(s) ago. Quantity below is recalculated from ' +
+                    'live stock — a deferral raises urgency, it is not added to demand.';
+                el.appendChild(document.createTextNode(' '));
+                el.appendChild(chip);
+            }
+            break;
+        case 'deferqty':
+            el.textContent = gt(row.deferqty, 0) ? fmtQty(row.deferqty) : '—';
+            if (gt(row.deferqty, 0)) el.className = 'text-warning fw-bold';
+            break;
+        case 'srcafter':
+            el.textContent = fmtQty(row.srcafter);
+            el.title = 'Source available ' + fmtQty(row.srcavail) + ' → ' + fmtQty(row.srcafter) +
+                       ' after every planned line for this part.';
+            if (row.floorbreach) { el.className = 'text-danger fw-bold'; el.title += ' Below the retention floor.'; }
+            else if (row.srcafterpct < 25) el.className = 'text-warning fw-bold';
+            break;
+        case 'sharepct':
+            el.textContent = gt(row.srcavail, 0) ? (fmtQty(row.sharepct) + '%') : '—';
+            break;
+        case 'destafter':
+            el.textContent = fmtQty(row.destafter);
+            el.className = row.deststate === 'critical' ? 'text-danger'
+                         : row.deststate === 'alert'    ? 'text-warning'
+                         : row.deststate === 'good'     ? 'text-success' : '';
+            el.title = row.destlg + ' has ' + fmtQty(row.destavail) +
+                       (gt(row.destinbound, 0) ? (' (+' + fmtQty(row.destinbound) + ' in transit)') : '') +
+                       ' → ' + fmtQty(row.destafter) + '. Reorder point ' + fmtQty(row.rop) +
+                       ', target ' + fmtQty(row.oul) + '.';
+            break;
+        case 'cap':
+            el.textContent = fmtQty(row.cap);
+            var tag = document.createElement('span');
+            tag.className = 'bind-tag bind-' + row.capbinding;
+            tag.textContent = row.capbinding === 'PCT'   ? 'pct'
+                            : row.capbinding === 'FLOOR' ? 'floor'
+                            : row.capbinding === 'BOTH'  ? 'both' : 'none';
+            el.appendChild(document.createTextNode(' '));
+            el.appendChild(tag);
+            el.style.cursor = 'pointer';
+            el.title = 'Click to see how this cap was calculated.';
+            el.onclick = function (e) { e.stopPropagation(); openPolicyExplainer(row.partid); };
+            break;
+        case 'state':
+            var sp = document.createElement('span');
+            sp.className = 'spill ' + (row.state || 'neutral');
+            var dot = document.createElement('span'); dot.className = 'dot';
+            sp.appendChild(dot);
+            sp.appendChild(document.createTextNode(
+                row.locked            ? ('Created ' + row.createdto)
+              : row.floorbreach       ? 'Below floor'
+              : row.overcap           ? 'Over cap'
+              : !gt(row.qty, 0)       ? 'Nothing planned'
+              : gt(row.deferqty, 0)   ? 'Partial'
+              : 'Covered'));
+            el.textContent = '';
+            el.appendChild(sp);
+            break;
+    }
+}
+
+function patchRowCells(row) {
+    DERIVED.forEach(function (f) {
+        var el = document.querySelector('[data-k="' + cssEsc(row._k) + '"][data-f="' + f + '"]');
+        if (el) paintDerived(el, f, row);
+    });
+    var inp = document.querySelector('input.qty-inp[data-k="' + cssEsc(row._k) + '"]');
+    if (inp) {
+        inp.classList.toggle('over',   !!row.overcap || !!row.floorbreach);
+        inp.classList.toggle('pinned', !!row.pinned);
+        inp.disabled = !!row.locked;
+        if (document.activeElement !== inp) inp.value = (row.qty == null ? '' : row.qty);
+    }
+    var pin = document.querySelector('.pin-btn[data-k="' + cssEsc(row._k) + '"]');
+    if (pin) setPinState(pin, row.pinned);
+    // brief highlight on rows the engine moved that the user did not touch
+    if (row._changed && inp) {
+        var tr = inp.closest('tr');
+        if (tr) { tr.classList.remove('reflowed'); void tr.offsetWidth; tr.classList.add('reflowed'); }
+    }
+}
+
+function cssEsc(s) {
+    if (window.CSS && typeof CSS.escape === 'function') return CSS.escape(s);
+    return String(s).replace(/([^\w-])/g, '\\$1');
+}
+
+// Pin glyph as inline SVG — never an emoji. Emoji render inconsistently across
+// the JxBrowser font stack and cannot inherit the .pin-btn colour states.
+// Same path for both states; only the fill differs.
+var PIN_PATH = 'M12 17v5M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 ' +
+               '1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z';
+
+function pinIcon(on) {
+    var ns = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('width', '13');
+    svg.setAttribute('height', '13');
+    svg.setAttribute('fill', on ? 'currentColor' : 'none');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', '2');
+    svg.setAttribute('stroke-linecap', 'round');
+    svg.setAttribute('stroke-linejoin', 'round');
+    var p = document.createElementNS(ns, 'path');
+    p.setAttribute('d', PIN_PATH);
+    svg.appendChild(p);
+    return svg;
+}
+
+function setPinState(btn, on) {
+    btn.classList.toggle('on', !!on);
+    btn.textContent = '';
+    btn.appendChild(pinIcon(on));
+    btn.title = on ? 'Pinned — click to let the planner rebalance this row'
+                   : 'Not pinned — the planner may change this quantity';
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.setAttribute('aria-label', on ? 'Unpin this quantity' : 'Pin this quantity');
+}
+
+// --- the editable quantity cell --------------------------------------------
+function qtyCell(v, row) {
+    var wrap = document.createElement('span');
+    wrap.className = 'qty-wrap';
+
+    var inp = document.createElement('input');
+    inp.type = 'number';
+    inp.className = 'qty-inp';
+    inp.min = '0';
+    inp.step = row._pn && row._pn.uomIntegral ? '1' : 'any';
+    inp.disabled = !!row.locked;
+    inp.value = (row.qty == null ? '' : row.qty);    // model -> DOM, every render
+    inp.dataset.k = row._k;
+    if (row.overcap || row.floorbreach) inp.classList.add('over');
+    if (row.pinned) inp.classList.add('pinned');
+
+    inp.addEventListener('input', function () {
+        var n = parseFloat(inp.value);
+        onQtyEdited(row, isNaN(n) ? 0 : Math.max(0, n));      // DOM -> model
+    });
+    inp.addEventListener('blur', function () {
+        var dec = decimalsFor(row._pn, _cfg);
+        var snapped = rdown(Math.max(0, num(inp.value)), dec);
+        inp.value = snapped;
+        onQtyEdited(row, snapped);
+    });
+    inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') inp.blur(); });
+
+    var pin = document.createElement('button');
+    pin.type = 'button';
+    pin.className = 'pin-btn';
+    pin.dataset.k = row._k;
+    setPinState(pin, row.pinned);
+    pin.addEventListener('click', function (e) { e.stopPropagation(); togglePin(row); });
+
+    wrap.appendChild(inp);
+    wrap.appendChild(pin);
+    return wrap;
+}
+
+// ============================================================================
+//  EDIT HANDLERS
+//  ----
+//  An edit PINS the row: allocate() takes pinned totals out of the cap first
+//  and runs the policy over what is left, so a pinned row is never recomputed.
+//  Under the default reflowMode the other destinations DO rebalance — that is
+//  what a planner wants — and every row whose quantity moved is highlighted
+//  with a delta chip, so nothing changes silently.
+// ============================================================================
+var _editTimer = null;
+
+function onQtyEdited(row, value) {
+    if (row.locked) return;
+    var pn = row._pn, d = row._d;
+
+    if (_cfg.reflowMode === 'pinAll') {
+        // First edit on this part freezes every sibling at its current value.
+        pn.dests.forEach(function (o) {
+            if (o.pinned) return;
+            var sib = findLine(pn.partId, o.lgId);
+            o.pinned = true;
+            o.pinnedQty = sib ? sib.qty : 0;
+        });
+    }
+    d.pinned = true;
+    d.pinnedQty = value;
+
+    if (_editTimer) clearTimeout(_editTimer);
+    _editTimer = setTimeout(function () { applyEdit(pn); }, 140);
+}
+
+function applyEdit(pn) {
+    recomputePart(pn);
+    _model.lines.forEach(function (r) { if (r.partid === pn.partId) patchRowCells(r); });
+    renderFooter();
+    renderKpis();
+    renderBanners(collectBanners());
+    refreshCreateButton();
+    if (_activePane === 'impactPane') { rebuildImpact(); if (_impactTable) _impactTable.render(); }
+}
+
+function togglePin(row) {
+    if (row.locked) return;
+    var d = row._d;
+    if (d.pinned) { d.pinned = false; d.pinnedQty = 0; }
+    else          { d.pinned = true;  d.pinnedQty = row.qty; }
+    applyEdit(row._pn);
+}
+
+function findLine(partId, lgId) {
+    for (var i = 0; i < _model.lines.length; i++) {
+        if (_model.lines[i].partid === partId && _model.lines[i].destlgid === lgId) return _model.lines[i];
+    }
+    return null;
+}
+
+function autoAllocate(silent) {
+    readConfig();
+    _model.parts.forEach(function (pn) {
+        pn.dests.forEach(function (d) {
+            if (d.pinned && !d._lockedByCreate) { d.pinned = false; d.pinnedQty = 0; }
+        });
+        recomputePart(pn, true);
+    });
+    if (!silent) {
+        if (_planTable) _planTable.render();
+        renderAll();
+        var n = _model.lines.filter(function (r) { return gt(r.qty, 0); }).length;
+        showToast('Allocated ' + n + ' line' + (n === 1 ? '' : 's') + ' using ' +
+                  policyLabel(_cfg.allocPolicy) + '.', 'success');
+    }
+}
+
+function resetQuantities() {
+    _model.parts.forEach(function (pn) {
+        pn.dests.forEach(function (d) {
+            if (d._lockedByCreate) return;
+            d.pinned = true; d.pinnedQty = 0;        // pinned at zero = "leave alone"
+        });
+        recomputePart(pn, true);
+    });
+    if (_planTable) _planTable.render();
+    renderAll();
+    showToast('All planned quantities cleared.', 'info');
+}
+
+function policyLabel(k) {
+    return ({ severity: 'most-critical-first', coverThenTopUp: 'cover-then-top-up',
+              proRata: 'pro-rata', equalShare: 'equal shares', priority: 'fixed ranking',
+              manual: 'manual entry' })[k] || k;
+}
+
+// ============================================================================
+//  COLUMNS
+// ============================================================================
+var _bandByPart = {};
+function bandFor(partId) {
+    if (_bandByPart[partId] === undefined) {
+        _bandByPart[partId] = (Object.keys(_bandByPart).length % 2) ? 'b' : 'a';
+    }
+    return _bandByPart[partId];
+}
+
+function planColumns() {
+    var cols = [
+        { key: 'partnum', label: 'Part #', width: 150, filter: 'text', format: function (v, row) {
+            var s = document.createElement('span');
+            var b = document.createElement('span');
+            b.className = 'pband ' + bandFor(row.partid);
+            s.appendChild(b);
+            var a = document.createElement('a');
+            a.href = 'javascript:void(0)';
+            a.className = 'row-link';
+            a.textContent = v || '';
+            a.addEventListener('click', function (e) {
+                e.preventDefault();
+                if (typeof openModule === 'function') openModule('Part', v);
+            });
+            s.appendChild(a);
+            if (row.tracked) {
+                var t = document.createElement('span');
+                t.className = 'badge b20';
+                t.textContent = 'TRK';
+                t.title = 'Serial/lot tracked — issuing or picking this transfer may require tracking data.';
+                t.style.marginLeft = '5px';
+                s.appendChild(t);
+            }
+            return s;
+        } },
+        { key: 'description', label: 'Description', width: 210, filter: 'text' },
+        { key: 'destlg',  label: 'Destination', width: 120, filter: 'select', filterOptions: 'auto' },
+        { key: 'uomcode', label: 'UOM', width: 60, filter: false },
+
+        { key: 'destavail', label: 'Dest avail', width: 88, align: 'right', qty: true, filter: false,
+          format: function (v) { return fmtQty(v); } },
+        { key: 'destinbound', label: 'In transit', width: 82, align: 'right', qty: true, filter: false,
+          format: function (v) { return gt(num(v), 0) ? fmtQty(v) : '—'; } },
+        { key: 'rop', label: 'Dest ROP', width: 80, align: 'right', qty: true, filter: false,
+          format: function (v, row) {
+            var s = document.createElement('span');
+            s.textContent = fmtQty(v);
+            if (row.ropsource === 'COMPANY') {
+                var c = document.createElement('span');
+                c.className = 'badge b10'; c.textContent = 'CW'; c.style.marginLeft = '4px';
+                c.title = 'Company-wide reorder point applied to this location group. ' +
+                          'Each destination independently targets the COMPANY order-up-to level, ' +
+                          'which systematically over-orders.';
+                s.appendChild(c);
+            }
+            return s;
+          } },
+        { key: 'oul', label: 'Dest target', width: 88, align: 'right', qty: true, filter: false,
+          format: function (v) { return fmtQty(v); } },
+        { key: 'need', label: 'Needs', width: 130, align: 'right', qty: true, filter: false,
+          format: derivedCell('need') },
+
+        { key: 'srcavail', label: 'Source avail', width: 100, align: 'right', qty: true, filter: false,
+          format: function (v, row) {
+            var s = document.createElement('span');
+            s.textContent = fmtQty(v);
+            if (_cfg.showRecon && !eq(num(v), num(row.srcavailfb))) {
+                var f = document.createElement('span');
+                f.className = 'recon-flag'; f.textContent = '*';
+                f.title = 'Fishbowl reports ' + fmtQty(row.srcavailfb) + ' here. The difference is ' +
+                          'intra-warehouse putaway transfers, which Fishbowl counts as stock leaving ' +
+                          'the location group but which never actually do.';
+                s.appendChild(f);
+            }
+            return s;
+          } },
+        { key: 'cap', label: 'Cap', width: 118, align: 'right', qty: true, filter: false,
+          format: derivedCell('cap') },
+        { key: 'qty', label: 'Transfer qty', width: 128, align: 'right', type: 'number', filter: false,
+          sortable: false, format: qtyCell },
+        { key: 'sharepct', label: '% of source', width: 90, align: 'right', type: 'number', filter: false,
+          format: derivedCell('sharepct') },
+        { key: 'srcafter', label: 'Source after', width: 100, align: 'right', qty: true, filter: false,
+          format: derivedCell('srcafter') },
+        { key: 'destafter', label: 'Dest after', width: 96, align: 'right', qty: true, filter: false,
+          format: derivedCell('destafter') },
+        { key: 'deferqty', label: 'Deferred', width: 88, align: 'right', qty: true, filter: false,
+          format: derivedCell('deferqty') },
+        { key: 'state', label: 'Status', width: 140, filter: false, sortable: false,
+          format: derivedCell('state') }
+    ];
+    if (_cfg.showRecon) {
+        cols.splice(10, 0, { key: 'srcavailfb', label: 'Source avail (FB)', width: 118, align: 'right',
+            qty: true, filter: false, format: function (v) { return fmtQty(v); } });
+    }
+    return cols;
+}
+
+function impactColumns() {
+    return [
+        { key: 'partnum', label: 'Part #', width: 150, link: 'Part', filter: 'text' },
+        { key: 'description', label: 'Description', width: 240, filter: 'text' },
+        { key: 'uomcode', label: 'UOM', width: 60, filter: false },
+        { key: 'pool', label: 'Available', width: 100, align: 'right', qty: true, filter: false, format: function (v) { return fmtQty(v); } },
+        { key: 'availfb', label: 'Available (FB)', width: 110, align: 'right', qty: true, filter: false, format: function (v) { return fmtQty(v); } },
+        { key: 'floor', label: 'Retain floor', width: 100, align: 'right', qty: true, filter: false, format: function (v) { return fmtQty(v); } },
+        { key: 'cap', label: 'Cap', width: 90, align: 'right', qty: true, filter: false, format: function (v) { return fmtQty(v); } },
+        { key: 'capbinding', label: 'Bound by', width: 92, filter: 'select', filterOptions: 'auto',
+          format: function (v) {
+            var s = document.createElement('span');
+            s.className = 'bind-tag bind-' + v;
+            s.textContent = v === 'PCT' ? 'pct' : v === 'FLOOR' ? 'floor' : v === 'BOTH' ? 'both' : 'none';
+            return s;
+          } },
+        { key: 'dests', label: 'Sites', width: 60, align: 'right', type: 'number', filter: false },
+        { key: 'requested', label: 'Requested', width: 100, align: 'right', qty: true, filter: false, format: function (v) { return fmtQty(v); } },
+        { key: 'allocated', label: 'Planned', width: 100, align: 'right', qty: true, filter: false, format: function (v) { return fmtQty(v); } },
+        { key: 'deferred', label: 'Deferred', width: 100, align: 'right', qty: true, filter: false, format: function (v) { return gt(num(v), 0) ? fmtQty(v) : '—'; } },
+        { key: 'after', label: 'Source after', width: 104, align: 'right', qty: true, filter: false,
+          format: function (v, row) {
+            var s = document.createElement('span');
+            s.textContent = fmtQty(v);
+            if (row.floorbreach) s.className = 'text-danger fw-bold';
+            return s;
+          } },
+        { key: 'ropafter', label: 'vs source ROP', width: 112, align: 'right', qty: true, filter: false,
+          format: function (v) {
+            var s = document.createElement('span');
+            s.textContent = (num(v) >= 0 ? '+' : '') + fmtQty(v);
+            s.className = num(v) < 0 ? 'text-danger fw-bold' : 'text-success';
+            return s;
+          } },
+        { key: 'drawpct', label: 'Draw-down', width: 96, align: 'right', type: 'number', filter: false,
+          format: function (v) { return fmtQty(v) + '%'; } }
+    ];
+}
+
+function deferColumns() {
+    return [
+        { key: 'partnum', label: 'Part #', width: 150, link: 'Part', filter: 'text' },
+        { key: 'description', label: 'Description', width: 240, filter: 'text' },
+        { key: 'destlg', label: 'Destination', width: 130, filter: 'select', filterOptions: 'auto' },
+        { key: 'qty', label: 'Deferred qty', width: 108, align: 'right', qty: true, filter: false, format: function (v) { return fmtQty(v); } },
+        { key: 'uomcode', label: 'UOM', width: 60, filter: false },
+        { key: 'asof', label: 'Deferred on', width: 104, filter: false,
+          format: function (v) { return v ? FBLib.Common.formatDate(String(v)) : ''; } },
+        { key: 'age', label: 'Age (days)', width: 96, align: 'right', type: 'number', filter: false,
+          format: function (v) {
+            var s = document.createElement('span');
+            s.textContent = String(v);
+            s.className = v >= 14 ? 'text-danger fw-bold' : v >= 7 ? 'text-warning fw-bold' : '';
+            return s;
+          } },
+        { key: 'stillshort', label: 'Still short', width: 100, align: 'right', qty: true, filter: false,
+          format: function (v) { return v == null ? '—' : fmtQty(v); } },
+        { key: 'inplan', label: 'In this plan', width: 110, filter: false,
+          format: function (v) {
+            var s = document.createElement('span');
+            s.className = 'spill ' + (v === 'covered' ? 'success' : v === 'partial' ? 'caution' : 'neutral');
+            var d = document.createElement('span'); d.className = 'dot'; s.appendChild(d);
+            s.appendChild(document.createTextNode(v === 'covered' ? 'Covered now'
+                : v === 'partial' ? 'Partly covered' : 'Not planned'));
+            return s;
+          } },
+        { key: 'act', label: '', width: 90, filter: false, sortable: false,
+          format: function (v, row) {
+            var b = document.createElement('button');
+            b.type = 'button'; b.className = 'ps-btn sm';
+            b.textContent = 'Clear';
+            b.title = 'Remove this entry from your deferred ledger';
+            b.addEventListener('click', function (e) {
+                e.stopPropagation();
+                delete _ledger[ledgerKey(row.partid, row.destlgid)];
+                ledgerSave();
+                rebuildDefer();
+                if (_deferTable) _deferTable.render();
+                renderTabCounts();
+                showToast('Deferral cleared.', 'info');
+            });
+            return b;
+          } }
+    ];
+}
+
+function monitorColumns() {
+    return [
+        { key: 'to_num', label: 'TO #', width: 100, filter: 'text', format: function (v) {
+            var a = document.createElement('a');
+            a.href = 'javascript:void(0)'; a.className = 'order-link'; a.textContent = v || '';
+            a.addEventListener('click', function (e) {
+                e.preventDefault();
+                if (typeof openModule === 'function') openModule('Transfer Order', v);
+            });
+            return a;
+        } },
+        { key: 'to_status', label: 'Status', width: 96, filter: 'select', filterOptions: 'auto' },
+        { key: 'to_type', label: 'Type', width: 80, filter: 'select', filterOptions: 'auto' },
+        { key: 'origin', label: 'Raised via', width: 100, filter: 'select', filterOptions: 'auto',
+          format: function (v) {
+            var s = document.createElement('span');
+            s.className = 'spill ' + (v === 'Planner' ? 'active' : 'caution');
+            var d = document.createElement('span'); d.className = 'dot'; s.appendChild(d);
+            s.appendChild(document.createTextNode(v));
+            if (v !== 'Planner') s.title = 'Raised directly in the Transfer Order module, so the cap was not applied.';
+            return s;
+          } },
+        { key: 'dest_lg', label: 'Destination', width: 126, filter: 'select', filterOptions: 'auto' },
+        { key: 'part_num', label: 'Part #', width: 148, link: 'Part', filter: 'text' },
+        { key: 'part_desc', label: 'Description', width: 210, filter: 'text' },
+        { key: 'qty_remaining', label: 'Outstanding', width: 106, align: 'right', qty: true, filter: false,
+          format: function (v, row) {
+            var s = document.createElement('span');
+            s.textContent = fmtQty(v);
+            if (String(row.uom_ok) !== '1') {
+                var w = document.createElement('span');
+                w.className = 'recon-flag'; w.textContent = '!';
+                w.title = 'This line uses a UOM with no conversion to the part\'s base UOM, so the ' +
+                          'quantity shown may be wrong.';
+                s.appendChild(w);
+            }
+            return s;
+          } },
+        { key: 'uom_code', label: 'UOM', width: 60, filter: false },
+        { key: 'pctofsource', label: '% of source', width: 96, align: 'right', type: 'number', filter: false,
+          format: function (v) { return v == null ? '—' : fmtQty(v) + '%'; } },
+        { key: 'verdict', label: 'Against cap', width: 132, filter: 'select', filterOptions: 'auto',
+          format: function (v, row) {
+            var tone = row.verdicttone || 'neutral';
+            var s = document.createElement('span');
+            s.className = 'spill ' + tone;
+            var d = document.createElement('span'); d.className = 'dot'; s.appendChild(d);
+            s.appendChild(document.createTextNode(v));
+            if (row.verdictwhy) s.title = row.verdictwhy;
+            return s;
+          } },
+        { key: 'date_scheduled', label: 'Scheduled', width: 100, filter: false,
+          format: function (v) { return v ? FBLib.Common.formatDate(String(v)) : '—'; } },
+        { key: 'created_by', label: 'Created by', width: 110, filter: 'text' }
+    ];
+}
+
+// ============================================================================
+//  RENDER
+// ============================================================================
+function showLoading(on) {
+    var id = 'rplLoading';
+    var el = document.getElementById(id);
+    if (on) {
+        if (el) return;
+        el = document.createElement('div');
+        el.id = id; el.className = 'loading-overlay';
+        var lb = document.createElement('div'); lb.className = 'lo-label'; lb.textContent = 'Loading plan…';
+        el.appendChild(lb);
+        document.body.appendChild(el);
+    } else if (el) { el.remove(); }
+}
+
+function switchTab(pane) {
+    _activePane = pane;
+    var tabs = document.querySelectorAll('.tab');
+    for (var i = 0; i < tabs.length; i++) {
+        tabs[i].classList.toggle('active', tabs[i].getAttribute('data-pane') === pane);
+    }
+    var panes = document.querySelectorAll('.pane');
+    for (var j = 0; j < panes.length; j++) {
+        panes[j].classList.toggle('active', panes[j].id === pane);
+    }
+    // Tables mounted while hidden measure zero, so re-render on reveal.
+    if (pane === 'impactPane')  { rebuildImpact();  if (_impactTable)  _impactTable.render(); }
+    if (pane === 'deferPane')   { rebuildDefer();   if (_deferTable)   _deferTable.render(); }
+    if (pane === 'monitorPane') { rebuildMonitor(); if (_monitorTable) _monitorTable.render(); }
+    if (pane === 'planPane'     && _planTable) _planTable.render();
+    renderFooter();
+}
+
+function renderAll() {
+    rebuildImpact();
+    rebuildDefer();
+    rebuildMonitor();
+    if (_planTable)    _planTable.render();
+    if (_impactTable)  _impactTable.render();
+    if (_deferTable)   _deferTable.render();
+    if (_monitorTable) _monitorTable.render();
+    renderKpis();
+    renderFooter();
+    renderTabCounts();
+    renderBanners(collectBanners());
+    refreshCreateButton();
+    renderSubline();
+}
+
+function renderSubline() {
+    var bits = [];
+    bits.push('Source: ' + (_model.srcLgName || '—'));
+    bits.push('cap ' + _cfg.capPct + '%');
+    bits.push('floor: ' + ({ rop: 'source ROP', oul: 'source target', ropMultiple: _cfg.floorMult + '× ROP',
+                             fixed: fmtQty(_cfg.floorFixed) + ' units', none: 'none' })[_cfg.floorMode]);
+    bits.push(policyLabel(_cfg.allocPolicy));
+    if (_cfg.dryRun) bits.push('DRY RUN');
+    var n = _model.lines.length;
+    setStatus(n.toLocaleString() + ' line' + (n === 1 ? '' : 's') + ' · ' + bits.join(' · '));
+}
+
+function renderTabCounts() {
+    var planned = _model.lines.filter(function (r) { return gt(r.qty, 0); }).length;
+    setText('cntPlan',    _model.lines.length);
+    setText('cntImpact',  _impactRows.length);
+    setText('cntDefer',   _deferRows.length);
+    setText('cntMonitor', _monitorRows.length);
+    var cb = document.getElementById('createBtn');
+    if (cb) cb.title = planned + ' line(s) planned';
+}
+
+function setText(id, v) { var e = document.getElementById(id); if (e) e.textContent = String(v); }
+
+function renderKpis() {
+    var host = document.getElementById('kpiRow');
+    if (!host) return;
+    var lines = _model.lines;
+    var planned = lines.filter(function (r) { return gt(r.qty, 0); });
+    var totalQty  = lines.reduce(function (s, r) { return q(s + num(r.qty)); }, 0);
+    var totalNeed = lines.reduce(function (s, r) { return q(s + num(r.need)); }, 0);
+    var totalDef  = lines.reduce(function (s, r) { return q(s + num(r.deferqty)); }, 0);
+    var destSet   = {}; planned.forEach(function (r) { destSet[r.destlgid] = 1; });
+    var capped    = _model.parts.filter(function (p) {
+        return p.result && p.result.capBinding !== 'NONE' &&
+               gt(p.result.totalRequested, p.result.cap);
+    }).length;
+    var breaches  = _model.parts.filter(function (p) {
+        return p.result && (p.result.capBreached || p.result.floorBreached);
+    }).length;
+
+    var tiles = [
+        { tone: 'blue',    lbl: 'Lines to transfer', val: planned.length.toLocaleString(),
+          sub: Object.keys(destSet).length + ' destination(s)',
+          icon: '<path d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2"/>' },
+        { tone: 'success', lbl: 'Units planned', val: fmtQty(totalQty),
+          sub: gt(totalNeed, 0) ? (Math.round((totalQty / totalNeed) * 100) + '% of demand') : '—',
+          icon: '<path d="M5 13l4 4L19 7"/>' },
+        { tone: 'warning', lbl: 'Units deferred', val: fmtQty(totalDef),
+          sub: totalDef > 0 ? 'carried to next run' : 'nothing held back',
+          icon: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>' },
+        { tone: 'purple',  lbl: 'Parts hitting the cap', val: String(capped),
+          sub: 'demand exceeds what the source may release',
+          icon: '<path d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>' },
+        { tone: breaches ? 'negative' : 'neutral', lbl: 'Rule breaches', val: String(breaches),
+          sub: breaches ? 'over cap or below floor' : 'plan is within policy',
+          icon: '<circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/>' }
+    ];
+
+    host.innerHTML = '';
+    tiles.forEach(function (t) {
+        var d = document.createElement('div');
+        d.className = 'kpi-tile';
+        d.innerHTML =
+            '<div class="kpi-chip tone-' + t.tone + '"><svg fill="none" stroke="currentColor" ' +
+            'stroke-width="2" viewBox="0 0 24 24">' + t.icon + '</svg></div>' +
+            '<div class="kpi-text"><div class="kpi-lbl"></div>' +
+            '<div class="kpi-val"></div><div class="kpi-sub"></div></div>';
+        d.querySelector('.kpi-lbl').textContent = t.lbl;
+        d.querySelector('.kpi-val').textContent = t.val;
+        d.querySelector('.kpi-sub').textContent = t.sub;
+        host.appendChild(d);
+    });
+}
+
+// --- totals footer ----------------------------------------------------------
+//  Sums the FULL filtered dataset, not just the lazily-rendered chunk.
+//  Deliberately excludes source availability and cap: those are PART-level
+//  values repeated on every destination row of that part, so adding them up
+//  would multiply one warehouse's stock by its number of destinations.
+var PLAN_SUM = { need: 1, qty: 1, deferqty: 1 };
+var IMPACT_SUM = { requested: 1, allocated: 1, deferred: 1, pool: 1, cap: 1 };
+var DEFER_SUM = { qty: 1 };
+var MON_SUM = { qty_remaining: 1 };
+
+function renderFooter() {
+    footFor('planFoot',    _planTable,    PLAN_SUM,   'line');
+    footFor('impactFoot',  _impactTable,  IMPACT_SUM, 'part');
+    footFor('deferFoot',   _deferTable,   DEFER_SUM,  'deferral');
+    footFor('monitorFoot', _monitorTable, MON_SUM,    'line');
+}
+
+function footFor(footId, table, sumKeys, noun) {
+    var foot = document.getElementById(footId);
+    if (!foot) return;
+    foot.innerHTML = '';
+    if (!table) return;
+    var rows, cols;
+    try { rows = table.getVisibleRows() || []; cols = (table.getColumns() || []).filter(function (c) { return c.vis !== false; }); }
+    catch (_) { return; }
+    if (!rows.length || !cols.length) return;
+
+    var sums = {};
+    Object.keys(sumKeys).forEach(function (k) { sums[k] = 0; });
+    rows.forEach(function (r) {
+        Object.keys(sumKeys).forEach(function (k) { sums[k] = q(sums[k] + num(r[k])); });
+    });
+
+    var tr = document.createElement('tr');
+    var labelled = false;
+    cols.forEach(function (col) {
+        var td = document.createElement('td');
+        if (Object.prototype.hasOwnProperty.call(sumKeys, col.key)) {
+            td.className = 'num-cell';
+            td.textContent = fmtQty(sums[col.key]);
+        } else if (!labelled) {
+            td.textContent = 'Total — ' + rows.length.toLocaleString() + ' ' + noun + (rows.length === 1 ? '' : 's');
+            labelled = true;
+        }
+        tr.appendChild(td);
+    });
+    foot.appendChild(tr);
+}
+
+// --- banners ---------------------------------------------------------------
+function collectBanners() {
+    var out = [];
+    if (!_model.srcLgId) return out;
+
+    if (!_carrierId) {
+        out.push({ kind: 'danger', text: 'No carrier could be resolved. Fishbowl requires a carrier on every ' +
+            'transfer order, so none can be created. Set a default carrier on the company, or activate at least one carrier.' });
+    }
+    if (!hasCreateRight()) {
+        out.push({ kind: 'warning', text: 'You do not have the Transfer Order-Create right, so this report can plan ' +
+            'but not create. Ask an administrator to grant it, or export the plan and hand it to someone who can.' });
+    }
+    if (_cfg.toType === 'Ship') {
+        // Only the groups actually in this plan matter, not every location group.
+        var inPlay = {};
+        inPlay[_model.srcLgId] = 1;
+        _model.lines.forEach(function (r) { inPlay[r.destlgid] = 1; });
+        var missing = Object.keys(inPlay).filter(function (k) { return !_addrByLg[k]; });
+        if (missing.length) {
+            var names = missing.map(function (k) {
+                var lg = _lgs.filter(function (l) { return String(l.id) === String(k); })[0];
+                return lg ? lg.name : ('LG ' + k);
+            });
+            out.push({ kind: 'danger', text: 'Ship-type transfers need a company address on every location group, ' +
+                'and ' + names.join(', ') + ' ' + (names.length === 1 ? 'has' : 'have') + ' none. ' +
+                'Switch to Move in Settings — Move ignores addresses entirely — or add the addresses in Fishbowl.' });
+        }
+    }
+    if (!_lgReordering) {
+        out.push({ kind: 'warning', text: 'Per-location-group reordering is switched off in this Fishbowl, so ' +
+            'destination demand is being inferred from company-wide reorder points. Each destination independently ' +
+            'targets the company order-up-to level, which systematically over-orders.' });
+    }
+    var floorBreaks = _model.parts.filter(function (p) { return p.result && p.result.floorBreached; });
+    if (floorBreaks.length) {
+        out.push({ kind: 'danger', text: floorBreaks.length + ' part(s) would take ' + _model.srcLgName +
+            ' below its retention floor: ' + floorBreaks.slice(0, 6).map(function (p) { return p.partNum; }).join(', ') +
+            (floorBreaks.length > 6 ? '…' : '') + '.' });
+    }
+    var capBreaks = _model.parts.filter(function (p) {
+        return p.result && p.result.capBreached && !p.result.capBreachIsBump && !p.result.floorBreached;
+    });
+    if (capBreaks.length) {
+        out.push({ kind: _cfg.capEnforcement === 'hard' ? 'danger' : 'warning',
+            text: capBreaks.length + ' part(s) exceed the ' + _cfg.capPct + '% cap: ' +
+            capBreaks.slice(0, 6).map(function (p) { return p.partNum; }).join(', ') +
+            (capBreaks.length > 6 ? '…' : '') +
+            (_cfg.capEnforcement === 'hard' ? '. Creation is blocked until these are reduced.' : '.') });
+    }
+    // Separate the two reasons a cap can be zero — they need different actions.
+    var atFloor = _model.parts.filter(function (p) {
+        return p.result && !gt(p.result.cap, 0) && gt(p.result.totalRequested, 0) && p.result.sourceBelowFloor;
+    });
+    var noStock = _model.parts.filter(function (p) {
+        return p.result && !gt(p.result.cap, 0) && gt(p.result.totalRequested, 0) &&
+               !p.result.sourceBelowFloor && !gt(p.result.pool, 0);
+    });
+    if (atFloor.length) {
+        out.push({ kind: 'info', text: atFloor.length + ' part(s) cannot be released because ' + _model.srcLgName +
+            ' is already at or below its own retention floor for them. Their demand is carried as deferred — ' +
+            'replenish ' + _model.srcLgName + ' first.' });
+    }
+    if (noStock.length) {
+        out.push({ kind: 'info', text: noStock.length + ' part(s) have no available stock at ' + _model.srcLgName +
+            ' at all. Their demand is carried as deferred.' });
+    }
+    return out;
+}
+
+function renderBanners(list) {
+    var host = document.getElementById('bannerStrip');
+    if (!host) return;
+    host.innerHTML = '';
+    (list || []).forEach(function (b) {
+        var d = document.createElement('div');
+        d.className = 'alert alert-' + (b.kind || 'info');
+        d.textContent = b.text;
+        host.appendChild(d);
+    });
+}
+
+// --- derived tab datasets --------------------------------------------------
+function rebuildImpact() {
+    _impactRows = _model.parts.filter(function (pn) { return pn.result; }).map(function (pn) {
+        var r = pn.result;
+        return {
+            partid: pn.partId, partnum: pn.partNum, description: pn.description, uomcode: pn.uomCode,
+            pool: r.pool, availfb: pn.srcAvailFb, floor: r.floor, cap: r.cap, capbinding: r.capBinding,
+            dests: pn.dests.length,
+            requested: r.totalRequested, allocated: r.totalAllocated, deferred: r.totalDeferred,
+            after: r.sourceAfter, ropafter: r.sourceRopAfter,
+            drawpct: gt(r.pool, 0) ? q((r.totalAllocated / r.pool) * 100) : 0,
+            floorbreach: r.floorBreached
+        };
+    }).filter(function (r) { return gt(r.requested, 0) || gt(r.allocated, 0); });
+}
+
+function rebuildDefer() {
+    var today = todayIso();
+    var rows = [];
+    Object.keys(_ledger).forEach(function (k) {
+        var e = _ledger[k];
+        if (!e) return;
+        var bits = k.split('|');
+        var pid = parseInt(bits[0], 10), lg = parseInt(bits[1], 10);
+        if (e.srcLgId && _model.srcLgId && parseInt(e.srcLgId, 10) !== parseInt(_model.srcLgId, 10)) return;
+        var line = findLine(pid, lg);
+        var inplan = !line ? 'none' : (gt(line.qty, 0) ? (gt(line.deferqty, 0) ? 'partial' : 'covered') : 'none');
+        rows.push({
+            partid: pid, destlgid: lg,
+            partnum: e.partNum || (line ? line.partnum : ('#' + pid)),
+            description: e.description || (line ? line.description : ''),
+            destlg: e.lgName || (line ? line.destlg : ('LG ' + lg)),
+            qty: num(e.qty), uomcode: e.uomCode || (line ? line.uomcode : ''),
+            asof: e.asOf || '', age: ledgerAgeDays(e, today),
+            stillshort: line ? line.need : null,
+            inplan: inplan
+        });
+    });
+    rows.sort(function (a, b) { return b.age - a.age || String(a.partnum).localeCompare(String(b.partnum)); });
+    _deferRows = rows;
+}
+
+function rebuildMonitor() {
+    var cap = {}, pool = {};
+    _model.parts.forEach(function (pn) {
+        if (pn.result) { cap[pn.partId] = pn.result.cap; pool[pn.partId] = pn.result.pool; }
+    });
+    _monitorRows.forEach(function (r) {
+        var pid = parseInt(r.part_id, 10);
+        var p = pool[pid], c = cap[pid];
+        var qty = num(r.qty_remaining);
+        r.origin = String(r.to_note || '').indexOf(ORDER_MARKER) === 0 ? 'Planner' : 'Native';
+        if (p === undefined || !gt(p, 0)) {
+            r.pctofsource = null; r.verdict = 'No cap data'; r.verdicttone = 'neutral';
+            r.verdictwhy = 'This part is not in the current plan, so there is no cap to compare against.';
+            return;
+        }
+        r.pctofsource = q((qty / p) * 100);
+        if (!gt(c, 0)) {
+            r.verdict = 'Source below floor'; r.verdicttone = 'blocked';
+            r.verdictwhy = 'The source is at or below its retention floor for this part, so no transfer should be released at all.';
+        } else if (ge(c, qty)) {
+            r.verdict = 'Within cap'; r.verdicttone = 'success';
+            r.verdictwhy = 'Outstanding ' + fmtQty(qty) + ' is within the current cap of ' + fmtQty(c) + '.';
+        } else if (ge(q(c * 1.5), qty)) {
+            r.verdict = 'Over cap'; r.verdicttone = 'caution';
+            r.verdictwhy = 'Outstanding ' + fmtQty(qty) + ' exceeds the cap of ' + fmtQty(c) + '.';
+        } else {
+            r.verdict = 'Far over cap'; r.verdicttone = 'critical';
+            r.verdictwhy = 'Outstanding ' + fmtQty(qty) + ' is more than 1.5× the cap of ' + fmtQty(c) + '.';
+        }
+    });
+}
+
+// --- the "why is my cap this number" explainer -----------------------------
+function openPolicyExplainer(partId) {
+    var pn = _model.byPart[partId];
+    if (!pn || !pn.result) return;
+    var r = pn.result;
+    var host = document.getElementById('policyBody');
+    var title = document.getElementById('policyTitle');
+    if (title) title.textContent = pn.partNum + ' — how this cap was calculated';
+
+    function row(label, val, op, cls) {
+        return '<tr' + (cls ? ' class="' + cls + '"' : '') + '><td>' +
+               (op ? '<span class="op">' + op + '</span> ' : '') + label +
+               '</td><td>' + val + '</td></tr>';
+    }
+
+    var poolLabel = ({ available: 'Available (net of allocations)',
+                       availToPick: 'Available to pick',
+                       physical: 'On hand less not-available' })[r.poolBasis];
+    var floorLabel = ({ rop: 'Source reorder point', oul: 'Source order-up-to level',
+                        ropMultiple: _cfg.floorMult + ' × source reorder point',
+                        fixed: 'Fixed retention quantity', none: 'No floor set',
+                        override: 'Per-part override' })[r.floorBasis];
+
+    var html = '';
+    html += '<div class="fb-group-title">Step 1 — how much is genuinely in play at ' + esc(_model.srcLgName) + '</div>';
+    html += '<table class="calc-tbl">';
+    html += row(esc(poolLabel), fmtQty(pn.srcAvailable));
+    if (!eq(pn.srcAvailFb, pn.srcAvailable)) {
+        html += row('Fishbowl reports', fmtQty(pn.srcAvailFb) +
+            ' <span class="recon-flag" title="Difference is intra-warehouse putaway, which never leaves the location group.">*</span>');
+        html += row('Intra-warehouse putaway added back', fmtQty(pn.srcOutIntra), '+');
+    }
+    if (_cfg.countDraftTos && gt(pn.srcOutDraft, 0)) {
+        html += row('Unissued transfers already drafted', fmtQty(pn.srcOutDraft), '−');
+    }
+    html += row('<strong>Pool</strong>', '<strong>' + fmtQty(r.pool) + '</strong>', '', 'rule');
+    html += '</table>';
+
+    html += '<div class="fb-group-title" style="margin-top:16px;">Step 2 — the two limits</div>';
+    html += '<table class="calc-tbl">';
+    html += row(_cfg.capPct + '% of the pool', fmtQty(r.capPct));
+    html += row(esc(floorLabel) + ' = ' + fmtQty(r.floor) + ', so releasable', fmtQty(r.capFloor));
+    html += row('<strong>Cap — the smaller of the two</strong>',
+                '<strong>' + fmtQty(r.cap) + '</strong>', '', 'rule');
+    html += '</table>';
+    html += '<p style="font-size:12.5px;margin-top:10px;color:var(--c-secondary);">' +
+        (r.capBinding === 'FLOOR'
+            ? 'The <strong>retention floor</strong> is what limits this part — the ' + _cfg.capPct +
+              '% rule would have allowed ' + fmtQty(r.capPct) + '.'
+         : r.capBinding === 'PCT'
+            ? 'The <strong>' + _cfg.capPct + '% rule</strong> is what limits this part — the floor would have ' +
+              'allowed ' + fmtQty(r.capFloor) + '.'
+         : r.capBinding === 'BOTH'
+            ? 'Both limits give the same number here.'
+            : 'The cap is zero: ' + esc(_model.srcLgName) + ' is at or below its retention floor for this part, ' +
+              'so none can be released.') + '</p>';
+
+    html += '<div class="fb-group-title" style="margin-top:16px;">Step 3 — sharing ' + fmtQty(r.cap) +
+            ' ' + esc(pn.uomCode) + ' between ' + r.allocations.length + ' destination(s)</div>';
+    html += '<p style="font-size:12px;color:var(--c-secondary);margin:0 0 8px;">' +
+            esc(POLICY_HINTS[_cfg.allocPolicy] || '') + '</p>';
+    html += '<table class="calc-tbl"><tr><td><strong>Destination</strong></td><td><strong>Needs / gets</strong></td></tr>';
+    r.allocations.forEach(function (a) {
+        var pct = Math.round(a.severity * 100);
+        html += '<tr><td>' + esc(a.lgName) +
+            ' <span class="sev-bar"><i style="width:' + Math.min(100, pct) + '%"></i></span>' +
+            ' <span style="font-size:10.5px;color:var(--c-tertiary);">' + pct + '% below ROP</span>' +
+            (a.pinned ? ' <span class="badge b20">pinned</span>' : '') +
+            (a.bumped ? ' <span class="badge b10">min qty</span>' : '') +
+            '</td><td>' + fmtQty(a.requested) + ' / <strong>' + fmtQty(a.allocated) + '</strong>' +
+            (gt(a.deferred, 0) ? ' <span class="text-warning">(' + fmtQty(a.deferred) + ' deferred)</span>' : '') +
+            '</td></tr>';
+    });
+    html += row('<strong>Total planned</strong>', '<strong>' + fmtQty(r.totalAllocated) + '</strong>', '', 'rule');
+    html += row('Source after', fmtQty(r.sourceAfter) +
+        (num(pn.srcRop) > 0 ? (' <span style="font-size:11px;color:var(--c-tertiary);">(' +
+            (r.sourceRopAfter >= 0 ? '+' : '') + fmtQty(r.sourceRopAfter) + ' vs its ROP)</span>') : ''));
+    html += '</table>';
+
+    if (r.violations.length) {
+        html += '<div class="fb-group-title" style="margin-top:16px;">Warnings</div>';
+        r.violations.forEach(function (v) {
+            html += '<div class="alert alert-' + (v.severity === 'error' ? 'danger' : 'warning') +
+                    '" style="font-size:12px;margin-bottom:6px;">' + esc(v.message) + '</div>';
+        });
+    }
+
+    host.innerHTML = html;
+    FBLib.Common.openDrawer('policyOverlay');
+}
+
+function esc(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function hasCreateRight() {
+    try { return typeof hasUserAccess !== 'function' || hasUserAccess('Transfer Order-Create'); }
+    catch (_) { return true; }
+}
+
+// ============================================================================
+//  CREATE — grouping, validation, preview
+// ============================================================================
+function buildGroups() {
+    var byLg = {};
+    _model.lines.forEach(function (row) {
+        if (row.locked || !gt(row.qty, 0)) return;
+        if (!byLg[row.destlgid]) byLg[row.destlgid] = { lgId: row.destlgid, lgName: row.destlg, lines: [] };
+        byLg[row.destlgid].lines.push(row);
+    });
+    return Object.keys(byLg).map(function (k) { return byLg[k]; })
+        .sort(function (a, b) { return String(a.lgName).localeCompare(String(b.lgName)); });
+}
+
+function blockingProblems(groups) {
+    var out = [];
+    if (!groups.length) out.push('Nothing is planned yet — enter some quantities or press Auto-Allocate.');
+    if (!hasCreateRight()) out.push('You do not have the Transfer Order-Create access right.');
+    if (!_carrierId) out.push('No carrier is available, and Fishbowl requires one on every transfer order.');
+
+    _model.parts.forEach(function (pn) {
+        var r = pn.result;
+        if (!r || !gt(r.totalAllocated, 0)) return;
+        // Over-selling the source is blocking for everyone, regardless of mode.
+        if (gt(r.totalAllocated, r.pool))
+            out.push(pn.partNum + ': planned ' + fmtQty(r.totalAllocated) + ' exceeds the ' +
+                     fmtQty(r.pool) + ' available at ' + _model.srcLgName + '.');
+        // A breach caused solely by the deliberate minimum-quantity bump is
+        // intentional and only warns.
+        else if (_cfg.capEnforcement === 'hard' && r.capBreached && !r.capBreachIsBump)
+            out.push(pn.partNum + ': planned ' + fmtQty(r.totalAllocated) + ' exceeds its cap of ' + fmtQty(r.cap) + '.');
+        else if (_cfg.capEnforcement === 'hard' && r.floorBreached)
+            out.push(pn.partNum + ': would leave ' + fmtQty(r.sourceAfter) + ' at ' + _model.srcLgName +
+                     ', below the retention floor of ' + fmtQty(r.floor) + '.');
+    });
+
+    if (_cfg.toType === 'Ship') {
+        if (!_addrByLg[_model.srcLgId])
+            out.push('Ship-type transfers need an address on the source location group ' + _model.srcLgName + '.');
+        groups.forEach(function (g) {
+            if (!_addrByLg[g.lgId]) out.push('Ship-type transfers need an address on ' + g.lgName + '.');
+        });
+    }
+    return out;
+}
+
+function refreshCreateButton() {
+    var btn = document.getElementById('createBtn');
+    if (!btn) return;
+    var groups = buildGroups();
+    var problems = blockingProblems(groups);
+    btn.disabled = problems.length > 0;
+    btn.title = problems.length ? problems[0] : ('Create ' + groups.length + ' transfer order(s)');
+}
+
+function openCreatePreview() {
+    var groups = buildGroups();
+    var problems = blockingProblems(groups);
+    var host = document.getElementById('createBody');
+    var html = '';
+
+    problems.forEach(function (p) {
+        html += '<div class="alert alert-danger" style="font-size:12.5px;margin-bottom:8px;">' + esc(p) + '</div>';
+    });
+
+    // soft warnings
+    var warns = [];
+    _model.parts.forEach(function (pn) {
+        var r = pn.result;
+        if (!r || !gt(r.totalAllocated, 0)) return;
+        r.violations.forEach(function (v) {
+            if (v.severity === 'warn') warns.push(pn.partNum + ': ' + v.message);
+        });
+    });
+    var tracked = {};
+    groups.forEach(function (g) { g.lines.forEach(function (l) { if (l.tracked) tracked[l.partnum] = 1; }); });
+    if (Object.keys(tracked).length) {
+        warns.push('Serial/lot tracked part(s) included (' + Object.keys(tracked).slice(0, 5).join(', ') +
+            (Object.keys(tracked).length > 5 ? '…' : '') + '). Creating is fine, but issuing or picking may require tracking data.');
+    }
+    warns.slice(0, 8).forEach(function (w) {
+        html += '<div class="alert alert-warning" style="font-size:12.5px;margin-bottom:8px;">' + esc(w) + '</div>';
+    });
+
+    if (groups.length) {
+        var totQty = 0, totLines = 0, totDef = 0;
+        groups.forEach(function (g) { g.lines.forEach(function (l) { totQty = q(totQty + l.qty); totLines++; }); });
+        _model.lines.forEach(function (l) { totDef = q(totDef + num(l.deferqty)); });
+
+        html += '<div style="font-size:12.5px;margin-bottom:12px;color:var(--c-secondary);">' +
+            '<strong>' + groups.length + '</strong> transfer order(s) · <strong>' + totLines + '</strong> line(s) · ' +
+            '<strong>' + fmtQty(totQty) + '</strong> unit(s) from <strong>' + esc(_model.srcLgName) + '</strong>' +
+            ' · type <strong>' + esc(_cfg.toType) + '</strong>' +
+            (_cfg.autoIssue ? ' · <strong>will be issued immediately</strong>' : ' · left in Entered status') +
+            (_cfg.dryRun ? ' · <strong style="color:var(--acc-orange-con);">DRY RUN — nothing will be created</strong>' : '') +
+            '</div>';
+
+        groups.forEach(function (g) {
+            var gQty = g.lines.reduce(function (s, l) { return q(s + l.qty); }, 0);
+            html += '<div class="grp-card"><div class="grp-head"><span>' + esc(_model.srcLgName) +
+                ' &rarr; ' + esc(g.lgName) + '</span><span style="font-size:12px;font-weight:600;">' +
+                g.lines.length + ' line(s) · ' + fmtQty(gQty) + ' unit(s)</span></div>' +
+                '<table><thead><tr><th>Part</th><th>Description</th><th class="num-cell">Qty</th>' +
+                '<th>UOM</th><th class="num-cell">Dest after</th><th class="num-cell">Source after</th></tr></thead><tbody>';
+            g.lines.forEach(function (l) {
+                html += '<tr><td>' + esc(l.partnum) + '</td><td>' + esc(l.description) + '</td>' +
+                    '<td class="num-cell"><strong>' + fmtQty(l.qty) + '</strong></td>' +
+                    '<td>' + esc(l.uomcode) + '</td>' +
+                    '<td class="num-cell">' + fmtQty(l.destafter) + '</td>' +
+                    '<td class="num-cell">' + fmtQty(l.srcafter) + '</td></tr>';
+            });
+            html += '</tbody><tfoot><tr><td colspan="2">Total</td><td class="num-cell">' + fmtQty(gQty) +
+                '</td><td colspan="3"></td></tr></tfoot></table></div>';
+        });
+
+        // source impact summary
+        html += '<div class="fb-group-title" style="margin-top:6px;">Impact on ' + esc(_model.srcLgName) + '</div>';
+        html += '<table class="calc-tbl">';
+        _model.parts.filter(function (p) { return p.result && gt(p.result.totalAllocated, 0); })
+            .sort(function (a, b) { return a.result.sourceAfter / Math.max(a.result.pool, 1) -
+                                           b.result.sourceAfter / Math.max(b.result.pool, 1); })
+            .slice(0, 40)
+            .forEach(function (pn) {
+                var r = pn.result;
+                var tone = r.floorBreached ? 'critical' : r.capBreached ? 'caution'
+                         : (gt(r.pool, 0) && (r.sourceAfter / r.pool) < 0.25) ? 'caution' : 'success';
+                html += '<tr><td>' + esc(pn.partNum) +
+                    ' <span class="bind-tag bind-' + r.capBinding + '">' +
+                    (r.capBinding === 'PCT' ? 'pct' : r.capBinding === 'FLOOR' ? 'floor' :
+                     r.capBinding === 'BOTH' ? 'both' : 'none') + '</span></td>' +
+                    '<td><span class="spill ' + tone + '"><span class="dot"></span>' +
+                    fmtQty(r.pool) + ' &rarr; ' + fmtQty(r.sourceAfter) + '</span></td></tr>';
+            });
+        html += '</table>';
+
+        if (gt(totDef, 0) && _cfg.deferEnabled) {
+            html += '<div class="fb-group-title" style="margin-top:14px;">Being deferred</div>' +
+                '<p style="font-size:12.5px;color:var(--c-secondary);">' + fmtQty(totDef) +
+                ' unit(s) of demand will not be covered and will be written to your deferred ledger, ' +
+                'to be re-offered at the top of your next planning run. The quantity is always ' +
+                'recalculated from live stock next time — a deferral raises urgency, it is not added to demand.</p>';
+        }
+    }
+
+    host.innerHTML = html;
+    var btn = document.getElementById('createConfirmBtn');
+    btn.disabled = problems.length > 0;
+    btn.textContent = _cfg.dryRun ? 'Run dry run' : ('Create ' + groups.length + ' transfer order' + (groups.length === 1 ? '' : 's'));
+    document.getElementById('createSummary').textContent =
+        problems.length ? (problems.length + ' problem(s) must be fixed first') : '';
+    FBLib.Common.openDrawer('createOverlay');
+}
+
+// ============================================================================
+//  CREATE — submit
+//  ----
+//  Sequential, never parallel: parallel POSTs risk transfer-order number
+//  contention and make partial-failure reporting incoherent.
+// ============================================================================
+function toPayload(group) {
+    var sched = isoPlusDays(_resolve('schedDaysOut', 0));
+    var user = '';
+    try { user = (JSON.parse(getUser()) || {}).userName || ''; } catch (_) {}
+
+    var p = {
+        type: _cfg.toType,
+        status: 'Entered',
+        fromLocationGroup: { id: _model.srcLgId },
+        toLocationGroup:   { id: group.lgId },
+        ownerIsFrom: true,
+        dateScheduled: sched,
+        note: ORDER_MARKER + ' src=' + _model.srcLgName + ' cap=' + _cfg.capPct + '%' +
+              ' floor=' + _cfg.floorMode + ' policy=' + _cfg.allocPolicy +
+              ' by=' + user + ' ' + todayIso(),
+        toItems: group.lines.map(function (l) {
+            var it = {
+                part: { id: l.partid },
+                uom:  { id: l._pn.uomId },     // ALWAYS the part's base UOM — the whole engine works in it
+                type: { id: 10 },              // Send: charges the qty to xo.fromLGId
+                quantity: Number(num(l.qty).toFixed(4)),
+                dateScheduled: sched
+            };
+            if (gt(l.deferqty, 0)) {
+                it.note = 'Capped at ' + _cfg.capPct + '% of source available; ' +
+                          fmtQty(l.deferqty) + ' ' + l.uomcode + ' deferred.';
+            }
+            return it;
+        })
+    };
+    // `number` deliberately omitted so Fishbowl auto-numbers.
+    // NEVER call GET /api/transfer-orders/next-number — it CONSUMES the number
+    // whether or not an order is then created.
+    if (_carrierId) p.carrier = { id: _carrierId };
+    return p;
+}
+
+async function submitTransfers() {
+    if (_submitting) return;
+    var groups = buildGroups();
+    var problems = blockingProblems(groups);
+    if (problems.length) { showToast(problems[0], 'error', 5000); return; }
+
+    // ---- pre-submit revalidation: closes the read-stale-then-write race ----
+    var drift = await revalidateSource(groups);
+    if (drift && drift.length) {
+        var msg = 'Stock at ' + _model.srcLgName + ' moved while you were planning:\n\n' +
+            drift.slice(0, 8).map(function (d) {
+                return '  ' + d.partNum + ': ' + fmtQty(d.was) + ' → ' + fmtQty(d.now);
+            }).join('\n') +
+            (drift.length > 8 ? ('\n  …and ' + (drift.length - 8) + ' more') : '') +
+            '\n\nReload the plan before creating?';
+        if (confirm(msg)) { FBLib.Common.closeDrawer('createOverlay'); loadPlanner(); return; }
+    }
+
+    _submitting = true;
+    var btn = document.getElementById('createConfirmBtn');
+    btn.disabled = true; btn.textContent = 'Creating…';
+    showLoading(true);
+
+    var results = [];
+    var startedAt = todayIso();
+
+    for (var i = 0; i < groups.length; i++) {
+        var g = groups[i];
+        var rec = { lgId: g.lgId, lg: g.lgName, lines: g.lines, ok: false, num: '', id: null,
+                    err: '', issued: false, thrown: false };
+        var payload = toPayload(g);
+        try {
+            if (_cfg.dryRun) {
+                debugLog('DRY RUN payload → ' + JSON.stringify(payload), 'info');
+                rec.ok = true; rec.num = '(dry run)';
+            } else {
+                var res = await runRestApiAsync({
+                    method: 'POST', path: '/api/transfer-orders', body: JSON.stringify(payload)
+                });
+                rec.id  = res && res.id;
+                rec.num = (res && (res.number || res.num)) || '';
+                rec.ok  = !!(rec.id || rec.num);
+                if (!rec.ok) rec.err = 'The server accepted the request but returned no order.';
+            }
+        } catch (e) {
+            rec.err = (e && e.message) ? e.message : String(e);
+            rec.thrown = true;             // may or may not have landed — probe before retry
+            debugLog('Create failed for ' + g.lgName + ': ' + rec.err, 'error');
+        }
+
+        // Issue is a SEPARATE try/catch: a created-but-unissued order is
+        // recoverable, a failed create is not. Issuing also triggers pick
+        // creation, which is why it stays opt-in.
+        if (rec.ok && _cfg.autoIssue && rec.id && !_cfg.dryRun) {
+            try {
+                await runRestApiAsync({ method: 'POST', path: '/api/transfer-orders/' + rec.id + '/issue' });
+                rec.issued = true;
+            } catch (e2) {
+                rec.err = 'Created ' + rec.num + ' but issuing failed: ' + ((e2 && e2.message) || e2);
+                debugLog(rec.err, 'error');
+            }
+        }
+
+        if (rec.ok) {
+            markGroupCreated(g, rec.num);
+            if (_cfg.deferEnabled && !_cfg.dryRun) recordDeferrals(g);
+        }
+        results.push(rec);
+    }
+
+    _lastResults = results;
+    _submitting = false;
+    showLoading(false);
+    btn.disabled = false;
+    btn.textContent = 'Create transfer orders';
+
+    if (!_cfg.dryRun) ledgerSave();
+    FBLib.Common.closeDrawer('createOverlay');
+    renderAll();
+    showResults(results, startedAt);
+}
+
+function markGroupCreated(group, toNum) {
+    group.lines.forEach(function (l) {
+        l.locked = true;
+        l.createdto = toNum;
+        l.state = 'blocked';
+        if (l._d) { l._d.pinned = true; l._d.pinnedQty = l.qty; l._d._lockedByCreate = true; }
+        patchRowCells(l);
+    });
+}
+
+function recordDeferrals(group) {
+    var today = todayIso();
+    group.lines.forEach(function (l) {
+        var k = ledgerKey(l.partid, l.destlgid);
+        if (gt(l.deferqty, 0)) {
+            _ledger[k] = {
+                qty: l.deferqty, srcLgId: _model.srcLgId, asOf: today,
+                partNum: l.partnum, description: l.description,
+                lgName: l.destlg, uomCode: l.uomcode
+            };
+        } else {
+            delete _ledger[k];       // fully covered — the deferral is discharged
+        }
+    });
+}
+
+// Re-read the source pool for exactly the parts being transferred and compare
+// against what the plan was built on.
+async function revalidateSource(groups) {
+    if (_cfg.dryRun) return [];
+    var ids = {}, drift = [];
+    groups.forEach(function (g) { g.lines.forEach(function (l) { ids[l.partid] = 1; }); });
+    var list = Object.keys(ids).map(Number);
+    if (!list.length) return [];
+    try {
+        var rows = await runQueryP(sqlFacts(list, [_model.srcLgId]));
+        var tol = 2;   // percent
+        rows.forEach(function (r) {
+            var pid = parseInt(r.part_id, 10);
+            var pn = _model.byPart[pid];
+            if (!pn) return;
+            var nowAvail = num(r.avail_adj);
+            var wasAvail = num(pn.srcAvailable);
+            var base = Math.max(1, Math.abs(wasAvail));
+            if (Math.abs(nowAvail - wasAvail) / base * 100 > tol) {
+                drift.push({ partNum: pn.partNum, was: wasAvail, now: nowAvail });
+            }
+        });
+    } catch (e) { debugLog('revalidateSource: ' + (e && e.message), 'warn'); }
+    return drift;
+}
+
+function showResults(results, startedAt) {
+    var ok = results.filter(function (r) { return r.ok; });
+    var bad = results.filter(function (r) { return !r.ok; });
+    document.getElementById('resultsTitle').textContent =
+        bad.length ? (ok.length + ' created, ' + bad.length + ' failed')
+                   : (_cfg.dryRun ? 'Dry run complete' : (ok.length + ' transfer order(s) created'));
+
+    var host = document.getElementById('resultsBody');
+    host.innerHTML = '';
+    results.forEach(function (r) {
+        var row = document.createElement('div');
+        row.className = 'res-row';
+        var sp = document.createElement('span');
+        sp.className = 'spill ' + (r.ok ? (r.issued ? 'active' : 'success') : 'critical');
+        var d = document.createElement('span'); d.className = 'dot'; sp.appendChild(d);
+        sp.appendChild(document.createTextNode(r.ok ? (r.issued ? 'Issued' : 'Created') : 'Failed'));
+        var lg = document.createElement('span');
+        lg.className = 'res-lg';
+        lg.textContent = _model.srcLgName + ' → ' + r.lg + (r.num ? ('  ·  ' + r.num) : '');
+        row.appendChild(sp); row.appendChild(lg);
+        if (r.ok && r.num && !_cfg.dryRun) {
+            var a = document.createElement('a');
+            a.href = 'javascript:void(0)'; a.className = 'order-link'; a.textContent = 'Open';
+            a.addEventListener('click', function (e) {
+                e.preventDefault();
+                if (typeof openModule === 'function') openModule('Transfer Order', r.num);
+            });
+            row.appendChild(a);
+        }
+        host.appendChild(row);
+        if (r.err) {
+            var er = document.createElement('div');
+            er.className = 'text-danger';
+            er.style.cssText = 'font-size:11.5px;padding:0 0 6px 4px;';
+            er.textContent = r.err;
+            host.appendChild(er);
+        }
+    });
+
+    if (bad.some(function (r) { return r.thrown; })) {
+        var warn = document.createElement('div');
+        warn.className = 'alert alert-warning';
+        warn.style.cssText = 'font-size:12px;margin-top:10px;';
+        warn.textContent = 'Some requests failed without a reply, so it is not certain whether the order ' +
+            'was created. Retry will check Fishbowl for a matching order first rather than risk a duplicate.';
+        host.appendChild(warn);
+    }
+    document.getElementById('retryBtn').style.display = bad.length ? 'inline-block' : 'none';
+    document.getElementById('resultsModal').classList.add('open');
+
+    if (ok.length) showToast(_cfg.dryRun ? 'Dry run complete — see the debug console for payloads.'
+                                         : (ok.length + ' transfer order(s) created.'), 'success');
+    if (bad.length) showToast(bad.length + ' transfer order(s) failed.', 'error', 6000);
+}
+
+function closeResults() { document.getElementById('resultsModal').classList.remove('open'); }
+
+async function retryFailed() {
+    var bad = _lastResults.filter(function (r) { return !r.ok; });
+    if (!bad.length) return;
+
+    // Duplicate probe for anything that threw: we cannot tell whether it landed.
+    for (var i = 0; i < bad.length; i++) {
+        var r = bad[i];
+        if (!r.thrown) continue;
+        try {
+            var found = await runQueryP(
+                " SELECT id, num, DATE(datecreated) AS dc FROM xo" +
+                " WHERE fromlgid = " + _model.srcLgId + " AND shiptolgid = " + r.lgId +
+                "   AND statusid = 10 AND datecreated >= DATE_SUB(NOW(), INTERVAL 1 HOUR)" +
+                " ORDER BY id DESC LIMIT 5");
+            if (found.length) {
+                var msg = 'A recent Entered transfer to ' + r.lg + ' already exists (' +
+                    found.map(function (f) { return f.num; }).join(', ') +
+                    ').\n\nIt may be the one that appeared to fail. Create ANOTHER anyway?';
+                if (!confirm(msg)) { r.skip = true; }
+            }
+        } catch (e) { debugLog('duplicate probe: ' + (e && e.message), 'warn'); }
+    }
+
+    // Unlock the lines of the groups we will retry, then re-run the normal path.
+    bad.forEach(function (r) {
+        if (r.skip) return;
+        (r.lines || []).forEach(function (l) {
+            l.locked = false; l.createdto = '';
+            if (l._d) l._d._lockedByCreate = false;
+        });
+    });
+    closeResults();
+    recomputeAll();
+    renderAll();
+    openCreatePreview();
+}
+
+// ============================================================================
+//  SETTINGS UI
+// ============================================================================
+function _hydrateSettings() {
+    setVal('setCapPct',         _resolve('capPct', 35));
+    setVal('setPoolMode',       _resolve('poolMode', 'available'));
+    setChk('setCountDrafts',    _resolve('countDraftTos', true));
+    setVal('setFloorMode',      _resolve('floorMode', 'rop'));
+    setVal('setFloorMult',      _resolve('floorMult', 1));
+    setVal('setFloorFixed',     _resolve('floorFixed', 0));
+    setVal('setAllocPolicy',    _resolve('allocPolicy', 'severity'));
+    setVal('setNeedBasis',      _resolve('needBasis', 'oul'));
+    setChk('setIncludeInbound', _resolve('includeInbound', true));
+    setVal('setMinQty',         _resolve('minTransferQty', 1));
+    setVal('setMinQtyPolicy',   _resolve('minQtyPolicy', 'bump'));
+    setVal('setReflowMode',     _resolve('reflowMode', 'unpinnedOnly'));
+    setVal('setToType',         _resolve('toType', 'Move'));
+    setChk('setAutoIssue',      _resolve('autoIssue', false));
+    setChk('setDryRun',         _resolve('dryRun', false));
+    setVal('setCapEnforcement', _resolve('capEnforcement', 'hard'));
+    setChk('setShowDebug',      _resolve('showDebug', false));
+    setChk('setShowRecon',      _resolve('showRecon', false));
+    setChk('setDeferEnabled',   _resolve('deferEnabled', true));
+    syncSettingsVisibility();
+}
+
+function setVal(id, v) { var e = document.getElementById(id); if (e) e.value = (v == null ? '' : v); }
+function setChk(id, v) { var e = document.getElementById(id); if (e) e.checked = !!v; }
+function getVal(id)    { var e = document.getElementById(id); return e ? e.value : ''; }
+function getChk(id)    { var e = document.getElementById(id); return e ? !!e.checked : false; }
+
+function syncSettingsVisibility() {
+    var fm = getVal('setFloorMode');
+    var mw = document.getElementById('floorMultWrap');
+    var fw = document.getElementById('floorFixedWrap');
+    if (mw) mw.style.display = (fm === 'ropMultiple') ? 'flex' : 'none';
+    if (fw) fw.style.display = (fm === 'fixed') ? 'flex' : 'none';
+    var ph = document.getElementById('policyHint');
+    if (ph) ph.textContent = POLICY_HINTS[getVal('setAllocPolicy')] || '';
+}
+
+function onSettingsChange() {
+    _setUserKey('capPct',         Math.max(1, Math.min(100, parseFloat(getVal('setCapPct')) || 35)));
+    _setUserKey('poolMode',       getVal('setPoolMode'));
+    _setUserKey('countDraftTos',  getChk('setCountDrafts'));
+    _setUserKey('floorMode',      getVal('setFloorMode'));
+    _setUserKey('floorMult',      parseFloat(getVal('setFloorMult')) || 0);
+    _setUserKey('floorFixed',     parseFloat(getVal('setFloorFixed')) || 0);
+    _setUserKey('allocPolicy',    getVal('setAllocPolicy'));
+    _setUserKey('needBasis',      getVal('setNeedBasis'));
+    _setUserKey('includeInbound', getChk('setIncludeInbound'));
+    _setUserKey('minTransferQty', parseFloat(getVal('setMinQty')) || 0);
+    _setUserKey('minQtyPolicy',   getVal('setMinQtyPolicy'));
+    _setUserKey('reflowMode',     getVal('setReflowMode'));
+    _setUserKey('toType',         getVal('setToType'));
+    _setUserKey('autoIssue',      getChk('setAutoIssue'));
+    _setUserKey('dryRun',         getChk('setDryRun'));
+    _setUserKey('capEnforcement', getVal('setCapEnforcement'));
+    _setUserKey('showDebug',      getChk('setShowDebug'));
+    _setUserKey('showRecon',      getChk('setShowRecon'));
+    _setUserKey('deferEnabled',   getChk('setDeferEnabled'));
+
+    syncSettingsVisibility();
+    _applyDebugDrawer(getChk('setShowDebug'));
+
+    var prevPool = _cfg.poolMode, prevNeed = _cfg.needBasis, prevInb = _cfg.includeInbound;
+    var prevRecon = _cfg.showRecon;
+    readConfig();
+
+    // These change what the SQL/model means, so a reload is required.
+    if (prevPool !== _cfg.poolMode || prevNeed !== _cfg.needBasis || prevInb !== _cfg.includeInbound) {
+        loadPlanner();
+        return;
+    }
+    if (prevRecon !== _cfg.showRecon && _planTable) _planTable.setColumns(planColumns());
+
+    recomputeAll();
+    if (_planTable) _planTable.render();
+    renderAll();
+}
+
+function resetSettings() {
+    if (!confirm('Reset your personal settings to the published defaults?')) return;
+    try { FBLib.Settings.clearUser(); } catch (_) {}
+    readConfig();
+    _hydrateSettings();
+    _applyDebugDrawer(!!_resolve('showDebug', false));
+    loadPlanner();
+}
+
+// publishMaster REPLACES the entire master object (fb-lib.js Object.assign on a
+// fresh {}), so anything not merged in here is destroyed. Merge over the
+// existing master and publish only the policy keys.
+function publishDefaults() {
+    if (!FBLib.Settings.isAdmin()) return;
+    if (!confirm('Publish the current cap, floor, sharing policy and transfer-order options as the ' +
+                 'default for every user?\n\nPersonal display preferences are not published.')) return;
+    try {
+        var current = FBLib.Settings.getMaster() || {};
+        var policy = {};
+        POLICY_KEYS.forEach(function (k) { policy[k] = _resolve(k, null); });
+        policy.sourceLgId = _model.srcLgId || _resolve('sourceLgId', null);
+        FBLib.Settings.publishMaster(Object.assign({}, current, policy));
+        showToast('Published as the organisation default.', 'success');
+        debugLog('Defaults published: ' + JSON.stringify(policy), 'success');
+    } catch (e) {
+        debugLog('publishDefaults: ' + e.message, 'error');
+        showToast('Could not publish: ' + e.message, 'error');
+    }
+}
+
+function toggleUserEditing() {
+    if (!FBLib.Settings.isAdmin()) return;
+    try {
+        FBLib.Settings.setLock(FBLib.Settings.userEditingAllowed());
+        _refreshAdminUi();
+    } catch (e) { debugLog('toggleUserEditing: ' + e.message, 'error'); }
+}
+
+function _refreshAdminUi() {
+    var isAdmin = false, allowed = true;
+    try { isAdmin = FBLib.Settings.isAdmin(); allowed = FBLib.Settings.userEditingAllowed(); } catch (_) {}
+    var sec = document.getElementById('dsAdminSection');
+    if (sec) sec.style.display = isAdmin ? 'block' : 'none';
+    var badge = document.getElementById('dsLockBadge');
+    if (badge) badge.style.display = (!allowed && !isAdmin) ? 'block' : 'none';
+    var lockBtn = document.getElementById('dsLockBtn');
+    if (lockBtn) lockBtn.textContent = allowed ? 'Lock user editing' : 'Unlock user editing';
+}
+
+// ---- debug drawer ---------------------------------------------------------
+var _debugApi = null;
+function _applyDebugDrawer(showIt) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (showIt) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    if (_debugApi.element) _observeDebugDrawer(_debugApi.element);
+}
+function _observeDebugDrawer(el) {
+    if (!el || el._observed) return;
+    el._observed = true;
+    var apply = function () {
+        var visible = el.classList.contains('is-visible');
+        var open    = el.classList.contains('is-open');
+        var h = (visible && open) ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    if (typeof ResizeObserver === 'function') { try { new ResizeObserver(apply).observe(el); } catch (_) {} }
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+
+// ============================================================================
+//  FILTERS
+// ============================================================================
+function onSourceChange() {
+    var v = parseInt(getVal('srcLgSel'), 10) || null;
+    _setUserKey('sourceLgId', v);
+    readConfig();
+    populateDestOptions();
+    loadPlanner();
+}
+
+function applyFilters() {
+    _setUserKey('destLgIds',           _destMs ? _destMs.getSelected().map(Number) : []);
+    _setUserKey('onlyShort',           getChk('filterOnlyShort'));
+    _setUserKey('useCwFallback',       getChk('filterCwFallback'));
+    _setUserKey('schedDaysOut',        parseInt(getVal('schedDaysOut'), 10) || 0);
+    _setUserKey('monitorLookbackDays', parseInt(getVal('monitorLookback'), 10) || 30);
+    FBLib.Common.closeDrawer('filtersOverlay');
+    loadPlanner();
+}
+
+function clearFilters() {
+    setVal('filterPartNum', ''); setVal('filterPartDesc', '');
+    setChk('filterOnlyShort', true); setChk('filterCwFallback', false);
+    if (_destMs) _destMs.setSelected([]);
+    if (_planTable) _planTable.clearFilters();
+    applyFilters();
+}
+
+function applyTextFilters() {
+    if (!_planTable) return;
+    _planTable.setFilter('partnum', getVal('filterPartNum'));
+    _planTable.setFilter('description', getVal('filterPartDesc'));
+    renderFooter();
+}
+
+function populateDestOptions() {
+    if (!_destMs) return;
+    var srcId = _model.srcLgId || parseInt(_resolve('sourceLgId', 0), 10);
+    var items = _lgs.filter(function (l) { return l.id !== srcId; })
+                    .map(function (l) { return { value: l.id, label: l.name }; });
+    _destMs.setItems(items);
+    var saved = (_resolve('destLgIds', []) || []).map(Number)
+                   .filter(function (id) { return id !== srcId; });
+    _destMs.setSelected(saved);
+}
+
+// ============================================================================
+//  EXPORT / PRINT
+// ============================================================================
+function activeTable() {
+    return _activePane === 'impactPane'  ? { t: _impactTable,  name: 'Source Impact' }
+         : _activePane === 'deferPane'   ? { t: _deferTable,   name: 'Deferred' }
+         : _activePane === 'monitorPane' ? { t: _monitorTable, name: 'Monitor' }
+         : { t: _planTable, name: 'Plan' };
+}
+
+function sheetFor(table, name, rows) {
+    if (!table) return null;
+    var cols = (table.getColumns() || []).filter(function (c) {
+        return c.vis !== false && c.key !== 'act' && c.key !== 'state';
+    }).map(function (c) {
+        return { key: c.key, label: c.label, w: Math.max(10, Math.round((c.width || 100) / 7)),
+                 type: c.qty ? 'qty' : (c.type === 'number' ? 'qty' : 'text') };
+    });
+    return { name: name, title: 'Replenishment Transfer Planner — ' + name,
+             subtitle: ['Source: ' + _model.srcLgName + ' · cap ' + _cfg.capPct + '% · floor ' +
+                        _cfg.floorMode + ' · ' + policyLabel(_cfg.allocPolicy) + ' · ' + todayIso()],
+             cols: cols, rows: rows || table.getVisibleRows(), totals: true,
+             freeze: true, freezeCols: 1, autoFilter: true };
+}
+
+async function exportXlsx() {
+    try {
+        var sheets = [];
+        [[_planTable, 'Plan'], [_impactTable, 'Source Impact'],
+         [_deferTable, 'Deferred'], [_monitorTable, 'Monitor']].forEach(function (p) {
+            var s = sheetFor(p[0], p[1]);
+            if (s && s.rows && s.rows.length) sheets.push(s);
+        });
+        if (!sheets.length) { showToast('Nothing to export.', 'warn'); return; }
+        var fn = await FBLib.Export.xlsx({
+            filename: 'Replenishment_Plan_' + FBLib.Export.slug(_model.srcLgName, 'source') + '_' + FBLib.Export.stamp(),
+            sheets: sheets
+        });
+        showToast('Exported ' + fn, 'success');
+    } catch (e) {
+        debugLog('exportXlsx: ' + e.message, 'error');
+        showToast('Export failed: ' + e.message, 'error');
+    }
+}
+
+// window.print() is unreliable in JxBrowser — build the HTML and print a new window.
+function printReport() {
+    var at = activeTable();
+    if (!at.t) return;
+    var cols = (at.t.getColumns() || []).filter(function (c) {
+        return c.vis !== false && c.key !== 'act' && c.key !== 'qty' && c.key !== 'state';
+    });
+    var rows = at.t.getVisibleRows() || [];
+
+    var html = '<html><head><meta charset="UTF-8"><title>Replenishment — ' + esc(at.name) + '</title><style>' +
+        'body{font-family:Arial,Helvetica,sans-serif;font-size:11px;padding:16px;color:#101010;}' +
+        'h1{font-size:16px;margin:0 0 2px;} .meta{font-size:11px;color:#506872;margin-bottom:12px;}' +
+        'table{width:100%;border-collapse:collapse;} th{background:#0B3140;color:#fff;font-size:10px;' +
+        'text-transform:uppercase;padding:5px 7px;text-align:left;} td{padding:4px 7px;border-bottom:1px solid #ddd;}' +
+        'td.n,th.n{text-align:right;} tr:nth-child(even) td{background:#f5f7f8;}' +
+        '</style></head><body>';
+    html += '<h1>Replenishment Transfer Planner — ' + esc(at.name) + '</h1>';
+    html += '<div class="meta">Source: <strong>' + esc(_model.srcLgName) + '</strong> · cap ' + _cfg.capPct +
+            '% · floor: ' + esc(_cfg.floorMode) + ' · sharing: ' + esc(policyLabel(_cfg.allocPolicy)) +
+            ' · printed ' + esc(todayIso()) + ' · ' + rows.length + ' row(s)</div>';
+    html += '<table><thead><tr>';
+    cols.forEach(function (c) {
+        html += '<th' + (c.align === 'right' ? ' class="n"' : '') + '>' + esc(c.label) + '</th>';
+    });
+    html += '</tr></thead><tbody>';
+    rows.forEach(function (r) {
+        html += '<tr>';
+        cols.forEach(function (c) {
+            var v = r[c.key];
+            var txt = (c.qty || c.type === 'number') ? fmtQty(v) : (v == null ? '' : String(v));
+            html += '<td' + (c.align === 'right' ? ' class="n"' : '') + '>' + esc(txt) + '</td>';
+        });
+        html += '</tr>';
+    });
+    html += '</tbody></table></body></html>';
+
+    var w = window.open('', '_blank');
+    if (!w) { showToast('Could not open the print window — check pop-up settings.', 'error'); return; }
+    w.document.write(html);
+    w.document.close();
+    setTimeout(function () { try { w.print(); } catch (_) {} }, 350);
+}
+
+// ============================================================================
+//  BOOTSTRAP + INIT
+// ============================================================================
+async function bootstrap() {
+    // Location groups the logged-in user may see.
+    var ids = [];
+    try { ids = getLocationGroupList() || []; } catch (_) {}
+    var idList = intList(ids);
+    var lgSql = " SELECT id, name FROM locationgroup WHERE activeflag = 1" +
+                (idList ? (" AND id IN (" + idList.join(',') + ")") : "") + " ORDER BY name";
+    _lgs = (await runQueryP(lgSql)).map(function (r) {
+        return { id: parseInt(r.id, 10), name: r.name || ('LG ' + r.id) };
+    });
+
+    // Per-LG reordering mode. Note the value is the STRING 'true', not 1.
+    try {
+        var pr = await runQueryP(" SELECT sysvalue FROM sysproperties WHERE syskey = 'locationGroupReordering' LIMIT 1");
+        if (pr.length) {
+            var v = String(pr[0].sysvalue).toLowerCase();
+            _lgReordering = (v === 'true' || v === '1');
+        }
+    } catch (_) {}
+
+    // Carrier — xo.carrierId is NOT NULL, so without one nothing can be created.
+    try {
+        var cr = await runQueryP(
+            " SELECT c.id, c.name, CASE WHEN co.id IS NULL THEN 0 ELSE 1 END AS isdefault" +
+            " FROM carrier c" +
+            " LEFT JOIN company co ON co.defaultcarrierid = c.id" +
+            " WHERE c.activeflag = 1" +
+            " ORDER BY isdefault DESC, c.name LIMIT 5");
+        if (cr.length) { _carrierId = parseInt(cr[0].id, 10); _carrierName = cr[0].name || ''; }
+    } catch (e) { debugLog('carrier lookup: ' + (e && e.message), 'warn'); }
+
+    // Company address per LG — only needed to validate Ship-type transfers.
+    _addrByLg = {};
+    _lgs.forEach(function (l) {
+        var a = '';
+        try { a = getCompanyAddress(l.id, true) || ''; } catch (_) {}
+        _addrByLg[l.id] = a && String(a).trim() ? a : null;
+    });
+
+    // Source select
+    var sel = document.getElementById('srcLgSel');
+    if (sel) {
+        sel.innerHTML = '';
+        var blank = document.createElement('option');
+        blank.value = ''; blank.textContent = '— choose —';
+        sel.appendChild(blank);
+        var saved = parseInt(_resolve('sourceLgId', 0), 10);
+        _lgs.forEach(function (l) {
+            var o = document.createElement('option');
+            o.value = l.id; o.textContent = l.name;
+            if (l.id === saved) o.selected = true;
+            sel.appendChild(o);
+        });
+    }
+
+    setChk('filterOnlyShort',  _resolve('onlyShort', true));
+    setChk('filterCwFallback', _resolve('useCwFallback', false));
+    setVal('schedDaysOut',     _resolve('schedDaysOut', 0));
+    setVal('monitorLookback',  _resolve('monitorLookbackDays', 30));
+
+    var hint = document.getElementById('cwFallbackHint');
+    if (hint && !_lgReordering) {
+        hint.textContent = 'Per-location-group reordering is OFF in this Fishbowl, so only company-wide ' +
+            'reorder points exist — leave this ticked or no demand will be found.';
+        setChk('filterCwFallback', true);
+        _setUserKey('useCwFallback', true);
+    }
+}
+
+window.addEventListener('DOMContentLoaded', async function () {
+    try {
+        readConfig();
+
+        FBLib.Common.registerDrawer({ id: 'filtersOverlay', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',     triggerId: 'setBtn'     });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay',    triggerId: 'helpBtn'    });
+        FBLib.Common.registerDrawer({ id: 'createOverlay' });
+        FBLib.Common.registerDrawer({ id: 'policyOverlay' });
+
+        // containerId MUST match the .ms-container id, or create() throws and
+        // the rest of init never runs (which presents as a blank page).
+        _destMs = FBLib.Common.MultiSelect.create({
+            containerId: 'destMs',
+            items: [],
+            placeholder: 'All destinations',
+            maxTags: 3
+        });
+
+        _planTable = FBLib.Table.init({
+            tableEl: document.getElementById('planTable'),
+            columns: planColumns(),
+            getRows: function () { return _model.lines; },
+            chunkSize: 200,
+            settingsKey: 'tablePrefsPlan',
+            onSort: function () { renderFooter(); }
+        });
+        _impactTable = FBLib.Table.init({
+            tableEl: document.getElementById('impactTable'),
+            columns: impactColumns(),
+            getRows: function () { return _impactRows; },
+            chunkSize: 200, settingsKey: 'tablePrefsImpact',
+            onSort: function () { renderFooter(); }
+        });
+        _deferTable = FBLib.Table.init({
+            tableEl: document.getElementById('deferTable'),
+            columns: deferColumns(),
+            getRows: function () { return _deferRows; },
+            chunkSize: 200, settingsKey: 'tablePrefsDefer',
+            onSort: function () { renderFooter(); }
+        });
+        _monitorTable = FBLib.Table.init({
+            tableEl: document.getElementById('monitorTable'),
+            columns: monitorColumns(),
+            getRows: function () { return _monitorRows; },
+            chunkSize: 200, settingsKey: 'tablePrefsMonitor',
+            onSort: function () { renderFooter(); }
+        });
+
+        _hydrateSettings();
+        _applyDebugDrawer(!!_resolve('showDebug', false));
+        _refreshAdminUi();
+        ledgerLoad();
+
+        await bootstrap();
+        populateDestOptions();
+
+        ['filterPartNum', 'filterPartDesc'].forEach(function (id) {
+            var e = document.getElementById(id);
+            if (e) e.addEventListener('input', applyTextFilters);
+        });
+
+        await loadPlanner();
+        debugLog('Replenishment planner initialised', 'success');
+    } catch (e) {
+        console.error('[Replenishment planner init] failed:', e);
+        setStatus('Init failed — ' + (e && e.message ? e.message : 'see browser console'));
+        try { FBLib.Common.debugLog('Init failed: ' + (e && e.stack ? e.stack : e), 'error'); } catch (_) {}
+    }
+});
+
+// Handlers referenced from inline onclick= attributes.
+window.switchTab          = switchTab;
+window.loadPlanner        = loadPlanner;
+window.autoAllocate       = autoAllocate;
+window.resetQuantities    = resetQuantities;
+window.openCreatePreview  = openCreatePreview;
+window.submitTransfers    = submitTransfers;
+window.retryFailed        = retryFailed;
+window.closeResults       = closeResults;
+window.onSourceChange     = onSourceChange;
+window.applyFilters       = applyFilters;
+window.clearFilters       = clearFilters;
+window.onSettingsChange   = onSettingsChange;
+window.resetSettings      = resetSettings;
+window.publishDefaults    = publishDefaults;
+window.toggleUserEditing  = toggleUserEditing;
+window.exportXlsx         = exportXlsx;
+window.printReport        = printReport;
+window.openPolicyExplainer = openPolicyExplainer;
+</script>
+</body>
+</html>
