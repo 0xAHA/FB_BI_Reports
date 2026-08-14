@@ -740,6 +740,40 @@ async function handleConnect(env, email, request) {
     });
 }
 
+// End the cached Fishbowl session behind each of these connections.
+//
+// Disconnect used to delete the KV entry and stop there, which left two
+// things behind: the FB session stayed open until Fishbowl's idle timeout
+// reaped it, and the TokenManager kept serving a still-valid token for a
+// user whose credentials had just been deleted — for up to
+// MAX_TOKEN_AGE_SECONDS. Everywhere else in this Worker every login is
+// matched by a logout; this closes the one path that was not.
+//
+// The DO key strings MUST match the ones the proxy hot path derives, or
+// this silently invalidates a different (empty) instance and appears to
+// work. Legacy entries are keyed 'fb:default:<user>', per-tenant ones
+// 'fb:<tenantId>:<user>'.
+//
+// Best-effort by design: the user asked to disconnect, so a failed logout
+// must never block removal — being unable to reach FB would otherwise
+// leave them permanently unable to disconnect. doInvalidate already
+// swallows its own errors; the try/catch guards key derivation too.
+async function invalidateConnections(env, conns) {
+    if (!env.TOKEN_MANAGER || !Array.isArray(conns)) return 0;
+    let n = 0;
+    for (const c of conns) {
+        const user = c && c.fbUsername;
+        if (!user) continue;
+        const name = c.tenantId ? ('fb:' + c.tenantId + ':' + user)
+                                : ('fb:default:' + user);
+        try {
+            await doInvalidate(env.TOKEN_MANAGER.get(env.TOKEN_MANAGER.idFromName(name)));
+            n++;
+        } catch (_) { /* best-effort — never block the disconnect */ }
+    }
+    return n;
+}
+
 async function handleDisconnect(env, email, request) {
     let body = {};
     try { body = await request.json(); } catch (_) {}
@@ -752,16 +786,24 @@ async function handleDisconnect(env, email, request) {
 
     // Legacy entry OR no tenantId specified → remove the whole record.
     if (!Array.isArray(entry.connections) || !tenantId) {
+        // A legacy entry IS the connection; a new-shape entry carries a list.
+        // Both must be logged out, not just the new shape.
+        const all = Array.isArray(entry.connections) ? entry.connections : [entry];
+        const loggedOut = await invalidateConnections(env, all);
         await env.KEYS.delete(email);
-        return jsonResponse(200, { ok: true });
+        return jsonResponse(200, { ok: true, loggedOut });
     }
 
-    // Remove just the matching connection.
-    const before = entry.connections.length;
+    // Log out BEFORE filtering. Once the connection is out of the array its
+    // fbUsername is gone with it and the DO key can no longer be derived.
+    const before  = entry.connections.length;
+    const removing = entry.connections.filter(c => c.tenantId === tenantId);
+    const loggedOut = await invalidateConnections(env, removing);
+
     entry.connections = entry.connections.filter(c => c.tenantId !== tenantId);
     if (entry.connections.length === 0) {
         await env.KEYS.delete(email);
-        return jsonResponse(200, { ok: true, lastConnectionRemoved: true });
+        return jsonResponse(200, { ok: true, lastConnectionRemoved: true, loggedOut });
     }
     if (entry.lastTenantId === tenantId) {
         entry.lastTenantId = entry.connections[0].tenantId;
@@ -772,6 +814,7 @@ async function handleDisconnect(env, email, request) {
         ok: true,
         removed:        before - entry.connections.length,
         activeTenantId: entry.lastTenantId,
+        loggedOut,
     });
 }
 
