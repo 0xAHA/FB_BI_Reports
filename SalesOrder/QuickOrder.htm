@@ -2755,7 +2755,20 @@ function persistConn() {
 
 const FB_DATE_FORMAT = (typeof getProperty === 'function')
     ? getProperty('DateFormatShort', 'MM/dd/yyyy') : 'MM/dd/yyyy';
-const MOMENT_FMT = FB_DATE_FORMAT.replace(/yyyy/g, 'YYYY').replace(/yy/g, 'YY').replace(/dd/g, 'DD');
+// Java (SimpleDateFormat) -> moment token conversion. The old inline version
+// handled yyyy/yy/dd but NOT a single `d`: an install configured `d/MM/yyyy`
+// produced the moment pattern `d/MM/YYYY`, where `d` is day-OF-WEEK (0-6),
+// so every date rendered with a number between 0 and 6 in the day position.
+// This install is dd/MM/yyyy so it was unaffected, but the trap is one
+// character away.
+function javaToMomentFormat(f) {
+    return String(f || 'MM/dd/yyyy')
+        .replace(/y{4}/g, 'YYYY')
+        .replace(/y{2}/g, 'YY')
+        .replace(/d{1,2}/g, m => (m.length === 2 ? 'DD' : 'D'))
+        .replace(/E{3,}/g, 'ddd');
+}
+const MOMENT_FMT = javaToMomentFormat(FB_DATE_FORMAT);
 // Debug console visibility — saved per user via the Settings checkbox.
 // `let` not `const` so the toggle handler can flip it at runtime;
 // `loadSavedState` applies the persisted value once settings are loaded.
@@ -2862,7 +2875,7 @@ let _ordersRange     = 90;        // days; 0 = all time
 let _ordersStatusSet = 'open';    // 'open' | 'all'
 let _ordersSearch    = '';
 let _ordersLimit     = 300;
-let _ordersSort      = { key: 'so_date', dir: -1 };
+let _ordersSort      = { key: 'so_sched', dir: -1 };
 let _ordersExpanded  = null;      // soId of the open detail row, or null
 const _soLines       = new Map(); // soId -> line rows (lazy, cached)
 // Salesman filter. Defaults to 'me' — a rep opening this view wants their
@@ -4728,10 +4741,31 @@ function openProduct(num) {
     }
 }
 
+// Parse whatever the transport hands back for a datetime column. The shape
+// varies: runQueryAsync/REST return ISO or SQL datetime strings, but a
+// transport that pre-formats to the install's DateFormatShort would give
+// "15/08/2026" — and bare moment()/Date() reads that as MM/DD, so a day
+// above 12 is Invalid and a day of 12 or less silently becomes the WRONG
+// date (01/08 -> 8 January, not 1 August). Try the unambiguous forms first,
+// then the configured short format, and only then fall back to lenient
+// parsing.
+function parseFbDate(d) {
+    if (!d) return null;
+    if (d instanceof Date) { const m = moment(d); return m.isValid() ? m : null; }
+    const s = String(d).trim();
+    if (!s) return null;
+    let m = moment(s, [moment.ISO_8601, 'YYYY-MM-DD HH:mm:ss', 'YYYY-MM-DD HH:mm:ss.S',
+                       'YYYY-MM-DD'], true);
+    if (m.isValid()) return m;
+    m = moment(s, MOMENT_FMT, true);            // the install's own short format
+    if (m.isValid()) return m;
+    m = moment(s);                              // last resort
+    return m.isValid() ? m : null;
+}
+
 function formatDateShort(d) {
-    if (!d) return '';
-    const m = moment(d);
-    return m.isValid() ? m.format(MOMENT_FMT) : '';
+    const m = parseFbDate(d);
+    return m ? m.format(MOMENT_FMT) : '';
 }
 
 // Build the styled-tooltip HTML for a product's open POs. Uses the same
@@ -5668,6 +5702,12 @@ async function loadOrders() {
                    ss.name            AS statusname,
                    so.dateCreated     AS datecreated,
                    so.dateIssued      AS dateissued,
+                   -- The SO's scheduled ship date. There is NO so.dateScheduled
+                   -- column; dateFirstShip is the field the SO module labels
+                   -- "Date Scheduled", and what the CSV's OrderDateScheduled /
+                   -- the REST create's dateScheduled both land in. Same column
+                   -- Open_Sales_Orders.htm shows under that name.
+                   so.dateFirstShip   AS datefirstship,
                    so.customerId      AS customerid,
                    cu.name            AS customername,
                    cu.number          AS customernum,
@@ -5711,6 +5751,7 @@ async function loadOrders() {
                 statusClass: orderStatusClass(st.label),
                 dateCreated: r.datecreated,
                 dateIssued: r.dateissued,
+                dateScheduled: r.datefirstship,
                 customerId: intOf(r.customerid),
                 customerName: r.customername || '',
                 customerNum: r.customernum || '',
@@ -5800,8 +5841,14 @@ function sortOrders() {
             case 'so_salesman': return o.salesman.toLowerCase();
             case 'so_issued':   return o.dateIssued || '';
             case 'so_total':    return o.totalPrice;
-            case 'so_date':
-            default:            return o.dateCreated || '';
+            // Dates sort on the PARSED value, not the raw string — a
+            // pre-formatted dd/MM/yyyy string sorts by day-of-month
+            // otherwise, which looks almost right and never is.
+            case 'so_sched':
+            default: {
+                const m = parseFbDate(key === 'so_sched' ? o.dateScheduled : o.dateCreated);
+                return m ? m.valueOf() : 0;
+            }
         }
     };
     // Decorated sort so equal values keep their load order (id DESC).
@@ -8071,7 +8118,10 @@ const ORDER_COLS = [
     // unprefixed 'num' here would silently resize the catalogue's Part # too.
     { key: 'so_num',      label: 'SO #',        w: 110 },
     { key: 'so_status',   label: 'Status',      w: 120 },
-    { key: 'so_date',     label: 'Created',     w: 100 },
+    // Scheduled, not Created. When an order is due out is the operational
+    // question; when it was keyed in is bookkeeping. Created is still in
+    // the expanded detail for anyone who needs it.
+    { key: 'so_sched',    label: 'Scheduled',   w: 110 },
     { key: 'so_customer', label: 'Customer',    w: 200 },
     { key: 'so_po',       label: 'Customer PO', w: 130 },
     { key: 'so_salesman', label: 'Salesman',    w: 110 },
@@ -8145,7 +8195,7 @@ function renderOrdersTable(rows) {
         const cell = {
             so_num:      () => `<td class="num-cell"><strong>${escapeHtml(o.num)}</strong></td>`,
             so_status:   () => `<td data-status-tip="1">${orderStatusPill(o)}</td>`,
-            so_date:     () => `<td>${escapeHtml(formatDateShort(o.dateCreated))}</td>`,
+            so_sched:    () => `<td title="Scheduled ship date">${escapeHtml(o.dateScheduled ? formatDateShort(o.dateScheduled) : '—')}</td>`,
             so_customer: () => `<td>${escapeHtml(o.customerName)}</td>`,
             so_po:       () => `<td>${escapeHtml(o.customerPO)}</td>`,
             so_salesman: () => `<td>${escapeHtml(o.salesman)}</td>`,
@@ -8190,7 +8240,9 @@ function renderOrderCards(rows) {
         const card = document.createElement('div');
         card.className = 'order-card' + (_ordersExpanded === o.id ? ' expanded' : '');
         card.setAttribute('data-soid', String(o.id));
-        const meta = [formatDateShort(o.dateCreated),
+        // Scheduled date leads, matching the desktop column. Prefixed so a
+        // bare date on a card can't be mistaken for the created date.
+        const meta = [o.dateScheduled ? 'Sched ' + formatDateShort(o.dateScheduled) : '',
                       o.customerPO ? 'PO ' + o.customerPO : '',
                       o.salesman].filter(Boolean).join(' · ');
         card.innerHTML = `
@@ -8226,6 +8278,7 @@ function buildDetailBlock(o) {
     const kv = [
         ['Customer', o.customerName + (o.customerNum ? ' (' + o.customerNum + ')' : '')],
         ['Customer PO', o.customerPO || '—'],
+        ['Scheduled', o.dateScheduled ? formatDateShort(o.dateScheduled) : '—'],
         ['Created', formatDateShort(o.dateCreated)],
         ['Issued', o.dateIssued ? formatDateShort(o.dateIssued) : '—'],
         ['Salesman', o.salesman || '—'],
@@ -8325,7 +8378,7 @@ function toggleOrderDetail(soId) {
 
 function toggleOrdersSort(key) {
     if (_ordersSort.key === key) _ordersSort.dir = -_ordersSort.dir;
-    else _ordersSort = { key, dir: key === 'so_date' || key === 'so_issued' || key === 'so_total' ? -1 : 1 };
+    else _ordersSort = { key, dir: key === 'so_sched' || key === 'so_issued' || key === 'so_total' ? -1 : 1 };
     sortOrders();
     renderOrders();
 }
