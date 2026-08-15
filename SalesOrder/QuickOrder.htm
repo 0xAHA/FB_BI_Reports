@@ -2753,8 +2753,27 @@ function persistConn() {
     catch (_) { /* quota / disabled */ }
 }
 
-const FB_DATE_FORMAT = (typeof getProperty === 'function')
+// The install's short date format.
+//
+// getProperty() is a FISHBOWL BRIDGE — it exists only inside the desktop
+// JxBrowser host. In portal and standalone mode it is undefined, so this
+// used to fall back to the hardcoded US 'MM/dd/yyyy' on an install
+// configured dd/MM/yyyy, with two consequences:
+//
+//   * every date DISPLAYED in the portal was month-first; and
+//   * far worse, every date WRITTEN by the CSV import path was month-first
+//     too. The importer reads the install's own format, so 15 August 2026
+//     went out as "08/15/2026" and came back as day 08 / month 15 — and
+//     month 15 rolls over to March of the next year. That is where orders
+//     created on 15/08/2026 acquired a date of 8 March 2027.
+//
+// So the value is resolved from the bridge when there is one, and read
+// straight out of sysproperties otherwise (see loadDateFormat, called
+// early in bootstrapData BEFORE anything renders or submits). Both are
+// mutable because the query result arrives after this module loads.
+let FB_DATE_FORMAT = (typeof getProperty === 'function')
     ? getProperty('DateFormatShort', 'MM/dd/yyyy') : 'MM/dd/yyyy';
+let _dateFormatResolved = (typeof getProperty === 'function');
 // Java (SimpleDateFormat) -> moment token conversion. The old inline version
 // handled yyyy/yy/dd but NOT a single `d`: an install configured `d/MM/yyyy`
 // produced the moment pattern `d/MM/YYYY`, where `d` is day-OF-WEEK (0-6),
@@ -2768,7 +2787,43 @@ function javaToMomentFormat(f) {
         .replace(/d{1,2}/g, m => (m.length === 2 ? 'DD' : 'D'))
         .replace(/E{3,}/g, 'ddd');
 }
-const MOMENT_FMT = javaToMomentFormat(FB_DATE_FORMAT);
+let MOMENT_FMT = javaToMomentFormat(FB_DATE_FORMAT);
+
+// Read DateFormatShort out of the database when the getProperty bridge is
+// absent (portal / standalone). Everything that formats or parses a date
+// reads MOMENT_FMT at CALL time, so refreshing the variable is enough —
+// nothing needs re-rendering, provided this runs before the first render.
+//
+// Failing closed is not an option here: leaving the US default in place is
+// exactly the bug. On failure the report keeps the fallback but says so
+// loudly, because the consequence is mis-dated sales orders, not cosmetics.
+async function loadDateFormat() {
+    if (_dateFormatResolved) return;
+    try {
+        const rows = await qp(`
+            SELECT sysValue AS v FROM sysproperties
+            WHERE sysKey = 'DateFormatShort' LIMIT 1
+        `);
+        const v = rows && rows.length ? String(rows[0].v || '').trim() : '';
+        if (v) {
+            FB_DATE_FORMAT = v;
+            MOMENT_FMT = javaToMomentFormat(v);
+            _dateFormatResolved = true;
+            if (DEBUG) qoDebug('DateFormatShort resolved from sysproperties: '
+                + v + ' -> ' + MOMENT_FMT);
+            return;
+        }
+        throw new Error('DateFormatShort not set');
+    } catch (e) {
+        qoDebug('Could not read DateFormatShort (' + (e && e.message || e) + '). Dates will '
+              + 'use ' + FB_DATE_FORMAT + '. If that is not this server\'s format, dates on '
+              + 'CREATED sales orders will be wrong, not just displayed wrong.', 'warn');
+        // Surfaced, not just logged: the failure mode is a mis-dated order,
+        // which nobody notices until someone chases a delivery.
+        showToast('Could not read this server\'s date format — falling back to '
+                + FB_DATE_FORMAT + '. Check dates on any order you create.', 'error', 9000);
+    }
+}
 // Debug console visibility — saved per user via the Settings checkbox.
 // `let` not `const` so the toggle handler can flip it at runtime;
 // `loadSavedState` applies the persisted value once settings are loaded.
@@ -10889,6 +10944,10 @@ async function bootstrapData() {
               + 'CSV import route.', 'warn');
     }
     try {
+        // FIRST, and awaited on its own: every date rendered or submitted
+        // after this point depends on it, and getting it wrong mis-dates
+        // created sales orders rather than merely displaying them oddly.
+        await loadDateFormat();
         await Promise.all([
             loadCustomers(),
             loadProductTrees(),
