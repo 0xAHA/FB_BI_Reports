@@ -459,7 +459,8 @@ const MAX_TOKEN_AGE_SECONDS = 50 * 60;  // 50 minutes
 //
 // /api/_internal/whoami         GET     → identity + connected tenants
 // /api/_internal/connect        POST    → add a tenant binding
-// /api/_internal/disconnect     POST    → remove a tenant binding
+// /api/_internal/disconnect     POST    → remove a tenant binding (forgets creds)
+// /api/_internal/end-session    POST    → release the FB session, KEEP creds
 // /api/_internal/switch-tenant  POST    → change the active tenant
 //
 // All identified by X-User-Email which the Pages Function sets from
@@ -774,6 +775,28 @@ async function invalidateConnections(env, conns) {
     return n;
 }
 
+// Sign out of the SESSION without forgetting the account.
+//
+// Disconnect and sign-out are different intentions and used to share one
+// endpoint, so "Sign out" deleted the user's KV record and they had to
+// re-enter tenant code, username and password on every return. This ends
+// the Fishbowl session behind the connection - so the seat is released and
+// nothing keeps working on a cached token - and leaves the stored,
+// encrypted credentials alone. Removing a binding remains a separate,
+// explicitly confirmed action (handleDisconnect).
+//
+// Deliberately touches only the Durable Object, never KV.
+async function handleEndSession(env, email) {
+    let entry = null;
+    try { entry = await readRawEntry(env, email); }
+    catch (_) {}
+    if (!entry) return jsonResponse(200, { ok: true, loggedOut: 0 });
+    // A legacy entry IS the connection; a new-shape entry carries a list.
+    const all = Array.isArray(entry.connections) ? entry.connections : [entry];
+    const loggedOut = await invalidateConnections(env, all);
+    return jsonResponse(200, { ok: true, loggedOut });
+}
+
 async function handleDisconnect(env, email, request) {
     let body = {};
     try { body = await request.json(); } catch (_) {}
@@ -887,6 +910,9 @@ export default {
         }
         if (url.pathname === '/api/_internal/disconnect' && request.method === 'POST') {
             return handleDisconnect(env, email, request);
+        }
+        if (url.pathname === '/api/_internal/end-session' && request.method === 'POST') {
+            return handleEndSession(env, email);
         }
         if (url.pathname === '/api/_internal/switch-tenant' && request.method === 'POST') {
             return handleSwitchTenant(env, email, request);
