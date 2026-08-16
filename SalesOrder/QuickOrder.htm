@@ -1368,7 +1368,21 @@
            (no body class) the page renders the desktop layout
            regardless of viewport width. JxBrowser inside the
            Fishbowl client always renders desktop. */
-        @media (max-width: 1023px) {
+        /* Tier 1 triggers on EITHER a narrow viewport OR a touch-first
+           device up to tablet size.
+           Width alone cannot tell an iPad from a laptop: every iPad is
+           1133-1366px in landscape, so they all fell through to the desktop
+           layout, and the 12.9" Pro is 1024px even in portrait.
+           `pointer: coarse` describes the PRIMARY input — a finger. iPadOS
+           reports it; a laptop reports `fine` even when it has a
+           touchscreen, so this does not catch desk machines. The 1366px cap
+           keeps a large touch kiosk on the desktop layout.
+           KEEP IN SYNC with MQ_LAYOUT_AUTO in the script below, which drives
+           the JS half (cart drawer, tile coercion, order cards). The tablet
+           override rewrites this rule's mediaText through the CSSOM, so the
+           `pointer: coarse` text here is also what applyLayoutPref() matches
+           on to find the rule. */
+        @media (max-width: 1023px), (pointer: coarse) and (max-width: 1366px) {
             /* Cart becomes a fixed slide-out drawer. */
             body.mobile-enabled #cartPanel {
                 position: fixed; top: 0; right: 0; bottom: 0;
@@ -2045,7 +2059,7 @@
         </div>
         <div class="modal-actions">
             <button class="hdr-btn" onclick="closeFbConnectModalAndContinue()" id="qoFbConnCancel" type="button" style="display:none;">Cancel</button>
-            <button class="hdr-btn" onclick="fbConnectLogout()" type="button" title="Log out of Cloudflare Access entirely">Sign out</button>
+            <button class="hdr-btn" onclick="fbConnectLogout()" type="button" title="Sign out of this session — your saved Fishbowl connection is kept">Sign out</button>
             <button class="hdr-btn primary" onclick="submitFbConnect()" id="qoFbConnSubmit" type="button">Connect</button>
         </div>
     </div>
@@ -2105,8 +2119,8 @@
                 <span class="idle-countdown" id="qoIdleCountdown"
                       onclick="extendIdle()"
                       title="Click to extend session">10:00</span>
-                <button class="idle-logout" type="button" onclick="logoutAccess()"
-                        title="Log out now (clears Cloudflare Access session)" aria-label="Log out">
+                <button class="idle-logout" type="button" onclick="fbConnectLogout()"
+                        title="Sign out now — your saved Fishbowl connection is kept" aria-label="Sign out">
                     <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
                         <polyline points="16 17 21 12 16 7"/>
@@ -2130,6 +2144,19 @@
                     <span class="lbl">Orders</span>
                 </button>
             </div>
+            <!-- Tablet layout override. Hidden by default and un-hidden by
+                 applyLayoutPref() only on a touch device with a >=1024px
+                 screen, where either layout is defensible. Sits outside
+                 .btn-group on purpose — that is display:none below 1024px,
+                 which is exactly where this needs to work. -->
+            <span id="layoutToggleWrap" class="view-switch" style="display:none;">
+                <button id="layoutToggleBtn" type="button" class="hdr-btn"
+                        onclick="toggleLayoutPref()" aria-pressed="false"
+                        title="Switch to the full desktop layout">
+                    <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
+                    <span class="lbl">Desktop</span>
+                </button>
+            </span>
             <!-- View mode toggle (3 segments) -->
             <div class="btn-group" role="group" aria-label="View mode">
                 <button id="view-btn-tile"      onclick="setViewMode('tile')"       class="hdr-btn active" title="Tile view with images">
@@ -3411,6 +3438,7 @@ function loadSavedState() {
         if (typeof s.defaultSoDetailsExpanded === 'boolean') {
             _defaultSoDetailsExpanded = s.defaultSoDetailsExpanded;
         }
+        if (s.layoutPref === 'desktop' || s.layoutPref === 'auto') _layoutPref = s.layoutPref;
         _pageSize = s.pageSize || 24;
         // Migrate legacy sort values (saved before the field-dir refactor).
         const legacySort = {
@@ -3541,6 +3569,7 @@ function saveState() {
         // applySessionDefaults / loadSavedState.
         defaultViewMode: _defaultViewMode,
         defaultSoDetailsExpanded: _defaultSoDetailsExpanded,
+        layoutPref: _layoutPref,
         pageSize: _pageSize,
         sortBy: _sortBy,
         defaultStatusId: _defaultStatusId,
@@ -4108,9 +4137,23 @@ async function submitFbConnect() {
     }
 }
 
-// "Sign out" — clears all FB bindings AND the Cloudflare Access cookie.
+// "Sign out" — ends the session, KEEPS the account.
+//
+// This used to POST /api/_internal/disconnect, which deletes the whole KV
+// record: signing out forgot the tenant code, username and password, so
+// every return trip meant re-entering all three. Signing out and forgetting
+// an account are different intentions.
+//
+// end-session releases the Fishbowl session behind the connection (so the
+// seat is freed and nothing runs on a cached token) and leaves the stored
+// credentials alone. Forgetting an account stays a separate, confirmed
+// action — the ✕ on a tenant row, disconnectTenant().
+//
+// Best-effort: an older Worker without this route answers 404, and the
+// Access logout below must happen regardless. Signing out can never be
+// blocked by a server-side failure.
 async function fbConnectLogout() {
-    try { await fetch('/api/_internal/disconnect', { method: 'POST' }); }
+    try { await fetch('/api/_internal/end-session', { method: 'POST' }); }
     catch (_) {}
     logoutAccess();
 }
@@ -4145,7 +4188,11 @@ function renderPortalMenu() {
     html += '<div class="menu-divider"></div>';
     html += '<div class="menu-item menu-action" data-action="connect-new">+ Connect another tenant</div>';
     html += '<div class="menu-divider"></div>';
-    html += '<div class="menu-item menu-action danger" data-action="signout">Sign out</div>';
+    // Sign out ends the session only. Removing an account is the ✕ on its
+    // row — spelled out here because the two used to be the same thing.
+    html += '<div class="menu-item menu-action danger" data-action="signout">'
+          + '<div class="info"><div class="title">Sign out</div>'
+          + '<div class="sub">Keeps your saved connection</div></div></div>';
     if (_portalIdentityEmail) {
         html += `<div class="menu-meta">Cloudflare Access: ${escapeHtml(_portalIdentityEmail)}</div>`;
     }
@@ -4356,6 +4403,9 @@ let _idleLastActivity = Date.now();
 let _idleTicker = null;
 function recordActivity() { _idleLastActivity = Date.now(); }
 function extendIdle() { recordActivity(); updateIdlePill(); }
+// Raw primitive: drop the Cloudflare Access cookie. Prefer fbConnectLogout(),
+// which also releases the Fishbowl session first. Neither touches the stored
+// tenant credentials.
 function logoutAccess() {
     location.href = '/cdn-cgi/access/logout';
 }
@@ -4367,7 +4417,9 @@ function updateIdlePill() {
     const remaining = Math.max(0, IDLE_LIMIT_MS - (Date.now() - _idleLastActivity));
     if (remaining <= 0) {
         pill.style.display = 'none';
-        logoutAccess();
+        // Timing out is still a sign-out: release the Fishbowl session, keep
+        // the saved connection so the user just re-authenticates on return.
+        fbConnectLogout();
         return;
     }
     // Hide entirely until we're inside the "about to log out" window.
@@ -7673,8 +7725,7 @@ function setViewMode(mode) {
     // with a horizontally-clipped table. The matching CSS also hides
     // the view-mode toggle below 1024px, so users can't even pick
     // list there.
-    if (mode !== 'tile' && window.matchMedia &&
-        window.matchMedia('(max-width: 1023px)').matches) {
+    if (mode !== 'tile' && isMobileViewport()) {
         mode = 'tile';
     }
     _viewMode = mode;
@@ -9419,9 +9470,106 @@ function attachSwipeToDelete(lineEl, productId) {
 // helpers are no-ops. On phone / tablet portrait the panel renders as
 // a slide-out drawer; open/close toggles a body class that the CSS
 // uses to translate the panel and fade the backdrop in.
+// ---------------------------------------------------------------------------
+// Touch layout: detection + the tablet override
+// ---------------------------------------------------------------------------
+// Two media queries, mirrored by the tier-1 CSS block:
+//   AUTO    — narrow viewport OR a touch-first device up to tablet size.
+//   DESKTOP — width only, i.e. the pre-tablet-detection behaviour.
+// See the comment on that CSS block for why width alone is not enough.
+const MQ_LAYOUT_AUTO    = '(max-width: 1023px), (pointer: coarse) and (max-width: 1366px)';
+const MQ_LAYOUT_DESKTOP = '(max-width: 1023px)';
+
+// 'auto' | 'desktop'. Deliberately only two states, both of which resolve
+// identically on a mouse-driven machine — the setting rides in the shared
+// per-user state blob, so a tablet must not be able to push a touch layout
+// onto the same user's laptop.
+let _layoutPref = 'auto';
+
+function layoutMQ() { return _layoutPref === 'desktop' ? MQ_LAYOUT_DESKTOP : MQ_LAYOUT_AUTO; }
+
 function isMobileViewport() {
-    try { return window.matchMedia('(max-width: 1023px)').matches; }
+    try { return window.matchMedia(layoutMQ()).matches; }
     catch (_) { return window.innerWidth < 1024; }
+}
+
+// True on a touch-first device big enough that either layout is defensible —
+// i.e. a tablet. Uses screen (not viewport) size so rotating does not make the
+// button appear and disappear. Phones are excluded: the widest is ~956px, so
+// the touch layout is never in question there and the button would be clutter.
+function isTabletDevice() {
+    try {
+        if (!window.matchMedia('(pointer: coarse)').matches) return false;
+        const longEdge = Math.max(window.screen?.width || 0, window.screen?.height || 0);
+        return longEdge >= 1024;
+    } catch (_) { return false; }
+}
+
+// The tier-1 CSS block is ~450 rules deep; a body class cannot un-apply it
+// without duplicating all of them. Editing the CSSMediaRule's mediaText
+// through the CSSOM re-evaluates the whole block in one step instead.
+let _layoutMediaRule = null;
+function layoutMediaRule() {
+    if (_layoutMediaRule) return _layoutMediaRule;
+    try {
+        for (const sheet of document.styleSheets) {
+            let rules;
+            try { rules = sheet.cssRules; } catch (_) { continue; }  // cross-origin sheet
+            for (const r of rules) {
+                if (r.type === CSSRule.MEDIA_RULE && /pointer:\s*coarse/.test(r.media.mediaText)) {
+                    _layoutMediaRule = r;
+                    return r;
+                }
+            }
+        }
+    } catch (_) {}
+    return null;
+}
+
+// Re-registered on every pref change: the listener has to watch whichever
+// query is currently live, or a rotate/resize under the override is missed.
+let _layoutMql = null;
+function watchLayoutMQ() {
+    try {
+        if (_layoutMql && _layoutMql.removeEventListener) {
+            _layoutMql.removeEventListener('change', onLayoutMQChange);
+        }
+        _layoutMql = window.matchMedia(layoutMQ());
+        _layoutMql.addEventListener('change', onLayoutMQChange);
+    } catch (_) {}
+}
+function onLayoutMQChange() {
+    if (_appView === 'orders') renderOrders();
+}
+
+function applyLayoutPref() {
+    const rule = layoutMediaRule();
+    if (rule) {
+        try { rule.media.mediaText = layoutMQ(); } catch (_) {}
+    }
+    document.body.classList.toggle('layout-forced-desktop', _layoutPref === 'desktop');
+    const wrap = document.getElementById('layoutToggleWrap');
+    if (wrap) wrap.style.display = isTabletDevice() ? '' : 'none';
+    const btn = document.getElementById('layoutToggleBtn');
+    if (btn) {
+        const toTouch = _layoutPref === 'desktop';
+        btn.title = toTouch ? 'Switch to the touch layout' : 'Switch to the full desktop layout';
+        btn.setAttribute('aria-pressed', toTouch ? 'true' : 'false');
+        const lbl = btn.querySelector('.lbl');
+        if (lbl) lbl.textContent = toTouch ? 'Touch' : 'Desktop';
+    }
+    watchLayoutMQ();
+}
+
+// Header button. setViewMode() re-runs because the tile coercion is keyed off
+// isMobileViewport(); renderOrders() because the table/card choice is too.
+function toggleLayoutPref() {
+    _layoutPref = _layoutPref === 'desktop' ? 'auto' : 'desktop';
+    applyLayoutPref();
+    saveState();
+    setViewMode(_viewMode);
+    if (_appView === 'orders') renderOrders();
+    showToast(_layoutPref === 'desktop' ? 'Desktop layout' : 'Touch layout');
 }
 function openCartDrawer()  { document.body.classList.add('cart-drawer-open'); }
 function closeCartDrawer() { document.body.classList.remove('cart-drawer-open'); }
@@ -11225,15 +11373,12 @@ async function init() {
             applyOrdersSearch();
         }, 250));
     }
-    // Re-render when the layout tier flips, so dragging a desktop window
-    // across 1024px doesn't leave a table rendered where cards belong.
-    // Scoped to the orders view on purpose — the catalogue's render path is
-    // left alone so this cannot regress it.
-    try {
-        window.matchMedia('(max-width: 1023px)').addEventListener('change', () => {
-            if (_appView === 'orders') renderOrders();
-        });
-    } catch (_) { /* older engines: no-op, matching setViewMode's guard style */ }
+    // Applies the saved layout preference, reveals the tablet override button
+    // if this is a tablet, and registers the tier-flip listener so dragging a
+    // desktop window across 1024px doesn't leave a table where cards belong.
+    // That listener is scoped to the orders view on purpose — the catalogue's
+    // render path is left alone so this cannot regress it.
+    applyLayoutPref();
 
     document.getElementById('lazyImagesToggle').addEventListener('change', e => {
         _lazyImages = e.target.checked;
