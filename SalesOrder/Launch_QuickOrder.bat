@@ -26,15 +26,18 @@ echo so it can reach your Fishbowl server's REST
 echo API. Uses a separate temporary browser profile
 echo so your normal browsing is unaffected.
 echo.
-echo NOTE: Sales-order creation is DISABLED in
-echo standalone mode - the Create button stays
-echo greyed out. Browse the catalogue, price it up
-echo and build quotes here; submit from the Fishbowl
-echo desktop client.
+echo *** NOT A SANDBOX ***
 echo.
-echo It is NOT fully read-only though: marking a
-echo product as a customer favourite writes back to
-echo the customer record on the server you log in to.
+echo Everything you do here hits the real server you
+echo log in to. Point it at a test server unless you
+echo mean it.
+echo.
+echo   QuickOrder_v1.2.htm  CAN create sales orders.
+echo   QuickOrder.htm       cannot - v1.0 keeps its
+echo                        Create button disabled.
+echo.
+echo Either version writes back when you mark a
+echo product as a customer favourite.
 echo.
 
 :: ---- Try Google Chrome ----
