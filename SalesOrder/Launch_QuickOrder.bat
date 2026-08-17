@@ -1,17 +1,22 @@
 @echo off
 title Fishbowl Quick Order Launcher
 :: Optional argument: the report to open.
-::   Launch_QuickOrder.bat QuickOrder_v1.2.htm
-:: With no argument, use whichever report is actually sitting next to this
-:: launcher: v1.0 if present, otherwise v1.2. A hard default of QuickOrder.htm
-:: meant a handover carrying only the v1.2 file failed on the first
-:: double-click, before the recipient had any idea an argument existed.
+::   Launch_QuickOrder.bat QuickOrder.htm
+:: With no argument, prefer the NEWEST report present — v1.2, falling back to
+:: v1.0. Two reasons it is that way round:
+::   * a handover carrying only QuickOrder_v1.2.htm must still work on the
+::     first double-click, and
+::   * in a working folder both files exist, and silently launching the parked
+::     v1.0 means testing the version nobody is changing. That cost a real
+::     debugging session: a fix made in v1.2 "did not appear", because the
+::     launcher had opened v1.0.
+:: Name a file explicitly to test the old one.
 set "REPORT=%~1"
 if "%REPORT%"=="" (
-  if exist "%~dp0QuickOrder.htm" (
-    set "REPORT=QuickOrder.htm"
-  ) else (
+  if exist "%~dp0QuickOrder_v1.2.htm" (
     set "REPORT=QuickOrder_v1.2.htm"
+  ) else (
+    set "REPORT=QuickOrder.htm"
   )
 )
 set "FILE=%~dp0%REPORT%"
@@ -29,7 +34,11 @@ echo =========================================
 echo  Fishbowl Quick Order (Standalone)
 echo =========================================
 echo.
-echo Report: %REPORT%
+echo   ##############################################
+echo    Report: %REPORT%
+echo   ##############################################
+echo.
+echo (Pass a filename to open a different one.)
 echo.
 echo Opens the report with CORS security disabled
 echo so it can reach your Fishbowl server's REST
