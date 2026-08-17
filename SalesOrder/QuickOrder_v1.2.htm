@@ -4281,6 +4281,10 @@ const _customerImportPathCandidates = [
     '/api/import/ImportCustomer',
 ];
 let _resolvedCustomerImportPath = null;
+// Wire format this server accepts on POST /api/import/:name — 'json' (an
+// array of row arrays) or 'csv' (text). JSON is tried first and is strictly
+// better; see _postCustomerImport. null = not yet determined.
+let _importEncoding = null;
 // Candidate REST paths for the Custom Fields import (used to auto-
 // create Favourites_1.._5). Probed most-likely-first, same pattern as
 // the customer import above.
@@ -7012,7 +7016,7 @@ const CSV_CONTENT_TYPE = 'text/plain; charset=utf-8';
 //
 // RFC 4180 allows one inside quotes. Fishbowl's importer does not: it splits
 // the body into rows BEFORE it honours quoting, and so does our own legacy
-// runApiRequest branch (`csvBody.split('\n')` in _postCustomerImportCsv).
+// runApiRequest branch used to (`csvBody.split('\n')`, since removed).
 // Either way one row tears into two, the second with the wrong column count,
 // and the import dies with an unhandled 500 carrying no message at all.
 //
@@ -7020,10 +7024,11 @@ const CSV_CONTENT_TYPE = 'text/plain; charset=utf-8';
 // customer worked — the difference being a two-line main-office address,
 // "Australia Fair Shopping Centre\n42 Marine Parade".
 //
-// Collapsing to a space FLATTENS the stored value, because ImportCustomer
-// demands the address columns on every update, so each save rewrites the
-// address. That is the trade: a one-line address that saves, against a
-// two-line one that cannot.
+// Collapsing to a space FLATTENS the value, and on the customer import that
+// is a real data change: ImportCustomer demands the address columns on every
+// update, so each save rewrites the address. Which is why _postCustomerImport
+// sends JSON where it can — JSON carries the newline intact and never reaches
+// this function. Flattening is the price of the CSV fallback only.
 function csvSafe(v) {
     return String(v ?? '').replace(/\s*[\r\n]+\s*/g, ' ');
 }
@@ -8549,15 +8554,13 @@ async function createFavCustomFields(names) {
         sortBase = (rows && rows.length ? intOf(rows[0].maxsort) : 0) || 0;
     } catch (_) { /* cosmetic only */ }
 
-    const enc = v => '"' + csvSafe(v).replace(/"/g, '""') + '"';
     const cols = ['FieldName', 'Description', 'Type', 'ModuleName', 'Required', 'SortOrder', 'Active', 'ListName'];
-    const csvRows = [cols.map(enc).join(',')];
+    const importRows = [cols];
     names.forEach((nm, i) => {
-        csvRows.push([nm, 'Quick Order tool favourites', 'Long Text', 'Customer',
-                      'FALSE', sortBase + 1 + i, 'TRUE', ''].map(enc).join(','));
+        importRows.push([nm, 'Quick Order tool favourites', 'Long Text', 'Customer',
+                         'FALSE', String(sortBase + 1 + i), 'TRUE', '']);
     });
-    const csvBody = csvRows.join('\n');
-    if (DEBUG) { qoDebug('createFavCustomFields ↓'); csvRows.forEach(r => qoDebug('  ' + r)); }
+    if (DEBUG) { qoDebug('createFavCustomFields ↓'); importRows.forEach(r => qoDebug('  ' + JSON.stringify(r))); }
 
     const pathsToTry = _resolvedCustomFieldImportPath
         ? [_resolvedCustomFieldImportPath]
@@ -8565,7 +8568,7 @@ async function createFavCustomFields(names) {
     let lastErr = null;
     for (const path of pathsToTry) {
         try {
-            await _postCustomerImportCsv(path, csvBody);   // generic CSV poster
+            await _postCustomerImport(path, importRows);   // generic row poster
             if (_resolvedCustomFieldImportPath !== path) {
                 _resolvedCustomFieldImportPath = path;
                 if (DEBUG) qoDebug('Custom Fields import path resolved → ' + path);
@@ -8829,7 +8832,6 @@ async function writeCustomerFavourites(cust, productIds) {
         if (DEBUG) qoDebug('writeCustomerFavourites: no favourites CF columns to write — skipped', 'warn');
         return { ok: true };
     }
-    const enc = v => '"' + csvSafe(v).replace(/"/g, '""') + '"';
 
     // Columns:
     //   Name              — identity key (matches the existing customer)
@@ -8862,16 +8864,16 @@ async function writeCustomerFavourites(cust, productIds) {
         ...cfVals,
     ];
 
-    const headerRow = cols.map(enc).join(',');
-    const dataRow   = vals.map(enc).join(',');
-    const csvBody   = headerRow + '\n' + dataRow;
+    const importRows = [cols, vals];
 
-    // Surface the full CSV body in the debug console so column-mismatch
-    // / formatting issues are visible without devtools.
+    // Surface the rows in the debug console so column-mismatch / formatting
+    // issues are visible without devtools. JSON.stringify rather than raw
+    // text so an embedded newline shows as \n instead of silently wrapping
+    // the log line — which is exactly what made the two-line-address bug
+    // look like a torn CSV in the first place.
     if (DEBUG) {
-        qoDebug('writeCustomerFavourites CSV body ↓');
-        qoDebug('  ' + headerRow);
-        qoDebug('  ' + dataRow);
+        qoDebug('writeCustomerFavourites rows ↓');
+        importRows.forEach(r => qoDebug('  ' + JSON.stringify(r)));
     }
 
     // Build the ordered list of paths to attempt. If we've already
@@ -8889,7 +8891,7 @@ async function writeCustomerFavourites(cust, productIds) {
     // off briefly and resending the identical CSV is safe.
     const postWithRetry = async (path) => {
         for (let attempt = 0; ; attempt++) {
-            try { return await _postCustomerImportCsv(path, csvBody); }
+            try { return await _postCustomerImport(path, importRows); }
             catch (e) {
                 const stale = /updated or deleted by another transaction/i.test(String(e && e.message || e));
                 if (!stale || attempt >= 2) throw e;
@@ -8951,32 +8953,40 @@ async function writeCustomerFavourites(cust, productIds) {
         + pathsToTry.join(', '));
 }
 
-// Single attempt at posting a CSV import body to a specific path.
-// Tries the available transports in MODE order: runRestApiAsync (most
-// flexible — works in fishbowl, portal, and standalone with REST), the
-// legacy runApiRequest('ImportRq', …) bridge (fishbowl-only), and
-// finally direct fetch (portal/standalone fallback).
+// Single attempt at posting import ROWS to a specific path. `rows` is an
+// array of row arrays, header row first:
+//   [['Name','City'], ['Pierres Pastry','Southport']]
+//
+// JSON FIRST, deliberately. POST /api/import/:name accepts exactly that shape
+// under Content-Type: application/json (apidocs "Import data via JSON", server
+// 26.6), and sending it that way removes an entire class of text-escaping
+// bugs at once: no row splitting, no quote doubling, no charset guessing.
+//
+// It is also the ONLY way to send a value that CONTAINS a newline. In JSON a
+// two-line street address is just "a\nb"; in CSV the importer tears the row in
+// half and throws (see csvSafe). So on a server that takes JSON, the address
+// goes back exactly as it was stored — nothing is flattened.
+//
+// CSV remains the fallback for older servers, and the working encoding is
+// cached, so discovering which one this server speaks costs one extra request
+// once per session and only if the first attempt fails.
 //
 // Returns on success, throws on any failure. The caller distinguishes
-// "wrong path" vs "real error" by inspecting the thrown message.
-async function _postCustomerImportCsv(path, csvBody) {
-    if (typeof runRestApiAsync === 'function') {
-        return await runRestApiAsync({
-            method: 'POST',
-            path,
-            body: csvBody,
-            contentType: CSV_CONTENT_TYPE,
-        });
-    }
-    if (MODE === 'fishbowl' && typeof runApiRequest === 'function') {
-        // Legacy bridge — Type derived from the URL path (strip the
-        // /api/import/ prefix and re-add 'Import' so 'Customer' becomes
-        // 'ImportCustomer'). This branch only runs in fishbowl mode
-        // where the runApiRequest global exists.
+// "wrong path" vs "real error" via looksLikeUnresolvedImport.
+async function _postCustomerImport(path, rows) {
+    const asCsv = () => rows.map(r => r.map(csvField).join(',')).join('\n');
+
+    // Legacy bridge (fishbowl host without runRestApiAsync). ImportRq is
+    // line-oriented, so it is CSV-only — but the rows arrive already split,
+    // so nothing can tear on a value's newline the way `csvBody.split('\n')`
+    // used to. The values are still flattened by csvField.
+    if (MODE === 'fishbowl' && typeof runRestApiAsync !== 'function'
+        && typeof runApiRequest === 'function') {
+        // Type derived from the URL path (strip the /api/import/ prefix and
+        // re-add 'Import', so 'Customers' becomes 'ImportCustomers').
         const typeName = 'Import' + path.replace(/^.*\/api\/import\//, '').replace(/-/g, '');
-        const rows = csvBody.split('\n');
         const payload = {
-            ImportRq: { Type: typeName, Rows: { Row: rows } },
+            ImportRq: { Type: typeName, Rows: { Row: rows.map(r => r.map(csvField).join(',')) } },
         };
         const raw = runApiRequest('ImportRq', JSON.stringify(payload));
         const resp = typeof raw === 'string' ? safeParse(raw) : raw;
@@ -8985,19 +8995,50 @@ async function _postCustomerImportCsv(path, csvBody) {
         if (!ok) throw new Error(extractImportError(resp) || 'ImportRq did not return success status');
         return resp;
     }
-    // Direct fetch — portal/standalone.
-    if (MODE === 'standalone' && !_conn.token) {
-        throw new Error('Not connected — log in via the header Connect button.');
+
+    const send = async (encoding) => {
+        const body = encoding === 'json' ? JSON.stringify(rows) : asCsv();
+        const type = encoding === 'json' ? 'application/json' : CSV_CONTENT_TYPE;
+        if (typeof runRestApiAsync === 'function') {
+            return await runRestApiAsync({ method: 'POST', path, body, contentType: type });
+        }
+        // Direct fetch — portal/standalone.
+        if (MODE === 'standalone' && !_conn.token) {
+            throw new Error('Not connected — log in via the header Connect button.');
+        }
+        const url = _conn.baseUrl.replace(/\/$/, '') + path;
+        const headers = { 'Content-Type': type, 'Accept': 'application/json, text/plain' };
+        if (_conn.token) headers.Authorization = 'Bearer ' + _conn.token;
+        const res = await fetch(url, { method: 'POST', headers, body });
+        if (!res.ok) {
+            const text = await res.text().catch(() => '');
+            const err = new Error('HTTP ' + res.status + (text ? ' — ' + text.slice(0, 400) : ''));
+            err.status = res.status;
+            throw err;
+        }
+        return await res.text().catch(() => '');
+    };
+
+    const order = _importEncoding ? [_importEncoding] : ['json', 'csv'];
+    let lastErr = null;
+    for (const encoding of order) {
+        try {
+            const resp = await send(encoding);
+            if (_importEncoding !== encoding) {
+                _importEncoding = encoding;
+                if (DEBUG) qoDebug('Import encoding resolved → ' + encoding
+                    + (encoding === 'csv' ? ' (this server does not take the JSON form; '
+                        + 'values containing newlines will be flattened)' : ''));
+            }
+            return resp;
+        } catch (e) {
+            lastErr = e;
+            if (DEBUG) qoDebug('import via ' + encoding + ' failed: ' + errText(e), 'warn');
+        }
     }
-    const url = _conn.baseUrl.replace(/\/$/, '') + path;
-    const headers = { 'Content-Type': CSV_CONTENT_TYPE, 'Accept': 'application/json, text/plain' };
-    if (_conn.token) headers.Authorization = 'Bearer ' + _conn.token;
-    const res = await fetch(url, { method: 'POST', headers, body: csvBody });
-    if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        throw new Error('HTTP ' + res.status + (text ? ' — ' + text.slice(0, 400) : ''));
-    }
-    return await res.text().catch(() => '');
+    // A cached encoding that stopped working gets re-probed on the next call.
+    if (_importEncoding && order.length === 1) _importEncoding = null;
+    throw lastErr;
 }
 
 function onModuleOptChange() {
