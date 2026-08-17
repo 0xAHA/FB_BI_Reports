@@ -11404,7 +11404,10 @@ function buildSoRestPayload(statusOverride, opts) {
 
     const cust = _selectedCustomer;
     const body = {
-        status: wantsIssued(statusOverride) ? 'Issued' : 'Estimate',
+        // Always an Estimate on create, even when the rep asked for Issued —
+        // submitSoCreate() issues it as a second call. See the issue-date note
+        // at the bottom of this function for why.
+        status: 'Estimate',
         customer: { id: cust.id },
         customerContact: ship.recipient || cust.name,
         shipToAddress: addrForRest(ship, cust),
@@ -11463,26 +11466,23 @@ function buildSoRestPayload(statusOverride, opts) {
     // MOMENT_FMT.
     body.dateScheduled = _orderDateScheduled || moment().format('YYYY-MM-DD');
 
-    // NOTE ON THE ISSUE DATE — deliberately not sent.
+    // THE ISSUE DATE — why this creates an Estimate and issues separately.
     //
-    // Creating with status "Issued" issues the order correctly: the allocation
-    // runs and a pick is produced. It just leaves so.dateIssued null, so the
-    // Orders view shows a blank Issued date.
+    // Creating straight into status "Issued" issues the order correctly (the
+    // allocation runs, a pick is produced) but leaves so.dateIssued null, so
+    // the Orders view shows a blank Issued date.
     //
-    // There is no field for it. The create endpoint's documented attributes
-    // are number, status, type, customer, salesperson, class, carrier,
-    // fobPointName, paymentTerms, shipTerms, customerPoNumber, vendorPoNumber,
-    // customerContact, dateCreated, dateScheduled, taxRate, locationGroup,
-    // note, url, currency, email, phone, shipToAddress, billToAddress,
-    // soItems, customFields — dateCreated and dateScheduled are settable,
-    // dateIssued is not. POST /sales-orders/:id/issue does not help either:
-    // the order is already Issued by then, so there is nothing for it to do.
+    // Two things that do NOT fix it, both tried:
+    //   · Sending dateIssued on the create. There is no such field — the
+    //     documented attributes carry dateCreated and dateScheduled but not
+    //     dateIssued — and an unknown field risks a stricter server build
+    //     rejecting the whole create.
+    //   · Calling POST /sales-orders/:id/issue after creating as Issued. By
+    //     then the order is already issued, so that endpoint has nothing to do.
     //
-    // Stamping the date is the server's job on issue, so this is a Fishbowl-
-    // side gap rather than something the report can paper over. Sending an
-    // undocumented dateIssued was tried and removed — it is not honoured, and
-    // a stricter server build could reject the whole create for an unknown
-    // field, turning a cosmetic gap into a failed order.
+    // What is left is the sequence the desktop client actually performs:
+    // create the order as an Estimate, then issue it. The date is stamped by
+    // the transition, so the transition has to be a real one.
 
     return body;
 }
@@ -11678,6 +11678,49 @@ function wantsIssued(statusOverride) {
     return s === 20;
 }
 
+// The created order's internal id, which /issue needs.
+//
+// The create response should carry it, but that shape is the least-verified
+// part of this route, so fall back to a lookup by number and then to the
+// newest order for this customer — the same ladder the success toast uses.
+async function resolveCreatedSoId(created) {
+    if (created && created.id) return created.id;
+    try {
+        if (created && created.num) {
+            const rows = await qp(`SELECT id FROM so WHERE num = ${sqlStr(String(created.num))} LIMIT 1`);
+            if (rows && rows.length) return intOf(rows[0].id);
+        }
+        if (_selectedCustomer) {
+            const rows = await qp(`SELECT id FROM so WHERE customerId = ${Number(_selectedCustomer.id)}
+                                   ORDER BY id DESC LIMIT 1`);
+            if (rows && rows.length) return intOf(rows[0].id);
+        }
+    } catch (e) {
+        if (DEBUG) qoDebug('resolveCreatedSoId lookup failed: ' + e, 'warn');
+    }
+    return null;
+}
+
+// Issue an order that was just created as an Estimate.
+//
+// Never throws. The order exists and is correct by this point, so a failure
+// here must not surface as a failed create. It returns the reason instead and
+// the caller tells the rep the order is sitting as an Estimate — visible, and
+// one click to fix in Fishbowl.
+async function issueCreatedOrder(created) {
+    const id = await resolveCreatedSoId(created);
+    if (!id) return { issued: false, reason: 'could not resolve the new order id' };
+    try {
+        await submitSoRestPath('/api/sales-orders/' + encodeURIComponent(id) + '/issue');
+        if (DEBUG) qoDebug('Issued SO id ' + id + ' — this call is what stamps the issue date.');
+        return { issued: true };
+    } catch (e) {
+        const msg = (e && e.message) || String(e);
+        qoDebug('Order created as an Estimate but issuing it failed: ' + msg, 'warn');
+        return { issued: false, reason: msg };
+    }
+}
+
 
 
 async function submitSoCreate(statusOverride) {
@@ -11704,7 +11747,13 @@ async function submitSoCreate(statusOverride) {
             try {
                 const resp = await submitSoRest(body);
                 _soCreateRoute = 'rest';
-                return { route: 'rest', created: extractCreatedSo(resp) };
+                const created = extractCreatedSo(resp);
+                // Created as an Estimate above; issuing is the separate
+                // transition that stamps so.dateIssued.
+                const issue = wantsIssued(statusOverride)
+                    ? await issueCreatedOrder(created)
+                    : { issued: true };
+                return { route: 'rest', created, issueFailed: issue.issued ? null : issue.reason };
             } catch (err) {
                 const st = restErrStatus(err);
                 // Route absent on this server build — this is the only case
@@ -11839,7 +11888,7 @@ async function createSalesOrder() {
     try {
         // Prefers POST /api/sales-orders, falling back to the CSV importer on
         // servers that don't register it. Both routes work in every MODE.
-        const { route, created } = await submitSoCreate(chosenStatus);
+        const { route, created, issueFailed } = await submitSoCreate(chosenStatus);
 
         // The REST route returns the created order, so the number is
         // authoritative. The CSV route echoes nothing, so fall back to the
@@ -11865,7 +11914,15 @@ async function createSalesOrder() {
         // up the next time that view is opened.
         _orders = [];
 
-        showToast(newSoNum ? `✓ Sales order ${newSoNum} created` : `✓ Sales order created`, 'success', 6000);
+        // A failed issue is not a failed order — the SO exists, it is just
+        // still an Estimate. Name it so the fix is one click, not a hunt.
+        if (issueFailed) {
+            showToast(`⚠ Sales order ${newSoNum || ''} was created but could NOT be issued `
+                    + `(${issueFailed}). It is saved as an Estimate — issue it in Fishbowl.`,
+                      'error', 12000);
+        } else {
+            showToast(newSoNum ? `✓ Sales order ${newSoNum} created` : `✓ Sales order created`, 'success', 6000);
+        }
         _cart.clear();
         // Per-order SO-detail fields reset for the next quote.
         _orderCustomerPO    = '';
