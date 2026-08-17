@@ -26,14 +26,15 @@ echo so it can reach your Fishbowl server's REST
 echo API. Uses a separate temporary browser profile
 echo so your normal browsing is unaffected.
 echo.
-echo *** WARNING: THIS IS NOT READ-ONLY. ***
+echo NOTE: Sales-order creation is DISABLED in
+echo standalone mode - the Create button stays
+echo greyed out. Browse the catalogue, price it up
+echo and build quotes here; submit from the Fishbowl
+echo desktop client.
 echo.
-echo Standalone mode can CREATE REAL SALES ORDERS
-echo on whatever server you log in to. Point it at
-echo a test server, or treat anything you click as
-echo permanent. (This launcher used to say the
-echo opposite; that stopped being true when REST
-echo sales-order creation was added.)
+echo It is NOT fully read-only though: marking a
+echo product as a customer favourite writes back to
+echo the customer record on the server you log in to.
 echo.
 
 :: ---- Try Google Chrome ----
