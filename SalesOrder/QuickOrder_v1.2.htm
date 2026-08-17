@@ -11403,9 +11403,8 @@ function buildSoRestPayload(statusOverride, opts) {
     if (!ship || !bill) return null;
 
     const cust = _selectedCustomer;
-    const effectiveStatus = statusOverride != null ? parseInt(statusOverride, 10) : _defaultStatusId;
     const body = {
-        status: effectiveStatus === 20 ? 'Issued' : 'Estimate',
+        status: wantsIssued(statusOverride) ? 'Issued' : 'Estimate',
         customer: { id: cust.id },
         customerContact: ship.recipient || cust.name,
         shipToAddress: addrForRest(ship, cust),
@@ -11463,6 +11462,26 @@ function buildSoRestPayload(statusOverride, opts) {
     // Raw YYYY-MM-DD — the API takes ISO dates, unlike the CSV which needs
     // MOMENT_FMT.
     body.dateScheduled = _orderDateScheduled || moment().format('YYYY-MM-DD');
+
+    // Issue date. Creating with status "Issued" issues the order — the
+    // allocation runs, a pick is produced — but leaves so.dateIssued null, so
+    // the Orders view shows a blank Issued date.
+    //
+    // dateIssued is NOT in the create endpoint's documented attribute list
+    // (number, status, type, customer, salesperson, class, carrier,
+    // fobPointName, paymentTerms, shipTerms, customerPoNumber, vendorPoNumber,
+    // customerContact, dateCreated, dateScheduled, taxRate, locationGroup,
+    // note, url, currency, email, phone, shipToAddress, billToAddress,
+    // soItems, customFields). Sending it is therefore a probe: the server may
+    // honour it, or drop it silently. It cannot make things worse — the field
+    // is already null — and it keeps creation to a single call.
+    //
+    // If it turns out to be ignored, the fallback is to create as an Estimate
+    // and POST /sales-orders/:id/issue as a second step, which is the sequence
+    // the desktop client performs. That version is in git history.
+    if (wantsIssued(statusOverride)) {
+        body.dateIssued = moment().format('YYYY-MM-DD');
+    }
 
     return body;
 }
@@ -11649,33 +11668,16 @@ let _soCreateRoute = 'unknown';   // 'unknown' | 'rest' | 'csv'
 
 // Create the order, preferring REST and falling back to the CSV importer.
 // Returns { route, created } where created is {id, num} or null.
-// Creating with status "Issued" issues the order — the allocation runs and a
-// pick is produced — but leaves so.dateIssued null. Verified: of 56 issued
-// orders in the database, the only one without an issue date is the one this
-// report created that way. The Orders view reads that column, so the order
-// showed a blank Issued date.
-//
-// POST /sales-orders/:id/issue is the documented way to issue, and stamps it.
-// Called AFTER a successful create rather than replacing the status on the
-// create: the order is already correct apart from this field, so a failure
-// here must not lose it. Best-effort and non-throwing for the same reason —
-// worst case the date stays blank, exactly as it is today.
-async function stampIssuedDate(body, created) {
-    if (!body || body.status !== 'Issued') return;
-    const id = created && created.id;
-    if (!id) {
-        if (DEBUG) qoDebug('Issued order created but the response carried no id — '
-                         + 'cannot stamp the issue date.', 'warn');
-        return;
-    }
-    try {
-        await submitSoRestPath('/api/sales-orders/' + encodeURIComponent(id) + '/issue');
-        if (DEBUG) qoDebug('Stamped the issue date on SO id ' + id + '.');
-    } catch (e) {
-        qoDebug('Order created, but stamping the issue date failed: ' + (e && e.message || e)
-              + ' — the order is issued, its Issued date is blank.', 'warn');
-    }
+// Did this submission ask for an Issued order? Status 20 is Issued, anything
+// else is an Estimate. One definition, shared by the CSV builder (which puts
+// the status straight in the row) and the REST route (which always creates an
+// Estimate and issues afterwards).
+function wantsIssued(statusOverride) {
+    const s = statusOverride != null ? parseInt(statusOverride, 10) : _defaultStatusId;
+    return s === 20;
 }
+
+
 
 async function submitSoCreate(statusOverride) {
     // Kits / drop-ship lines are 422 on the REST route but fine through the
@@ -11701,9 +11703,7 @@ async function submitSoCreate(statusOverride) {
             try {
                 const resp = await submitSoRest(body);
                 _soCreateRoute = 'rest';
-                const created = extractCreatedSo(resp);
-                await stampIssuedDate(body, created);
-                return { route: 'rest', created };
+                return { route: 'rest', created: extractCreatedSo(resp) };
             } catch (err) {
                 const st = restErrStatus(err);
                 // Route absent on this server build — this is the only case
