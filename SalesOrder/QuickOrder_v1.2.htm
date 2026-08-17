@@ -4179,6 +4179,10 @@ let _uoms = [];           // [{code, name}] active UOMs — populates the Prefer
 // Customer addresses — populated when a customer is selected. Drives the
 // ship-to / bill-to selectors required by the ImportSalesOrder CSV.
 let _customerAddresses = [];   // [{id, label, recipient, street, city, state, zip, country, defaultFlag, typeId, typeName, residential}]
+// Typed contact rows for the selected customer's account — one value per
+// row (phone, email, fax...). Resolved to the order's phone/email by
+// orderContact(). [{id, addressId, typeId, name, value, defaultFlag}]
+let _customerContacts = [];
 let _selectedShipToId = null;  // pointer into _customerAddresses
 let _selectedBillToId = null;
 
@@ -6250,6 +6254,64 @@ function addressUsable(a) {
     return !!(a && a.street && (a.city || a.state || a.zip));
 }
 
+// Contact types. Fishbowl models a "contact" as one typed value per row —
+// contact.datus holds the number or address, contact.typeId says which kind.
+// Main (50) is the phone the order should carry; Email (60) the address.
+const CONTACT_TYPE_MAIN  = 50;
+const CONTACT_TYPE_EMAIL = 60;
+
+// Phone + email for the order, resolved against the chosen ship-to.
+//
+// Contacts hang off an ADDRESS, not the account — all 176 in the database do.
+// So prefer the ship-to's own contacts, fall back to the default main office's,
+// and finally to any default contact on the account. That last rung is not
+// theoretical: Allan's Raceway keeps its phone and email on a Ship To address
+// that auto-selection now (correctly) skips as incomplete, so a strict
+// per-address lookup would find nothing for a customer that plainly has both.
+//
+// defaultFlag wins within a type; otherwise first match.
+function orderContact() {
+    const pick = typeId => {
+        const of = pred => {
+            const rows = _customerContacts.filter(c => c.typeId === typeId && pred(c));
+            return (rows.find(c => c.defaultFlag) || rows[0] || null);
+        };
+        const c = of(c => c.addressId === _selectedShipToId)
+               || of(c => c.addressId === _selectedBillToId)
+               || of(() => true);
+        return c && c.value ? String(c.value).trim() : '';
+    };
+    return { phone: pick(CONTACT_TYPE_MAIN), email: pick(CONTACT_TYPE_EMAIL) };
+}
+
+async function loadCustomerContacts(customer) {
+    _customerContacts = [];
+    if (!customer || !customer.accountId) return;
+    try {
+        const rows = await qp(`
+            SELECT c.id, c.addressId AS addressid, c.typeId AS typeid,
+                   c.contactName AS contactname, c.datus AS value,
+                   c.defaultFlag AS defaultflag
+            FROM contact c
+            WHERE c.accountId = ${Number(customer.accountId)}
+            ORDER BY c.defaultFlag DESC, c.typeId
+        `);
+        _customerContacts = rows.map(r => ({
+            id: intOf(r.id),
+            addressId: intOf(r.addressid),
+            typeId: intOf(r.typeid),
+            name: r.contactname || '',
+            value: r.value || '',
+            defaultFlag: bitTrue(r.defaultflag),
+        }));
+    } catch (e) {
+        // Non-fatal: the order just goes out without a phone/email, exactly as
+        // it did before these were populated at all.
+        _customerContacts = [];
+        if (DEBUG) qoDebug('loadCustomerContacts failed: ' + e, 'warn');
+    }
+}
+
 async function loadCustomerAddresses(customer) {
     _customerAddresses = [];
     _selectedBillToId = null;
@@ -7963,12 +8025,14 @@ async function selectCustomer(c, skipSave) {
             loadActiveRulesForCustomer(c),
             loadCustomerPartsHistory(c),
             loadCustomerAddresses(c),
+            loadCustomerContacts(c),
         ]);
     } else {
         _activeRules = [];
         _customerParts = new Map();
         _customerLastPrice = new Map();
         _customerAddresses = [];
+        _customerContacts = [];
         _selectedShipToId = _selectedBillToId = null;
         // A 'customer'-mode favourites filter only makes sense with a
         // selected customer — collapse to off when they deselect.
@@ -11187,6 +11251,9 @@ function buildImportPayload(statusOverride) {
     // TaxRateName: send empty when the customer has no default — an
     // empty field tells Fishbowl to apply its own server-side default.
     const taxRateName = cust.taxRateName || '';
+    // Phone/Email columns exist in the importer and were always sent blank.
+    // Same resolution the REST route uses, so both produce the same order.
+    const contact = orderContact();
     // CarrierName: order-level override → customer default → company
     // default. The company fallback exists because sending an empty
     // CarrierName triggers "Unknown Carrier on line number 3" on some
@@ -11255,8 +11322,8 @@ function buildImportPayload(statusOverride) {
         '',                                    // CurrencyRate
         'true',                                // PriceIsHomeCurrency
         '',                                    // DateExpired
-        '',                                    // Phone
-        '',                                    // Email
+        contact.phone,                         // Phone
+        contact.email,                         // Email
         '',                                    // Category
     ];
 
@@ -11453,6 +11520,13 @@ function buildSoRestPayload(statusOverride, opts) {
     // above carry the product's own.
     const custTax = customerTaxRateId();
     if (custTax) body.taxRate = { id: custTax };
+
+    // Contact details for the order, from the ship-to address's contact rows.
+    // Sent only when present — an empty string would overwrite whatever the
+    // server would otherwise inherit from the customer.
+    const contact = orderContact();
+    if (contact.phone)         body.phone            = contact.phone;
+    if (contact.email)         body.email            = contact.email;
 
     const carrierId = effectiveCarrierId(cust);
     if (carrierId)             body.carrier          = { id: carrierId };
