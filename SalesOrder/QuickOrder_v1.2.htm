@@ -6655,6 +6655,12 @@ async function loadProducts() {
             taxRate: parseFloat(r.taxrate) || 0,
             taxCode: r.taxcode || '',
             taxRateName: r.taxratename || '',
+            // product.taxid — the SALES tax rate (part.taxId is the purchase
+            // one; never mix them). The query has always fetched this and the
+            // mapping dropped it, so nothing could send the product's rate on
+            // an order. REST identifies rates by id, which sidesteps
+            // taxrate.code not being unique. See effectiveTaxRateId().
+            taxRateId: intOf(r.taxratetaxid),
             treeIds, treeNames: r.treenames || '',
             uomCode: r.uomcode || '', uomName: r.uomname || '',
         };
@@ -6866,6 +6872,32 @@ function currentFbUsername() {
     }
     if (MODE === 'standalone' && _conn.username) return String(_conn.username);
     return '';
+}
+
+// sysuser.id for the signed-in user, or null.
+//
+// The create endpoint documents salesperson as defaulting to the
+// authenticated user, but an order created for a customer with no default
+// salesman came back with so.salesman = '' — the only one of 56 issued orders
+// in the database without one. So send it explicitly rather than relying on
+// the default. Sending your OWN id never needs SO_EDIT_SALESPERSON, so this
+// cannot introduce a 403 that wasn't already there.
+//
+// Resolved once per session and cached, including the failure, so a lookup
+// that returns nothing does not re-query on every order.
+let _currentUserId;          // undefined = not yet looked up, null = none
+async function currentFbUserId() {
+    if (_currentUserId !== undefined) return _currentUserId;
+    _currentUserId = null;
+    const name = currentFbUsername();
+    if (!name) return null;
+    try {
+        const rows = await qp(`SELECT id FROM sysuser WHERE userName = ${sqlStr(name)} LIMIT 1`);
+        if (rows && rows.length) _currentUserId = intOf(rows[0].id);
+    } catch (e) {
+        if (DEBUG) qoDebug('currentFbUserId lookup failed: ' + e, 'warn');
+    }
+    return _currentUserId;
 }
 
 // Escape a string for a single-quoted SQL literal. This report otherwise
@@ -10537,6 +10569,51 @@ function cartSubtotal() {
 // tax rate wins when configured — every taxable line then shares that
 // code. Otherwise falls back to the product's own taxrate.code. Empty
 // string when the product isn't taxable (caller should suppress the pill).
+// The customer's tax rate id, or null when they have none.
+//
+// "No tax code" reaches us in several shapes depending on the transport —
+// null, undefined, '', or the string '0' — and every one of them must mean
+// "fall through to the product", not "rate id zero". Number('') is 0 and
+// Number(null) is 0, so a bare `Number(x) || null` would be right by accident
+// while `if (x != null)` would be wrong; test the parsed value explicitly.
+function customerTaxRateId() {
+    const raw = _selectedCustomer && _selectedCustomer.taxRateId;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+// The tax rate id that should land on one order line.
+//
+// Customer default wins; failing that the product carries its own. This is
+// what the server cannot work out for us: with no order taxRate supplied it
+// falls back to the SYSTEM default rate, which in this database is "None"
+// (rate 0, defaultFlag set) — so every line came back taxId 1 and
+// taxableFlag 0 even though the products are flagged taxable. The apidocs are
+// explicit that "the line's taxableFlag is derived from the resolved tax
+// rate (None => false)", so sending the right rate fixes both at once.
+//
+// 55 of 150 products carry their own taxid, so this is the difference between
+// a correct order and a zero-rated one for a third of the catalogue.
+function effectiveTaxRateId(product) {
+    const cust = customerTaxRateId();
+    if (cust) return cust;
+    const own = product && parseInt(product.taxRateId, 10);
+    if (Number.isFinite(own) && own > 0) return own;
+    // UOM-group fallback, mirroring taxCodeForLine() exactly — same index,
+    // same skip-self, same source list. Sibling variants of one part often
+    // have the rate set on only one of them.
+    if (product && product.partId != null) {
+        for (const sid of (_partGroups.get(product.partId) || [])) {
+            if (sid === product.id) continue;
+            const s = _allProducts.find(x => x.id === sid);
+            if (!s) continue;
+            const sibId = parseInt(s.taxRateId, 10);
+            if (Number.isFinite(sibId) && sibId > 0) return sibId;
+        }
+    }
+    return null;
+}
+
 function taxCodeForLine(product) {
     if (!product) return '';
     // Treat the line as taxable if EITHER taxableFlag is set OR a tax
@@ -11333,32 +11410,59 @@ function buildSoRestPayload(statusOverride, opts) {
         customerContact: ship.recipient || cust.name,
         shipToAddress: addrForRest(ship, cust),
         billToAddress: addrForRest(bill, cust),
-        soItems: [..._cart.entries()].map(([pid, line], i) => ({
-            product:    { id: pid },
-            type:       { id: SOITEM_TYPE_SALE },
-            lineNumber: i + 1,
-            // Strings, matching the documented example — these are decimals
-            // and JSON numbers would risk float noise on the wire.
-            quantity:   String(line.qty),
-            unitPrice:  String(line.resolved?.price ?? line.product?.price ?? 0),
-        })),
+        soItems: [..._cart.entries()].map(([pid, line], i) => {
+            const item = {
+                product:    { id: pid },
+                type:       { id: SOITEM_TYPE_SALE },
+                lineNumber: i + 1,
+                // Strings, matching the documented example — these are decimals
+                // and JSON numbers would risk float noise on the wire.
+                quantity:   String(line.qty),
+                unitPrice:  String(line.resolved?.price ?? line.product?.price ?? 0),
+            };
+            // Per-line rate only when the customer has no default of their
+            // own — otherwise the order-level rate below covers every line,
+            // and repeating it per line would trip the US-database rule that
+            // a line rate must equal the order rate or None.
+            if (!customerTaxRateId()) {
+                const lineTax = effectiveTaxRateId(line.product);
+                if (lineTax) item.taxRate = { id: lineTax };
+            }
+            return item;
+        }),
     };
 
     // The customer's salesman, preserving the CSV's commission attribution.
     // Requires SO_EDIT_SALESPERSON when it isn't the signed-in user; the
     // caller retries without it on a 403 rather than failing the order.
-    if (!(opts && opts.omitSalesperson) && cust.salesmanId) {
-        body.salesperson = { id: cust.salesmanId };
+    // Falling back to the signed-in user (resolved by the caller and passed
+    // in) covers customers with no default salesman, who were otherwise
+    // landing orders with an empty so.salesman.
+    if (!(opts && opts.omitSalesperson)) {
+        const salesId = cust.salesmanId || (opts && opts.fallbackSalespersonId);
+        if (salesId) body.salesperson = { id: salesId };
     }
+
+    // Order-level tax rate. Omitting it does NOT mean "work it out per line":
+    // the server falls back to the customer's default and then to the SYSTEM
+    // default, which in this database is "None" (rate 0). That is how an order
+    // of four taxable products came back fully zero-rated. Send the customer's
+    // rate explicitly when they have one; when they do not, the per-line rates
+    // above carry the product's own.
+    const custTax = customerTaxRateId();
+    if (custTax) body.taxRate = { id: custTax };
 
     const carrierId = effectiveCarrierId(cust);
     if (carrierId)             body.carrier          = { id: carrierId };
     if (_despatchLg && _despatchLg.id) body.locationGroup = { id: _despatchLg.id };
     if (_orderCustomerPO)      body.customerPoNumber = _orderCustomerPO;
     if (_orderNote)            body.note             = _orderNote;
-    // Sent as the raw YYYY-MM-DD from the date input — NOT reformatted through
-    // MOMENT_FMT the way the CSV needs, because the API takes ISO dates.
-    if (_orderDateScheduled)   body.dateScheduled    = _orderDateScheduled;
+    // Scheduled date defaults to today when the rep left it blank, matching
+    // what the CSV route has always done. Without this the REST route left
+    // so.dateFirstShip null, so the Orders view had no Scheduled date to show.
+    // Raw YYYY-MM-DD — the API takes ISO dates, unlike the CSV which needs
+    // MOMENT_FMT.
+    body.dateScheduled = _orderDateScheduled || moment().format('YYYY-MM-DD');
 
     return body;
 }
@@ -11454,35 +11558,42 @@ async function submitSoImport(csvBody, payload) {
 // Throws on failure with err.status set, which is what submitSoCreate() reads
 // to tell "route missing" (404/405) from a real rejection.
 async function submitSoRest(body) {
-    const json = JSON.stringify(body);
-    if (DEBUG) qoDebug('POST /api/sales-orders body: ' + json);
+    return submitSoRestPath('/api/sales-orders', body);
+}
+
+// POST to a sales-order REST path in whichever transport this MODE has.
+// Factored out of submitSoRest so the issue endpoint (which takes no body)
+// reuses the same auth, error translation and portal server-status handling
+// rather than growing a second, subtly different copy.
+async function submitSoRestPath(path, body) {
+    const json = body === undefined ? null : JSON.stringify(body);
+    if (DEBUG) qoDebug('POST ' + path + (json ? ' body: ' + json : ' (no body)'));
 
     if (typeof runRestApiAsync === 'function') {
-        const resp = await runRestApiAsync({
-            method: 'POST',
-            path:   '/api/sales-orders',
-            body:   json,
-            contentType: 'application/json',
-        });
-        if (DEBUG) qoDebug('runRestApiAsync /api/sales-orders response: ' + JSON.stringify(resp));
+        const req = { method: 'POST', path, contentType: 'application/json' };
+        if (json !== null) req.body = json;
+        const resp = await runRestApiAsync(req);
+        if (DEBUG) qoDebug('runRestApiAsync ' + path + ' response: ' + JSON.stringify(resp));
         return resp;
     }
 
     if (MODE === 'standalone' && !_conn.token) {
         throw new Error('Not connected — log in via the header Connect button.');
     }
-    const url = _conn.baseUrl.replace(/\/$/, '') + '/api/sales-orders';
+    const url = _conn.baseUrl.replace(/\/$/, '') + path;
     const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
     if (_conn.token) headers.Authorization = 'Bearer ' + _conn.token;
     let res;
     try {
-        res = await fetch(url, { method: 'POST', headers, body: json });
+        const init = { method: 'POST', headers };
+        if (json !== null) init.body = json;
+        res = await fetch(url, init);
     } catch (e) {
         if (MODE === 'portal') noteServerError();
-        throw new Error('Network error creating SO: ' + (e && e.message || e));
+        throw new Error('Network error calling ' + path + ': ' + (e && e.message || e));
     }
     const text = await res.text().catch(() => '');
-    if (DEBUG) qoDebug('REST /api/sales-orders ' + res.status + ': ' + text.slice(0, 400));
+    if (DEBUG) qoDebug('REST ' + path + ' ' + res.status + ': ' + text.slice(0, 400));
     if (!res.ok) {
         if (MODE === 'portal' && res.status >= 500) noteServerError();
         let detail = text;
@@ -11538,6 +11649,34 @@ let _soCreateRoute = 'unknown';   // 'unknown' | 'rest' | 'csv'
 
 // Create the order, preferring REST and falling back to the CSV importer.
 // Returns { route, created } where created is {id, num} or null.
+// Creating with status "Issued" issues the order — the allocation runs and a
+// pick is produced — but leaves so.dateIssued null. Verified: of 56 issued
+// orders in the database, the only one without an issue date is the one this
+// report created that way. The Orders view reads that column, so the order
+// showed a blank Issued date.
+//
+// POST /sales-orders/:id/issue is the documented way to issue, and stamps it.
+// Called AFTER a successful create rather than replacing the status on the
+// create: the order is already correct apart from this field, so a failure
+// here must not lose it. Best-effort and non-throwing for the same reason —
+// worst case the date stays blank, exactly as it is today.
+async function stampIssuedDate(body, created) {
+    if (!body || body.status !== 'Issued') return;
+    const id = created && created.id;
+    if (!id) {
+        if (DEBUG) qoDebug('Issued order created but the response carried no id — '
+                         + 'cannot stamp the issue date.', 'warn');
+        return;
+    }
+    try {
+        await submitSoRestPath('/api/sales-orders/' + encodeURIComponent(id) + '/issue');
+        if (DEBUG) qoDebug('Stamped the issue date on SO id ' + id + '.');
+    } catch (e) {
+        qoDebug('Order created, but stamping the issue date failed: ' + (e && e.message || e)
+              + ' — the order is issued, its Issued date is blank.', 'warn');
+    }
+}
+
 async function submitSoCreate(statusOverride) {
     // Kits / drop-ship lines are 422 on the REST route but fine through the
     // importer, so divert the whole order rather than fail it.
@@ -11555,13 +11694,16 @@ async function submitSoCreate(statusOverride) {
     }
 
     if (_soCreateRoute !== 'csv') {
+        const fallbackSalespersonId = await currentFbUserId();
         for (const omitSalesperson of [false, true]) {
-            const body = buildSoRestPayload(statusOverride, { omitSalesperson });
+            const body = buildSoRestPayload(statusOverride, { omitSalesperson, fallbackSalespersonId });
             if (!body) throw new Error('Could not build the order payload.');
             try {
                 const resp = await submitSoRest(body);
                 _soCreateRoute = 'rest';
-                return { route: 'rest', created: extractCreatedSo(resp) };
+                const created = extractCreatedSo(resp);
+                await stampIssuedDate(body, created);
+                return { route: 'rest', created };
             } catch (err) {
                 const st = restErrStatus(err);
                 // Route absent on this server build — this is the only case
