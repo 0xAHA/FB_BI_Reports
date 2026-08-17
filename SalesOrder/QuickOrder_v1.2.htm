@@ -2305,6 +2305,24 @@ body.pv-signed-measure .pivot-table tbody td.pv-neg { color: var(--fb-negative);
         }
         .qo-login-card .modal-row input:focus { border-color: var(--c-tertiary); }
         .qo-login-card .modal-row .modal-hint { font-size: 10px; color: var(--muted-2); }
+        /* Multi-factor row — tinted so it reads as the server asking a
+           question, not another field that was there all along. It appears
+           mid-dialog only after the first login attempt comes back
+           challenged. */
+        .qo-login-card .qo-mfa-row {
+            background: var(--tint-blue); border: 1px solid var(--tint-blue-2);
+            border-radius: var(--r-btn); padding: 8px 10px; gap: 5px;
+        }
+        .qo-login-card .qo-mfa-row label { color: var(--fb-blue-accent); }
+        .qo-login-card .qo-mfa-row input[type=text] {
+            font-variant-numeric: tabular-nums; letter-spacing: 0.12em;
+        }
+        .qo-login-card .qo-mfa-row .qo-mfa-trust {
+            display: flex; align-items: center; gap: 6px;
+            text-transform: none; letter-spacing: 0; font-weight: 500;
+            color: var(--muted); font-size: 11px; cursor: pointer;
+        }
+        .qo-login-card .qo-mfa-row .qo-mfa-trust input { width: auto; }
         .qo-login-card .modal-actions {
             display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px;
         }
@@ -3087,12 +3105,26 @@ body.pv-signed-measure .pivot-table tbody td.pv-neg { color: var(--fb-negative);
             <input type="password" id="qoConnPass" autocomplete="current-password" />
             <span class="modal-hint">Not stored. Only the resulting session token is cached.</span>
         </div>
+        <!-- Multi-factor code. Hidden until the server answers the first login
+             with 401 + an "MFA: Required" header; submitLogin() reveals it and
+             re-sends the SAME credentials plus the code. Always in the DOM so
+             fbLogin() can read .value without a null check. -->
+        <div class="modal-row qo-mfa-row" id="qoConnMfaRow" style="display:none;">
+            <label for="qoConnMfaCode">Multi-factor code</label>
+            <input type="text" id="qoConnMfaCode" inputmode="numeric" maxlength="10"
+                   autocomplete="one-time-code" placeholder="123456" />
+            <label class="qo-mfa-trust">
+                <input type="checkbox" id="qoConnTrustDevice" checked />
+                <span>Remember this device, so Fishbowl stops asking here</span>
+            </label>
+            <span class="modal-hint">6-digit code from this user's authenticator app. Codes expire every 30 seconds.</span>
+        </div>
         <details class="qo-adv" id="qoConnAdvanced">
             <summary>Advanced — application identity</summary>
             <p class="qo-adv-note">
                 This report signs in as a registered Integrated Application. If login fails with an
                 approval error, an admin needs to approve it under
-                <strong>Fishbowl → Maintenance → Integrated Applications</strong>.
+                <strong>Fishbowl → Setup → Settings → Integrated Apps</strong>.
                 Change these only if it was registered under a different name or ID.
             </p>
             <div class="modal-row">
@@ -5037,15 +5069,64 @@ async function standaloneQuery(sql) {
     return lowercaseKeys(rows);
 }
 
+// Stable per-device id for Fishbowl's trusted-device list.
+//
+// Sent alongside a successful MFA code, it writes a `trusteddevice` row against
+// the user with an expiry, and Fishbowl stops challenging this browser until
+// that expires. It has to survive reloads — a fresh id every login would mint a
+// new trusted-device row each time and never actually stop the prompts.
+//
+// Goes through _readSettings/_writeSettings so it lands wherever this MODE
+// persists things. In standalone that is localStorage, which Fishbowl is known
+// to clear periodically; the cost of losing it is one more code prompt, and it
+// re-seeds itself on the next challenge.
+function qoDeviceId() {
+    const KEY = 'cdx.bi.quickorder.deviceid.v1';
+    let id = '';
+    try { id = _readSettings(KEY) || ''; } catch (_) {}
+    if (!id) {
+        id = 'quickorder-' + ((typeof crypto !== 'undefined' && crypto.randomUUID)
+            ? crypto.randomUUID()
+            : Math.random().toString(36).slice(2) + Date.now().toString(36));
+        try { _writeSettings(KEY, id); } catch (_) {}
+    }
+    return id;
+}
+
 // Authenticate against /api/login. Returns the bearer token on success.
-async function fbLogin(baseUrl, username, password, appName, appId) {
+//
+// MFA: an account with multi-factor enabled answers the FIRST attempt with 401
+// and a response HEADER — `MFA: Required` — while the body reads like an
+// ordinary failure. Code that only inspects the body reports "login failed" and
+// the user has no idea a code was wanted. The retry must repeat the SAME
+// payload with `mfaCode` added; it is not a separate endpoint.
+//
+// On a challenge this throws an Error carrying `.mfaRequired = true` so the
+// caller can reveal its code field and call again, rather than having to parse
+// the message back out.
+//
+// opts: { mfaCode, trustDevice }
+async function fbLogin(baseUrl, username, password, appName, appId, opts) {
     const url = baseUrl.replace(/\/$/, '') + '/api/login';
+    const body = { appName, appId: parseInt(appId, 10) || 102, username, password };
+    const mfaCode = opts && opts.mfaCode ? String(opts.mfaCode).trim() : '';
+    if (mfaCode) {
+        body.mfaCode = mfaCode;
+        // deviceId only rides along WITH a code — it is what seeds the trusted
+        // device, and sending it on an unchallenged login achieves nothing.
+        if (opts.trustDevice) body.deviceId = qoDeviceId();
+    } else {
+        // No code to hand over, but if this device was trusted earlier the id
+        // is what lets the server skip the challenge entirely.
+        const known = (() => { try { return _readSettings('cdx.bi.quickorder.deviceid.v1') || ''; } catch (_) { return ''; } })();
+        if (known) body.deviceId = known;
+    }
     let res;
     try {
         res = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ appName, appId: parseInt(appId, 10) || 102, username, password }),
+            body: JSON.stringify(body),
         });
     } catch (e) {
         // Surface the underlying error verbatim — WKWebView typically
@@ -5063,14 +5144,29 @@ async function fbLogin(baseUrl, username, password, appName, appId) {
     const txt = await res.text();
     let parsed = null;
     try { parsed = JSON.parse(txt); } catch (_) {}
-    if (res.status === 401 && parsed && /approval/i.test(parsed.message || parsed.Message || '')) {
+    const bodyMsg = (parsed && (parsed.message || parsed.Message || parsed.error)) || txt || '';
+
+    // Approval is checked BEFORE credentials, so this can fire even when the
+    // username is wrong — fix approval first, then judge the credentials.
+    if (res.status === 401 && /approval|new integrated application/i.test(bodyMsg)) {
         throw new Error('App "' + appName + '" registered but not yet approved. An admin must approve it in '
-            + 'Fishbowl → Maintenance → Integrated Applications.');
+            + 'Fishbowl → Setup → Settings → Integrated Apps.');
     }
-    if (!res.ok) {
-        const msg = (parsed && (parsed.message || parsed.Message || parsed.error)) || txt || ('HTTP ' + res.status);
-        throw new Error(msg);
+
+    // The MFA challenge. Header first — Headers.get is case-insensitive, so the
+    // server's exact casing does not matter. The body test is a fallback for a
+    // proxy that strips unknown headers, which would otherwise turn a solvable
+    // challenge into a dead "login failed".
+    const mfaHdr = (res.headers.get('MFA') || '').trim().toLowerCase();
+    if (res.status === 401 && (mfaHdr === 'required' || /multi-?factor|\bmfa\b/i.test(bodyMsg))) {
+        const err = new Error(mfaCode
+            ? 'That code was rejected — codes expire every 30 seconds, so enter the current one.'
+            : 'This account uses multi-factor authentication. Enter the 6-digit code from its authenticator app.');
+        err.mfaRequired = true;
+        err.mfaRejected = !!mfaCode;
+        throw err;
     }
+    if (!res.ok) throw new Error(bodyMsg || ('HTTP ' + res.status));
     const tok = parsed && (parsed.token || parsed.Token || parsed.access_token);
     if (!tok) throw new Error('Login OK but no token field in the response.');
     return tok;
@@ -5620,6 +5716,13 @@ function openConnModal() {
                 || (_conn.appId   && Number(_conn.appId) !== 102);
     }
     document.getElementById('qoLoginError').classList.remove('show');
+    // Start every open un-challenged. The row is revealed by submitLogin() only
+    // when THIS server says so — leaving a previous challenge on screen would
+    // ask for a code before anything had asked for one.
+    const mfaRow = document.getElementById('qoConnMfaRow');
+    const mfaEl  = document.getElementById('qoConnMfaCode');
+    if (mfaRow) mfaRow.style.display = 'none';
+    if (mfaEl) mfaEl.value = '';
     document.getElementById('qoConnDisconnect').style.display = _conn.token ? '' : 'none';
     document.getElementById('qoLoginModal').classList.add('open');
     setTimeout(() => {
@@ -5651,7 +5754,15 @@ async function submitLogin() {
     btn.disabled = true;
     btn.textContent = 'Logging in…';
     try {
-        const tok = await fbLogin(baseUrl, username, password, appName, appId);
+        const mfaRow  = document.getElementById('qoConnMfaRow');
+        const mfaEl   = document.getElementById('qoConnMfaCode');
+        const trustEl = document.getElementById('qoConnTrustDevice');
+        const tok = await fbLogin(baseUrl, username, password, appName, appId, {
+            mfaCode: mfaEl ? mfaEl.value : '',
+            trustDevice: !!(trustEl && trustEl.checked),
+        });
+        if (mfaRow) mfaRow.style.display = 'none';
+        if (mfaEl) mfaEl.value = '';
         _conn.baseUrl = baseUrl;
         _conn.username = username;
         _conn.appName = appName;
@@ -5667,6 +5778,20 @@ async function submitLogin() {
     } catch (e) {
         errEl.textContent = e.message || String(e);
         errEl.classList.add('show');
+        // A challenge is not a failed login — the credentials were accepted as
+        // far as the server has gone. Reveal the code field and leave the
+        // dialog open so the user can finish, rather than making them retype
+        // everything. A REJECTED code clears the box; a first challenge keeps
+        // whatever is there.
+        if (e && e.mfaRequired) {
+            const row = document.getElementById('qoConnMfaRow');
+            const el  = document.getElementById('qoConnMfaCode');
+            if (row) row.style.display = '';
+            if (el) {
+                if (e.mfaRejected) el.value = '';
+                el.focus();
+            }
+        }
     } finally {
         btn.disabled = false;
         btn.textContent = 'Log In';
@@ -13179,7 +13304,7 @@ async function init() {
           + 'against your Fishbowl server. Click <strong>Connect…</strong> in the header to log in.'
           + '</p>'
           + '<p style="font-size:11px;color:var(--c-tertiary);line-height:1.5;margin:0;">'
-          + 'You must first register this app in <em>Fishbowl → Maintenance → Integrated Applications</em> '
+          + 'You must first register this app in <em>Fishbowl → Setup → Settings → Integrated Apps</em> '
           + 'and have an admin approve it. Once connected, your credentials persist on this device until you log out.'
           + '</p></div>';
         openConnModal();
