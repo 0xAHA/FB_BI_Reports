@@ -1,21 +1,39 @@
 @echo off
 title Fishbowl Quick Order Launcher
-set "FILE=%~dp0QuickOrder.htm"
+:: Optional argument: the report to open, defaulting to v1.0.
+::   Launch_QuickOrder.bat QuickOrder_v1.2.htm
+set "REPORT=%~1"
+if "%REPORT%"=="" set "REPORT=QuickOrder.htm"
+set "FILE=%~dp0%REPORT%"
 set "TMPDIR=%TEMP%\FBQuickOrder"
+
+if not exist "%FILE%" (
+  echo ERROR: No such report next to this launcher:
+  echo   %FILE%
+  echo.
+  pause
+  exit /b 1
+)
 
 echo =========================================
 echo  Fishbowl Quick Order (Standalone)
 echo =========================================
+echo.
+echo Report: %REPORT%
 echo.
 echo Opens the report with CORS security disabled
 echo so it can reach your Fishbowl server's REST
 echo API. Uses a separate temporary browser profile
 echo so your normal browsing is unaffected.
 echo.
-echo NOTE: Standalone mode is read-only — you can
-echo browse the catalogue and build quotes, but
-echo sales-order creation requires the Fishbowl
-echo desktop client.
+echo *** WARNING: THIS IS NOT READ-ONLY. ***
+echo.
+echo Standalone mode can CREATE REAL SALES ORDERS
+echo on whatever server you log in to. Point it at
+echo a test server, or treat anything you click as
+echo permanent. (This launcher used to say the
+echo opposite; that stopped being true when REST
+echo sales-order creation was added.)
 echo.
 
 :: ---- Try Google Chrome ----
