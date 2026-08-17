@@ -5795,27 +5795,48 @@ function currentFbUsername() {
 // updating one. Every favourites save on such a customer minted a duplicate.
 const CSV_CONTENT_TYPE = 'text/plain; charset=utf-8';
 
+// CSV fields must not contain a raw newline.
+//
+// RFC 4180 allows one inside quotes. Fishbowl's importer does not: it splits
+// the body into rows BEFORE it honours quoting, and so does our own legacy
+// runApiRequest branch (`csvBody.split('\n')` in _postCustomerImportCsv).
+// Either way one row tears into two, the second with the wrong column count,
+// and the import dies with an unhandled 500 carrying no message at all.
+//
+// Cost a real site every favourites save on one customer while every other
+// customer worked -- the difference being a two-line main-office address,
+// "Australia Fair Shopping Centre\n42 Marine Parade".
+//
+// Collapsing to a space FLATTENS the stored value, because ImportCustomer
+// demands the address columns on every update, so each save rewrites the
+// address. That is the trade: a one-line address that saves, against a
+// two-line one that cannot.
+function csvSafe(v) {
+    return String(v ?? '').replace(/\s*[\r\n]+\s*/g, ' ');
+}
+
 // Should the import-path prober try the NEXT candidate, or stop and report?
 //
-// Stop only when the server said WHY. An unresolvable :name on
-// POST /api/import/:name answers 500 with a bare Spring error body --
-// {"timeStamp":...,"status":500,"path":"/api/import/Customer"} -- carrying no
-// message at all. Reading that as a genuine rejection is what stopped the
-// prober on its first candidate, so it never reached the correct path.
-//
-// A row-level rejection (bad column, missing address, stale row) always comes
-// back with text. So: text present -> real failure, stop. No text -> the name
-// did not resolve, keep probing.
+// Only on an explicit not-found. This used to also infer "wrong path" from a
+// 500 whose body carried no message -- on the theory that an unresolvable
+// :name answers that way and a genuine rejection always says why. The second
+// half is false: an unhandled server-side exception (the newline above) gives
+// exactly the same messageless 500, so the rule turned a real failure into
+// four pointless retries against paths that do not exist, and reported the
+// last one. A 500 means the endpoint took the request and the request failed.
 function looksLikeUnresolvedImport(err) {
-    const msg = String((err && err.message) || err || '');
-    if (/import not found|not found|404/i.test(msg)) return true;
-    const brace = msg.indexOf('{');
-    if (brace < 0) return false;
-    let body;
-    try { body = JSON.parse(msg.slice(brace)); } catch (_) { return false; }
-    if (!body || typeof body !== 'object') return false;
-    const said = body.message || body.error || body.detail || body.statusMessage;
-    return !(said && String(said).trim());
+    // Search the message AND the object: runRestApiAsync rejects with the
+    // PARSED response body, so there is no .message and String(err) is
+    // "[object Object]" -- reading .message alone never saw that shape.
+    if (Number(err && (err.status || err.statusCode)) === 404) return true;
+    let hay = String((err && err.message) || '');
+    if (err && typeof err === 'object') {
+        try { hay += ' ' + JSON.stringify(err); } catch (_) { /* cyclic */ }
+    }
+    if (!hay.trim()) hay = String(err || '');
+    // Deliberately NOT a bare /not found/ -- a row-level rejection naming a
+    // missing product or address would match it and send us probing again.
+    return /import not found|no such import|unknown import|\bhttp 404\b/i.test(hay);
 }
 
 // Readable text out of anything thrown or rejected. Error paths were showing
@@ -7293,7 +7314,7 @@ async function createFavCustomFields(names) {
         sortBase = (rows && rows.length ? intOf(rows[0].maxsort) : 0) || 0;
     } catch (_) { /* cosmetic only */ }
 
-    const enc = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+    const enc = v => '"' + csvSafe(v).replace(/"/g, '""') + '"';
     const cols = ['FieldName', 'Description', 'Type', 'ModuleName', 'Required', 'SortOrder', 'Active', 'ListName'];
     const csvRows = [cols.map(enc).join(',')];
     names.forEach((nm, i) => {
@@ -7573,7 +7594,7 @@ async function writeCustomerFavourites(cust, productIds) {
         if (DEBUG) qoDebug('writeCustomerFavourites: no favourites CF columns to write — skipped', 'warn');
         return { ok: true };
     }
-    const enc = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+    const enc = v => '"' + csvSafe(v).replace(/"/g, '""') + '"';
 
     // Columns:
     //   Name              — identity key (matches the existing customer)
@@ -9992,14 +10013,17 @@ function renderCart() {
 // Wire pattern (from PPP_Pricing_Validator.htm L2871, the canonical example):
 //   runApiRequest('ImportRq', JSON.stringify({ImportRq:{Type, Rows:{Row:[…]}}}))
 
-// CSV field escaper. Wraps in double-quotes when the value contains
-// comma, quote, or newline; escapes embedded quotes by doubling them.
-// Always emits empty fields as "" (safer for the import parser than
+// CSV field escaper. Always quotes; escapes embedded quotes by doubling
+// them. Always emits empty fields as "" (safer for the import parser than
 // bare commas). Null/undefined → empty string.
+//
+// Newlines are stripped by csvSafe BEFORE quoting — see its note. This
+// matters here as well as on the customer import: the order Note is a
+// textarea, so a multi-line note would otherwise tear the SO row in half
+// when submitSoImport joins the rows with '\n'.
 function csvField(v) {
     if (v == null) return '""';
-    const s = String(v);
-    return '"' + s.replace(/"/g, '""') + '"';
+    return '"' + csvSafe(v).replace(/"/g, '""') + '"';
 }
 
 // Format today (or any date) in the FB-configured short format. Used
