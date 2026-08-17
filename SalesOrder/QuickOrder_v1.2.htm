@@ -6974,6 +6974,58 @@ async function currentFbUserId() {
     return _currentUserId;
 }
 
+// CSV import bodies MUST declare UTF-8.
+//
+// For text/* with no charset parameter, servers fall back to ISO-8859-1 (the
+// old HTTP/1.1 default, still Jetty's behaviour). fetch() always encodes the
+// body as UTF-8, so every non-ASCII character was being written with its UTF-8
+// bytes and read back as Latin-1 — one character in, several out.
+//
+// A customer named with a typographic apostrophe shows the damage plainly:
+//
+//   Pierre’s Pastry            U+2019 = UTF-8 E2 80 99
+//   Pierreâ€™s Pastry          the same bytes read as Latin-1
+//
+// The â is E2; € and ™ are unprintable in most fonts and render as boxes.
+// A plain ASCII apostrophe (U+0027, one byte) survives untouched, which is
+// why most customers were unaffected and only the ones typed or pasted from
+// Word — which autocorrects ' to ’ — broke.
+//
+// The consequence was worse than a display glitch: the importer matches
+// customers BY NAME, so a mangled name matched nothing and the import created
+// a NEW customer instead of updating the existing one. Every favourites save
+// on such a customer minted another duplicate.
+const CSV_CONTENT_TYPE = 'text/plain; charset=utf-8';
+
+// Readable text out of anything thrown or rejected.
+//
+// Error paths were reporting "[object Object]" and "[500] undefined" — a
+// rejection carrying {status, detail} has no .message, so `err.message || err`
+// stringifies the object and `${err.message}` prints undefined. Both hid the
+// server's actual complaint at exactly the moment it was needed.
+function errText(err) {
+    if (err == null) return 'unknown error';
+    if (typeof err === 'string') return err;
+    const parts = [];
+    if (err.status) parts.push('[' + err.status + ']');
+    const body = err.message || err.detail || err.error
+              || (err.response && (err.response.message || err.response.detail));
+    if (body) {
+        parts.push(String(body));
+    } else {
+        // No conventional field. Dump the object rather than let it stringify
+        // to "[object Object]" — but drop the dump when status was its only
+        // content, since that is already in the prefix.
+        let dump = '';
+        try { dump = JSON.stringify(err) || ''; } catch (_) { dump = ''; }
+        const onlyStatus = dump === '{"status":' + JSON.stringify(err.status) + '}';
+        if (dump && dump !== '{}' && !onlyStatus) parts.push(dump.slice(0, 300));
+    }
+    // Never fall through to String(err) — that is the "[object Object]" this
+    // function exists to prevent.
+    return parts.join(' ') || 'unknown error (no message on the response)';
+}
+
 // Escape a string for a single-quoted SQL literal. This report otherwise
 // never puts free text in a query — the orders search is filtered in JS
 // precisely to avoid that — but the salesman filter has to compare against
@@ -8603,7 +8655,7 @@ function queueCustomerFavouritesSave() {
         if (!cust) return;
         writeCustomerFavourites(cust, [..._customerFavourites]).catch(err => {
             console.warn('writeCustomerFavourites failed:', err);
-            showToast('Could not save customer favourites: ' + (err.message || err), 'error', 6000);
+            showToast('Could not save customer favourites: ' + errText(err), 'error', 6000);
         });
     }, 600);
 }
@@ -8858,7 +8910,7 @@ async function _postCustomerImportCsv(path, csvBody) {
             method: 'POST',
             path,
             body: csvBody,
-            contentType: 'text/plain',
+            contentType: CSV_CONTENT_TYPE,
         });
     }
     if (MODE === 'fishbowl' && typeof runApiRequest === 'function') {
@@ -8883,7 +8935,7 @@ async function _postCustomerImportCsv(path, csvBody) {
         throw new Error('Not connected — log in via the header Connect button.');
     }
     const url = _conn.baseUrl.replace(/\/$/, '') + path;
-    const headers = { 'Content-Type': 'text/plain', 'Accept': 'application/json, text/plain' };
+    const headers = { 'Content-Type': CSV_CONTENT_TYPE, 'Accept': 'application/json, text/plain' };
     if (_conn.token) headers.Authorization = 'Bearer ' + _conn.token;
     const res = await fetch(url, { method: 'POST', headers, body: csvBody });
     if (!res.ok) {
@@ -11591,7 +11643,7 @@ async function submitSoImport(csvBody, payload) {
             method: 'POST',
             path:   '/api/import/Sales-Order',
             body:   csvBody,
-            contentType: 'text/plain',
+            contentType: CSV_CONTENT_TYPE,
         });
         if (DEBUG) qoDebug('runRestApiAsync /api/import/Sales-Order response: ' + JSON.stringify(resp));
         return { ok: true, resp };
@@ -11617,7 +11669,7 @@ async function submitSoImport(csvBody, payload) {
     }
     const url = _conn.baseUrl.replace(/\/$/, '') + '/api/import/Sales-Order';
     const headers = {
-        'Content-Type':  'text/plain',
+        'Content-Type':  CSV_CONTENT_TYPE,
         'Accept':        'application/json, text/plain',
     };
     if (_conn.token) headers.Authorization = 'Bearer ' + _conn.token;
@@ -12045,7 +12097,10 @@ async function createSalesOrder() {
         }
     } catch (err) {
         console.error('createSalesOrder failed:', err);
-        const detail = err && err.status ? `[${err.status}] ${err.message}` : (err?.message || String(err));
+        // errText() rather than `[${status}] ${message}` — a rejection with a
+        // status but no .message printed "[500] undefined", which told the rep
+        // nothing and cost a support round trip.
+        const detail = errText(err);
         // When the failure is a server-unreachable signal (502/503/504
         // or network error), the dedicated server-status pill is now
         // visible; the toast can be shorter + friendlier. Cart is
