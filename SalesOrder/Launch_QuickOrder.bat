@@ -1,9 +1,19 @@
 @echo off
 title Fishbowl Quick Order Launcher
-:: Optional argument: the report to open, defaulting to v1.0.
+:: Optional argument: the report to open.
 ::   Launch_QuickOrder.bat QuickOrder_v1.2.htm
+:: With no argument, use whichever report is actually sitting next to this
+:: launcher: v1.0 if present, otherwise v1.2. A hard default of QuickOrder.htm
+:: meant a handover carrying only the v1.2 file failed on the first
+:: double-click, before the recipient had any idea an argument existed.
 set "REPORT=%~1"
-if "%REPORT%"=="" set "REPORT=QuickOrder.htm"
+if "%REPORT%"=="" (
+  if exist "%~dp0QuickOrder.htm" (
+    set "REPORT=QuickOrder.htm"
+  ) else (
+    set "REPORT=QuickOrder_v1.2.htm"
+  )
+)
 set "FILE=%~dp0%REPORT%"
 set "TMPDIR=%TEMP%\FBQuickOrder"
 
@@ -32,12 +42,13 @@ echo Everything you do here hits the real server you
 echo log in to. Point it at a test server unless you
 echo mean it.
 echo.
-echo   QuickOrder_v1.2.htm  CAN create sales orders.
-echo   QuickOrder.htm       cannot - v1.0 keeps its
-echo                        Create button disabled.
+echo Sales orders you create are REAL orders, and
+echo marking a product as a customer favourite writes
+echo back to that customer's record.
 echo.
-echo Either version writes back when you mark a
-echo product as a customer favourite.
+echo (QuickOrder.htm, the older v1.0, is the one
+echo  exception - it keeps its Create button disabled
+echo  outside the Fishbowl client.)
 echo.
 
 :: ---- Try Google Chrome ----
