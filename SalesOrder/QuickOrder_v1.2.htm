@@ -6241,6 +6241,15 @@ async function loadCustomers() {
 // Customer addresses — required for the ImportSalesOrder CSV (BillTo /
 // ShipTo are mandatory columns). Linked via address.accountId, NOT
 // customer.id — see schema-customers-vendors.sql L8.
+// Is this address complete enough to put on an order? A street line alone is
+// not — Fishbowl accumulates stub addresses (typically auto-created from a
+// previous SO) that carry a street and nothing else. Requiring at least one
+// locality field alongside it separates a real address from a placeholder.
+// Used to bias auto-selection and to flag the stubs in the picker.
+function addressUsable(a) {
+    return !!(a && a.street && (a.city || a.state || a.zip));
+}
+
 async function loadCustomerAddresses(customer) {
     _customerAddresses = [];
     _selectedBillToId = null;
@@ -6284,27 +6293,41 @@ async function loadCustomerAddresses(customer) {
     // (the old comment here had them wrong): 10 Ship To, 20 Bill To,
     // 30 Remit To, 40 Home, 50 Main Office.
     //
-    // `first` MUST be able to return null. The previous helper was
-    //     pred => (_customerAddresses.find(pred) || _customerAddresses[0])
-    // which never returns a nullish value while the list is non-empty, so
-    // `first(...)?.id ?? next(...)` short-circuited on the very first branch
-    // and every fallback below it was dead code. A customer with no Bill To
-    // address silently billed to _customerAddresses[0] instead of falling
-    // through to Main Office — and since the ORDER BY is defaultFlag DESC,
-    // typeID ASC, element [0] is typically the SHIP TO address. Allan's
-    // Raceway (Ship To + two Main Office, no Bill To) reproduced it exactly:
-    // bill-to came back as the ship-to address rather than the main office.
+    // Two rules, both learned the hard way:
+    //
+    //  1. Each side falls back to the MAIN OFFICE, never to the other side.
+    //     The original helper was
+    //         pred => (_customerAddresses.find(pred) || _customerAddresses[0])
+    //     which can never return a nullish value while the list is non-empty,
+    //     so every `??` fallback after the first was dead code. A customer
+    //     with no Bill To address billed to element [0] — and since the query
+    //     orders by defaultFlag DESC, typeID ASC, that is usually the SHIP TO
+    //     address.
+    //
+    //  2. Skip addresses too incomplete to order against. Fishbowl accrues
+    //     stub addresses from previous orders — Allan's Raceway carries a
+    //     Ship To row named "New address from SO" with a street line and
+    //     nothing else, no city, state or postcode. Matching purely on type
+    //     selected that stub over the real store address. 24 of 143 addresses
+    //     across 22 accounts are in that state, so this is not one bad row.
+    //     An incomplete address cannot produce a valid order and this report
+    //     has no address editor, so auto-selecting one is a dead end.
+    //
+    // Completeness is only a PREFERENCE: if every address is incomplete the
+    // last resorts still return something, so the pickers are never empty.
     const first = pred => _customerAddresses.find(pred) || null;
     const typeIs = word => a => a.typeName.toLowerCase().includes(word);
     if (_customerAddresses.length) {
-        const fallback = _customerAddresses[0];
-        _selectedShipToId = (first(typeIs('ship'))
-                          || first(a => a.defaultFlag)
-                          || fallback).id;
-        _selectedBillToId = (first(typeIs('bill'))
-                          || first(typeIs('main'))
-                          || first(a => a.defaultFlag)
-                          || fallback).id;
+        const pick = word =>
+               first(a => typeIs(word)(a) && addressUsable(a))   // right type, complete
+            || first(a => typeIs('main')(a) && addressUsable(a)) // the customer's main address
+            || first(addressUsable)                              // any complete address
+            || first(typeIs(word))                               // completeness unavailable
+            || first(typeIs('main'))
+            || first(a => a.defaultFlag)
+            || _customerAddresses[0];
+        _selectedShipToId = pick('ship').id;
+        _selectedBillToId = pick('bill').id;
     }
 }
 
@@ -11820,7 +11843,12 @@ function addressOptionsHtml(selectedId) {
         // address.name nickname if addressName isn't set.
         const primary = a.recipient || a.label;
         const loc = [a.city, a.state].filter(Boolean).join(', ');
-        const lbl = `${glyphFor(a)}  ${primary}${loc ? ' — ' + loc : ''}`;
+        // Stub addresses stay selectable — they are real records and someone
+        // may genuinely want one — but say so, rather than showing a bare
+        // name like "New address from SO" that reads as a normal choice.
+        const lbl = `${glyphFor(a)}  ${primary}`
+                  + (loc ? ' — ' + loc : '')
+                  + (addressUsable(a) ? '' : '  (incomplete — no city/state/postcode)');
         return `<option value="${a.id}"${a.id === selectedId ? ' selected' : ''}>${escapeHtml(lbl)}</option>`;
     }).join('');
 }
