@@ -1638,6 +1638,17 @@
 const BI_SHOW_DEBUG_PROP = (typeof getProperty === 'function' ? getProperty('BI_SHOW_DEBUG', 'false') : null) || 'false';
 const DEBUG_MODE = BI_SHOW_DEBUG_PROP === 'true' || BI_SHOW_DEBUG_PROP === true;
 
+// VERBOSE debug — gates the two things that froze the client when the console was
+// on: (a) the per-call console.log, which is a ~70ms Java-bridge round-trip in
+// JxBrowser (proven by the log: debugLog lines land ~70ms apart while psDiag lines
+// — same code minus console.log — batch in <1ms), and (b) the per-row 'debug'
+// flood (the 90-day capacity scan etc.). OFF unless the BI_SHOW_DEBUG_VERBOSE
+// property is 'true'. Normal debug still shows phase timings, load counts and
+// info/success/warn/error lines — just without the console round-trip.
+const BI_SHOW_DEBUG_VERBOSE_PROP = (typeof getProperty === 'function' ? getProperty('BI_SHOW_DEBUG_VERBOSE', 'false') : null) || 'false';
+const DEBUG_VERBOSE = BI_SHOW_DEBUG_VERBOSE_PROP === 'true' || BI_SHOW_DEBUG_VERBOSE_PROP === true;
+const _DBG_MAX_LINES = 500;   // cap the on-screen drawer so scrollHeight reads stay cheap
+
 // Get date format from Fishbowl settings
 const FB_DATE_FORMAT = typeof getProperty === 'function' ? getProperty('DateFormatShort', 'MM/dd/yyyy') : 'MM/dd/yyyy';
 // Convert Java SimpleDateFormat to moment.js format (dd -> DD, yyyy -> YYYY)
@@ -1742,10 +1753,16 @@ function formatDate(momentObj, includeTime = false) {
 function debugLog(type, message, ...args) {
     // Only log if DEBUG_MODE is enabled
     if (!DEBUG_MODE) return;
+    // 'debug'-type lines are the per-row flood (per-WO hours, the 90-day capacity
+    // scan). Drop them unless verbose so the console stays usable during load.
+    if (type === 'debug' && !DEBUG_VERBOSE) return;
 
     const timestamp = moment().format('HH:mm:ss.SSS');
     const prefix = `[${timestamp}] [${type.toUpperCase()}]`;
-    console.log(prefix, message, ...args);
+    // console.log is a ~70ms Java-bridge round-trip PER CALL in JxBrowser — the
+    // single biggest load-time cost when the console is on. Gate it behind the
+    // verbose flag; the on-screen drawer below is the normal sink.
+    if (DEBUG_VERBOSE) console.log(prefix, message, ...args);
 
     // Add to UI debug console
     const debugLogEl = document.getElementById('debugLog');
@@ -1760,15 +1777,35 @@ function debugLog(type, message, ...args) {
             'success': 'text-emerald-400',
             'error': 'text-red-400',
             'warn': 'text-amber-400',
-            'info': 'text-blue-400'
+            'info': 'text-blue-400',
+            'debug': 'text-slate-400'
         };
         const entry = document.createElement('div');
         entry.className = `${colorMap[type] || 'text-slate-300'} py-0.5`;
         const argsStr = args.length > 0 ? ' ' + args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ') : '';
         entry.textContent = `${prefix} ${message}${argsStr}`;
         debugLogEl.appendChild(entry);
+        // Cap the drawer so a big load doesn't grow an unbounded node list (each
+        // scrollHeight read below forces a layout over the whole subtree).
+        while (debugLogEl.childNodes.length > _DBG_MAX_LINES) debugLogEl.removeChild(debugLogEl.firstChild);
         debugLogEl.scrollTop = debugLogEl.scrollHeight; // Auto-scroll to bottom
     }
+}
+
+// ── Load-time performance instrumentation ────────────────────────────────
+// Times each load phase so an install can see where the seconds actually go —
+// SERVER query time vs CLIENT render / allocation time. Lines print to the
+// debug drawer (Settings ▸ Show debug console); raw marks also accumulate on
+// window._psPerf for ad-hoc inspection. Cost is a handful of performance.now()
+// reads per load (negligible), and the debug sink is gated on DEBUG_MODE.
+const _psPerf = { last: null, runs: [] };
+function _psNow() { try { return performance.now(); } catch (_) { return Date.now(); } }
+function _psPerfLog(phase, parts) {
+    const rec = Object.assign({ phase: phase }, parts);
+    _psPerf.last = rec; _psPerf.runs.push(rec);
+    if (_psPerf.runs.length > 60) _psPerf.runs.shift();   // keep ~last 10 loads (3 tiers each)
+    const seg = Object.keys(parts).map(k => k + ' ' + Math.round(parts[k]) + 'ms').join(' · ');
+    debugLog('info', '⏱ ' + phase + ': ' + seg);
 }
 
 // Diagnostic line — writes straight to the debug drawer whenever it is OPEN
@@ -2267,31 +2304,39 @@ async function _loadWorkOrdersImpl(background) {
              LEFT JOIN part ON woitem.partid = part.id
              WHERE woitem.woid = wo.id AND woitem.typeid = 10
              LIMIT 1) AS part_num,
+            -- The 'Hour' UOM id is resolved ONCE via the hu LEFT JOIN in the FROM
+            -- clause (LEFT JOIN so a DB with no 'Hour' UOM still returns every row —
+            -- hu.hour_uom_id is then NULL and every branch falls through to 0, matching
+            -- the old ELSE-0 behaviour). Previously this subquery re-ran
+            -- (SELECT id FROM uom WHERE name='Hour') up to 5x PER bomitem PER WO row
+            -- (uom.name is unindexed) — the single biggest Tier-1 query cost and it
+            -- scaled per-row (~2.4s at 48 WOs). demodb-verified identical over all 48
+            -- WOs (28 non-zero, 0 mismatches).
             (SELECT SUM(
                 CASE
-                    WHEN bomitem.uomid = (SELECT id FROM uom WHERE name = 'Hour' LIMIT 1) THEN
+                    WHEN bomitem.uomid = hu.hour_uom_id THEN
                         COALESCE(bomitem.quantity, 0)
                     WHEN EXISTS (
                         SELECT 1 FROM uomconversion
                         WHERE fromuomid = bomitem.uomid
-                        AND touomid = (SELECT id FROM uom WHERE name = 'Hour' LIMIT 1)
+                        AND touomid = hu.hour_uom_id
                     ) THEN
                         COALESCE(bomitem.quantity, 0) * (
                             SELECT (multiply / factor)
                             FROM uomconversion
                             WHERE fromuomid = bomitem.uomid
-                            AND touomid = (SELECT id FROM uom WHERE name = 'Hour' LIMIT 1)
+                            AND touomid = hu.hour_uom_id
                             LIMIT 1
                         )
                     WHEN EXISTS (
                         SELECT 1 FROM uomconversion
-                        WHERE fromuomid = (SELECT id FROM uom WHERE name = 'Hour' LIMIT 1)
+                        WHERE fromuomid = hu.hour_uom_id
                         AND touomid = bomitem.uomid
                     ) THEN
                         COALESCE(bomitem.quantity, 0) / (
                             SELECT (multiply / factor)
                             FROM uomconversion
-                            WHERE fromuomid = (SELECT id FROM uom WHERE name = 'Hour' LIMIT 1)
+                            WHERE fromuomid = hu.hour_uom_id
                             AND touomid = bomitem.uomid
                             LIMIT 1
                         )
@@ -2306,6 +2351,9 @@ async function _loadWorkOrdersImpl(background) {
         LEFT JOIN moitem ON wo.moitemid = moitem.id
         LEFT JOIN mo ON moitem.moid = mo.id
         LEFT JOIN bom ON moitem.bomid = bom.id
+        -- Resolve the 'Hour' UOM id once (see labor_hours_from_bom above). ON 1=1 so
+        -- it's a single-row cross-join that never drops a WO row.
+        LEFT JOIN (SELECT id AS hour_uom_id FROM uom WHERE name = 'Hour' LIMIT 1) hu ON 1=1
         LEFT JOIN calcategory AS calcat ON wo.calcategoryid = calcat.id
         LEFT JOIN locationgroup lg ON lg.id = wo.locationgroupid
         LEFT JOIN sysuser su ON su.id = wo.userId
@@ -2397,12 +2445,16 @@ async function _loadWorkOrdersImpl(background) {
 
         // The three primary queries are independent — run them concurrently.
         // runQueryAsync resolves to an already-parsed array (no JSON.parse).
+        const _psT0 = _psNow();
         const [woResults, depResults, moResults] = await Promise.all([
             runQueryAsync(woQuery),
             runQueryAsync(depQuery),
             runQueryAsync(moQuery)
         ]);
+        const _psTQueries = _psNow() - _psT0;
+        const _psTProc0 = _psNow();
         allWorkOrders = processWorkOrdersWithHours(woResults);
+        const _psTProc = _psNow() - _psTProc0;
         debugLog('success', `Loaded ${allWorkOrders.length} work orders`);
         stagingDependencies = depResults;
         debugLog('success', `Loaded ${stagingDependencies.length} staging dependencies`);
@@ -2502,7 +2554,10 @@ async function _loadWorkOrdersImpl(background) {
             currentCapacityWeek = moment().startOf('isoWeek');
         }
 
+        const _psTR0 = _psNow();
         renderCurrentView();   // ← FIRST PAINT (schedule visible now)
+        _psPerfLog(`Tier 1 (${background ? 'reload' : 'initial'} · ${allWorkOrders.length} WOs)`,
+                   { queries: _psTQueries, process: _psTProc, render: _psNow() - _psTR0, firstPaint: _psNow() - _psT0 });
 
         showToast(`✓ Loaded ${allWorkOrders.length} work orders from Fishbowl`, 'success');
         setStatus(`${allWorkOrders.length} work orders · ${manufacturingOrders.length} MOs`);
@@ -2561,18 +2616,22 @@ function psBuildUserDimension() {
 // repaint follows once all settle. Availability (Tier 3) is then kicked off in the
 // background so it renders when ready.
 async function _loadEnrichments(background, gen) {
+    const _psT0 = _psNow();
     const woIds = allWorkOrders.map(w => w.wo_id).filter(v => v != null);
     await Promise.all([
         _enrichAssignedUsers(woIds),
         _enrichPriorities(),
         _enrichCustomFields(),
         _enrichReorder(woIds),
-        _enrichShortage(),
+        _enrichShortage(woIds),
         _enrichPickStatus()
     ]);
+    const _psTEnrich = _psNow() - _psT0;
     if (gen != null && gen !== _psLoadGen) return;   // a newer load superseded us — skip the stale repaint
     // Repaint so the newly-loaded pills/flags/dimensions appear.
+    const _psTR0 = _psNow();
     try { applyActiveFilters(); updateKPIs(); renderTabs(); renderFilterbar(); renderActiveView(); } catch (_) {}
+    _psPerfLog('Tier 2 (enrichments)', { queries: _psTEnrich, repaint: _psNow() - _psTR0 });
     // Tier 3 — compute availability in the BACKGROUND now (render-when-ready) so the
     // Timeline availability dots, Materials/Procurement badge counts and the
     // availability tabs fill in without waiting for a tab to be opened. Guarded
@@ -2698,8 +2757,16 @@ async function _enrichReorder(woIds) {
 // Crude material-shortage flag (one batched query) — the coarse indicator the
 // Timeline dot / Dashboard shortages fall back to when availability isn't computed.
 // Reproduces qty-on-hand inline (avoids the TEMPTABLE quantity views).
-async function _enrichShortage() {
+async function _enrichShortage(woIds) {
+    if (!woIds || !woIds.length) return;
     try {
+        // Bound the on-hand `av` derived table to ONLY the component parts of the
+        // loaded WOs. Without this it materialised SUM(on-hand) over the ENTIRE
+        // tag(30,40) universe (every part in the DB) before the join filtered it —
+        // invisible at 48 WOs, but O(all tags) at scale. `av` only ever joins on
+        // av.partid = woi.partid, so restricting the scan to those partids drops
+        // exactly the rows that could never join — result-identical, just bounded.
+        const woIn = woIds.join(',');
         const shortageQuery = `
             SELECT DISTINCT woi.woid AS wo_id
             FROM woitem woi
@@ -2715,9 +2782,11 @@ async function _enrichShortage() {
                 WHERE t.typeid IN (30, 40)
                   AND l.countedasavailable = 1
                   AND l.pickable = 1
+                  AND t.partid IN (SELECT DISTINCT woi2.partid FROM woitem woi2 WHERE woi2.woid IN (${woIn}) AND woi2.typeid = 20)
                 GROUP BY t.partid, l.locationgroupid
             ) av ON av.partid = woi.partid AND av.lgid = mo.locationgroupid
             WHERE woi.typeid = 20
+              AND woi.woid IN (${woIn})
               AND wp.typeid = 10
               AND wo.statusid IN (10, 30)
               AND mo.statusid < 60
@@ -2791,7 +2860,9 @@ async function psEnsureAvailability() {
     // Preserve the Timeline's horizontal scroll across the repaint (a Gantt
     // re-render otherwise snaps back to today).
     try { const _sc = document.getElementById('ganttScroll'); if (_sc) psKeepScroll = _sc.scrollLeft; } catch (_) {}
+    const _psTR0 = _psNow();
     try { applyActiveFilters(); renderTabs(); renderActiveView(); } catch (_) {}
+    _psPerfLog('Tier 3 (repaint)', { repaint: _psNow() - _psTR0 });
 }
 
 // ============================================
@@ -2824,12 +2895,12 @@ function calculateWOHours(wo) {
     // Priority 1: BOM estimated duration (convert minutes to hours)
     if (wo.bom_duration_minutes && wo.bom_duration_minutes > 0) {
         totalHours = (wo.bom_duration_minutes / 60) * wo.qty_target;
-        debugLog('info', `WO ${wo.wo_num}: Using BOM duration ${wo.bom_duration_minutes}min * ${wo.qty_target}qty = ${totalHours.toFixed(2)}hrs`);
+        debugLog('debug', `WO ${wo.wo_num}: Using BOM duration ${wo.bom_duration_minutes}min * ${wo.qty_target}qty = ${totalHours.toFixed(2)}hrs`);
     }
     // Priority 2: Labor hours from BOM parts (already in hours)
     else if (wo.labor_hours_from_bom && wo.labor_hours_from_bom > 0) {
         totalHours = wo.labor_hours_from_bom * wo.qty_target;
-        debugLog('info', `WO ${wo.wo_num}: Using labor parts ${wo.labor_hours_from_bom}hrs * ${wo.qty_target}qty = ${totalHours.toFixed(2)}hrs`);
+        debugLog('debug', `WO ${wo.wo_num}: Using labor parts ${wo.labor_hours_from_bom}hrs * ${wo.qty_target}qty = ${totalHours.toFixed(2)}hrs`);
     }
     // Priority 3: Default fallback (1 hour per day)
     else {
@@ -2838,7 +2909,7 @@ function calculateWOHours(wo) {
             'days'
         ) + 1;
         totalHours = Math.max(1, dateRange) * 1; // 1 hour per day, minimum 1 hour
-        debugLog('warn', `WO ${wo.wo_num}: No BOM data found, using fallback ${totalHours}hrs (1hr/day * ${dateRange}days)`);
+        debugLog('debug', `WO ${wo.wo_num}: No BOM data found, using fallback ${totalHours}hrs (1hr/day * ${dateRange}days)`);
     }
 
     return Math.max(0, totalHours); // Ensure non-negative
@@ -3248,6 +3319,13 @@ function generateMockData() {
 // ============================================
 function updateKPIs() {
     const container = document.getElementById('kpiCards');
+    // #kpiCards is permanently display:none in v1.2 — the Dashboard renders its own
+    // KPI tiles (renderDashboard), so this function's ONLY output is that hidden
+    // element. It nonetheless ran an ~O(90 days × categories × WOs) capacity scan
+    // (+ a staging-conflict pass) two-plus times per load. Skip it entirely while
+    // the element is hidden (offsetParent is null under display:none); if it is ever
+    // made visible again the full computation runs exactly as before.
+    if (!container || container.offsetParent === null) return;
 
     const startedWOs = filteredWorkOrders.filter(wo => wo.wo_status === 30).length;
     const enteredWOs = filteredWorkOrders.filter(wo => wo.wo_status === 10).length;
@@ -8697,6 +8775,7 @@ async function psLoadAvailability() {
     psAvailReady = false;
     if (typeof runQueryAsync !== 'function' || !allWorkOrders.length) return;
     try {
+        const _psAvT0 = _psNow();   // perf: DB/query phase start
         const woIdList = allWorkOrders.map(w => w.wo_id).filter(v => v != null);
         if (!woIdList.length) return;
         const lgIds = (typeof getLocationGroupList === 'function' ? getLocationGroupList() : []) || [];
@@ -8823,7 +8902,34 @@ async function psLoadAvailability() {
         //    QtyOnHand semantics) kept alongside for the drawer's display column.
         const availByPartLg = new Map();   // pid -> Map(lg -> availableToPick)
         const onhandByPartLg = new Map();  // pid -> Map(lg -> total on hand)
-        if (partIdArr.length) {
+        const committedByWoPart = new Map();  // "woid|pid" -> { qty, status }  (status: 40 Finished, 30 Committed)
+        const supplyByPartLg = new Map();   // "pid|lg" -> [{ ponum, vendor, outstanding, eta, linkedMoNum }]
+        psPendingPo = new Map();
+        // ── The next four queries (on-hand, committed picks, incoming POs, pending
+        //    bids) are INDEPENDENT — each writes its own distinct map and their only
+        //    inputs (partIdArr / woIdList / lgIds) are already known. Run them
+        //    CONCURRENTLY (they were four sequential awaits) so Tier 3's DB phase is
+        //    one round-trip wide instead of four deep. avail/committed/supply have no
+        //    local try/catch on purpose — a failure rejects Promise.all and propagates
+        //    to psLoadAvailability's outer try (availability disabled), exactly as the
+        //    sequential form did; the pending-PO block keeps its own soft guard. ──
+        await Promise.all([
+          // 2) Available-to-Pick per part + location group. Fishbowl's
+          //    "available to pick" = QtyOnHand − QtyCommitted − QtyNotAvailable
+          //    (open SO/PO/MO/TO *allocations* are demand, NOT committed stock, so
+          //    they are deliberately not subtracted). Computed directly per tag as
+          //    GREATEST(qty − qtyCommitted, 0) over tags that are:
+          //      • available   (location.countedAsAvailable = 1, not a shipping loc)
+          //      • uncommitted (qtyCommitted removes stock reserved by a committed pick)
+          //      • NOT staged to a WO (tag.woItemId IS NULL) — a Finished pickitem
+          //        pulls its material to a WIP tag with woItemId set; that stock is
+          //        secured to its WO (added back below via committedByWoPart) and must
+          //        NOT remain in the shared pool for other WOs.
+          //    Reproduced inline from tag + location (schema-index forbids querying
+          //    the TEMPTABLE QTYINVENTORY view with a WHERE). onhand (total physical,
+          //    QtyOnHand semantics) kept alongside for the drawer's display column.
+          (async () => {
+            if (!partIdArr.length) return;
             const lgF = lgIds.length ? ` AND l.locationgroupid IN (${lgIds.join(',')})` : '';
             (await runQueryAsync(`
                 SELECT t.partid AS part_id, l.locationgroupid AS lgid,
@@ -8842,22 +8948,20 @@ async function psLoadAvailability() {
                 availByPartLg.get(pid).set(lg, Math.max(0, parseFloat(r.availtopick) || 0));
                 onhandByPartLg.get(pid).set(lg, parseFloat(r.onhand) || 0);
             });
-        }
-        const getAvail  = (pid, lg) => { const m = availByPartLg.get(pid);  return (m && m.get(String(lg))) || 0; };
-        const getOnhand = (pid, lg) => { const m = onhandByPartLg.get(pid); return (m && m.get(String(lg))) || 0; };
+          })(),
 
-        // 2b) Committed-to-this-WO from pickitem. Classified by the PICKITEM LINE
-        //     status (pit.statusid), NOT the pick header — a single picked line
-        //     goes Committed (30) / Finished (40) while the pick header can still
-        //     be Started (20). Convention matches Work_Order_WIP.htm: pit.statusid
-        //     30 = Committed, 40 = Finished — both mean the parts are pulled to a
-        //     tag and secured to this WO (staged as WIP; woitem.qtyUsed isn't
-        //     bumped until the WO itself consumes them, so `need` is still full and
-        //     the reservation must be added back). Committed/finished stock is netted
-        //     out of the shared pool above, so we add each WO's own reservation back
-        //     as guaranteed.
-        const committedByWoPart = new Map();  // "woid|pid" -> { qty, status }  (status: 40 Finished, 30 Committed)
-        if (woIdList.length) {
+          // 2b) Committed-to-this-WO from pickitem. Classified by the PICKITEM LINE
+          //     status (pit.statusid), NOT the pick header — a single picked line
+          //     goes Committed (30) / Finished (40) while the pick header can still
+          //     be Started (20). Convention matches Work_Order_WIP.htm: pit.statusid
+          //     30 = Committed, 40 = Finished — both mean the parts are pulled to a
+          //     tag and secured to this WO (staged as WIP; woitem.qtyUsed isn't
+          //     bumped until the WO itself consumes them, so `need` is still full and
+          //     the reservation must be added back). Committed/finished stock is netted
+          //     out of the shared pool above, so we add each WO's own reservation back
+          //     as guaranteed.
+          (async () => {
+            if (!woIdList.length) return;
             (await runQueryAsync(`
                 SELECT woi.woid AS wo_id, pit.partid AS part_id, COALESCE(SUM(pit.qty), 0) AS qty,
                        MAX(pit.statusid) AS status
@@ -8868,12 +8972,12 @@ async function psLoadAvailability() {
                   AND pit.statusid IN (30, 40)
                 GROUP BY woi.woid, pit.partid
             `)).forEach(r => committedByWoPart.set(r.wo_id + '|' + String(r.part_id), { qty: parseFloat(r.qty) || 0, status: parseInt(r.status, 10) || 0 }));
-        }
+          })(),
 
-        // 3) Incoming PO supply (open POs, outstanding qty), per part + delivery LG.
-        //    memo → source MO marks an express/committed PO; no memo = blanket supply.
-        const supplyByPartLg = new Map();   // "pid|lg" -> [{ ponum, vendor, outstanding, eta, linkedMoNum }]
-        if (partIdArr.length) {
+          // 3) Incoming PO supply (open POs, outstanding qty), per part + delivery LG.
+          //    memo → source MO marks an express/committed PO; no memo = blanket supply.
+          (async () => {
+            if (!partIdArr.length) return;
             (await runQueryAsync(`
                 SELECT po.num AS ponum, v.name AS vendor, pi.partid AS part_id, po.locationgroupid AS lgid,
                        COALESCE(pi.qtytofulfill, 0) AS ordered, COALESCE(pi.qtyfulfilled, 0) AS fulfilled,
@@ -8905,17 +9009,17 @@ async function psLoadAvailability() {
                     linkedMoNum: mm ? mm[1] : null
                 });
             });
-        }
+          })(),
 
-        // Pending / unissued PO coverage — Bid Request (10) + Pending Approval (15).
-        // These are NOT confirmed supply (deliberately excluded from availByPartLg /
-        // supplyByPartLg above, so the part still reads Short), but the planner wants
-        // to see that a bid already covers a shortage — otherwise "did I already raise
-        // a PO for this?" is ambiguous. Collect outstanding qty per part+LG so the
-        // Procurement worklist can flag + link it. Self-guarded so a failure just
-        // leaves the indicator blank rather than disabling availability.
-        psPendingPo = new Map();
-        if (partIdArr.length) {
+          // Pending / unissued PO coverage — Bid Request (10) + Pending Approval (15).
+          // These are NOT confirmed supply (deliberately excluded from availByPartLg /
+          // supplyByPartLg above, so the part still reads Short), but the planner wants
+          // to see that a bid already covers a shortage — otherwise "did I already raise
+          // a PO for this?" is ambiguous. Collect outstanding qty per part+LG so the
+          // Procurement worklist can flag + link it. Self-guarded so a failure just
+          // leaves the indicator blank rather than disabling availability.
+          (async () => {
+            if (!partIdArr.length) return;
             try {
                 (await runQueryAsync(`
                     SELECT po.num AS ponum, po.statusid AS statusid, ps.name AS status_name,
@@ -8939,7 +9043,10 @@ async function psLoadAvailability() {
                 });
                 debugLog('success', `Pending/bid POs: ${psPendingPo.size} part+LG group(s)`);
             } catch (e) { debugLog('warn', 'Pending-PO scan failed (indicator disabled): ' + (e && e.message)); }
-        }
+          })(),
+        ]);
+        const getAvail  = (pid, lg) => { const m = availByPartLg.get(pid);  return (m && m.get(String(lg))) || 0; };
+        const getOnhand = (pid, lg) => { const m = onhandByPartLg.get(pid); return (m && m.get(String(lg))) || 0; };
 
         // Staged components: this WO consumes a part produced by another WO.
         const stagedByWo = new Map();  // wo_id → Map(part_num → producer wo_id)
@@ -9048,6 +9155,8 @@ async function psLoadAvailability() {
 
         // Allocate raw (non-staged) parts in scheduled-start order. Each WO draws
         // from its own location group's stock.
+        const _psAvDb = _psNow() - _psAvT0;   // perf: DB/query + map-prep phase done
+        const _psAvA0 = _psNow();             // perf: allocation (pure JS/CPU) phase start
         const woLg = new Map(allWorkOrders.map(w => [String(w.wo_id), String(w.location_group_id != null ? w.location_group_id : '')]));
         const ordered = allWorkOrders.slice().sort((a, b) =>
             (moment(a.date_scheduled_start).valueOf() || 0) - (moment(b.date_scheduled_start).valueOf() || 0));
@@ -9247,6 +9356,7 @@ async function psLoadAvailability() {
             } catch (dgErr) { psDiag('diagnostic dump failed: ' + (dgErr && dgErr.message)); }
         }
 
+        _psPerfLog(`Tier 3 (availability · ${allWorkOrders.length} WOs)`, { db: _psAvDb, allocate: _psNow() - _psAvA0 });
         psAvailReady = true;
         debugLog('success', `Availability computed for ${allWorkOrders.length} WO(s)`);
     } catch (e) {
@@ -11726,7 +11836,7 @@ function getUsageForCategoryAndDay(categoryId, currentDay) {
                 debugLog('debug', `  WO ${wo.wo_num}: ${totalHours}hrs / ${daysInWO}${dayType} = ${hoursPerDay.toFixed(2)}hrs/day (${woStart.format('YYYY-MM-DD')} to ${woEnd.format('YYYY-MM-DD')})`);
             } else {
                 wosWithNoLabor++;
-                debugLog('warn', `  WO ${wo.wo_num} has NO labor hours (labor_hours_from_bom = ${wo.labor_hours_from_bom})`);
+                debugLog('debug', `  WO ${wo.wo_num} has NO labor hours (labor_hours_from_bom = ${wo.labor_hours_from_bom})`);
             }
 
             usage += hoursPerDay;
@@ -11738,7 +11848,7 @@ function getUsageForCategoryAndDay(categoryId, currentDay) {
     }
 
     if (wosWithNoLabor > 0) {
-        debugLog('warn', `  ⚠️ ${wosWithNoLabor} WO(s) have no labor hours and contribute 0 to capacity!`);
+        debugLog('debug', `  ⚠️ ${wosWithNoLabor} WO(s) have no labor hours and contribute 0 to capacity!`);
     }
 
     return { usage };
@@ -13788,8 +13898,20 @@ var AI_SYSTEM = [
     '2) purchaseOrders — for genuinely short purchasable parts (shortages.toPurchase only), grouped by vendor, each line a part + suggested order qty (>= its short qty) + optional unitCost, plus a needBy date.',
     '3) manufactureOrders — for short manufacturable parts (shortages.toManufacture only), a build qty (>= short) and a dateScheduled that finishes before the earliest consuming WO.',
     '4) metrics — a short plain-English summary, a before/after snapshot ({onTime, overloadedDays, unmetWOs, latestFinish}) computed from the input as-is vs. your proposed plan, and an improvements list naming what got better (readiness dates, capacity bottlenecks removed, on-time count, shortages resolved).',
-    'Return ONLY the JSON object. All dates are YYYY-MM-DD strings; set unitCost to null when unknown.'
+    'Return ONLY the JSON object. The machine-read date fields (reschedule[].start, reschedule[].finish, purchaseOrders[].needBy, manufactureOrders[].dateScheduled, metrics.before/after.latestFinish) MUST be strict ISO YYYY-MM-DD strings so the application can parse them; the LOCALE note below governs how dates read in human-readable prose. Set unitCost to null when unknown.'
 ].join('\n');
+
+// Locale directive appended to the system prompt at call time (MOMENT_DATE_FORMAT
+// is a runtime value). Keeps the machine-read date fields ISO — the app parses +
+// writes those back — while asking Claude to phrase dates/times in the user's own
+// locale in every human-readable field (reasons, summary, improvements), which is
+// what the planner actually reads.
+function aiLocaleNote() {
+    var loc = '';
+    try { var l = (typeof currencyLocale === 'function') ? currencyLocale() : null; loc = (l && l.locale) ? String(l.locale) : ''; } catch (_) {}
+    return '\n\nLOCALE: the user\'s short date format is "' + MOMENT_DATE_FORMAT + '"' + (loc ? ' (locale ' + loc + ')' : '') +
+        '. In EVERY human-readable text field — each reschedule[].reason, each purchaseOrders[].reason, each manufactureOrders[].reason, metrics.summary, and every metrics.improvements entry — write any date or time in THIS format and the user\'s local time-of-day convention, NOT ISO. The machine-read date fields listed above MUST still be strict ISO YYYY-MM-DD.';
+}
 
 function aiModel() { try { var m = FBLib.Settings.resolve('aiPlannerModel'); return AI_MODELS.some(function (x) { return x.id === m; }) ? m : 'claude-opus-4-8'; } catch (_) { return 'claude-opus-4-8'; } }
 function aiSetModel(v) { try { FBLib.Settings.setUserKey('aiPlannerModel', v); FBLib.Settings.saveUser(); } catch (_) {} }
@@ -13913,7 +14035,7 @@ async function aiCallClaude(payload) {
         model: aiModel(),
         max_tokens: 16000,
         thinking: { type: 'disabled' },
-        system: AI_SYSTEM,
+        system: AI_SYSTEM + aiLocaleNote(),
         messages: [{ role: 'user', content: 'Current production picture (JSON). Produce the plan.\n\n' + JSON.stringify(payload) }],
         output_config: { format: { type: 'json_schema', schema: AI_SCHEMA } }
     };
@@ -14186,7 +14308,9 @@ function aiMetricsHtml() {
             row('On-time WOs', b.onTime, a.onTime) +
             row('Overloaded days', b.overloadedDays, a.overloadedDays) +
             row('Unmet-material WOs', b.unmetWOs, a.unmetWOs) +
-            row('Latest finish', b.latestFinish, a.latestFinish) +
+            // latestFinish stays ISO in the JSON (see the LOCALE note) — localise it
+            // for display via aiFmtReason so it reads in the user's date format.
+            ('<div class="k">Latest finish</div><div>' + aiNum(aiFmtReason(b.latestFinish)) + '</div><div>' + aiNum(aiFmtReason(a.latestFinish)) + '</div>') +
         '</div></div>' +
         '<div class="banner ' + (overN ? 'warn' : 'info') + '" style="margin:0"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path stroke-linecap="round" d="M12 11v5m0-8h.01"/></svg>' +
             '<div>Local capacity cross-check: of ' + accN + ' accepted reschedule' + (accN === 1 ? '' : 's') + ', ' + overN + ' exceed a resource\'s daily capacity by the report\'s own model' + (overN ? ' — review those before applying.' : '.') + '</div></div>';
