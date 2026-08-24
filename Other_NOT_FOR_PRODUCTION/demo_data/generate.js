@@ -65,7 +65,41 @@ const LGS = [
 ];
 const PURCHASE_TAX = 'NCG';   // part-level (purchase) tax code, APAC
 const SALES_TAX    = 'GST';   // product-level (sales) tax code, APAC
+// Tax-RATE names (taxrate.name) for the order headers/lines. These differ from
+// the part/product tax CODES above. Verified against demodb: 'GST' = taxrate
+// id 2 (orderTypeId 20, sales); 'NCG' = taxrate id 4 (orderTypeId 10, purchase).
+const SALES_TAX_NAME    = 'GST';
+const PURCHASE_TAX_NAME = 'NCG';
 const LABOUR = ['WX-LAB-FAB', 'WX-LAB-ASSY', 'WX-LAB-TEST'];
+
+// Real customer ship/bill addresses pulled from demodb (address ⋈ customer via
+// accountId). Every customer here EXISTS in demodb — this is additive-only.
+const AU = 'Australia';
+const CUST_ADDR = {
+    'Bike World':            { addr: 'Racer Way St',            city: 'Burwood',         state: 'NSW', zip: '2984' },
+    'Pro Bike':              { addr: '145 Twindle Road',        city: 'Toorak',          state: 'NSW', zip: '2980' },
+    'Speed Way Bikes':       { addr: '1427 Westminster',        city: 'Dandenong',       state: 'VIC', zip: '3255' },
+    'Cityscape Bikes':       { addr: '1000 Time Square',        city: 'Vermont',         state: 'VIC', zip: '3687' },
+    'DIYBike Co.':           { addr: '123 Glacier Mountain',    city: 'South Dandenong', state: 'VIC', zip: '3125' },
+    'National Bicycle Club': { addr: '99 Community Circle',     city: 'Torquay',         state: 'VIC', zip: '3588' },
+    'Timeless Bicycles':     { addr: '1488 Sky Limit',         city: 'Port Augusta',    state: 'SA',  zip: '7666' },
+    "Big Al's Bike Shop":    { addr: '1 Chapel St',            city: 'South Yarra',     state: 'VIC', zip: '3526' },
+    'Magic Mountain Biking': { addr: '1498 Apple Way',          city: 'Pakeham',         state: 'VIC', zip: '3955' },
+    'Peak Mountaineer':      { addr: '1400 South Sky Limit Ave', city: 'Flemington',     state: 'NSW', zip: '2003' },
+};
+// Real vendor (remit-to) addresses pulled from demodb — every vendor EXISTS.
+const VENDOR_ADDR = {
+    'A&B Distribution':      { addr: '432 Vine St',        city: 'Double Bay',     state: 'NSW', zip: '2988' },
+    "Chuck's Chain Shop":    { addr: '5500 East Rd',       city: 'Sandown',        state: 'VIC', zip: '3651' },
+    'Cyclery Connection':    { addr: '500 E. Lost Way',    city: 'South Melbourne', state: 'VIC', zip: '3254' },
+    'Johnson Manufacturing': { addr: '3245 Williams Ave',  city: 'Dandenong Nth',  state: 'VIC', zip: '3943' },
+    "Kevin's Cables":        { addr: '2155 Mescalero Trail', city: 'Footscray',    state: 'VIC', zip: '3984' },
+    'Monroe Bike Company':   { addr: '100 Wall Street',    city: 'Sunbury',        state: 'VIC', zip: '3742' },
+    'Rocky Mountain Bikes':  { addr: '234 Garden Rd',      city: 'Sydney',         state: 'NSW', zip: '2884' },
+    'Simpson Cyclery':       { addr: '3 Dumskaya Ulitsa',  city: 'Monbulk',        state: 'VIC', zip: '3987' },
+};
+// Company ship-to for POs (home company default address in demodb).
+const COMPANY_SHIPTO = { name: 'FB July', addr: '1 Smith St', city: 'Smithtown', state: 'QLD', zip: '4174' };
 
 // Raw-material UOMs, rotated so the availability engine's UOM conversion path is
 // exercised (not everything is 'ea').
@@ -206,16 +240,19 @@ sa.forEach((p, j) => { reorderRows.push([p.num, LGS[0].name, 5, 20, 1]); });
 const INV_COLS = ['PartNumber', 'PartDescription', 'Location', 'Qty', 'UOM', 'Cost', 'QBClass', 'Date', 'Note'];
 const invRows = [];
 const todayFmt = fmtDate(TODAY);
+// The Location column is prefixed with the location group + hyphen so it is
+// unambiguous when the same location name exists under more than one LG.
+const locFull = (lg) => lg.name + '-' + lg.loc;   // e.g. "QLD Stock-R1A2"
 rm.forEach((p, i) => {
     const lg = LGS[i % LGS.length];
     let qty;
     if (shortRm.has(p.num)) qty = 0;                 // genuinely short
     else if (contestedRm.has(p.num)) qty = 3;        // enough for ~1 WO → contested
     else qty = [40, 80, 150, 250][i % 4];            // healthy
-    if (qty > 0) invRows.push([p.num, p.desc, lg.loc, qty, p.uom, p.cost, '', todayFmt, 'WX demo seed']);
+    if (qty > 0) invRows.push([p.num, p.desc, locFull(lg), qty, p.uom, p.cost, '', todayFmt, 'WX demo seed']);
 });
 // A subset of sub-assemblies pre-stocked so not every chain must be built.
-sa.forEach((p, j) => { if (j % 2 === 0) invRows.push([p.num, p.desc, LGS[0].loc, 4 + (j % 3), 'ea', Math.round(p.price * 0.55 * 100) / 100, '', todayFmt, 'WX demo seed']); });
+sa.forEach((p, j) => { if (j % 2 === 0) invRows.push([p.num, p.desc, locFull(LGS[0]), 4 + (j % 3), 'ea', Math.round(p.price * 0.55 * 100) / 100, '', todayFmt, 'WX demo seed']); });
 
 // ============================================================================
 // 5) SALES ORDERS  (ImportSalesOrder — CONFIRMED two-header layout)
@@ -237,12 +274,13 @@ const N_SO = 15;
 for (let s = 0; s < N_SO; s++) {
     const cust = CUSTOMERS[s % CUSTOMERS.length];
     const lg = LGS[s % LGS.length];
+    const a = CUST_ADDR[cust];                          // real demodb address
     const sched = fmtDate(addDays(TODAY, 7 + s * 3));   // spread 1-8 weeks out
     soRows.push([
         'SO', '', 20, cust, cust,
-        cust, '', '', '', '', 'Australia',
-        cust, '', '', '', '', 'Australia',
-        'false', '', 'GST', 30, 'false',
+        cust, a.addr, a.city, a.state, a.zip, AU,        // BillTo* (full address)
+        cust, a.addr, a.city, a.state, a.zip, AU,        // ShipTo* (full address)
+        'false', '', SALES_TAX_NAME, 30, 'false',
         'WX-PO-' + (100 + s), '', todayFmt, '', '', '', '', 'WX demo sales order',
         '', lg.name, sched, '', '',
         '', '', 'true', '', '', '', '',
@@ -252,7 +290,7 @@ for (let s = 0; s < N_SO; s++) {
         const f = fg[(s * 3 + k) % fg.length];
         soRows.push([
             'Item', 10, f.num, f.desc, 1 + ((s + k) % 4),
-            'ea', f.price, 'true', 'GST', '', '',
+            'ea', f.price, 'true', SALES_TAX_NAME, '', '',  // TaxCode = tax-rate NAME on every line
             sched, 'true', '', '', '',
         ]);
     }
@@ -263,8 +301,19 @@ for (let s = 0; s < N_SO; s++) {
 //    Open POs covering short raws: a mix of Issued (20), Bid Request (10), and
 //    an overdue batch (ETA in the past). One row per line, PO header repeated.
 // ============================================================================
-const PO_COLS = ['Flag', 'PONum', 'Status', 'VendorName', 'LocationGroupName', 'Date',
-    'DateScheduled', 'Note', 'PartNumber', 'VendorPartNumber', 'Quantity', 'UOM', 'UnitCost'];
+// Two-header layout (matching the confirmed SO shape): a 'PO' header row with
+// full RemitTo (vendor) + ShipTo (company) address + TaxRate, then 'Item' rows
+// each carrying the purchase tax-rate NAME. Header is best-effort — verify the
+// column list in your Import wizard before running.
+const PO_COLS = ['Flag', 'PONum', 'Status', 'VendorName', 'VendorContact',
+    'RemitToName', 'RemitToAddress', 'RemitToCity', 'RemitToState', 'RemitToZip', 'RemitToCountry',
+    'ShipToName', 'ShipToAddress', 'ShipToCity', 'ShipToState', 'ShipToZip', 'ShipToCountry',
+    'CarrierName', 'TaxRateName', 'PaymentTerms', 'FOB', 'Note',
+    'QuickBooksClassName', 'LocationGroupName', 'Date', 'DateScheduled', 'URL',
+    'CurrencyName', 'CurrencyRate', 'PriceIsHomeCurrency'];
+const PO_ITEM_COLS = ['Flag', 'POItemTypeID', 'PartNumber', 'PartDescription', 'PartQuantity',
+    'UOM', 'PartPrice', 'Taxable', 'TaxCode', 'Note', 'ItemQuickBooksClassName',
+    'ItemDateScheduled', 'ShowItem', 'RevisionLevel', 'CustomerPartNumber', 'VendorPartNumber'];
 const poRows = [];
 const shortList = rm.filter(p => shortRm.has(p.num));
 let poN = 500;
@@ -272,6 +321,7 @@ let poN = 500;
 const byVendor = new Map();
 shortList.forEach(p => { if (!byVendor.has(p.vendor)) byVendor.set(p.vendor, []); byVendor.get(p.vendor).push(p); });
 let vi = 0;
+const cs = COMPANY_SHIPTO;
 for (const [vendor, list] of byVendor) {
     // status/eta profile rotates: issued+future, bid, issued+overdue.
     const profile = vi % 3;
@@ -279,10 +329,22 @@ for (const [vendor, list] of byVendor) {
     const eta = profile === 2 ? addDays(TODAY, -3 - (vi % 5))     // overdue
         : addDays(TODAY, 5 + (vi % 10));                          // future
     const ponum = 'WX-PO-' + (poN++);
+    const va = VENDOR_ADDR[vendor];                               // real vendor address
+    poRows.push([
+        'PO', ponum, status, vendor, vendor,
+        vendor, va.addr, va.city, va.state, va.zip, AU,          // RemitTo* (vendor address)
+        cs.name, cs.addr, cs.city, cs.state, cs.zip, AU,         // ShipTo* (company address)
+        '', PURCHASE_TAX_NAME, '', '',
+        (profile === 2 ? 'WX demo — overdue supply' : 'WX demo PO'),
+        '', LGS[0].name, todayFmt, fmtDate(eta), '',
+        '', '', 'true',
+    ]);
     list.forEach(p => {
-        poRows.push(['PO', ponum, status, vendor, LGS[0].name, todayFmt, fmtDate(eta),
-            (profile === 2 ? 'WX demo — overdue supply' : 'WX demo PO'),
-            p.num, p.num + '-V', Math.max(p.moq, 50), p.uom, p.cost]);
+        poRows.push([
+            'Item', 10, p.num, p.desc, Math.max(p.moq, 50),
+            p.uom, p.cost, 'true', PURCHASE_TAX_NAME, '', '',    // TaxCode = tax-rate NAME on every line
+            fmtDate(eta), 'true', '', p.num + '-V', p.num + '-V',
+        ]);
     });
     vi++;
 }
@@ -294,7 +356,7 @@ writeCsv('02_boms.csv', [BOM_COLS], bomRows);
 writeCsv('03_reorder_points.csv', [REORDER_COLS], reorderRows);
 writeCsv('04_starting_inventory.csv', [INV_COLS], invRows);
 writeCsv('05_sales_orders.csv', [SO_COLS, SO_ITEM_COLS], soRows);
-writeCsv('06_purchase_orders.csv', [PO_COLS], poRows);
+writeCsv('06_purchase_orders.csv', [PO_COLS, PO_ITEM_COLS], poRows);
 
 // Reference dump so a header fix never needs the data re-derived.
 fs.writeFileSync(path.join(__dirname, '_reference.json'), JSON.stringify({

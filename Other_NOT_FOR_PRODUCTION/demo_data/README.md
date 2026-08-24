@@ -33,10 +33,13 @@ import type.
 | 6 | `06_purchase_orders.csv` | **Purchase Order** | ⚠ Verify header |
 | 7 | *Manufacture Orders → Work Orders* | *(see "The WO step" below)* | ⛔ Needs a decision |
 
-**Prerequisites** (already true on demodb, confirmed): the vendors, customers,
-UOM codes (`ea/hr/m/kg/mm/L/ft`), tax codes (`NCG` purchase, `GST` sales), and
-location groups the files reference all exist. Stock lands in **QLD Stock (`R1A2`),
-Sydney (`Bike Storage`), Melbourne (`Stock Room`)**.
+**Prerequisites** (all verified present in demodb): the 8 vendors, 10 customers,
+UOM codes (`ea/hr/m/kg/mm/L/ft`), tax‑rate names (`NCG` purchase = id 4, `GST`
+sales = id 2), and 3 location groups the files reference all exist. SO/PO rows
+carry the real customer/vendor addresses pulled from demodb. Stock lands in
+**QLD Stock (`R1A2`), Sydney (`Bike Storage`), Melbourne (`Stock Room`)** — the
+inventory `Location` column is written **`LocationGroup-Location`**
+(e.g. `QLD Stock-R1A2`) so it is unambiguous across LGs.
 
 ### ✅ Confirmed formats
 Column sets taken verbatim from the repo's own tools:
@@ -55,10 +58,12 @@ header row. If they differ, paste me the wizard's column list and I'll re‑emit
   `Finished Good`) carries the description + `Estimated Duration (min)`; component
   and labour lines follow (`Type` = `Raw Good`). Estimated duration is what drives
   the report's **Est. Labor** and the capacity heatmap.
-- **PO** (`06_purchase_orders.csv`): the repo deliberately creates POs via **REST**
-  (`/api/purchase-orders`) because the CSV route can't carry per‑line cost cleanly —
-  so this CSV is the least‑certain. If the import balks, I can instead give you a
-  small REST seeder (same path the report's Create‑PO drawer uses).
+- **PO** (`06_purchase_orders.csv`): two‑header layout like the SO — a `PO` header
+  row (full RemitTo **vendor** address + ShipTo **company** address + `TaxRateName`
+  = `NCG`), then `Item` rows each carrying the purchase tax‑rate name in `TaxCode`.
+  The repo normally creates POs via **REST** (`/api/purchase-orders`), so this CSV
+  header is the least‑certain — if the import balks, I can instead give you a small
+  REST seeder (same path the report's Create‑PO drawer uses).
 
 ---
 
