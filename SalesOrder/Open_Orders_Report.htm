@@ -1,4 +1,69 @@
 <!DOCTYPE html>
+<!--
+================================================================================
+  REPORT: Open Orders Report
+  PATH:   SalesOrder/Open_Orders_Report.htm
+  --------------------------------------------------------------------------------
+  Open sales-order demand grouped Category → Part → SO line, with the part's
+  live availability beside it so a planner can see, in one pass, what is owed
+  to customers and whether stock covers it.
+
+  RE-PLATFORMED (2026-09) onto the shared fb-lib / fb-styles stack:
+    - Chrome (header, .hdr-btn, .btn, .ms-*, .rpt-table, spinner, badges)
+      now comes from the saved fb-styles Style; only report-specific rules
+      stay in the inline block.
+    - Location-group filtering via FBLib.Common.MultiSelect. EMPTY selection
+      means "every location group I can access" (previous behaviour).
+    - Availability columns match Inv_Reorder_Watchlist.htm exactly — same
+      qty* views, same Available formula — so the two reports agree.
+    - Columns: show/hide + drag-reorder (header or Columns panel), drag-resize,
+      and click-to-sort. All persisted per user via FBLib.Settings.
+    - Search split into three fields: Product, Customer, SO #.
+
+  AVAILABILITY SCOPE. Everything is summed over the SELECTED location groups
+  (or every accessible one when that filter is empty). Available is recomputed
+  from the summed components — never summed from the per-LG view value, which
+  is floored at zero per LG.
+
+  THE LOCATION FILTER NARROWS STOCK ONLY. Locations sit under location groups,
+  but Fishbowl's demand-side quantities have no location dimension at all —
+  QTYALLOCATED, QTYDROPSHIP and QTYONORDER are keyed by part + LG. So:
+    - On Hand, Committed, Not Available  → tag rows in the SELECTED LOCATIONS
+    - Allocated, Dropship, On Order      → whole location group, always
+  Those three stock columns therefore come from an inline tag+location
+  aggregate rather than the qty* views. The inline version reproduces
+  QTYONHAND / QTYCOMMITTED / QTYNOTAVAILABLE exactly (demodb-verified across
+  every part+LG combination) and is faster, so the numbers still agree with
+  Inv_Reorder_Watchlist when no location filter is applied. With one applied,
+  Available reads as "stock in these locations, less everything the whole LG
+  owes" — deliberately conservative.
+
+  NOTE ON "ALLOCATED" vs "QTY REQUIRED": Allocated already includes the open
+  sales-order demand this report lists, so Available has that demand netted out
+  of it. Qty Required is deliberately the other view — Qty to Ship − On Hand −
+  Qty In Production — i.e. the shortfall against physical + incoming-build
+  stock, ignoring who it is already earmarked for.
+
+  COMMITTED / ALLOCATED READ AT BOTH TIERS, ON DIFFERENT SCOPES — the part row
+  is NOT the sum of its order lines, by design:
+    - Part row  Committed = tag.qtyCommitted for the part across the selected
+                LGs, i.e. every commitment against it (sales, work and transfer
+                orders alike), not only the orders listed here.
+                Allocated = the QTYALLOCATED view = SO + PO + TO + MO demand.
+    - Line row  Committed = stock reserved against THIS order line by its pick
+                (pickitem.statusId 30, plus a Started/Finished pick whose tag
+                still carries qtyCommitted — see the query comment).
+                Allocated = this line's own contribution to QTYALLOCATEDSO —
+                verified against demodb to reproduce that view exactly.
+  Both line values are converted to the part's base UOM so they read in the
+  same unit as the part-level numbers above them.
+
+  SO A PART ROW CAN SHOW COMMITTED WHILE EVERY LINE UNDER IT READS ZERO, and
+  that is not a bug: tag.qtyCommitted counts WORK- and TRANSFER-order picks
+  too. On demodb, WO picks hold more committed qty than SO picks do. Turn on
+  the debug console to see the split for the parts on screen.
+================================================================================
+-->
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -7,97 +72,139 @@
 
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
 
-  <!-- Shared Fishbowl BI lib (Settings layer + Common formatting/debug helpers).
-       Inlined by Fishbowl from the saved script named "fb-lib". Source of truth
-       lives at scripts/fb-lib.js. Uses FBLib.Common + FBLib.Settings only. -->
+  <!-- Shared Fishbowl BI lib — inlined by Fishbowl from the saved "fb-lib"
+       Script. Source of truth: scripts/fb-lib.js. Provides FBLib.Settings,
+       FBLib.Common (formatting, debug, MultiSelect). MUST sit before the
+       fb-styles directive so window.FBLib exists when inline code runs. -->
   <script>
     {% Script fb-lib %}
   </script>
 
+  <!-- Shared Fishbowl BI stylesheet — injected from the saved "fb-styles"
+       Style. Source of truth: scripts/fb-styles.css. Owns header/.hdr-btn,
+       .btn, .rpt-table, .ms-*, .row-link, .badge, .spin, forms and tokens.
+       MUST come BEFORE the inline block so per-report rules win the cascade
+       on identical selectors. -->
   <style>
-    * { box-sizing: border-box; }
-    html, body { margin: 0; padding: 0; }
-    body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px; color: #1e293b; background: #f8fafc; }
+    {% Style fb-styles %}
+  </style>
 
-    /* ── HEADER BAR ── */
-    header { position: sticky; top: 0; z-index: 50; background: #fff; border-bottom: 1px solid #e2e8f0; box-shadow: 0 1px 2px rgba(0,0,0,0.04); display: flex; align-items: center; justify-content: space-between; padding: 0 20px; height: 56px; }
-    header h1 { font-size: 16px; font-weight: 700; color: #0f172a; margin: 0; line-height: 1.15; }
-    #statusLine { font-size: 12px; color: #94a3b8; line-height: 1.15; margin: 0; }
-    .hdr-actions { display: flex; align-items: center; gap: 8px; }
-    .hdr-btn { display: flex; align-items: center; gap: 5px; padding: 6px 10px; border-radius: 8px; font-size: 12px; font-weight: 500; border: 1px solid #e2e8f0; background: #fff; color: #475569; cursor: pointer; transition: all 0.15s; white-space: nowrap; font-family: inherit; }
-    .hdr-btn:hover { background: #f8fafc; border-color: #cbd5e1; }
-    .hdr-btn svg { width: 14px; height: 14px; flex-shrink: 0; }
-    .hdr-btn-icon { padding: 7px; border-radius: 8px; }
+  <style>
+    /* ── Only report-specific rules live here; everything else is fb-styles. ── */
+    html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
+    body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           font-size: 13px; color: var(--c-primary); background: var(--bg-1);
+           display: flex; flex-direction: column; }
 
-    /* ── PAGE ── */
-    .wrap { max-width: 100%; margin: 0; padding: 16px 20px 60px; }
-    .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; box-shadow: 0 1px 2px rgba(0,0,0,0.03); margin-bottom: 16px; }
+    /* ── FILTER BAR ── */
+    #filterBar { flex-shrink: 0; background: #fff; border-bottom: 1px solid var(--border);
+                 padding: 10px 20px; display: flex; flex-wrap: wrap; gap: 12px 18px; align-items: flex-end; }
+    .fld { display: flex; flex-direction: column; gap: 4px; }
+    .fld > label { font-size: 10px; font-weight: 600; color: var(--c-secondary);
+                   text-transform: uppercase; letter-spacing: 0.04em; }
+    /* One compact size for every control on the bar. fb-styles' base form tier
+       is 13px/7px padding, which stands taller than the 30px .ms-trigger the
+       location-group picker renders as — matching the multi-select is what
+       makes the row read as a single strip rather than three heights. */
+    .fld input[type=text], .fld select {
+      height: 30px; padding: 3px 8px; font-size: 12px; line-height: 1.3;
+    }
+    .fld input[type=text] { width: 170px; }
+    #filterBar .btn { height: 30px; font-size: 12px; padding: 0 10px; }
+    .fld-chk { display: flex; align-items: center; gap: 7px; font-size: 12px;
+               color: var(--c-secondary); cursor: pointer; height: 30px; }
 
-    /* ── CONTROLS ── */
-    .controls { display: flex; flex-wrap: wrap; gap: 14px 20px; padding: 14px 16px; align-items: flex-end; }
-    .field { display: flex; flex-direction: column; gap: 4px; }
-    .field label { font-size: 10px; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; }
-    .field select, .field input { padding: 7px 9px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; color: #1e293b; background: #fff; font-family: inherit; }
-    .field input[type=text] { min-width: 220px; }
-    .field select:focus, .field input:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,0.12); }
-    .field .chk { display: flex; align-items: center; gap: 7px; text-transform: none; font-size: 12px; font-weight: 500; color: #475569; cursor: pointer; padding-bottom: 7px; }
-    .field .chk input { width: auto; padding: 0; margin: 0; border: 0; box-shadow: none; }
+    /* ── TABLE ── The compact .rpt-table tier ships from fb-styles; this
+       report adds fixed layout (for resizable columns) and its three row
+       tiers: category band, part summary, SO detail. ── */
+    #tableScroll { flex: 1; min-height: 0; overflow: auto; background: #fff; }
+    #ooTable { table-layout: fixed; }
+    #ooTable th { cursor: pointer; position: sticky; top: 0; z-index: 10; overflow: hidden; }
+    #ooTable th.nr { text-align: right; }
+    #ooTable th.dragging { opacity: 0.4; }
+    #ooTable th.drag-over { box-shadow: inset 3px 0 0 var(--tint-blue-2); }
+    #ooTable th .sort-ind { opacity: 0.85; font-size: 10px; }
+    #ooTable td { overflow: hidden; text-overflow: ellipsis; }
+    /* Resize grip — right edge of each header cell, above the drag/sort handlers. */
+    .col-resize { position: absolute; top: 0; right: 0; width: 7px; height: 100%;
+                  cursor: col-resize; user-select: none; z-index: 12; }
+    .col-resize::after { content: ''; position: absolute; top: 22%; right: 3px;
+                  width: 1px; height: 56%; background: rgba(255,255,255,0.25); }
+    #ooTable th:hover .col-resize::after { background: rgba(255,255,255,0.65); }
+    body.col-resizing, body.col-resizing * { cursor: col-resize !important; user-select: none !important; }
 
-    /* ── TABLE ── */
-    .data-table { width: 100%; border-collapse: collapse; font-size: 12.5px; table-layout: fixed; }
-    .data-table th { background: #1e3a5f; color: #fff; font-weight: 500; font-size: 11px; text-align: left; padding: 8px 10px; white-space: nowrap; position: sticky; top: 56px; z-index: 5; text-transform: uppercase; letter-spacing: 0.03em; cursor: grab; user-select: none; overflow: hidden; }
-    .data-table th.nr { text-align: right; }
-    .data-table th.dragging { opacity: 0.4; }
-    .data-table th.drag-over { box-shadow: inset 3px 0 0 #60a5fa; }
-    .col-resize { position: absolute; top: 0; right: 0; width: 7px; height: 100%; cursor: col-resize; }
-    .data-table td { padding: 6px 10px; border-bottom: 1px solid #eef2f7; white-space: nowrap; vertical-align: middle; overflow: hidden; text-overflow: ellipsis; }
-    .data-table tbody tr.item:hover td { background: #eff6ff; }
-    .group-row td { background: #eef2f7; font-weight: 600; color: #0f172a; padding: 7px 10px; border-bottom: 1px solid #e2e8f0; position: sticky; top: 88px; z-index: 4; }
-    .group-row .cat-name { color: #1e3a5f; }
-    .group-row .group-sub { color: #64748b; font-weight: 500; font-size: 11px; margin-left: 8px; }
+    /* Row tiers. --thead-h is measured after each head render so the category
+       band sticks directly under the header rather than at a guessed offset. */
+    tr.cat-row td { background: var(--bg-2); font-weight: 600; color: var(--c-primary);
+                    padding: 6px 10px; border-bottom: 1px solid var(--border);
+                    position: sticky; top: var(--thead-h, 30px); z-index: 5; }
+    tr.cat-row .cat-name { color: var(--menu-bg); }
+    tr.cat-row .cat-sub { color: var(--c-secondary); font-weight: 500; font-size: 11px; margin-left: 8px; }
+    tr.part-row td { background: var(--bg-1); font-weight: 600; }
+    tr.part-row:hover td { background: var(--tint-blue) !important; }
+    tr.so-row td { color: var(--c-secondary); }
+    tr.so-row:hover td { background: var(--tint-blue) !important; }
+    tr.so-row .so-indent { border-left: 3px solid var(--border-strong); }
+
     .num-cell { text-align: right; font-variant-numeric: tabular-nums; }
-    .muted { color: #94a3b8; }
-    .row-link { color: #2563eb; cursor: pointer; text-decoration: none; font-weight: 600; }
-    .row-link:hover { text-decoration: underline; }
-    .past-due { color: #b91c1c; font-weight: 600; }
-    .short { color: #b91c1c; font-weight: 700; }   /* qty required > 0 (shortfall) */
-    .covered { color: #047857; font-weight: 600; } /* qty required <= 0 (covered) */
-    .part-row td { background: #f1f5f9; font-weight: 600; }
-    .pcount { color: #94a3b8; font-weight: 500; font-size: 11px; }
-    .pdesc { color: #64748b; font-weight: 400; }
-    .so-row td { color: #475569; }
-    .so-row .so-prod { border-left: 3px solid #cbd5e1; }
-    .empty { padding: 36px; text-align: center; color: #94a3b8; font-style: italic; }
+    .muted { color: var(--c-tertiary); }
+    .past-due { color: var(--fb-negative); font-weight: 600; }
+    .short   { color: var(--fb-negative); font-weight: 700; }   /* qty required > 0  */
+    .covered { color: var(--fb-success);  font-weight: 600; }   /* qty required <= 0 */
+    .pcount { color: var(--c-tertiary); font-weight: 500; font-size: 11px; }
+    .pdesc  { color: var(--c-secondary); font-weight: 400; }
+    .empty  { padding: 36px; text-align: center; color: var(--c-tertiary); font-style: italic; }
 
-    /* ── SPINNER ── */
-    #spinner { display: none; padding: 40px; text-align: center; color: #64748b; }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    .spin { animation: spin 0.8s linear infinite; }
+    /* ── COLUMNS PANEL (show / hide / reorder) ── */
+    #colWrap { position: relative; }
+    #colPanel { position: absolute; z-index: 200; top: calc(100% + 4px); right: 0;
+                background: #fff; border: 1px solid var(--border-strong); border-radius: 8px;
+                box-shadow: var(--sh2); width: 230px; max-height: 420px; overflow-y: auto; }
+    #colPanel.hidden { display: none; }
+    #colPanel .col-head { padding: 6px 12px; font-size: 11px; font-weight: 600; color: var(--c-tertiary);
+                border-bottom: 1px solid var(--bg-2); position: sticky; top: 0; background: #fff; }
+    .col-row { display: flex; align-items: center; gap: 8px; padding: 5px 10px;
+               border-bottom: 1px solid var(--bg-2); cursor: grab; user-select: none; }
+    .col-row:last-child { border-bottom: none; }
+    .col-row:active { cursor: grabbing; }
+    .col-row.drag-over { background: var(--tint-blue); box-shadow: inset 0 2px 0 var(--color-primary); }
+    .col-row.dragging { opacity: 0.4; }
+    .col-row label { font-size: 12px; cursor: pointer; flex: 1; color: var(--c-primary); }
+    .col-row .grip { color: var(--c-tertiary); flex-shrink: 0; cursor: grab; line-height: 1; }
+    #colPanel .col-foot { padding: 6px 10px; border-top: 1px solid var(--bg-2);
+                position: sticky; bottom: 0; background: #fff; }
 
-    /* ── DEBUG ── */
-    #debugConsole { display: none; }
-    #debugConsole .dc-head { display: flex; justify-content: space-between; align-items: center; background: #0f172a; padding: 10px 14px; border-radius: 10px 10px 0 0; }
-    #debugConsole .dc-head h3 { margin: 0; font-size: 12px; color: #e2e8f0; }
-    #debugLog { background: #0f172a; border-radius: 0 0 10px 10px; padding: 12px; max-height: 260px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 11px; color: #e2e8f0; white-space: pre-wrap; }
-    .mini-btn { padding: 4px 9px; font-size: 11px; border-radius: 6px; border: 1px solid #334155; background: #1e293b; color: #cbd5e1; cursor: pointer; font-family: inherit; }
+    /* ── SPINNER + DEBUG ── */
+    #spinner { display: none; padding: 40px; text-align: center; color: var(--c-secondary); }
+    #debugConsole { display: none; flex-shrink: 0; border-top: 1px solid var(--border); }
+    #debugConsole .dc-head { display: flex; justify-content: space-between; align-items: center;
+                background: var(--menu-bg); padding: 7px 14px; }
+    #debugConsole .dc-head h3 { margin: 0; font-size: 12px; color: #D5E4E8; }
+    #debugLog { background: var(--menu-bg); padding: 10px 14px; max-height: 200px; overflow-y: auto;
+                font-family: ui-monospace, monospace; font-size: 11px; color: #D5E4E8; white-space: pre-wrap; }
 
     /* ── SETTINGS PANEL ── */
-    #setOverlay { position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 1001; display: none; justify-content: flex-end; }
-    #setPanel { background: #f8fafc; width: 360px; max-width: 95vw; height: 100%; overflow-y: auto; box-shadow: -2px 0 12px rgba(0,0,0,0.25); display: flex; flex-direction: column; }
-    #setPanel .ds-header { display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; border-bottom: 1px solid #e2e8f0; background: #fff; }
+    #setOverlay { position: fixed; inset: 0; background: rgba(16,16,16,0.45); z-index: 1001;
+                  display: none; justify-content: flex-end; }
+    #setPanel { background: var(--bg-1); width: 360px; max-width: 95vw; height: 100%;
+                overflow-y: auto; box-shadow: var(--sh3); display: flex; flex-direction: column; }
+    #setPanel .ds-header { display: flex; justify-content: space-between; align-items: center;
+                padding: 14px 18px; border-bottom: 1px solid var(--border); background: #fff; }
     #setPanel .ds-header h2 { margin: 0; font-size: 15px; }
-    #setPanel .ds-close { background: transparent; border: none; font-size: 24px; cursor: pointer; color: #64748b; line-height: 1; }
     #setPanel .ds-body { padding: 16px 18px; flex: 1; }
     #setPanel .ds-section { margin-bottom: 20px; }
-    #setPanel .ds-label { display: block; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: #475569; margin-bottom: 8px; }
+    #setPanel .ds-label { display: block; font-weight: 600; font-size: 11px; text-transform: uppercase;
+                letter-spacing: 0.04em; color: var(--c-secondary); margin-bottom: 8px; }
     #setPanel .ds-checks label { display: block; padding: 5px 0; font-size: 13px; cursor: pointer; }
     #setPanel .ds-checks input { margin-right: 7px; }
-    #setPanel .ds-footer { padding: 12px 18px; border-top: 1px solid #e2e8f0; background: #fff; display: flex; gap: 8px; justify-content: flex-end; }
-    #setPanel .ds-btn { padding: 7px 14px; font-size: 13px; border-radius: 6px; border: 1px solid #cbd5e1; background: #fff; cursor: pointer; font-family: inherit; }
-    #setPanel .ds-btn-primary { background: #2563eb; color: #fff; border-color: #2563eb; }
-    #setPanel .ds-admin { border-top: 1px dashed #cbd5e1; padding-top: 16px; }
-    #setPanel .ds-btn-admin { display: block; width: 100%; margin-bottom: 6px; background: #fef3c7; border-color: #f59e0b; color: #7c2d12; }
-    #setPanel .ds-lock-badge { background: #fef3c7; color: #92400e; border: 1px solid #f59e0b; padding: 6px 10px; border-radius: 6px; font-size: 12px; margin-bottom: 14px; }
+    #setPanel .ds-hint { font-size: 11px; color: var(--c-tertiary); margin-top: 6px; line-height: 1.45; }
+    #setPanel .ds-footer { padding: 12px 18px; border-top: 1px solid var(--border); background: #fff;
+                display: flex; gap: 8px; justify-content: flex-end; }
+    #setPanel .ds-admin { border-top: 1px dashed var(--border-strong); padding-top: 16px; }
+    #setPanel .ds-btn-admin { display: block; width: 100%; margin-bottom: 6px;
+                background: #F5E7DD; border-color: #F69133; color: #7c2d12; }
+    #setPanel .ds-lock-badge { background: #F5E7DD; color: #8A4E10; border: 1px solid #F69133;
+                padding: 6px 10px; border-radius: 6px; font-size: 12px; margin-bottom: 14px; }
   </style>
 </head>
 <body>
@@ -108,50 +215,98 @@
       <p id="statusLine">Initialising…</p>
     </div>
     <div class="hdr-actions">
-      <button class="hdr-btn" onclick="loadData()" title="Reload"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>Refresh</button>
-      <button class="hdr-btn" onclick="exportCSV()" title="Export CSV"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>CSV</button>
-      <button class="hdr-btn" onclick="printReport()" title="Print / PDF (landscape)"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>Print</button>
-      <button class="hdr-btn hdr-btn-icon" onclick="PageSettings.openPanel()" title="Settings"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg></button>
+      <button class="hdr-btn" onclick="loadData()" title="Reload from Fishbowl">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>Refresh
+      </button>
+      <div id="colWrap">
+        <button class="hdr-btn" id="colBtn" onclick="toggleColPanel(event)" title="Show / hide and reorder columns">
+          <svg fill="currentColor" viewBox="0 0 24 24"><circle cx="8" cy="6" r="1.5"/><circle cx="8" cy="12" r="1.5"/><circle cx="8" cy="18" r="1.5"/><circle cx="16" cy="6" r="1.5"/><circle cx="16" cy="12" r="1.5"/><circle cx="16" cy="18" r="1.5"/></svg>Columns
+        </button>
+        <div id="colPanel" class="hidden">
+          <div class="col-head">Show / Reorder</div>
+          <div id="colList"></div>
+          <div class="col-foot">
+            <button type="button" class="btn btn-sm" style="width:100%" onclick="resetColWidths()"
+                    title="Hand every column back to automatic width. You can also drag a column edge in the header to resize one, or double-click an edge to reset.">
+              Reset widths
+            </button>
+          </div>
+        </div>
+      </div>
+      <div style="width:1px;height:24px;background:var(--border);margin:0 2px;"></div>
+      <button class="hdr-btn" onclick="exportCSV()" title="Export the on-screen rows to CSV">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>CSV
+      </button>
+      <button class="hdr-btn" onclick="printReport()" title="Print / PDF (A4 landscape)">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>Print
+      </button>
+      <button class="hdr-btn hdr-btn-icon" onclick="PageSettings.openPanel()" title="Settings">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+      </button>
     </div>
   </header>
 
-  <div class="wrap">
-
-    <!-- CONTROLS -->
-    <div class="card">
-      <div class="controls">
-        <div class="field">
-          <label>Search product / SO / customer</label>
-          <input type="text" id="search" placeholder="contains…" oninput="applyFiltersDebounced()" />
-        </div>
-        <div class="field">
-          <label>Category</label>
-          <select id="catFilter" onchange="applyFilters()"><option value="">All categories</option></select>
-        </div>
-        <div class="field">
-          <label class="chk"><input type="checkbox" id="onlyShort" onchange="applyFilters()" /> Only shortfalls (qty required &gt; 0)</label>
+  <!-- FILTER BAR -->
+  <div id="filterBar">
+    <div class="fld" style="min-width:190px;">
+      <label>Location Group</label>
+      <div class="ms-container" id="lg-ms">
+        <div class="ms-trigger" id="lgTrigger"><span class="ms-placeholder" id="lgPlaceholder">All location groups</span></div>
+        <div class="ms-dropdown hidden" id="lgDropdown">
+          <div class="ms-search"><input type="text" id="lgSearch" placeholder="Search…" /></div>
+          <div class="ms-actions"><span id="lgAll">Select All</span><span id="lgClear">Clear All</span></div>
+          <div class="ms-list" id="lgList"></div>
         </div>
       </div>
     </div>
-
-    <!-- TABLE -->
-    <div class="card">
-      <div id="spinner"><svg class="spin" width="30" height="30" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#e2e8f0" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="#2563eb" stroke-width="3" stroke-linecap="round"/></svg><div style="margin-top:8px;">Loading open orders, on-hand &amp; production…</div></div>
-      <table class="data-table" id="ooTable">
-        <colgroup id="ooColgroup"></colgroup>
-        <thead id="ooHead"></thead>
-        <tbody id="ooBody">
-          <tr><td class="empty" colspan="9">Loading…</td></tr>
-        </tbody>
-      </table>
+    <div class="fld" style="min-width:200px;">
+      <label title="Narrows On Hand, Committed and Not Available to these locations. Allocated, Dropship and On Order have no location dimension in Fishbowl, so they always cover the whole location group.">Location</label>
+      <div class="ms-container" id="loc-ms">
+        <div class="ms-trigger" id="locTrigger"><span class="ms-placeholder" id="locPlaceholder">All locations</span></div>
+        <div class="ms-dropdown hidden" id="locDropdown">
+          <div class="ms-search"><input type="text" id="locSearch" placeholder="Search location or group…" /></div>
+          <div class="ms-actions"><span id="locAll">Select All</span><span id="locClear">Clear All</span></div>
+          <div class="ms-list" id="locList"></div>
+        </div>
+      </div>
     </div>
-
-    <!-- DEBUG -->
-    <div class="card" id="debugConsole">
-      <div class="dc-head"><h3>Debug Console</h3><button class="mini-btn" onclick="clearDebug()">Clear</button></div>
-      <div id="debugLog"></div>
+    <div class="fld">
+      <label>Category</label>
+      <select id="catFilter" onchange="applyFilters()"><option value="">All categories</option></select>
     </div>
+    <div class="fld">
+      <label>Product</label>
+      <input type="text" id="qProduct" placeholder="part / description…" oninput="applyFiltersDebounced()" />
+    </div>
+    <div class="fld">
+      <label>Customer</label>
+      <input type="text" id="qCustomer" placeholder="customer name…" oninput="applyFiltersDebounced()" />
+    </div>
+    <div class="fld">
+      <label>SO #</label>
+      <input type="text" id="qSoNum" placeholder="SO # / customer PO…" oninput="applyFiltersDebounced()" />
+    </div>
+    <label class="fld-chk"><input type="checkbox" id="onlyShort" onchange="applyFilters()" /> Only shortfalls (qty required &gt; 0)</label>
+    <button type="button" class="btn btn-sm" onclick="clearFilters()" title="Clear every filter on this bar">Clear filters</button>
+  </div>
 
+  <!-- TABLE -->
+  <div id="tableScroll">
+    <div id="spinner">
+      <svg class="spin" width="30" height="30" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="var(--color-primary)" stroke-width="3" stroke-linecap="round"/></svg>
+      <div style="margin-top:8px;">Loading open orders, availability &amp; production…</div>
+    </div>
+    <table class="rpt-table" id="ooTable">
+      <colgroup id="ooColgroup"></colgroup>
+      <thead id="ooHead"></thead>
+      <tbody id="ooBody"><tr><td class="empty" colspan="9">Loading…</td></tr></tbody>
+    </table>
+  </div>
+
+  <!-- DEBUG -->
+  <div id="debugConsole">
+    <div class="dc-head"><h3>Debug Console</h3><button class="btn btn-sm" onclick="clearDebug()">Clear</button></div>
+    <div id="debugLog"></div>
   </div>
 
   <!-- SETTINGS PANEL -->
@@ -159,7 +314,7 @@
     <div id="setPanel" onclick="event.stopPropagation()">
       <div class="ds-header">
         <h2>Settings — Open Orders</h2>
-        <button type="button" class="ds-close" onclick="PageSettings.closePanel()">&times;</button>
+        <button type="button" class="close-x" onclick="PageSettings.closePanel()" aria-label="Close">&times;</button>
       </div>
       <div class="ds-body">
         <div id="dsLockBadge" class="ds-lock-badge" style="display:none;">Locked by admin — your changes won't be saved.</div>
@@ -167,45 +322,69 @@
           <label class="ds-label">Options</label>
           <label><input type="checkbox" id="dsOnlyShort" /> Default to only shortfalls</label>
           <label><input type="checkbox" id="dsDebug" /> Show debug console</label>
+          <div class="ds-hint">Your location-group selection, column layout (order, visibility, widths) and sort are saved automatically as you change them — no need to press Save for those.</div>
         </div>
         <div id="dsAdminSection" class="ds-section ds-admin" style="display:none;">
           <label class="ds-label">Admin</label>
-          <button type="button" class="ds-btn ds-btn-admin" onclick="PageSettings.publishMaster()">Publish as default for everyone</button>
-          <button type="button" class="ds-btn ds-btn-admin" id="dsLockBtn" onclick="PageSettings.toggleLock()">Lock user editing</button>
+          <button type="button" class="btn ds-btn-admin" onclick="PageSettings.publishMaster()">Publish as default for everyone</button>
+          <button type="button" class="btn ds-btn-admin" id="dsLockBtn" onclick="PageSettings.toggleLock()">Lock user editing</button>
         </div>
       </div>
       <div class="ds-footer">
-        <button type="button" class="ds-btn" onclick="PageSettings.resetToDefaults()">Reset to defaults</button>
-        <button type="button" class="ds-btn ds-btn-primary" onclick="PageSettings.saveUser()">Save (just me)</button>
+        <button type="button" class="btn" onclick="PageSettings.resetToDefaults()">Reset to defaults</button>
+        <button type="button" class="btn btn-primary" onclick="PageSettings.saveUser()">Save (just me)</button>
       </div>
     </div>
   </div>
 
 <script>
-/* ── RUNTIME GUARD ── */
+/* ── RUNTIME GUARDS ── */
 if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
   document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#475569;"><h2>Not running inside Fishbowl</h2><p>This report requires the Fishbowl BI environment.</p></div>';
   throw new Error('Fishbowl API not available');
 }
+/* fb-lib powers the settings layer AND the location-group multi-select. Without
+   it the page would be half-dead, so say what to fix instead. (Literal hexes:
+   fb-styles is very likely missing for the same reason.) */
+if (!window.FBLib || !FBLib.Common || !FBLib.Common.MultiSelect || !FBLib.Settings) {
+  document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#8A1E30;background:#F0D7DD;">' +
+    '<h2>fb-lib not loaded</h2><p>This report requires the shared <code>fb-lib</code> Script. In BI Script Editor, ' +
+    'confirm a Script named exactly <code>fb-lib</code> exists with the current contents of scripts/fb-lib.js, then ' +
+    're-save THIS report (directives expand at save time).</p></div>';
+  throw new Error('FBLib not available');
+}
 
-/* ── FB-LIB SETTINGS ── */
+/* ── SETTINGS ── */
 FBLib.Settings.init({
   userKey:   'cdx.bi.openOrders.user.v1',
   masterKey: 'cdx.bi.openOrders.master.v1',
-  defaults: { v: 1, onlyShort: false, cols: [], debug: false },
+  defaults: {
+    v: 2,
+    onlyShort: false,
+    debug: false,
+    cols: [],            // [{key, vis, w}] — order + visibility + width
+    locationGroups: [],  // [] = every location group the user can access
+    locations: [],       // [] = every location in those groups
+    sortKey: '',         // '' = natural order (category → product → SO #)
+    sortDir: 'asc'
+  },
   propFallback: { debug: { name: 'BI_SHOW_DEBUG', dflt: 'false', parse: v => (v === 'true' || v === true) } }
 });
 
-/* ── THIN HELPERS ── */
-const _C = (window.FBLib && FBLib.Common) ? FBLib.Common : null;
+/* ── FORMAT HELPERS (thin wrappers so the page still renders if fb-lib
+   formatting ever changes shape) ── */
+const _C = FBLib.Common;
 function fmtQty(v) {
-  if (_C && _C.formatQty) return _C.formatQty(v);
+  if (v === null || v === undefined || v === '') return '';
+  try { return _C.formatQty(v); } catch (_) {}
   const n = parseFloat(v); if (isNaN(n)) return '';
   return n % 1 === 0 ? String(Math.round(n)) : n.toFixed(4).replace(/\.?0+$/, '');
 }
-function fmtDate(s) { try { return _C && _C.formatDate ? _C.formatDate(s) : String(s || '').split(' ')[0]; } catch (_) { return String(s || ''); } }
+function fmtDate(s) { try { return _C.formatDate(s); } catch (_) { return String(s || '').split(' ')[0]; } }
 function escHtml(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 function setStatus(m) { document.getElementById('statusLine').textContent = m; }
+function dbg(msg, type) { try { if (_C.DEBUG_MODE) _C.debugLog(msg, type || 'info'); } catch (_) {} }
+function clearDebug() { try { _C.clearDebugLog(); } catch (_) {} }
 
 /* ── QUERY HELPERS ── */
 function norm(r) {
@@ -219,329 +398,946 @@ async function qp(sql) {
 }
 
 /* ── STATE ── */
-let _parts = [];      // part groups: {category, partid, productnum, partnum, onHand, inProd, lines:[]}
-let _shown = [];      // filtered: [{ g, lines, sumToShip, required }]
+let _parts = [];        // part groups (see loadData)
+let _shown = [];        // post-filter: [{ g, lines, sumToShip, required }]
+let _lgList = [];       // [{val,lbl}] accessible + active location groups
+let _selLg = new Set(); // selected LG ids as strings; empty = all accessible
+let _lgMs = null;
+let _locList = [];      // [{val,lbl,sub,group,tagLabel}] locations in those LGs
+let _selLoc = new Set();// selected location ids; empty = every location in scope
+let _locMs = null;
+let _filtersReady = false;
 let _filterTimer = null;
 const _UNCAT = '(Uncategorised)';
 const _todayStr = new Date().toISOString().split('T')[0];
 
-/* ── COLUMNS (reorderable + resizable, persisted via fb-lib) ── */
+/* ── COLUMNS ──
+   `level` documents where a value lives, which drives both rendering and
+   sorting: 'part' columns carry one value per part (blank on the SO detail
+   rows), 'line' columns carry one per SO line (blank on the part summary),
+   and 'both' is filled on each tier — Qty to Ship is the part's total on the
+   summary row and the line's own qty underneath.
+   Availability keys mirror Inv_Reorder_Watchlist so the two reports read the
+   same. `nr` right-aligns and marks the column numeric for sorting. */
+const MIN_COL_W = 50;   // narrowest a column may be dragged (also the floor a saved width must clear)
 const _DEFAULT_COLS = [
-  { key: 'product',   label: 'Product',          w: 280 },
-  { key: 'scheduled', label: 'Scheduled',        w: 110 },
-  { key: 'sonum',     label: 'SO #',             w: 120 },
-  { key: 'custpo',    label: 'Customer PO',      w: 140 },
-  { key: 'customer',  label: 'Customer',         w: 200 },
-  { key: 'toship',    label: 'Qty to Ship',      w: 110, nr: true },
-  { key: 'onhand',    label: 'Qty On Hand',      w: 110, nr: true },
-  { key: 'inprod',    label: 'Qty In Production', w: 130, nr: true },
-  { key: 'required',  label: 'Qty Required',     w: 120, nr: true }
+  { key: 'product',   label: 'Product',           vis: true,  w: 280, level: 'part' },
+  { key: 'uom',       label: 'UOM',               vis: false, w: 70,  level: 'part' },
+  { key: 'scheduled', label: 'Scheduled',         vis: true,  w: 105, level: 'line' },
+  { key: 'sonum',     label: 'SO #',              vis: true,  w: 105, level: 'line' },
+  { key: 'custpo',    label: 'Customer PO',       vis: true,  w: 130, level: 'line' },
+  { key: 'customer',  label: 'Customer',          vis: true,  w: 190, level: 'line' },
+  { key: 'lg',        label: 'Location Group',    vis: false, w: 140, level: 'line' },
+  { key: 'toship',    label: 'Qty to Ship',       vis: true,  w: 105, level: 'both', nr: true },
+  { key: 'onhand',    label: 'Qty On Hand',       vis: true,  w: 105, level: 'part', nr: true },
+  { key: 'available', label: 'Available',         vis: true,  w: 100, level: 'part', nr: true },
+  // 'both': the part row shows the part's total (all orders, from the qty*
+  // views) and each order line shows its own share. See the header block —
+  // the two tiers are different scopes and deliberately do not add up.
+  { key: 'committed', label: 'Committed',         vis: false, w: 100, level: 'both', nr: true },
+  { key: 'allocated', label: 'Allocated',         vis: false, w: 100, level: 'both', nr: true },
+  { key: 'notavail',  label: 'Not Available',     vis: false, w: 115, level: 'part', nr: true },
+  { key: 'dropship',  label: 'Dropship',          vis: false, w: 95,  level: 'part', nr: true },
+  { key: 'onorder',   label: 'On Order',          vis: true,  w: 95,  level: 'part', nr: true },
+  { key: 'inprod',    label: 'Qty In Production', vis: true,  w: 125, level: 'part', nr: true },
+  { key: 'required',  label: 'Qty Required',      vis: true,  w: 115, level: 'part', nr: true }
 ];
-let _cols = _DEFAULT_COLS.map(function (c) { return Object.assign({}, c); });
-let _dragKey = null;
+let _cols = _DEFAULT_COLS.map(c => Object.assign({}, c));
+let _dragKey = null;      // header drag-reorder
+let _dragIdx = null;      // Columns-panel drag-reorder
 let _resizing = null;
+let _sortKey = '';
+let _sortDir = 'asc';
+
+function visCols() { return _cols.filter(c => c.vis); }
 
 function loadColPrefs() {
   let saved = null;
   try { saved = FBLib.Settings.resolve('cols'); } catch (_) {}
-  if (!Array.isArray(saved) || !saved.length) { _cols = _DEFAULT_COLS.map(function (c) { return Object.assign({}, c); }); return; }
-  const byKey = {}; _DEFAULT_COLS.forEach(function (c) { byKey[c.key] = c; });
-  const out = []; const seen = {};
-  saved.forEach(function (s) {
+  if (!Array.isArray(saved) || !saved.length) { _cols = _DEFAULT_COLS.map(c => Object.assign({}, c)); return; }
+  // Resilient to columns added or removed since the layout was saved: known
+  // keys keep their saved order/visibility/width, anything new is appended
+  // with its file defaults, anything gone is dropped.
+  const byKey = {}; _DEFAULT_COLS.forEach(c => { byKey[c.key] = c; });
+  const out = [], seen = {};
+  saved.forEach(s => {
     const d = byKey[s.key];
-    if (d && !seen[s.key]) { out.push(Object.assign({}, d, { w: (s.w > 40 ? s.w : d.w) })); seen[s.key] = 1; }
+    if (!d || seen[s.key]) return;
+    out.push(Object.assign({}, d, {
+      vis: (s.vis === undefined ? d.vis : !!s.vis),
+      w:   (s.w > MIN_COL_W ? s.w : d.w)
+    }));
+    seen[s.key] = 1;
   });
-  _DEFAULT_COLS.forEach(function (c) { if (!seen[c.key]) out.push(Object.assign({}, c)); });
+  _DEFAULT_COLS.forEach(c => { if (!seen[c.key]) out.push(Object.assign({}, c)); });
   _cols = out;
 }
-function saveColPrefs() {
-  try { FBLib.Settings.setUserKey('cols', _cols.map(function (c) { return { key: c.key, w: c.w }; })); FBLib.Settings.saveUser(); } catch (_) {}
+function persistCols() {
+  try {
+    FBLib.Settings.setUserKey('cols', _cols.map(c => ({ key: c.key, vis: c.vis, w: c.w })));
+    FBLib.Settings.saveUser();
+  } catch (e) { dbg('persistCols failed: ' + e, 'warn'); }
+}
+function persistPrefs() {
+  try {
+    FBLib.Settings.setUserKey('locationGroups', Array.from(_selLg));
+    FBLib.Settings.setUserKey('locations', Array.from(_selLoc));
+    FBLib.Settings.setUserKey('onlyShort', document.getElementById('onlyShort').checked);
+    FBLib.Settings.setUserKey('sortKey', _sortKey);
+    FBLib.Settings.setUserKey('sortDir', _sortDir);
+    FBLib.Settings.saveUser();
+  } catch (e) { dbg('persistPrefs failed: ' + e, 'warn'); }
 }
 
+/* ── HEAD RENDER (sort + drag-reorder + resize all live on the th) ── */
+
 function renderHead() {
+  const vis = visCols();
   const cg = document.getElementById('ooColgroup');
   const head = document.getElementById('ooHead');
   let total = 0;
-  cg.innerHTML = _cols.map(function (c) { total += c.w; return '<col style="width:' + c.w + 'px">'; }).join('');
+  cg.innerHTML = vis.map(c => { total += c.w; return '<col style="width:' + c.w + 'px">'; }).join('');
+  // An explicit total, not 100%: under fixed layout a table wider than the sum
+  // of its columns redistributes the slack, so every resize would nudge the
+  // neighbouring columns too.
   document.getElementById('ooTable').style.width = total + 'px';
 
   const tr = document.createElement('tr');
-  _cols.forEach(function (c) {
+  vis.forEach(c => {
     const th = document.createElement('th');
     if (c.nr) th.className = 'nr';
     th.dataset.key = c.key;
     th.draggable = true;
+    th.title = c.label + ' — click to sort, drag to reorder, drag the right edge to resize';
     th.appendChild(document.createTextNode(c.label));
-    const rz = document.createElement('div'); rz.className = 'col-resize';
-    rz.addEventListener('mousedown', function (e) { startResize(e, c, th); });
+    if (_sortKey === c.key) {
+      const ind = document.createElement('span');
+      ind.className = 'sort-ind';
+      ind.textContent = _sortDir === 'asc' ? ' ↑' : ' ↓';
+      th.appendChild(ind);
+    }
+
+    const rz = document.createElement('div');
+    rz.className = 'col-resize';
+    rz.draggable = false;
+    rz.title = 'Drag to resize. Double-click to reset every column to its default width.';
+    rz.addEventListener('mousedown', e => startResize(e, c, th));
+    rz.addEventListener('click',     e => { e.stopPropagation(); e.preventDefault(); });
+    rz.addEventListener('dragstart', e => { e.stopPropagation(); e.preventDefault(); });
+    rz.addEventListener('dblclick',  e => { e.stopPropagation(); e.preventDefault(); resetColWidths(); });
     th.appendChild(rz);
-    th.addEventListener('dragstart', function (e) { if (_resizing) { e.preventDefault(); return; } _dragKey = c.key; e.dataTransfer.effectAllowed = 'move'; th.classList.add('dragging'); });
-    th.addEventListener('dragover', function (e) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; if (_dragKey && _dragKey !== c.key) th.classList.add('drag-over'); });
-    th.addEventListener('dragleave', function () { th.classList.remove('drag-over'); });
-    th.addEventListener('drop', function (e) {
+
+    th.addEventListener('click', () => sortBy(c.key));
+    th.addEventListener('dragstart', e => {
+      if (_resizing) { e.preventDefault(); return; }
+      _dragKey = c.key; e.dataTransfer.effectAllowed = 'move'; th.classList.add('dragging');
+    });
+    th.addEventListener('dragover', e => {
+      e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+      if (_dragKey && _dragKey !== c.key) th.classList.add('drag-over');
+    });
+    th.addEventListener('dragleave', () => th.classList.remove('drag-over'));
+    th.addEventListener('drop', e => {
       e.preventDefault(); th.classList.remove('drag-over');
       if (!_dragKey || _dragKey === c.key) return;
-      const fi = _cols.findIndex(function (x) { return x.key === _dragKey; });
-      const ti = _cols.findIndex(function (x) { return x.key === c.key; });
+      const fi = _cols.findIndex(x => x.key === _dragKey);
+      const ti = _cols.findIndex(x => x.key === c.key);
       if (fi < 0 || ti < 0) return;
-      const m = _cols.splice(fi, 1)[0]; _cols.splice(ti, 0, m);
-      saveColPrefs(); renderHead(); render();
+      _cols.splice(ti, 0, _cols.splice(fi, 1)[0]);
+      _dragKey = null;
+      persistCols(); buildColPanel(); renderHead(); render();
     });
-    th.addEventListener('dragend', function () { _dragKey = null; document.querySelectorAll('#ooHead th').forEach(function (t) { t.classList.remove('dragging', 'drag-over'); }); });
+    th.addEventListener('dragend', () => {
+      _dragKey = null;
+      document.querySelectorAll('#ooHead th').forEach(t => t.classList.remove('dragging', 'drag-over'));
+    });
     tr.appendChild(th);
   });
   head.innerHTML = ''; head.appendChild(tr);
+  // Measure, don't guess: the category band sticks directly under the header.
+  requestAnimationFrame(() => {
+    const h = head.offsetHeight || 30;
+    document.documentElement.style.setProperty('--thead-h', h + 'px');
+  });
 }
 
+/* ── RESIZE ── */
 function startResize(e, col, th) {
+  // Claim the gesture before the header reads it as a sort click or a
+  // reorder drag.
   e.preventDefault(); e.stopPropagation();
-  _resizing = { col: col, startX: e.clientX, startW: col.w };
+  _resizing = { col: col, startX: e.clientX, startW: col.w, wasDraggable: th.draggable, th: th };
   th.draggable = false;
+  document.body.classList.add('col-resizing');
   document.addEventListener('mousemove', onResizeMove);
   document.addEventListener('mouseup', onResizeUp);
 }
 function onResizeMove(e) {
   if (!_resizing) return;
-  const w = Math.max(50, _resizing.startW + (e.clientX - _resizing.startX));
-  _resizing.col.w = w;
-  const idx = _cols.indexOf(_resizing.col);
+  _resizing.col.w = Math.max(MIN_COL_W, Math.round(_resizing.startW + (e.clientX - _resizing.startX)));
+  const vis = visCols();
+  const idx = vis.indexOf(_resizing.col);
   const colEl = document.getElementById('ooColgroup').children[idx];
-  if (colEl) colEl.style.width = w + 'px';
-  let total = 0; _cols.forEach(function (c) { total += c.w; });
+  if (colEl) colEl.style.width = _resizing.col.w + 'px';
+  let total = 0; vis.forEach(c => { total += c.w; });
   document.getElementById('ooTable').style.width = total + 'px';
 }
 function onResizeUp() {
   document.removeEventListener('mousemove', onResizeMove);
   document.removeEventListener('mouseup', onResizeUp);
-  if (_resizing) { _resizing = null; saveColPrefs(); renderHead(); }
+  document.body.classList.remove('col-resizing');
+  if (!_resizing) return;
+  _resizing.th.draggable = _resizing.wasDraggable;
+  // mouseup on a header is about to fire a click, which would sort the column
+  // the user was only resizing. Swallow exactly one.
+  const swallow = ev => { ev.stopPropagation(); ev.preventDefault(); };
+  document.addEventListener('click', swallow, true);
+  setTimeout(() => document.removeEventListener('click', swallow, true), 0);
+  _resizing = null;
+  persistCols(); renderHead();
+}
+function resetColWidths() {
+  const byKey = {}; _DEFAULT_COLS.forEach(c => { byKey[c.key] = c; });
+  _cols.forEach(c => { if (byKey[c.key]) c.w = byKey[c.key].w; });
+  persistCols(); renderHead(); render();
+  setStatus('Column widths reset to defaults.');
 }
 
-function link(text, fn) {
-  const a = document.createElement('a'); a.className = 'row-link'; a.href = '#'; a.textContent = text;
-  a.addEventListener('click', function (e) { e.preventDefault(); fn(); });
-  return a;
+/* ── COLUMNS PANEL ── */
+function buildColPanel() {
+  const list = document.getElementById('colList');
+  list.innerHTML = '';
+  _cols.forEach((col, i) => {
+    const div = document.createElement('div');
+    div.className = 'col-row'; div.draggable = true; div.dataset.idx = i;
+
+    const grip = document.createElement('span');
+    grip.className = 'grip';
+    grip.innerHTML = '<svg width="12" height="10" viewBox="0 0 12 10" fill="currentColor"><rect y="0" width="12" height="2" rx="1"/><rect y="4" width="12" height="2" rx="1"/><rect y="8" width="12" height="2" rx="1"/></svg>';
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = col.vis; cb.id = 'cv_' + col.key;
+    cb.addEventListener('change', () => {
+      // Keep at least one column on screen, or the grid has nothing to render.
+      if (!cb.checked && visCols().length <= 1) { cb.checked = true; setStatus('At least one column must stay visible.'); return; }
+      col.vis = cb.checked;
+      persistCols(); renderHead(); render();
+    });
+
+    const lbl = document.createElement('label');
+    lbl.htmlFor = cb.id; lbl.textContent = col.label;
+
+    div.appendChild(grip); div.appendChild(cb); div.appendChild(lbl);
+
+    div.addEventListener('dragstart', e => { _dragIdx = i; setTimeout(() => div.classList.add('dragging'), 0); e.dataTransfer.effectAllowed = 'move'; });
+    div.addEventListener('dragend',   () => { _dragIdx = null; list.querySelectorAll('.col-row').forEach(r => r.classList.remove('dragging', 'drag-over')); });
+    div.addEventListener('dragover',  e => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; list.querySelectorAll('.col-row').forEach(r => r.classList.remove('drag-over')); if (_dragIdx !== null && _dragIdx !== i) div.classList.add('drag-over'); });
+    div.addEventListener('dragleave', () => div.classList.remove('drag-over'));
+    div.addEventListener('drop', e => {
+      e.preventDefault(); div.classList.remove('drag-over');
+      if (_dragIdx === null || _dragIdx === i) return;
+      _cols.splice(i, 0, _cols.splice(_dragIdx, 1)[0]);
+      _dragIdx = null;
+      persistCols(); buildColPanel(); renderHead(); render();
+    });
+    list.appendChild(div);
+  });
+}
+function toggleColPanel(e) {
+  if (e) e.stopPropagation();
+  document.getElementById('colPanel').classList.toggle('hidden');
 }
 
-/* ── DEBUG ── */
-function dbg(msg, type) { try { if (FBLib.Common.DEBUG_MODE) FBLib.Common.debugLog(msg, type || 'info'); } catch (_) {} }
-function clearDebug() { try { FBLib.Common.clearDebugLog(); } catch (_) {} if (!FBLib.Common.DEBUG_MODE) document.getElementById('debugConsole').style.display = 'none'; }
+/* ── LOCATION-GROUP FILTER ──
+   EMPTY selection means "no filter" — every location group the logged-in user
+   can access, i.e. the report's behaviour before the filter existed. */
+function selectedLgIds() {
+  const all = _lgList.map(o => String(o.val));
+  if (!_selLg.size) return all;
+  return all.filter(id => _selLg.has(id));
+}
+// Same contract for locations: empty = every location in the LGs in scope.
+// Returns null when nothing is selected, so the caller can skip the predicate
+// entirely rather than emitting a huge IN list of every location.
+function selectedLocIds() {
+  if (!_selLoc.size) return null;
+  const valid = _locList.map(o => String(o.val)).filter(id => _selLoc.has(id));
+  return valid.length ? valid : null;
+}
 
-/* ── LOAD DATA ── */
+function initLgFilter() {
+  _lgMs = FBLib.Common.MultiSelect.create({
+    containerId: 'lg-ms',
+    items: [], selected: Array.from(_selLg),
+    placeholder: 'All location groups', maxTags: 2, flipUp: false,
+    onChange: vals => { _selLg = new Set((vals || []).map(String)); },
+    // Availability + production are queried per LG, so a change means a
+    // reload — but only once per dropdown session (onClose, not onChange).
+    // The Location list is a child of this selection, so refresh it first.
+    onClose: async () => {
+      if (!_filtersReady) return;
+      await populateLocFilter();
+      persistPrefs(); loadData();
+    }
+  });
+  _locMs = FBLib.Common.MultiSelect.create({
+    containerId: 'loc-ms',
+    items: [], selected: Array.from(_selLoc),
+    placeholder: 'All locations', maxTags: 1, flipUp: false,
+    onChange: vals => { _selLoc = new Set((vals || []).map(String)); },
+    onClose: () => { if (_filtersReady) { persistPrefs(); loadData(); } }
+  });
+}
+
+// Locations cascade off the location-group selection — only the ones inside
+// the LGs currently in scope are offered. Each entry carries the LG as both a
+// dropdown group header and a searchable sub-line, and the selected chip spells
+// out "LG / Location" so two same-named bins in different LGs stay distinct.
+async function populateLocFilter() {
+  const lgIds = selectedLgIds();
+  _locList = [];
+  if (lgIds.length) {
+    try {
+      const rows = await qp(
+        'SELECT l.id AS id, l.name AS name, lg.name AS lgname ' +
+        'FROM location l JOIN locationgroup lg ON lg.id = l.locationgroupid ' +
+        'WHERE l.activeflag = 1 AND l.locationgroupid IN (' + lgIds.join(',') + ') ' +
+        'ORDER BY lg.name, l.name');
+      _locList = rows.map(r => ({
+        val: String(r.id), lbl: r.name, sub: r.lgname, group: r.lgname,
+        tagLabel: r.lgname + ' / ' + r.name
+      }));
+    } catch (e) { dbg('populateLocFilter failed: ' + e, 'warn'); }
+  }
+  if (_locMs) _locMs.setItems(_locList);
+  // Prune selections that fell out of scope (LG deselected, location retired)
+  // so a stale id cannot silently filter the stock columns down to nothing.
+  const valid = new Set(_locList.map(o => o.val));
+  const pruned = Array.from(_selLoc).filter(id => valid.has(id));
+  if (pruned.length !== _selLoc.size) {
+    _selLoc = new Set(pruned);
+    if (_locMs) _locMs.setSelected(pruned);
+  }
+  dbg('Locations available: ' + _locList.length, 'info');
+}
+
+async function populateLgFilter() {
+  let allowed = null;
+  try { if (typeof getLocationGroupList === 'function') allowed = getLocationGroupList(); } catch (_) {}
+  const idFilter = (Array.isArray(allowed) && allowed.length) ? ' AND id IN (' + allowed.join(',') + ')' : '';
+  let rows = [];
+  try { rows = await qp('SELECT id, name FROM locationgroup WHERE activeFlag = 1' + idFilter + ' ORDER BY name'); }
+  catch (e) { dbg('populateLgFilter failed: ' + e, 'warn'); }
+  _lgList = rows.map(r => ({ val: String(r.id), lbl: r.name }));
+  if (_lgMs) _lgMs.setItems(_lgList);
+  // Drop any saved selection that no longer resolves (LG deactivated, or the
+  // user's access changed) so the filter can't silently exclude everything.
+  const valid = new Set(_lgList.map(o => o.val));
+  const pruned = Array.from(_selLg).filter(id => valid.has(id));
+  if (pruned.length !== _selLg.size) {
+    _selLg = new Set(pruned);
+    if (_lgMs) _lgMs.setSelected(pruned);
+  }
+  dbg('Location groups available: ' + _lgList.length, 'info');
+}
+
+/* ── LOAD ── */
 async function loadData() {
   document.getElementById('spinner').style.display = 'block';
   document.getElementById('ooTable').style.display = 'none';
   setStatus('Loading…');
 
   try {
-    let allowed = null;
-    try { if (typeof getLocationGroupList === 'function') allowed = getLocationGroupList(); } catch (_) {}
-    const lgClause = (Array.isArray(allowed) && allowed.length) ? (' AND so.locationgroupid IN (' + allowed.join(',') + ') ') : ' ';
+    const lgIds = selectedLgIds();
+    if (!lgIds.length) {
+      _parts = []; buildCatFilter(); applyFilters();
+      setStatus('No accessible location groups.');
+      return;
+    }
+    const lgIn = lgIds.join(',');
 
-    // Open SO lines: issued / in-progress orders, line not yet shipped, with a
-    // product (→ part). Category = the product's product-tree node (one per
-    // product via MIN tree id to avoid many-to-many duplication).
+    // 1. Open SO lines — issued / in-progress orders, line not shipped out,
+    //    with a product (→ part). Category is the product's product-tree node
+    //    (MIN tree id per product, so a product in several nodes doesn't
+    //    duplicate its lines).
     const rows = await qp(
       "SELECT so.num AS sonum, so.customerpo AS custpo, cust.name AS customername, " +
+      "so.locationgroupid AS lgid, solg.name AS lgname, " +
       "soitem.id AS soitemid, soitem.datescheduledfulfillment AS scheduled, " +
       "soitem.productnum AS productnum, COALESCE(prod.description, soitem.description) AS proddesc, " +
-      "prod.partid AS partid, part.num AS partnum, " +
+      "prod.partid AS partid, part.num AS partnum, uom.code AS uom, " +
       "(COALESCE(soitem.qtytofulfill,0) - COALESCE(soitem.qtyfulfilled,0)) AS qtytoship, " +
+      // Per-line Allocated: this line's own contribution to the QTYALLOCATEDSO
+      // view — outstanding qty in the part's BASE uom, and only for the line
+      // types/statuses that view counts (a kit component or a non-allocating
+      // type contributes nothing, so it must read 0, not its qty). The CASE
+      // mirrors the view verbatim; demodb-verified to reproduce it exactly.
+      "CASE WHEN soitem.typeid IN (10,12) AND soitem.statusid IN (10,14,20,30,40) " +
+      "     THEN CASE WHEN soitem.uomid <> part.uomid AND uc.id > 0 " +
+      "               THEN (COALESCE(soitem.qtytofulfill,0) - COALESCE(soitem.qtyfulfilled,0)) * uc.multiply / uc.factor " +
+      "               ELSE (COALESCE(soitem.qtytofulfill,0) - COALESCE(soitem.qtyfulfilled,0)) END " +
+      "     ELSE 0 END AS lineallocated, " +
+      // Per-line Committed: stock reserved against THIS line by its pick.
+      // Status 30 (Committed) is the nominal case, but a site can leave picks
+      // parked at Started or Finished while the stock is still held, so a
+      // 20/40 line also counts when the tag it points at genuinely carries
+      // qtyCommitted — the same field the part-row Committed totals. That
+      // keeps the column data-backed rather than workflow-state-dependent,
+      // and it can only ever ADD to the status-30 result, never remove.
+      // pickitem.tagId is the reliable link (srcTagId is often unset), so
+      // check both. Correlated on the indexed pickitem.soitemid; base-UOM
+      // converted like the allocated column above.
+      "COALESCE((SELECT SUM(CASE WHEN pi.uomid <> part.uomid AND puc.id > 0 " +
+      "                          THEN pi.qty * puc.multiply / puc.factor ELSE pi.qty END) " +
+      "            FROM pickitem pi " +
+      "            LEFT JOIN uomconversion puc ON puc.touomid = part.uomid AND puc.fromuomid = pi.uomid " +
+      "           WHERE pi.soitemid = soitem.id " +
+      "             AND (pi.statusid = 30 " +
+      "                  OR (pi.statusid IN (20, 40) " +
+      "                      AND EXISTS (SELECT 1 FROM tag ptag " +
+      "                                   WHERE ptag.id IN (pi.tagid, pi.srctagid) " +
+      "                                     AND COALESCE(ptag.qtycommitted, 0) > 0)))), 0) AS linecommitted, " +
       "ptree.name AS category " +
       "FROM so " +
       "JOIN soitem ON soitem.soid = so.id " +
       "JOIN product prod ON prod.id = soitem.productid " +
       "LEFT JOIN customer cust ON cust.id = so.customerid " +
+      "LEFT JOIN locationgroup solg ON solg.id = so.locationgroupid " +
       "LEFT JOIN part ON part.id = prod.partid " +
-      "LEFT JOIN (SELECT productid, MIN(producttreeid) AS treeid FROM producttotree GROUP BY productid) ptt ON ptt.productid = soitem.productid " +
+      "LEFT JOIN uom ON uom.id = part.uomid " +
+      "LEFT JOIN uomconversion uc ON uc.touomid = part.uomid AND uc.fromuomid = soitem.uomid " +
+      "LEFT JOIN (SELECT productid, MIN(producttreeid) AS treeid FROM producttotree GROUP BY productid) ptt " +
+      "  ON ptt.productid = soitem.productid " +
       "LEFT JOIN producttree ptree ON ptree.id = ptt.treeid " +
       "WHERE so.statusid IN (20, 25) " +
       "AND soitem.statusid NOT IN (50, 60, 70, 75) " +
-      "AND (COALESCE(soitem.qtytofulfill,0) - COALESCE(soitem.qtyfulfilled,0)) > 0" + lgClause +
+      "AND (COALESCE(soitem.qtytofulfill,0) - COALESCE(soitem.qtyfulfilled,0)) > 0 " +
+      "AND so.locationgroupid IN (" + lgIn + ") " +
       "ORDER BY ptree.name, soitem.productnum, so.num LIMIT 10000");
+    dbg('Open SO lines: ' + rows.length, 'success');
 
-    // Distinct manufacturable/stocked part ids for the supplementary roll-ups.
-    const partIds = [...new Set(rows.map(function (r) { return r.partid; }).filter(function (x) { return x != null; }))];
+    const partIds = [...new Set(rows.map(r => r.partid).filter(x => x != null))];
 
-    // Qty on hand (company-wide) — tag types 30/40, by part.
-    const onhand = {};
-    for (let i = 0; i < partIds.length; i += 1000) {
-      const chunk = partIds.slice(i, i + 1000); if (!chunk.length) continue;
-      const oh = await qp(
-        "SELECT t.partid AS partid, COALESCE(SUM(t.qty),0) AS qty " +
-        "FROM tag t WHERE t.typeid IN (30,40) AND t.partid IN (" + chunk.join(',') + ") GROUP BY t.partid");
-      oh.forEach(function (r) { onhand[r.partid] = parseFloat(r.qty) || 0; });
+    // 2. Availability per part, over the selected location groups.
+    //
+    //    Split in two because the Location filter can only narrow half of it:
+    //    2a STOCK (On Hand / Committed / Not Available) comes from an inline
+    //       tag+location aggregate so it can be scoped to chosen locations.
+    //       The three CASE expressions reproduce QTYONHAND / QTYCOMMITTED /
+    //       QTYNOTAVAILABLE verbatim (note QTYCOMMITTED applies NO tag-type
+    //       filter, unlike the other two) — demodb-verified to match the views
+    //       exactly on every part+LG, so unfiltered numbers still agree with
+    //       Inv_Reorder_Watchlist.
+    //    2b DEMAND (Allocated / Dropship / On Order) stays on the views: those
+    //       are keyed by part + LG and have no location dimension to filter by.
+    const locIds = selectedLocIds();
+    const locClause = locIds ? ' AND l.id IN (' + locIds.join(',') + ') ' : ' ';
+    const avail = {};
+    function slot(partid) {
+      let a = avail[partid];
+      if (!a) a = avail[partid] = { onhand: 0, committed: 0, allocated: 0,
+                                    notavail: 0, dropship: 0, onorder: 0, available: 0 };
+      return a;
     }
+    for (let i = 0; i < partIds.length; i += 500) {
+      const chunk = partIds.slice(i, i + 500); if (!chunk.length) continue;
+      // 2a — stock, location-scopable
+      const st = await qp(
+        "SELECT t.partid AS partid, " +
+        "  COALESCE(SUM(CASE WHEN t.typeid IN (30,40) THEN t.qty ELSE 0 END),0) AS onhand, " +
+        "  COALESCE(SUM(t.qtycommitted),0) AS committed, " +
+        "  COALESCE(SUM(CASE WHEN t.typeid IN (30,40) AND l.countedasavailable = 0 AND l.typeid <> 100 " +
+        "                    THEN t.qty - t.qtycommitted ELSE 0 END),0) AS notavail " +
+        "FROM tag t " +
+        "INNER JOIN location l ON l.id = t.locationid " +
+        "WHERE t.partid IN (" + chunk.join(',') + ") " +
+        "AND l.locationgroupid IN (" + lgIn + ")" + locClause +
+        "GROUP BY t.partid");
+      st.forEach(r => {
+        const a = slot(r.partid);
+        a.onhand = parseFloat(r.onhand) || 0;
+        a.committed = parseFloat(r.committed) || 0;
+        a.notavail = parseFloat(r.notavail) || 0;
+      });
+      // 2b — demand, always whole-LG
+      const dm = await qp(
+        "SELECT part.id AS partid, " +
+        "  COALESCE(SUM(COALESCE(qtyallocated.qty,0)),0) AS allocated, " +
+        "  COALESCE(SUM(COALESCE(qtydropship.qty,0)),0)  AS dropship, " +
+        "  COALESCE(SUM(COALESCE(qtyonorder.qty,0)),0)   AS onorder " +
+        "FROM part " +
+        "CROSS JOIN locationgroup " +
+        "LEFT OUTER JOIN qtyallocated ON part.id = qtyallocated.partid AND locationgroup.id = qtyallocated.locationgroupid " +
+        "LEFT OUTER JOIN qtyonorder   ON part.id = qtyonorder.partid   AND locationgroup.id = qtyonorder.locationgroupid " +
+        "LEFT OUTER JOIN qtydropship  ON part.id = qtydropship.partid  AND locationgroup.id = qtydropship.locationgroupid " +
+        "WHERE part.id IN (" + chunk.join(',') + ") " +
+        "AND locationgroup.activeFlag = 1 AND locationgroup.id IN (" + lgIn + ") " +
+        "GROUP BY part.id");
+      dm.forEach(r => {
+        const a = slot(r.partid);
+        a.allocated = parseFloat(r.allocated) || 0;
+        a.dropship = parseFloat(r.dropship) || 0;
+        a.onorder = parseFloat(r.onorder) || 0;
+      });
+    }
+    Object.keys(avail).forEach(k => {
+      const a = avail[k];
+      a.available = Math.max(0, a.onhand - a.allocated - a.notavail + a.dropship);
+    });
+    dbg('Availability: ' + Object.keys(avail).length + ' part(s) over ' + lgIds.length +
+        ' LG(s)' + (locIds ? ', stock scoped to ' + locIds.length + ' location(s)' : ''), 'success');
 
-    // Qty in production — WOs (statusId < 40) whose produced part (moitem.partId
-    // via wo.moItemId) is the part, summing the WO target quantity.
-    const prod = {};
-    for (let i = 0; i < partIds.length; i += 1000) {
-      const chunk = partIds.slice(i, i + 1000); if (!chunk.length) continue;
+    // 3. Qty in production — open WOs (status < 40) producing the part, in the
+    //    selected location groups.
+    //
+    //    The produced part is the WO's typeid-10 woitem, NOT moitem.partId via
+    //    wo.moItemId: wo.moItemId points at the typeid-50 BUILD HEADER, whose
+    //    partId is NULL, so joining through it silently matched nothing and
+    //    this column read 0 for every part (the bug this replaces).
+    //
+    //    Qty is target − used, i.e. what is still TO COME. The used portion has
+    //    already been received into stock and is therefore in On Hand — summing
+    //    the raw target would count it twice.
+    const inprod = {};
+    for (let i = 0; i < partIds.length; i += 500) {
+      const chunk = partIds.slice(i, i + 500); if (!chunk.length) continue;
       const pr = await qp(
-        "SELECT moitem.partid AS partid, COALESCE(SUM(COALESCE(wo.qtytarget, wo.qtyordered, 0)),0) AS qty " +
-        "FROM wo JOIN moitem ON moitem.id = wo.moitemid " +
-        "WHERE wo.statusid < 40 AND moitem.partid IN (" + chunk.join(',') + ") GROUP BY moitem.partid");
-      pr.forEach(function (r) { prod[r.partid] = parseFloat(r.qty) || 0; });
+        "SELECT woi.partid AS partid, " +
+        "  COALESCE(SUM(GREATEST(COALESCE(woi.qtytarget,0) - COALESCE(woi.qtyused,0), 0)),0) AS qty " +
+        "FROM wo " +
+        "JOIN woitem woi ON woi.woid = wo.id AND woi.typeid = 10 " +
+        "WHERE wo.statusid < 40 AND woi.partid IN (" + chunk.join(',') + ") " +
+        "AND wo.locationgroupid IN (" + lgIn + ") GROUP BY woi.partid");
+      pr.forEach(r => { inprod[r.partid] = parseFloat(r.qty) || 0; });
     }
+    dbg('In production: ' + Object.keys(inprod).length + ' part(s)', 'success');
 
-    // Group SO lines by category + part. On-hand / in-production are part-level
-    // (one value per part); qty-to-ship aggregates across the part's SO lines.
-    const map = {}; const orderKeys = []; let lineCount = 0;
-    rows.forEach(function (r) {
+    // Group by category + part. Availability / production are part-level (one
+    // value per part); qty-to-ship aggregates across the part's SO lines.
+    const map = {}, orderKeys = []; let lineCount = 0;
+    rows.forEach(r => {
       const cat = r.category || _UNCAT;
       const key = cat + '||' + (r.partid != null ? 'p' + r.partid : 'n' + (r.productnum || ''));
       let g = map[key];
       if (!g) {
-        g = { key: key, category: cat, partid: r.partid, productnum: r.productnum || '', proddesc: r.proddesc || '', partnum: r.partnum || '',
-              onHand: r.partid != null ? (onhand[r.partid] || 0) : 0,
-              inProd: r.partid != null ? (prod[r.partid] || 0) : 0, lines: [] };
+        const a = (r.partid != null && avail[r.partid]) ? avail[r.partid] : null;
+        g = {
+          key: key, category: cat, partid: r.partid,
+          productnum: r.productnum || '', proddesc: r.proddesc || '',
+          partnum: r.partnum || '', uom: r.uom || '',
+          onhand:    a ? a.onhand    : 0,
+          available: a ? a.available : 0,
+          committed: a ? a.committed : 0,
+          allocated: a ? a.allocated : 0,
+          notavail:  a ? a.notavail  : 0,
+          dropship:  a ? a.dropship  : 0,
+          onorder:   a ? a.onorder   : 0,
+          inProd: (r.partid != null ? (inprod[r.partid] || 0) : 0),
+          lines: []
+        };
         map[key] = g; orderKeys.push(key);
       }
-      g.lines.push({ scheduled: r.scheduled, sonum: r.sonum, custpo: r.custpo || '', customer: r.customername || '', toShip: parseFloat(r.qtytoship) || 0 });
+      g.lines.push({
+        scheduled: r.scheduled, sonum: r.sonum, custpo: r.custpo || '',
+        customer: r.customername || '', lg: r.lgname || '',
+        toShip: parseFloat(r.qtytoship) || 0,
+        allocated: parseFloat(r.lineallocated) || 0,
+        committed: parseFloat(r.linecommitted) || 0
+      });
       lineCount++;
     });
-    _parts = orderKeys.map(function (k) { return map[k]; });
+    _parts = orderKeys.map(k => map[k]);
 
-    buildFilters();
+    await explainCommitted(partIds, lgIn);
+
+    buildCatFilter();
     applyFilters();
+
     let shortParts = 0, shortQty = 0;
-    _parts.forEach(function (g) {
-      const req = g.lines.reduce(function (s, l) { return s + l.toShip; }, 0) - g.onHand - g.inProd;
+    _parts.forEach(g => {
+      const req = g.lines.reduce((s, l) => s + l.toShip, 0) - g.onhand - g.inProd;
       if (req > 0) { shortParts++; shortQty += req; }
     });
-    setStatus(_parts.length + ' part(s) · ' + lineCount + ' open line(s) · ' + shortParts + ' part(s) short (' + fmtQty(shortQty) + ' units)');
+    const lgLabel = _selLg.size ? (_selLg.size + ' of ' + _lgList.length + ' LG') : 'all LGs';
+    const locLabel = _selLoc.size ? (' · stock in ' + _selLoc.size + ' location(s)') : '';
+    setStatus(_parts.length + ' part(s) · ' + lineCount + ' open line(s) · ' +
+              shortParts + ' part(s) short (' + fmtQty(shortQty) + ' units) · ' + lgLabel + locLabel);
   } catch (e) {
     console.error(e);
     setStatus('Error: ' + (e.message || e));
-    document.getElementById('ooBody').innerHTML = '<tr><td class="empty" colspan="' + _cols.length + '">Error: ' + escHtml(e.message || String(e)) + '</td></tr>';
+    dbg('loadData failed: ' + (e.message || e), 'error');
+    document.getElementById('ooBody').innerHTML =
+      '<tr><td class="empty" colspan="' + visCols().length + '">Error: ' + escHtml(e.message || String(e)) + '</td></tr>';
   } finally {
     document.getElementById('spinner').style.display = 'none';
     document.getElementById('ooTable').style.display = '';
   }
 }
 
-function buildFilters() {
-  const catSel = document.getElementById('catFilter');
-  const cur = catSel.value;
-  const cats = [...new Set(_parts.map(function (g) { return g.category; }))].sort(function (a, b) { return a.localeCompare(b); });
-  catSel.innerHTML = '<option value="">All categories</option>';
-  cats.forEach(function (c) {
-    const o = document.createElement('option'); o.value = c; o.textContent = c;
-    if (c === cur) o.selected = true; catSel.appendChild(o);
+// A part row can show Committed while every order line under it reads zero,
+// because tag.qtyCommitted counts WORK- and TRANSFER-order picks as well as
+// sales ones. Rather than leave that looking like a bug, split each on-screen
+// part's committed qty by the order type of the pick holding it and print the
+// breakdown to the debug console. Debug-only — it is an extra query, and the
+// answer only matters when someone is questioning a number.
+async function explainCommitted(partIds, lgIn) {
+  try {
+    if (!FBLib.Common.DEBUG_MODE) return;
+    const unexplained = _parts.filter(g =>
+      g.partid != null && g.committed > 0 &&
+      g.lines.reduce((s, l) => s + l.committed, 0) <= 0);
+    if (!unexplained.length) { dbg('Committed: every part with a commitment has it on a line', 'success'); return; }
+
+    const ids = unexplained.map(g => g.partid).slice(0, 500);
+    const locIds = selectedLocIds();
+    const locClause = locIds ? ' AND l.id IN (' + locIds.join(',') + ') ' : ' ';
+    // Resolve the holder per TAG first, then total — summing over the join
+    // directly would multiply a tag by however many picks touch it. A tag held
+    // by picks of more than one type is attributed to the lowest type id;
+    // that is a reporting nicety, not a number anyone sums.
+    const rows = await qp(
+      "SELECT x.partid AS partid, x.ot AS ot, COUNT(*) AS tags, SUM(x.cmt) AS cmt FROM (" +
+      "  SELECT t.id AS id, t.partid AS partid, t.qtycommitted AS cmt, " +
+      "    COALESCE((SELECT MIN(pi.ordertypeid) FROM pickitem pi " +
+      "               WHERE (pi.tagid = t.id OR pi.srctagid = t.id) " +
+      "                 AND pi.statusid IN (5,10,11,20,30,40)), 0) AS ot " +
+      "  FROM tag t " +
+      "  INNER JOIN location l ON l.id = t.locationid " +
+      "  WHERE t.partid IN (" + ids.join(',') + ") AND t.qtycommitted > 0 " +
+      "    AND l.locationgroupid IN (" + lgIn + ")" + locClause +
+      ") x GROUP BY x.partid, x.ot");
+
+    const OT = { 10: 'purchase order', 20: 'sales order', 30: 'work order', 40: 'transfer order', 0: 'no open pick' };
+    const byPart = {};
+    rows.forEach(r => {
+      (byPart[r.partid] = byPart[r.partid] || []).push(
+        fmtQty(r.cmt) + ' on ' + (OT[r.ot] || ('order type ' + r.ot)) + ' picks');
+    });
+    dbg(unexplained.length + ' part(s) show Committed with nothing on their order lines — ' +
+        'that qty is held by picks for OTHER order types:', 'warning');
+    unexplained.slice(0, 20).forEach(g => {
+      const parts = byPart[g.partid];
+      dbg('  ' + (g.partnum || g.productnum) + ': committed ' + fmtQty(g.committed) + ' → ' +
+          (parts && parts.length ? parts.join(', ') : 'holder not identifiable'), 'info');
+    });
+  } catch (e) {
+    dbg('Committed breakdown failed: ' + (e.message || e), 'error');
+  }
+}
+
+function buildCatFilter() {
+  const sel = document.getElementById('catFilter');
+  const cur = sel.value;
+  const cats = [...new Set(_parts.map(g => g.category))].sort((a, b) => a.localeCompare(b));
+  sel.innerHTML = '<option value="">All categories</option>';
+  cats.forEach(c => {
+    const o = document.createElement('option');
+    o.value = c; o.textContent = c;
+    if (c === cur) o.selected = true;
+    sel.appendChild(o);
   });
 }
 
-/* ── FILTER + RENDER ── */
+/* ── FILTER ── */
 function applyFiltersDebounced() { clearTimeout(_filterTimer); _filterTimer = setTimeout(applyFilters, 200); }
 
+// Text/category/shortfall filters clear instantly (client-side). The LG and
+// Location selections drive the QUERIES, so clearing them has to reload —
+// which is why they are cleared here explicitly rather than left behind.
+function clearFilters() {
+  document.getElementById('qProduct').value = '';
+  document.getElementById('qCustomer').value = '';
+  document.getElementById('qSoNum').value = '';
+  document.getElementById('catFilter').value = '';
+  document.getElementById('onlyShort').checked = false;
+  const hadScope = _selLg.size || _selLoc.size;
+  if (hadScope) {
+    _selLg = new Set(); _selLoc = new Set();
+    if (_lgMs) _lgMs.setSelected([]);
+    if (_locMs) _locMs.setSelected([]);
+  }
+  applyFilters();
+  if (hadScope) { persistPrefs(); populateLocFilter().then(loadData); }
+}
+
 function applyFilters() {
-  const q = (document.getElementById('search').value || '').trim().toLowerCase();
+  const qProd = (document.getElementById('qProduct').value || '').trim().toLowerCase();
+  const qCust = (document.getElementById('qCustomer').value || '').trim().toLowerCase();
+  const qSo   = (document.getElementById('qSoNum').value || '').trim().toLowerCase();
   const cat = document.getElementById('catFilter').value;
   const onlyShort = document.getElementById('onlyShort').checked;
-  persistControls();
+  if (_filtersReady) persistPrefs();
+
   _shown = [];
-  _parts.forEach(function (g) {
+  _parts.forEach(g => {
     if (cat && g.category !== cat) return;
+    // Product search matches the part group (it is a part-level attribute), so
+    // it keeps or drops the whole group; Customer and SO # are line-level and
+    // narrow the lines within a group.
+    if (qProd && (g.productnum + ' ' + g.proddesc + ' ' + g.partnum).toLowerCase().indexOf(qProd) === -1) return;
     let lines = g.lines;
-    if (q) lines = lines.filter(function (l) { return (g.productnum + ' ' + g.proddesc + ' ' + l.sonum + ' ' + l.custpo + ' ' + l.customer).toLowerCase().indexOf(q) !== -1; });
+    if (qCust) lines = lines.filter(l => (l.customer || '').toLowerCase().indexOf(qCust) !== -1);
+    if (qSo)   lines = lines.filter(l => (l.sonum + ' ' + l.custpo).toLowerCase().indexOf(qSo) !== -1);
     if (!lines.length) return;
-    const sumToShip = lines.reduce(function (s, l) { return s + l.toShip; }, 0);
-    const required = sumToShip - g.onHand - g.inProd;
+    const sumToShip = lines.reduce((s, l) => s + l.toShip, 0);
+    const required = sumToShip - g.onhand - g.inProd;
     if (onlyShort && !(required > 0)) return;
     _shown.push({ g: g, lines: lines, sumToShip: sumToShip, required: required });
   });
   render();
 }
 
+/* ── SORT ──
+   Sorting always reorders the PART groups within their category (the grid's
+   unit of meaning), using a group-level value per column. For line-level
+   columns it also sorts each group's SO lines by the same value, so
+   "Scheduled ↑" reads earliest-first at both tiers. */
+function sortBy(key) {
+  const col = _cols.find(c => c.key === key);
+  if (!col) return;
+  if (_sortKey === key) {
+    // Third click on the same column returns to natural order.
+    if (_sortDir === 'asc') _sortDir = 'desc';
+    else { _sortKey = ''; _sortDir = 'asc'; }
+  } else { _sortKey = key; _sortDir = 'asc'; }
+  persistPrefs(); renderHead(); render();
+}
+
+function lineValue(l, key) {
+  switch (key) {
+    case 'scheduled': return l.scheduled ? String(l.scheduled) : '';
+    case 'sonum':     return l.sonum || '';
+    case 'custpo':    return l.custpo || '';
+    case 'customer':  return l.customer || '';
+    case 'lg':        return l.lg || '';
+    case 'toship':    return l.toShip;
+    case 'allocated': return l.allocated;
+    case 'committed': return l.committed;
+    default:          return '';
+  }
+}
+
+// One value per part group for the sort key. Line-level columns collapse to
+// the group's minimum (earliest date / first SO # / first customer), which is
+// what "sort by Scheduled" means when a part has several orders.
+function groupValue(item, key) {
+  const g = item.g;
+  switch (key) {
+    case 'product':   return g.productnum || '';
+    case 'uom':       return g.uom || '';
+    case 'toship':    return item.sumToShip;
+    case 'onhand':    return g.onhand;
+    case 'available': return g.available;
+    case 'committed': return g.committed;
+    case 'allocated': return g.allocated;
+    case 'notavail':  return g.notavail;
+    case 'dropship':  return g.dropship;
+    case 'onorder':   return g.onorder;
+    case 'inprod':    return g.inProd;
+    case 'required':  return item.required;
+    default: {
+      const vals = item.lines.map(l => lineValue(l, key)).filter(v => v !== '' && v != null);
+      if (!vals.length) return '';
+      return vals.reduce((a, b) => (cmpRaw(a, b) <= 0 ? a : b));
+    }
+  }
+}
+
+function cmpRaw(a, b) {
+  if (typeof a === 'number' && typeof b === 'number') return a - b;
+  const sa = String(a == null ? '' : a), sb = String(b == null ? '' : b);
+  // Natural compare so SO "9" sorts before "10".
+  return sa.localeCompare(sb, undefined, { numeric: true, sensitivity: 'base' });
+}
+
+function sortedShown() {
+  if (!_sortKey) return _shown;
+  const dir = _sortDir === 'asc' ? 1 : -1;
+  // Stable within a category: sort by (category, value) so the category
+  // grouping — the outer structure of the report — is never broken by a sort.
+  return _shown.slice().sort((x, y) => {
+    const c = x.g.category.localeCompare(y.g.category);
+    if (c !== 0) return c;
+    return cmpRaw(groupValue(x, _sortKey), groupValue(y, _sortKey)) * dir;
+  });
+}
+
+function sortedLines(item) {
+  const col = _cols.find(c => c.key === _sortKey);
+  if (!_sortKey || !col || (col.level !== 'line' && col.level !== 'both')) return item.lines;
+  const dir = _sortDir === 'asc' ? 1 : -1;
+  return item.lines.slice().sort((a, b) => cmpRaw(lineValue(a, _sortKey), lineValue(b, _sortKey)) * dir);
+}
+
+/* ── RENDER ── */
 function render() {
   const tbody = document.getElementById('ooBody');
+  const vis = visCols();
   tbody.innerHTML = '';
   if (!_shown.length) {
-    tbody.innerHTML = '<tr><td class="empty" colspan="' + _cols.length + '">No open order lines match the current filters.</td></tr>';
+    tbody.innerHTML = '<tr><td class="empty" colspan="' + vis.length + '">No open order lines match the current filters.</td></tr>';
     return;
   }
+  const ordered = sortedShown();
   const frag = document.createDocumentFragment();
   let curCat = null;
-  _shown.forEach(function (item) {
-    if (item.g.category !== curCat) { curCat = item.g.category; frag.appendChild(buildCatHeader(curCat)); }
-    frag.appendChild(buildPartRow(item));                                    // part summary
-    item.lines.forEach(function (l) { frag.appendChild(buildDetailRow(item.g, l)); });  // SO detail lines
+  ordered.forEach(item => {
+    if (item.g.category !== curCat) {
+      curCat = item.g.category;
+      frag.appendChild(buildCatRow(curCat, ordered, vis));
+    }
+    frag.appendChild(buildPartRow(item, vis));
+    sortedLines(item).forEach(l => frag.appendChild(buildDetailRow(item.g, l, vis)));
   });
   tbody.appendChild(frag);
 }
 
-function buildCatHeader(cat) {
-  const items = _shown.filter(function (it) { return it.g.category === cat; });
-  const toShip = items.reduce(function (s, it) { return s + it.sumToShip; }, 0);
-  const req = items.reduce(function (s, it) { return s + Math.max(0, it.required); }, 0);
-  const tr = document.createElement('tr'); tr.className = 'group-row';
-  const td = document.createElement('td'); td.colSpan = _cols.length;
+function buildCatRow(cat, ordered, vis) {
+  const items = ordered.filter(it => it.g.category === cat);
+  const toShip = items.reduce((s, it) => s + it.sumToShip, 0);
+  const req = items.reduce((s, it) => s + Math.max(0, it.required), 0);
+  const tr = document.createElement('tr'); tr.className = 'cat-row';
+  const td = document.createElement('td'); td.colSpan = vis.length;
   td.innerHTML = '<span class="cat-name">▸ ' + escHtml(cat) + '</span>' +
-    '<span class="group-sub">' + items.length + ' part(s) · ' + fmtQty(toShip) + ' to ship · ' + fmtQty(req) + ' short</span>';
+    '<span class="cat-sub">' + items.length + ' part(s) · ' + escHtml(fmtQty(toShip)) +
+    ' to ship · ' + escHtml(fmtQty(req)) + ' short</span>';
   tr.appendChild(td);
   return tr;
 }
 
-// Part summary row: aggregate qty-to-ship + the part-level on-hand / production / required.
-function buildPartRow(item) {
+function link(text, fn) {
+  const a = document.createElement('a');
+  a.className = 'row-link'; a.href = '#'; a.textContent = text;
+  a.addEventListener('click', e => { e.preventDefault(); fn(); });
+  return a;
+}
+function cell(text, cls) {
+  const el = document.createElement('td');
+  el.textContent = text == null ? '' : text;
+  if (cls) el.className = cls;
+  if (text) el.title = text;
+  return el;
+}
+function numTd(text, cls) {
+  const el = document.createElement('td');
+  el.className = 'num-cell' + (cls ? ' ' + cls : '');
+  el.textContent = text == null ? '' : text;
+  return el;
+}
+
+// Part summary row: total qty to ship for the part, plus its part-level
+// availability. Line-level columns are blank here.
+function buildPartRow(item, vis) {
   const tr = document.createElement('tr'); tr.className = 'part-row';
-  _cols.forEach(function (c) { tr.appendChild(partCell(item, c)); });
+  vis.forEach(c => tr.appendChild(partCell(item, c)));
   return tr;
 }
 function partCell(item, col) {
   const g = item.g;
-  if (col.key === 'product') {
-    const td = document.createElement('td');
-    if (g.partnum) { const a = link(g.productnum, function () { openModule('Part', g.partnum); }); a.title = 'Open part ' + g.partnum; td.appendChild(a); }
-    else { td.appendChild(document.createTextNode(g.productnum)); }
-    if (g.proddesc) { const d = document.createElement('span'); d.className = 'pdesc'; d.textContent = ' — ' + g.proddesc; td.appendChild(d); }
-    const cnt = document.createElement('span'); cnt.className = 'pcount';
-    cnt.textContent = ' (' + item.lines.length + ' order' + (item.lines.length === 1 ? '' : 's') + ')';
-    td.appendChild(cnt);
-    td.title = g.productnum + (g.proddesc ? ' — ' + g.proddesc : '');
-    return td;
+  switch (col.key) {
+    case 'product': {
+      const td = document.createElement('td');
+      if (g.partnum) {
+        const a = link(g.productnum, () => openModule('Part', g.partnum));
+        a.title = 'Open part ' + g.partnum;
+        td.appendChild(a);
+      } else {
+        td.appendChild(document.createTextNode(g.productnum));
+      }
+      if (g.proddesc) {
+        const d = document.createElement('span'); d.className = 'pdesc';
+        d.textContent = ' — ' + g.proddesc; td.appendChild(d);
+      }
+      const cnt = document.createElement('span'); cnt.className = 'pcount';
+      cnt.textContent = ' (' + item.lines.length + ' order' + (item.lines.length === 1 ? '' : 's') + ')';
+      td.appendChild(cnt);
+      td.title = g.productnum + (g.proddesc ? ' — ' + g.proddesc : '');
+      return td;
+    }
+    case 'uom':       return cell(g.uom, 'muted');
+    case 'toship':    return numTd(fmtQty(item.sumToShip));
+    case 'onhand':    return numTd(fmtQty(g.onhand),    g.onhand    ? '' : 'muted');
+    case 'available': return numTd(fmtQty(g.available), g.available ? '' : 'muted');
+    case 'committed': {
+      const td = numTd(fmtQty(g.committed), g.committed ? '' : 'muted');
+      td.title = 'Part total across the selected location groups — every commitment '
+               + 'against this part, not only the orders listed below';
+      return td;
+    }
+    case 'allocated': {
+      const td = numTd(fmtQty(g.allocated), g.allocated ? '' : 'muted');
+      td.title = 'Part total across the selected location groups — sales, purchase, '
+               + 'transfer and manufacture demand, not only the orders listed below';
+      return td;
+    }
+    case 'notavail':  return numTd(fmtQty(g.notavail),  g.notavail  ? '' : 'muted');
+    case 'dropship':  return numTd(fmtQty(g.dropship),  g.dropship  ? '' : 'muted');
+    case 'onorder':   return numTd(fmtQty(g.onorder),   g.onorder   ? '' : 'muted');
+    case 'inprod':    return numTd(fmtQty(g.inProd),    g.inProd    ? '' : 'muted');
+    case 'required': {
+      const td = numTd(fmtQty(item.required));
+      td.classList.add(item.required > 0 ? 'short' : 'covered');
+      return td;
+    }
+    default: return cell('', '');   // scheduled / sonum / custpo / customer / lg
   }
-  if (col.key === 'toship')   return numTd(fmtQty(item.sumToShip));
-  if (col.key === 'onhand')   return numTd(fmtQty(g.onHand), g.onHand ? '' : 'muted');
-  if (col.key === 'inprod')   return numTd(fmtQty(g.inProd), g.inProd ? '' : 'muted');
-  if (col.key === 'required') { const td = numTd(fmtQty(item.required)); td.classList.add(item.required > 0 ? 'short' : 'covered'); return td; }
-  return cell('', '');   // scheduled / sonum / custpo / customer blank on the summary row
 }
 
-// SO detail line: only the per-line qty to ship; part-level columns blank.
-function buildDetailRow(g, l) {
+// SO detail line: the per-line qty to ship and the order's own fields.
+// Part-level columns show an em-dash so it is clear the number lives one tier up.
+function buildDetailRow(g, l, vis) {
   const tr = document.createElement('tr'); tr.className = 'so-row';
-  _cols.forEach(function (c) { tr.appendChild(detailCell(g, l, c)); });
+  vis.forEach(c => tr.appendChild(detailCell(g, l, c)));
   return tr;
 }
 function detailCell(g, l, col) {
   switch (col.key) {
-    case 'product': return cell('', 'so-prod');   // indent marker (blank — product shown on summary)
+    case 'product': return cell('', 'so-indent');
     case 'scheduled': {
-      const td = document.createElement('td'); td.textContent = fmtDate(l.scheduled);
+      const td = document.createElement('td');
+      td.textContent = fmtDate(l.scheduled);
       if (l.scheduled && String(l.scheduled).split(' ')[0] < _todayStr) td.className = 'past-due';
       return td;
     }
-    case 'sonum': { const td = document.createElement('td'); td.appendChild(link(l.sonum, function () { openModule('Sales Order', l.sonum); })); return td; }
+    case 'sonum': {
+      const td = document.createElement('td');
+      td.appendChild(link(l.sonum, () => openModule('Sales Order', l.sonum)));
+      return td;
+    }
     case 'custpo':   return cell(l.custpo, 'muted');
     case 'customer': return cell(l.customer, 'muted');
+    case 'lg':       return cell(l.lg, 'muted');
     case 'toship':   return numTd(fmtQty(l.toShip));
-    default:         return numTd('—', 'muted');   // onhand / inprod / required — part-level only
+    case 'uom':      return cell('', '');
+    case 'allocated': {
+      const td = numTd(fmtQty(l.allocated), l.allocated ? '' : 'muted');
+      td.title = 'This order line\u2019s own allocated demand';
+      return td;
+    }
+    case 'committed': {
+      const td = numTd(fmtQty(l.committed), l.committed ? '' : 'muted');
+      td.title = l.committed
+        ? 'Stock committed to this order line by a Committed pick'
+        : 'No stock committed to this order line yet';
+      return td;
+    }
+    default:         return numTd('\u2014', 'muted');   // part-level availability
   }
 }
-function cell(text, cls) { const el = document.createElement('td'); el.textContent = text == null ? '' : text; if (cls) el.className = cls; if (text) el.title = text; return el; }
-function numTd(text, cls) { const el = document.createElement('td'); el.className = 'num-cell' + (cls ? ' ' + cls : ''); el.textContent = text == null ? '' : text; return el; }
 
-/* ── CSV ── */
+/* ── CSV ── Exports the on-screen sequence (sort + filters + visible columns),
+   one row per SO line with the part-level numbers repeated for context. ── */
 function exportCSV() {
   if (!_shown.length) { alert('Nothing to export.'); return; }
-  const q = function (v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; };
-  const lines = ['Category,Product,Description,Scheduled,SO #,Customer PO,Customer,Line Qty to Ship,Part Qty to Ship,Qty On Hand,Qty In Production,Qty Required'];
-  _shown.forEach(function (item) {
+  const vis = visCols();
+  const q = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+  const head = ['Category'].concat(vis.map(c => c.label));
+  const lines = [head.map(q).join(',')];
+  sortedShown().forEach(item => {
     const g = item.g;
-    item.lines.forEach(function (l) {
-      lines.push([g.category, g.productnum, g.proddesc, fmtDate(l.scheduled), l.sonum, l.custpo, l.customer, l.toShip,
-        item.sumToShip, g.onHand, g.inProd, item.required].map(q).join(','));
+    sortedLines(item).forEach(l => {
+      const row = [g.category].concat(vis.map(c => csvValue(item, l, c)));
+      lines.push(row.map(q).join(','));
     });
   });
   const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
@@ -550,10 +1346,41 @@ function exportCSV() {
   a.href = url; a.download = 'OpenOrders_' + new Date().toISOString().split('T')[0] + '.csv';
   a.click(); URL.revokeObjectURL(url);
 }
+// One flat value per (line, column) — part-level numbers repeat on each of the
+// part's lines so a spreadsheet pivot has everything it needs on every row.
+function csvValue(item, l, col) {
+  const g = item.g;
+  switch (col.key) {
+    case 'product':   return g.productnum + (g.proddesc ? ' — ' + g.proddesc : '');
+    case 'uom':       return g.uom;
+    case 'scheduled': return fmtDate(l.scheduled);
+    case 'sonum':     return l.sonum;
+    case 'custpo':    return l.custpo;
+    case 'customer':  return l.customer;
+    case 'lg':        return l.lg;
+    case 'toship':    return l.toShip;
+    case 'onhand':    return g.onhand;
+    case 'available': return g.available;
+    // Line-level for these two — a CSV row IS an order line, so its own
+    // committed / allocated is the useful number to pivot on.
+    case 'committed': return l.committed;
+    case 'allocated': return l.allocated;
+    case 'notavail':  return g.notavail;
+    case 'dropship':  return g.dropship;
+    case 'onorder':   return g.onorder;
+    case 'inprod':    return g.inProd;
+    case 'required':  return item.required;
+    default:          return '';
+  }
+}
 
-/* ── PRINT (landscape PDF via standalone window — JxBrowser ignores window.print() on the page) ── */
+/* ── PRINT ──
+   Rendered into a standalone window rather than via window.print() on this
+   page: inside the Fishbowl JxBrowser panel printing the page itself is
+   unreliable, so we build the document and print THAT. ── */
 function printPartCellHtml(item, c) {
   const g = item.g;
+  const nr = c.nr ? ' class="nr"' : '';
   switch (c.key) {
     case 'product': {
       let h = escHtml(g.productnum);
@@ -561,16 +1388,23 @@ function printPartCellHtml(item, c) {
       h += ' <span class="pcount">(' + item.lines.length + ' order' + (item.lines.length === 1 ? '' : 's') + ')</span>';
       return '<td>' + h + '</td>';
     }
-    case 'toship':   return '<td class="nr">' + escHtml(fmtQty(item.sumToShip)) + '</td>';
-    case 'onhand':   return '<td class="nr' + (g.onHand ? '' : ' muted') + '">' + escHtml(fmtQty(g.onHand)) + '</td>';
-    case 'inprod':   return '<td class="nr' + (g.inProd ? '' : ' muted') + '">' + escHtml(fmtQty(g.inProd)) + '</td>';
+    case 'uom':      return '<td class="muted">' + escHtml(g.uom) + '</td>';
     case 'required': return '<td class="nr ' + (item.required > 0 ? 'short' : 'covered') + '">' + escHtml(fmtQty(item.required)) + '</td>';
-    default:         return '<td' + (c.nr ? ' class="nr"' : '') + '></td>';   // scheduled/sonum/custpo/customer blank on summary
+    case 'toship':   return '<td class="nr">' + escHtml(fmtQty(item.sumToShip)) + '</td>';
+    case 'onhand': case 'available': case 'committed': case 'allocated':
+    case 'notavail': case 'dropship': case 'onorder': case 'inprod': {
+      const map = { onhand: g.onhand, available: g.available, committed: g.committed, allocated: g.allocated,
+                    notavail: g.notavail, dropship: g.dropship, onorder: g.onorder, inprod: g.inProd };
+      const v = map[c.key];
+      return '<td class="nr' + (v ? '' : ' muted') + '">' + escHtml(fmtQty(v)) + '</td>';
+    }
+    default: return '<td' + nr + '></td>';   // line-level columns blank on the summary
   }
 }
 function printDetailCellHtml(g, l, c) {
   switch (c.key) {
-    case 'product':  return '<td></td>';
+    case 'product': return '<td></td>';
+    case 'uom':     return '<td></td>';
     case 'scheduled': {
       const pd = (l.scheduled && String(l.scheduled).split(' ')[0] < _todayStr) ? ' class="past-due"' : '';
       return '<td' + pd + '>' + escHtml(fmtDate(l.scheduled)) + '</td>';
@@ -578,89 +1412,100 @@ function printDetailCellHtml(g, l, c) {
     case 'sonum':    return '<td>' + escHtml(l.sonum) + '</td>';
     case 'custpo':   return '<td class="muted">' + escHtml(l.custpo) + '</td>';
     case 'customer': return '<td class="muted">' + escHtml(l.customer) + '</td>';
+    case 'lg':       return '<td class="muted">' + escHtml(l.lg) + '</td>';
     case 'toship':   return '<td class="nr">' + escHtml(fmtQty(l.toShip)) + '</td>';
-    default:         return '<td class="nr muted">—</td>';   // onhand / inprod / required — part-level only
+    case 'allocated': return '<td class="nr' + (l.allocated ? '' : ' muted') + '">' + escHtml(fmtQty(l.allocated)) + '</td>';
+    case 'committed': return '<td class="nr' + (l.committed ? '' : ' muted') + '">' + escHtml(fmtQty(l.committed)) + '</td>';
+    default:         return '<td class="nr muted">—</td>';
   }
 }
 function printReport() {
   if (!_shown.length) { alert('Nothing to print.'); return; }
+  const vis = visCols();
 
-  // Honour the on-screen column order + proportional widths (table-layout:fixed wraps long text).
-  const totalW = _cols.reduce(function (s, c) { return s + c.w; }, 0) || 1;
-  const colgroup = _cols.map(function (c) { return '<col style="width:' + (c.w / totalW * 100).toFixed(2) + '%">'; }).join('');
-  const headCells = _cols.map(function (c) { return '<th' + (c.nr ? ' class="nr"' : '') + '>' + escHtml(c.label) + '</th>'; }).join('');
+  // Honour the on-screen column order + proportional widths; table-layout:fixed
+  // then wraps long text instead of blowing the page width.
+  const totalW = vis.reduce((s, c) => s + c.w, 0) || 1;
+  const colgroup = vis.map(c => '<col style="width:' + (c.w / totalW * 100).toFixed(2) + '%">').join('');
+  const headCells = vis.map(c => '<th' + (c.nr ? ' class="nr"' : '') + '>' + escHtml(c.label) + '</th>').join('');
 
+  const ordered = sortedShown();
   const body = [];
   let curCat = null;
-  _shown.forEach(function (item) {
+  ordered.forEach(item => {
     if (item.g.category !== curCat) {
       curCat = item.g.category;
-      const catItems = _shown.filter(function (it) { return it.g.category === curCat; });
-      const toShip = catItems.reduce(function (s, it) { return s + it.sumToShip; }, 0);
-      const req = catItems.reduce(function (s, it) { return s + Math.max(0, it.required); }, 0);
-      body.push('<tr class="cat"><td colspan="' + _cols.length + '">▸ ' + escHtml(curCat) +
-        ' <span class="pcount">' + catItems.length + ' part(s) · ' + escHtml(fmtQty(toShip)) + ' to ship · ' + escHtml(fmtQty(req)) + ' short</span></td></tr>');
+      const catItems = ordered.filter(it => it.g.category === curCat);
+      const toShip = catItems.reduce((s, it) => s + it.sumToShip, 0);
+      const req = catItems.reduce((s, it) => s + Math.max(0, it.required), 0);
+      body.push('<tr class="cat"><td colspan="' + vis.length + '">▸ ' + escHtml(curCat) +
+        ' <span class="pcount">' + catItems.length + ' part(s) · ' + escHtml(fmtQty(toShip)) +
+        ' to ship · ' + escHtml(fmtQty(req)) + ' short</span></td></tr>');
     }
-    body.push('<tr class="part">' + _cols.map(function (c) { return printPartCellHtml(item, c); }).join('') + '</tr>');
-    item.lines.forEach(function (l) {
-      body.push('<tr class="detail">' + _cols.map(function (c) { return printDetailCellHtml(item.g, l, c); }).join('') + '</tr>');
+    body.push('<tr class="part">' + vis.map(c => printPartCellHtml(item, c)).join('') + '</tr>');
+    sortedLines(item).forEach(l => {
+      body.push('<tr class="detail">' + vis.map(c => printDetailCellHtml(item.g, l, c)).join('') + '</tr>');
     });
   });
 
-  // Filter / summary line for the header.
+  // Filter / scope line for the printed header.
   const filters = [];
-  const q = (document.getElementById('search').value || '').trim();
-  if (q) filters.push('search "' + q + '"');
+  const qProd = (document.getElementById('qProduct').value || '').trim();
+  const qCust = (document.getElementById('qCustomer').value || '').trim();
+  const qSo   = (document.getElementById('qSoNum').value || '').trim();
+  if (qProd) filters.push('product "' + qProd + '"');
+  if (qCust) filters.push('customer "' + qCust + '"');
+  if (qSo)   filters.push('SO "' + qSo + '"');
   const cat = document.getElementById('catFilter').value;
   if (cat) filters.push('category ' + cat);
+  if (_selLg.size) {
+    const names = _lgList.filter(o => _selLg.has(o.val)).map(o => o.lbl);
+    filters.push('location group ' + names.join(', '));
+  }
+  if (_selLoc.size) {
+    const names = _locList.filter(o => _selLoc.has(o.val)).map(o => o.tagLabel);
+    filters.push('stock in ' + names.join(', '));
+  }
   if (document.getElementById('onlyShort').checked) filters.push('only shortfalls');
-  const filterText = filters.length ? 'Filters: ' + filters.join(' · ') : 'All open orders';
+  const filterText = filters.length ? 'Filters: ' + filters.join(' · ') : 'All open orders, all location groups';
   const summary = document.getElementById('statusLine').textContent || '';
 
   const doc = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Open Orders Report</title><style>' +
     '@page{size:A4 landscape;margin:10mm;}' +
     '*{box-sizing:border-box;}' +
-    'body{font-family:Arial,Helvetica,sans-serif;font-size:9px;color:#1e293b;margin:0;-webkit-print-color-adjust:exact;print-color-adjust:exact;}' +
-    'h1{font-size:15px;margin:0 0 2px;color:#0f172a;}' +
-    '.sub{font-size:9px;color:#64748b;margin:0 0 2px;}' +
-    '.meta{font-size:8px;color:#94a3b8;margin:0 0 10px;}' +
+    'body{font-family:Arial,Helvetica,sans-serif;font-size:9px;color:#101010;margin:0;-webkit-print-color-adjust:exact;print-color-adjust:exact;}' +
+    'h1{font-size:15px;margin:0 0 2px;color:#0B3140;}' +
+    '.sub{font-size:9px;color:#506872;margin:0 0 2px;}' +
+    '.meta{font-size:8px;color:#8FA1A7;margin:0 0 10px;}' +
     'table{width:100%;border-collapse:collapse;table-layout:fixed;}' +
     'thead{display:table-header-group;}' +
-    'th{background:#1e3a5f;color:#fff;font-size:8px;text-transform:uppercase;letter-spacing:.03em;text-align:left;padding:5px 6px;border:1px solid #1e3a5f;}' +
+    'th{background:#0B3140;color:#fff;font-size:8px;text-transform:uppercase;letter-spacing:.03em;text-align:left;padding:5px 6px;border:1px solid #0B3140;}' +
     'th.nr{text-align:right;}' +
-    'td{padding:3px 6px;border:1px solid #e5e7eb;vertical-align:top;word-wrap:break-word;overflow-wrap:break-word;}' +
+    'td{padding:3px 6px;border:1px solid #E3E3E3;vertical-align:top;word-wrap:break-word;overflow-wrap:break-word;}' +
     'td.nr{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;}' +
     'tr{page-break-inside:avoid;}' +
-    'tr.cat td{background:#eef2f7;font-weight:700;color:#1e3a5f;}' +
+    'tr.cat td{background:#EBEEED;font-weight:700;color:#0B3140;}' +
     'tr.cat{page-break-after:avoid;}' +
-    'tr.part td{background:#f1f5f9;font-weight:700;}' +
-    'tr.detail td{color:#475569;}' +
-    '.short{color:#b91c1c;font-weight:700;}' +
-    '.covered{color:#047857;font-weight:600;}' +
-    '.past-due{color:#b91c1c;font-weight:700;}' +
-    '.muted{color:#94a3b8;}' +
-    '.pdesc{color:#64748b;font-weight:400;}' +
-    '.pcount{color:#94a3b8;font-weight:500;}' +
+    'tr.part td{background:#F7F7F7;font-weight:700;}' +
+    'tr.detail td{color:#415157;}' +
+    '.short{color:#C43046;font-weight:700;}' +
+    '.covered{color:#1B7A46;font-weight:600;}' +
+    '.past-due{color:#C43046;font-weight:700;}' +
+    '.muted{color:#8FA1A7;}' +
+    '.pdesc{color:#506872;font-weight:400;}' +
+    '.pcount{color:#8FA1A7;font-weight:500;}' +
     '</style></head><body>' +
     '<h1>Open Orders Report</h1>' +
     '<div class="sub">' + escHtml(filterText) + '</div>' +
     (summary ? '<div class="sub">' + escHtml(summary) + '</div>' : '') +
     '<div class="meta">Generated ' + escHtml(new Date().toLocaleString()) + '</div>' +
-    '<table><colgroup>' + colgroup + '</colgroup><thead><tr>' + headCells + '</tr></thead><tbody>' + body.join('') + '</tbody></table>' +
-    '</body></html>';
+    '<table><colgroup>' + colgroup + '</colgroup><thead><tr>' + headCells + '</tr></thead><tbody>' +
+    body.join('') + '</tbody></table></body></html>';
 
   const w = window.open('', '_blank');
   if (!w) { alert('Pop-up blocked — allow pop-ups for this report to print.'); return; }
   w.document.write(doc); w.document.close(); w.focus();
-  setTimeout(function () { try { w.print(); } catch (_) {} }, 200);
-}
-
-/* ── SETTINGS PERSISTENCE ── */
-function persistControls() {
-  try {
-    FBLib.Settings.setUserKey('onlyShort', document.getElementById('onlyShort').checked);
-    FBLib.Settings.saveUser();
-  } catch (_) {}
+  setTimeout(() => { try { w.print(); } catch (_) {} }, 200);
 }
 
 /* ── SETTINGS PANEL ── */
@@ -688,44 +1533,88 @@ window.PageSettings = (function () {
   function closePanel() { document.getElementById('setOverlay').style.display = 'none'; }
   function closeIfOverlay(e) { if (e && e.target && e.target.id === 'setOverlay') closePanel(); }
   function readPanel() {
-    return { onlyShort: document.getElementById('dsOnlyShort').checked, debug: document.getElementById('dsDebug').checked };
+    return {
+      onlyShort: document.getElementById('dsOnlyShort').checked,
+      debug: document.getElementById('dsDebug').checked
+    };
   }
+  // Re-hydrate every control from the freshly-resolved settings. A reset may
+  // have cleared the column layout and the LG selection, so both are rebuilt
+  // and the data is reloaded (availability is LG-scoped).
   function applyAndClose() {
     closePanel();
     document.getElementById('onlyShort').checked = !!FBLib.Settings.resolve('onlyShort');
     document.getElementById('debugConsole').style.display = FBLib.Common.DEBUG_MODE ? 'block' : 'none';
-    loadColPrefs(); renderHead();   // a settings reset may have changed/cleared column prefs
-    applyFilters();
+    const savedLg = FBLib.Settings.resolve('locationGroups');
+    _selLg = new Set(Array.isArray(savedLg) ? savedLg.map(String) : []);
+    if (_lgMs) _lgMs.setSelected(Array.from(_selLg));
+    const savedLoc = FBLib.Settings.resolve('locations');
+    _selLoc = new Set(Array.isArray(savedLoc) ? savedLoc.map(String) : []);
+    if (_locMs) _locMs.setSelected(Array.from(_selLoc));
+    _sortKey = FBLib.Settings.resolve('sortKey') || '';
+    _sortDir = FBLib.Settings.resolve('sortDir') === 'desc' ? 'desc' : 'asc';
+    loadColPrefs(); buildColPanel(); renderHead();
+    loadData();
   }
   function saveUser() {
     const p = readPanel();
-    Object.keys(p).forEach(function (k) { FBLib.Settings.setUserKey(k, p[k]); });
+    Object.keys(p).forEach(k => FBLib.Settings.setUserKey(k, p[k]));
     if (!FBLib.Settings.saveUser()) { alert('User editing is locked by admin.'); return; }
     applyAndClose();
   }
-  function resetToDefaults() { if (!confirm('Reset your personal settings to defaults?')) return; FBLib.Settings.clearUser(); applyAndClose(); }
+  function resetToDefaults() {
+    if (!confirm('Reset your personal settings to defaults?')) return;
+    FBLib.Settings.clearUser();
+    applyAndClose();
+  }
   function publishMaster() {
     if (!FBLib.Settings.isAdmin()) return;
     if (!confirm('Publish current panel values as the default for all users?')) return;
-    FBLib.Settings.publishMaster(readPanel()); alert('Published.'); applyAndClose();
+    FBLib.Settings.publishMaster(readPanel());
+    alert('Published.');
+    applyAndClose();
   }
   function toggleLock() {
     if (!FBLib.Settings.isAdmin()) return;
     const nowLocked = FBLib.Settings.userEditingAllowed();
-    FBLib.Settings.setLock(nowLocked); refreshLockUI();
+    FBLib.Settings.setLock(nowLocked);
+    refreshLockUI();
     alert('User editing: ' + (nowLocked ? 'LOCKED' : 'UNLOCKED'));
   }
-  return { init: init, openPanel: openPanel, closePanel: closePanel, closeIfOverlay: closeIfOverlay,
-    saveUser: saveUser, resetToDefaults: resetToDefaults, publishMaster: publishMaster, toggleLock: toggleLock };
+  return { init, openPanel, closePanel, closeIfOverlay, saveUser, resetToDefaults, publishMaster, toggleLock };
 })();
 
+/* ── OUTSIDE-CLICK closes the Columns panel (the multi-select handles its own
+   via fb-lib's registry). ── */
+document.addEventListener('click', e => {
+  const wrap = document.getElementById('colWrap');
+  if (wrap && !wrap.contains(e.target)) document.getElementById('colPanel').classList.add('hidden');
+});
+
 /* ── INIT ── */
-window.onload = function () {
+window.onload = async function () {
   document.getElementById('onlyShort').checked = !!FBLib.Settings.resolve('onlyShort');
   if (FBLib.Common.DEBUG_MODE) document.getElementById('debugConsole').style.display = 'block';
   PageSettings.init();
+
+  const savedLg = FBLib.Settings.resolve('locationGroups');
+  _selLg = new Set(Array.isArray(savedLg) ? savedLg.map(String) : []);
+  const savedLoc = FBLib.Settings.resolve('locations');
+  _selLoc = new Set(Array.isArray(savedLoc) ? savedLoc.map(String) : []);
+  _sortKey = FBLib.Settings.resolve('sortKey') || '';
+  _sortDir = FBLib.Settings.resolve('sortDir') === 'desc' ? 'desc' : 'asc';
+
   loadColPrefs();
+  buildColPanel();
   renderHead();
+
+  initLgFilter();
+  await populateLgFilter();
+  await populateLocFilter();   // cascades off the LG list resolved above
+  // Only now may a control change trigger a persist / reload — hydrating the
+  // widgets above must not write settings or re-query.
+  _filtersReady = true;
+
   loadData();
 };
 </script>

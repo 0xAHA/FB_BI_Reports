@@ -533,6 +533,7 @@
                 <div class="ds-section ds-checks">
                     <label><input type="checkbox" id="dsHideEstimates" /> Hide Estimates (Sales Orders)</label>
                     <label><input type="checkbox" id="dsHideBidRequests" /> Hide Bid Requests (Purchase Orders)</label>
+                    <label><input type="checkbox" id="dsPersistFilters" /> Remember table filters between sessions</label>
                     <label><input type="checkbox" id="dsDebug" /> Show debug console</label>
                 </div>
 
@@ -773,6 +774,13 @@
             },
             defaults: {
                 v: 1,
+                // Remember each tile's column-filter row between sessions.
+                // Off by default, so nothing extra is written and the
+                // dashboard behaves exactly as before until a user opts in.
+                persistFilters: false,
+                // Per-user snapshot of the filter rows, keyed by tile code.
+                // Personal state - never published to the admin master.
+                savedFilters: {},
                 layout: { cols: 2, tileOrder: ['SO','PO','WO','RMA','TO','PICK','RCV','SHIP'] },
                 rowsPerTile: 5,
                 refreshSec: 0,
@@ -1034,6 +1042,144 @@
         // notify the settings panel and re-init any tile whose user-selected
         // CFs are now in the catalog.
         // ========================================================================
+        // ========================================================================
+        // DashFilters - optional persistence for each tile's column-filter row.
+        //
+        // Gated on the `persistFilters` setting (Settings > "Remember table
+        // filters between sessions"), which is OFF by default: with it off
+        // nothing is read or written and the dashboard behaves exactly as before.
+        //
+        // When on, each tile's filter row is snapshotted into the per-user
+        // settings payload under `savedFilters` (keyed by tile code) and restored
+        // whenever the dashboard - or a single tile - is rebuilt. It lives in the
+        // USER payload only: filter text is personal state, never an org-wide
+        // default, so it is deliberately not read through resolve() and not
+        // included in the panel's readPanel() (which feeds publishMaster).
+        //
+        // Saves are event-driven - one delegated listener covers every tile,
+        // including the custom-field filter widgets injected after first paint -
+        // and debounced per tile, so a burst of typing costs a single write.
+        // ========================================================================
+        window.DashFilters = (function () {
+            var SAVE_DEBOUNCE = 400;
+            var TILE_CODES = ['SO', 'PO', 'WO', 'RMA', 'TO', 'PICK', 'RCV', 'SHIP'];
+            var _timers = {}, _last = {}, _wired = false, _restoring = false;
+
+            function enabled() {
+                try { return !!FBLib.Settings.resolve('persistFilters'); } catch (_) { return false; }
+            }
+            function savedMap() {
+                var u = {};
+                try { u = FBLib.Settings.getUser() || {}; } catch (_) {}
+                var m = u.savedFilters;
+                return (m && typeof m === 'object') ? m : {};
+            }
+            function containerIdFor(code) { return 'tile-' + String(code).toLowerCase(); }
+            function codeFor(containerId) { return String(containerId || '').replace(/^tile-/, '').toUpperCase(); }
+
+            function snapshot(containerId) {
+                var out = {}, container = document.getElementById(containerId);
+                if (!container) return out;
+                var els = container.querySelectorAll('.filter-row input[data-filter], .filter-row select[data-filter]');
+                for (var i = 0; i < els.length; i++) {
+                    if (els[i].value) out[els[i].getAttribute('data-filter')] = els[i].value;
+                }
+                return out;
+            }
+
+            function save(containerId) {
+                if (_restoring || !enabled()) return;
+                var code = codeFor(containerId);
+                if (_timers[code]) clearTimeout(_timers[code]);
+                _timers[code] = setTimeout(function () {
+                    _timers[code] = null;
+                    try {
+                        var snap = snapshot(containerId), json = JSON.stringify(snap);
+                        if (json === _last[code]) return;   // unchanged - skip the write
+                        _last[code] = json;
+                        var merged = {}, cur = savedMap();
+                        Object.keys(cur).forEach(function (k) { merged[k] = cur[k]; });
+                        merged[code] = snap;
+                        FBLib.Settings.setUserKey('savedFilters', merged);
+                        FBLib.Settings.saveUser();
+                    } catch (_) {}
+                }, SAVE_DEBOUNCE);
+            }
+
+            // Seed one tile's filter row from the saved snapshot. Returns true if
+            // anything was written into an input, so the caller knows whether the
+            // tile needs a re-filter. Skipped while that tile has a save pending -
+            // the user is mid-edit there, and re-seeding would stomp their typing.
+            function restoreTile(code) {
+                if (_timers[code]) return false;
+                var containerId = containerIdFor(code);
+                var container = document.getElementById(containerId);
+                if (!container) return false;
+                var saved = savedMap()[code];
+                var touched = false;
+                _restoring = true;
+                try {
+                    if (saved && typeof saved === 'object') {
+                        Object.keys(saved).forEach(function (key) {
+                            var el = container.querySelector('.filter-row [data-filter="' + key + '"]');
+                            // Indicator columns render as a bare <td data-filter>
+                            // with no input - the `value` guard skips those.
+                            if (el && 'value' in el) { el.value = saved[key]; touched = true; }
+                        });
+                    }
+                    // Baseline the comparison snapshot even when nothing was
+                    // restored, so simply opening the dashboard costs no write.
+                    _last[code] = JSON.stringify(snapshot(containerId));
+                } finally { _restoring = false; }
+                return touched;
+            }
+
+            // Re-seed every tile and re-run its filter pass. Called after the
+            // dashboard is (re)built - the filter row is static markup, so it
+            // always comes back empty.
+            function restoreAll() {
+                if (!enabled()) return;
+                TILE_CODES.forEach(function (code) {
+                    if (!restoreTile(code)) return;
+                    var mod = window['Report' + code];
+                    if (mod && typeof mod.applyFilters === 'function') {
+                        try { mod.applyFilters(); } catch (_) {}
+                    }
+                });
+            }
+
+            // One delegated listener for the whole page catches the tiles' inline
+            // onkeyup inputs AND the custom-field widgets injected later.
+            // clearFilters() empties the inputs programmatically (no event fires),
+            // so each module's public clearFilters is wrapped to save as well.
+            function wire() {
+                if (_wired) return;
+                _wired = true;
+                ['input', 'change'].forEach(function (evt) {
+                    document.addEventListener(evt, function (e) {
+                        var el = e.target;
+                        if (!el || !el.getAttribute || !el.getAttribute('data-filter')) return;
+                        var tile = el.closest ? el.closest('.dashboard-tile') : null;
+                        if (tile && tile.id) save(tile.id);
+                    }, true);
+                });
+                TILE_CODES.forEach(function (code) {
+                    var mod = window['Report' + code];
+                    if (!mod || typeof mod.clearFilters !== 'function' || mod.clearFilters.__dashFilters) return;
+                    var orig = mod.clearFilters;
+                    var wrapped = function () {
+                        var r = orig.apply(this, arguments);
+                        save(containerIdFor(code));
+                        return r;
+                    };
+                    wrapped.__dashFilters = true;
+                    mod.clearFilters = wrapped;
+                });
+            }
+
+            return { wire: wire, restoreAll: restoreAll, save: save };
+        })();
+
         window.onFbLibCfCatalogLoaded = function () {
             if (window.DashboardSettings && typeof DashboardSettings.onCatalogLoaded === 'function') {
                 try { DashboardSettings.onCatalogLoaded(); } catch (_) {}
@@ -1054,6 +1200,9 @@
                     }
                 } catch (_) {}
             });
+            // Tiles re-init from static markup, so their filter rows came
+            // back empty - re-seed them from the saved snapshot.
+            if (window.DashFilters) DashFilters.restoreAll();
         };
     </script>
 
@@ -4793,6 +4942,7 @@ window.ReportSHIP = (function() {
             if (window.DashboardSettings && typeof window.DashboardSettings.init === 'function') {
                 window.DashboardSettings.init();
             }
+            if (window.DashFilters) { DashFilters.wire(); DashFilters.restoreAll(); }
         };
     </script>
 
@@ -4866,6 +5016,7 @@ window.ReportSHIP = (function() {
                 document.getElementById('dsHideEstimates').checked   = !!eff.hideEstimates;
                 document.getElementById('dsHideBidRequests').checked = !!eff.hideBidRequests;
                 document.getElementById('dsDebug').checked        = !!eff.debug;
+                document.getElementById('dsPersistFilters').checked = !!eff.persistFilters;
                 renderTileList(eff.layout && Array.isArray(eff.layout.tileOrder)
                     ? eff.layout.tileOrder
                     : core.DEFAULT_TILE_ORDER.slice());
@@ -5064,6 +5215,7 @@ window.ReportSHIP = (function() {
                     hideEstimates:   document.getElementById('dsHideEstimates').checked,
                     hideBidRequests: document.getElementById('dsHideBidRequests').checked,
                     debug:           document.getElementById('dsDebug').checked,
+                    persistFilters:  document.getElementById('dsPersistFilters').checked,
                     locationGroups:  readLgSelection(),
                     customFields:           sel.customFields,
                     hiddenStandardColumns:  sel.hiddenStandardColumns,
@@ -5103,6 +5255,7 @@ window.ReportSHIP = (function() {
                 if (window.Dashboard && typeof Dashboard.init === 'function') {
                     Dashboard.init();
                 }
+                if (window.DashFilters) { DashFilters.wire(); DashFilters.restoreAll(); }
             }
 
             // ── Actions
@@ -5110,6 +5263,9 @@ window.ReportSHIP = (function() {
                 if (!core) return;
                 const payload = readPanel();
                 Object.keys(payload).forEach(k => core.setUserKey(k, payload[k]));
+                // Turning filter persistence off discards whatever was stored,
+                // so re-enabling it later starts from clean filter rows.
+                if (!payload.persistFilters) core.setUserKey('savedFilters', {});
                 const ok = core.saveUser();
                 if (!ok) {
                     alert('User editing is locked by admin.');
