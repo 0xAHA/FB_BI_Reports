@@ -104,6 +104,47 @@
     </div>
   </div>
 
+  <div id="subWrap" style="margin-top:14px; padding-top:12px; border-top:2px solid #0f172a;">
+    <h2 style="font-size:15px;">Item substitution probe — remove one WOItem + add another (open WO)</h2>
+    <div class="sub">
+      Tests whether a component part can be <b>substituted</b> on an OPEN work order via the
+      legacy API. <b>Add</b> uses the documented <code>AddWorkOrderItemRq</code> ("add an item to
+      an open WO"); <b>Remove</b> uses <code>SaveWorkOrderRq</code> with the chosen line dropped
+      from the <code>WOItems</code> array — that removal is <i>undocumented</i> and is the real
+      unknown we're probing. Each button writes to the WO, then re-reads the DB
+      <code>woitem</code> rows to show what actually persisted (<b>[NEW]</b> / <b>[REMOVED]</b>).
+      Demo DB / disposable open WO only.
+    </div>
+    <div style="margin-top:10px; display:flex; gap:16px; flex-wrap:wrap; align-items:flex-end;">
+      <label>Work order (open) — the BOM to edit<br>
+        <select id="subWo" onchange="subLoadItems()" style="min-width:170px; padding:4px; font-size:13px;"></select>
+      </label>
+      <label>Remove WOItem<br>
+        <select id="subRemove" style="min-width:300px; padding:4px; font-size:13px;"></select>
+      </label>
+      <label>Add part<br>
+        <select id="subAddPart" style="min-width:230px; padding:4px; font-size:13px;"></select>
+      </label>
+      <label>Add as type<br>
+        <select id="subAddType" style="min-width:150px; padding:4px; font-size:13px;">
+          <option value="20">Raw Good (20)</option>
+          <option value="10">Finished Good (10)</option>
+        </select>
+      </label>
+      <label>Qty<br>
+        <input id="subAddQty" value="1" style="width:70px" />
+      </label>
+    </div>
+    <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+      <button onclick="subAddItem()">Add item (AddWorkOrderItemRq)</button>
+      <button class="warn" onclick="subRemoveItem()">Remove item (SaveWorkOrderRq)</button>
+      <button class="warn" style="background:#b91c1c;" onclick="subSubstitute()">Substitute (add + remove)</button>
+      <button onclick="subLoadItems()" style="background:#0f766e;">Reload items</button>
+      <span class="msg" id="subMsg"></span>
+    </div>
+    <div id="subGrid"></div>
+  </div>
+
   <pre id="out" style="display:none;"></pre>
 
   <script>
@@ -543,7 +584,213 @@
       } catch (e) { moSaveMsg.textContent = 'REST error: ' + ((e && (e.message || e.status)) || e); }
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    // ITEM SUBSTITUTION PROBE — remove one WOItem + add another (open WO)
+    // ------------------------------------------------------------------
+    // Add  = AddWorkOrderItemRq (documented: adds a line to an open WO).
+    // Remove = SaveWorkOrderRq with the chosen WOItem dropped from the
+    //          WOItems array (UNDOCUMENTED — the real unknown).
+    // Substitute = Add then Remove, one report.
+    // Every action re-reads the DB woitem rows so the [NEW]/[REMOVED]
+    // outcome is what actually persisted, not what the API claimed.
+    // ══════════════════════════════════════════════════════════════════
+    var _subItems = [];   // the picked WO's API WOItem[] (for the remove dropdown)
+
+    function subInit() {
+      if (typeof runQuery !== 'function') { document.getElementById('subMsg').textContent = 'Run inside Fishbowl.'; return; }
+      // Open WOs (Entered=10 / Started=30) — the only states AddWorkOrderItemRq accepts.
+      try {
+        var wos = q("SELECT wo.num AS num, wo.statusid AS st FROM wo WHERE wo.statusid IN (10,30) ORDER BY wo.num LIMIT 500");
+        document.getElementById('subWo').innerHTML = '<option value="">— pick a WO —</option>' +
+          wos.map(function (r) { var n = String(r.num).replace(/"/g, '&quot;'); return '<option value="' + n + '">' + r.num + ' (status ' + r.st + ')</option>'; }).join('');
+      } catch (e) { document.getElementById('subMsg').textContent = 'WO list failed: ' + (e && e.message || e); }
+      // Inventory parts to add (num + default UOM code + avg cost for the Add request).
+      try {
+        var parts = q("SELECT p.num AS num, COALESCE(p.description,'') AS descr, COALESCE(u.code,'ea') AS uomcode, COALESCE(pc.avgcost,0) AS cost " +
+          "FROM part p LEFT JOIN uom u ON u.id=p.uomid LEFT JOIN partcost pc ON pc.partid=p.id " +
+          "WHERE p.activeflag=1 AND p.typeid=10 ORDER BY p.num LIMIT 1000");
+        document.getElementById('subAddPart').innerHTML = parts.map(function (r) {
+          var esc = function (v) { return String(v == null ? '' : v).replace(/"/g, '&quot;'); };
+          return '<option value="' + esc(r.num) + '" data-uom="' + esc(r.uomcode) + '" data-cost="' + (r.cost || 0) + '" data-desc="' + esc(r.descr) + '">' + r.num + ' (' + r.uomcode + ')</option>';
+        }).join('');
+      } catch (e) { /* best-effort */ }
+    }
+
+    // GET the picked WO → fill the remove dropdown + show its current DB rows.
+    function subLoadItems() {
+      var woNum = document.getElementById('subWo').value.trim();
+      var rsel = document.getElementById('subRemove');
+      var grid = document.getElementById('subGrid');
+      var msg  = document.getElementById('subMsg');
+      rsel.innerHTML = ''; grid.innerHTML = ''; msg.textContent = ''; _subItems = [];
+      if (!woNum) return;
+      if (typeof runApiRequest !== 'function') { msg.textContent = 'Run inside Fishbowl.'; return; }
+      try {
+        var rs = JSON.parse(runApiRequest('GetWorkOrderRq', JSON.stringify({ GetWorkOrderRq: { WorkOrderNumber: woNum } })));
+        var g = rs.GetWorkOrderRs || {};
+        if (g.statusCode !== 1000 || !g.WO) { msg.textContent = 'Get failed: ' + g.statusCode + ' ' + (g.statusMessage || ''); return; }
+        var raw = g.WO.WOItems && g.WO.WOItems.WOItem;
+        _subItems = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+        rsel.innerHTML = _subItems.map(function (wi) {
+          var id = wi.ID != null ? wi.ID : (wi.WOItemID != null ? wi.WOItemID : '');
+          var pnum = wi.PartNum || (wi.Part && wi.Part.Num) || '?';
+          return '<option value="' + id + '">#' + id + ' — ' + pnum + ' (type ' + wi.TypeID + ', target ' + wi.QtyToFulfill + ')</option>';
+        }).join('');
+        subRenderDb(woNum);
+        msg.textContent = 'WO ' + woNum + ' status=' + g.WO.StatusID + ' — ' + _subItems.length + ' item(s).';
+      } catch (e) { msg.textContent = 'ERR: ' + (e && e.message || e); }
+    }
+
+    function subRenderDb(woNum) {
+      try {
+        var db = dbRows(woNum);
+        var rows = '<table><tr><th>woitem id</th><th>Part</th><th>type</th><th>target</th><th>used</th><th>scrap</th></tr>';
+        db.forEach(function (r) {
+          rows += '<tr><td>' + r.woitem_id + '</td><td>' + (r.part_num || '?') + '</td>' +
+                  '<td class="num">' + r.wo_item_type + '</td><td class="num">' + r.qtytarget + '</td>' +
+                  '<td class="num">' + r.qtyused + '</td><td class="num">' + (r.qtyscrapped != null ? r.qtyscrapped : '—') + '</td></tr>';
+        });
+        document.getElementById('subGrid').innerHTML = rows + '</table>';
+      } catch (e) { document.getElementById('subGrid').innerHTML = ''; }
+    }
+
+    // Text diff of the WO's DB woitem rows before vs after an action.
+    function subDiff(before, after) {
+      var beforeIds = {}, afterIds = {};
+      before.forEach(function (r) { beforeIds[String(r.woitem_id)] = r; });
+      after.forEach(function (r) { afterIds[String(r.woitem_id)] = r; });
+      var lines = 'WOItem rows AFTER (vs before):\n';
+      after.forEach(function (r) {
+        var tag = beforeIds[String(r.woitem_id)] ? '' : '   [NEW]';
+        lines += '  #' + r.woitem_id + '  ' + (r.part_num || '?') + '  type ' + r.wo_item_type +
+                 '  target=' + r.qtytarget + '  used=' + r.qtyused + tag + '\n';
+      });
+      before.forEach(function (r) {
+        if (!afterIds[String(r.woitem_id)]) lines += '  #' + r.woitem_id + '  ' + (r.part_num || '?') + '   [REMOVED]\n';
+      });
+      return lines;
+    }
+
+    // Read the Add-part selector → { partNum, uom, cost, typeId, qty } or null.
+    function subAddSpec(msg) {
+      var psel = document.getElementById('subAddPart');
+      var opt = psel.options[psel.selectedIndex];
+      if (!opt || !opt.value) { msg.textContent = 'Pick a part to add.'; return null; }
+      var qty = parseFloat(document.getElementById('subAddQty').value.trim());
+      if (!isFinite(qty)) { msg.textContent = 'Enter a qty to add.'; return null; }
+      return {
+        partNum: opt.value,
+        // AddWorkOrderItemRq REQUIRES a non-empty Description (else status 1012
+        // "You must have a description for the Work Order item."). Default to the
+        // part's own description, falling back to the part number.
+        desc: opt.getAttribute('data-desc') || opt.value,
+        uom: opt.getAttribute('data-uom') || 'ea',
+        cost: parseFloat(opt.getAttribute('data-cost') || '0') || 0,
+        typeId: parseInt(document.getElementById('subAddType').value, 10) || 20,
+        qty: qty
+      };
+    }
+
+    // AddWorkOrderItemRq (documented add).
+    function subAdd(woNum, spec) {
+      var rs = JSON.parse(runApiRequest('AddWorkOrderItemRq', JSON.stringify({ AddWorkOrderItemRq: {
+        OrderNum: woNum, TypeId: spec.typeId, Description: spec.desc, PartNum: spec.partNum,
+        Quantity: spec.qty, UOMCode: spec.uom, Cost: spec.cost
+      } })));
+      return rs.AddWorkOrderItemRs || {};
+    }
+
+    // Remove a WOItem by dropping it from the array in a SaveWorkOrderRq (undocumented).
+    // Returns { statusCode, statusMessage, found }.
+    function subRemoveById(woNum, removeId) {
+      var rs = JSON.parse(runApiRequest('GetWorkOrderRq', JSON.stringify({ GetWorkOrderRq: { WorkOrderNumber: woNum } })));
+      var wo = rs.GetWorkOrderRs && rs.GetWorkOrderRs.WO;
+      if (!wo) return { statusCode: 'no-get', found: false };
+      var raw = wo.WOItems && wo.WOItems.WOItem;
+      var items = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+      var kept = items.filter(function (wi) { var id = (wi.ID != null ? wi.ID : wi.WOItemID); return String(id) !== String(removeId); });
+      var found = kept.length !== items.length;
+      wo.WOItems = { WOItem: kept };
+      var sr = JSON.parse(runApiRequest('SaveWorkOrderRq', JSON.stringify({ SaveWorkOrderRq: { WO: wo } })));
+      var s = sr.SaveWorkOrderRs || {};
+      return { statusCode: s.statusCode, statusMessage: s.statusMessage, found: found };
+    }
+
+    function subAddItem() {
+      var woNum = document.getElementById('subWo').value.trim();
+      var msg = document.getElementById('subMsg'), out = document.getElementById('out');
+      msg.textContent = '';
+      if (!woNum) { msg.textContent = 'Pick a WO.'; return; }
+      var spec = subAddSpec(msg); if (!spec) return;
+      try {
+        var dbBefore = dbRows(woNum);
+        var s = subAdd(woNum, spec);
+        var dbAfter = dbRows(woNum);
+        var addedOk = dbAfter.some(function (r) { return String(r.part_num) === String(spec.partNum); }) &&
+                      dbAfter.length > dbBefore.length;
+        out.style.display = 'block';
+        out.textContent = 'ADD via AddWorkOrderItemRq\n' +
+          'Sent: OrderNum=' + woNum + '  PartNum=' + spec.partNum + '  TypeId=' + spec.typeId +
+          '  Qty=' + spec.qty + '  UOM=' + spec.uom + '  Cost=' + spec.cost + '\n' +
+          'AddWorkOrderItemRs statusCode=' + s.statusCode + '  ' + (s.statusMessage || '') + '\n' +
+          'Row count ' + dbBefore.length + ' -> ' + dbAfter.length + '   ' + (addedOk ? '[ADDED]' : '[no new line]') + '\n\n' +
+          subDiff(dbBefore, dbAfter);
+        msg.textContent = s.statusCode === 1000 ? 'Add returned 1000 — check the diff.' : 'Add returned ' + s.statusCode;
+        subLoadItems();
+      } catch (e) { msg.textContent = 'ERR: ' + (e && e.message || e); }
+    }
+
+    function subRemoveItem() {
+      var woNum = document.getElementById('subWo').value.trim();
+      var msg = document.getElementById('subMsg'), out = document.getElementById('out');
+      msg.textContent = '';
+      if (!woNum) { msg.textContent = 'Pick a WO.'; return; }
+      var removeId = document.getElementById('subRemove').value;
+      if (!removeId) { msg.textContent = 'Pick a WOItem to remove.'; return; }
+      try {
+        var dbBefore = dbRows(woNum);
+        var r = subRemoveById(woNum, removeId);
+        var dbAfter = dbRows(woNum);
+        var gone = !dbAfter.some(function (x) { return String(x.woitem_id) === String(removeId); });
+        out.style.display = 'block';
+        out.textContent = 'REMOVE via SaveWorkOrderRq (dropped WOItem ' + removeId + ' from the array)\n' +
+          (r.found ? '' : 'NOTE: WOItem ' + removeId + ' was not in the fresh GET.\n') +
+          'SaveWorkOrderRs statusCode=' + r.statusCode + '  ' + (r.statusMessage || '') + '\n' +
+          'WOItem ' + removeId + ' after save: ' + (gone ? '[REMOVED]' : '[STILL PRESENT — save ignored the drop]') + '\n\n' +
+          subDiff(dbBefore, dbAfter);
+        msg.textContent = (r.statusCode === 1000) ? (gone ? 'Removed (1000).' : 'Save 1000 but the line persisted.') : 'Save returned ' + r.statusCode;
+        subLoadItems();
+      } catch (e) { msg.textContent = 'ERR: ' + (e && e.message || e); }
+    }
+
+    function subSubstitute() {
+      var woNum = document.getElementById('subWo').value.trim();
+      var msg = document.getElementById('subMsg'), out = document.getElementById('out');
+      msg.textContent = '';
+      if (!woNum) { msg.textContent = 'Pick a WO.'; return; }
+      var removeId = document.getElementById('subRemove').value;
+      if (!removeId) { msg.textContent = 'Pick a WOItem to remove.'; return; }
+      var spec = subAddSpec(msg); if (!spec) return;
+      try {
+        var dbBefore = dbRows(woNum);
+        var aS = subAdd(woNum, spec);                 // 1) add the replacement
+        var r  = subRemoveById(woNum, removeId);      // 2) fresh GET (now includes the new line) then drop the old
+        var dbAfter = dbRows(woNum);
+        var addedOk   = dbAfter.some(function (x) { return String(x.part_num) === String(spec.partNum); });
+        var removedOk = !dbAfter.some(function (x) { return String(x.woitem_id) === String(removeId); });
+        out.style.display = 'block';
+        out.textContent = 'SUBSTITUTE — add ' + spec.partNum + ' (x' + spec.qty + ', type ' + spec.typeId + ')  +  remove WOItem ' + removeId + '\n' +
+          'AddWorkOrderItemRs=' + aS.statusCode + '  ' + (aS.statusMessage || '') + '\n' +
+          'SaveWorkOrderRs(remove)=' + r.statusCode + '  ' + (r.statusMessage || '') + '\n' +
+          'Result: add ' + (addedOk ? '[ADDED]' : '[not added]') + ' · remove ' + (removedOk ? '[REMOVED]' : '[still present]') + '\n\n' +
+          subDiff(dbBefore, dbAfter);
+        msg.textContent = 'Substitute done — see the report.';
+        subLoadItems();
+      } catch (e) { msg.textContent = 'ERR: ' + (e && e.message || e); }
+    }
+
     loadWo();
+    subInit();
   </script>
 </body>
 </html>

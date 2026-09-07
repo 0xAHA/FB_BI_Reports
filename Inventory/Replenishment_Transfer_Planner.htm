@@ -1832,7 +1832,9 @@ function rebuildLines() {
                 deferprev: d.deferPrev, deferage: d.deferAgeDays,
                 // stamped by recomputePart()
                 qty: 0, deferqty: 0, pinned: false, bumped: false,
-                srcavail: 0, srcavailfb: pn.srcAvailFb, cap: 0, capbinding: 'NONE',
+                srcavail: 0, srcavailfb: pn.srcAvailFb,
+                srcavailraw: pn.srcAvailable, srcoutdraft: pn.srcOutDraft,
+                cap: 0, capbinding: 'NONE',
                 srcafter: 0, srcafterpct: 0, sharepct: 0, destafter: 0, deststate: '',
                 severity: 0, fillpct: 0, overcap: false, floorbreach: false,
                 state: 'neutral', locked: false, createdto: ''
@@ -2244,7 +2246,24 @@ function planColumns() {
           format: function (v, row) {
             var s = document.createElement('span');
             s.textContent = fmtQty(v);
-            if (_cfg.showRecon && !eq(num(v), num(row.srcavailfb))) {
+            // A draft deduction can take this to zero on a part that is
+            // physically well stocked. Never let that look like "no stock".
+            var draft = _cfg.countDraftTos ? num(row.srcoutdraft) : 0;
+            if (gt(draft, 0)) {
+                var dq = document.createElement('span');
+                dq.className = 'recon-flag';
+                dq.textContent = '↓';
+                dq.title = fmtQty(row.srcavailraw) + ' is available at the source, but ' + fmtQty(draft) +
+                           ' is already committed on unissued (Entered/Request) transfer orders out of ' +
+                           _model.srcLgName + ', leaving ' + fmtQty(v) + ' to plan with.' +
+                           (num(v) <= 0 ? '  Those drafts already claim more than is available — issue, ' +
+                            'reduce or delete them, or untick "Count unissued transfers" in Settings.' : '') +
+                           '  Fishbowl does not reserve stock for unissued transfers, so without this ' +
+                           'deduction the same units could be planned twice.';
+                s.appendChild(dq);
+                s.classList.add(num(v) <= 0 ? 'text-danger' : 'text-warning');
+            }
+            if (_cfg.showRecon && !eq(num(row.srcavailraw), num(row.srcavailfb))) {
                 var f = document.createElement('span');
                 f.className = 'recon-flag'; f.textContent = '*';
                 f.title = 'Fishbowl reports ' + fmtQty(row.srcavailfb) + ' here. The difference is ' +
@@ -2656,8 +2675,22 @@ function collectBanners() {
             ' is already at or below its own retention floor for them. Their demand is carried as deferred — ' +
             'replenish ' + _model.srcLgName + ' first.' });
     }
-    if (noStock.length) {
-        out.push({ kind: 'info', text: noStock.length + ' part(s) have no available stock at ' + _model.srcLgName +
+    // Split "genuinely empty" from "eaten by unissued drafts" — the second is
+    // a fixable data condition, not a stock problem, and reads very differently.
+    var byDraft = noStock.filter(function (p) {
+        return _cfg.countDraftTos && gt(num(p.srcOutDraft), 0) && gt(num(p.srcAvailable), 0);
+    });
+    var reallyEmpty = noStock.filter(function (p) { return byDraft.indexOf(p) === -1; });
+    if (byDraft.length) {
+        out.push({ kind: 'warning', text: byDraft.length + ' part(s) show no stock to plan with because unissued ' +
+            '(Entered/Request) transfer orders out of ' + _model.srcLgName + ' already claim it all — for example ' +
+            byDraft.slice(0, 4).map(function (p) {
+                return p.partNum + ' (' + fmtQty(p.srcAvailable) + ' available, ' + fmtQty(p.srcOutDraft) + ' on drafts)';
+            }).join(', ') + (byDraft.length > 4 ? '…' : '') +
+            '. Issue, reduce or delete those drafts, or untick "Count unissued transfers" in Settings to ignore them.' });
+    }
+    if (reallyEmpty.length) {
+        out.push({ kind: 'info', text: reallyEmpty.length + ' part(s) have no available stock at ' + _model.srcLgName +
             ' at all. Their demand is carried as deferred.' });
     }
     return out;
@@ -2781,11 +2814,27 @@ function openPolicyExplainer(partId) {
             ' <span class="recon-flag" title="Difference is intra-warehouse putaway, which never leaves the location group.">*</span>');
         html += row('Intra-warehouse putaway added back', fmtQty(pn.srcOutIntra), '+');
     }
+    var clamped = false;
     if (_cfg.countDraftTos && gt(pn.srcOutDraft, 0)) {
-        html += row('Unissued transfers already drafted', fmtQty(pn.srcOutDraft), '−');
+        html += row('Unissued transfers already drafted out of ' + esc(_model.srcLgName),
+                    fmtQty(pn.srcOutDraft), '−');
+        clamped = (num(pn.srcAvailable) - num(pn.srcOutDraft)) < -EPS;
+        if (clamped) {
+            html += row('<span class="text-danger">Subtotal (drafts claim more than exists)</span>',
+                '<span class="text-danger">' + fmtQty(q(num(pn.srcAvailable) - num(pn.srcOutDraft))) + '</span>');
+            html += row('<span class="text-danger">Floored at zero</span>', '0');
+        }
     }
     html += row('<strong>Pool</strong>', '<strong>' + fmtQty(r.pool) + '</strong>', '', 'rule');
     html += '</table>';
+    if (clamped) {
+        html += '<div class="alert alert-warning" style="font-size:12px;margin-top:8px;">' +
+            'This part is physically well stocked — ' + fmtQty(pn.srcAvailable) + ' is available at ' +
+            esc(_model.srcLgName) + '. It shows nothing to plan with only because unissued transfer orders ' +
+            'already claim ' + fmtQty(pn.srcOutDraft) + '. Fishbowl does not reserve stock for unissued ' +
+            'transfers, so the report counts them to stop the same units being planned twice. Issue, reduce ' +
+            'or delete those drafts, or untick "Count unissued transfers" in Settings.</div>';
+    }
 
     html += '<div class="fb-group-title" style="margin-top:16px;">Step 2 — the two limits</div>';
     html += '<table class="calc-tbl">';

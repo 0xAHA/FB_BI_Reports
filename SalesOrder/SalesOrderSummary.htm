@@ -8,7 +8,9 @@
   By-Product grouped / Pivot views. Filters across status, customer, sales
   person, product, item type, UOM, carrier, QB class, date range, and
   SO + SO-item custom fields; supports CSV / Print export and saved pivot
-  presets.
+  presets. Each line also carries the order's full Ship-To address and the
+  part tracking (lot / serial / expiry) of whatever has shipped against it.
+  Columns can be shown/hidden, dragged to reorder, and dragged to resize.
 ================================================================================
 -->
 <html lang="en">
@@ -57,6 +59,26 @@
        class for styling. Only report-specific cells stay local. */
     .num-cell { text-align: right; font-variant-numeric: tabular-nums; }
     .desc-cell { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* Once the user has set explicit column widths the table runs on fixed
+       layout and the <col> width IS the column — the 180px cap would then
+       clip a cell the user has deliberately widened. */
+    #dataTable.cols-fixed .desc-cell { max-width: none; }
+
+    /* Column resize grip — the right edge of every header cell. It sits above
+       the header's own drag-to-reorder and click-to-sort handlers, both of
+       which are suppressed while a resize is in progress. */
+    .col-resizer {
+      position: absolute; top: 0; right: 0;
+      width: 7px; height: 100%;
+      cursor: col-resize; user-select: none; z-index: 12;
+    }
+    .col-resizer::after {
+      content: ''; position: absolute; top: 22%; right: 3px;
+      width: 1px; height: 56%; background: rgba(255, 255, 255, 0.25);
+    }
+    .rpt-table th:hover .col-resizer::after { background: rgba(255, 255, 255, 0.65); }
+    /* While dragging, the cursor must not flicker as it crosses other elements. */
+    body.col-resizing, body.col-resizing * { cursor: col-resize !important; user-select: none !important; }
 
     /* Status badges (.badge/.b*) + .row-link ship from fb-styles (§31/33). */
 
@@ -148,6 +170,14 @@
         <div id="colPanel" class="hidden">
           <div class="px-3 py-2 text-xs font-semibold text-slate-400 border-b border-slate-100 sticky top-0 bg-white">Show / Reorder</div>
           <div id="colList"></div>
+          <div style="padding:6px 10px; border-top:1px solid #f1f5f9; position:sticky; bottom:0; background:#fff;">
+            <button type="button" onclick="resetColWidths()"
+              style="width:100%; font-size:11px; padding:4px 8px; border:1px solid #cbd5e1;
+                     border-radius:5px; background:#f8fafc; color:#475569; cursor:pointer;"
+              title="Hand every column back to automatic width. You can also drag a column edge in the header to resize one, or double-click an edge to reset.">
+              Reset widths
+            </button>
+          </div>
         </div>
       </div>
 
@@ -648,6 +678,9 @@ let _columns = [
   {key:'lg',                       label:'Location Group', vis:false, money:false, date:false, qty:false, link:null,           pivotRole:'dim'},
   {key:'salesman',                 label:'Sales Person',   vis:true,  money:false, date:false, qty:false, link:null,           pivotRole:'dim'},
   {key:'shiptostate',              label:'Ship-To State',  vis:false, money:false, date:false, qty:false, link:null,           pivotRole:'dim'},
+  // Ship-To address as one line: address name, contact, street, suburb,
+  // state, postcode - built in SQL from the SO's own ship-to snapshot.
+  {key:'shiptofull',               label:'Ship To',        vis:true,  money:false, date:false, qty:false, link:null, truncate:true, pivotRole:'dim'},
   {key:'class',                    label:'QB Class',       vis:false, money:false, date:false, qty:false, link:null,           pivotRole:'dim'},
   {key:'productnum',               label:'Product #',      vis:true,  money:false, date:false, qty:false, link:'Part',         pivotRole:'dim'},
   {key:'description',              label:'Description',    vis:true,  money:false, date:false, qty:false, link:null, truncate:true, pivotRole:'skip'},
@@ -666,6 +699,12 @@ let _columns = [
   {key:'datecompleted',            label:'Date Completed', vis:false, money:false, date:true,  qty:false, link:null,           pivotRole:'dim'},
   {key:'postdate',                 label:'Post Date',      vis:false, money:false, date:true,  qty:false, link:null,           pivotRole:'dim'},
   {key:'carrier',                  label:'Carrier',        vis:false, money:false, date:false, qty:false, link:null,           pivotRole:'dim'},
+  // Line-item grain: the part tracking (lot #, serial #, expiry date…)
+  // recorded against whatever has shipped on this SO line, formatted the
+  // same way PartActivity shows it — "Lot#: 1111, 1212 | ExpDate: 2026-05-05".
+  // Blank until the line ships, and blank on a group header row (tracking is
+  // per line, not per order).
+  {key:'trackinfo',                label:'Tracking Info',  vis:true,  money:false, date:false, qty:false, link:null, truncate:true, pivotRole:'skip'},
   {key:'note', label:'Note', vis:false, money:false, date:false, qty:false, link:null, truncate:true, pivotRole:'skip'},
 ];
 
@@ -962,6 +1001,16 @@ function loadSavedSettings() {
       _columns = [...reordered, ...extras];
       _columns.forEach(c => { if (savedMap[c.key]) c.vis = savedMap[c.key].vis; });
     }
+    // Column widths — kept only for columns that still exist, so a width
+    // saved against a since-removed custom field doesn't linger.
+    if (s.colWidths && typeof s.colWidths === 'object') {
+      const known = new Set(_columns.map(c => c.key));
+      _colWidths = {};
+      Object.keys(s.colWidths).forEach(k => {
+        const px = parseInt(s.colWidths[k], 10);
+        if (known.has(k) && isFinite(px) && px >= MIN_COL_W) _colWidths[k] = px;
+      });
+    }
     if (s.viewMode) {
       _viewMode = s.viewMode === 'grouped' ? 'byso' : s.viewMode;
       const sel = document.getElementById('viewModeSelect');
@@ -1010,6 +1059,7 @@ function saveCurrentSettings() {
     selSoiCFValues: [..._selSoiCFValues],
     cfsoivalSearch: document.getElementById('cfsoivalSearch')?.value || '',
     cols:       _columns.map(c => ({key:c.key, vis:c.vis})),
+    colWidths:  _colWidths,
     viewMode:   _viewMode,
     pivot:      Object.assign({}, _pivotCfg),
     savedPresets: _savedPresets,
@@ -1366,6 +1416,22 @@ function buildSQL() {
     if (conds.length) where.push(`(${conds.join(' OR ')})`);
   }
 
+  // Scope for the tracking derived table below. Reuses the outer query's
+  // always-present order filters (status + location group, plus the date
+  // window when the chosen date field lives on so/soitem) so the tracking
+  // pass stays proportional to the orders in view rather than to the whole
+  // shipment history. Filters it can't see (product, UOM, item type…) only
+  // make the outer result smaller, so leaving them out is safe — the extra
+  // groups simply never get joined to.
+  const trkScope = [
+    `so2.statusid IN (${statuses.join(',')})`,
+    `so2.locationgroupid IN (${selLgIds.join(',')})`
+  ];
+  if (from && to && (safeDF.indexOf('so.') === 0 || safeDF.indexOf('soitem.') === 0)) {
+    const scopedDF = safeDF.replace(/^so\./, 'so2.').replace(/^soitem\./, 'soi2.');
+    trkScope.push(`DATE(${scopedDF}) BETWEEN '${safeDate(from)}' AND '${safeDate(to)}'`);
+  }
+
   return `SELECT
   locationgroup.name AS lg,
   customer.name AS customer,
@@ -1380,6 +1446,19 @@ function buildSQL() {
   so.salesman AS salesman,
   qbclass.name AS class,
   stateconst.code AS shiptostate,
+  -- Ship-To as one readable line. CONCAT_WS drops NULL parts, so each part is
+  -- NULLIF-ed to NULL when blank; the contact is skipped when it just repeats
+  -- the address name, and an embedded newline in the street becomes ', '.
+  NULLIF(CONCAT_WS(', ',
+    NULLIF(TRIM(so.shiptoname), ''),
+    NULLIF(TRIM(CASE WHEN TRIM(COALESCE(so.customercontact, '')) <> ''
+                      AND TRIM(COALESCE(so.customercontact, '')) <> TRIM(COALESCE(so.shiptoname, ''))
+                     THEN so.customercontact END), ''),
+    NULLIF(TRIM(REPLACE(REPLACE(COALESCE(so.shiptoaddress, ''), CHAR(13), ''), CHAR(10), ', ')), ''),
+    NULLIF(TRIM(so.shiptocity), ''),
+    NULLIF(TRIM(stateconst.code), ''),
+    NULLIF(TRIM(so.shiptozip), '')
+  ), '') AS shiptofull,
   COALESCE(product.num, soitem.productnum) AS productnum,
   soitem.description AS description,
   uom.code AS uomcode,
@@ -1398,6 +1477,7 @@ function buildSQL() {
     * soitem.qtyfulfilled)*10,1)/10 AS rprice,
   soitem.datescheduledfulfillment AS datescheduledfulfillment,
   carrier.name AS carrier,
+  trk.trackinfo AS trackinfo,
   soitem.note AS note${cfSelects ? ',\n' + cfSelects : ''}
 FROM so
 INNER JOIN locationgroup  ON locationgroup.id = so.locationgroupid
@@ -1413,6 +1493,40 @@ LEFT JOIN  stateconst     ON so.shiptostateid = stateconst.id
 LEFT JOIN  carrier        ON so.carrierid = carrier.id
 LEFT JOIN  (SELECT soid, MAX(postdate) AS postdate FROM postso GROUP BY soid) AS postso_sub
            ON postso_sub.soid = so.id
+-- Part tracking per SO line. The values live on tiinventorylog, hanging off
+-- the inventorylog entries the SHIPMENT of that line produced (tableId
+-- 1555030112 = ShipItem) — the same source PartActivity's Tracking Info
+-- column reads, and the same CASE over parttracking.typeid, so a lot number
+-- reads identically in both reports. NOTE this is PART tracking (lot /
+-- serial / expiry), not the carrier's consignment number.
+--   inner group: one "Abbr: v1, v2" string per tracking field per SO line
+--   outer group: those joined with ' | ' into one cell
+LEFT JOIN (
+  SELECT g.soitemid AS soitemid,
+         GROUP_CONCAT(g.trackvalue ORDER BY g.sortorder, g.abbr SEPARATOR ' | ') AS trackinfo
+    FROM (
+      SELECT si2.soitemid AS soitemid, pt.sortorder AS sortorder, pt.abbr AS abbr,
+             CONCAT(pt.abbr, ': ', GROUP_CONCAT(DISTINCT
+               CASE
+                 WHEN pt.typeid IN (20, 30) THEN DATE_FORMAT(til.infodate, '%Y-%m-%d')
+                 WHEN pt.typeid = 40 THEN tilsn.serialnum
+                 WHEN pt.typeid = 50 THEN CAST(til.infodouble AS DECIMAL(18,2))
+                 WHEN pt.typeid = 60 THEN CAST(til.infodouble AS DECIMAL(18,5))
+                 WHEN pt.typeid IN (70, 80) THEN til.infointeger
+                 ELSE til.info
+               END ORDER BY 1 SEPARATOR ', ')) AS trackvalue
+        FROM shipitem si2
+        INNER JOIN soitem soi2        ON soi2.id = si2.soitemid
+        INNER JOIN so so2             ON so2.id = soi2.soid
+        INNER JOIN inventorylog il    ON il.tableid = 1555030112 AND il.recordid = si2.id
+        INNER JOIN tiinventorylog til ON til.inventorylogid = il.id
+        INNER JOIN parttracking pt    ON pt.id = til.parttrackingid
+        LEFT JOIN  tiinventorylogsn tilsn ON tilsn.tiinventorylogid = til.id
+       WHERE ${trkScope.join('\n         AND ')}
+       GROUP BY si2.soitemid, pt.abbr, pt.sortorder
+    ) AS g
+   GROUP BY g.soitemid
+) AS trk ON trk.soitemid = soitem.id
 WHERE ${where.join('\n  AND ')}
 ORDER BY customer.name, LENGTH(so.num), so.num, soitem.id
 LIMIT 10000`;
@@ -1455,6 +1569,7 @@ function renderTable() {
   renderHead(vis);
   renderBody(vis);
   renderTotals(vis);
+  applyColWidths(vis);
 }
 
 /* Grand-totals footer — sums the measure columns over the ENTIRE filtered
@@ -1493,6 +1608,7 @@ function renderTotals(vis) {
 
 function _buildColHeader(vis, topOffset) {
   const tr = document.createElement('tr');
+  tr.className = 'col-head-row';   // snapshotColWidths reads this row
   vis.forEach(col => {
     const th = document.createElement('th');
     th.textContent = col.label;
@@ -1522,9 +1638,123 @@ function _buildColHeader(vis, topOffset) {
       if (fi===-1||ti===-1) return;
       const [mv]=_columns.splice(fi,1); _columns.splice(ti,0,mv); renderTable(); buildColPanel();
     });
+    addColResizer(th, col);
     tr.appendChild(th);
   });
   return tr;
+}
+
+/* ── COLUMN RESIZING ──
+   The table runs on the browser's AUTOMATIC layout until the moment the user
+   drags a column edge. On that first drag the current rendered widths are
+   snapshotted into a <colgroup> and the table switches to table-layout: fixed.
+
+   That ordering matters: going fixed up front would mean inventing a width for
+   every column and the table would stop looking the way it does now, whereas
+   snapshotting what is already on screen makes the switch invisible. From then
+   on the widths are exact, so a drag moves only the column being dragged.
+   Widths ride along with the other column settings — press Save to keep them —
+   and "Reset widths" in the Columns panel hands the table back to automatic. */
+const MIN_COL_W = 40;
+let _colWidths = {};          // { <columnKey>: px }  empty = automatic layout
+
+function colWidthsActive() { return Object.keys(_colWidths).length > 0; }
+
+function applyColWidths(vis) {
+  const table = document.getElementById('dataTable');
+  if (!table) return;
+  const old = table.querySelector('colgroup');
+  if (old) old.parentNode.removeChild(old);
+
+  if (!colWidthsActive()) {
+    table.style.tableLayout = '';
+    table.style.width = '';
+    table.classList.remove('cols-fixed');
+    return;
+  }
+
+  const cg = document.createElement('colgroup');
+  let total = 0;
+  vis.forEach(col => {
+    const px = _colWidths[col.key] || 110;
+    const c = document.createElement('col');
+    c.style.width = px + 'px';
+    cg.appendChild(c);
+    total += px;
+  });
+  table.insertBefore(cg, table.firstChild);
+  table.style.tableLayout = 'fixed';
+  table.classList.add('cols-fixed');
+  // An explicit total, not 100%: under fixed layout a table wider than the sum
+  // of its columns redistributes the slack, so every drag would nudge the
+  // columns either side of the one being dragged.
+  table.style.width = total + 'px';
+}
+
+/* Freeze the table exactly as it looks right now. Reads the COLUMN header row
+   specifically — in the grouped views #tHead also carries the SO-sort row,
+   whose cells are colspanned and would not line up with `vis`. */
+function snapshotColWidths(vis) {
+  const ths = document.querySelectorAll('#tHead tr.col-head-row th');
+  if (!ths.length) return;
+  _colWidths = {};
+  vis.forEach((col, i) => {
+    const th = ths[i];
+    _colWidths[col.key] = Math.round(th ? th.offsetWidth : 110) || 110;
+  });
+}
+
+function resetColWidths() {
+  _colWidths = {};
+  renderTable();
+  setStatus('Column widths reset to automatic. ' + _statusSuffix);
+}
+
+function beginColResize(e, col, th) {
+  // Claim the gesture before the header can read it as a sort click or the
+  // start of a column-reorder drag.
+  e.preventDefault();
+  e.stopPropagation();
+
+  const vis = _columns.filter(c => c.vis);
+  if (!colWidthsActive()) snapshotColWidths(vis);
+
+  const startX = e.clientX;
+  const startW = _colWidths[col.key] || Math.round(th.offsetWidth) || 110;
+  const wasDraggable = th.draggable;
+  th.draggable = false;
+  document.body.classList.add('col-resizing');
+
+  function onMove(ev) {
+    _colWidths[col.key] = Math.max(MIN_COL_W, Math.round(startW + (ev.clientX - startX)));
+    applyColWidths(vis);
+  }
+  function onUp() {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    document.body.classList.remove('col-resizing');
+    th.draggable = wasDraggable;
+    // mouseup on a header is about to fire a click, which would sort the
+    // column the user was only resizing. Swallow exactly one.
+    const swallow = ev => { ev.stopPropagation(); ev.preventDefault(); };
+    document.addEventListener('click', swallow, true);
+    setTimeout(() => document.removeEventListener('click', swallow, true), 0);
+  }
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+}
+
+function addColResizer(th, col) {
+  const grip = document.createElement('span');
+  grip.className = 'col-resizer';
+  grip.draggable = false;
+  grip.title = 'Drag to resize this column. Double-click to reset every column to automatic width.';
+  grip.addEventListener('mousedown', e => beginColResize(e, col, th));
+  // Belt and braces around the header's own handlers.
+  grip.addEventListener('click',     e => { e.stopPropagation(); e.preventDefault(); });
+  grip.addEventListener('dragstart', e => { e.stopPropagation(); e.preventDefault(); });
+  grip.addEventListener('dblclick',  e => { e.stopPropagation(); e.preventDefault(); resetColWidths(); });
+  th.appendChild(grip);
 }
 
 function renderHead(vis) {
@@ -1546,6 +1776,7 @@ const _GROUP_COL_MAP = {
     lg:           {key:'lg',           label:'Loc. Group',      align:'left'},
     salesman:     {key:'salesman',     label:'Sales Person',    align:'left'},
     shiptostate:  {key:'shiptostate',  label:'Ship-To State',   align:'left'},
+    shiptofull:   {key:'shiptofull',   label:'Ship To',         align:'left'},
     class:        {key:'class',        label:'QB Class',        align:'left'},
     qtytofulfill: {key:'totalOrdered', label:'Total Ordered',   align:'right'},
     oprice:       {key:'totalOprice',  label:'Order Total',     align:'right'},
@@ -1720,7 +1951,8 @@ function buildGroups(data) {
       if (!map.has(key)) {
         meta = { groupKey:key, sonum:key, customer:row.customer, customerpo:row.customerpo,
                  statusid:row.statusid, status:row.status, lg:row.lg,
-                 salesman:row.salesman, shiptostate:row.shiptostate, class:row.class,
+                 salesman:row.salesman, shiptostate:row.shiptostate,
+                 shiptofull:row.shiptofull, class:row.class,
                  dateissued:row.dateissued, datefirstship:row.datefirstship,
                  datecompleted:row.datecompleted, carrier:row.carrier,
                  items:[], totalOrdered:0, totalOprice:0, totalShipped:0, totalFprice:0, totalRemain:0, totalRprice:0 };
@@ -1824,6 +2056,7 @@ function buildGroupHeader(g, vis) {
         case 'lg':          meta(g.lg); break;
         case 'salesman':    meta(g.salesman); break;
         case 'shiptostate': meta(g.shiptostate); break;
+        case 'shiptofull':  { td.className='desc-cell'; if (g.shiptofull) td.title=g.shiptofull; meta(g.shiptofull); break; }
         case 'class':       meta(g.class); break;
         case 'qtytofulfill':total(formatQty(g.totalOrdered)); break;
         case 'oprice':      total(formatMoney(g.totalOprice)); break;

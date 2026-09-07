@@ -1,0 +1,784 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<jasperReport xmlns="http://jasperreports.sourceforge.net/jasperreports" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://jasperreports.sourceforge.net/jasperreports http://jasperreports.sourceforge.net/xsd/jasperreport.xsd" name="AvailableToBuild_v2" pageWidth="792" pageHeight="612" orientation="Landscape" whenNoDataType="AllSectionsNoDetail" columnWidth="732" leftMargin="30" rightMargin="30" topMargin="20" bottomMargin="20" uuid="a7b41c02-6f18-4d93-9c60-2e51d8f4ab10">
+	<property name="ireport.zoom" value="1.3636363636363638"/>
+	<property name="ireport.x" value="0"/>
+	<property name="ireport.y" value="0"/>
+	<property name="ireport.callouts" value="##Sun Jun 01 10:37:41 MDT 2025"/>
+	<style name="RestrictingAtb">
+		<conditionalStyle>
+			<conditionExpression><![CDATA[$F{TYPEID}!= 10 && $F{parttype} == 10 && ((($F{stageflag} ?
+$V{StageAvailableToBuild} < 0 ? 0 : $V{StageAvailableToBuild}
+: $F{QTYAVAILABLE} < 0 ? 0 : $F{QTYAVAILABLE}) / $V{UomConversion}) == $F{AvailableToBuild} || $V{UomConversion} > ($F{stageflag} ?
+$V{StageAvailableToBuild} < 0 ? 0 : $V{StageAvailableToBuild}
+: $F{QTYAVAILABLE} < 0 ? 0 : $F{QTYAVAILABLE}) || ($F{stageflag} ?
+$V{StageAvailableToBuild} < 0 ? 0 : $V{StageAvailableToBuild}
+: $F{QTYAVAILABLE} < 0 ? 0 : $F{QTYAVAILABLE}) < 0)]]></conditionExpression>
+			<style mode="Opaque" backcolor="#FFFF66"/>
+		</conditionalStyle>
+	</style>
+	<parameter name="module" class="java.lang.Object" isForPrompting="false">
+		<defaultValueExpression><![CDATA[null]]></defaultValueExpression>
+	</parameter>
+	<parameter name="bomNum" class="java.lang.String" isForPrompting="false">
+		<defaultValueExpression><![CDATA["%"]]></defaultValueExpression>
+	</parameter>
+	<parameter name="locationGroupID" class="java.lang.String" isForPrompting="false">
+		<defaultValueExpression><![CDATA["-1"]]></defaultValueExpression>
+	</parameter>
+	<parameter name="REPORTDESCRIPTION" class="java.lang.String" isForPrompting="false">
+		<defaultValueExpression><![CDATA["Allows user to see the number of bill of materials per location that are available to build with current available inventory."]]></defaultValueExpression>
+	</parameter>
+	<parameter name="colLineNumber" class="java.lang.Boolean" isForPrompting="false">
+		<defaultValueExpression><![CDATA[true]]></defaultValueExpression>
+	</parameter>
+	<queryString>
+		<![CDATA[WITH RECURSIVE
+-- Availability basis, unchanged from the stock report: on hand less allocated
+-- less not-available plus dropship, floored at zero. Always in the part's own
+-- stocking UOM, which is exactly why the conversion below is needed.
+avail AS (
+  SELECT qi.PARTID AS partid, qi.LOCATIONGROUPID AS lgid,
+         GREATEST(SUM(qi.QTYONHAND - qi.QTYALLOCATED - qi.QTYNOTAVAILABLE + qi.QTYDROPSHIP), 0) AS qa
+  FROM QTYINVENTORYTOTALS qi
+  WHERE qi.LOCATIONGROUPID IN ($P!{locationGroupID})
+  GROUP BY qi.PARTID, qi.LOCATIONGROUPID
+),
+atblg AS (
+  SELECT id AS lgid FROM locationgroup WHERE id IN ($P!{locationGroupID})
+),
+-- Consumable inventory component lines, per-build quantity already normalised
+-- into the component part's stocking UOM. groupdefault = 1 holds a
+-- configurable BOM to its default option; part.typeid = 10 keeps labour and
+-- other non-stocked lines from zeroing every BOM.
+comp AS (
+  SELECT bi.bomid, bi.partid, bi.stage + 0 AS stage, bi.stagebomid,
+         (CASE WHEN bi.uomid = cp.uomid THEN bi.quantity
+                    WHEN cd.id IS NOT NULL THEN bi.quantity * COALESCE(cd.multiply,1) / NULLIF(COALESCE(cd.factor,1),0)
+                    WHEN cr.id IS NOT NULL THEN bi.quantity * COALESCE(cr.factor,1)   / NULLIF(COALESCE(cr.multiply,1),0)
+                    ELSE bi.quantity END) AS qpb,
+         CASE WHEN bi.uomid <> cp.uomid AND cd.id IS NULL AND cr.id IS NULL
+              THEN 1 ELSE 0 END AS uomrisk
+  FROM bomitem bi
+  JOIN part cp ON cp.id = bi.partid AND cp.typeid = 10
+  LEFT JOIN uomconversion cd ON cd.fromuomid = bi.uomid AND cd.touomid = cp.uomid
+  LEFT JOIN uomconversion cr ON cr.fromuomid = cp.uomid AND cr.touomid = bi.uomid
+  WHERE bi.groupdefault = 1 AND bi.typeid <> 10 AND bi.partid IS NOT NULL
+),
+-- Units of the sub-assembly part that ONE build of its own BOM yields. A BOM's
+-- output quantity is often not 1, and it is authored in the bomitem UOM, so it
+-- needs the same conversion as a component. Keyed by part as well as BOM so a
+-- co-product BOM credits the right output.
+sfg AS (
+  SELECT fg.bomid, fg.partid,
+         MAX(CASE WHEN fg.uomid = fp.uomid THEN fg.quantity
+                    WHEN fd.id IS NOT NULL THEN fg.quantity * COALESCE(fd.multiply,1) / NULLIF(COALESCE(fd.factor,1),0)
+                    WHEN fr.id IS NOT NULL THEN fg.quantity * COALESCE(fr.factor,1)   / NULLIF(COALESCE(fr.multiply,1),0)
+                    ELSE fg.quantity END) AS units
+  FROM bomitem fg
+  JOIN part fp ON fp.id = fg.partid
+  LEFT JOIN uomconversion fd ON fd.fromuomid = fg.uomid AND fd.touomid = fp.uomid
+  LEFT JOIN uomconversion fr ON fr.fromuomid = fp.uomid AND fr.touomid = fg.uomid
+  WHERE fg.typeid = 10 AND fg.partid IS NOT NULL AND fg.groupdefault = 1
+  GROUP BY fg.bomid, fg.partid
+),
+atbrisk AS (
+  SELECT bomid, MAX(uomrisk) AS uomrisk FROM comp GROUP BY bomid
+),
+-- Non-staged lines constrain the BOM identically at every level, so this is
+-- evaluated once rather than once per pass.
+fixed AS (
+  SELECT l.lgid, c.bomid,
+         MIN(FLOOR(COALESCE(a.qa,0) / NULLIF(c.qpb,0))) AS builds
+  FROM comp c
+  CROSS JOIN atblg l
+  LEFT JOIN avail a ON a.partid = c.partid AND a.lgid = l.lgid
+  WHERE c.stage = 0
+  GROUP BY l.lgid, c.bomid
+),
+-- The staged lines on their own, with their on-hand stock and their sub-BOM's
+-- per-build output already resolved. A handful of rows in any real database.
+staged AS (
+  SELECT l.lgid, c.bomid, c.partid, c.stagebomid, c.qpb,
+         COALESCE(a.qa,0) AS qa, COALESCE(s.units,0) AS units
+  FROM comp c
+  CROSS JOIN atblg l
+  LEFT JOIN avail a ON a.partid = c.partid AND a.lgid = l.lgid
+  LEFT JOIN sfg   s ON s.bomid = c.stagebomid AND s.partid = c.partid
+  WHERE c.stage = 1
+),
+-- Every (location group, BOM) that has at least one inventory component line.
+-- A BOM with none stays absent and its ATB prints blank, as in the stock report.
+-- Deliberately a DISTINCT over comp rather than a UNION of fixed and staged:
+-- the UNION form made MySQL's EXPLAIN row estimate overflow to 2^64, meaning
+-- the optimizer had given up costing everything joined to it.
+atbkeys AS (
+  SELECT DISTINCT l.lgid, c.bomid FROM comp c CROSS JOIN atblg l
+),
+-- Staged lines valued on their on-hand stock alone -- the on-hand baseline.
+st0 AS (
+  SELECT g.lgid, g.bomid,
+         MIN(FLOOR((g.qa) / NULLIF(g.qpb,0))) AS builds
+  FROM staged g
+  GROUP BY g.lgid, g.bomid
+),
+lvl0 AS (
+  SELECT k.lgid, k.bomid,
+         CASE WHEN f.builds IS NULL THEN st.builds
+              WHEN st.builds IS NULL THEN f.builds
+              ELSE LEAST(f.builds, st.builds) END AS builds
+  FROM atbkeys k
+  LEFT JOIN fixed f  ON f.lgid  = k.lgid AND f.bomid  = k.bomid
+  LEFT JOIN st0 st ON st.lgid = k.lgid AND st.bomid = k.bomid
+),
+-- Staged lines credited with what their own sub-BOM can build, using the
+-- lvl0 figure, times the units that sub-BOM yields per build.
+st1 AS (
+  SELECT g.lgid, g.bomid,
+         MIN(FLOOR((g.qa + COALESCE(p.builds,0) * g.units) / NULLIF(g.qpb,0))) AS builds
+  FROM staged g
+  LEFT JOIN lvl0 p ON p.bomid = g.stagebomid AND p.lgid = g.lgid
+  GROUP BY g.lgid, g.bomid
+),
+lvl1 AS (
+  SELECT k.lgid, k.bomid,
+         CASE WHEN f.builds IS NULL THEN st.builds
+              WHEN st.builds IS NULL THEN f.builds
+              ELSE LEAST(f.builds, st.builds) END AS builds
+  FROM atbkeys k
+  LEFT JOIN fixed f  ON f.lgid  = k.lgid AND f.bomid  = k.bomid
+  LEFT JOIN st1 st ON st.lgid = k.lgid AND st.bomid = k.bomid
+),
+-- Staged lines credited with what their own sub-BOM can build, using the
+-- lvl1 figure, times the units that sub-BOM yields per build.
+st2 AS (
+  SELECT g.lgid, g.bomid,
+         MIN(FLOOR((g.qa + COALESCE(p.builds,0) * g.units) / NULLIF(g.qpb,0))) AS builds
+  FROM staged g
+  LEFT JOIN lvl1 p ON p.bomid = g.stagebomid AND p.lgid = g.lgid
+  GROUP BY g.lgid, g.bomid
+),
+lvl2 AS (
+  SELECT k.lgid, k.bomid,
+         CASE WHEN f.builds IS NULL THEN st.builds
+              WHEN st.builds IS NULL THEN f.builds
+              ELSE LEAST(f.builds, st.builds) END AS builds
+  FROM atbkeys k
+  LEFT JOIN fixed f  ON f.lgid  = k.lgid AND f.bomid  = k.bomid
+  LEFT JOIN st2 st ON st.lgid = k.lgid AND st.bomid = k.bomid
+),
+-- Staged lines credited with what their own sub-BOM can build, using the
+-- lvl2 figure, times the units that sub-BOM yields per build.
+st3 AS (
+  SELECT g.lgid, g.bomid,
+         MIN(FLOOR((g.qa + COALESCE(p.builds,0) * g.units) / NULLIF(g.qpb,0))) AS builds
+  FROM staged g
+  LEFT JOIN lvl2 p ON p.bomid = g.stagebomid AND p.lgid = g.lgid
+  GROUP BY g.lgid, g.bomid
+),
+lvl3 AS (
+  SELECT k.lgid, k.bomid,
+         CASE WHEN f.builds IS NULL THEN st.builds
+              WHEN st.builds IS NULL THEN f.builds
+              ELSE LEAST(f.builds, st.builds) END AS builds
+  FROM atbkeys k
+  LEFT JOIN fixed f  ON f.lgid  = k.lgid AND f.bomid  = k.bomid
+  LEFT JOIN st3 st ON st.lgid = k.lgid AND st.bomid = k.bomid
+),
+-- True staging depth per BOM, so the report can say when a tree is deeper than
+-- the 3-level unroll (where the total is understated, not wrong). Recursion is
+-- fine here: a plain closure with no aggregate in the recursive member.
+stagetree AS (
+  SELECT bi.bomid AS rootbom, bi.stagebomid AS child, 1 AS depth
+  FROM bomitem bi
+  WHERE bi.groupdefault = 1 AND bi.stage = 1 AND bi.stagebomid > 0
+  UNION ALL
+  SELECT t.rootbom, bi.stagebomid, t.depth + 1
+  FROM stagetree t
+  JOIN bomitem bi ON bi.bomid = t.child AND bi.groupdefault = 1
+                 AND bi.stage = 1 AND bi.stagebomid > 0
+  WHERE t.depth < 12
+),
+stagedepth AS (
+  SELECT rootbom, MAX(depth) AS maxdepth FROM stagetree GROUP BY rootbom
+)
+SELECT LOCATIONGROUP.NAME AS LOCATIONGROUP,
+CONCAT(BOM.NUM,' - ',BOM.DESCRIPTION) AS BOMNUM,
+BOMITEMTYPE.NAME AS TYPE,
+BOMITEM.TYPEID AS TYPEID,
+CONCAT(PART.NUM,' - ',PART.DESCRIPTION) AS PART,
+BOMITEM.QUANTITY AS BOMQTY,
+part.typeid AS parttype,
+COALESCE(QTYONHAND.QTY,0) - COALESCE(QTYALLOCATED.QTY,0) -COALESCE(QTYNOTAVAILABLE.QTY,0) + COALESCE(QTYDROPSHIP.QTY,0) AS QTYAVAILABLE,
+COALESCE(QTYALLOCATED.QTY,0) - COALESCE(QTYONHAND.QTY,0) AS BACKORDERED,
+COMPANY.NAME AS COMPANY,
+UOM.CODE AS BOMITEMUOM,
+CASE WHEN bomitem.uomid = part.uomid THEN 1
+     WHEN ucd.id IS NOT NULL THEN COALESCE(ucd.factor,1)
+     WHEN ucr.id IS NOT NULL THEN COALESCE(ucr.multiply,1)
+     ELSE 1 END AS FACTOR,
+CASE WHEN bomitem.uomid = part.uomid THEN 1
+     WHEN ucd.id IS NOT NULL THEN COALESCE(ucd.multiply,1)
+     WHEN ucr.id IS NOT NULL THEN COALESCE(ucr.factor,1)
+     ELSE 1 END AS MULTIPLY,
+PARTUOM.CODE AS PARTUOM,
+COALESCE(PARTREORDER.ORDERUPTOLEVEL, COMPANYWIDERP.ORDERUPTOLEVEL,0) AS ORDERUPTOLEVEL,
+COALESCE(PARTREORDER.REORDERPOINT, COMPANYWIDERP.REORDERPOINT,0) AS REORDERPOINT,
+COALESCE(QTYALLOCATEDSO.QTY,0) AS ALLOCATEDSO,
+COALESCE(QTYONORDERPO.QTY,0) AS QTYONORDERPO,
+COALESCE(QTYONORDERMO.QTY,0) AS QTYONORDERMO,
+bomitem.stage AS stageflag,
+bomitem.stagebomid,
+locationgroup.id AS locationgroupid,
+bomitem.id AS bomitemid,
+bomitem.sortidconfig AS sortidinstruct,
+part.num AS partnum,
+atb.builds AS AvailableToBuild,
+atbstage.builds AS AvailableToBuildStage,
+atb0.builds AS AvailableToBuildOnHand,
+atbstage0.builds AS AvailableToBuildStageOnHand,
+CAST(COALESCE(ar.uomrisk,0) AS SIGNED) AS AvailableToBuildRisk,
+CAST(COALESCE(ars.uomrisk,0) AS SIGNED) AS AvailableToBuildStageRisk,
+CAST(COALESCE(sd.maxdepth,0) AS SIGNED) AS AvailableToBuildDepth
+
+
+from bom
+JOIN bomitem on bom.id = bomitem.bomid and bomitem.groupdefault = 1
+JOIN bomitemtype on bomitem.typeid = bomitemtype.id
+JOIN part on bomitem.partid = part.id
+JOIN uom partuom on part.uomid = partuom.id
+JOIN uom ON bomitem.uomid = uom.id
+LEFT JOIN uomconversion ucd ON ucd.fromUomid = bomitem.uomid AND ucd.touomid = part.uomid
+LEFT JOIN uomconversion ucr ON ucr.fromUomid = part.uomid    AND ucr.touomid = bomitem.uomid
+LEFT JOIN locationgroup ON locationgroup.id IN ($P!{locationGroupID})
+LEFT JOIN (Select sum(COALESCE(qtyonhand.qty,0)) as qty, qtyonhand.partid, qtyonhand.locationgroupid
+                from  qtyonhand
+                group by 2,3) as qtyonhand on part.id = qtyonhand.partid and qtyonhand.locationgroupid = locationgroup.id
+LEFT JOIN (Select sum(COALESCE(qtyallocated.qty,0)) as qty, qtyallocated.partid, qtyallocated.locationgroupid
+                from  qtyallocated
+                group by 2,3) as qtyallocated on part.id = qtyallocated.partid and qtyallocated.locationgroupid = locationgroup.id
+LEFT JOIN (Select sum(COALESCE(qtynotavailable.qty,0)) as qty, qtynotavailable.partid, qtynotavailable.locationgroupid
+                from  qtynotavailable
+                group by 2,3) as qtynotavailable on part.id = qtynotavailable.partid and qtynotavailable.locationgroupid = locationgroup.id
+LEFT JOIN (Select sum(COALESCE(qtyDropship.qty,0)) as qty, qtyDropship.partid, qtydropship.locationgroupid
+                from  qtyDropship
+                group by 2,3) as qtyDropship on part.id = qtyDropship.partid and qtydropship.locationgroupid = locationgroup.id
+LEFT JOIN qtyallocatedso on part.id = qtyallocatedso.partid and bomitem.typeid = 10 and qtyallocatedso.locationgroupid = locationgroup.id
+LEFT JOIN qtyonorderpo on part.id = qtyonorderpo.partid and bomitem.typeid = 10 and qtyonorderpo.locationgroupid = locationgroup.id
+LEFT JOIN qtyonordermo on part.id = qtyonordermo.partid and bomitem.typeid = 10 and qtyonordermo.locationgroupid = locationgroup.id
+
+LEFT JOIN (SELECT SYSPROPERTIES.sysvalue AS sysvalue FROM SYSPROPERTIES WHERE syskey = 'locationGroupReordering') ropLG ON (1=1)
+LEFT JOIN partreorder ON locationgroup.id = partreorder.locationgroupid AND part.id = partreorder.partid and bomitem.typeid = 10
+LEFT JOIN partreorder CompanyWideRP on part.id = CompanyWideRP.partid AND CompanyWideRP.locationgroupid IS NULL AND ropLG.sysvalue = 'false' and bomitem.typeid = 10
+JOIN company on company.id = 1
+LEFT JOIN lvl3 atb ON atb.bomid = bom.id AND atb.lgid = locationgroup.id
+LEFT JOIN lvl0 atb0 ON atb0.bomid = bom.id AND atb0.lgid = locationgroup.id
+LEFT JOIN lvl3 atbstage ON atbstage.bomid = bomitem.stagebomid AND atbstage.lgid = locationgroup.id
+LEFT JOIN lvl0 atbstage0 ON atbstage0.bomid = bomitem.stagebomid AND atbstage0.lgid = locationgroup.id
+LEFT JOIN atbrisk ar ON ar.bomid = bom.id
+LEFT JOIN atbrisk ars ON ars.bomid = bomitem.stagebomid
+LEFT JOIN stagedepth sd ON sd.rootbom = bom.id
+
+where bom.num like $P{bomNum}
+
+order by 1,2,3, bomitem.stage, bomitem.bomitemgroupid, bomitem.sortidconfig]]>
+	</queryString>
+	<field name="LOCATIONGROUP" class="java.lang.String"/>
+	<field name="BOMNUM" class="java.lang.String"/>
+	<field name="TYPE" class="java.lang.String">
+		<fieldDescription><![CDATA[]]></fieldDescription>
+	</field>
+	<field name="TYPEID" class="java.lang.Long">
+		<fieldDescription><![CDATA[]]></fieldDescription>
+	</field>
+	<field name="PART" class="java.lang.String"/>
+	<field name="BOMQTY" class="java.lang.Double"/>
+	<field name="parttype" class="java.lang.Double"/>
+	<field name="QTYAVAILABLE" class="java.lang.Double"/>
+	<field name="BACKORDERED" class="java.lang.String"/>
+	<field name="COMPANY" class="java.lang.String"/>
+	<field name="BOMITEMUOM" class="java.lang.String"/>
+	<field name="FACTOR" class="java.lang.Double">
+		<fieldDescription><![CDATA[]]></fieldDescription>
+	</field>
+	<field name="MULTIPLY" class="java.lang.Double">
+		<fieldDescription><![CDATA[]]></fieldDescription>
+	</field>
+	<field name="PARTUOM" class="java.lang.String"/>
+	<field name="ORDERUPTOLEVEL" class="java.lang.Double">
+		<fieldDescription><![CDATA[]]></fieldDescription>
+	</field>
+	<field name="REORDERPOINT" class="java.lang.Double">
+		<fieldDescription><![CDATA[]]></fieldDescription>
+	</field>
+	<field name="ALLOCATEDSO" class="java.lang.Double"/>
+	<field name="QTYONORDERPO" class="java.lang.Double">
+		<fieldDescription><![CDATA[]]></fieldDescription>
+	</field>
+	<field name="QTYONORDERMO" class="java.lang.Double">
+		<fieldDescription><![CDATA[]]></fieldDescription>
+	</field>
+	<field name="stageflag" class="java.lang.Boolean"/>
+	<field name="stagebomid" class="java.lang.String">
+		<fieldDescription><![CDATA[]]></fieldDescription>
+	</field>
+	<field name="locationgroupid" class="java.lang.String">
+		<fieldDescription><![CDATA[]]></fieldDescription>
+	</field>
+	<field name="bomitemid" class="java.lang.Long">
+		<fieldDescription><![CDATA[]]></fieldDescription>
+	</field>
+	<field name="sortidinstruct" class="java.lang.Long">
+		<fieldDescription><![CDATA[]]></fieldDescription>
+	</field>
+	<field name="partnum" class="java.lang.String"/>
+	<field name="AvailableToBuild" class="java.lang.Double"/>
+	<field name="AvailableToBuildStage" class="java.lang.Double"/>
+	<field name="AvailableToBuildOnHand" class="java.lang.Double"/>
+	<field name="AvailableToBuildStageOnHand" class="java.lang.Double"/>
+	<field name="AvailableToBuildRisk" class="java.lang.Long"/>
+	<field name="AvailableToBuildStageRisk" class="java.lang.Long"/>
+	<field name="AvailableToBuildDepth" class="java.lang.Long"/>
+	<variable name="DateFormat" class="java.lang.String" resetType="None">
+		<variableExpression><![CDATA[(System.getProperty("REPORT_DATE_FORMAT"))]]></variableExpression>
+	</variable>
+	<variable name="QtyDecimal" class="java.lang.String" resetType="None">
+		<variableExpression><![CDATA[System.getProperty("REPORT_DECIMAL_QTY")]]></variableExpression>
+	</variable>
+	<variable name="UomConversion" class="java.lang.Double">
+		<variableExpression><![CDATA[$F{BOMQTY} * $F{MULTIPLY} / $F{FACTOR}]]></variableExpression>
+	</variable>
+	<variable name="AvailableToBuild" class="java.lang.Double" resetType="Group" resetGroup="BOM" calculation="Lowest">
+		<variableExpression><![CDATA[$F{TYPEID} != 10 && !$F{stageflag} && $F{parttype} == 10?
+($F{QTYAVAILABLE} / $V{UomConversion} < 0 ? 0 : $F{QTYAVAILABLE} / $V{UomConversion})
+: 1000000000]]></variableExpression>
+	</variable>
+	<variable name="QtyNeeded" class="java.lang.Double">
+		<variableExpression><![CDATA[($F{QTYAVAILABLE} + $F{QTYONORDERPO} + $F{QTYONORDERMO}) <= $F{REORDERPOINT}
+    ?
+    ($F{QTYAVAILABLE} + $F{QTYONORDERPO} + $F{QTYONORDERMO}) <= $F{ORDERUPTOLEVEL}
+        ?
+    ($F{ORDERUPTOLEVEL} - ($F{QTYAVAILABLE} + $F{QTYONORDERPO} + $F{QTYONORDERMO}))
+    : 0
+        : 0]]></variableExpression>
+	</variable>
+	<variable name="StageAvailableToBuild" class="java.lang.Double" resetType="Group" resetGroup="bomitem">
+		<variableExpression><![CDATA[0.0]]></variableExpression>
+		<initialValueExpression><![CDATA[0.0]]></initialValueExpression>
+	</variable>
+	<variable name="StageLowestAvailable" class="java.lang.Double" resetType="Group" resetGroup="BOM" calculation="Lowest">
+		<variableExpression><![CDATA[10000000000000.0]]></variableExpression>
+		<initialValueExpression><![CDATA[10000000000000.0]]></initialValueExpression>
+	</variable>
+	<variable name="counter" class="java.lang.Integer" resetType="Group" resetGroup="BOM">
+		<variableExpression><![CDATA[$V{counter} + 1]]></variableExpression>
+		<initialValueExpression><![CDATA[0]]></initialValueExpression>
+	</variable>
+	<group name="LocationGroup">
+		<groupExpression><![CDATA[$F{LOCATIONGROUP}]]></groupExpression>
+		<groupHeader>
+			<band height="30">
+				<textField isBlankWhenNull="true">
+					<reportElement x="0" y="10" width="732" height="20" uuid="0d22f299-05dc-41c0-95d8-bad229ff71f3"/>
+					<box leftPadding="0" rightPadding="3">
+						<bottomPen lineWidth="1.0"/>
+					</box>
+					<textElement verticalAlignment="Middle">
+						<font fontName="Open Sans" size="12" isBold="true"/>
+					</textElement>
+					<textFieldExpression><![CDATA[$F{LOCATIONGROUP}]]></textFieldExpression>
+				</textField>
+			</band>
+		</groupHeader>
+	</group>
+	<group name="BOM">
+		<groupExpression><![CDATA[$F{BOMNUM}]]></groupExpression>
+		<groupHeader>
+			<band height="21">
+				<textField isBlankWhenNull="true">
+					<reportElement x="0" y="0" width="412" height="20" uuid="f626c07f-7d5f-4818-aa95-4aeba54f353f"/>
+					<box leftPadding="0" rightPadding="3"/>
+					<textElement verticalAlignment="Middle">
+						<font fontName="Open Sans" size="10" isBold="true"/>
+					</textElement>
+					<textFieldExpression><![CDATA[$F{BOMNUM}]]></textFieldExpression>
+				</textField>
+				<textField isStretchWithOverflow="true" evaluationTime="Group" evaluationGroup="BOM" isBlankWhenNull="true">
+					<reportElement x="412" y="0" width="74" height="20" uuid="bcbdcf73-3340-4781-8fd1-d55fdbc3d4fc"/>
+					<box leftPadding="3" rightPadding="3"/>
+					<textElement textAlignment="Right" verticalAlignment="Middle">
+						<font fontName="Open Sans" size="12" isBold="true"/>
+					</textElement>
+					<textFieldExpression><![CDATA[$F{AvailableToBuild}]]></textFieldExpression>
+					<patternExpression><![CDATA[$V{QtyDecimal}]]></patternExpression>
+				</textField>
+				<line>
+					<reportElement x="0" y="20" width="732" height="1" uuid="e66082a6-9ec0-4206-8ae1-fcb89de3044d"/>
+					<graphicElement>
+						<pen lineColor="#999999"/>
+					</graphicElement>
+				</line>
+				<textField isStretchWithOverflow="true" isBlankWhenNull="true">
+					<reportElement x="486" y="0" width="46" height="20" uuid="1607b9ed-e214-4bb2-8d3d-3b188a1edacf"/>
+					<box leftPadding="3" rightPadding="3"/>
+					<textElement verticalAlignment="Middle">
+						<font fontName="Open Sans" size="12" isBold="true"/>
+					</textElement>
+					<textFieldExpression><![CDATA[$F{BOMITEMUOM}]]></textFieldExpression>
+				</textField>
+				<textField isBlankWhenNull="true">
+					<reportElement x="532" y="0" width="69" height="20" forecolor="#666666" uuid="31e30e9b-20e6-4b59-b654-f2915681d1ef"/>
+					<box leftPadding="3" rightPadding="3">
+						<bottomPen lineWidth="0.0"/>
+					</box>
+					<textElement textAlignment="Left" verticalAlignment="Bottom">
+						<font fontName="Open Sans" size="8" isBold="true"/>
+					</textElement>
+					<textFieldExpression><![CDATA[$F{AvailableToBuildOnHand} == null ? ""
+: "on hand " + new java.text.DecimalFormat("#,##0").format($F{AvailableToBuildOnHand})]]></textFieldExpression>
+				</textField>
+				<textField isBlankWhenNull="true">
+					<reportElement x="632" y="0" width="100" height="20" forecolor="#CC0000" uuid="9b86c4a8-9e3f-4db1-8e7b-f8c74b155c87"/>
+					<box leftPadding="3" rightPadding="3">
+						<bottomPen lineWidth="0.0"/>
+					</box>
+					<textElement textAlignment="Right" verticalAlignment="Bottom">
+						<font fontName="Open Sans" size="8" isBold="true"/>
+					</textElement>
+					<textFieldExpression><![CDATA[($F{AvailableToBuildRisk} != null && $F{AvailableToBuildRisk}.intValue() == 1 ? "check UOM " : "")
++ ($F{AvailableToBuildDepth} != null && $F{AvailableToBuildDepth}.intValue() > 3 ? "staged >3 deep" : "")]]></textFieldExpression>
+				</textField>
+				<staticText>
+					<reportElement key="Uom" x="601" y="0" width="31" height="20" uuid="69b578f2-b4b0-44f1-b6f5-d1513b249855"/>
+					<box leftPadding="3" rightPadding="3">
+						<bottomPen lineWidth="0.0"/>
+					</box>
+					<textElement textAlignment="Right" verticalAlignment="Bottom">
+						<font fontName="Open Sans" size="12" isBold="true"/>
+					</textElement>
+					<text><![CDATA[]]></text>
+				</staticText>
+			</band>
+		</groupHeader>
+		<groupFooter>
+			<band/>
+		</groupFooter>
+	</group>
+	<group name="itemType">
+		<groupExpression><![CDATA[$F{TYPE}]]></groupExpression>
+		<groupHeader>
+			<band height="19">
+				<image scaleImage="FillFrame" hAlign="Left" vAlign="Middle" isUsingCache="false">
+					<reportElement key="image-3" mode="Transparent" x="0" y="0" width="14" height="14" forecolor="#000000" backcolor="#FFFFFF" uuid="ac425fd7-82ec-4cd2-b848-dbc4a6be9552">
+						<printWhenExpression><![CDATA[new Boolean($P{module} != null)]]></printWhenExpression>
+					</reportElement>
+					<box>
+						<topPen lineWidth="0.0" lineStyle="Solid" lineColor="#FFFFFF"/>
+						<leftPen lineWidth="0.0" lineStyle="Solid" lineColor="#FFFFFF"/>
+						<bottomPen lineWidth="0.0" lineColor="#0000CC"/>
+						<rightPen lineWidth="0.0" lineStyle="Solid" lineColor="#FF3300"/>
+					</box>
+					<graphicElement fill="Solid">
+						<pen lineWidth="0.0" lineStyle="Solid"/>
+					</graphicElement>
+					<imageExpression><![CDATA[((com.evnt.eve.modules.ReportHelperModule) $P{module}).getBOMItemTypeIconUrl($F{TYPEID}.intValue())]]></imageExpression>
+				</image>
+				<textField isBlankWhenNull="true">
+					<reportElement x="14" y="0" width="718" height="14" uuid="54df74e7-d635-4914-9830-4e4095071ef1"/>
+					<box leftPadding="3" rightPadding="3"/>
+					<textElement verticalAlignment="Middle">
+						<font fontName="Open Sans" size="10" isBold="true"/>
+					</textElement>
+					<textFieldExpression><![CDATA[$F{TYPE}]]></textFieldExpression>
+				</textField>
+				<line>
+					<reportElement x="0" y="14" width="732" height="1" uuid="4aab9f8e-fa9e-41d5-b47c-15cda633c714"/>
+					<graphicElement>
+						<pen lineColor="#CCCCCC"/>
+					</graphicElement>
+				</line>
+			</band>
+		</groupHeader>
+	</group>
+	<group name="bomitem">
+		<groupExpression><![CDATA[$F{bomitemid}]]></groupExpression>
+	</group>
+	<background>
+		<band splitType="Stretch"/>
+	</background>
+	<title>
+		<band height="54" splitType="Stretch">
+			<textField isStretchWithOverflow="true" isBlankWhenNull="true">
+				<reportElement key="textField-14" x="0" y="0" width="732" height="18" uuid="5e20da69-e3ce-46be-93f0-746e024fdd46"/>
+				<box leftPadding="3" rightPadding="3"/>
+				<textElement textAlignment="Center">
+					<font fontName="Open Sans" size="14" isBold="true" pdfFontName="Helvetica-Bold"/>
+				</textElement>
+				<textFieldExpression><![CDATA[$F{COMPANY}]]></textFieldExpression>
+			</textField>
+			<staticText>
+				<reportElement key="Title" mode="Transparent" x="0" y="18" width="732" height="36" forecolor="#000000" backcolor="#FFFFFF" uuid="302670d3-1b83-48e3-9f5b-9e1dcc7649dd"/>
+				<box leftPadding="3" rightPadding="3">
+					<topPen lineWidth="0.0" lineStyle="Solid" lineColor="#000000"/>
+					<leftPen lineWidth="0.0" lineStyle="Solid" lineColor="#000000"/>
+					<bottomPen lineWidth="0.0" lineColor="#000000"/>
+					<rightPen lineWidth="0.0" lineStyle="Solid" lineColor="#FFFFFF"/>
+				</box>
+				<textElement textAlignment="Center" verticalAlignment="Top" rotation="None">
+					<font fontName="Open Sans" size="17" isBold="true" isItalic="false" isUnderline="false" isStrikeThrough="false" pdfFontName="Helvetica-Bold" pdfEncoding="Cp1252" isPdfEmbedded="false"/>
+					<paragraph lineSpacing="Single"/>
+				</textElement>
+				<text><![CDATA[Available To Build]]></text>
+			</staticText>
+		</band>
+	</title>
+	<pageHeader>
+		<band splitType="Stretch"/>
+	</pageHeader>
+	<columnHeader>
+		<band height="17" splitType="Stretch">
+			<staticText>
+				<reportElement x="31" y="0" width="281" height="16" uuid="43012701-8903-4d5d-b3c9-f027167d70d7"/>
+				<box leftPadding="3" rightPadding="3">
+					<bottomPen lineWidth="0.0"/>
+				</box>
+				<textElement verticalAlignment="Bottom">
+					<font fontName="Open Sans" size="11" isBold="true"/>
+				</textElement>
+				<text><![CDATA[Item - Description ]]></text>
+			</staticText>
+			<staticText>
+				<reportElement x="312" y="0" width="101" height="16" uuid="d3a93586-cfe4-4957-9921-8c8068a0d45c"/>
+				<box leftPadding="3" rightPadding="0">
+					<bottomPen lineWidth="0.0"/>
+				</box>
+				<textElement textAlignment="Right" verticalAlignment="Bottom">
+					<font fontName="Open Sans" size="11" isBold="true"/>
+				</textElement>
+				<text><![CDATA[Qty per BOM]]></text>
+			</staticText>
+			<staticText>
+				<reportElement x="532" y="0" width="100" height="16" uuid="f715268a-4758-4b22-ad8c-aad04556017d"/>
+				<box leftPadding="0" rightPadding="0">
+					<bottomPen lineWidth="0.0"/>
+				</box>
+				<textElement textAlignment="Right" verticalAlignment="Bottom">
+					<font fontName="Open Sans" size="11" isBold="true"/>
+				</textElement>
+				<text><![CDATA[Available for Sale]]></text>
+			</staticText>
+			<staticText>
+				<reportElement x="632" y="0" width="100" height="16" uuid="c7e82e85-0776-4c29-abc3-3aef8a4b5633"/>
+				<box leftPadding="0" rightPadding="0">
+					<bottomPen lineWidth="0.0"/>
+				</box>
+				<textElement textAlignment="Right" verticalAlignment="Bottom">
+					<font fontName="Open Sans" size="11" isBold="true"/>
+				</textElement>
+				<text><![CDATA[System Demand]]></text>
+			</staticText>
+			<line>
+				<reportElement x="0" y="16" width="732" height="1" uuid="fc179cbf-5268-4676-abbf-76f7431121c2"/>
+			</line>
+			<staticText>
+				<reportElement key="Uom" x="0" y="0" width="31" height="16" uuid="f7856e7f-cb5a-4b6a-98cb-51369b5c284d"/>
+				<box leftPadding="3" rightPadding="3">
+					<bottomPen lineWidth="0.0"/>
+				</box>
+				<textElement textAlignment="Right" verticalAlignment="Bottom">
+					<font fontName="Open Sans" size="11" isBold="true"/>
+				</textElement>
+				<text><![CDATA[]]></text>
+			</staticText>
+			<staticText>
+				<reportElement x="413" y="0" width="119" height="16" uuid="a6aebb68-baa0-46fb-bc94-3430c4c0f1d5"/>
+				<box leftPadding="3" rightPadding="3">
+					<bottomPen lineWidth="0.0"/>
+				</box>
+				<textElement textAlignment="Right" verticalAlignment="Bottom">
+					<font fontName="Open Sans" size="11" isBold="true"/>
+				</textElement>
+				<text><![CDATA[Available to Build]]></text>
+			</staticText>
+		</band>
+	</columnHeader>
+	<detail>
+		<band height="20" splitType="Stretch">
+			<printWhenExpression><![CDATA[$F{parttype} != 14]]></printWhenExpression>
+			<textField isStretchWithOverflow="true" isBlankWhenNull="true" hyperlinkType="Reference">
+				<reportElement stretchType="RelativeToTallestObject" x="31" y="0" width="281" height="14" forecolor="#000099" uuid="b9c4b779-1155-4a03-b8d3-3e01e1b60311"/>
+				<box>
+					<bottomPen lineWidth="0.5" lineColor="#CCCCCC"/>
+				</box>
+				<textElement>
+					<font fontName="Open Sans" size="10"/>
+				</textElement>
+				<textFieldExpression><![CDATA[$F{PART}]]></textFieldExpression>
+				<anchorNameExpression><![CDATA["PartNum"]]></anchorNameExpression>
+				<hyperlinkReferenceExpression><![CDATA[$F{partnum}]]></hyperlinkReferenceExpression>
+			</textField>
+			<textField isStretchWithOverflow="true" isBlankWhenNull="true">
+				<reportElement stretchType="RelativeToTallestObject" x="312" y="0" width="69" height="14" uuid="f57bee48-f2f9-4ffd-9d65-1b448f737c84"/>
+				<box rightPadding="2">
+					<bottomPen lineWidth="0.5" lineColor="#CCCCCC"/>
+				</box>
+				<textElement textAlignment="Right">
+					<font fontName="Open Sans" size="10"/>
+				</textElement>
+				<textFieldExpression><![CDATA[$F{BOMQTY}]]></textFieldExpression>
+				<patternExpression><![CDATA[$V{QtyDecimal}]]></patternExpression>
+			</textField>
+			<textField isStretchWithOverflow="true" evaluationTime="Group" evaluationGroup="bomitem" isBlankWhenNull="true">
+				<reportElement style="RestrictingAtb" stretchType="RelativeToTallestObject" x="532" y="0" width="69" height="14" uuid="84e61f76-1579-44e7-856c-a2e453e8fc65"/>
+				<box rightPadding="2">
+					<bottomPen lineWidth="0.5" lineColor="#CCCCCC"/>
+				</box>
+				<textElement textAlignment="Right">
+					<font fontName="Open Sans" size="10"/>
+				</textElement>
+				<textFieldExpression><![CDATA[$F{parttype} != 10 ? "Non-Inv"
+: $F{QTYAVAILABLE} < 0 ? 0 : $F{QTYAVAILABLE}]]></textFieldExpression>
+				<patternExpression><![CDATA[$V{QtyDecimal}]]></patternExpression>
+			</textField>
+			<textField isStretchWithOverflow="true" isBlankWhenNull="true">
+				<reportElement stretchType="RelativeToTallestObject" x="382" y="0" width="31" height="14" uuid="bfbb9c62-414c-44ca-9d0b-709c448ab284"/>
+				<box>
+					<bottomPen lineWidth="0.5" lineColor="#CCCCCC"/>
+				</box>
+				<textElement>
+					<font fontName="Open Sans" size="10"/>
+				</textElement>
+				<textFieldExpression><![CDATA[$F{BOMITEMUOM}]]></textFieldExpression>
+			</textField>
+			<textField isStretchWithOverflow="true" isBlankWhenNull="true">
+				<reportElement stretchType="RelativeToTallestObject" x="601" y="0" width="31" height="14" uuid="130909b9-2d06-4659-93a6-74a6e7dd6f5a"/>
+				<box>
+					<bottomPen lineWidth="0.5" lineColor="#CCCCCC"/>
+				</box>
+				<textElement>
+					<font fontName="Open Sans" size="10"/>
+				</textElement>
+				<textFieldExpression><![CDATA[$F{parttype} != 10 ? ""
+: $F{PARTUOM}]]></textFieldExpression>
+			</textField>
+			<textField isStretchWithOverflow="true" isBlankWhenNull="true">
+				<reportElement stretchType="RelativeToTallestObject" x="632" y="0" width="100" height="14" uuid="bcfcc7c7-2301-4830-b480-04e25a9cc48c">
+					<printWhenExpression><![CDATA[$F{TYPEID} == 10]]></printWhenExpression>
+				</reportElement>
+				<box>
+					<bottomPen lineWidth="0.5" lineColor="#CCCCCC"/>
+				</box>
+				<textElement textAlignment="Right">
+					<font fontName="Open Sans" size="10"/>
+				</textElement>
+				<textFieldExpression><![CDATA[$V{QtyNeeded}]]></textFieldExpression>
+				<patternExpression><![CDATA[$V{QtyDecimal}]]></patternExpression>
+			</textField>
+			<textField isStretchWithOverflow="true" evaluationTime="Group" evaluationGroup="bomitem" isBlankWhenNull="true">
+				<reportElement stretchType="RelativeToTallestObject" x="412" y="0" width="74" height="14" uuid="a0167e23-21af-45d1-821a-4484d5c96987"/>
+				<box rightPadding="2">
+					<bottomPen lineWidth="0.5" lineColor="#CCCCCC"/>
+				</box>
+				<textElement textAlignment="Right" verticalAlignment="Middle">
+					<font fontName="Open Sans" size="10" isBold="true"/>
+				</textElement>
+				<textFieldExpression><![CDATA[$F{parttype} != 10 ? ""
+: (!$F{stageflag} ? ""
+: $F{AvailableToBuildStage} < 0 ? 0
+    : $F{AvailableToBuildStage})]]></textFieldExpression>
+				<patternExpression><![CDATA[$V{QtyDecimal}]]></patternExpression>
+			</textField>
+			<textField isStretchWithOverflow="true" isBlankWhenNull="true">
+				<reportElement stretchType="RelativeToTallestObject" x="486" y="0" width="46" height="14" uuid="432849b8-bd45-468b-8b80-637c29e5061c"/>
+				<box>
+					<bottomPen lineWidth="0.5" lineColor="#CCCCCC"/>
+				</box>
+				<textElement verticalAlignment="Middle">
+					<font fontName="Open Sans" size="10" isBold="true"/>
+				</textElement>
+				<textFieldExpression><![CDATA[$F{parttype} == 10 && $F{stageflag} ? $F{PARTUOM} : ""]]></textFieldExpression>
+			</textField>
+			<textField isStretchWithOverflow="true" isBlankWhenNull="true">
+				<reportElement stretchType="RelativeToTallestObject" x="0" y="0" width="32" height="14" uuid="18f3e09a-720f-4442-832b-e2644ed71998">
+					<printWhenExpression><![CDATA[$P{colLineNumber}]]></printWhenExpression>
+				</reportElement>
+				<box>
+					<bottomPen lineWidth="0.5" lineColor="#CCCCCC"/>
+				</box>
+				<textElement>
+					<font fontName="Open Sans" size="10" isBold="true"/>
+				</textElement>
+				<textFieldExpression><![CDATA[$V{counter}]]></textFieldExpression>
+			</textField>
+		</band>
+		<band height="19">
+			<printWhenExpression><![CDATA[$F{stageflag}]]></printWhenExpression>
+			<subreport>
+				<reportElement positionType="Float" x="0" y="0" width="732" height="19" uuid="74ceb2c3-4de8-4757-9514-14eb8fb0422e"/>
+				<subreportParameter name="module"/>
+				<subreportParameter name="locationGroupID">
+					<subreportParameterExpression><![CDATA[$F{locationgroupid}]]></subreportParameterExpression>
+				</subreportParameter>
+				<subreportParameter name="parentcount">
+					<subreportParameterExpression><![CDATA[$V{counter}.toString()]]></subreportParameterExpression>
+				</subreportParameter>
+				<subreportParameter name="bomID">
+					<subreportParameterExpression><![CDATA[$F{stagebomid}]]></subreportParameterExpression>
+				</subreportParameter>
+				<subreportParameter name="colLineNumber">
+					<subreportParameterExpression><![CDATA[$P{colLineNumber}]]></subreportParameterExpression>
+				</subreportParameter>
+				<connectionExpression><![CDATA[$P{REPORT_CONNECTION}]]></connectionExpression>
+				<subreportExpression><![CDATA["../Custom/subAvailableToBuild_v2.jasper"]]></subreportExpression>
+			</subreport>
+		</band>
+	</detail>
+	<columnFooter>
+		<band splitType="Stretch"/>
+	</columnFooter>
+	<pageFooter>
+		<band height="15" splitType="Stretch">
+			<textField evaluationTime="Report" pattern="" isBlankWhenNull="true">
+				<reportElement key="textField" mode="Transparent" x="684" y="0" width="48" height="15" forecolor="#000000" backcolor="#FFFFFF" uuid="8708e37b-eafa-4764-a7df-003f023ac55f"/>
+				<box leftPadding="3" rightPadding="3">
+					<topPen lineWidth="0.0" lineStyle="Solid" lineColor="#000000"/>
+					<leftPen lineWidth="0.0" lineStyle="Solid" lineColor="#000000"/>
+					<bottomPen lineWidth="0.0" lineColor="#000000"/>
+					<rightPen lineWidth="0.0" lineStyle="Solid" lineColor="#FFFFFF"/>
+				</box>
+				<textElement textAlignment="Left" verticalAlignment="Middle" rotation="None">
+					<font fontName="Open Sans" size="9"/>
+					<paragraph lineSpacing="Single"/>
+				</textElement>
+				<textFieldExpression><![CDATA["" + $V{PAGE_NUMBER}]]></textFieldExpression>
+			</textField>
+			<textField pattern="" isBlankWhenNull="true">
+				<reportElement key="textField" mode="Transparent" x="501" y="0" width="183" height="15" forecolor="#000000" backcolor="#FFFFFF" uuid="d20786e2-4ba7-4c74-a305-70a361f1e926"/>
+				<box leftPadding="3" rightPadding="3">
+					<topPen lineWidth="0.0" lineStyle="Solid" lineColor="#000000"/>
+					<leftPen lineWidth="0.0" lineStyle="Solid" lineColor="#000000"/>
+					<bottomPen lineWidth="0.0" lineColor="#000000"/>
+					<rightPen lineWidth="0.0" lineStyle="Solid" lineColor="#FFFFFF"/>
+				</box>
+				<textElement textAlignment="Right" verticalAlignment="Middle" rotation="None">
+					<font fontName="Open Sans" size="9"/>
+					<paragraph lineSpacing="Single"/>
+				</textElement>
+				<textFieldExpression><![CDATA["Page " + $V{PAGE_NUMBER} + " of "]]></textFieldExpression>
+			</textField>
+			<textField pattern="" isBlankWhenNull="true">
+				<reportElement key="textField" mode="Transparent" x="0" y="0" width="501" height="15" forecolor="#000000" backcolor="#FFFFFF" uuid="5195705c-e752-437c-bbf4-24788b6dd8de"/>
+				<box leftPadding="3" rightPadding="3">
+					<topPen lineWidth="0.0" lineStyle="Solid" lineColor="#000000"/>
+					<leftPen lineWidth="0.0" lineStyle="Solid" lineColor="#000000"/>
+					<bottomPen lineWidth="0.0" lineColor="#000000"/>
+					<rightPen lineWidth="0.0" lineStyle="Solid" lineColor="#FFFFFF"/>
+				</box>
+				<textElement textAlignment="Left" verticalAlignment="Middle" rotation="None">
+					<font fontName="Open Sans" size="9"/>
+					<paragraph lineSpacing="Single"/>
+				</textElement>
+				<textFieldExpression><![CDATA[(DateFormat.getDateTimeInstance(DateFormat.LONG,DateFormat.LONG)).format(new Date())]]></textFieldExpression>
+			</textField>
+		</band>
+	</pageFooter>
+</jasperReport>

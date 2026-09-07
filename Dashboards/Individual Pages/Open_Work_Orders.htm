@@ -526,6 +526,7 @@
                 </div>
 
                 <div class="ds-section ds-checks">
+                    <label><input type="checkbox" id="dsPersistFilters" /> Remember table filters between sessions</label>
                     <label><input type="checkbox" id="dsDebug" /> Show debug console</label>
                 </div>
 
@@ -631,6 +632,13 @@
             tileToTable: { WO: 'wo' },
             defaults: {
                 v: 1,
+                // Remember the column-filter row between sessions. Off by
+                // default, so nothing extra is written and the page behaves
+                // exactly as before until the user opts in.
+                persistFilters: false,
+                // Per-user snapshot of the filter row, keyed by tile code.
+                // Personal state - never published to the admin master.
+                savedFilters: {},
                 debug: false,
                 // Location-group filter. Empty array = no filter (every location
                 // group the logged-in user can access, i.e. previous behaviour).
@@ -1164,6 +1172,108 @@
         }
 
         // Tear down + rebuild after settings save.
+        // ------------------------------------------------------------------
+        // FilterPersist - optional persistence for the column-filter row.
+        //
+        // Gated on the `persistFilters` setting (Settings > "Remember table
+        // filters between sessions"), which is OFF by default: with it off
+        // nothing is read or written and the page behaves exactly as before.
+        //
+        // When on, the filter row is snapshotted into the per-user settings
+        // payload (debounced, and skipped when the snapshot is unchanged, so a
+        // burst of typing costs at most one saveSettings write) and restored on
+        // the next build. It lives in the USER payload only - filter text is
+        // personal state, never an org-wide default, so it is deliberately not
+        // read through resolve() and not included in readPanel().
+        // ------------------------------------------------------------------
+        var FilterPersist = (function () {
+            var TILE = 'WO';
+            var SAVE_DEBOUNCE = 400;
+            var _timer = null, _last = null, _restoring = false;
+
+            function enabled() {
+                try { return !!FBLib.Settings.resolve('persistFilters'); } catch (_) { return false; }
+            }
+            function savedMap() {
+                var u = {};
+                try { u = FBLib.Settings.getUser() || {}; } catch (_) {}
+                var m = u.savedFilters;
+                return (m && typeof m === 'object') ? m : {};
+            }
+            function snapshot() {
+                var out = {};
+                var els = document.querySelectorAll('.filter-row input[data-filter], .filter-row select[data-filter]');
+                for (var i = 0; i < els.length; i++) {
+                    if (els[i].value) out[els[i].getAttribute('data-filter')] = els[i].value;
+                }
+                return out;
+            }
+
+            function save() {
+                if (_restoring || !enabled()) return;
+                if (_timer) clearTimeout(_timer);
+                _timer = setTimeout(function () {
+                    _timer = null;
+                    try {
+                        var snap = snapshot(), json = JSON.stringify(snap);
+                        if (json === _last) return;   // unchanged - skip the write
+                        _last = json;
+                        var merged = {}, cur = savedMap();
+                        Object.keys(cur).forEach(function (k) { merged[k] = cur[k]; });
+                        merged[TILE] = snap;
+                        FBLib.Settings.setUserKey('savedFilters', merged);
+                        FBLib.Settings.saveUser();
+                    } catch (_) {}
+                }, SAVE_DEBOUNCE);
+            }
+
+            // Seed the filter row from the saved snapshot. Skipped while a save
+            // is pending - that means the user is mid-edit, and re-seeding would
+            // stomp what they just typed with the previous values.
+            function restore() {
+                if (!enabled() || _timer) return;
+                var saved = savedMap()[TILE];
+                _restoring = true;
+                try {
+                    if (saved && typeof saved === 'object') {
+                        Object.keys(saved).forEach(function (key) {
+                            var el = document.querySelector('.filter-row [data-filter="' + key + '"]');
+                            // Indicator columns render as a bare <td data-filter>
+                            // with no input - the `value` guard skips those.
+                            if (el && 'value' in el) el.value = saved[key];
+                        });
+                    }
+                    // Baseline the comparison snapshot even when nothing was
+                    // restored, so simply opening the page never costs a write.
+                    _last = JSON.stringify(snapshot());
+                } finally { _restoring = false; }
+            }
+
+            return { save: save, restore: restore };
+        })();
+
+        // Every filter path - the inline onkeyup handlers, the custom-field
+        // widgets injected after first paint, and clearFilters() - ends up in the
+        // page-global applyFilters(), so one wrapper captures them all.
+        applyFilters = (function (orig) {
+            return function () {
+                var r = orig.apply(this, arguments);
+                FilterPersist.save();
+                return r;
+            };
+        })(applyFilters);
+
+        // loadData() is the last step of every build path (first paint, the
+        // custom-field catalog callback, and rebuildPage), and each of those has
+        // already injected the CF filter widgets by the time it runs - so this is
+        // the one place that reliably sees a complete, empty filter row.
+        loadData = (function (orig) {
+            return function () {
+                FilterPersist.restore();
+                return orig.apply(this, arguments);
+            };
+        })(loadData);
+
         function rebuildPage() {
             var headerRow = document.getElementById('headerRow');
             var filterRow = document.getElementById('filterRow');
@@ -1248,6 +1358,7 @@
 
             function seedPanel(eff) {
                 document.getElementById('dsDebug').checked = !!eff.debug;
+                document.getElementById('dsPersistFilters').checked = !!eff.persistFilters;
                 renderLgSelect(Array.isArray(eff.locationGroups) ? eff.locationGroups : []);
                 renderCfPicker(eff.customFields || {}, eff.hiddenStandardColumns || {});
             }
@@ -1294,6 +1405,7 @@
                 var sel = readPickerSelections();
                 return {
                     debug:                 document.getElementById('dsDebug').checked,
+                    persistFilters:        document.getElementById('dsPersistFilters').checked,
                     locationGroups:        readLgSelection(),
                     customFields:          sel.customFields,
                     hiddenStandardColumns: sel.hiddenStandardColumns,
@@ -1304,6 +1416,9 @@
             function saveUser() {
                 var payload = readPanel();
                 Object.keys(payload).forEach(function (k) { FBLib.Settings.setUserKey(k, payload[k]); });
+                // Turning filter persistence off discards whatever was stored,
+                // so re-enabling it later starts from a clean filter row.
+                if (!payload.persistFilters) FBLib.Settings.setUserKey('savedFilters', {});
                 var ok = FBLib.Settings.saveUser();
                 if (!ok) { alert('User editing is locked by admin.'); return; }
                 closePanel();
