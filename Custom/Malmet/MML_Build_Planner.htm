@@ -1,0 +1,1675 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  REPORT: MML Build Planner
+  PATH:   Custom/Malmet/MML_Build_Planner.htm
+  --------------------------------------------------------------------------------
+  Drag in a Malmet MML (Master Material List) CSV and the report renders it as it
+  sits in the sheet, then enriches every line from Fishbowl: the matching part,
+  its description, and its live inventory (on hand, available, committed, not
+  available, allocated, on order).
+
+  THE PLANNER. The MML says, per part, how many go into a unit (Parts per Unit)
+  and how many come off one blank (Parts per Blank). From just those two numbers
+  a build quantity either lands exactly on whole blanks or wastes part of one.
+  The planner works backwards from the material: for each Material Part No. it
+  finds the build quantities that consume whole blanks, so nothing is part-cut.
+
+    need     = Parts per Unit x build qty
+    blanks   = ceil(need / Parts per Blank)
+    capacity = blanks x Parts per Blank
+    waste    = capacity - need            (part-slots of material thrown away)
+
+  A row is EXACT when Parts per Blank divides `need` with no remainder. The
+  smallest build quantity that does it is
+
+    period = Parts per Blank / gcd(Parts per Unit, Parts per Blank)
+
+  and every row sharing a material is exact together on any common multiple of
+  their periods. That LCM is computed and shown, but it is routinely in the
+  millions for a group with periods like 7, 22 and 52 — useless on a shop floor
+  — so the planner ALSO scans a practical range and ranks real quantities by how
+  little they waste. The exact answer when it is usable, an honest ranking when
+  it is not.
+
+  DELIBERATELY NOT USED: the "Scrap, Coil or Sheet" and "Blank Size" columns.
+  They are rendered, because the sheet shows them, but no material maths is
+  derived from sheet geometry — per Andrew, the calculation is Parts per Unit
+  and Parts per Blank only.
+
+  FORMAT TOLERANCE. Columns are located by matching the header TEXT, not by
+  position, so a sheet with columns inserted or reordered still works. The file
+  is read with a real RFC4180 parser (quoted commas, doubled quotes), and its
+  structure — a title banner, a two-row header, repeating section banners each
+  followed by another header, and trailing junk rows — is detected rather than
+  assumed. The reference sheet "MML - BWFW 105 Litre (AE2510NT).csv" carries
+  two sections and 66 data rows.
+================================================================================
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MML Build Planner - Fishbowl BI</title>
+
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+
+  <!-- Shared Fishbowl BI lib — inlined by Fishbowl from the saved "fb-lib"
+       Script. Source of truth: scripts/fb-lib.js. MUST sit before fb-styles so
+       window.FBLib exists when inline code runs. -->
+  <script>
+    {% Script fb-lib %}
+  </script>
+
+  <!-- Shared Fishbowl BI stylesheet — from the saved "fb-styles" Style.
+       Source of truth: scripts/fb-styles.css. Owns header/.hdr-btn, .btn,
+       .rpt-table, .badge, .fb-drawer, spinner and the tokens. MUST come BEFORE
+       the inline block so per-report rules win on identical selectors. -->
+  <style>
+    {% Style fb-styles %}
+  </style>
+
+  <style>
+    /* ── Report-specific only; the rest is fb-styles. ── */
+    html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
+    body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           font-size: 13px; color: var(--c-primary); background: var(--bg-1);
+           display: flex; flex-direction: column; }
+
+    /* ── DROP ZONE ──
+       Large and central until a file is loaded, then collapsed to a slim bar so
+       the table gets the screen. Both states accept a drop. */
+    #dropZone { flex-shrink: 0; margin: 14px 20px; padding: 30px; background: #fff;
+                border: 2px dashed var(--border-strong); border-radius: 10px;
+                text-align: center; cursor: pointer; transition: border-color .15s, background .15s; }
+    #dropZone:hover { border-color: var(--color-primary); background: var(--tint-blue); }
+    #dropZone.dragover { border-color: var(--fb-success); background: #E6F4EC; border-style: solid; }
+    #dropZone .dz-icon { color: var(--c-tertiary); margin-bottom: 10px; }
+    #dropZone .dz-title { font-size: 15px; font-weight: 600; color: var(--c-primary); }
+    #dropZone .dz-sub { font-size: 12px; color: var(--c-secondary); margin-top: 5px; line-height: 1.5; }
+    /* Loaded state — one line, still a drop target for replacing the file. */
+    #dropZone.loaded { padding: 7px 12px; margin: 8px 20px 0; text-align: left;
+                       display: flex; align-items: center; gap: 10px; border-style: solid;
+                       border-color: var(--border); border-width: 1px; }
+    #dropZone.loaded .dz-icon, #dropZone.loaded .dz-sub { display: none; }
+    #dropZone.loaded .dz-title { font-size: 12px; font-weight: 500; color: var(--c-secondary); }
+
+    /* ── TOOLBAR ── */
+    #toolbar { flex-shrink: 0; display: none; background: #fff; border-bottom: 1px solid var(--border);
+               padding: 9px 20px; gap: 10px 18px; align-items: flex-end; flex-wrap: wrap; }
+    #toolbar.on { display: flex; }
+    .fld { display: flex; flex-direction: column; gap: 4px; }
+    .fld > label { font-size: 10px; font-weight: 600; color: var(--c-secondary);
+                   text-transform: uppercase; letter-spacing: .04em; }
+    .fld input[type=text], .fld input[type=number], .fld select {
+      height: 30px; padding: 3px 8px; font-size: 12px; line-height: 1.3;
+      border: 1px solid var(--border); border-radius: 6px; background: #f9fafb; color: #374151;
+      font-family: inherit;
+    }
+    .fld input[type=number] { width: 92px; }
+    .fld input[type=text] { width: 190px; }
+    .fld-chk { display: flex; align-items: center; gap: 7px; font-size: 12px;
+               color: var(--c-secondary); cursor: pointer; height: 30px; }
+    #toolbar .btn { height: 30px; font-size: 12px; padding: 0 10px; }
+
+    /* ── SPLIT: table left, planner right ── */
+    #main { flex: 1; min-height: 0; display: flex; }
+    #tableScroll { flex: 1; min-width: 0; overflow: auto; background: #fff; }
+    #plannerPane { width: 400px; flex-shrink: 0; border-left: 1px solid var(--border);
+                   background: var(--bg-1); overflow-y: auto; display: none; }
+    #plannerPane.on { display: block; }
+
+    /* ── TABLE ── .rpt-table tier ships from fb-styles §29. ── */
+    #mmlTable { table-layout: fixed; }
+    #mmlTable th { cursor: pointer; position: sticky; top: 0; z-index: 10; overflow: hidden; }
+    #mmlTable th.nr { text-align: right; }
+    #mmlTable th.dragging { opacity: .4; }
+    #mmlTable th.drag-over { box-shadow: inset 3px 0 0 var(--tint-blue-2); }
+    #mmlTable th .sort-ind { opacity: .85; font-size: 10px; }
+    #mmlTable td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .col-resize { position: absolute; top: 0; right: 0; width: 7px; height: 100%;
+                  cursor: col-resize; user-select: none; z-index: 12; }
+    .col-resize::after { content: ''; position: absolute; top: 22%; right: 3px;
+                  width: 1px; height: 56%; background: rgba(255,255,255,.25); }
+    #mmlTable th:hover .col-resize::after { background: rgba(255,255,255,.65); }
+    body.col-resizing, body.col-resizing * { cursor: col-resize !important; user-select: none !important; }
+
+    tr.sec-row td { background: var(--bg-2); font-weight: 600; color: var(--menu-bg);
+                    padding: 6px 10px; border-bottom: 1px solid var(--border);
+                    position: sticky; top: var(--thead-h, 30px); z-index: 5; }
+    tr.data-row:hover td { background: var(--tint-blue) !important; }
+    tr.data-row.nomatch td { background: #FCF3F4; }
+    tr.data-row.nomatch:hover td { background: #F8E6E8 !important; }
+
+    .num-cell { text-align: right; font-variant-numeric: tabular-nums; }
+    .muted { color: var(--c-tertiary); }
+    .neg   { color: var(--fb-negative); font-weight: 600; }
+    .pos   { color: var(--fb-success); font-weight: 600; }
+    .empty { padding: 40px; text-align: center; color: var(--c-tertiary); font-style: italic; }
+    /* Exact vs part-used blank, on the per-row planner columns. */
+    td.exact  { color: var(--fb-success); font-weight: 600; }
+    td.wasted { color: #8A4E10; }
+
+    /* ── COLUMNS PANEL ── */
+    #colWrap { position: relative; }
+    #colPanel { position: absolute; z-index: 200; top: calc(100% + 4px); right: 0;
+                background: #fff; border: 1px solid var(--border-strong); border-radius: 8px;
+                box-shadow: var(--sh2); width: 250px; max-height: 440px; overflow-y: auto; }
+    #colPanel.hidden { display: none; }
+    #colPanel .col-head { padding: 6px 12px; font-size: 11px; font-weight: 600; color: var(--c-tertiary);
+                border-bottom: 1px solid var(--bg-2); position: sticky; top: 0; background: #fff; }
+    .col-row { display: flex; align-items: center; gap: 8px; padding: 5px 10px;
+               border-bottom: 1px solid var(--bg-2); cursor: grab; user-select: none; }
+    .col-row:last-child { border-bottom: none; }
+    .col-row.drag-over { background: var(--tint-blue); box-shadow: inset 0 2px 0 var(--color-primary); }
+    .col-row.dragging { opacity: .4; }
+    .col-row label { font-size: 12px; cursor: pointer; flex: 1; color: var(--c-primary); }
+    .col-row .grip { color: var(--c-tertiary); flex-shrink: 0; cursor: grab; line-height: 1; }
+    .col-row .src { font-size: 9px; text-transform: uppercase; letter-spacing: .04em;
+                    padding: 1px 4px; border-radius: 3px; flex-shrink: 0; }
+    .src-csv { background: #EBEEED; color: #506872; }
+    .src-fb  { background: #DEEAF4; color: #0B3140; }
+    .src-plan{ background: #F5E7DD; color: #8A4E10; }
+    #colPanel .col-foot { padding: 6px 10px; border-top: 1px solid var(--bg-2);
+                position: sticky; bottom: 0; background: #fff; }
+
+    /* ── PLANNER ── */
+    .pl-head { padding: 11px 14px; border-bottom: 1px solid var(--border); background: #fff; }
+    .pl-head h3 { margin: 0 0 3px; font-size: 13px; color: var(--menu-bg); }
+    .pl-head p { margin: 0; font-size: 11px; color: var(--c-secondary); line-height: 1.5; }
+    .pl-body { padding: 10px 12px; }
+    .pl-mat { background: #fff; border: 1px solid var(--border); border-radius: 8px;
+              margin-bottom: 10px; overflow: hidden; }
+    .pl-mat-hd { padding: 8px 11px; background: var(--bg-2); border-bottom: 1px solid var(--border);
+                 display: flex; align-items: baseline; gap: 8px; cursor: pointer; }
+    .pl-mat-hd:hover { background: var(--tint-blue); }
+    .pl-mat-num { font-weight: 700; font-size: 12px; color: var(--menu-bg); }
+    .pl-mat-sub { font-size: 10px; color: var(--c-tertiary); margin-left: auto; }
+    .pl-mat-body { padding: 9px 11px; }
+    .pl-exact { font-size: 11px; color: #415157; line-height: 1.55; margin-bottom: 8px; }
+    .pl-exact b { color: var(--fb-success); }
+    .pl-qty-tbl { width: 100%; border-collapse: collapse; font-size: 11px; }
+    .pl-qty-tbl th { text-align: left; font-size: 9px; text-transform: uppercase;
+                     letter-spacing: .04em; color: var(--c-tertiary); font-weight: 600;
+                     padding: 3px 5px; border-bottom: 1px solid var(--bg-2); }
+    .pl-qty-tbl td { padding: 3px 5px; border-bottom: 1px solid #f5f7f8; }
+    .pl-qty-tbl td.nr { text-align: right; font-variant-numeric: tabular-nums; }
+    .pl-qty-tbl tr.best td { background: #E6F4EC; font-weight: 600; }
+    .pl-qty-tbl tr.cur td { background: var(--tint-blue); }
+    .pl-qty-tbl tr:hover td { background: var(--tint-blue); cursor: pointer; }
+    .pl-bar { height: 4px; border-radius: 2px; background: #E3E3E3; overflow: hidden; min-width: 40px; }
+    .pl-bar > i { display: block; height: 100%; background: var(--fb-success); }
+    .pl-bar.warn > i { background: #F69133; }
+    .pl-bar.bad  > i { background: var(--fb-negative); }
+    .pl-none { font-size: 11px; color: var(--c-tertiary); font-style: italic; padding: 10px 2px; }
+
+    /* ── SPINNER / STATUS ── */
+    #spinner { display: none; padding: 40px; text-align: center; color: var(--c-secondary); }
+    #parseIssues { display: none; margin: 8px 20px 0; }
+    #parseIssues.on { display: block; }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div>
+      <h1>MML Build Planner</h1>
+      <p id="statusLine">Drop an MML CSV to begin.</p>
+    </div>
+    <div class="hdr-actions">
+      <button class="hdr-btn" onclick="document.getElementById('fileInput').click()" title="Choose an MML CSV">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 15V3m0 0L8 7m4-4l4 4M2 17l.621 2.485A2 2 0 004.561 21h14.878a2 2 0 001.94-1.515L22 17"/></svg>Load CSV
+      </button>
+      <button class="hdr-btn" id="refreshBtn" onclick="loadFishbowl()" title="Re-read part and inventory data from Fishbowl" disabled>
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>Refresh
+      </button>
+      <div id="colWrap">
+        <button class="hdr-btn" id="colBtn" onclick="toggleColPanel(event)" title="Show / hide and reorder columns">
+          <svg fill="currentColor" viewBox="0 0 24 24"><circle cx="8" cy="6" r="1.5"/><circle cx="8" cy="12" r="1.5"/><circle cx="8" cy="18" r="1.5"/><circle cx="16" cy="6" r="1.5"/><circle cx="16" cy="12" r="1.5"/><circle cx="16" cy="18" r="1.5"/></svg>Columns
+        </button>
+        <div id="colPanel" class="hidden">
+          <div class="col-head">Show / Reorder — drag to move</div>
+          <div id="colList"></div>
+          <div class="col-foot">
+            <button type="button" class="btn btn-sm" style="width:100%" onclick="resetColWidths()"
+                    title="Hand every column back to automatic width. You can also drag a column edge, or double-click an edge to reset.">
+              Reset widths
+            </button>
+          </div>
+        </div>
+      </div>
+      <div style="width:1px;height:24px;background:var(--border);margin:0 2px;"></div>
+      <button class="hdr-btn" onclick="exportCSV()" title="Export the on-screen rows to CSV">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>CSV
+      </button>
+      <button class="hdr-btn" onclick="printReport()" title="Print / PDF (A4 landscape)">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>Print
+      </button>
+      <button class="hdr-btn" id="helpBtn" onclick="FBLib.Common.toggleDrawer('helpOverlay')"
+              title="What this report does, and what every column means">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>Help
+      </button>
+    </div>
+  </header>
+
+  <!-- HELP DRAWER — sibling of <header>; fb-lib owns the scrim, ESC and offset. -->
+  <div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+      <h2>MML Build Planner — how it works</h2>
+      <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+      <div class="info-box">
+        <p style="margin-bottom:0;"><strong>Drop an MML CSV anywhere on the page.</strong> The sheet is rendered as
+        it stands, each part is matched to Fishbowl for its live stock, and the planner works out which build
+        quantities consume whole blanks of each raw material.</p>
+      </div>
+
+      <div class="ds-grid">
+        <div class="config-group">
+          <h5>Reading the file</h5>
+          <p style="margin:0 0 8px;font-size:12px;color:#415157;">The structure is detected, not assumed, so a
+          sheet that gains a column or a section still loads:</p>
+          <ul style="margin:0;padding-left:18px;font-size:12px;color:#415157;">
+            <li style="margin-bottom:5px;">The title banner at the top is ignored.</li>
+            <li style="margin-bottom:5px;">Any row whose first cell is <code>Part No.</code> is a header. The
+            row under it carrying <em>Width / x / Length</em> is folded into those headings.</li>
+            <li style="margin-bottom:5px;">A row with text in the first cell and nothing else is a
+            <strong>section banner</strong> and is kept as a heading in the grid.</li>
+            <li style="margin-bottom:0;">Blank and trailing junk rows are dropped. Anything skipped is counted,
+            and you can list it from the status bar.</li>
+          </ul>
+        </div>
+
+        <div class="config-group">
+          <h5>The Fishbowl columns</h5>
+          <p style="margin:0 0 8px;font-size:12px;color:#415157;">Each <strong>Part No.</strong> is matched to
+          <code>part.num</code> <strong>exactly</strong>. A row that finds no part is tinted and counted — it is
+          never quietly dropped.</p>
+          <p style="margin:0;font-size:12px;color:#415157;">Inventory is summed over the location groups you can
+          access, using the same formulas as the other inventory reports, so the numbers agree:
+          <strong>Available = On Hand − Allocated − Not Available + Dropship</strong>, floored at zero.</p>
+        </div>
+
+        <div class="config-group">
+          <h5>The planner</h5>
+          <p style="margin:0 0 8px;font-size:12px;color:#415157;">For a build quantity <em>Q</em>, each row needs
+          <code>Parts per Unit × Q</code> parts, which take
+          <code>ceil(need ÷ Parts per Blank)</code> blanks. Anything the last blank yields but you don't need is
+          waste.</p>
+          <p style="margin:0 0 8px;font-size:12px;color:#415157;">A row is <b>exact</b> when Parts per Blank
+          divides the need evenly. The smallest quantity that does it is
+          <code>Parts per Blank ÷ gcd(Parts per Unit, Parts per Blank)</code>, and rows sharing a material are all
+          exact together on any common multiple of those.</p>
+          <p style="margin:0;font-size:12px;color:#415157;">That perfect figure is shown when it is usable, but it
+          is often in the millions — so the planner also scans real quantities and ranks them by waste. Click any
+          suggested quantity to load it into the grid.</p>
+        </div>
+
+        <div class="config-group">
+          <h5>What is deliberately NOT used</h5>
+          <p style="margin:0;font-size:12px;color:#415157;">The <em>Blank Size</em> and
+          <em>Scrap, Coil or Sheet</em> columns are shown because the sheet shows them, but no material maths is
+          derived from sheet or coil geometry. The calculation uses <strong>Parts per Unit</strong> and
+          <strong>Parts per Blank</strong> only.</p>
+          <p style="margin:8px 0 0;font-size:12px;color:#415157;">Rows carrying a note like
+          <em>“Offcut from …”</em> or <em>“Nested with …”</em> are flagged in the planner, because their material
+          comes from another part's scrap and counting them again would overstate what you need.</p>
+        </div>
+      </div>
+
+      <div class="config-group" style="margin-top:2px;">
+        <h5>Every column</h5>
+        <table class="rpt-table" id="colRef" style="width:100%;table-layout:auto;"></table>
+      </div>
+    </div>
+    <div class="fb-drawer-foot">
+      <span style="font-size:11px;color:#8FA1A7;">Hover any column heading for its definition.</span>
+      <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('helpOverlay')">Close</button>
+    </div>
+  </div>
+
+  <!-- Rich hover popover target — fb-styles §13 owns the styling. -->
+  <div id="appTooltip" class="app-tooltip" role="tooltip" aria-hidden="true"></div>
+
+  <!-- DROP ZONE -->
+  <div id="dropZone" onclick="document.getElementById('fileInput').click()">
+    <svg class="dz-icon" width="38" height="38" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24">
+      <path d="M7 18a4.6 4.4 0 010-9 5 4.5 0 019.9-1A3.5 3.5 0 0118 18M12 13v8m0-8l-3 3m3-3l3 3" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <div class="dz-title">Drop an MML CSV here</div>
+    <div class="dz-sub">or click to choose a file — the header rows and section banners are detected automatically</div>
+  </div>
+  <input type="file" id="fileInput" accept=".csv,text/csv" style="display:none" />
+
+  <div id="parseIssues" class="info-box" style="border-left-color:#F69133;background:#F5E7DD;"></div>
+
+  <!-- TOOLBAR -->
+  <div id="toolbar">
+    <div class="fld">
+      <label for="buildQty" title="How many finished units you intend to build. Every requirement below scales from this.">Build qty (units)</label>
+      <input type="number" id="buildQty" min="1" step="1" value="1" oninput="onQtyChange()" />
+    </div>
+    <div class="fld">
+      <label for="qSearch">Search</label>
+      <input type="text" id="qSearch" placeholder="part / description / material…" oninput="applyFiltersDebounced()" />
+    </div>
+    <div class="fld">
+      <label for="matFilter">Material Part No.</label>
+      <select id="matFilter" onchange="applyFilters()" style="width:170px;"></select>
+    </div>
+    <label class="fld-chk" title="Hide rows whose Part No. found no matching Fishbowl part."><input type="checkbox" id="onlyMatched" onchange="applyFilters()" /> Matched parts only</label>
+    <label class="fld-chk" title="Show only rows that waste part of a blank at the current build quantity."><input type="checkbox" id="onlyWaste" onchange="applyFilters()" /> Wasteful rows only</label>
+    <button type="button" class="btn btn-sm" onclick="clearFilters()">Clear filters</button>
+    <label class="fld-chk" style="margin-left:auto;"><input type="checkbox" id="showPlanner" checked onchange="togglePlanner()" /> Planner panel</label>
+  </div>
+
+  <!-- MAIN -->
+  <div id="main">
+    <div id="tableScroll">
+      <div id="spinner">
+        <svg class="spin" width="30" height="30" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="var(--color-primary)" stroke-width="3" stroke-linecap="round"/></svg>
+        <div style="margin-top:8px;">Reading Fishbowl parts &amp; inventory…</div>
+      </div>
+      <table class="rpt-table" id="mmlTable">
+        <colgroup id="mmlColgroup"></colgroup>
+        <thead id="mmlHead"></thead>
+        <tbody id="mmlBody"><tr><td class="empty" colspan="9">No file loaded.</td></tr></tbody>
+      </table>
+    </div>
+
+    <div id="plannerPane">
+      <div class="pl-head">
+        <h3>Ideal build quantities</h3>
+        <p>Quantities that consume <strong>whole blanks</strong> of each material, so nothing is part-cut.
+           Click one to load it.</p>
+      </div>
+      <div class="pl-body" id="plannerBody"></div>
+    </div>
+  </div>
+
+<script>
+/* ── RUNTIME GUARDS ── */
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+  document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#475569;">' +
+    '<h2>Not running inside Fishbowl</h2><p>This report requires the Fishbowl BI environment.</p></div>';
+  throw new Error('Fishbowl API not available');
+}
+if (!window.FBLib || !FBLib.Common || !FBLib.Settings || !FBLib.Common.registerDrawer) {
+  document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#8A1E30;background:#F0D7DD;">' +
+    '<h2>fb-lib not loaded</h2><p>This report requires the shared <code>fb-lib</code> Script. In BI Script Editor, ' +
+    'confirm a Script named exactly <code>fb-lib</code> exists with the current contents of scripts/fb-lib.js, then ' +
+    're-save THIS report (directives expand at save time).</p></div>';
+  throw new Error('FBLib not available');
+}
+
+/* ── SETTINGS ── */
+FBLib.Settings.init({
+  userKey:   'cdx.bi.mmlplanner.user.v1',
+  masterKey: 'cdx.bi.mmlplanner.master.v1',
+  defaults: { v: 1, cols: [], buildQty: 1, showPlanner: true, maxScanQty: 200, topSuggestions: 6 },
+  propFallback: { debug: { name: 'BI_SHOW_DEBUG', dflt: 'false', parse: v => (v === 'true' || v === true) } }
+});
+
+const _C = FBLib.Common;
+function fmtQty(v) {
+  if (v === null || v === undefined || v === '') return '';
+  try { return _C.formatQty(v); } catch (_) {}
+  const n = parseFloat(v); if (isNaN(n)) return '';
+  return n % 1 === 0 ? String(Math.round(n)) : n.toFixed(4).replace(/\.?0+$/, '');
+}
+function escHtml(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+function escSQL(s) { return String(s).replace(/'/g, "''"); }
+function setStatus(m) { document.getElementById('statusLine').textContent = m; }
+
+function norm(r) {
+  if (r == null) return [];
+  if (typeof r === 'string') { try { const p = JSON.parse(r); return Array.isArray(p) ? p : []; } catch (_) { return []; } }
+  return Array.isArray(r) ? r : [];
+}
+async function qp(sql) {
+  try { return norm(await runQueryAsync(sql)); }
+  catch (e) { try { return norm(runQuery(sql)); } catch (e2) { throw e2; } }
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   CSV PARSING
+   ════════════════════════════════════════════════════════════════════ */
+
+/* RFC4180. Handles quoted fields containing commas, doubled quotes and
+   embedded newlines. Written out rather than split(',') because the reference
+   sheet has quoted cells like "Cost split ..." that a naive split destroys. */
+function parseCSV(text) {
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  const Q = String.fromCharCode(34);
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === Q) {
+        if (text[i + 1] === Q) { field += Q; i++; }   // escaped quote
+        else inQuotes = false;
+      } else field += c;
+    } else if (c === Q) {
+      inQuotes = true;
+    } else if (c === ',') {
+      row.push(field); field = '';
+    } else if (c === '\n') {
+      row.push(field); field = ''; rows.push(row); row = [];
+    } else if (c !== '\r') {
+      field += c;
+    }
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+const cell = (r, i) => String((r && r[i] != null) ? r[i] : '').trim();
+const isBlankRow = r => !r || r.every(c => !String(c == null ? '' : c).trim());
+
+/* ── FIELD RESOLUTION ──
+   Columns are found by matching the HEADER TEXT, never by position, so a sheet
+   with a column inserted or moved still works. Each field lists the patterns
+   that identify it, most specific first. `req` marks the three the planner
+   cannot run without. */
+const FIELD_DEFS = [
+  { key: 'partNo',    label: 'Part No.',        req: true,  pats: [/^part\s*(no|num|number)\.?$/i, /^part\s*no/i] },
+  { key: 'perUnit',   label: 'Parts per Unit',  req: true,  pats: [/parts?\s*per\s*unit/i] },
+  { key: 'perBlank',  label: 'Parts per Blank', req: true,  pats: [/parts?\s*per\s*blank/i] },
+  { key: 'matPartNo', label: 'Material Part No.', req: true, pats: [/material\s*part\s*(no|num)/i] },
+  { key: 'desc',      label: 'Description',     pats: [/^description$/i, /descr/i] },
+  { key: 'status',    label: 'Status',          pats: [/^status$/i] },
+  // NOT anchored: folding the two-row header can prefix this with its group,
+  // giving "Blank Size Exact Size". Anchoring it stopped the nesting notes
+  // being found at all, which silently overstated material for every offcut
+  // part — so the pattern has to survive the fold.
+  { key: 'nestNote',  label: 'Exact Size',      pats: [/exact\s*size/i] },
+  { key: 'material',  label: 'Material',        pats: [/^material$/i] }
+];
+
+/* Resolve each logical field to a column index in the parsed header. */
+function resolveFields(headers) {
+  const map = {};
+  FIELD_DEFS.forEach(def => {
+    let idx = -1;
+    for (const pat of def.pats) {
+      idx = headers.findIndex(h => pat.test(String(h || '').trim()));
+      if (idx >= 0) break;
+    }
+    map[def.key] = idx;
+  });
+  return map;
+}
+
+/* ── MML STRUCTURE ──
+   The sheet is: a title banner, a header row, a sub-header row that only
+   carries the Blank Size parts, data rows, then (repeatedly) a section banner
+   followed by another header + sub-header + more data, and trailing junk.
+
+   Everything here is DETECTED. The one assumption is that a header row starts
+   with "Part No." — which is also what makes a repeated header recognisable. */
+function parseMML(text) {
+  const rows = parseCSV(text);
+  const out = { headers: [], fields: {}, rows: [], sections: [], skipped: [], issues: [] };
+  if (!rows.length) { out.issues.push('The file is empty.'); return out; }
+
+  const isHeaderRow = r => /^part\s*(no|num|number)\.?$/i.test(cell(r, 0)) || /^part\s*no/i.test(cell(r, 0));
+  // A sub-header only describes the Blank Size group: first cell empty, but
+  // "Width"/"Length" appear further along.
+  const isSubHeader = r => !cell(r, 0) && r.some(c => /^(width|length)$/i.test(String(c || '').trim()));
+  // A banner is a lone label: text in the first cell, nothing anywhere else.
+  const isBanner = r => !!cell(r, 0) && r.slice(1).every(c => !String(c == null ? '' : c).trim());
+
+  let section = '';
+  let headerSeen = false;
+  // A banner is only a SECTION once a data row actually appears under it. The
+  // reference sheet ends with a lone "ECN1481" note followed by blank rows;
+  // committing that on sight would invent an empty section in the grid.
+  let pendingSection = null;
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (isBlankRow(r)) continue;
+
+    if (isHeaderRow(r)) {
+      // Take the FIRST header as the column set; later repeats just confirm a
+      // new section has started. Fold the sub-header in if one follows.
+      if (!headerSeen) {
+        let hdr = r.map(c => String(c == null ? '' : c).trim());
+        const nxt = rows[i + 1];
+        if (nxt && isSubHeader(nxt)) {
+          const group = {};   // remember the group label each sub-cell sits under
+          let lastLabel = '';
+          hdr.forEach((h, j) => { if (h) lastLabel = h; group[j] = lastLabel; });
+          hdr = hdr.map((h, j) => {
+            const sub = cell(nxt, j);
+            if (!sub) return h;
+            // A bare "x" separator keeps its own column so the grid can be made
+            // to read exactly like the sheet.
+            if (/^x$/i.test(sub)) return 'x';
+            const g = (group[j] || '').replace(/\s*\(mm\)\s*/i, '').trim();
+            if (!g) return sub;
+            // "Blank Size" + "Width" -> "Blank Size Width", but "Blank Size" +
+            // "Exact Size" stays "Exact Size" rather than doubling the shared
+            // word into "Blank Size Exact Size".
+            const lastWord = g.split(/\s+/).pop() || '';
+            const shares = lastWord &&
+              new RegExp('\\b' + lastWord.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i').test(sub);
+            return shares ? sub : (g + ' ' + sub);
+          });
+        }
+        out.headers = hdr;
+        out.fields = resolveFields(hdr);
+        headerSeen = true;
+      }
+      if (rows[i + 1] && isSubHeader(rows[i + 1])) i++;   // consume the sub-header
+      continue;
+    }
+
+    if (isSubHeader(r)) continue;
+
+    if (isBanner(r)) {
+      // The very first banner is the sheet title; later ones head a section —
+      // but only once something is filed under them (see pendingSection).
+      if (!headerSeen) { out.issues.push('Title: ' + cell(r, 0)); continue; }
+      pendingSection = { text: cell(r, 0), line: i + 1 };
+      continue;
+    }
+
+    if (!headerSeen) { out.skipped.push({ line: i + 1, why: 'before the header row', text: cell(r, 0) }); continue; }
+
+    const partNo = out.fields.partNo >= 0 ? cell(r, out.fields.partNo) : cell(r, 0);
+    if (!partNo) { out.skipped.push({ line: i + 1, why: 'no Part No.', text: r.slice(0, 4).join(',') }); continue; }
+
+    if (pendingSection) {
+      section = pendingSection.text;
+      out.sections.push(section);
+      pendingSection = null;
+    }
+    out.rows.push({ _line: i + 1, _section: section, cells: r });
+  }
+
+  // A banner with nothing under it is a stray note, not a section — say so
+  // rather than dropping it silently.
+  if (pendingSection) out.skipped.push({ line: pendingSection.line, why: 'a note with no rows under it', text: pendingSection.text });
+
+  if (!out.headers.length) out.issues.push('No header row found — expected a row whose first cell is "Part No.".');
+  FIELD_DEFS.filter(d => d.req).forEach(d => {
+    if (out.fields[d.key] < 0) out.issues.push('Could not find the "' + d.label + '" column.');
+  });
+  return out;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   PLANNER ENGINE
+   Pure arithmetic on Parts per Unit and Parts per Blank — no sheet or coil
+   geometry, per the spec.
+   ════════════════════════════════════════════════════════════════════ */
+function gcd(a, b) { a = Math.abs(a); b = Math.abs(b); while (b) { const t = a % b; a = b; b = t; } return a; }
+function lcm(a, b) { if (!a || !b) return 0; return Math.abs(a / gcd(a, b) * b); }
+
+/* Blanks and waste for one row at build quantity q. */
+function rowPlan(row, q) {
+  const pu = row.perUnit, pb = row.perBlank;
+  if (!(pu > 0) || !(pb > 0) || !(q > 0)) return null;
+  const need = pu * q;
+  const blanks = Math.ceil(need / pb);
+  const capacity = blanks * pb;
+  return { need: need, blanks: blanks, capacity: capacity, waste: capacity - need, exact: capacity === need };
+}
+
+/* The smallest q>0 at which this row lands on whole blanks.
+   need = pu*q must be divisible by pb  ->  q must be a multiple of
+   pb / gcd(pu, pb). */
+function rowPeriod(row) {
+  const pu = row.perUnit, pb = row.perBlank;
+  if (!(pu > 0) || !(pb > 0)) return 0;
+  return pb / gcd(pu, pb);
+}
+
+/* Evaluate a whole material group at quantity q. */
+function groupPlan(rows, q) {
+  let need = 0, capacity = 0, waste = 0, blanks = 0, exactRows = 0, usable = 0;
+  rows.forEach(r => {
+    const p = rowPlan(r, q);
+    if (!p) return;
+    usable++;
+    need += p.need; capacity += p.capacity; waste += p.waste; blanks += p.blanks;
+    if (p.exact) exactRows++;
+  });
+  return {
+    q: q, need: need, capacity: capacity, waste: waste, blanks: blanks,
+    exactRows: exactRows, rows: usable,
+    wastePct: capacity > 0 ? (waste / capacity) * 100 : 0,
+    allExact: usable > 0 && exactRows === usable
+  };
+}
+
+/* For each material: the exact (all-rows-whole) quantity if there is a usable
+   one, plus the best real quantities found by scanning.
+
+   The scan exists because the exact answer is frequently useless: periods of
+   7, 22 and 52 in one group give an LCM of 4004. Ranking real quantities by
+   waste gives something a shop floor can act on either way. */
+function planMaterials(rows, opts) {
+  const maxQ = (opts && opts.maxQ) || 200;
+  const top = (opts && opts.top) || 6;
+  const byMat = new Map();
+  rows.forEach(r => {
+    if (!r.matPartNo) return;
+    if (!byMat.has(r.matPartNo)) byMat.set(r.matPartNo, []);
+    byMat.get(r.matPartNo).push(r);
+  });
+
+  const out = [];
+  byMat.forEach((group, mat) => {
+    // A row whose material comes from another part's offcut must not be
+    // counted again — it consumes no material of its own.
+    const counted = group.filter(r => !r.nested && r.perUnit > 0 && r.perBlank > 0);
+    const periods = counted.map(rowPeriod).filter(p => p > 0);
+
+    // Exact quantity for the whole group = LCM of the per-row periods.
+    let exactQ = periods.length ? periods.reduce((a, b) => lcm(a, b), 1) : 0;
+    if (!isFinite(exactQ) || exactQ > 1e9) exactQ = 0;
+
+    const scan = [];
+    for (let q = 1; q <= maxQ; q++) scan.push(groupPlan(counted, q));
+    // Rank by waste, then prefer the smaller quantity — a smaller batch that
+    // wastes the same is strictly better.
+    const ranked = scan.slice().sort((a, b) => (a.wastePct - b.wastePct) || (a.q - b.q));
+    const best = ranked.slice(0, top);
+
+    out.push({
+      matPartNo: mat,
+      rows: group,
+      countedRows: counted.length,
+      nestedRows: group.length - counted.length,
+      periods: periods,
+      exactQ: exactQ,
+      exactWithinScan: exactQ > 0 && exactQ <= maxQ,
+      best: best,
+      scan: scan
+    });
+  });
+  out.sort((a, b) => String(a.matPartNo).localeCompare(String(b.matPartNo), undefined, { numeric: true }));
+  return out;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   COLUMNS
+   Built dynamically: every CSV column as it appeared, then the Fishbowl
+   lookups, then the per-row planner figures. `src` drives the tag in the
+   Columns panel and the grouping in the help drawer.
+   ════════════════════════════════════════════════════════════════════ */
+const MIN_COL_W = 46;
+let _cols = [];
+let _colWidths = {};
+
+/* The Fishbowl + planner columns appended to whatever the CSV supplied.
+   Inventory formulas match the other inventory reports so the numbers agree. */
+const EXTRA_COLS = [
+  { key: '_fbPartNum', label: 'FB Part #',    src: 'fb', w: 120,
+    tip: 'The Fishbowl part whose number matches this row’s Part No. exactly. Blank means no part was found — the row is tinted and counted in the status bar.',
+    meta: 'part.num, exact match' },
+  { key: '_fbDesc',    label: 'FB Description', src: 'fb', w: 190,
+    tip: 'The description held against the part in Fishbowl. Worth comparing to the MML’s own Description when they disagree.',
+    meta: 'part.description' },
+  { key: '_onHand',    label: 'On Hand',      src: 'fb', w: 90, nr: true,
+    tip: 'Physical stock on the shelf across the location groups you can access.',
+    meta: 'SUM(tag.qty) where tag.typeId IN (30,40)' },
+  { key: '_available', label: 'Available',    src: 'fb', w: 90, nr: true,
+    tip: 'What is genuinely free to promise. Floored at zero, and recomputed from the summed components rather than summed from the per-group view — which is itself floored per group, so summing it would overstate.',
+    meta: 'max(0, On Hand − Allocated − Not Available + Dropship)' },
+  { key: '_committed', label: 'Committed',    src: 'fb', w: 90, nr: true,
+    tip: 'Stock reserved by a pick. Counts every order type — work and transfer orders as well as sales — so it can exceed the sales demand you can see.',
+    meta: 'SUM(tag.qtyCommitted), no tag-type filter' },
+  { key: '_notAvail',  label: 'Not Available', src: 'fb', w: 100, nr: true, vis: false,
+    tip: 'On-hand stock in locations not counted as available (quarantine, inspection), net of what is already committed there. Subtracted from Available.',
+    meta: 'SUM(tag.qty − tag.qtyCommitted) where location.countedAsAvailable = 0' },
+  { key: '_allocated', label: 'Allocated',    src: 'fb', w: 90, nr: true, vis: false,
+    tip: 'Open demand against the part — sales, purchase, transfer and manufacture.',
+    meta: 'QTYALLOCATED view' },
+  { key: '_onOrder',   label: 'On Order',     src: 'fb', w: 90, nr: true, vis: false,
+    tip: 'Quantity on open purchase orders. Deliberately NOT part of Available — it has not arrived, so it cannot be promised.',
+    meta: 'QTYONORDER view' },
+
+  { key: '_need',   label: 'Need',       src: 'plan', w: 80, nr: true,
+    tip: 'Parts required at the current build quantity.',
+    meta: 'Parts per Unit × build qty' },
+  { key: '_blanks', label: 'Blanks',     src: 'plan', w: 80, nr: true,
+    tip: 'Blanks that must be cut to yield the need. Rounded UP — you cannot cut part of a blank.',
+    meta: 'ceil(need ÷ Parts per Blank)' },
+  { key: '_wasteN', label: 'Waste',      src: 'plan', w: 80, nr: true,
+    tip: 'Parts’ worth of material the last blank yields but you do not need. Zero means the quantity lands exactly on whole blanks.',
+    meta: '(blanks × Parts per Blank) − need' },
+  { key: '_period', label: 'Exact every', src: 'plan', w: 95, nr: true,
+    tip: 'The smallest build quantity at which THIS row uses whole blanks, and every multiple of it thereafter. The planner combines these across a material to find quantities that suit all of its parts at once.',
+    meta: 'Parts per Blank ÷ gcd(Parts per Unit, Parts per Blank)' },
+  { key: '_short',  label: 'Short by',   src: 'plan', w: 90, nr: true, vis: false,
+    tip: 'How many more parts are needed than Fishbowl currently has available. Blank when stock covers the build.',
+    meta: 'max(0, need − Available)' }
+];
+
+function buildColumns(headers) {
+  const csvCols = headers.map((h, i) => ({
+    key: 'c' + i, label: h || ('Column ' + (i + 1)), src: 'csv', idx: i,
+    w: /description|comment/i.test(h) ? 200 : (/^x$/i.test(h) ? 28 : 110),
+    // A bare "x" is the separator between Blank Width and Length; it carries no
+    // information on its own, so it is off by default but kept available so the
+    // grid can be made to look exactly like the sheet.
+    vis: !/^x$/i.test(h),
+    tip: 'Straight from the CSV, column ' + (i + 1) + '.',
+    meta: 'MML column “' + (h || '') + '”'
+  }));
+  const extra = EXTRA_COLS.map(c => Object.assign({ vis: c.vis !== false }, c));
+  return csvCols.concat(extra);
+}
+
+function visCols() { return _cols.filter(c => c.vis); }
+
+function loadColPrefs() {
+  let saved = null;
+  try { saved = FBLib.Settings.resolve('cols'); } catch (_) {}
+  if (!Array.isArray(saved) || !saved.length) return;
+  // Resilient to a different sheet: keys that still exist keep their saved
+  // order/visibility/width, anything new is appended, anything gone is dropped.
+  const byKey = {}; _cols.forEach(c => { byKey[c.key] = c; });
+  const out = [], seen = {};
+  saved.forEach(s => {
+    const d = byKey[s.key];
+    if (!d || seen[s.key]) return;
+    d.vis = (s.vis === undefined ? d.vis : !!s.vis);
+    if (s.w > MIN_COL_W) d.w = s.w;
+    out.push(d); seen[s.key] = 1;
+  });
+  _cols.forEach(c => { if (!seen[c.key]) out.push(c); });
+  _cols = out;
+}
+function persistCols() {
+  try {
+    FBLib.Settings.setUserKey('cols', _cols.map(c => ({ key: c.key, vis: c.vis, w: c.w })));
+    FBLib.Settings.saveUser();
+  } catch (_) {}
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   STATE
+   ════════════════════════════════════════════════════════════════════ */
+let _parsed = null;      // output of parseMML
+let _rows = [];          // enriched row objects
+let _shown = [];
+let _plan = [];          // planMaterials output
+let _fileName = '';
+let _sortKey = '', _sortDir = 'asc';
+let _dragKey = null, _dragIdx = null, _resizing = null;
+let _filterTimer = null;
+let _fbLoaded = false;
+
+/* ── RICH TOOLTIP ──
+   Delegated hover popover into #appTooltip (fb-styles §13). Any element with
+   data-tt-* opts in, so renderHead() can rebuild the header freely without
+   rebinding. Used INSTEAD OF a native title on headings: the OS tooltip cannot
+   carry the formula tier, and two tooltips for one element race each other.
+   The 400ms reveal is never restarted by mousemove (that way it never fires),
+   and leaving a host defers the hide 80ms so moving to another swaps content. */
+let _ttTimer = null, _ttVisible = false, _ttHost = null, _ttHideTimer = null;
+let _ttHtml = null, _ttX = 0, _ttY = 0;
+function _ttPosition(el, x, y) {
+  const tw = el.offsetWidth || 320, th = el.offsetHeight || 100;
+  const ax = (x + tw + 15 > window.innerWidth) ? Math.max(12, x - tw - 15) : x + 15;
+  const ay = (y + th + 15 > window.innerHeight) ? Math.max(12, y - th - 15) : y + 15;
+  el.style.left = ax + 'px'; el.style.top = ay + 'px';
+}
+function _ttBuild(p) {
+  let h = '';
+  if (p.title) h += '<span class="tt-title">' + escHtml(p.title) + '</span>';
+  if (p.desc)  h += '<span class="tt-desc">'  + escHtml(p.desc)  + '</span>';
+  if (p.meta)  h += '<span class="tt-meta">'  + escHtml(p.meta)  + '</span>';
+  return h;
+}
+function showAppTooltip(e, payload) {
+  const el = document.getElementById('appTooltip');
+  if (!el || !payload) return;
+  _ttHtml = _ttBuild(payload); _ttX = e.clientX; _ttY = e.clientY;
+  if (_ttVisible) { el.innerHTML = _ttHtml; _ttPosition(el, _ttX, _ttY); return; }
+  if (_ttTimer) return;
+  _ttTimer = setTimeout(() => {
+    _ttTimer = null;
+    if (_ttHtml == null) return;
+    el.innerHTML = _ttHtml; _ttPosition(el, _ttX, _ttY);
+    el.classList.add('show'); el.setAttribute('aria-hidden', 'false'); _ttVisible = true;
+  }, 400);
+}
+function hideAppTooltip() {
+  if (_ttTimer) { clearTimeout(_ttTimer); _ttTimer = null; }
+  if (_ttHideTimer) { clearTimeout(_ttHideTimer); _ttHideTimer = null; }
+  _ttHtml = null; _ttHost = null;
+  const el = document.getElementById('appTooltip');
+  if (!el) return;
+  el.classList.remove('show'); el.setAttribute('aria-hidden', 'true'); _ttVisible = false;
+}
+function _ttFindHost(el) {
+  while (el && el !== document.body && el.nodeType === 1) {
+    const ds = el.dataset;
+    if (ds && (ds.ttTitle || ds.ttDesc || ds.ttMeta)) return el;
+    el = el.parentElement;
+  }
+  return null;
+}
+function _ttPayload(h) { return { title: h.dataset.ttTitle || '', desc: h.dataset.ttDesc || '', meta: h.dataset.ttMeta || '' }; }
+document.addEventListener('mouseover', e => {
+  if (_resizing || _dragKey) { hideAppTooltip(); return; }
+  const host = _ttFindHost(e.target);
+  if (!host) return;
+  if (_ttHideTimer) { clearTimeout(_ttHideTimer); _ttHideTimer = null; }
+  if (host === _ttHost) return;
+  _ttHost = host; showAppTooltip(e, _ttPayload(host));
+}, true);
+document.addEventListener('mousemove', e => {
+  if (!_ttHost) return;
+  if (_resizing || _dragKey) { hideAppTooltip(); return; }
+  showAppTooltip(e, _ttPayload(_ttHost));
+}, true);
+document.addEventListener('mouseout', e => {
+  if (!_ttHost) return;
+  const to = e.relatedTarget;
+  if (to && _ttHost.contains(to)) return;
+  if (to && _ttFindHost(to) === _ttHost) return;
+  if (_ttHideTimer) clearTimeout(_ttHideTimer);
+  _ttHideTimer = setTimeout(() => { _ttHideTimer = null; hideAppTooltip(); }, 80);
+}, true);
+
+/* ════════════════════════════════════════════════════════════════════
+   FILE LOADING
+   ════════════════════════════════════════════════════════════════════ */
+function wireDropZone() {
+  const dz = document.getElementById('dropZone');
+  const fi = document.getElementById('fileInput');
+  // The whole window accepts a drop, not just the zone — once the table fills
+  // the screen the zone is a thin strip and a near-miss would otherwise make
+  // the browser navigate away to the dropped file.
+  ['dragenter', 'dragover'].forEach(ev => {
+    window.addEventListener(ev, e => { e.preventDefault(); dz.classList.add('dragover'); });
+  });
+  ['dragleave', 'drop'].forEach(ev => {
+    window.addEventListener(ev, e => {
+      e.preventDefault();
+      if (ev === 'dragleave' && e.relatedTarget) return;   // still inside the window
+      dz.classList.remove('dragover');
+    });
+  });
+  window.addEventListener('drop', e => {
+    e.preventDefault();
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) takeFile(f);
+  });
+  fi.addEventListener('change', () => { if (fi.files && fi.files[0]) takeFile(fi.files[0]); });
+}
+
+function takeFile(file) {
+  if (!/\.csv$/i.test(file.name)) {
+    setStatus('That is not a .csv file — "' + file.name + '" was ignored.');
+    return;
+  }
+  _fileName = file.name;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    try { ingest(String(ev.target.result || '')); }
+    catch (err) { setStatus('Could not read that file: ' + (err.message || err)); console.error(err); }
+  };
+  reader.onerror = () => setStatus('Could not read that file.');
+  reader.readAsText(file);
+}
+
+function ingest(text) {
+  _parsed = parseMML(text);
+  const f = _parsed.fields;
+
+  // Build the row objects the rest of the report works from.
+  _rows = _parsed.rows.map(r => {
+    const num = v => { const n = parseFloat(String(v).replace(/[^0-9.\-]/g, '')); return isFinite(n) ? n : 0; };
+    const nest = f.nestNote >= 0 ? cell(r.cells, f.nestNote) : '';
+    return {
+      line: r._line,
+      section: r._section,
+      cells: r.cells,
+      partNo:    f.partNo    >= 0 ? cell(r.cells, f.partNo)    : '',
+      desc:      f.desc      >= 0 ? cell(r.cells, f.desc)      : '',
+      perUnit:   f.perUnit   >= 0 ? num(cell(r.cells, f.perUnit))  : 0,
+      perBlank:  f.perBlank  >= 0 ? num(cell(r.cells, f.perBlank)) : 0,
+      matPartNo: f.matPartNo >= 0 ? cell(r.cells, f.matPartNo) : '',
+      status:    f.status    >= 0 ? cell(r.cells, f.status)    : '',
+      nestNote:  nest,
+      // "Offcut from X" / "Nested with X" mean this part's material comes off
+      // another part's blank, so it must not be counted again.
+      nested: /offcut|nested/i.test(nest),
+      fb: null
+    };
+  });
+
+  _cols = buildColumns(_parsed.headers);
+  loadColPrefs();
+  buildColPanel();
+  buildColRef();
+  renderHead();
+
+  // Present the drop zone as a slim loaded bar, and open the workspace.
+  const dz = document.getElementById('dropZone');
+  dz.classList.add('loaded');
+  dz.querySelector('.dz-title').textContent = _fileName + '  —  click or drop to load a different file';
+  document.getElementById('toolbar').classList.add('on');
+  document.getElementById('refreshBtn').disabled = false;
+  togglePlanner();
+
+  buildMatFilter();
+  reportIssues();
+  recompute();
+  loadFishbowl();
+}
+
+function reportIssues() {
+  const box = document.getElementById('parseIssues');
+  const bits = [];
+  const hard = _parsed.issues.filter(i => !/^Title: /.test(i));
+  if (hard.length) bits.push('<strong>' + hard.map(escHtml).join('</strong><br><strong>') + '</strong>');
+  if (_parsed.skipped.length) {
+    const shown = _parsed.skipped.slice(0, 6)
+      .map(s => 'line ' + s.line + ' (' + escHtml(s.why) + (s.text ? ': ' + escHtml(s.text.slice(0, 40)) : '') + ')');
+    bits.push(_parsed.skipped.length + ' row(s) skipped — ' + shown.join(', ') +
+      (_parsed.skipped.length > 6 ? ', …' : ''));
+  }
+  if (!bits.length) { box.classList.remove('on'); return; }
+  box.innerHTML = bits.join('<br>');
+  box.classList.add('on');
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   FISHBOWL LOOKUP
+   ════════════════════════════════════════════════════════════════════ */
+async function loadFishbowl() {
+  if (!_rows.length) return;
+  document.getElementById('spinner').style.display = 'block';
+  setStatus('Matching parts in Fishbowl…');
+  try {
+    // Every part number the sheet references — the parts themselves AND the
+    // raw materials, so the planner can show material stock too.
+    const nums = [...new Set(_rows.flatMap(r => [r.partNo, r.matPartNo]).filter(Boolean))];
+    const partByNum = new Map();
+    for (let i = 0; i < nums.length; i += 400) {
+      const chunk = nums.slice(i, i + 400);
+      const inList = chunk.map(n => "'" + escSQL(n) + "'").join(',');
+      const rows = await qp(
+        'SELECT p.id AS id, p.num AS num, p.description AS descr, u.code AS uom ' +
+        'FROM part p LEFT JOIN uom u ON u.id = p.uomid ' +
+        'WHERE p.num IN (' + inList + ')');
+      rows.forEach(r => partByNum.set(String(r.num), { id: r.id, num: r.num, descr: r.descr, uom: r.uom }));
+    }
+
+    // Inventory over the location groups this user can access. Same formulas as
+    // the other inventory reports so the figures agree across the suite.
+    const lgIds = (typeof getLocationGroupList === 'function' ? getLocationGroupList() : []) || [];
+    const ids = [...new Set([...partByNum.values()].map(p => p.id))];
+    const inv = {};
+    if (ids.length && lgIds.length) {
+      const lgIn = lgIds.join(',');
+      for (let i = 0; i < ids.length; i += 400) {
+        const chunk = ids.slice(i, i + 400).join(',');
+        const st = await qp(
+          'SELECT t.partid AS partid, ' +
+          '  COALESCE(SUM(CASE WHEN t.typeid IN (30,40) THEN t.qty ELSE 0 END),0) AS onhand, ' +
+          '  COALESCE(SUM(t.qtycommitted),0) AS committed, ' +
+          '  COALESCE(SUM(CASE WHEN t.typeid IN (30,40) AND l.countedasavailable = 0 AND l.typeid <> 100 ' +
+          '                    THEN t.qty - t.qtycommitted ELSE 0 END),0) AS notavail ' +
+          'FROM tag t INNER JOIN location l ON l.id = t.locationid ' +
+          'WHERE t.partid IN (' + chunk + ') AND l.locationgroupid IN (' + lgIn + ') ' +
+          'GROUP BY t.partid');
+        st.forEach(r => {
+          const a = inv[r.partid] || (inv[r.partid] = {});
+          a.onHand = parseFloat(r.onhand) || 0;
+          a.committed = parseFloat(r.committed) || 0;
+          a.notAvail = parseFloat(r.notavail) || 0;
+        });
+        const dm = await qp(
+          'SELECT part.id AS partid, ' +
+          '  COALESCE(SUM(COALESCE(qtyallocated.qty,0)),0) AS allocated, ' +
+          '  COALESCE(SUM(COALESCE(qtydropship.qty,0)),0)  AS dropship, ' +
+          '  COALESCE(SUM(COALESCE(qtyonorder.qty,0)),0)   AS onorder ' +
+          'FROM part CROSS JOIN locationgroup ' +
+          'LEFT OUTER JOIN qtyallocated ON part.id = qtyallocated.partid AND locationgroup.id = qtyallocated.locationgroupid ' +
+          'LEFT OUTER JOIN qtyonorder   ON part.id = qtyonorder.partid   AND locationgroup.id = qtyonorder.locationgroupid ' +
+          'LEFT OUTER JOIN qtydropship  ON part.id = qtydropship.partid  AND locationgroup.id = qtydropship.locationgroupid ' +
+          'WHERE part.id IN (' + chunk + ') AND locationgroup.activeFlag = 1 AND locationgroup.id IN (' + lgIn + ') ' +
+          'GROUP BY part.id');
+        dm.forEach(r => {
+          const a = inv[r.partid] || (inv[r.partid] = {});
+          a.allocated = parseFloat(r.allocated) || 0;
+          a.dropship = parseFloat(r.dropship) || 0;
+          a.onOrder = parseFloat(r.onorder) || 0;
+        });
+      }
+      Object.keys(inv).forEach(k => {
+        const a = inv[k];
+        a.onHand = a.onHand || 0; a.committed = a.committed || 0; a.notAvail = a.notAvail || 0;
+        a.allocated = a.allocated || 0; a.dropship = a.dropship || 0; a.onOrder = a.onOrder || 0;
+        // Floored at zero, and recomputed from the summed components — never
+        // summed from the per-LG view value, which is itself floored per group.
+        a.available = Math.max(0, a.onHand - a.allocated - a.notAvail + a.dropship);
+      });
+    }
+
+    const attach = numStr => {
+      const p = partByNum.get(numStr);
+      if (!p) return null;
+      return Object.assign({ id: p.id, num: p.num, descr: p.descr, uom: p.uom },
+        inv[p.id] || { onHand: 0, available: 0, committed: 0, notAvail: 0, allocated: 0, dropship: 0, onOrder: 0 });
+    };
+    _rows.forEach(r => { r.fb = attach(r.partNo); r.matFb = attach(r.matPartNo); });
+
+    _fbLoaded = true;
+    recompute();
+  } catch (e) {
+    setStatus('Fishbowl lookup failed: ' + (e.message || e));
+    console.error(e);
+  } finally {
+    document.getElementById('spinner').style.display = 'none';
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   RECOMPUTE / FILTER / RENDER
+   ════════════════════════════════════════════════════════════════════ */
+function buildQty() {
+  const v = parseInt(document.getElementById('buildQty').value, 10);
+  return (isFinite(v) && v > 0) ? v : 1;
+}
+
+function recompute() {
+  const q = buildQty();
+  _rows.forEach(r => {
+    const p = rowPlan(r, q);
+    r.plan = p;
+    r.period = rowPeriod(r);
+    r.short = (r.fb && p) ? Math.max(0, p.need - (r.fb.available || 0)) : null;
+  });
+  _plan = planMaterials(_rows, {
+    maxQ: FBLib.Settings.resolve('maxScanQty') || 200,
+    top:  FBLib.Settings.resolve('topSuggestions') || 6
+  });
+  applyFilters();
+  renderPlanner();
+}
+
+function onQtyChange() {
+  try { FBLib.Settings.setUserKey('buildQty', buildQty()); FBLib.Settings.saveUser(); } catch (_) {}
+  recompute();
+}
+
+function buildMatFilter() {
+  const sel = document.getElementById('matFilter');
+  const mats = [...new Set(_rows.map(r => r.matPartNo).filter(Boolean))]
+    .sort((a, b) => String(a).localeCompare(String(b), undefined, { numeric: true }));
+  sel.innerHTML = '';
+  const all = document.createElement('option');
+  all.value = ''; all.textContent = 'All materials (' + mats.length + ')';
+  sel.appendChild(all);
+  mats.forEach(m => {
+    const o = document.createElement('option');
+    o.value = m; o.textContent = m;
+    sel.appendChild(o);
+  });
+}
+
+function applyFiltersDebounced() { clearTimeout(_filterTimer); _filterTimer = setTimeout(applyFilters, 200); }
+
+function clearFilters() {
+  document.getElementById('qSearch').value = '';
+  document.getElementById('matFilter').value = '';
+  document.getElementById('onlyMatched').checked = false;
+  document.getElementById('onlyWaste').checked = false;
+  applyFilters();
+}
+
+function applyFilters() {
+  const q = (document.getElementById('qSearch').value || '').trim().toLowerCase();
+  const mat = document.getElementById('matFilter').value;
+  const onlyMatched = document.getElementById('onlyMatched').checked;
+  const onlyWaste = document.getElementById('onlyWaste').checked;
+
+  _shown = _rows.filter(r => {
+    if (mat && r.matPartNo !== mat) return false;
+    if (onlyMatched && !r.fb) return false;
+    if (onlyWaste && !(r.plan && r.plan.waste > 0)) return false;
+    if (q) {
+      const hay = (r.partNo + ' ' + r.desc + ' ' + r.matPartNo + ' ' +
+                   (r.fb ? r.fb.num + ' ' + (r.fb.descr || '') : '')).toLowerCase();
+      if (hay.indexOf(q) === -1) return false;
+    }
+    return true;
+  });
+
+  render();
+  const matched = _rows.filter(r => r.fb).length;
+  const missing = _rows.length - matched;
+  const wasteful = _rows.filter(r => r.plan && r.plan.waste > 0).length;
+  setStatus(_fileName + ' — ' + _rows.length + ' part(s)' +
+    (_parsed.sections.length ? ' across ' + (_parsed.sections.length + 1) + ' section(s)' : '') +
+    (_fbLoaded ? ' · ' + matched + ' matched in Fishbowl' + (missing ? ', ' + missing + ' NOT found' : '') : ' · Fishbowl not loaded') +
+    ' · ' + _plan.length + ' material(s)' +
+    ' · build ' + buildQty() + ' → ' + wasteful + ' row(s) waste part of a blank' +
+    (_shown.length !== _rows.length ? '  (showing ' + _shown.length + ')' : ''));
+}
+
+/* ── HEAD ── */
+function renderHead() {
+  const vis = visCols();
+  const cg = document.getElementById('mmlColgroup');
+  const head = document.getElementById('mmlHead');
+  let total = 0;
+  cg.innerHTML = vis.map(c => { const w = _colWidths[c.key] || c.w; total += w; return '<col style="width:' + w + 'px">'; }).join('');
+  // An explicit total, not 100%: under fixed layout a table wider than the sum
+  // of its columns redistributes the slack, so every resize would nudge the
+  // neighbouring columns too.
+  document.getElementById('mmlTable').style.width = total + 'px';
+
+  const tr = document.createElement('tr');
+  vis.forEach(c => {
+    const th = document.createElement('th');
+    if (c.nr) th.className = 'nr';
+    th.dataset.key = c.key;
+    th.draggable = true;
+    th.appendChild(document.createTextNode(c.label));
+    // The rich popover, NOT a native title — the two race, and the OS tooltip
+    // cannot carry the formula tier or line breaks.
+    th.dataset.ttTitle = c.label;
+    if (c.tip) th.dataset.ttDesc = c.tip;
+    th.dataset.ttMeta = (c.meta ? c.meta + '\n' : '') + 'Click to sort · drag to reorder · drag the right edge to resize';
+    if (_sortKey === c.key) {
+      const ind = document.createElement('span');
+      ind.className = 'sort-ind';
+      ind.textContent = _sortDir === 'asc' ? ' ↑' : ' ↓';
+      th.appendChild(ind);
+    }
+
+    const rz = document.createElement('div');
+    rz.className = 'col-resize';
+    rz.draggable = false;
+    rz.dataset.ttTitle = c.label + ' — resize';
+    rz.dataset.ttDesc = 'Drag to set this column’s width. Double-click to hand every column back to its default.';
+    rz.addEventListener('mousedown', e => startResize(e, c, th));
+    rz.addEventListener('click', e => { e.stopPropagation(); e.preventDefault(); });
+    rz.addEventListener('dragstart', e => { e.stopPropagation(); e.preventDefault(); });
+    rz.addEventListener('dblclick', e => { e.stopPropagation(); e.preventDefault(); resetColWidths(); });
+    th.appendChild(rz);
+
+    th.addEventListener('click', () => sortBy(c.key));
+    th.addEventListener('dragstart', e => {
+      if (_resizing) { e.preventDefault(); return; }
+      _dragKey = c.key; e.dataTransfer.effectAllowed = 'move'; th.classList.add('dragging');
+    });
+    th.addEventListener('dragover', e => {
+      e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+      if (_dragKey && _dragKey !== c.key) th.classList.add('drag-over');
+    });
+    th.addEventListener('dragleave', () => th.classList.remove('drag-over'));
+    th.addEventListener('drop', e => {
+      e.preventDefault(); th.classList.remove('drag-over');
+      if (!_dragKey || _dragKey === c.key) return;
+      const fi = _cols.findIndex(x => x.key === _dragKey);
+      const ti = _cols.findIndex(x => x.key === c.key);
+      if (fi < 0 || ti < 0) return;
+      _cols.splice(ti, 0, _cols.splice(fi, 1)[0]);
+      _dragKey = null;
+      persistCols(); buildColPanel(); renderHead(); render();
+    });
+    th.addEventListener('dragend', () => {
+      _dragKey = null;
+      document.querySelectorAll('#mmlHead th').forEach(t => t.classList.remove('dragging', 'drag-over'));
+    });
+    tr.appendChild(th);
+  });
+  head.innerHTML = ''; head.appendChild(tr);
+  // Measure, don't guess: the section band sticks directly under the header.
+  requestAnimationFrame(() => {
+    const h = head.offsetHeight || 30;
+    document.documentElement.style.setProperty('--thead-h', h + 'px');
+  });
+}
+
+/* ── RESIZE ── */
+function startResize(e, col, th) {
+  e.preventDefault(); e.stopPropagation();
+  _resizing = { col: col, startX: e.clientX, startW: _colWidths[col.key] || col.w, wasDraggable: th.draggable, th: th };
+  th.draggable = false;
+  document.body.classList.add('col-resizing');
+  document.addEventListener('mousemove', onResizeMove);
+  document.addEventListener('mouseup', onResizeUp);
+}
+function onResizeMove(e) {
+  if (!_resizing) return;
+  const w = Math.max(MIN_COL_W, Math.round(_resizing.startW + (e.clientX - _resizing.startX)));
+  _colWidths[_resizing.col.key] = w;
+  _resizing.col.w = w;
+  const vis = visCols();
+  const idx = vis.indexOf(_resizing.col);
+  const colEl = document.getElementById('mmlColgroup').children[idx];
+  if (colEl) colEl.style.width = w + 'px';
+  let total = 0; vis.forEach(c => { total += (_colWidths[c.key] || c.w); });
+  document.getElementById('mmlTable').style.width = total + 'px';
+}
+function onResizeUp() {
+  document.removeEventListener('mousemove', onResizeMove);
+  document.removeEventListener('mouseup', onResizeUp);
+  document.body.classList.remove('col-resizing');
+  if (!_resizing) return;
+  _resizing.th.draggable = _resizing.wasDraggable;
+  // mouseup on a header is about to fire a click, which would sort the column
+  // the user was only resizing. Swallow exactly one.
+  const swallow = ev => { ev.stopPropagation(); ev.preventDefault(); };
+  document.addEventListener('click', swallow, true);
+  setTimeout(() => document.removeEventListener('click', swallow, true), 0);
+  _resizing = null;
+  persistCols(); renderHead();
+}
+function resetColWidths() {
+  _colWidths = {};
+  const defaults = buildColumns(_parsed ? _parsed.headers : []);
+  const byKey = {}; defaults.forEach(c => { byKey[c.key] = c; });
+  _cols.forEach(c => { if (byKey[c.key]) c.w = byKey[c.key].w; });
+  persistCols(); renderHead(); render();
+  setStatus('Column widths reset to defaults.');
+}
+
+/* ── COLUMNS PANEL ── */
+function buildColPanel() {
+  const list = document.getElementById('colList');
+  list.innerHTML = '';
+  _cols.forEach((col, i) => {
+    const div = document.createElement('div');
+    div.className = 'col-row'; div.draggable = true; div.dataset.idx = i;
+
+    const grip = document.createElement('span');
+    grip.className = 'grip';
+    grip.innerHTML = '<svg width="12" height="10" viewBox="0 0 12 10" fill="currentColor"><rect y="0" width="12" height="2" rx="1"/><rect y="4" width="12" height="2" rx="1"/><rect y="8" width="12" height="2" rx="1"/></svg>';
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = col.vis; cb.id = 'cv_' + col.key;
+    cb.addEventListener('change', () => {
+      if (!cb.checked && visCols().length <= 1) { cb.checked = true; setStatus('At least one column must stay visible.'); return; }
+      col.vis = cb.checked;
+      persistCols(); renderHead(); render();
+    });
+
+    const lbl = document.createElement('label');
+    lbl.htmlFor = cb.id; lbl.textContent = col.label;
+
+    const tag = document.createElement('span');
+    tag.className = 'src src-' + col.src;
+    tag.textContent = col.src === 'csv' ? 'CSV' : col.src === 'fb' ? 'FB' : 'PLAN';
+    tag.title = col.src === 'csv' ? 'Straight from the dropped file'
+              : col.src === 'fb' ? 'Looked up in Fishbowl'
+              : 'Calculated by the planner';
+
+    div.appendChild(grip); div.appendChild(cb); div.appendChild(lbl); div.appendChild(tag);
+
+    div.addEventListener('dragstart', e => { _dragIdx = i; setTimeout(() => div.classList.add('dragging'), 0); e.dataTransfer.effectAllowed = 'move'; });
+    div.addEventListener('dragend',   () => { _dragIdx = null; list.querySelectorAll('.col-row').forEach(r => r.classList.remove('dragging', 'drag-over')); });
+    div.addEventListener('dragover',  e => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; list.querySelectorAll('.col-row').forEach(r => r.classList.remove('drag-over')); if (_dragIdx !== null && _dragIdx !== i) div.classList.add('drag-over'); });
+    div.addEventListener('dragleave', () => div.classList.remove('drag-over'));
+    div.addEventListener('drop', e => {
+      e.preventDefault(); div.classList.remove('drag-over');
+      if (_dragIdx === null || _dragIdx === i) return;
+      _cols.splice(i, 0, _cols.splice(_dragIdx, 1)[0]);
+      _dragIdx = null;
+      persistCols(); buildColPanel(); renderHead(); render();
+    });
+    list.appendChild(div);
+  });
+}
+function toggleColPanel(e) {
+  if (e) e.stopPropagation();
+  document.getElementById('colPanel').classList.toggle('hidden');
+}
+
+/* The help drawer's column reference is generated from the same tip/meta the
+   header popovers read, so the two can never drift apart. */
+function buildColRef() {
+  const t = document.getElementById('colRef');
+  if (!t) return;
+  const SRC = { csv: 'From the CSV', fb: 'From Fishbowl', plan: 'Calculated' };
+  const rows = _cols.map(c =>
+    '<tr><td style="white-space:nowrap;vertical-align:top;font-weight:600;">' + escHtml(c.label) + '</td>' +
+    '<td style="white-space:nowrap;vertical-align:top;" class="muted">' + escHtml(SRC[c.src] || '') + '</td>' +
+    '<td style="vertical-align:top;">' + escHtml(c.tip || '') +
+      (c.meta ? '<div class="muted" style="margin-top:5px;font-size:11px;">' + escHtml(c.meta).replace(/\n/g, '<br>') + '</div>' : '') +
+    '</td></tr>').join('');
+  t.innerHTML = '<thead><tr><th>Column</th><th>Source</th><th>What it means</th></tr></thead><tbody>' + rows + '</tbody>';
+}
+
+/* ── SORT ── */
+function sortBy(key) {
+  if (_sortKey === key) {
+    if (_sortDir === 'asc') _sortDir = 'desc';
+    else { _sortKey = ''; _sortDir = 'asc'; }   // third click = natural order
+  } else { _sortKey = key; _sortDir = 'asc'; }
+  renderHead(); render();
+}
+function cellValue(row, col) {
+  if (col.src === 'csv') return cell(row.cells, col.idx);
+  switch (col.key) {
+    case '_fbPartNum': return row.fb ? row.fb.num : '';
+    case '_fbDesc':    return row.fb ? (row.fb.descr || '') : '';
+    case '_onHand':    return row.fb ? row.fb.onHand : null;
+    case '_available': return row.fb ? row.fb.available : null;
+    case '_committed': return row.fb ? row.fb.committed : null;
+    case '_notAvail':  return row.fb ? row.fb.notAvail : null;
+    case '_allocated': return row.fb ? row.fb.allocated : null;
+    case '_onOrder':   return row.fb ? row.fb.onOrder : null;
+    case '_need':      return row.plan ? row.plan.need : null;
+    case '_blanks':    return row.plan ? row.plan.blanks : null;
+    case '_wasteN':    return row.plan ? row.plan.waste : null;
+    case '_period':    return row.period || null;
+    case '_short':     return row.short;
+    default: return '';
+  }
+}
+function cmpRaw(a, b) {
+  const na = parseFloat(a), nb = parseFloat(b);
+  const aNum = a !== '' && a !== null && isFinite(na), bNum = b !== '' && b !== null && isFinite(nb);
+  if (aNum && bNum) return na - nb;
+  return String(a == null ? '' : a).localeCompare(String(b == null ? '' : b), undefined, { numeric: true, sensitivity: 'base' });
+}
+function sortedRows() {
+  if (!_sortKey) return _shown;
+  const col = _cols.find(c => c.key === _sortKey);
+  if (!col) return _shown;
+  const dir = _sortDir === 'asc' ? 1 : -1;
+  return _shown.slice().sort((a, b) => cmpRaw(cellValue(a, col), cellValue(b, col)) * dir);
+}
+
+/* ── BODY ── */
+function render() {
+  const tbody = document.getElementById('mmlBody');
+  const vis = visCols();
+  tbody.innerHTML = '';
+  if (!_shown.length) {
+    tbody.innerHTML = '<tr><td class="empty" colspan="' + Math.max(1, vis.length) + '">' +
+      (_rows.length ? 'No rows match the current filters.' : 'No file loaded.') + '</td></tr>';
+    return;
+  }
+  const ordered = sortedRows();
+  const frag = document.createDocumentFragment();
+  // Section bands only make sense in natural order; a sort mixes sections, so
+  // the band would lie about what sits under it.
+  const banded = !_sortKey;
+  let curSection = null;
+  ordered.forEach(r => {
+    if (banded && r.section !== curSection) {
+      curSection = r.section;
+      if (curSection) {
+        const tr = document.createElement('tr'); tr.className = 'sec-row';
+        const td = document.createElement('td'); td.colSpan = vis.length;
+        td.textContent = curSection;
+        tr.appendChild(td); frag.appendChild(tr);
+      }
+    }
+    frag.appendChild(buildRow(r, vis));
+  });
+  tbody.appendChild(frag);
+}
+
+function buildRow(row, vis) {
+  const tr = document.createElement('tr');
+  tr.className = 'data-row' + (_fbLoaded && !row.fb ? ' nomatch' : '');
+  if (_fbLoaded && !row.fb) tr.title = 'No Fishbowl part with number "' + row.partNo + '"';
+  vis.forEach(col => {
+    const td = document.createElement('td');
+    const v = cellValue(row, col);
+
+    if (col.key === '_fbPartNum') {
+      if (v) {
+        const a = document.createElement('a');
+        a.className = 'row-link'; a.href = '#'; a.textContent = v;
+        a.addEventListener('click', e => { e.preventDefault(); openModule('Part', v); });
+        td.appendChild(a);
+      } else if (_fbLoaded) {
+        td.className = 'muted'; td.textContent = 'not found';
+      }
+    } else if (col.nr) {
+      td.className = 'num-cell';
+      if (v === null || v === '' || v === undefined) { td.textContent = ''; }
+      else {
+        td.textContent = fmtQty(v);
+        if (col.key === '_wasteN') td.classList.add(v > 0 ? 'wasted' : 'exact');
+        if (col.key === '_short' && v > 0) td.classList.add('neg');
+        if (col.key === '_available' && !v) td.classList.add('muted');
+      }
+    } else {
+      td.textContent = v == null ? '' : v;
+      if (v) td.title = String(v);
+    }
+    tr.appendChild(td);
+  });
+  return tr;
+}
+
+/* ── PLANNER PANEL ── */
+function togglePlanner() {
+  const on = document.getElementById('showPlanner').checked;
+  document.getElementById('plannerPane').classList.toggle('on', on && _rows.length > 0);
+  try { FBLib.Settings.setUserKey('showPlanner', on); FBLib.Settings.saveUser(); } catch (_) {}
+}
+
+function renderPlanner() {
+  const body = document.getElementById('plannerBody');
+  if (!body) return;
+  body.innerHTML = '';
+  if (!_plan.length) {
+    body.innerHTML = '<div class="pl-none">No Material Part No. values found in this sheet.</div>';
+    return;
+  }
+  const curQ = buildQty();
+  const matFilter = document.getElementById('matFilter').value;
+  const list = matFilter ? _plan.filter(m => m.matPartNo === matFilter) : _plan;
+
+  list.forEach(m => {
+    const card = document.createElement('div');
+    card.className = 'pl-mat';
+
+    const hd = document.createElement('div');
+    hd.className = 'pl-mat-hd';
+    const num = document.createElement('span');
+    num.className = 'pl-mat-num'; num.textContent = m.matPartNo;
+    const sub = document.createElement('span');
+    sub.className = 'pl-mat-sub';
+    sub.textContent = m.countedRows + ' part' + (m.countedRows === 1 ? '' : 's') +
+      (m.nestedRows ? ' · ' + m.nestedRows + ' nested' : '');
+    hd.appendChild(num); hd.appendChild(sub);
+    // Clicking the header narrows the grid to this material.
+    hd.addEventListener('click', () => {
+      document.getElementById('matFilter').value =
+        (document.getElementById('matFilter').value === m.matPartNo) ? '' : m.matPartNo;
+      applyFilters(); renderPlanner();
+    });
+    card.appendChild(hd);
+
+    const bd = document.createElement('div');
+    bd.className = 'pl-mat-body';
+
+    // The exact figure, stated honestly about whether it is usable.
+    const ex = document.createElement('div');
+    ex.className = 'pl-exact';
+    if (!m.countedRows) {
+      ex.innerHTML = 'Every part on this material is nested or has no Parts per Blank, so there is nothing to plan.';
+    } else if (m.exactQ && m.exactWithinScan) {
+      ex.innerHTML = 'Every part uses whole blanks at <b>' + m.exactQ + '</b> units, and each multiple of it.';
+    } else if (m.exactQ) {
+      ex.innerHTML = 'All parts line up exactly only at <b>' + m.exactQ.toLocaleString() + '</b> units — ' +
+        'too large to be useful, so the quantities below are ranked by how little they waste.';
+    } else {
+      ex.innerHTML = 'No quantity makes every part exact. The quantities below waste the least.';
+    }
+    bd.appendChild(ex);
+
+    if (m.countedRows) {
+      const cur = groupPlan(m.rows.filter(r => !r.nested && r.perUnit > 0 && r.perBlank > 0), curQ);
+      const tbl = document.createElement('table');
+      tbl.className = 'pl-qty-tbl';
+      tbl.innerHTML = '<thead><tr><th>Qty</th><th class="nr">Blanks</th><th class="nr">Waste</th><th>Efficiency</th></tr></thead>';
+      const tb = document.createElement('tbody');
+
+      // The quantity on screen first, so the comparison is against what the
+      // user actually typed, then the suggestions.
+      const shown = [Object.assign({}, cur, { _cur: true })];
+      m.best.forEach(b => { if (b.q !== curQ) shown.push(b); });
+
+      shown.forEach(p => {
+        const tr = document.createElement('tr');
+        if (p._cur) tr.className = 'cur';
+        else if (p.wastePct === 0) tr.className = 'best';
+        const eff = 100 - p.wastePct;
+        tr.innerHTML =
+          '<td>' + p.q + (p._cur ? ' <span class="muted">(current)</span>' : '') + '</td>' +
+          '<td class="nr">' + p.blanks + '</td>' +
+          '<td class="nr">' + (p.waste ? fmtQty(p.waste) : '—') + '</td>' +
+          '<td><div class="pl-bar' + (p.wastePct > 15 ? ' bad' : p.wastePct > 5 ? ' warn' : '') +
+            '"><i style="width:' + Math.max(0, Math.min(100, eff)).toFixed(1) + '%"></i></div></td>';
+        tr.title = p.exactRows + ' of ' + p.rows + ' parts land on whole blanks · ' +
+                   eff.toFixed(1) + '% of the material cut is used';
+        tr.addEventListener('click', () => {
+          document.getElementById('buildQty').value = p.q;
+          onQtyChange();
+        });
+        tb.appendChild(tr);
+      });
+      tbl.appendChild(tb);
+      bd.appendChild(tbl);
+
+      // Material stock, when the raw part resolved in Fishbowl.
+      const anyMat = m.rows.find(r => r.matFb);
+      if (anyMat && anyMat.matFb) {
+        const s = document.createElement('div');
+        s.style.cssText = 'font-size:11px;color:#506872;margin-top:8px;padding-top:7px;border-top:1px solid #f1f5f9;';
+        s.innerHTML = 'Fishbowl stock — on hand <strong>' + fmtQty(anyMat.matFb.onHand) + '</strong>' +
+                      ', available <strong>' + fmtQty(anyMat.matFb.available) + '</strong>' +
+                      (anyMat.matFb.uom ? ' ' + escHtml(anyMat.matFb.uom) : '');
+        bd.appendChild(s);
+      } else if (_fbLoaded) {
+        const s = document.createElement('div');
+        s.style.cssText = 'font-size:11px;color:#8FA1A7;margin-top:8px;padding-top:7px;border-top:1px solid #f1f5f9;';
+        s.textContent = 'No Fishbowl part numbered "' + m.matPartNo + '".';
+        bd.appendChild(s);
+      }
+    }
+
+    card.appendChild(bd);
+    body.appendChild(card);
+  });
+}
+
+/* ── EXPORT ── */
+function exportCSV() {
+  if (!_shown.length) { alert('Nothing to export.'); return; }
+  const vis = visCols();
+  const q = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+  const head = ['Section'].concat(vis.map(c => c.label));
+  const lines = [head.map(q).join(',')];
+  sortedRows().forEach(r => {
+    lines.push([r.section].concat(vis.map(c => {
+      const v = cellValue(r, c);
+      return v == null ? '' : v;
+    })).map(q).join(','));
+  });
+  const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = (_fileName.replace(/\.csv$/i, '') || 'MML') + '_planned_qty' + buildQty() + '.csv';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  // JxBrowser hands the download to a Save-As dialog that opens behind the
+  // window; revoking immediately truncates the file.
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+/* ── PRINT ──
+   Built into a standalone window rather than window.print() on this page:
+   inside the Fishbowl JxBrowser panel printing the page itself is unreliable,
+   so the document is built and THAT is printed. */
+function printReport() {
+  if (!_shown.length) { alert('Nothing to print.'); return; }
+  const vis = visCols();
+  const totalW = vis.reduce((s, c) => s + (_colWidths[c.key] || c.w), 0) || 1;
+  const colgroup = vis.map(c => '<col style="width:' + (((_colWidths[c.key] || c.w) / totalW) * 100).toFixed(2) + '%">').join('');
+  const headCells = vis.map(c => '<th' + (c.nr ? ' class="nr"' : '') + '>' + escHtml(c.label) + '</th>').join('');
+  const body = [];
+  let curSection = null;
+  sortedRows().forEach(r => {
+    if (!_sortKey && r.section !== curSection) {
+      curSection = r.section;
+      if (curSection) body.push('<tr class="sec"><td colspan="' + vis.length + '">' + escHtml(curSection) + '</td></tr>');
+    }
+    body.push('<tr>' + vis.map(c => {
+      const v = cellValue(r, c);
+      return '<td' + (c.nr ? ' class="nr"' : '') + '>' + escHtml(c.nr && v != null && v !== '' ? fmtQty(v) : (v == null ? '' : v)) + '</td>';
+    }).join('') + '</tr>');
+  });
+
+  const doc = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>MML Build Planner</title><style>' +
+    '@page{size:A4 landscape;margin:10mm;}' +
+    '*{box-sizing:border-box;}' +
+    'body{font-family:Arial,Helvetica,sans-serif;font-size:8.5px;color:#101010;margin:0;-webkit-print-color-adjust:exact;print-color-adjust:exact;}' +
+    'h1{font-size:14px;margin:0 0 2px;color:#0B3140;}' +
+    '.sub{font-size:9px;color:#506872;margin:0 0 2px;}' +
+    '.meta{font-size:8px;color:#8FA1A7;margin:0 0 9px;}' +
+    'table{width:100%;border-collapse:collapse;table-layout:fixed;}' +
+    'thead{display:table-header-group;}' +
+    'th{background:#0B3140;color:#fff;font-size:7.5px;text-transform:uppercase;letter-spacing:.03em;text-align:left;padding:4px 5px;border:1px solid #0B3140;}' +
+    'th.nr{text-align:right;}' +
+    'td{padding:3px 5px;border:1px solid #E3E3E3;vertical-align:top;word-wrap:break-word;}' +
+    'td.nr{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;}' +
+    'tr{page-break-inside:avoid;}' +
+    'tr.sec td{background:#EBEEED;font-weight:700;color:#0B3140;}' +
+    '</style></head><body>' +
+    '<h1>MML Build Planner</h1>' +
+    '<div class="sub">' + escHtml(_fileName) + ' — build quantity ' + buildQty() + ' unit(s)</div>' +
+    '<div class="sub">' + escHtml(document.getElementById('statusLine').textContent || '') + '</div>' +
+    '<div class="meta">Generated ' + escHtml(new Date().toLocaleString()) + '</div>' +
+    '<table><colgroup>' + colgroup + '</colgroup><thead><tr>' + headCells + '</tr></thead><tbody>' +
+    body.join('') + '</tbody></table></body></html>';
+
+  const w = window.open('', '_blank');
+  if (!w) { alert('Pop-up blocked — allow pop-ups for this report to print.'); return; }
+  w.document.write(doc); w.document.close(); w.focus();
+  setTimeout(() => { try { w.print(); } catch (_) {} }, 200);
+}
+
+/* ── OUTSIDE-CLICK closes the Columns panel ── */
+document.addEventListener('click', e => {
+  const wrap = document.getElementById('colWrap');
+  if (wrap && !wrap.contains(e.target)) document.getElementById('colPanel').classList.add('hidden');
+});
+
+/* ── INIT ── */
+(function init() {
+  wireDropZone();
+  FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+  const q = FBLib.Settings.resolve('buildQty');
+  if (q > 0) document.getElementById('buildQty').value = q;
+  const sp = FBLib.Settings.resolve('showPlanner');
+  if (sp === false) document.getElementById('showPlanner').checked = false;
+  setStatus('Drop an MML CSV anywhere on this page to begin.');
+})();
+
+/* Exposed for the test harness — the report is driven through the same
+   functions a user's drop would. */
+window.MMLP = {
+  parseCSV: parseCSV, parseMML: parseMML, ingest: ingest,
+  rowPlan: rowPlan, rowPeriod: rowPeriod, groupPlan: groupPlan, planMaterials: planMaterials,
+  gcd: gcd, lcm: lcm,
+  get rows() { return _rows; }, get plan() { return _plan; }, get cols() { return _cols; },
+  get shown() { return _shown; }, get parsed() { return _parsed; },
+  setQty(n) { document.getElementById('buildQty').value = n; onQtyChange(); },
+  recompute: recompute, applyFilters: applyFilters, sortBy: sortBy
+};
+</script>
+</body>
+</html>

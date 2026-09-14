@@ -1,0 +1,1072 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  REPORT: Historical Inventory Valuation
+  PATH:   Inventory/HistoricalInventoryValuation.htm
+  --------------------------------------------------------------------------------
+  "What was my inventory worth on <date>?" — an interactive HTML BI rebuild that
+  combines two standard Fishbowl reports:
+    • Inventory/OnHandByDate.jrxml   → historical ON-HAND per part per LG, taken
+      as the last inventorylog snapshot on/before the as-of date.
+    • Part/PartCostOverTime.jrxml    → the per-part cost trend over time.
+
+  Valuation basis:
+    On-hand: as of TODAY (or a future date) → LIVE tag qty, so the total
+             reconciles with the standard Inventory Valuation Summary; a PAST
+             as-of date → the last inventorylog snapshot on/before that date (the
+             OnHandByDate method — tag has no date dimension). Summed over the
+             selected location groups; INACTIVE groups are INCLUDED (the standard
+             summary counts their stock) — deselect them in Location to exclude.
+    Cost:    a toggle, default "As of date" — the cost effective on the as-of
+             date (partcosthistory capture on/before it, carried forward across
+             gaps; falls back to current when a part has none). For TODAY it uses
+             the live partcost.avgCost / part.stdCost, so the total still
+             reconciles with the standard Inventory Valuation Summary; only PAST
+             dates pull the historical snapshot (so the main-row cost moves with
+             the date). "Today's cost" forces current partcost for every date
+             (OnHandByDate style — historical qty × today's cost).
+    Methods: Average + Standard. No FIFO/LIFO (would need current cost layers and
+             only approximate a past date).
+
+  Drill-down (expand a part): an inline cost-over-time line chart (avg + std)
+  plus the part's partcosthistory snapshot rows (date · qty · cost · value) over
+  a lookback window ending at the as-of date. NOTE: partcosthistory is
+  company-wide (no LG), so the drill-down cost history is labelled company-wide;
+  the parent row's ON-HAND still respects the location-group filter.
+
+  Format mirrors Inventory/InventoryAvailability.htm — same shared fb-lib /
+  fb-styles chrome, header toolbar, filter chip strip, chevron drill-down,
+  column show/hide/reorder panel, settings persistence, CSV + print.
+
+  The shared fb-lib is inlined once and fb-styles once (directives below). Never
+  repeat either directive placeholder anywhere else in this file — Fishbowl
+  expands every occurrence at save time.
+================================================================================
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Historical Inventory Valuation — Fishbowl BI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+
+  <!-- Shared Fishbowl BI lib — inlined from the saved "fb-lib" Script. Source of
+       truth: scripts/fb-lib.js. Powers FBLib.Common.MultiSelect. Must sit BEFORE
+       the style include so window.FBLib exists when inline code runs. -->
+  <script>
+    {% Script fb-lib %}
+  </script>
+
+  <!-- Shared Fishbowl BI stylesheet — from the saved "fb-styles" Style. Source
+       of truth: scripts/fb-styles.css. Provides .hdr-btn, toasts, scrollbar,
+       spinner, tokens, .rpt-table, .ms-*, .row-link. MUST come BEFORE the inline
+       block so per-report rules win on identical selectors. -->
+  <style>
+    {% Style fb-styles %}
+  </style>
+
+  <style>
+    html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family: 'Inter', sans-serif; }
+
+    /* Filter chip strip — always visible, wraps only when it must. */
+    #filtersPanel {
+      background: white; border-bottom: 1px solid #e2e8f0;
+      padding: 8px 16px; flex-shrink: 0;
+      display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px;
+      position: relative; z-index: 30;
+    }
+    #filtersPanel input[type=text], #filtersPanel input[type=date], #filtersPanel select {
+      padding: 4px 8px; border: 1px solid #e2e8f0; border-radius: 6px;
+      font-size: 12px; color: #374151; background: white; font-family: 'Inter', sans-serif;
+      height: 30px;
+    }
+    .fl-group { display: flex; align-items: center; gap: 6px; }
+    .fl-label {
+      font-size: 9px; font-weight: 700; letter-spacing: 0.04em;
+      text-transform: uppercase; color: #64748b;
+      padding: 4px 8px; background: #f1f5f9; border-radius: 999px; white-space: nowrap;
+    }
+    .fl-divider { width: 1px; height: 22px; background: #e2e8f0; flex-shrink: 0; }
+    .fl-checkbox { display: flex; align-items: center; gap: 5px; font-size: 11px; color: #475569; cursor: pointer; }
+    .fl-checkbox input { margin: 0; }
+
+    /* Table */
+    #tableWrap { flex: 1; overflow: auto; }
+    #dataTable th.num { text-align: right; }
+    .num-cell { text-align: right; font-variant-numeric: tabular-nums; }
+    .desc-cell { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .money-neg { color: #C43046; }
+
+    /* Chevron */
+    .chev { display:inline-block; width:14px; text-align:center; color:#6366f1; cursor:pointer; font-size:10px;
+            transition: transform 0.12s; user-select: none; }
+    .chev.open { transform: rotate(90deg); }
+
+    /* Drill-down block (chart + snapshots) hosted in one full-width cell. */
+    tr.drill-row td { background: #fbfcff !important; padding: 8px 12px 12px 30px; border-bottom: 1px solid #eef2f7; }
+    tr.drill-row:hover td { background: #fbfcff !important; }
+    tr.drill-row.msg td { color: #94a3b8; font-style: italic; padding: 8px 12px 8px 30px; }
+    .drill-title { font-size: 11px; font-weight: 600; color: #1e3a5f; margin: 0 0 4px; }
+    .drill-note { font-size: 10px; color: #94a3b8; font-weight: 400; }
+    .cc-svg { display: block; width: 100%; }
+    .cc-legend { display: inline-flex; gap: 12px; font-size: 10px; color: #64748b; margin-left: 8px; }
+    .cc-legend span { display: inline-flex; align-items: center; gap: 4px; }
+    .cc-sw { width: 10px; height: 3px; border-radius: 2px; display: inline-block; }
+
+    /* Snapshot mini-table */
+    .snap-table { border-collapse: collapse; margin-top: 8px; font-size: 11px; min-width: 420px; }
+    .snap-table th { text-align: left; color: #94a3b8; font-weight: 700; text-transform: uppercase;
+                     font-size: 9px; letter-spacing: 0.03em; padding: 3px 12px 3px 0; border-bottom: 1px solid #e2e8f0; white-space: nowrap; }
+    .snap-table th.n, .snap-table td.n { text-align: right; }
+    .snap-table td { padding: 2px 12px 2px 0; color: #475569; border-bottom: 1px solid #f1f5f9; font-variant-numeric: tabular-nums; }
+    .snap-table tr:last-child td { border-bottom: none; }
+
+    /* Column panel */
+    #colPanel {
+      position: absolute; z-index: 200; top: calc(100% + 4px); right: 0;
+      background: white; border: 1px solid #d1d5db; border-radius: 8px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.13); width: 220px; max-height: 400px; overflow-y: auto;
+    }
+    .col-row { display: flex; align-items: center; gap: 8px; padding: 5px 10px; border-bottom: 1px solid #f3f4f6; cursor: grab; user-select: none; }
+    .col-row:last-child { border: none; }
+    .col-row:active { cursor: grabbing; }
+    .col-row.drag-over { background: #eff6ff; border-top: 2px solid #3b82f6; }
+    .col-row.dragging { opacity: 0.4; }
+    .col-row label { font-size: 12px; cursor: pointer; flex: 1; color: #374151; }
+    .drag-handle { color: #94a3b8; font-size: 13px; flex-shrink: 0; cursor: grab; line-height: 1; }
+
+    .hdr-btn.primary { background: var(--color-primary); color: #fff; border-color: var(--color-primary); }
+    .hdr-btn.primary:hover { background: var(--color-primary-dark); border-color: var(--color-primary-dark); }
+    .spinner { animation: spin 0.75s linear infinite; }
+
+    /* Total-value KPI pill in the header. */
+    .kpi { display: inline-flex; flex-direction: column; align-items: flex-end; line-height: 1.15; padding: 0 4px; }
+    .kpi .kpi-lbl { font-size: 9px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: #94a3b8; }
+    .kpi .kpi-val { font-size: 15px; font-weight: 800; color: #0f172a; font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body class="bg-slate-50 flex flex-col">
+
+<div class="toast-container" id="toastContainer"></div>
+
+<!-- HEADER -->
+<header class="bg-white border-b border-slate-200 px-5 flex items-center justify-between flex-shrink-0 shadow-sm" style="height:56px;">
+  <div>
+    <h1 class="text-base font-bold text-slate-900 leading-tight">Historical Inventory Valuation</h1>
+    <p id="statusLine" class="text-xs text-slate-400 leading-tight">Initialising...</p>
+  </div>
+  <div class="flex items-center gap-2">
+
+    <div class="kpi" title="Total value of the shown parts, as of the date">
+      <span class="kpi-lbl" id="kpiLbl">Total value</span>
+      <span class="kpi-val" id="kpiVal">—</span>
+    </div>
+
+    <div class="w-px h-6 bg-slate-200 mx-1"></div>
+
+    <div class="relative" id="colWrap">
+      <button onclick="toggleColPanel()" class="hdr-btn" id="colBtn">
+        <svg fill="currentColor" viewBox="0 0 24 24"><circle cx="8" cy="6" r="1.5"/><circle cx="8" cy="12" r="1.5"/><circle cx="8" cy="18" r="1.5"/><circle cx="16" cy="6" r="1.5"/><circle cx="16" cy="12" r="1.5"/><circle cx="16" cy="18" r="1.5"/></svg>
+        Columns
+      </button>
+      <div id="colPanel" class="hidden">
+        <div class="px-3 py-2 text-xs font-semibold text-slate-400 border-b border-slate-100 sticky top-0 bg-white">Show / Reorder</div>
+        <div id="colList"></div>
+      </div>
+    </div>
+
+    <button onclick="refresh()" class="hdr-btn">
+      <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+      Refresh
+    </button>
+
+    <!-- Drill-down display selector: chart / snapshot rows / both. -->
+    <div class="flex" style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;flex-shrink:0;" title="What an expanded part shows">
+      <button onclick="setDrillMode('chart')" class="hdr-btn drill-mode" data-mode="chart" style="border:none;border-radius:0;border-right:1px solid #e2e8f0;">Chart</button>
+      <button onclick="setDrillMode('rows')" class="hdr-btn drill-mode" data-mode="rows" style="border:none;border-radius:0;border-right:1px solid #e2e8f0;">Snapshots</button>
+      <button onclick="setDrillMode('both')" class="hdr-btn drill-mode" data-mode="both" style="border:none;border-radius:0;">Both</button>
+    </div>
+
+    <div class="flex" style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;flex-shrink:0;">
+      <button onclick="saveCurrentSettings()" class="hdr-btn" style="border:none;border-radius:0;border-right:1px solid #e2e8f0;" title="Save settings">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+        Save
+      </button>
+      <button onclick="resetSettings()" class="hdr-btn" style="border:none;border-radius:0;" title="Reset to defaults">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+        Reset
+      </button>
+    </div>
+
+    <div class="w-px h-6 bg-slate-200 mx-1"></div>
+
+    <button onclick="exportCSV()" class="hdr-btn">
+      <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+      CSV
+    </button>
+
+    <button onclick="printTable()" class="hdr-btn">
+      <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+      Print
+    </button>
+  </div>
+</header>
+
+<!-- FILTER CHIP STRIP -->
+<div id="filtersPanel">
+
+  <div class="fl-group">
+    <span class="fl-label">As of</span>
+    <input type="date" id="asOfDate" title="Value inventory as of this date. Today uses live on-hand (matches the standard Valuation Summary); a past date uses the end-of-day historical snapshot." />
+  </div>
+
+  <div class="fl-group" style="min-width:200px;">
+    <span class="fl-label">Location</span>
+    <div class="ms-container" id="lg-ms" style="flex:1;">
+      <div class="ms-trigger" id="lgTrigger" style="min-width:160px;"><span class="ms-placeholder" id="lgPlaceholder">All location groups</span></div>
+      <div class="ms-dropdown hidden" id="lgDropdown">
+        <div class="ms-actions"><span id="lgAll">Select All</span><span id="lgClear">Clear All</span></div>
+        <div class="ms-list" id="lgList"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="fl-group" style="min-width:220px;">
+    <span class="fl-label">Search</span>
+    <input type="text" id="partFilter" placeholder="part # or description…" style="width:180px;" />
+  </div>
+
+  <div class="fl-divider"></div>
+
+  <div class="fl-group">
+    <span class="fl-label">Cost</span>
+    <select id="costBasis" title="Which unit cost to value on-hand at. 'As of date' uses the cost effective on the date (today = live cost, matches the Valuation Summary); 'Today's cost' uses current cost for every date.">
+      <option value="asof">As of date</option>
+      <option value="current">Today's cost (all dates)</option>
+    </select>
+  </div>
+
+  <div class="fl-group">
+    <span class="fl-label">History</span>
+    <select id="lookback" title="Range of the drill-down cost history (ending at the as-of date)">
+      <option value="3">3 months</option>
+      <option value="6">6 months</option>
+      <option value="12" selected>12 months</option>
+      <option value="24">24 months</option>
+      <option value="all">All</option>
+    </select>
+  </div>
+
+  <div class="fl-divider"></div>
+
+  <label class="fl-checkbox"><input type="checkbox" id="showZero" /> Show zero on-hand</label>
+  <label class="fl-checkbox"><input type="checkbox" id="activeOnly" checked /> Active only</label>
+
+  <div style="flex:1;"></div>
+  <button class="hdr-btn primary" onclick="refresh()" style="flex-shrink:0;">Apply</button>
+
+</div>
+
+<!-- TABLE -->
+<div id="tableWrap">
+  <table id="dataTable" class="rpt-table">
+    <thead id="dataHead"></thead>
+    <tbody id="dataBody"></tbody>
+  </table>
+</div>
+
+<script>
+// ════════════════════════════════════════════════════════════════════
+// Historical Inventory Valuation — Fishbowl BI report
+// Runs inside the Fishbowl client (JxBrowser). Shared chrome + the
+// multi-select widget come from the saved fb-lib / fb-styles Scripts,
+// injected by the Script/Style directives in <head> (expanded at save
+// time). Never repeat the literal directive placeholder syntax in a
+// comment — it's a global text replace and a second occurrence breaks it.
+// Settings key: 'inv.bi.histvaluation.v1'
+// ════════════════════════════════════════════════════════════════════
+
+/* ── RUNTIME GUARD ── */
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+  document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#475569;"><h2>Not running inside Fishbowl</h2><p>This report requires the Fishbowl BI environment.</p></div>';
+  throw new Error('Fishbowl API not available');
+}
+if (!window.FBLib || !FBLib.Common || !FBLib.Common.MultiSelect) {
+  document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#8A1E30;background:#F0D7DD;">' +
+    '<h2>fb-lib not loaded</h2><p>This report requires the shared <code>fb-lib</code> script. ' +
+    'In BI Script Editor, confirm a Script named exactly <code>fb-lib</code> exists with the current ' +
+    'contents of scripts/fb-lib.js, then re-save THIS report (directives expand at save time).</p></div>';
+  throw new Error('FBLib not available');
+}
+
+const SETTINGS_KEY = 'inv.bi.histvaluation.v1';
+const ROW_CAP = 5000;
+// inventorylog event types that carry a running on-hand snapshot (from
+// OnHandByDate.jrxml). Anything else is a non-quantity event.
+const OH_TYPES = '1,10,15,20,30,40,50,60,64,65,67,68,72';
+
+// ── Settings persistence — thin wrappers over the Fishbowl built-ins. ──
+function _readSettings(key)        { return (typeof loadSettings === 'function') ? loadSettings(key) : null; }
+function _writeSettings(key, value) { if (typeof saveSettings === 'function') saveSettings(key, value); }
+
+// ── Column model ────────────────────────────────────────────────────
+const COL_DEFS = {
+  num:         { label: 'Part #',       numeric: false, defaultOn: true,  always: true },
+  description: { label: 'Description',  numeric: false, defaultOn: true },
+  uom:         { label: 'UOM',          numeric: false, defaultOn: true },
+  vendor:      { label: 'Vendor',       numeric: false, defaultOn: false },
+  onHand:      { label: 'On Hand',      numeric: true,  defaultOn: true,  qty: true },
+  avgCost:     { label: 'Avg Cost',     numeric: true,  defaultOn: true,  money: true },
+  stdCost:     { label: 'Std Cost',     numeric: true,  defaultOn: true,  money: true },
+  valueAvg:    { label: 'Value (Avg)',  numeric: true,  defaultOn: true,  money: true },
+  valueStd:    { label: 'Value (Std)',  numeric: true,  defaultOn: false, money: true },
+  costDate:    { label: 'Cost As-Of',   numeric: false, defaultOn: false, date: true },
+};
+const DEFAULT_COL_ORDER = ['num','description','uom','vendor','onHand','avgCost','stdCost','valueAvg','valueStd','costDate'];
+
+// ── State ───────────────────────────────────────────────────────────
+let _lgList = [];               // [{val, lbl}]
+let _selLg = new Set();
+let _asOf = '';                 // 'YYYY-MM-DD' as-of date
+let _lookback = '12';           // drill-down cost-history window (months | 'all')
+let _costBasis = 'asof';        // 'asof' (partcosthistory ≤ date; today → live partcost) DEFAULT | 'current' (live partcost for every date)
+let _onHandLive = true;         // true when on-hand came from live tag (as-of >= today), else inventorylog
+let _showZero = false;
+let _activeOnly = true;
+let _partFilter = '';
+let _drillMode = 'both';        // 'chart' | 'rows' | 'both'
+
+let _columnsVisible = {};
+let _columnsOrder = DEFAULT_COL_ORDER.slice();
+
+let _parts = [];                // parent rows
+let _expanded = new Set();      // partIds expanded
+let _snapCache = new Map();     // partId -> array of snapshot rows
+let _snapLoading = new Set();
+let _limitHit = false;
+let _initialExpandedToRestore = [];
+let _pendingCharts = [];        // chart <td>s awaiting a width-measured render
+let _curSymbol = '$';
+
+// ── Helpers ─────────────────────────────────────────────────────────
+function escSQL(s) { return String(s == null ? '' : s).replace(/'/g, "''"); }
+function qstr(s) { return "'" + escSQL(s) + "'"; }
+function todayISO() { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
+function safeDate(s) { return /^\d{4}-\d{2}-\d{2}$/.test(String(s||'')) ? s : ''; }
+function fmtNum(n) {
+  if (n == null || isNaN(n)) return '';
+  const v = parseFloat(n);
+  if (v === 0) return '0';
+  return v.toLocaleString(undefined, { maximumFractionDigits: 4 });
+}
+function fmtMoney(n) {
+  if (n == null || isNaN(n)) return '';
+  const v = parseFloat(n);
+  const s = _curSymbol + Math.abs(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return v < 0 ? '-' + s : s;
+}
+var _dateFmt = 'MM/DD/YYYY';
+(function () {
+  try {
+    var jf = (typeof getProperty === 'function') ? getProperty('DateFormatShort', 'MM/dd/yyyy') : 'MM/dd/yyyy';
+    _dateFmt = jf.replace(/yyyy/g, 'YYYY').replace(/dd/g, 'DD');
+  } catch (e) {}
+  try { if (typeof currencyLocale === 'function') { var cl = currencyLocale(); if (cl && cl.symbol) _curSymbol = cl.symbol; } } catch (e) {}
+})();
+function fmtDate(s) {
+  if (!s || String(s).length < 10) return '';
+  var str = String(s).split('T')[0].split(' ')[0];
+  var y = str.substring(0, 4), m = str.substring(5, 7), d = str.substring(8, 10);
+  return _dateFmt.replace('YYYY', y).replace('MM', m).replace('DD', d);
+}
+
+function showToast(message, type = 'info', duration = 3000) {
+  const container = document.getElementById('toastContainer') || document.querySelector('.toast-container');
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+  const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : 'ℹ';
+  toast.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg"></span>`;
+  toast.querySelector('.toast-msg').textContent = message;
+  container.appendChild(toast);
+  setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, duration);
+}
+function setStatus(text) { document.getElementById('statusLine').textContent = text; }
+
+// ── qp() — Fishbowl data-query router ───────────────────────────────
+async function qp(sql) {
+  if (typeof runQueryAsync === 'function') {
+    const r = await runQueryAsync(sql);
+    return Array.isArray(r) ? r : (typeof r === 'string' ? JSON.parse(r) : []);
+  }
+  const r = runQuery(sql);
+  return typeof r === 'string' ? JSON.parse(r) : (Array.isArray(r) ? r : []);
+}
+function openInModule(moduleName, item) {
+  if (typeof openModule === 'function') {
+    try { openModule(moduleName, item); } catch (e) { showToast('openModule failed: ' + e.message, 'error'); }
+  } else { showToast('Module navigation only works inside Fishbowl: ' + moduleName + ' / ' + item, 'info'); }
+}
+
+// ── Location-Group filter (FBLib.Common.MultiSelect) ────────────────
+function buildLgMS() {
+  FBLib.Common.MultiSelect.create({
+    containerId: 'lg-ms',
+    items: _lgList.map(o => ({ value: o.val, label: o.lbl })),
+    selected: [..._selLg],
+    placeholder: 'All location groups',
+    onChange: function (vals) { _selLg.clear(); vals.forEach(v => _selLg.add(String(v))); }
+  });
+}
+function setLgItems(list) {
+  const ms = FBLib.Common.MultiSelect.get('lg-ms');
+  if (ms) ms.setItems(list.map(o => ({ value: o.val, label: o.lbl })));
+}
+function syncLgSelected() {
+  const ms = FBLib.Common.MultiSelect.get('lg-ms');
+  if (ms) ms.setSelected([..._selLg]);
+}
+
+// ── UI toggles ──────────────────────────────────────────────────────
+function setDrillMode(mode) {
+  if (['chart','rows','both'].indexOf(mode) === -1) mode = 'both';
+  _drillMode = mode;
+  document.querySelectorAll('.drill-mode').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+  renderTable();
+}
+function toggleColPanel() {
+  const p = document.getElementById('colPanel');
+  p.classList.toggle('hidden');
+  if (!p.classList.contains('hidden')) renderColPanel();
+}
+document.addEventListener('click', e => {
+  const wrap = document.getElementById('colWrap');
+  if (wrap && !wrap.contains(e.target)) document.getElementById('colPanel').classList.add('hidden');
+});
+
+// ── Column panel ────────────────────────────────────────────────────
+function renderColPanel() {
+  const listEl = document.getElementById('colList');
+  listEl.innerHTML = '';
+  _columnsOrder.forEach((key) => {
+    const def = COL_DEFS[key]; if (!def) return;
+    const row = document.createElement('div'); row.className = 'col-row'; row.draggable = true; row.dataset.col = key;
+    const handle = document.createElement('span'); handle.className = 'drag-handle'; handle.textContent = '⋮⋮';
+    const cb = document.createElement('input'); cb.type = 'checkbox';
+    cb.checked = _columnsVisible[key] !== false;
+    if (def.always) { cb.disabled = true; cb.checked = true; }
+    const label = document.createElement('label'); label.textContent = def.label;
+    cb.addEventListener('change', () => { _columnsVisible[key] = cb.checked; renderTable(); });
+    row.appendChild(handle); row.appendChild(cb); row.appendChild(label);
+    row.addEventListener('dragstart', ev => { row.classList.add('dragging'); ev.dataTransfer.setData('text/plain', key); ev.dataTransfer.effectAllowed = 'move'; });
+    row.addEventListener('dragend', () => row.classList.remove('dragging'));
+    row.addEventListener('dragover', ev => { ev.preventDefault(); row.classList.add('drag-over'); });
+    row.addEventListener('dragleave', () => row.classList.remove('drag-over'));
+    row.addEventListener('drop', ev => {
+      ev.preventDefault(); row.classList.remove('drag-over');
+      const from = ev.dataTransfer.getData('text/plain');
+      if (!from || from === key) return;
+      const fromIdx = _columnsOrder.indexOf(from), toIdx = _columnsOrder.indexOf(key);
+      if (fromIdx < 0 || toIdx < 0) return;
+      _columnsOrder.splice(fromIdx, 1); _columnsOrder.splice(toIdx, 0, from);
+      renderColPanel(); renderTable();
+    });
+    listEl.appendChild(row);
+  });
+}
+
+// ── Settings save/load/reset ────────────────────────────────────────
+function loadSavedState() {
+  try {
+    const raw = _readSettings(SETTINGS_KEY);
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    if (s.v !== 1) return;
+    if (Array.isArray(s.locationGroupIds)) _selLg = new Set(s.locationGroupIds.map(String));
+    if (typeof s.partFilter === 'string') _partFilter = s.partFilter;
+    if (safeDate(s.asOf)) _asOf = s.asOf;
+    if (['3','6','12','24','all'].indexOf(String(s.lookback)) !== -1) _lookback = String(s.lookback);
+    if (['current','asof'].indexOf(s.costBasis) !== -1) _costBasis = s.costBasis;
+    if (typeof s.showZero === 'boolean') _showZero = s.showZero;
+    if (typeof s.activeOnly === 'boolean') _activeOnly = s.activeOnly;
+    if (s.columnsVisible && typeof s.columnsVisible === 'object') _columnsVisible = Object.assign({}, s.columnsVisible);
+    if (Array.isArray(s.columnsOrder) && s.columnsOrder.length) {
+      const valid = s.columnsOrder.filter(k => COL_DEFS[k]);
+      const missing = DEFAULT_COL_ORDER.filter(k => !valid.includes(k));
+      _columnsOrder = valid.concat(missing);
+    }
+    if (Array.isArray(s.expandedPartIds)) _initialExpandedToRestore = s.expandedPartIds.map(n => parseInt(n, 10)).filter(n => !isNaN(n));
+    if (['chart','rows','both'].indexOf(s.drillMode) !== -1) _drillMode = s.drillMode;
+  } catch (e) { /* ignore corrupt */ }
+}
+function saveCurrentSettings() {
+  const payload = {
+    v: 1,
+    locationGroupIds: [..._selLg],
+    partFilter: _partFilter, asOf: _asOf, lookback: _lookback, costBasis: _costBasis,
+    showZero: _showZero, activeOnly: _activeOnly,
+    columnsVisible: Object.assign({}, _columnsVisible),
+    columnsOrder: _columnsOrder.slice(),
+    expandedPartIds: [..._expanded],
+    drillMode: _drillMode,
+    savedAt: new Date().toISOString(),
+  };
+  _writeSettings(SETTINGS_KEY, JSON.stringify(payload));
+  showToast('Settings saved', 'success', 1800);
+}
+function resetSettings() {
+  _writeSettings(SETTINGS_KEY, '');
+  _selLg.clear();
+  _partFilter = ''; _asOf = todayISO(); _lookback = '12'; _costBasis = 'asof';
+  _showZero = false; _activeOnly = true;
+  _columnsVisible = {}; _columnsOrder = DEFAULT_COL_ORDER.slice();
+  _expanded.clear(); _snapCache.clear();
+  document.getElementById('partFilter').value = '';
+  document.getElementById('asOfDate').value = _asOf;
+  document.getElementById('lookback').value = _lookback;
+  document.getElementById('costBasis').value = _costBasis;
+  document.getElementById('showZero').checked = false;
+  document.getElementById('activeOnly').checked = true;
+  setDrillMode('both');
+  syncLgSelected();
+  refresh();
+  showToast('Settings reset', 'info', 1800);
+}
+
+// ── Sync UI with state ──────────────────────────────────────────────
+function applyUiFromState() {
+  document.getElementById('partFilter').value = _partFilter || '';
+  document.getElementById('asOfDate').value = _asOf || todayISO();
+  document.getElementById('lookback').value = _lookback;
+  document.getElementById('costBasis').value = _costBasis;
+  document.getElementById('showZero').checked = !!_showZero;
+  document.getElementById('activeOnly').checked = !!_activeOnly;
+  document.querySelectorAll('.drill-mode').forEach(b => b.classList.toggle('active', b.dataset.mode === _drillMode));
+}
+function readUiToState() {
+  _partFilter = document.getElementById('partFilter').value.trim();
+  _asOf = safeDate(document.getElementById('asOfDate').value) || todayISO();
+  _lookback = document.getElementById('lookback').value;
+  _costBasis = document.getElementById('costBasis').value;
+  _showZero = document.getElementById('showZero').checked;
+  _activeOnly = document.getElementById('activeOnly').checked;
+}
+
+// ── Location groups ─────────────────────────────────────────────────
+async function loadLocationGroups() {
+  let userLgIds = null;
+  try {
+    if (typeof getLocationGroupList === 'function') {
+      const arr = getLocationGroupList();
+      if (Array.isArray(arr) && arr.length) userLgIds = arr.map(n => parseInt(n, 10)).filter(n => !isNaN(n));
+    }
+  } catch (_) {}
+  // Include INACTIVE location groups (they can still hold valued stock — the
+  // standard Inventory Valuation Summary counts them). Labelled "(inactive)",
+  // and still gated by the user's accessible LGs when available.
+  let sql = 'SELECT id, name, (activeFlag + 0) AS act FROM locationgroup';
+  if (userLgIds && userLgIds.length) sql += ' WHERE id IN (' + userLgIds.join(',') + ')';
+  sql += ' ORDER BY act DESC, name';
+  const rows = await qp(sql);
+  _lgList = rows.map(r => {
+    const inactive = String(r.act) !== '1';
+    return { val: String(r.id), lbl: (r.name || ('LG ' + r.id)) + (inactive ? ' (inactive)' : '') };
+  });
+}
+function lgListSql() {
+  if (_selLg.size) return [..._selLg].map(v => parseInt(v, 10)).filter(n => !isNaN(n)).join(',');
+  return _lgList.map(o => parseInt(o.val, 10)).filter(n => !isNaN(n)).join(',') || '0';
+}
+
+// ── Parent query — valuation as of _asOf ────────────────────────────
+// On-hand: as of TODAY (or future) → live tag qty (reconciles with the standard
+//   Inventory Valuation Summary); a PAST date → last inventorylog snapshot
+//   on/before it (OnHandByDate method). Summed over the selected LGs.
+// Cost:    BOTH current (partcost.avgCost / part.stdCost) AND the as-of
+//   partcosthistory capture are fetched; recomputeValues() picks per _costBasis.
+// Value:   on-hand × chosen cost (computed in JS).
+function numOrNull(x) { return (x == null || x === '') ? null : parseFloat(x); }
+async function loadParts() {
+  const lgIds = lgListSql();
+  const asOf = safeDate(_asOf) || todayISO();
+  const asOfEnd = "'" + asOf + " 23:59:59.999999'";
+  const filter = (_partFilter || '').trim();
+  const activeClause = _activeOnly ? 'AND part.activeflag = 1' : '';
+  let numCond = "part.num LIKE '%'";
+  if (filter) {
+    const f = qstr('%' + filter.replace(/^%+|%+$/g, '') + '%');
+    numCond = '(part.num LIKE ' + f + ' OR part.description LIKE ' + f + ')';
+  }
+  const zeroClause = _showZero ? '' : 'AND COALESCE(oh.onhand, 0) <> 0';
+
+  // On-hand source. tag has no date dimension, so it only answers "now"; use it
+  // for today/future (matches the live Valuation Summary), inventorylog for the
+  // past.
+  _onHandLive = (asOf >= todayISO());
+  const ohSub = _onHandLive
+    ? ("   SELECT tag.partid, SUM(tag.qty) AS onhand" +
+       "   FROM tag JOIN location l ON l.id = tag.locationid" +
+       "   WHERE l.locationgroupid IN (" + lgIds + ")" +
+       "   GROUP BY tag.partid")
+    : ("   SELECT il.partid, SUM(il.qtyonhand) AS onhand" +
+       "   FROM inventorylog il" +
+       "   JOIN (SELECT partid, locationgroupid, MAX(id) AS logid" +
+       "           FROM inventorylog" +
+       "          WHERE eventdate <= " + asOfEnd +
+       "            AND typeid IN (" + OH_TYPES + ")" +
+       "            AND locationgroupid IN (" + lgIds + ")" +
+       "          GROUP BY partid, locationgroupid) mx ON mx.logid = il.id" +
+       "   GROUP BY il.partid");
+
+  const sql =
+    "SELECT part.id, part.num, part.description, uom.code AS uomcode, v.name AS vendor," +
+    "       COALESCE(oh.onhand, 0) AS onhand," +
+    "       pc.avgcost AS curavg, part.stdcost AS curstd," +
+    "       cst.avgcost AS pchavg, cst.stdcost AS pchstd, cst.costday AS costday" +
+    " FROM part" +
+    " LEFT JOIN uom ON part.uomid = uom.id" +
+    " LEFT JOIN partcost pc ON pc.partid = part.id" +
+    " LEFT JOIN vendorparts vp ON vp.partid = part.id AND vp.defaultflag = 1" +
+    " LEFT JOIN vendor v ON v.id = vp.vendorid" +
+    " LEFT JOIN (" + ohSub + " ) oh ON oh.partid = part.id" +
+    " LEFT JOIN (" +
+    "   SELECT pch.partid, pch.avgcost, pch.stdcost, DATE(pch.datecaptured) AS costday" +
+    "   FROM partcosthistory pch" +
+    "   JOIN (SELECT partid, MAX(id) AS costid" +
+    "           FROM partcosthistory" +
+    "          WHERE datecaptured <= " + asOfEnd +
+    "          GROUP BY partid) mc ON mc.costid = pch.id" +
+    " ) cst ON cst.partid = part.id" +
+    " WHERE part.typeid = 10" +
+    " " + activeClause +
+    " AND " + numCond +
+    " " + zeroClause +
+    " ORDER BY part.num" +
+    " LIMIT " + (ROW_CAP + 1);
+
+  const rows = await qp(sql);
+  _limitHit = rows.length > ROW_CAP;
+  _parts = rows.slice(0, ROW_CAP).map(r => ({
+    id: parseInt(r.id, 10),
+    num: r.num || '',
+    description: r.description || '',
+    uom: r.uomcode || '',
+    vendor: r.vendor || '',
+    onHand: parseFloat(r.onhand) || 0,
+    curAvg: numOrNull(r.curavg), curStd: numOrNull(r.curstd),
+    pchAvg: numOrNull(r.pchavg), pchStd: numOrNull(r.pchstd), pchDay: r.costday || '',
+    // effective fields filled by recomputeValues()
+    avgCost: null, stdCost: null, costDate: '', valueAvg: null, valueStd: null,
+  }));
+  recomputeValues();
+}
+
+// Fill each row's effective cost + value from the chosen cost basis. No re-query
+// — both cost sources are held on the row, so the Cost toggle recomputes live.
+//
+// The as-of snapshot is used ONLY for a PAST date (so the main-row cost moves
+// with the date and reconciles with the drill-down's latest snapshot). Today /
+// future — and the whole 'current' basis — use the live partcost, so the total
+// still reconciles with the standard Inventory Valuation Summary. (_onHandLive is
+// true when the as-of date is today or later.)
+function recomputeValues() {
+  const useSnapshot = (_costBasis === 'asof') && !_onHandLive;
+  _parts.forEach(p => {
+    let a, s, cdate = '';
+    if (useSnapshot) {
+      // True as-of cost; fall back to current when the part has no snapshot ≤ date.
+      a = (p.pchAvg != null) ? p.pchAvg : p.curAvg;
+      s = (p.pchStd != null) ? p.pchStd : p.curStd;
+      cdate = (p.pchAvg != null || p.pchStd != null) ? p.pchDay : '';
+    } else {
+      a = p.curAvg; s = p.curStd;   // current / today's cost
+    }
+    p.avgCost = (a == null) ? null : a;
+    p.stdCost = (s == null) ? null : s;
+    p.costDate = cdate;
+    p.valueAvg = (p.avgCost == null) ? null : p.onHand * p.avgCost;
+    p.valueStd = (p.stdCost == null) ? null : p.onHand * p.stdCost;
+  });
+}
+
+// ── Drill-down: partcosthistory snapshots over the lookback window ───
+function lookbackStartISO() {
+  const asOf = safeDate(_asOf) || todayISO();
+  if (_lookback === 'all') return '1900-01-01';
+  const months = parseInt(_lookback, 10) || 12;
+  const d = new Date(asOf + 'T00:00:00');
+  d.setMonth(d.getMonth() - months);
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+function buildSnapshotSQL(partId) {
+  const asOf = safeDate(_asOf) || todayISO();
+  const start = lookbackStartISO();
+  return "SELECT DATE(datecaptured) AS day, quantity AS qty, avgcost, stdcost, totalcost" +
+         " FROM partcosthistory" +
+         " WHERE partid = " + partId +
+         "   AND datecaptured >= '" + start + " 00:00:00'" +
+         "   AND datecaptured <= '" + asOf + " 23:59:59.999999'" +
+         " ORDER BY datecaptured";
+}
+async function loadSnapshots(partId) {
+  if (_snapCache.has(partId)) return _snapCache.get(partId);
+  if (_snapLoading.has(partId)) return null;
+  _snapLoading.add(partId);
+  try {
+    const rows = await qp(buildSnapshotSQL(partId));
+    const norm = rows.map(r => ({
+      day: r.day,
+      qty: parseFloat(r.qty) || 0,
+      avgCost: (r.avgcost == null || r.avgcost === '') ? null : parseFloat(r.avgcost),
+      stdCost: (r.stdcost == null || r.stdcost === '') ? null : parseFloat(r.stdcost),
+      totalCost: (r.totalcost == null || r.totalcost === '') ? null : parseFloat(r.totalcost),
+    }));
+    _snapCache.set(partId, norm);
+    return norm;
+  } finally { _snapLoading.delete(partId); }
+}
+
+// ── Table render ────────────────────────────────────────────────────
+function visibleColumns() {
+  return _columnsOrder.filter(k => {
+    const def = COL_DEFS[k]; if (!def) return false;
+    if (def.always) return true;
+    return _columnsVisible[k] !== false && (_columnsVisible[k] !== undefined || def.defaultOn);
+  });
+}
+function cellText(p, k) {
+  const def = COL_DEFS[k];
+  if (k === 'num' || k === 'description' || k === 'uom' || k === 'vendor') return p[k] || '';
+  if (def.date) return fmtDate(p[k]);
+  if (def.money) return p[k] == null ? '—' : fmtMoney(p[k]);
+  if (def.qty)   return fmtNum(p[k]);
+  return p[k] == null ? '' : String(p[k]);
+}
+
+function renderTable() {
+  const cols = visibleColumns();
+  const head = document.getElementById('dataHead');
+  let html = '<tr><th style="width:24px;"></th>';
+  cols.forEach(k => { const def = COL_DEFS[k]; html += '<th' + (def.numeric ? ' class="num"' : '') + '>' + def.label + '</th>'; });
+  html += '</tr>';
+  head.innerHTML = html;
+
+  const body = document.getElementById('dataBody');
+  body.innerHTML = '';
+  _pendingCharts = [];
+
+  if (!_parts.length) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td colspan="' + (cols.length + 1) + '" style="padding:24px;text-align:center;color:#94a3b8;">No parts match the current filters.</td>';
+    body.appendChild(tr);
+    updateKpi();
+    setStatus('0 parts');
+    return;
+  }
+
+  _parts.forEach(p => {
+    const tr = document.createElement('tr');
+    tr.className = 'part-row';
+    tr.dataset.partId = p.id;
+    const chevTd = document.createElement('td');
+    const chev = document.createElement('span');
+    chev.className = 'chev' + (_expanded.has(p.id) ? ' open' : '');
+    chev.textContent = '▶';
+    chev.addEventListener('click', e => { e.stopPropagation(); togglePart(p.id); });
+    chevTd.appendChild(chev);
+    tr.appendChild(chevTd);
+
+    cols.forEach(k => {
+      const def = COL_DEFS[k];
+      const td = document.createElement('td');
+      if (def.numeric) td.className = 'num-cell';
+      if (k === 'num') {
+        const a = document.createElement('a');
+        a.className = 'row-link'; a.textContent = p.num;
+        a.addEventListener('click', e => { e.preventDefault(); openInModule('Part', p.num); });
+        td.appendChild(a);
+      } else if (k === 'description') {
+        td.className = 'desc-cell'; td.textContent = p.description || ''; td.title = p.description || '';
+      } else {
+        td.textContent = cellText(p, k);
+        if (def.money && p[k] != null && p[k] < 0) td.classList.add('money-neg');
+      }
+      tr.appendChild(td);
+    });
+    body.appendChild(tr);
+
+    if (_expanded.has(p.id)) renderDrillRow(p, body, cols.length + 1);
+  });
+
+  flushCharts();
+  updateKpi();
+
+  let status = _parts.length + ' part' + (_parts.length === 1 ? '' : 's') + ' · as of ' + fmtDate(_asOf) +
+    (_onHandLive ? ' (live on-hand)' : ' (historical on-hand)');
+  if (_limitHit) status += ' (limit ' + ROW_CAP + ' reached — refine filters)';
+  if (_expanded.size) status += ' · ' + _expanded.size + ' expanded';
+  setStatus(status);
+}
+
+function updateKpi() {
+  const totAvg = _parts.reduce((s, p) => s + (p.valueAvg || 0), 0);
+  const totStd = _parts.reduce((s, p) => s + (p.valueStd || 0), 0);
+  const basis = _costBasis === 'asof' ? (_onHandLive ? 'as-of cost · today = live' : 'as-of cost') : "today's cost";
+  document.getElementById('kpiVal').textContent = _parts.length ? fmtMoney(totAvg) : '—';
+  document.getElementById('kpiLbl').textContent = 'Total · Avg (' + basis + ') · Std ' + (_parts.length ? fmtMoney(totStd) : '—');
+}
+
+// ── Drill-down render ───────────────────────────────────────────────
+function renderDrillRow(part, body, colSpan) {
+  const snaps = _snapCache.get(part.id);
+  const tr = document.createElement('tr');
+  tr.dataset.parentPartId = part.id;
+
+  if (_snapLoading.has(part.id) || snaps === undefined) {
+    tr.className = 'drill-row msg';
+    const td = document.createElement('td'); td.colSpan = colSpan;
+    td.innerHTML = '<span class="spinner" style="display:inline-block;width:10px;height:10px;border:2px solid #cbd5e1;border-top-color:#3b82f6;border-radius:50%;"></span> Loading cost history…';
+    tr.appendChild(td); body.appendChild(tr);
+    return;
+  }
+  tr.className = 'drill-row';
+  const td = document.createElement('td'); td.colSpan = colSpan;
+
+  const title = document.createElement('div');
+  title.className = 'drill-title';
+  title.innerHTML = 'Cost history · ' + snaps.length + ' snapshot' + (snaps.length === 1 ? '' : 's') +
+    ' <span class="drill-note">(company-wide cost · ' + (_lookback === 'all' ? 'all history' : 'last ' + _lookback + ' months') + ' to ' + fmtDate(_asOf) + ')</span>' +
+    '<span class="cc-legend"><span><span class="cc-sw" style="background:#1B7A46;"></span>Avg</span><span><span class="cc-sw" style="background:#2563EB;"></span>Std</span></span>';
+  td.appendChild(title);
+
+  if (!snaps.length) {
+    const none = document.createElement('div');
+    none.className = 'drill-note';
+    none.textContent = 'No cost snapshots captured in this window. Widen History or move the as-of date.';
+    td.appendChild(none);
+    tr.appendChild(td); body.appendChild(tr);
+    return;
+  }
+
+  // Chart (deferred so we can measure the cell width for an undistorted SVG).
+  if (_drillMode === 'chart' || _drillMode === 'both') {
+    const chartHost = document.createElement('div');
+    td.appendChild(chartHost);
+    _pendingCharts.push({ host: chartHost, snaps: snaps });
+  }
+
+  // Snapshot rows.
+  if (_drillMode === 'rows' || _drillMode === 'both') {
+    const tbl = document.createElement('table');
+    tbl.className = 'snap-table';
+    tbl.innerHTML =
+      '<thead><tr><th>Date</th><th class="n">Qty</th><th class="n">Avg Cost</th><th class="n">Std Cost</th><th class="n">Value (Avg)</th></tr></thead>' +
+      '<tbody>' + snaps.map(s =>
+        '<tr><td>' + fmtDate(s.day) + '</td>' +
+        '<td class="n">' + fmtNum(s.qty) + '</td>' +
+        '<td class="n">' + (s.avgCost == null ? '—' : fmtMoney(s.avgCost)) + '</td>' +
+        '<td class="n">' + (s.stdCost == null ? '—' : fmtMoney(s.stdCost)) + '</td>' +
+        '<td class="n">' + (s.totalCost == null ? '—' : fmtMoney(s.totalCost)) + '</td></tr>'
+      ).join('') + '</tbody>';
+    td.appendChild(tbl);
+  }
+
+  tr.appendChild(td);
+  body.appendChild(tr);
+}
+
+// Cost-over-time line chart (avg + std series) — inline SVG, no libs.
+const _MONTHS3 = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function _xmlEsc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+function buildCostChartSVG(snaps, W) {
+  const H = 132, padL = 44, padR = 14, plotTop = 10, plotH = 84, plotBot = plotTop + plotH;
+  const plotL = padL, plotR = Math.max(padL + 60, W - padR), plotW = plotR - plotL;
+  const GREEN = '#1B7A46', BLUE = '#2563EB', GRID = '#e2e8f0', AXIS = '#94a3b8', MUTE = '#94a3b8';
+
+  const startMs = new Date(lookbackStartISO() + 'T00:00:00').getTime();
+  const endMs = new Date((safeDate(_asOf) || todayISO()) + 'T00:00:00').getTime();
+  // Domain from the actual points when 'all' (start could be 1900); else the window.
+  const pts = snaps.map(s => ({ t: new Date(String(s.day).split('T')[0] + 'T00:00:00').getTime(), avg: s.avgCost, std: s.stdCost }))
+                   .filter(p => !isNaN(p.t));
+  if (!pts.length) return '';
+  let t0 = (_lookback === 'all') ? pts[0].t : startMs;
+  let tE = endMs;
+  if (tE <= t0) tE = t0 + 86400000;
+  const span = tE - t0;
+
+  let vMin = Infinity, vMax = -Infinity;
+  pts.forEach(p => { [p.avg, p.std].forEach(v => { if (v != null) { if (v < vMin) vMin = v; if (v > vMax) vMax = v; } }); });
+  if (!isFinite(vMin)) { vMin = 0; vMax = 1; }
+  if (vMin === vMax) { vMax = vMin + Math.abs(vMin || 1) * 0.1 + 1; vMin = Math.max(0, vMin - Math.abs(vMin || 1) * 0.1); }
+  const pad = (vMax - vMin) * 0.12; let vTop = vMax + pad, vBot = Math.max(0, vMin - pad);
+  if (vTop === vBot) vTop = vBot + 1;
+
+  const x = t => plotL + (t - t0) / span * plotW;
+  const y = v => plotTop + (vTop - v) / (vTop - vBot) * plotH;
+
+  const out = [];
+  out.push('<svg class="cc-svg" viewBox="0 0 ' + W + ' ' + H + '" style="height:' + H + 'px" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">');
+
+  // Y gridlines + cost labels (3 ticks).
+  for (let i = 0; i <= 3; i++) {
+    const v = vBot + (vTop - vBot) * i / 3, gy = y(v);
+    out.push('<line x1="' + plotL + '" y1="' + gy.toFixed(1) + '" x2="' + plotR + '" y2="' + gy.toFixed(1) + '" stroke="' + GRID + '" stroke-width="1"/>');
+    out.push('<text x="' + (plotL - 4) + '" y="' + (gy + 3).toFixed(1) + '" fill="' + MUTE + '" font-size="8.5" text-anchor="end">' + _xmlEsc(fmtMoney(v)) + '</text>');
+  }
+  // Month gridlines.
+  let mt = new Date(t0); mt = new Date(mt.getFullYear(), mt.getMonth(), 1);
+  if (mt.getTime() < t0) mt = new Date(mt.getFullYear(), mt.getMonth() + 1, 1);
+  let guard = 0;
+  while (mt.getTime() <= tE && guard++ < 60) {
+    const gx = x(mt.getTime());
+    out.push('<line x1="' + gx.toFixed(1) + '" y1="' + plotTop + '" x2="' + gx.toFixed(1) + '" y2="' + plotBot + '" stroke="' + GRID + '" stroke-width="1" opacity="0.5"/>');
+    out.push('<text x="' + gx.toFixed(1) + '" y="' + (plotBot + 12) + '" fill="' + MUTE + '" font-size="8.5" text-anchor="middle">' + _MONTHS3[mt.getMonth()] + (mt.getMonth() === 0 ? " '" + String(mt.getFullYear()).slice(2) : '') + '</text>');
+    mt = new Date(mt.getFullYear(), mt.getMonth() + 1, 1);
+  }
+
+  // Series polylines + points.
+  function series(key, col) {
+    const sp = pts.filter(p => p[key] != null);
+    if (!sp.length) return;
+    if (sp.length > 1) {
+      out.push('<polyline fill="none" stroke="' + col + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="' +
+        sp.map(p => x(p.t).toFixed(1) + ',' + y(p[key]).toFixed(1)).join(' ') + '"/>');
+    }
+    sp.forEach(p => {
+      out.push('<circle cx="' + x(p.t).toFixed(1) + '" cy="' + y(p[key]).toFixed(1) + '" r="2.2" fill="' + col + '"><title>' +
+        _xmlEsc((key === 'avg' ? 'Avg' : 'Std') + ' ' + fmtMoney(p[key]) + ' · ' + fmtDate(new Date(p.t).toISOString())) + '</title></circle>');
+    });
+  }
+  series('std', BLUE);
+  series('avg', GREEN);
+
+  out.push('</svg>');
+  return out.join('');
+}
+function flushCharts() {
+  if (!_pendingCharts.length) return;
+  _pendingCharts.forEach(job => {
+    const w = Math.max(360, (job.host.clientWidth || document.getElementById('tableWrap').clientWidth || 900) - 20);
+    try { job.host.innerHTML = buildCostChartSVG(job.snaps, w); }
+    catch (e) { job.host.textContent = 'chart unavailable'; }
+  });
+  _pendingCharts = [];
+}
+
+async function togglePart(partId) {
+  if (_expanded.has(partId)) { _expanded.delete(partId); renderTable(); return; }
+  _expanded.add(partId);
+  renderTable();
+  if (!_snapCache.has(partId)) {
+    try { await loadSnapshots(partId); }
+    catch (e) { showToast('Failed to load cost history: ' + (e.message || e), 'error', 4000); _snapCache.set(partId, []); }
+    renderTable();
+  }
+}
+
+// ── Refresh pipeline ────────────────────────────────────────────────
+async function refresh() {
+  readUiToState();
+  setStatus('Loading valuation…');
+  try { await loadParts(); }
+  catch (e) { setStatus('Error: ' + (e.message || e)); showToast('Query failed: ' + (e.message || e), 'error', 5000); return; }
+  // As-of date changed → cached snapshots are stale (different window/anchor).
+  _snapCache.clear();
+  const valid = new Set(_parts.map(p => p.id));
+  // Drop expanded parts that fell out of the current filter.
+  [..._expanded].forEach(id => { if (!valid.has(id)) _expanded.delete(id); });
+  // First load only: restore the saved-expanded set.
+  if (_initialExpandedToRestore.length) {
+    const ids = _initialExpandedToRestore; _initialExpandedToRestore = [];
+    ids.forEach(id => { if (valid.has(id)) _expanded.add(id); });
+  }
+  renderTable();
+  // Re-fetch snapshots for whatever is expanded now, re-rendering as each lands.
+  [..._expanded].forEach(id => { loadSnapshots(id).then(() => renderTable()).catch(() => {}); });
+}
+
+// ── CSV export ──────────────────────────────────────────────────────
+function csvEscape(v) {
+  if (v == null) return '';
+  const s = String(v);
+  if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+function exportCSV() {
+  const cols = visibleColumns();
+  const lines = [];
+  lines.push(['Row Type'].concat(cols.map(k => COL_DEFS[k].label))
+    .concat(['Snapshot Date','Snapshot Qty','Snapshot Avg Cost','Snapshot Std Cost','Snapshot Value'])
+    .map(csvEscape).join(','));
+  _parts.forEach(p => {
+    const parentCells = cols.map(k => {
+      const def = COL_DEFS[k];
+      if (k === 'num' || k === 'description' || k === 'uom' || k === 'vendor') return p[k] || '';
+      if (def.date) return fmtDate(p[k]);
+      return p[k] == null ? '' : p[k];
+    });
+    lines.push(['PART'].concat(parentCells).concat(['','','','','']).map(csvEscape).join(','));
+    if (_expanded.has(p.id)) {
+      const snaps = _snapCache.get(p.id) || [];
+      const blank = cols.map(() => '');
+      snaps.forEach(s => {
+        lines.push(['SNAPSHOT'].concat(blank).concat([
+          fmtDate(s.day), s.qty,
+          s.avgCost == null ? '' : s.avgCost,
+          s.stdCost == null ? '' : s.stdCost,
+          s.totalCost == null ? '' : s.totalCost
+        ]).map(csvEscape).join(','));
+      });
+    }
+  });
+  const blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = (safeDate(_asOf) || todayISO());
+  a.href = url; a.download = 'inventory_valuation_' + stamp + '.csv';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+function printTable() { window.print(); }
+
+// ── Bootstrap ───────────────────────────────────────────────────────
+async function bootstrapData() {
+  try {
+    await loadLocationGroups();
+    setLgItems(_lgList);
+    syncLgSelected();
+    await refresh();
+  } catch (e) {
+    setStatus('Error: ' + (e.message || e));
+    showToast('Init failed: ' + (e.message || e), 'error', 5000);
+  }
+}
+async function init() {
+  if (!_asOf) _asOf = todayISO();
+  loadSavedState();
+  applyUiFromState();
+
+  document.getElementById('partFilter').addEventListener('keydown', e => { if (e.key === 'Enter') refresh(); });
+  document.getElementById('asOfDate').addEventListener('change', () => refresh());
+  // Cost basis switches the valuation without a re-query — both costs are held.
+  document.getElementById('costBasis').addEventListener('change', () => {
+    _costBasis = document.getElementById('costBasis').value;
+    recomputeValues();
+    renderTable();
+  });
+  document.getElementById('lookback').addEventListener('change', () => {
+    _lookback = document.getElementById('lookback').value;
+    // Lookback only affects the drill-down window (not the parent valuation),
+    // so just re-fetch the open snapshots and re-render as each lands.
+    _snapCache.clear();
+    renderTable();   // shows the loading state for expanded parts
+    [..._expanded].forEach(id => { loadSnapshots(id).then(() => renderTable()).catch(() => {}); });
+  });
+
+  buildLgMS();
+  await bootstrapData();
+  window.addEventListener('resize', () => { if (_expanded.size) renderTable(); });
+}
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>

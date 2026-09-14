@@ -4,6 +4,31 @@ This guide covers every built-in JavaScript function available in Fishbowl BI re
 
 ---
 
+## ⚠ After ANY edit: regenerate `Deployed/`
+
+Every `*.htm` and `scripts/*.{js,css}` in this repo has a JSON-wrapped twin in
+**`Deployed/`** — the form the Fishbowl client imports. **Whenever you change a
+source file, regenerate:**
+
+```
+node tools/deploy/build-deployed.js
+```
+
+- The folder is **flat** — every export sits directly in `Deployed/`, no
+  subfolders. That matches how the client exports, so the folder is a drop-in
+  match for a client export directory.
+- Filenames are `<name>-<type>.json`; type is `Page` (.htm), `Script` (.js),
+  `Style` (.css). `Deployed/manifest.json` maps each back to its source.
+- The envelope is Jackson's `DefaultPrettyPrinter` output, **not**
+  `JSON.stringify` — space on both sides of the colon, CRLF, `[ {` … `} ]` with
+  no trailing newline. `tools/deploy/fbwrap.js` owns it; don't hand-roll it.
+- **Names key the import.** A name matching a live record UPDATES it; a new name
+  CREATES a duplicate. The recovered live names live in `DEPLOYED_NAMES` in the
+  generator — do not "tidy" them. See `Deployed/README.md` for the full contract
+  and the known caveats.
+
+---
+
 ## What Is a BI Report?
 
 A BI report is an **HTML file** that runs inside an embedded browser in the Fishbowl Advanced desktop client. You write standard HTML, CSS, and JavaScript — the report is stored in Fishbowl and opened in a panel inside the client window.

@@ -1,0 +1,1541 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  REPORT: Bill of Materials Cost
+  PATH:   Manufacturing/BOM_Cost.htm
+  --------------------------------------------------------------------------------
+  Expected cost to build one unit of each Bill of Materials, rebuilt from
+  BillOfMaterials.jrxml.
+
+  WHY THIS EXISTS — the JRXML miscosts every line whose BOM unit of measure
+  differs from the part's stocking unit. Its total is
+      $V{cost}.multiply($F{bomItemQty})
+  i.e. (cost per PART uom) x (quantity in BOM uom), with no conversion between
+  the two. Measured against demodb that overstates 7 of the BOMs, e.g.
+
+      BOM              JRXML       correct    because
+      Kombucha Keg     $81.31      $2.64      2 "min" of labour priced per "hr"
+      Kombucha 500mL   $20.28      $0.62      0.5 "min" of labour priced per "hr"
+      ABC. rev2       $856.34     $69.99      389 "mm" of a part sold per "4.8m"
+      COYO             $46.55     $40.61      1.25 "kg" of a part sold per "20kg"
+
+  This report converts the BOM quantity into the part's stocking UOM before
+  costing it, shows the factor it applied, and refuses to guess when no
+  conversion path exists (the silent 1:1 assumption is the original bug).
+
+  CONFIGURABLE BOMs — a line carrying a bomItemGroupId is one option among
+  several, and exactly one member of each group may be costed or the BOM is
+  priced with every option fitted at once (FG2200: $186 correct, $398 if all
+  8 groups are double-counted). The group members are sorted together, indented
+  under the BOM's fixed lines and given a radio, so the default can be swapped
+  for any alternative and the build cost, the co-product apportionment and
+  Available to Build all recost against the configuration actually chosen.
+  A customised BOM is flagged CUSTOM CONFIG, because the figure it shows is no
+  longer the BOM's own answer; the flag, or the header button, resets it.
+================================================================================
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Bill of Materials Cost - Fishbowl BI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+
+  <!-- Shared Fishbowl BI lib — inlined by Fishbowl at report SAVE time from the
+       saved "fb-lib" script (source of truth: scripts/fb-lib.js). Powers the
+       multi-select filters and the shared format helpers. The include below is
+       expanded by a GLOBAL textual replace, so it may appear only once in this
+       whole file — comments and JS strings included. Must precede the shared
+       stylesheet so window.FBLib exists before any inline code runs. -->
+  <script>
+    {% Script fb-lib %}
+  </script>
+
+  <!-- Shared Fishbowl BI stylesheet, expanded the same way from the saved
+       "fb-styles" Style (source of truth: scripts/fb-styles.css). Provides
+       .hdr-btn, .rpt-table (§29), .ms-* (§32), .badge, .row-link and the
+       tokens. MUST come before the inline block below so per-report rules win
+       the cascade on identical selectors. -->
+  <style>
+    {% Style fb-styles %}
+  </style>
+
+  <style>
+    html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family: 'Inter', sans-serif; }
+
+    #filtersPanel { background: white; border-bottom: 1px solid #e2e8f0; padding: 10px 20px; display: none; flex-shrink: 0; }
+    #filtersPanel.open { display: block; }
+    #filtersPanel select, #filtersPanel input[type=text] {
+      padding: 4px 8px; border: 1px solid #e2e8f0; border-radius: 6px;
+      font-size: 12px; color: #374151; background: #f9fafb; font-family: 'Inter', sans-serif;
+    }
+    .f-group  { display: flex; flex-direction: column; gap: 8px; min-width: 240px; }
+    .f-head   { font-size: 11px; font-weight: 600; color: #64748b; text-transform: uppercase;
+                letter-spacing: .04em; border-bottom: 1px solid #e2e8f0; padding-bottom: 4px; }
+    .f-lbl    { font-size: 10px; font-weight: 600; color: #94a3b8; text-transform: uppercase;
+                letter-spacing: .04em; margin-bottom: 4px; }
+    .f-check  { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #475569; cursor: pointer; }
+
+    /* .ms-* skin ships from fb-styles §32; widgets built by FBLib.Common.MultiSelect. */
+
+    /* Table — the compact tier is .rpt-table from fb-styles §29. Only the
+       report-specific cells live here. */
+    .num-cell  { text-align: right; font-variant-numeric: tabular-nums; }
+    .desc-cell { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+
+    /* BOM row — deliberately the SAME cells and the same styling in both views,
+       so a Detail band reads as a Summary row. Detail adds only a chevron and a
+       top rule to delimit each group; there is no coloured band. */
+    tr.bom-row td { border-top: 2px solid #CBE5FB; }
+    tr.bom-row.bom-clickable td { cursor: pointer; }
+    tr.bom-row:hover td { background: var(--tint-blue) !important; }
+    .bom-toggle { display: inline-block; width: 12px; font-size: 9px; color: var(--link); margin-right: 4px; }
+
+    /* Sub-rows (components, and the co-product apportionment) sit visually
+       beneath their BOM without competing with it. */
+    tr.sub-row td { background: #fbfdff; color: #475569; }
+    tr.sub-row.out-row td { background: #faf9ff; }
+    tr.sub-row:hover td { background: #eff6ff !important; }
+    .sub-ind { color: #cbd5e1; margin-right: 5px; }
+    /* Option-group members are indented one step further than a fixed component
+       so the choices read as a set nested under the BOM's fixed content. */
+    .opt-ind   { display: inline-block; width: 17px; }
+    .opt-radio { margin: 0 6px 0 0; vertical-align: -2px; cursor: pointer; accent-color: var(--link); }
+    tr.sub-row.opt-row td { background: #f7f7fe; }
+    tr.sub-row.opt-row:hover td { background: #eef2ff !important; }
+    /* The costed option carries the emphasis; the alternatives recede. */
+    tr.sub-row.opt-row.opt-off td { color: #94a3b8; }
+    /* Converted quantities get a faint underline so the tooltip is discoverable. */
+    .conv-cell { border-bottom: 1px dotted #10b981; cursor: help; }
+
+    /* Conversion chip — the visible evidence of the fix. */
+    .conv {
+      display: inline-flex; align-items: center; gap: 3px; font-size: 10.5px;
+      background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0;
+      border-radius: 4px; padding: 0 5px; font-variant-numeric: tabular-nums;
+    }
+    .conv.same { background: #f1f5f9; color: #94a3b8; border-color: #e2e8f0; }
+    .conv.bad  { background: #fef2f2; color: #b91c1c; border-color: #fecaca; }
+
+    .flag {
+      display: inline-flex; align-items: center; gap: 3px; font-size: 10px; font-weight: 600;
+      border-radius: 4px; padding: 1px 5px; margin-right: 3px; white-space: nowrap;
+    }
+    .flag-conv   { background: #ecfdf5; color: #047857; }
+    .flag-nocost { background: #fef3c7; color: #92400e; }
+    .flag-noconv { background: #fee2e2; color: #991b1b; }
+    .flag-multi  { background: #ede9fe; color: #5b21b6; }
+    .flag-sub    { background: #e0f2fe; color: #075985; }
+    .flag-fb     { background: #f1f5f9; color: #475569; }
+    /* The two "the BOM does not fix this line" cases, costed on their default. */
+    .flag-opt    { background: #eef2ff; color: #4338ca; }
+    .flag-var    { background: #fffbeb; color: #b45309; }
+    /* A configuration the user chose, not the one the BOM ships with — this must
+       be conspicuous, because the cost shown is no longer the BOM's own answer. */
+    .flag-custom { background: #4338ca; color: #ffffff; }
+
+    .warn-icon { width: 12px; height: 12px; flex-shrink: 0; vertical-align: -2px; }
+    .muted { color: #94a3b8; }
+
+    #colPanel {
+      position: absolute; z-index: 200; top: calc(100% + 4px); right: 0;
+      background: white; border: 1px solid #d1d5db; border-radius: 8px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.13); width: 230px; max-height: 400px; overflow-y: auto;
+    }
+    .col-row { display: flex; align-items: center; gap: 8px; padding: 5px 10px;
+               border-bottom: 1px solid #f3f4f6; cursor: grab; user-select: none; }
+    .col-row:last-child { border: none; }
+    .col-row.drag-over { background: #eff6ff; border-top: 2px solid var(--link); }
+    .col-row.dragging { opacity: .4; }
+    .col-row label { font-size: 12px; cursor: pointer; flex: 1; color: #374151; }
+    .drag-handle { color: #94a3b8; flex-shrink: 0; cursor: grab; line-height: 1; }
+
+    .spinner { animation: spin 0.75s linear infinite; }
+
+    .bc-tooltip {
+      position: absolute; background: rgba(15,23,42,.95); color: #fff;
+      padding: 9px 12px; border-radius: 8px; font-size: 11px; line-height: 1.55;
+      pointer-events: none; z-index: 10000; box-shadow: 0 8px 24px rgba(0,0,0,.35);
+      opacity: 0; transition: opacity .15s ease; max-width: 360px; white-space: pre-line;
+    }
+    .bc-tooltip.show { opacity: 1; }
+
+    @media print {
+      html, body { overflow: visible; height: auto; }
+      @page { size: A4 landscape; margin: .5in; }
+      header, #filtersPanel, #colPanel, .hdr-btn { display: none !important; }
+      #tableWrap { overflow: visible !important; }
+    }
+  </style>
+</head>
+<body class="bg-slate-50 flex flex-col">
+
+<div id="bcTooltip" class="bc-tooltip"></div>
+
+  <!-- HEADER -->
+  <header class="bg-white border-b border-slate-200 px-5 flex items-center justify-between flex-shrink-0 shadow-sm" style="height:56px;">
+    <div>
+      <h1 class="text-base font-bold text-slate-900 leading-tight">Bill of Materials Cost</h1>
+      <p id="statusLine" class="text-xs text-slate-400 leading-tight">Initialising…</p>
+    </div>
+    <div class="flex items-center gap-2">
+
+      <button id="filtersBtn" onclick="toggleFilters()" class="hdr-btn">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+        Filters
+      </button>
+
+      <div class="relative" id="colWrap">
+        <button onclick="toggleColPanel()" class="hdr-btn" id="colBtn">
+          <svg fill="currentColor" viewBox="0 0 24 24"><circle cx="8" cy="6" r="1.5"/><circle cx="8" cy="12" r="1.5"/><circle cx="8" cy="18" r="1.5"/><circle cx="16" cy="6" r="1.5"/><circle cx="16" cy="12" r="1.5"/><circle cx="16" cy="18" r="1.5"/></svg>
+          Columns
+        </button>
+        <div id="colPanel" class="hidden">
+          <div class="px-3 py-2 text-xs font-semibold text-slate-400 border-b border-slate-100 sticky top-0 bg-white">Show / Reorder</div>
+          <div id="colList"></div>
+        </div>
+      </div>
+
+      <div class="w-px h-6 bg-slate-200 mx-1"></div>
+
+      <button onclick="loadData()" class="hdr-btn" id="refreshBtn">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+        Refresh
+      </button>
+
+      <div class="flex items-center gap-1" style="border:1px solid #e2e8f0;border-radius:8px;padding:4px 10px;background:white;flex-shrink:0;">
+        <svg width="14" height="14" fill="none" stroke="#94a3b8" stroke-width="2" viewBox="0 0 24 24" style="flex-shrink:0;"><path d="M3 5h18M3 10h10M3 15h18M3 20h10" stroke-linecap="round"/></svg>
+        <select id="viewModeSelect" onchange="setViewMode(this.value)" style="border:none;background:transparent;font-size:12px;color:#475569;font-family:'Inter',sans-serif;cursor:pointer;outline:none;font-weight:500;">
+          <option value="summary">Summary</option>
+          <option value="detail" selected>Detail</option>
+        </select>
+      </div>
+
+      <!-- display is driven by setViewMode(); it must become `flex`, not the
+           default `block`, or the two buttons stack instead of sitting side by side. -->
+      <div id="expandBtnGroup" style="display:none; border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;flex-shrink:0;">
+        <button onclick="expandAll(true)" class="hdr-btn" style="border:none;border-radius:0;border-right:1px solid #e2e8f0;" title="Expand all">
+          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+          Expand
+        </button>
+        <button onclick="expandAll(false)" class="hdr-btn" style="border:none;border-radius:0;" title="Collapse all">
+          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 12h14" stroke-linecap="round"/></svg>
+          Collapse
+        </button>
+      </div>
+
+      <!-- Only shown once something is customised; renderTable() toggles it. -->
+      <button id="resetOptsBtn" onclick="resetAllOptions()" class="hdr-btn" style="display:none;"
+              title="Cost every configurable BOM on its own default options again">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h5M20 20v-5h-5M20 9A8 8 0 006.3 5.3M4 15a8 8 0 0013.7 3.7" stroke-linecap="round"/></svg>
+        Reset options
+      </button>
+
+      <div class="w-px h-6 bg-slate-200 mx-1"></div>
+
+      <button onclick="exportCSV()" class="hdr-btn">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+        CSV
+      </button>
+
+      <button onclick="printTable()" class="hdr-btn">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+        Print
+      </button>
+    </div>
+  </header>
+
+  <!-- FILTERS -->
+  <div id="filtersPanel">
+    <div class="flex flex-wrap items-start" style="gap:14px 22px;">
+
+      <div class="f-group">
+        <div class="f-head">Bill of Materials</div>
+        <div>
+          <div class="f-lbl">BOM Number</div>
+          <div class="ms-container" id="bomMs">
+            <div class="ms-trigger" id="bomMs-trigger"><span class="ms-placeholder">All BOMs</span></div>
+            <div class="ms-dropdown hidden" id="bomMs-dropdown">
+              <div class="ms-search"><input type="text" id="bomMs-search" placeholder="Type to filter…" /></div>
+              <div class="ms-actions"><span id="bomMs-all">Select All</span><span id="bomMs-clear">Clear All</span></div>
+              <div class="ms-list" id="bomMs-list"></div>
+            </div>
+          </div>
+        </div>
+        <label class="f-check"><input type="checkbox" id="inclInactive"> Include inactive BOMs</label>
+      </div>
+
+      <div class="f-group">
+        <div class="f-head">Finished Good</div>
+        <div>
+          <div class="f-lbl">Part Number</div>
+          <div class="ms-container" id="partMs">
+            <div class="ms-trigger" id="partMs-trigger"><span class="ms-placeholder">All finished goods</span></div>
+            <div class="ms-dropdown hidden" id="partMs-dropdown">
+              <div class="ms-search"><input type="text" id="partMs-search" placeholder="Type to filter…" /></div>
+              <div class="ms-actions"><span id="partMs-all">Select All</span><span id="partMs-clear">Clear All</span></div>
+              <div class="ms-list" id="partMs-list"></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="f-lbl">Text search (BOM / part / description)</div>
+          <input type="text" id="textFilter" placeholder="Filter…" style="width:100%;" oninput="renderTable()">
+        </div>
+      </div>
+
+      <div class="f-group">
+        <div class="f-head">Costing</div>
+        <div>
+          <div class="f-lbl">Method</div>
+          <select id="costMethod" style="width:100%;" onchange="recomputeAndRender()">
+            <option value="avg" selected>Average</option>
+            <option value="std">Standard</option>
+            <option value="avg_std">Average &gt; Standard</option>
+            <option value="std_avg">Standard &gt; Average</option>
+          </select>
+        </div>
+        <div>
+          <div class="f-lbl">Unit-cost decimals</div>
+          <select id="costDp" style="width:100%;" onchange="renderTable()">
+            <option value="2" selected>2</option>
+            <option value="4">4</option>
+            <option value="6">6</option>
+          </select>
+        </div>
+        <label class="f-check"><input type="checkbox" id="onlyIssues" onchange="renderTable()"> Only BOMs with a costing issue</label>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- TABLE -->
+  <div id="tableWrap" class="flex-1 overflow-auto" style="min-height:0; position:relative;">
+    <div id="loadingOverlay" style="display:none; position:sticky; top:0; left:0; right:0; height:0; z-index:30; overflow:visible;">
+      <div style="display:flex; align-items:center; justify-content:center; flex-direction:column; gap:10px; height:100vh; background:rgba(248,250,252,.85);">
+        <svg class="spinner" width="36" height="36" viewBox="0 0 24 24" fill="none">
+          <circle cx="12" cy="12" r="10" stroke="#e2e8f0" stroke-width="3"/>
+          <path d="M12 2a10 10 0 0 1 10 10" stroke="var(--link)" stroke-width="3" stroke-linecap="round"/>
+        </svg>
+        <span style="font-size:13px;color:#64748b;font-weight:500;">Loading data…</span>
+      </div>
+    </div>
+    <table id="dataTable" class="rpt-table">
+      <thead id="tHead"></thead>
+      <tbody id="tBody"><tr><td style="padding:2rem;color:#9ca3af;text-align:center;" colspan="99">Loading…</td></tr></tbody>
+      <tfoot id="tFoot"></tfoot>
+    </table>
+  </div>
+
+<script>
+// ============================================================================
+// Runtime guards
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+  document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;">' +
+    '<h2 style="color:#b91c1c;">Not running inside Fishbowl</h2>' +
+    '<p>This report uses the Fishbowl BI JavaScript API and must be opened from the ' +
+    'Fishbowl Advanced client.</p></div>';
+  throw new Error('Fishbowl API not available');
+}
+if (!window.FBLib || !FBLib.Common) {
+  document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;">' +
+    '<h2 style="color:#b91c1c;">fb-lib not loaded</h2>' +
+    '<p>Confirm a Script named exactly <code>fb-lib</code> exists in the BI Script Editor, ' +
+    'then <strong>re-save this report</strong> — the shared-library include is expanded at ' +
+    'save time, not at run time.</p></div>';
+  throw new Error('FBLib not available');
+}
+
+// NOTE: the refresh entry point is deliberately named loadData(), NOT runQuery().
+// `runQuery` is a Fishbowl built-in; declaring a global function with that name
+// shadows it for the whole page.
+
+// ============================================================================
+// bomitem.typeId — from the bomitemtype table
+// ============================================================================
+const T_FINISHED   = 10;   // Finished Good      — what the BOM outputs
+const T_RAW        = 20;   // Raw Good           — consumed, and therefore costed
+const T_REPAIR_RAW = 30;   // Repair Raw Good    — also consumed
+const T_REPAIR_FG  = 31;   // Repair Finished Good
+const T_NOTE       = 40;   // Note               — no part, no cost
+const T_SUBBOM     = 50;   // Bill of Materials  — a nested BOM
+
+const COMPONENT_TYPES = [T_RAW, T_REPAIR_RAW];
+const OUTPUT_TYPES    = [T_FINISHED, T_REPAIR_FG];
+
+// part.typeId 10 = Inventory. Only stocked parts can limit a build.
+const PART_TYPE_INVENTORY = 10;
+
+const SETTINGS = {
+  userKey:   'cdx.bi.bomcost.user.v1',
+  masterKey: 'cdx.bi.bomcost.master.v1',
+  defaults: { v: 1, cols: [], viewMode: 'detail', costMethod: 'avg',
+              costDp: '2', inclInactive: false, optionSel: {} }
+};
+
+// ============================================================================
+// State
+// ============================================================================
+let RAW_ROWS   = [];      // one row per bomitem (plus a row for empty BOMs)
+let BOMS       = [];      // computed per-BOM objects
+let collapsed  = {};      // { bomId: true } — BOMs start collapsed after every load
+let viewMode   = 'detail';
+// Which option a user has picked in each configurable group:
+//   { "<bomId>:<groupId>": <bomItemId> }
+// Absent = use the BOM's own default. Persisted per user, so a costed
+// configuration survives a reload.
+let OPTION_SEL = {};
+let bomMs = null, partMs = null;
+let _dragIdx = null;
+
+// ============================================================================
+// UOM engine
+//
+// uomconversion row (from F, to T, multiply m, factor f) means
+//     value_in_T = value_in_F * m / f
+// Rows exist only for pairs an admin created, so resolution is a breadth-first
+// walk of the conversion graph rather than a single lookup — that also picks up
+// multi-hop chains (e.g. mm -> m -> 4.8m) where no direct row was ever created.
+//
+// When no path exists the answer is null, NOT 1. Assuming 1:1 for an
+// unconvertible pair is precisely the defect this report was written to fix, so
+// the line is excluded from the cost and flagged instead of quietly wrong.
+// ============================================================================
+let UOM_BY_ID = {};
+let UOM_CONV  = {};
+const _ratioCache = {};
+
+function loadUomEngine() {
+  UOM_BY_ID = {}; UOM_CONV = {};
+  const uoms = JSON.parse(runQuery('SELECT id, code, name, uomtype FROM uom') || '[]') || [];
+  uoms.forEach(u => {
+    UOM_BY_ID[parseInt(u.id)] = { id: parseInt(u.id), code: String(u.code || '').trim(),
+                                  name: u.name, type: parseInt(u.uomtype) };
+  });
+  const convs = JSON.parse(runQuery('SELECT fromuomid, touomid, multiply, factor FROM uomconversion') || '[]') || [];
+  convs.forEach(c => {
+    const f = parseInt(c.fromuomid), t = parseInt(c.touomid);
+    const m = parseFloat(c.multiply), fac = parseFloat(c.factor);
+    if (!f || !t || !isFinite(m) || !isFinite(fac) || fac === 0) return;
+    (UOM_CONV[f] = UOM_CONV[f] || []).push({ to: t, ratio: m / fac });
+  });
+}
+
+// Multiplier that turns a quantity expressed in fromId into one expressed in
+// toId. Returns null when the two units cannot be related.
+function uomRatio(fromId, toId) {
+  fromId = parseInt(fromId); toId = parseInt(toId);
+  if (!fromId || !toId) return null;
+  if (fromId === toId) return 1;
+  const ck = fromId + '>' + toId;
+  if (_ratioCache[ck] !== undefined) return _ratioCache[ck];
+
+  const seen = { [fromId]: true };
+  let queue = [{ id: fromId, r: 1 }];
+  let guard = 0;
+  while (queue.length && guard++ < 5000) {
+    const cur = queue.shift();
+    const edges = UOM_CONV[cur.id] || [];
+    for (let i = 0; i < edges.length; i++) {
+      const e = edges[i], r = cur.r * e.ratio;
+      if (e.to === toId) { _ratioCache[ck] = r; return r; }
+      if (seen[e.to]) continue;
+      seen[e.to] = true;
+      queue.push({ id: e.to, r: r });
+    }
+  }
+  _ratioCache[ck] = null;
+  return null;
+}
+
+function uomCode(id) { const u = UOM_BY_ID[parseInt(id)]; return u ? u.code : ''; }
+
+// ============================================================================
+// Formatting
+// ============================================================================
+const fmtMoney = v => FBLib.Common.formatMoney(v);
+const fmtQty   = v => FBLib.Common.formatQty(v);
+
+function currencySym() {
+  try { return FBLib.Common.currency().symbol; } catch (e) { return '$'; }
+}
+// Unit costs need more precision than 2dp — $0.1167/min rounds to $0.12 and the
+// error compounds across a 500-unit batch.
+function fmtUnitCost(v) {
+  const dp = parseInt((document.getElementById('costDp') || {}).value || 4);
+  const n = parseFloat(v);
+  if (!isFinite(n)) return '';
+  return currencySym() + n.toFixed(dp);
+}
+// A conversion factor spans 1/4800 to 1000 here, so fixed decimals do not work.
+function fmtFactor(r) {
+  if (r == null) return '?';
+  if (r === 1) return '1';
+  if (r >= 0.001 && r < 1000) return String(parseFloat(r.toPrecision(6)));
+  return r.toExponential(3);
+}
+function esc(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function escAttr(s) { return esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+
+const WARN_SVG =
+  '<svg class="warn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+  'stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>' +
+  '<line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>';
+
+function setStatus(t) { const e = document.getElementById('statusLine'); if (e) e.textContent = t; }
+
+// ============================================================================
+// Tooltip
+// ============================================================================
+function tipShow(ev, html) {
+  const t = document.getElementById('bcTooltip');
+  t.innerHTML = html; t.classList.add('show');
+  const x = ev.pageX + 14, y = ev.pageY + 14;
+  t.style.left = (x + 360 > window.innerWidth ? ev.pageX - 360 : x) + 'px';
+  t.style.top  = (y + 140 > window.innerHeight ? ev.pageY - 140 : y) + 'px';
+}
+function tipHide() { document.getElementById('bcTooltip').classList.remove('show'); }
+
+// ============================================================================
+// Filter dropdowns
+// ============================================================================
+function initFilters() {
+  const boms = JSON.parse(runQuery(
+    "SELECT b.id, b.num, COALESCE(b.description,'') AS description, " +
+    "CAST(b.activeFlag AS UNSIGNED) AS act FROM bom b ORDER BY b.num") || '[]') || [];
+
+  bomMs = FBLib.Common.MultiSelect.create({
+    containerId: 'bomMs',
+    placeholder: 'All BOMs',
+    maxTags: 2,
+    items: boms.map(b => ({
+      value: parseInt(b.id),
+      label: b.num + (b.description ? ' — ' + b.description : '') + (b.act ? '' : '  (inactive)')
+    })),
+    onClose: () => loadData()
+  });
+
+  // Finished goods are the parts on a BOM's output line, not every part.
+  const fgs = JSON.parse(runQuery(
+    "SELECT DISTINCT p.id, p.num, COALESCE(p.description,'') AS description " +
+    "FROM bomitem bi INNER JOIN part p ON p.id = bi.partId " +
+    "WHERE bi.typeId IN (" + OUTPUT_TYPES.join(',') + ") ORDER BY p.num") || '[]') || [];
+
+  partMs = FBLib.Common.MultiSelect.create({
+    containerId: 'partMs',
+    placeholder: 'All finished goods',
+    maxTags: 2,
+    items: fgs.map(p => ({
+      value: parseInt(p.id),
+      label: p.num + (p.description ? ' — ' + p.description : '')
+    })),
+    onClose: () => loadData()
+  });
+}
+
+function toggleFilters() {
+  const p = document.getElementById('filtersPanel');
+  p.classList.toggle('open');
+  document.getElementById('filtersBtn').classList.toggle('active', p.classList.contains('open'));
+}
+
+// ============================================================================
+// Load
+// ============================================================================
+function buildSql() {
+  const bomIds  = bomMs  ? bomMs.getSelected().map(Number).filter(Boolean)  : [];
+  const partIds = partMs ? partMs.getSelected().map(Number).filter(Boolean) : [];
+  const inclInactive = document.getElementById('inclInactive').checked;
+
+  let w = ' WHERE 1=1';
+  if (!inclInactive)  w += ' AND b.activeFlag = 1';
+  if (bomIds.length)  w += ' AND b.id IN (' + bomIds.join(',') + ')';
+  if (partIds.length) w += ' AND b.id IN (SELECT bomId FROM bomitem WHERE typeId IN (' +
+                           OUTPUT_TYPES.join(',') + ') AND partId IN (' + partIds.join(',') + '))';
+
+  // Every alias is lowercase on purpose: runQuery lowercases all result keys, so
+  // an alias like `bomNum` would have to be read as row.bomnum. Aliasing in
+  // lowercase keeps the SQL and the JS reading identically.
+  //
+  // partcost is one row per part (verified: 137 rows / 137 distinct partIds), so
+  // this join cannot fan out and duplicate bomitem rows.
+  return (
+    "SELECT b.id AS bom_id, b.num AS bom_num, COALESCE(b.description,'') AS bom_desc, " +
+    "  COALESCE(b.revision,'') AS bom_rev, CAST(b.activeFlag AS UNSIGNED) AS bom_active, " +
+    "  bi.id AS item_id, bi.typeId AS item_type, COALESCE(bit.name,'') AS item_type_name, " +
+    "  COALESCE(bi.quantity,0) AS item_qty, bi.uomId AS item_uom_id, " +
+    "  COALESCE(bi.description,'') AS item_desc, " +
+    "  CAST(COALESCE(bi.variableQty,0) AS UNSIGNED) AS var_qty, " +
+    // groupDefault marks the chosen option inside a configurable BOM's option
+    // group. FG2200 has 8 groups, each with a default and one alternative;
+    // costing both sides of every group inflates it from $186 to $398.
+    "  CAST(COALESCE(bi.groupDefault,1) AS UNSIGNED) AS grp_default, " +
+    "  bi.bomItemGroupId AS grp_id, " +
+    "  p.id AS part_id, COALESCE(p.num,'') AS part_num, COALESCE(p.description,'') AS part_desc, " +
+    "  p.uomId AS part_uom_id, p.typeId AS part_type_id, COALESCE(pt.name,'') AS part_type, " +
+    "  COALESCE(p.stdCost,0) AS std_cost, COALESCE(pc.avgCost,0) AS avg_cost " +
+    "FROM bom b " +
+    "  LEFT JOIN bomitem bi   ON bi.bomId  = b.id " +
+    "  LEFT JOIN bomitemtype bit ON bit.id = bi.typeId " +
+    "  LEFT JOIN part p       ON p.id      = bi.partId " +
+    "  LEFT JOIN parttype pt  ON pt.id     = p.typeId " +
+    "  LEFT JOIN partcost pc  ON pc.partId = p.id " +
+    w +
+    " ORDER BY b.num, bi.typeId, p.num"
+  );
+}
+
+// Available-for-sale per part, company-wide, in the part's base UOM.
+//
+// Basis and source deliberately match Manufacturing/AvailableToBuild.htm:
+//     OnHand − Allocated − NotAvailable + DropShip, floored at 0
+// aggregated from qtyInventoryTotals. If the two reports disagreed on how many
+// units are buildable, that difference would read as a bug in one of them.
+const PART_AVAIL = {};
+function loadAvailability(partIds) {
+  Object.keys(PART_AVAIL).forEach(k => delete PART_AVAIL[k]);
+  const ids = partIds.filter(Boolean);
+  if (!ids.length) return;
+  try {
+    const rows = JSON.parse(runQuery(
+      "SELECT partid AS part_id, GREATEST(COALESCE(SUM(qtyonhand - qtyallocated - " +
+      "qtynotavailable + qtydropship), 0), 0) AS available " +
+      "FROM qtyinventorytotals WHERE partid IN (" + ids.join(',') + ") GROUP BY partid"
+    ) || '[]') || [];
+    rows.forEach(r => { PART_AVAIL[parseInt(r.part_id)] = parseFloat(r.available) || 0; });
+  } catch (e) {
+    console.error('Availability load failed:', e);
+  }
+}
+
+async function loadData() {
+  document.getElementById('loadingOverlay').style.display = 'block';
+  setStatus('Loading…');
+  try {
+    if (!Object.keys(UOM_BY_ID).length) loadUomEngine();
+    RAW_ROWS = await runQueryAsync(buildSql());
+    loadAvailability([...new Set(RAW_ROWS.map(r => parseInt(r.part_id)).filter(Boolean))]);
+    computeCosts();
+    // Detail opens collapsed — 44 BOMs x their components is not a useful
+    // first screen; the BOM rows alone are.
+    collapsed = {};
+    BOMS.forEach(b => { collapsed[b.bomId] = true; });
+    renderTable();
+    persistPrefs();
+  } catch (e) {
+    console.error('BOM cost load failed:', e);
+    setStatus('Load failed — ' + e.message);
+    document.getElementById('tBody').innerHTML =
+      '<tr><td colspan="99" style="padding:2rem;color:#b91c1c;text-align:center;">' +
+      esc(e.message) + '</td></tr>';
+  } finally {
+    document.getElementById('loadingOverlay').style.display = 'none';
+  }
+}
+
+// ============================================================================
+// Costing
+//
+// Cost of one BOM run = sum over consumed lines of
+//     (BOM qty converted into the part's stocking UOM) x (unit cost in that UOM)
+// The conversion is the whole point; see the header comment.
+// ============================================================================
+function pickCost(row, method) {
+  const avg = parseFloat(row.avg_cost) || 0;
+  const std = parseFloat(row.std_cost) || 0;
+  switch (method) {
+    case 'avg':     return { cost: avg, src: 'avg', fellBack: false };
+    case 'std':     return { cost: std, src: 'std', fellBack: false };
+    case 'std_avg': return std > 0 ? { cost: std, src: 'std', fellBack: false }
+                                   : { cost: avg, src: 'avg', fellBack: avg > 0 };
+    default:        return avg > 0 ? { cost: avg, src: 'avg', fellBack: false }
+                                   : { cost: std, src: 'std', fellBack: std > 0 };
+  }
+}
+
+function computeCosts() {
+  const method = document.getElementById('costMethod').value;
+  const byId = {};
+  const order = [];
+
+  RAW_ROWS.forEach(r => {
+    const id = parseInt(r.bom_id);
+    if (!byId[id]) {
+      byId[id] = {
+        bomId: id, num: r.bom_num, desc: r.bom_desc, rev: r.bom_rev,
+        active: String(r.bom_active) === '1',
+        components: [], outputs: [], notes: 0, subBoms: [],
+        buildCost: 0, convertedLines: 0, noConvLines: 0, noCostLines: 0,
+        fellBackLines: 0, optionLines: 0
+      };
+      order.push(id);
+    }
+    const b = byId[id];
+    if (r.item_id == null) return;              // BOM with no lines at all
+
+    const type = parseInt(r.item_type);
+    if (type === T_NOTE) { b.notes++; return; }
+
+    const qty       = parseFloat(r.item_qty) || 0;
+    const itemUomId = parseInt(r.item_uom_id) || null;
+    const partUomId = parseInt(r.part_uom_id) || null;
+
+    if (OUTPUT_TYPES.indexOf(type) >= 0) {
+      b.outputs.push({
+        partId: r.part_id, partNum: r.part_num, partDesc: r.part_desc,
+        qty: qty, uomId: itemUomId, uom: uomCode(itemUomId),
+        partUomId: partUomId, partUom: uomCode(partUomId),
+        avgCost: parseFloat(r.avg_cost) || 0, stdCost: parseFloat(r.std_cost) || 0
+      });
+      return;
+    }
+
+    if (type === T_SUBBOM) {
+      // A nested BOM's cost would have to be rolled up recursively. None exist in
+      // the current data; rather than cost it as zero and hide that, list it.
+      b.subBoms.push({ desc: r.item_desc || r.part_num || '(sub-assembly)', qty: qty });
+      return;
+    }
+
+    if (COMPONENT_TYPES.indexOf(type) < 0) return;
+
+    const ratio   = uomRatio(itemUomId, partUomId);
+    const converted = ratio != null && ratio !== 1;
+    const cs      = pickCost(r, method);
+    const qtyBase = ratio == null ? null : qty * ratio;
+    const ext     = qtyBase == null ? null : qtyBase * cs.cost;
+
+    // Two ways a BOM line is not fixed:
+    //   Optional — the line sits in a configurable BOM's option group
+    //              (bomItemGroupId set). Exactly one member of the group is
+    //              costed, or the BOM is priced at every option at once. That
+    //              is the BOM's default until the user picks another (see
+    //              OPTION_SEL); the rest are listed but excluded.
+    //   Variable — variableQty is set, so the quantity is chosen per build.
+    //              bomitem.quantity is the default, and that is what is costed.
+    const isDefault  = String(r.grp_default) === '1';
+    const inGroup    = r.grp_id != null && String(r.grp_id) !== '';
+    const partTypeId = parseInt(r.part_type_id) || null;
+    const isInv      = partTypeId === PART_TYPE_INVENTORY;
+    const avail      = isInv ? (PART_AVAIL[parseInt(r.part_id)] || 0) : null;
+
+    // Everything that depends on WHICH option is selected — the running cost,
+    // the counters, and how many builds the line allows — is deferred to the
+    // second pass below, because the selection is not known until every line of
+    // the group has been seen.
+    const line = {
+      itemId: r.item_id, typeName: r.item_type_name,
+      partId: r.part_id, partNum: r.part_num, partDesc: r.part_desc,
+      partType: r.part_type, partTypeId: partTypeId, isInventory: isInv,
+      varQty: String(r.var_qty) === '1',
+      isDefault: isDefault, inGroup: inGroup, groupId: r.grp_id,
+      qty: qty, itemUom: uomCode(itemUomId), partUom: uomCode(partUomId),
+      ratio: ratio, qtyBase: qtyBase,
+      unitCost: cs.cost, costSrc: cs.src, fellBack: cs.fellBack,
+      ext: ext, converted: converted,
+      available: avail, builds: null, isConstraint: false, isChosen: false
+    };
+    b.components.push(line);
+  });
+
+  BOMS = order.map(id => {
+    const b = byId[id];
+
+    // ---- Configurable options: sort, then resolve the selection ---------
+    // Fixed lines first in their BOM order, then each option group's members
+    // adjacent (default first) so the alternatives read as a set to choose from
+    // rather than being scattered through the component list.
+    b.components.sort((x, y) => {
+      if (x.inGroup !== y.inGroup) return x.inGroup ? 1 : -1;
+      if (!x.inGroup) return 0;                       // stable: keep BOM order
+      const gx = parseInt(x.groupId) || 0, gy = parseInt(y.groupId) || 0;
+      if (gx !== gy) return gx - gy;
+      return (y.isDefault ? 1 : 0) - (x.isDefault ? 1 : 0);
+    });
+
+    const groups = {};
+    b.components.forEach(c => {
+      if (!c.inGroup) return;
+      (groups[String(c.groupId)] = groups[String(c.groupId)] || []).push(c);
+    });
+    b.optionGroups = Object.keys(groups).length;
+    b.customGroups = 0;
+    Object.keys(groups).forEach(g => {
+      const members = groups[g];
+      const def     = members.find(m => m.isDefault) || members[0];
+      const key     = b.bomId + ':' + g;
+      const picked  = members.find(m => String(m.itemId) === String(OPTION_SEL[key]));
+      const chosen  = picked || def;
+      members.forEach((m, i) => {
+        m.isChosen  = (m === chosen);
+        m.groupKey  = key;
+        m.groupName = g;
+        m.groupFirst = (i === 0);
+        m.groupSize = members.length;
+      });
+      if (chosen !== def) b.customGroups++;
+    });
+    // Lines outside any group are simply in or out on their own flag.
+    b.components.forEach(c => { if (!c.inGroup) c.isChosen = c.isDefault; });
+
+    // ---- Accumulate over the CHOSEN lines only --------------------------
+    b.buildCost = 0; b.convertedLines = 0; b.noConvLines = 0;
+    b.noCostLines = 0; b.fellBackLines = 0; b.optionLines = 0;
+    b.components.forEach(c => {
+      c.builds = null;
+      if (!c.isChosen) { if (c.inGroup) b.optionLines++; return; }
+      if (c.ratio == null) b.noConvLines++; else b.buildCost += c.ext;
+      if (c.converted)     b.convertedLines++;
+      if (c.unitCost <= 0) b.noCostLines++;
+      if (c.fellBack)      b.fellBackLines++;
+      // Only a stocked (Inventory) part can limit a build — labour, service and
+      // non-inventory lines are not held in stock.
+      if (c.isInventory && c.qtyBase != null && c.qtyBase > 0) {
+        c.builds = Math.floor((c.available || 0) / c.qtyBase);
+      }
+    });
+    b.variableLines = b.components.filter(c => c.isChosen && c.varQty).length;
+
+    const distinctParts = new Set(b.outputs.map(o => o.partId)).size;
+    const distinctUoms  = new Set(b.outputs.map(o => o.uom)).size;
+    b.multiOutput = distinctParts > 1 || distinctUoms > 1;
+    b.outputQty   = b.outputs.reduce((s, o) => s + o.qty, 0);
+    b.outputUom   = b.outputs.length ? b.outputs[0].uom : '';
+    b.fgLabel     = b.outputs.length === 0 ? ''
+                  : b.multiOutput ? b.outputs.length + ' outputs'
+                  : b.outputs[0].partNum;
+
+    // ---- Co-product apportionment -------------------------------------
+    // A BOM that yields several finished goods (real here: 100 BTL5 + 5 K20)
+    // splits its build cost between them in proportion to each output's own
+    // value — (output qty converted into that part's stocking UOM) x that
+    // part's AVERAGE cost. This is the standard relative-value method.
+    //
+    // Average cost drives the split regardless of which costing method is
+    // selected for the components: the split is meant to track relative worth
+    // of the outputs, and standard cost is frequently unset (only 49 of 120
+    // BOM parts carry one here), which would silently hand the entire cost to
+    // whichever co-product happened to have a standard cost.
+    //
+    // The output quantity needs the same UOM conversion as the components —
+    // C_Grits is stated as 1 kg on the BOM but stocked and costed per g.
+    b.outputs.forEach(o => {
+      o.ratio     = uomRatio(o.uomId, o.partUomId);
+      o.qtyBase   = o.ratio == null ? null : o.qty * o.ratio;
+      o.basisCost = o.avgCost > 0 ? o.avgCost : 0;
+      o.weight    = (o.qtyBase != null && o.basisCost > 0) ? o.qtyBase * o.basisCost : 0;
+    });
+
+    let totW = b.outputs.reduce((s, o) => s + o.weight, 0);
+    b.apportionBasis = 'value';
+    if (totW <= 0 && b.outputs.length) {
+      // No output carries an average cost, so relative value is unknowable.
+      // Split by quantity and say so, rather than dumping the whole cost on
+      // one co-product or silently reporting nothing.
+      b.apportionBasis = 'quantity';
+      b.outputs.forEach(o => { o.weight = o.qtyBase != null ? o.qtyBase : o.qty; });
+      totW = b.outputs.reduce((s, o) => s + o.weight, 0);
+    }
+    b.outputs.forEach(o => {
+      o.share       = totW > 0 ? o.weight / totW : 0;
+      o.apportioned = b.buildCost * o.share;
+      o.unitCost    = o.qty > 0 ? o.apportioned / o.qty : null;
+    });
+
+    // Single-output BOMs get one rate. Note this covers a BOM that lists the
+    // same part on two output lines (not a co-product) — outputs.length is 2
+    // but the units are comparable, so the quantities legitimately add up.
+    b.costPerUnit = b.multiOutput ? null
+                  : (b.outputQty > 0 ? b.buildCost / b.outputQty : null);
+    // ---- Available to Build --------------------------------------------
+    // Same maths and the same availability basis as AvailableToBuild.htm, so
+    // the two reports agree: the scarcest stocked component sets the number of
+    // complete BUILDS of this BOM (not finished units — a BOM yielding 500 per
+    // build gives atb x 500 units, surfaced on the output rows and tooltip).
+    const constraints = b.components.filter(c => c.builds != null);
+    if (!constraints.length) {
+      b.atb = null;                       // nothing stocked constrains it
+    } else {
+      const min = Math.min.apply(null, constraints.map(c => c.builds));
+      b.atb = Math.max(0, min);
+      constraints.forEach(c => { c.isConstraint = (c.builds === min); });
+    }
+    b.constraintParts = b.components.filter(c => c.isConstraint).map(c => c.partNum);
+
+    b.hasIssue    = b.noConvLines > 0 || b.noCostLines > 0 || b.subBoms.length > 0 ||
+                    (b.multiOutput && b.apportionBasis === 'quantity');
+    return b;
+  });
+}
+
+function recomputeAndRender() { computeCosts(); renderTable(); persistPrefs(); }
+
+// ============================================================================
+// Columns — ONE model shared by both views, so a Detail BOM band row renders in
+// exactly the same columns, in the same positions, as a Summary row.
+//
+//   scope 'bom'  — meaningful only on a BOM band row      (blank on sub-rows)
+//   scope 'sub'  — meaningful only on component / output sub-rows (Detail only)
+//   scope 'both' — carries a comparable value on either
+//
+// Summary hides the 'sub' columns because they would be empty on every row.
+// ============================================================================
+let _columns = [
+  { key: 'bom',      label: 'BOM # / Part',  vis: true,  align: 'left',   scope: 'both' },
+  { key: 'desc',     label: 'Description',   vis: true,  align: 'left',   scope: 'both' },
+  { key: 'rev',      label: 'Rev',           vis: true,  align: 'center', scope: 'bom'  },
+  { key: 'fg',       label: 'Finished Good', vis: true,  align: 'left',   scope: 'bom'  },
+  { key: 'qty',      label: 'Qty',           vis: true,  align: 'right',  scope: 'both' },
+  { key: 'uom',      label: 'UOM',           vis: true,  align: 'center', scope: 'both' },
+  { key: 'baseqty',  label: 'Qty (Part UOM)',vis: true,  align: 'right',  scope: 'sub'  },
+  { key: 'unitcost', label: 'Unit Cost',     vis: true,  align: 'right',  scope: 'sub'  },
+  { key: 'cost',     label: 'Cost',          vis: true,  align: 'right',  scope: 'both' },
+  { key: 'perunit',  label: 'Cost / Unit',   vis: true,  align: 'right',  scope: 'both' },
+  { key: 'atb',      label: 'Available to Build', vis: true, align: 'right', scope: 'both' },
+  { key: 'flags',    label: 'Flags',         vis: true,  align: 'left',   scope: 'both' }
+];
+
+// Columns actually rendered for the current view.
+function visibleCols() {
+  return _columns.filter(c => c.vis && (viewMode === 'detail' || c.scope !== 'sub'));
+}
+function cellCls(c) { return c.align === 'right' ? 'num-cell' : ''; }
+
+function buildColPanel() {
+  const list = document.getElementById('colList');
+  list.innerHTML = '';
+  _columns.forEach((col, i) => {
+    const div = document.createElement('div');
+    div.className = 'col-row';
+    div.draggable = true;
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = col.vis; cb.id = 'cv_' + col.key;
+    cb.addEventListener('change', () => { col.vis = cb.checked; renderTable(); persistCols(); });
+    const lbl = document.createElement('label');
+    lbl.htmlFor = cb.id; lbl.textContent = col.label;
+    div.innerHTML = '<span class="drag-handle"><svg width="12" height="10" viewBox="0 0 12 10" fill="currentColor">' +
+      '<rect y="0" width="12" height="2" rx="1"/><rect y="4" width="12" height="2" rx="1"/>' +
+      '<rect y="8" width="12" height="2" rx="1"/></svg></span>';
+    div.appendChild(cb); div.appendChild(lbl);
+
+    div.addEventListener('dragstart', () => { _dragIdx = i; setTimeout(() => div.classList.add('dragging'), 0); });
+    div.addEventListener('dragend',   () => { div.classList.remove('dragging'); _dragIdx = null; });
+    div.addEventListener('dragover',  e => {
+      e.preventDefault();
+      list.querySelectorAll('.col-row').forEach(r => r.classList.remove('drag-over'));
+      div.classList.add('drag-over');
+    });
+    div.addEventListener('dragleave', () => div.classList.remove('drag-over'));
+    div.addEventListener('drop', e => {
+      e.preventDefault(); div.classList.remove('drag-over');
+      if (_dragIdx === null || _dragIdx === i) return;
+      const moved = _columns.splice(_dragIdx, 1)[0];
+      _columns.splice(i, 0, moved);
+      buildColPanel(); renderTable(); persistCols();
+    });
+    list.appendChild(div);
+  });
+}
+
+function toggleColPanel() { document.getElementById('colPanel').classList.toggle('hidden'); }
+
+// ============================================================================
+// Render
+// ============================================================================
+function setViewMode(m) {
+  viewMode = m;
+  // Must be `flex` — the default `block` stacks the two buttons vertically.
+  document.getElementById('expandBtnGroup').style.display = (m === 'detail') ? 'flex' : 'none';
+  renderTable(); persistPrefs();
+}
+
+function filteredBoms() {
+  const q = (document.getElementById('textFilter').value || '').toLowerCase().trim();
+  const onlyIssues = document.getElementById('onlyIssues').checked;
+  return BOMS.filter(b => {
+    if (onlyIssues && !b.hasIssue) return false;
+    if (!q) return true;
+    if ((b.num + ' ' + b.desc + ' ' + b.fgLabel).toLowerCase().indexOf(q) >= 0) return true;
+    return b.components.some(c =>
+      ((c.partNum || '') + ' ' + (c.partDesc || '')).toLowerCase().indexOf(q) >= 0);
+  });
+}
+
+function renderTable() {
+  const boms = filteredBoms();
+  const cols = visibleCols();
+  document.getElementById('tHead').innerHTML =
+    '<tr>' + cols.map(c => '<th class="' + cellCls(c) + '">' + esc(c.label) + '</th>').join('') + '</tr>';
+
+  const tb = document.getElementById('tBody');
+  if (!boms.length) {
+    tb.innerHTML = '<tr><td colspan="99" style="padding:2rem;color:#9ca3af;text-align:center;">' +
+                   'No bills of materials match the current filters.</td></tr>';
+    document.getElementById('tFoot').innerHTML = '';
+    setStatus('No results');
+    return;
+  }
+
+  const out = [];
+  boms.forEach(b => out.push(bomRowHtml(b, cols)));
+  tb.innerHTML = out.join('');
+  renderFoot(boms, cols);
+
+  // A customised configuration changes the numbers on screen, so it is stated
+  // in the status line as well as flagged on the affected BOM.
+  const custom = boms.filter(b => b.customGroups).length;
+  setStatus(boms.length + ' BOM' + (boms.length === 1 ? '' : 's') +
+    (viewMode === 'detail'
+      ? ' · ' + boms.reduce((s, b) => s + b.components.length, 0) + ' component lines'
+      : '') +
+    ' · ' + document.getElementById('costMethod').selectedOptions[0].text +
+    (custom ? ' · ' + custom + ' BOM' + (custom === 1 ? '' : 's') + ' costed on a custom configuration' : ''));
+  const rb = document.getElementById('resetOptsBtn');
+  if (rb) rb.style.display = Object.keys(OPTION_SEL).length ? 'inline-flex' : 'none';
+}
+
+function renderFoot(boms, cols) {
+  // Build Cost is summable; Cost / Unit is a RATE and is deliberately left
+  // blank — summing rates across BOMs is meaningless.
+  const total = boms.reduce((s, b) => s + b.buildCost, 0);
+  const costIdx = cols.findIndex(c => c.key === 'cost');
+  if (costIdx < 0) { document.getElementById('tFoot').innerHTML = ''; return; }
+  let html = '<tr><td colspan="' + costIdx + '" style="text-align:right;font-weight:600;">' +
+             boms.length + ' BOM' + (boms.length === 1 ? '' : 's') + ' — total build cost</td>' +
+             '<td class="num-cell" style="font-weight:700;">' + fmtMoney(total) + '</td>';
+  for (let i = costIdx + 1; i < cols.length; i++) html += '<td></td>';
+  document.getElementById('tFoot').innerHTML = html + '</tr>';
+}
+
+function bomFlagsHtml(b) {
+  let h = '';
+  if (b.convertedLines)   h += '<span class="flag flag-conv" title="BOM unit differs from the part stocking unit on ' +
+                               b.convertedLines + ' line(s); converted before costing">UOM ×' + b.convertedLines + '</span>';
+  if (b.noConvLines)      h += '<span class="flag flag-noconv" title="No conversion path between the BOM unit and the part unit — excluded from the cost">NO CONV ×' + b.noConvLines + '</span>';
+  if (b.noCostLines)      h += '<span class="flag flag-nocost" title="Part has no unit cost under the chosen method — counted as zero">NO COST ×' + b.noCostLines + '</span>';
+  if (b.fellBackLines)    h += '<span class="flag flag-fb" title="Fell back to the secondary costing method on ' +
+                               b.fellBackLines + ' line(s)">FALLBACK ×' + b.fellBackLines + '</span>';
+  if (b.subBoms.length)   h += '<span class="flag flag-sub" title="Nested BOM line — its sub-assembly cost is not rolled up">SUB-BOM ×' + b.subBoms.length + '</span>';
+  if (b.optionGroups)     h += '<span class="flag flag-opt" title="Configurable BOM with ' + b.optionGroups +
+                               ' option group(s). One option per group is costed — expand the BOM to choose ' +
+                               'which. The other ' + b.optionLines + ' line(s) are listed but not costed.">OPTIONAL ×' +
+                               b.optionGroups + '</span>';
+  if (b.customGroups)     h += '<span class="flag flag-custom" title="' + b.customGroups + ' of the ' +
+                               b.optionGroups + ' option group(s) are costed on an option you chose rather than ' +
+                               'the BOM default. Click to reset this BOM to its defaults." onclick="event.stopPropagation();' +
+                               'resetOptions(' + escAttr(JSON.stringify(String(b.bomId))) + ')" ' +
+                               'style="cursor:pointer;">CUSTOM CONFIG ×' + b.customGroups + '</span>';
+  if (b.variableLines)    h += '<span class="flag flag-var" title="' + b.variableLines +
+                               ' line(s) have a variable quantity — the amount is chosen per build, so this ' +
+                               'is costed at the DEFAULT quantity stated on the BOM.">VARIABLE ×' +
+                               b.variableLines + '</span>';
+  if (b.multiOutput) {
+    let tip = b.outputs.length + ' finished goods — the build cost is apportioned between them by ' +
+              'relative value (qty in each part\'s stocking UOM × its average cost)' +
+              (b.apportionBasis === 'quantity'
+                ? ', falling back to relative quantity because no output has an average cost' : '') +
+              '. Expand for the split.';
+    // When the outputs are stocked in different units their unit costs are not
+    // directly comparable by eye — $0.91/g is 1000x $0.91/kg — so say so.
+    if (new Set(b.outputs.map(o => o.partUom)).size > 1) {
+      tip += '\n\nNote: these outputs are stocked in different units (' +
+             [...new Set(b.outputs.map(o => o.partUom))].join(', ') +
+             '), so their unit costs are not comparable side by side. The split uses value in ' +
+             'currency, which is.';
+    }
+    h += '<span class="flag flag-multi" title="' + escAttr(tip) + '">CO-PRODUCT ×' + b.outputs.length + '</span>';
+  }
+  if (b.multiOutput && b.apportionBasis === 'quantity')
+                          h += '<span class="flag flag-nocost" title="No finished good carries an average cost, so the value-based split is not possible — apportioned by quantity instead">SPLIT BY QTY</span>';
+  if (!b.active)          h += '<span class="flag flag-fb">INACTIVE</span>';
+  return h;
+}
+
+// ---- BOM band row ---------------------------------------------------------
+// Rendered with a real <td> per shared column, so in Detail it is the same row,
+// in the same columns, as it would be in Summary — only a chevron and a group
+// delimiter are added.
+function bomCell(b, key) {
+  switch (key) {
+    case 'bom': {
+      const chev = viewMode === 'detail'
+        ? '<span class="bom-toggle">' + (collapsed[b.bomId] ? '&#9654;' : '&#9660;') + '</span>'
+        : '';
+      return chev + '<a href="#" class="row-link" onclick="event.stopPropagation();openModule(' +
+             "'Bill of Materials','" + escAttr(b.num).replace(/'/g, "\\'") + "'" +
+             ');return false;"><strong>' + esc(b.num) + '</strong></a>';
+    }
+    case 'desc': return '<span class="desc-cell">' + esc(b.desc) + '</span>';
+    case 'rev':  return esc(b.rev);
+    case 'fg':
+      if (!b.outputs.length) return '<span class="muted">—</span>';
+      if (b.multiOutput) return '<span class="muted" title="' +
+        escAttr(b.outputs.map(o => o.partNum).join(', ')) + '">' + b.outputs.length + ' outputs</span>';
+      return '<a href="#" class="row-link" onclick="event.stopPropagation();openModule(' +
+             "'Part','" + escAttr(b.outputs[0].partNum).replace(/'/g, "\\'") + "'" +
+             ');return false;">' + esc(b.outputs[0].partNum) + '</a>';
+    case 'qty':
+      if (b.multiOutput) return '<span class="muted" title="' +
+        escAttr(b.outputs.map(o => fmtQty(o.qty) + ' ' + o.uom + ' ' + o.partNum).join(' + ')) +
+        '">multiple</span>';
+      return b.outputQty ? fmtQty(b.outputQty) : '<span class="muted">—</span>';
+    case 'uom':
+      return b.multiOutput ? '<span class="muted">mixed</span>' : esc(b.outputUom);
+    case 'baseqty':
+    case 'unitcost':
+      return '';
+    case 'cost':
+      return b.noConvLines
+        ? '<span title="Excludes ' + b.noConvLines + ' unconvertible line(s) — this is a lower bound">' +
+          fmtMoney(b.buildCost) + ' ' + WARN_SVG + '</span>'
+        : fmtMoney(b.buildCost);
+    case 'perunit': {
+      if (!b.multiOutput) {
+        return b.costPerUnit == null
+          ? '<span class="muted" title="No finished-good output line on this BOM">—</span>'
+          : '<strong>' + fmtUnitCost(b.costPerUnit) + '</strong>' +
+            '<span class="muted" style="font-size:10px;">/' + esc(b.outputUom) + '</span>';
+      }
+      // Co-product: one rate per finished good. Show up to two inline; the
+      // per-output breakdown sits in the expanded rows underneath.
+      const full = b.outputs.map(o =>
+        o.partNum + ': ' + (o.unitCost == null ? '—' : fmtUnitCost(o.unitCost) + '/' + o.uom) +
+        '  (' + (o.share * 100).toFixed(1) + '% of cost)').join('\n');
+      const shown = b.outputs.slice(0, 2).map(o =>
+        (o.unitCost == null ? '—' : fmtUnitCost(o.unitCost)) +
+        '<span class="muted" style="font-size:10px;">/' + esc(o.uom) + '</span>').join(' · ');
+      const more = b.outputs.length > 2 ? ' <span class="muted">+' + (b.outputs.length - 2) + '</span>' : '';
+      return '<span title="' + escAttr(full) + '">' + shown + more + '</span>';
+    }
+    case 'atb': {
+      if (b.atb == null) return '<span class="muted" title="No stocked (Inventory) component constrains this BOM">—</span>';
+      let tip = 'Complete builds of this BOM from stock now.';
+      if (b.constraintParts.length) tip += '\nLimited by: ' + b.constraintParts.join(', ');
+      if (!b.multiOutput && b.outputQty)
+        tip += '\n= ' + fmtQty(b.atb * b.outputQty) + ' ' + b.outputUom + ' of finished goods.';
+      tip += '\nAvailable for sale = on hand − allocated − not available + drop ship.';
+      const cls = b.atb === 0 ? 'muted' : '';
+      return '<span class="' + cls + '" title="' + escAttr(tip) + '">' +
+             (b.atb === 0 ? '0' : '<strong>' + fmtQty(b.atb) + '</strong>') + '</span>';
+    }
+    case 'flags': return bomFlagsHtml(b);
+  }
+  return '';
+}
+
+// ---- co-product output sub-row -------------------------------------------
+// Shows the apportionment itself: the value weight that drove the split, the
+// share, the apportioned cost and the resulting unit cost.
+function outputCell(b, o, key) {
+  switch (key) {
+    case 'bom': return '<span class="sub-ind">&#8627;</span><a href="#" class="row-link" onclick="' +
+                       "openModule('Part','" + escAttr(o.partNum).replace(/'/g, "\\'") + "')" +
+                       ';return false;">' + esc(o.partNum) + '</a>';
+    case 'desc': return '<span class="desc-cell">' + esc(o.partDesc) + '</span>';
+    case 'rev':  return '';
+    case 'fg': {
+      // Show the VALUE that produced the share, not just the share. Two outputs
+      // whose unit costs read alike can be worth wildly different amounts when
+      // their stocking units differ (C_Grits $0.91/g is $913.78/kg against
+      // C_POLENTA's $1.11/kg) — without the dollar figure a lopsided split
+      // looks like a bug rather than the data it is.
+      const tip = o.basisCost > 0
+        ? 'Value = ' + fmtQty(o.qtyBase) + ' ' + o.partUom + ' × ' +
+          fmtUnitCost(o.basisCost) + '/' + o.partUom + ' = ' + fmtMoney(o.weight) +
+          '\n' + (o.share * 100).toFixed(2) + '% of the total output value' +
+          '\nThat share of the ' + fmtMoney(b.buildCost) + ' build cost = ' + fmtMoney(o.apportioned)
+        : 'No average cost on this part, so it carries no value weight';
+      return '<span class="flag flag-multi" title="' + escAttr(tip) + '">OUTPUT ' +
+             (o.share * 100).toFixed(1) + '%</span>' +
+             (o.weight > 0 ? ' <span class="muted" style="font-size:10.5px;">' +
+                             fmtMoney(o.weight) + '</span>' : '');
+    }
+    case 'qty':  return fmtQty(o.qty);
+    case 'uom':  return esc(o.uom);
+    case 'baseqty':
+      if (o.qtyBase == null) return '<span class="conv bad" title="No conversion from ' +
+        escAttr(o.uom) + ' to the stocking unit ' + escAttr(o.partUom) + '">no path</span>';
+      return fmtQty(o.qtyBase) + ' <span class="muted" style="font-size:10px;">' + esc(o.partUom) + '</span>';
+    case 'unitcost':
+      return o.basisCost > 0
+        ? fmtUnitCost(o.basisCost) + ' <span class="muted" style="font-size:10px;">/' + esc(o.partUom) + '</span>'
+        : '<span class="flag flag-nocost">no avg cost</span>';
+    case 'cost':    return fmtMoney(o.apportioned);
+    case 'perunit': return o.unitCost == null ? '<span class="muted">—</span>'
+                         : '<strong>' + fmtUnitCost(o.unitCost) + '</strong>' +
+                           '<span class="muted" style="font-size:10px;">/' + esc(o.uom) + '</span>';
+    case 'atb':
+      // Finished units of THIS output that the current build capacity yields.
+      return b.atb == null ? '<span class="muted">—</span>'
+           : '<span title="' + escAttr(b.atb + ' build(s) x ' + fmtQty(o.qty) + ' ' + o.uom + ' per build') + '">' +
+             fmtQty(b.atb * o.qty) + ' <span class="muted" style="font-size:10px;">' + esc(o.uom) + '</span></span>';
+    case 'flags':
+      return b.apportionBasis === 'quantity'
+        ? '<span class="flag flag-nocost" title="No output carries an average cost, so the split falls back to relative quantity">SPLIT BY QTY</span>'
+        : '<span class="flag flag-multi" title="Share of build cost = this output’s value (qty in stocking UOM × average cost) over the total">SPLIT BY VALUE</span>';
+  }
+  return '';
+}
+
+// ---- component sub-row ----------------------------------------------------
+function componentCell(line, key) {
+  switch (key) {
+    case 'bom': {
+      const link = line.partNum
+        ? '<a href="#" class="row-link" onclick="' +
+          "openModule('Part','" + escAttr(line.partNum).replace(/'/g, "\\'") + "')" +
+          ';return false;">' + esc(line.partNum) + '</a>'
+        : '<span class="muted">' + esc(line.partDesc || '(no part)') + '</span>';
+      // Option-group members get a radio so the configuration can be costed
+      // as the user would actually build it, and an extra indent so the group
+      // reads as one set of mutually exclusive choices.
+      if (line.inGroup) {
+        return '<span class="opt-ind"></span>' +
+          '<input type="radio" class="opt-radio" name="' + escAttr('optg_' + line.groupKey) + '"' +
+          (line.isChosen ? ' checked' : '') +
+          ' onclick="event.stopPropagation();"' +
+          ' onchange="chooseOption(' + escAttr(JSON.stringify(line.groupKey)) + ',' +
+                     escAttr(JSON.stringify(String(line.itemId))) + ')"' +
+          ' title="Cost this BOM using this option">' + link;
+      }
+      return '<span class="sub-ind">&#8627;</span>' + link;
+    }
+    case 'desc': return '<span class="desc-cell">' + esc(line.partDesc) + '</span>';
+    case 'rev':  return '';
+    case 'fg':
+      // For grouped lines the useful identifier is WHICH group, not the part type.
+      if (line.inGroup) return '<span class="muted" style="font-size:10.5px;" title="' +
+        escAttr('Option group ' + line.groupName + ' — ' + line.groupSize + ' choices, one is costed') +
+        '">Group ' + esc(line.groupName) + '</span>';
+      return '<span class="muted" style="font-size:10.5px;">' + esc(line.partType) + '</span>';
+    case 'qty':  return fmtQty(line.qty) +
+                        (line.varQty ? ' <span class="muted" title="Variable-quantity line — this is the default">~</span>' : '');
+    case 'uom':  return esc(line.itemUom);
+    case 'baseqty': {
+      // The conversion column was removed, so the factor lives here as a
+      // tooltip — this cell is the evidence that the conversion happened.
+      if (line.ratio == null) return '<span class="conv bad" title="No conversion path from ' +
+        escAttr(line.itemUom) + ' to ' + escAttr(line.partUom) +
+        ' — this line is excluded from the cost">no path</span>';
+      const body = fmtQty(line.qtyBase) +
+        ' <span class="muted" style="font-size:10px;">' + esc(line.partUom) + '</span>';
+      if (!line.converted) return body;
+      return '<span class="conv-cell" title="' + escAttr(line.itemUom) + ' → ' + escAttr(line.partUom) +
+             ' × ' + fmtFactor(line.ratio) + '">' + body + '</span>';
+    }
+    case 'unitcost': return line.unitCost > 0
+      ? fmtUnitCost(line.unitCost) + ' <span class="muted" style="font-size:10px;">/' + esc(line.partUom) + '</span>'
+      : '<span class="flag flag-nocost">no cost</span>';
+    case 'cost':    return !line.isChosen ? '<span class="muted">not costed</span>'
+                         : (line.ext == null ? '<span class="muted">—</span>' : fmtMoney(line.ext));
+    case 'perunit': return '';
+    case 'atb': {
+      if (!line.isChosen) return '';
+      if (!line.isInventory) return '<span class="muted" title="' + escAttr(line.partType) +
+        ' parts are not stocked, so this line cannot limit a build">n/a</span>';
+      if (line.builds == null) return '<span class="muted">—</span>';
+      const tip = fmtQty(line.available) + ' ' + line.partUom + ' available ÷ ' +
+                  fmtQty(line.qtyBase) + ' ' + line.partUom + ' per build';
+      return '<span title="' + escAttr(tip) + '"' +
+             (line.isConstraint ? ' style="color:#b91c1c;font-weight:700;"' : '') + '>' +
+             fmtQty(line.builds) + '</span>';
+    }
+    case 'flags': {
+      let n = '';
+      if (line.inGroup) {
+        // Two independent facts: which option the BOM ships as default, and
+        // which one is currently being costed. They differ once a user picks.
+        if (line.isChosen) {
+          n += line.isDefault
+            ? '<span class="flag flag-opt" title="Default option in this group — this is the one costed">OPTIONAL · default</span>'
+            : '<span class="flag flag-opt" title="You have selected this option instead of the BOM default — this is the one costed">OPTIONAL · selected</span>';
+        } else {
+          n += line.isDefault
+            ? '<span class="flag flag-fb" title="The BOM default for this group, but you have selected a different option — not costed">OPTIONAL · default, not selected</span>'
+            : '<span class="flag flag-fb" title="Alternative option in this group — not selected, so not costed">OPTIONAL · alternative</span>';
+        }
+      } else if (!line.isDefault) {
+        n += '<span class="flag flag-fb" title="Not the default line — not costed">NON-DEFAULT</span>';
+      }
+      if (line.varQty)        n += '<span class="flag flag-var" title="Variable quantity — the amount is chosen per build; costed at the default quantity stated on the BOM">VARIABLE</span>';
+      if (line.isConstraint)  n += '<span class="flag flag-noconv" title="This component is the bottleneck limiting Available to Build">BOTTLENECK</span>';
+      if (line.converted)     n += '<span class="flag flag-conv" title="BOM unit differs from the stocking unit; converted before costing">converted</span>';
+      if (line.ratio == null) n += '<span class="flag flag-noconv">excluded</span>';
+      if (line.fellBack)      n += '<span class="flag flag-fb">' + (line.costSrc === 'std' ? 'std' : 'avg') + ' fallback</span>';
+      return n;
+    }
+  }
+  return '';
+}
+
+// ---- a BOM and (in Detail, when expanded) everything under it -------------
+function bomRowHtml(b, cols) {
+  const rows = [];
+  const detail = viewMode === 'detail';
+  rows.push('<tr class="bom-row' + (detail ? ' bom-clickable' : '') + '"' +
+    (detail ? ' onclick="toggleBom(' + b.bomId + ')"' : '') + '>' +
+    cols.map(c => '<td class="' + cellCls(c) + '">' + bomCell(b, c.key) + '</td>').join('') + '</tr>');
+
+  if (!detail || collapsed[b.bomId]) return rows.join('');
+
+  // Co-product apportionment first — it explains the Cost / Unit above it.
+  if (b.multiOutput) {
+    b.outputs.forEach(o => {
+      rows.push('<tr class="sub-row out-row">' +
+        cols.map(c => '<td class="' + cellCls(c) + '">' + outputCell(b, o, c.key) + '</td>').join('') + '</tr>');
+    });
+  }
+
+  b.components.forEach(line => {
+    // The first member of each option group carries a caption row, so a reader
+    // knows the radios below it are one choice and not a list of components.
+    if (line.groupFirst) {
+      rows.push('<tr class="sub-row opt-row"><td colspan="' + cols.length + '" ' +
+        'style="padding-top:5px;font-size:11px;color:#4338ca;">' +
+        '<span class="opt-ind"></span><strong>Option group ' + esc(line.groupName) + '</strong> ' +
+        '<span class="muted">— choose 1 of ' + line.groupSize + ' to cost</span></td></tr>');
+    }
+    rows.push('<tr class="sub-row' +
+      (line.inGroup ? ' opt-row' + (line.isChosen ? '' : ' opt-off') : '') + '">' +
+      cols.map(c => '<td class="' + cellCls(c) + '">' + componentCell(line, c.key) + '</td>').join('') + '</tr>');
+  });
+
+  b.subBoms.forEach(s => {
+    rows.push('<tr class="sub-row"><td colspan="' + cols.length + '" style="color:#075985;background:#f0f9ff;">' +
+      '<span class="flag flag-sub">SUB-BOM</span> ' + esc(s.desc) + ' × ' + fmtQty(s.qty) +
+      ' — nested BOM cost is not rolled up into the figure above.</td></tr>');
+  });
+
+  if (!b.components.length && !b.subBoms.length) {
+    rows.push('<tr class="sub-row"><td colspan="' + cols.length + '" class="muted">' +
+      'No costed component lines on this BOM.</td></tr>');
+  }
+  return rows.join('');
+}
+
+function toggleBom(id) {
+  collapsed[id] = !collapsed[id];
+  renderTable();
+}
+function expandAll(open) {
+  collapsed = {};
+  if (!open) filteredBoms().forEach(b => collapsed[b.bomId] = true);
+  renderTable();
+}
+
+// ---- Configurable-BOM option selection ------------------------------------
+// Picking an option re-runs the whole costing pass rather than patching the
+// affected BOM: the choice moves the build cost, the co-product apportionment
+// derived from it, Available to Build, every counter and the footer totals, so
+// a targeted update would be a second implementation of computeCosts() to keep
+// in step. Recosting all BOMs is a few ms over demodb's 44.
+function chooseOption(groupKey, itemId) {
+  OPTION_SEL[groupKey] = String(itemId);
+  applyOptionChange();
+}
+function resetOptions(bomId) {
+  const pre = String(bomId) + ':';
+  Object.keys(OPTION_SEL).forEach(k => { if (k.indexOf(pre) === 0) delete OPTION_SEL[k]; });
+  applyOptionChange();
+}
+function resetAllOptions() {
+  OPTION_SEL = {};
+  applyOptionChange();
+}
+function applyOptionChange() {
+  computeCosts();
+  renderTable();
+  try {
+    FBLib.Settings.setUserKey('optionSel', OPTION_SEL);
+    FBLib.Settings.saveUser();
+  } catch (e) { /* persistence is a convenience, never block the recost */ }
+}
+
+// ============================================================================
+// Export / print
+// ============================================================================
+function exportRows() {
+  const boms = filteredBoms();
+  const rows = [];
+  const flagsOf = b => [
+    b.convertedLines ? 'converted x' + b.convertedLines : '',
+    b.noConvLines    ? 'no-conversion x' + b.noConvLines : '',
+    b.noCostLines    ? 'no-cost x' + b.noCostLines : '',
+    b.subBoms.length ? 'sub-bom x' + b.subBoms.length : '',
+    b.optionGroups   ? 'optional x' + b.optionGroups + ' group(s), one option costed per group (' +
+                       b.optionLines + ' other line(s) excluded)' : '',
+    // The export must say when the figures are not the BOM's own default answer.
+    b.customGroups   ? 'CUSTOM CONFIG: ' + b.customGroups + ' group(s) costed on a user-selected ' +
+                       'option, not the BOM default' : '',
+    b.variableLines  ? 'variable x' + b.variableLines + ' line(s), costed at default qty' : '',
+    b.multiOutput    ? 'co-product x' + b.outputs.length +
+                       ' (apportioned by ' + b.apportionBasis + ')' : ''
+  ].filter(Boolean).join('; ');
+
+  if (viewMode === 'summary') {
+    rows.push(['BOM #', 'Description', 'Rev', 'Finished Good', 'Output Qty', 'UOM',
+               'Lines', 'Build Cost', 'Cost/Unit', 'Available to Build', 'Bottleneck', 'Flags']);
+    boms.forEach(b => rows.push([
+      b.num, b.desc, b.rev, b.fgLabel,
+      // Never emit a summed quantity for a co-product BOM — list the outputs.
+      b.multiOutput ? b.outputs.map(o => o.qty + ' ' + o.uom + ' ' + o.partNum).join(' + ') : (b.outputQty || ''),
+      b.multiOutput ? 'mixed' : b.outputUom,
+      b.components.length, b.buildCost.toFixed(4),
+      // Co-products have one rate each, so the single Cost/Unit cell lists them.
+      b.multiOutput
+        ? b.outputs.map(o => o.partNum + ' ' +
+            (o.unitCost == null ? '' : o.unitCost.toFixed(6)) + '/' + o.uom).join('; ')
+        : (b.costPerUnit == null ? '' : b.costPerUnit.toFixed(6)),
+      b.atb == null ? '' : b.atb,
+      b.constraintParts.join('; '),
+      flagsOf(b)
+    ]));
+  } else {
+    // Detail exports one row per sub-row, typed so the two kinds stay separable.
+    rows.push(['BOM #', 'BOM Description', 'Row Type', 'Part #', 'Part Description', 'Part Type',
+               'Qty', 'UOM', 'Qty in Part UOM', 'Part UOM', 'Conversion Factor',
+               'Unit Cost', 'Cost', 'Cost/Unit', 'Share %', 'Available', 'Builds', 'Notes']);
+    boms.forEach(b => {
+      rows.push([b.num, b.desc, 'BOM', b.fgLabel, '', '',
+                 b.multiOutput ? '' : (b.outputQty || ''), b.multiOutput ? 'mixed' : b.outputUom,
+                 '', '', '', '', b.buildCost.toFixed(4),
+                 b.costPerUnit == null ? '' : b.costPerUnit.toFixed(6), '',
+                 '', b.atb == null ? '' : b.atb, flagsOf(b)]);
+      if (b.multiOutput) b.outputs.forEach(o => rows.push([
+        b.num, b.desc, 'OUTPUT', o.partNum, o.partDesc, '',
+        o.qty, o.uom, o.qtyBase == null ? '' : o.qtyBase, o.partUom,
+        o.ratio == null ? 'NO PATH' : fmtFactor(o.ratio),
+        o.basisCost, o.apportioned.toFixed(4),
+        o.unitCost == null ? '' : o.unitCost.toFixed(6),
+        (o.share * 100).toFixed(2), '',
+        b.atb == null ? '' : b.atb * o.qty,
+        'apportioned by ' + b.apportionBasis +
+          (o.weight > 0 ? ': value ' + o.qtyBase + ' ' + o.partUom + ' x ' + o.basisCost +
+                          ' = ' + o.weight.toFixed(4) : '')
+      ]));
+      b.components.forEach(l => rows.push([
+        b.num, b.desc, 'COMPONENT', l.partNum, l.partDesc, l.partType,
+        l.qty, l.itemUom, l.qtyBase == null ? '' : l.qtyBase, l.partUom,
+        l.ratio == null ? 'NO PATH' : fmtFactor(l.ratio),
+        l.unitCost, !l.isChosen ? '' : (l.ext == null ? '' : l.ext.toFixed(4)), '', '',
+        l.available == null ? '' : l.available, l.builds == null ? '' : l.builds,
+        [l.inGroup ? ('option group ' + l.groupName + ': ' +
+                      (l.isChosen ? (l.isDefault ? 'default, costed' : 'user-selected, costed')
+                                  : (l.isDefault ? 'default but NOT selected, not costed'
+                                                 : 'alternative, not costed')))
+                   : (!l.isChosen ? 'non-default (not costed)' : ''),
+         l.varQty ? 'variable qty (costed at default)' : '',
+         l.isConstraint ? 'BOTTLENECK' : '',
+         l.converted ? 'converted' : '', l.ratio == null ? 'excluded' : '',
+         l.fellBack ? 'cost fallback' : ''].filter(Boolean).join('; ')
+      ]));
+    });
+  }
+  return rows;
+}
+
+function exportCSV() {
+  const rows = exportRows();
+  if (rows.length <= 1) { alert('Nothing to export.'); return; }
+  const csv = rows.map(r => r.map(v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"').join(',')).join('\r\n');
+  const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'BOM_Cost_' + viewMode + '.csv';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  // Revoke on a timer — a synchronous revoke can truncate the download in
+  // JxBrowser, and the native Save-As dialog may open behind the window.
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+// window.print() is unreliable in JxBrowser — build clean markup, open a new
+// window and print THAT.
+function printTable() {
+  const rows = exportRows();
+  if (rows.length <= 1) { alert('Nothing to print.'); return; }
+  let html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Bill of Materials Cost</title><style>' +
+    '@page{size:A4 landscape;margin:.5in}body{font-family:Arial,sans-serif;font-size:8pt}' +
+    'h1{font-size:13pt;margin:0 0 2px}.sub{color:#555;font-size:8pt;margin-bottom:10px}' +
+    'table{width:100%;border-collapse:collapse}th{background:#1e3a4c;color:#fff;font-size:7pt;' +
+    'padding:4px 3px;text-align:left;border:1px solid #999}td{font-size:7.5pt;padding:3px;border:1px solid #ccc}' +
+    '</style></head><body><h1>Bill of Materials Cost</h1><div class="sub">' +
+    esc(document.getElementById('costMethod').selectedOptions[0].text) + '</div><table><thead><tr>' +
+    rows[0].map(h => '<th>' + esc(h) + '</th>').join('') + '</tr></thead><tbody>' +
+    rows.slice(1).map(r => '<tr>' + r.map(c => '<td>' + esc(c) + '</td>').join('') + '</tr>').join('') +
+    '</tbody></table></body></html>';
+  const w = window.open('', '_blank');
+  if (!w) { alert('Could not open the print window — check pop-up settings.'); return; }
+  w.document.open(); w.document.write(html); w.document.close();
+  setTimeout(() => { w.focus(); w.print(); }, 400);
+}
+
+// ============================================================================
+// Settings
+// ============================================================================
+function persistCols() {
+  try {
+    FBLib.Settings.setUserKey('cols', _columns.map(c => ({ key: c.key, vis: c.vis })));
+    FBLib.Settings.saveUser();
+  } catch (e) { /* settings are best-effort */ }
+}
+function persistPrefs() {
+  try {
+    FBLib.Settings.setUserKey('viewMode', viewMode);
+    FBLib.Settings.setUserKey('costMethod', document.getElementById('costMethod').value);
+    FBLib.Settings.setUserKey('costDp', document.getElementById('costDp').value);
+    FBLib.Settings.setUserKey('inclInactive', document.getElementById('inclInactive').checked);
+    FBLib.Settings.saveUser();
+  } catch (e) { /* best-effort */ }
+}
+function restorePrefs() {
+  try {
+    FBLib.Settings.init(SETTINGS);
+    const saved = FBLib.Settings.resolve('cols');
+    if (Array.isArray(saved) && saved.length) {
+      const map = {}; saved.forEach(c => map[c.key] = c);
+      const ordered = saved.map(s => _columns.find(c => c.key === s.key)).filter(Boolean);
+      _columns = ordered.concat(_columns.filter(c => !map[c.key]));
+      _columns.forEach(c => { if (map[c.key]) c.vis = !!map[c.key].vis; });
+    }
+    const vm = FBLib.Settings.resolve('viewMode');
+    if (vm) { viewMode = vm; document.getElementById('viewModeSelect').value = vm; }
+    const cm = FBLib.Settings.resolve('costMethod');
+    if (cm) document.getElementById('costMethod').value = cm;
+    const dp = FBLib.Settings.resolve('costDp');
+    if (dp) document.getElementById('costDp').value = dp;
+    const ia = FBLib.Settings.resolve('inclInactive');
+    if (ia != null) document.getElementById('inclInactive').checked = !!ia;
+    // Option picks are keyed on ids, so a stale entry for a BOM item that has
+    // since been deleted simply never matches and the default is used.
+    const os = FBLib.Settings.resolve('optionSel');
+    if (os && typeof os === 'object') OPTION_SEL = os;
+  } catch (e) { /* first run / no saved settings */ }
+}
+
+// ============================================================================
+// Init
+// ============================================================================
+document.addEventListener('DOMContentLoaded', () => {
+  restorePrefs();
+  loadUomEngine();
+  initFilters();
+  buildColPanel();
+  setViewMode(viewMode);
+
+  document.getElementById('inclInactive').addEventListener('change', loadData);
+
+  document.addEventListener('click', e => {
+    const cw = document.getElementById('colWrap');
+    const cp = document.getElementById('colPanel');
+    if (cw && cp && !cw.contains(e.target)) cp.classList.add('hidden');
+  });
+
+  loadData();
+});
+</script>
+</body>
+</html>
