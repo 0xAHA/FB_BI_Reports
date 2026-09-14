@@ -1,21 +1,63 @@
 @echo off
 title Fishbowl Quick Order Launcher
-set "FILE=%~dp0QuickOrder.htm"
+:: Optional argument: the report to open.
+::   Launch_QuickOrder.bat QuickOrder.htm
+:: With no argument, prefer the NEWEST report present — v1.2, falling back to
+:: v1.0. Two reasons it is that way round:
+::   * a handover carrying only QuickOrder_v1.2.htm must still work on the
+::     first double-click, and
+::   * in a working folder both files exist, and silently launching the parked
+::     v1.0 means testing the version nobody is changing. That cost a real
+::     debugging session: a fix made in v1.2 "did not appear", because the
+::     launcher had opened v1.0.
+:: Name a file explicitly to test the old one.
+set "REPORT=%~1"
+if "%REPORT%"=="" (
+  if exist "%~dp0QuickOrder_v1.2.htm" (
+    set "REPORT=QuickOrder_v1.2.htm"
+  ) else (
+    set "REPORT=QuickOrder.htm"
+  )
+)
+set "FILE=%~dp0%REPORT%"
 set "TMPDIR=%TEMP%\FBQuickOrder"
+
+if not exist "%FILE%" (
+  echo ERROR: No such report next to this launcher:
+  echo   %FILE%
+  echo.
+  pause
+  exit /b 1
+)
 
 echo =========================================
 echo  Fishbowl Quick Order (Standalone)
 echo =========================================
+echo.
+echo   ##############################################
+echo    Report: %REPORT%
+echo   ##############################################
+echo.
+echo (Pass a filename to open a different one.)
 echo.
 echo Opens the report with CORS security disabled
 echo so it can reach your Fishbowl server's REST
 echo API. Uses a separate temporary browser profile
 echo so your normal browsing is unaffected.
 echo.
-echo NOTE: Standalone mode is read-only — you can
-echo browse the catalogue and build quotes, but
-echo sales-order creation requires the Fishbowl
-echo desktop client.
+echo *** NOT A SANDBOX ***
+echo.
+echo Everything you do here hits the real server you
+echo log in to. Point it at a test server unless you
+echo mean it.
+echo.
+echo Sales orders you create are REAL orders, and
+echo marking a product as a customer favourite writes
+echo back to that customer's record.
+echo.
+echo (QuickOrder.htm, the older v1.0, is the one
+echo  exception - it keeps its Create button disabled
+echo  outside the Fishbowl client.)
 echo.
 
 :: ---- Try Google Chrome ----

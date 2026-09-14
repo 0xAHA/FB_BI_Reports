@@ -772,6 +772,35 @@
         }
 
         // ============================================
+        // Pie / donut slice roll-up
+        // --------------------------------------------
+        // A pie whose slices are cut off by a SQL LIMIT lies twice: the
+        // wedges no longer sum to the KPI total, and every percentage is
+        // computed against the truncated total. Query ALL groups, then keep
+        // the largest PIE_TOP_SLICES and fold the remainder into a single
+        // "Other" wedge — small slivers are visually useless, but their
+        // revenue still has to be on the chart for it to reconcile with the
+        // Revenue KPI. "Other" stays clickable: the drill-down and the CSV
+        // export both go back to the full, un-grouped category list.
+        // ============================================
+        const PIE_TOP_SLICES = 9;   // real slices; "Other" is the 10th
+
+        function rollupPieTail(rows, nameKey, valueKey, noun = 'items') {
+            if (!Array.isArray(rows)) return [];
+            const sorted = [...rows].sort((a, b) => parseFloat(b[valueKey] || 0) - parseFloat(a[valueKey] || 0));
+            if (sorted.length <= PIE_TOP_SLICES + 1) return sorted;
+            const head = sorted.slice(0, PIE_TOP_SLICES);
+            const tail = sorted.slice(PIE_TOP_SLICES);
+            head.push({
+                [nameKey]: `Other (${tail.length} ${noun})`,
+                [valueKey]: tail.reduce((s, r) => s + parseFloat(r[valueKey] || 0), 0),
+                is_other: true,
+                other_members: tail.map(r => r[nameKey])
+            });
+            return head;
+        }
+
+        // ============================================
         // Module Opening Functions
         // ============================================
         function openSalesOrder(orderNumber) {
@@ -1099,11 +1128,13 @@
                 ${conditions}
                 GROUP BY category
                 ORDER BY total_revenue DESC
-                LIMIT 8
             `;
 
             console.log('Product Tree Query:', query);
-            return await runQueryP(query);
+            // No LIMIT here on purpose — a SQL LIMIT dropped every category
+            // past the 8th, so the wedges could never add up to the Revenue
+            // KPI. The tail is folded into one "Other" slice instead.
+            return rollupPieTail(await runQueryP(query), 'category', 'total_revenue', 'categories');
         }
 
         async function getSalesByManager() {
@@ -1207,11 +1238,12 @@
                 ${conditions}
                 GROUP BY group_name
                 ORDER BY total_revenue DESC
-                LIMIT 8
             `;
 
             console.log('Sales by Group Query:', query);
-            return await runQueryP(query);
+            // Un-LIMITed for the same reason as the category pie — the tail
+            // becomes one "Other" slice so the wedges reconcile with Revenue.
+            return rollupPieTail(await runQueryP(query), 'group_name', 'total_revenue', 'groups');
         }
 
         async function getTopProducts() {
@@ -2414,8 +2446,14 @@
                 .domain(data.map(d => d.category))
                 .range(colorPalette);
 
+            // Percentages are taken against the TRUE arithmetic total (which
+            // now equals the Revenue KPI), while the wedge geometry clamps at
+            // zero — d3.pie cannot draw a negative angle, and a category that
+            // nets negative on credits would otherwise invert the whole pie.
+            const total = d3.sum(data, d => parseFloat(d.total_revenue || 0));
+
             const pie = d3.pie()
-                .value(d => parseFloat(d.total_revenue))
+                .value(d => Math.max(0, parseFloat(d.total_revenue || 0)))
                 .sort(null);
 
             const arc = d3.arc()
@@ -2440,14 +2478,19 @@
                         .duration(200)
                         .attr('d', d3.arc().innerRadius(radius * 0.35).outerRadius(radius * 0.95));
 
-                    const total = d3.sum(data, d => parseFloat(d.total_revenue));
-                    const percent = (parseFloat(d.data.total_revenue) / total * 100).toFixed(1);
+                    const percent = (parseFloat(d.data.total_revenue || 0) / (total || 1) * 100).toFixed(1);
+                    // The Other wedge names the categories it swallowed, so the
+                    // grouping is never a black box.
+                    const members = d.data.is_other
+                        ? `<div class="text-xs text-slate-400 mt-1">${(d.data.other_members || []).join(', ')}</div>`
+                        : '';
 
                     tooltip.style('opacity', 1)
                         .html(`
                             <div><span class="tooltip-label">Category:</span><span class="tooltip-value">${d.data.category}</span></div>
                             <div><span class="tooltip-label">Revenue:</span><span class="tooltip-value">${formatCurrencyValue(d.data.total_revenue)}</span></div>
                             <div><span class="tooltip-label">Percentage:</span><span class="tooltip-value">${percent}%</span></div>
+                            ${members}
                             <div class="text-xs text-slate-500 mt-1">Click to view products</div>
                         `)
                         .style('left', (event.pageX + 10) + 'px')
@@ -2461,11 +2504,10 @@
                     tooltip.style('opacity', 0);
                 })
                 .on('click', function(event, d) {
-                    drilldownCategory(d.data.category);
+                    drilldownCategory(d.data.category, d.data.other_members);
                 });
 
             // Add percentage labels on segments
-            const total = d3.sum(data, d => parseFloat(d.total_revenue));
             arcs.append('text')
                 .attr('transform', d => {
                     const pos = arc.centroid(d);
@@ -2497,7 +2539,7 @@
                 .style('margin-bottom', '8px')
                 .style('font-size', '11px')
                 .style('cursor', 'pointer')
-                .on('click', (event, d) => drilldownCategory(d.category));
+                .on('click', (event, d) => drilldownCategory(d.category, d.other_members));
 
             legendItems.append('div')
                 .style('width', '12px')
@@ -2846,8 +2888,12 @@
                 .domain(data.map(d => d.group_name))
                 .range(colorPalette);
 
+            // True arithmetic total for the percentages; wedge geometry
+            // clamps at zero so a credit-heavy group can't invert the pie.
+            const total = d3.sum(data, d => parseFloat(d.total_revenue || 0));
+
             const pie = d3.pie()
-                .value(d => parseFloat(d.total_revenue))
+                .value(d => Math.max(0, parseFloat(d.total_revenue || 0)))
                 .sort(null);
 
             const arc = d3.arc()
@@ -2872,14 +2918,17 @@
                         .duration(200)
                         .attr('d', d3.arc().innerRadius(radius * 0.35).outerRadius(radius * 0.95));
 
-                    const total = d3.sum(data, d => parseFloat(d.total_revenue));
-                    const percent = (parseFloat(d.data.total_revenue) / total * 100).toFixed(1);
+                    const percent = (parseFloat(d.data.total_revenue || 0) / (total || 1) * 100).toFixed(1);
+                    const members = d.data.is_other
+                        ? `<div class="text-xs text-slate-400 mt-1">${(d.data.other_members || []).join(', ')}</div>`
+                        : '';
 
                     tooltip.style('opacity', 1)
                         .html(`
                             <div><span class="tooltip-label">Group:</span><span class="tooltip-value">${d.data.group_name}</span></div>
                             <div><span class="tooltip-label">Revenue:</span><span class="tooltip-value">${formatCurrencyValue(d.data.total_revenue)}</span></div>
                             <div><span class="tooltip-label">Percentage:</span><span class="tooltip-value">${percent}%</span></div>
+                            ${members}
                             <div class="text-xs text-slate-500 mt-1">Click to view orders</div>
                         `)
                         .style('left', (event.pageX + 10) + 'px')
@@ -2893,11 +2942,10 @@
                     tooltip.style('opacity', 0);
                 })
                 .on('click', function(event, d) {
-                    drilldownCustomerGroup(d.data.group_name);
+                    drilldownCustomerGroup(d.data.group_name, d.data.other_members);
                 });
 
             // Add percentage labels on segments
-            const total = d3.sum(data, d => parseFloat(d.total_revenue));
             arcs.append('text')
                 .attr('transform', d => {
                     const pos = arc.centroid(d);
@@ -4527,22 +4575,31 @@
             }
         }
 
-        async function drilldownCategory(categoryName) {
+        // memberNames is set only for the aggregate "Other" slice — the tail
+        // categories it rolled up. Passing them through keeps the drill-down
+        // and its CSV export on the full, un-grouped data.
+        async function drilldownCategory(categoryName, memberNames) {
             try {
                 debugLog(`Chart clicked: Product Categories - "${categoryName}"`, 'click');
                 const conditions = buildFilterConditions();
                 const marginHaving = getMarginHavingClause('avg_margin');
                 debugLog('Building SQL query for category products...', 'info');
 
-                // Handle "No Category" specially - it represents null/blank categories
-                const categoryCondition = categoryName === 'No Category'
-                    ? `AND (ProductTree.Name IS NULL OR ProductTree.Name = '')`
-                    : `AND ProductTree.Name = '${escapeSQL(categoryName)}'`;
+                // "No Category" is the null/blank bucket, not a real tree node,
+                // so it needs an IS NULL test rather than a name match.
+                const names = (memberNames && memberNames.length) ? memberNames : [categoryName];
+                const isOther = !!(memberNames && memberNames.length);
+                const realNames = names.filter(n => n !== 'No Category');
+                const parts = [];
+                if (realNames.length) parts.push(`ProductTree.Name IN (${realNames.map(n => `'${escapeSQL(n)}'`).join(', ')})`);
+                if (names.length !== realNames.length) parts.push(`(ProductTree.Name IS NULL OR ProductTree.Name = '')`);
+                const categoryCondition = `AND (${parts.join(' OR ')})`;
 
                 const query = `
                 SELECT
                     Product.Num as product_num,
                     Product.Description as product_name,
+                    COALESCE(ProductTree.Name, 'No Category') as category,
                     SUM(PostSoItem.Qty) as units_sold,
                     SUM(COALESCE(((PostSoItem.TotalPrice/PostSoItem.Qty)-((PostSoItem.TotalPrice/PostSoItem.Qty)*PSI.AdjustPercent)), PostSoItem.TotalPrice/PostSoItem.Qty) * PostSoItem.Qty) as total_revenue,
                     AVG(COALESCE(((PostSoItem.TotalPrice/PostSoItem.Qty)-((PostSoItem.TotalPrice/PostSoItem.Qty)*PSI.AdjustPercent)), PostSoItem.TotalPrice/PostSoItem.Qty)) as avg_price,
@@ -4559,7 +4616,7 @@
                 LEFT JOIN AccountGroup ON AccountGroup.Id = (SELECT AccountGroupRelation.GroupId FROM AccountGroupRelation WHERE AccountGroupRelation.AccountId = Customer.AccountId ORDER BY AccountGroupRelation.AccountId ASC LIMIT 1)
                 ${conditions}
                 ${categoryCondition}
-                GROUP BY Product.Num, Product.Description
+                GROUP BY Product.Num, Product.Description, category
                 ${marginHaving}
                 ORDER BY total_revenue DESC
             `;
@@ -4575,6 +4632,8 @@
             const columns = [
                 { key: 'product_num', label: 'Product #', type: 'string' },
                 { key: 'product_name', label: 'Product Name', type: 'string' },
+                // Only worth a column when several categories are in play.
+                ...(isOther ? [{ key: 'category', label: 'Category', type: 'string' }] : []),
                 { key: 'units_sold', label: 'Units Sold', type: 'number' },
                 { key: 'total_revenue', label: 'Revenue', type: 'currency' },
                 { key: 'avg_price', label: 'Avg Price', type: 'currency' },
@@ -4583,7 +4642,7 @@
 
                 debugLog('Executing query...', 'info');
                 openDrilldown(
-                    `Products in ${categoryName}`,
+                    isOther ? `Products in ${names.length} other categories` : `Products in ${categoryName}`,
                     `Product Tree > ${categoryName}`,
                     data,
                     columns
@@ -4725,23 +4784,32 @@
             }
         }
 
-        async function drilldownCustomerGroup(groupName) {
+        // memberNames is set only for the aggregate "Other" slice — the tail
+        // groups it rolled up. The drill-down (and its CSV export) then covers
+        // all of them rather than a summary row.
+        async function drilldownCustomerGroup(groupName, memberNames) {
             try {
                 debugLog(`Chart clicked: Customer Groups - "${groupName}"`, 'click');
                 const conditions = buildFilterConditions();
                 const marginHaving = getMarginHavingClause('margin_percent');
                 debugLog('Building SQL query for customer group orders...', 'info');
 
-                // Handle "No Group" specially - it represents null/blank groups
-                const groupCondition = groupName === 'No Group'
-                    ? `AND (AccountGroup.Name IS NULL OR AccountGroup.Name = '')`
-                    : `AND AccountGroup.Name = '${escapeSQL(groupName)}'`;
+                // "No Group" is the null/blank bucket, not a real account group,
+                // so it needs an IS NULL test rather than a name match.
+                const names = (memberNames && memberNames.length) ? memberNames : [groupName];
+                const isOther = !!(memberNames && memberNames.length);
+                const realNames = names.filter(n => n !== 'No Group');
+                const gParts = [];
+                if (realNames.length) gParts.push(`AccountGroup.Name IN (${realNames.map(n => `'${escapeSQL(n)}'`).join(', ')})`);
+                if (names.length !== realNames.length) gParts.push(`(AccountGroup.Name IS NULL OR AccountGroup.Name = '')`);
+                const groupCondition = `AND (${gParts.join(' OR ')})`;
 
                 const query = `
                     SELECT
                         So.Num as order_num,
                         PostSo.DateCreated as order_date,
                         Customer.Name as customer_name,
+                        COALESCE(AccountGroup.Name, 'No Group') as group_name,
                         COUNT(DISTINCT SoItem.Id) as item_count,
                         SUM(COALESCE(((PostSoItem.TotalPrice/PostSoItem.Qty)-((PostSoItem.TotalPrice/PostSoItem.Qty)*PSI.AdjustPercent)), PostSoItem.TotalPrice/PostSoItem.Qty) * PostSoItem.Qty) as total_revenue,
                         SUM(PostSoItem.PostedTotalCost) as total_cost,
@@ -4759,7 +4827,7 @@
                     LEFT JOIN AccountGroup ON AccountGroup.Id = (SELECT AccountGroupRelation.GroupId FROM AccountGroupRelation WHERE AccountGroupRelation.AccountId = Customer.AccountId ORDER BY AccountGroupRelation.AccountId ASC LIMIT 1)
                     ${conditions}
                     ${groupCondition}
-                    GROUP BY So.Num, PostSo.DateCreated, Customer.Name, SalesUser.FirstName, SalesUser.LastName
+                    GROUP BY So.Num, PostSo.DateCreated, Customer.Name, group_name, SalesUser.FirstName, SalesUser.LastName
                     ${marginHaving}
                     ORDER BY PostSo.DateCreated DESC
                 `;
@@ -4779,6 +4847,8 @@
                     { key: 'order_num', label: 'Order #', type: 'string' },
                     { key: 'order_date', label: 'Date', type: 'date' },
                     { key: 'customer_name', label: 'Customer', type: 'string' },
+                    // Only worth a column when several groups are in play.
+                    ...(isOther ? [{ key: 'group_name', label: 'Group', type: 'string' }] : []),
                     { key: 'item_count', label: 'Items', type: 'number' },
                     { key: 'total_revenue', label: 'Total', type: 'currency' },
                     { key: 'margin_percent', label: 'Margin %', type: 'percent' },
@@ -4786,7 +4856,7 @@
                 ];
 
                 openDrilldown(
-                    `Orders for ${groupName}`,
+                    isOther ? `Orders across ${names.length} other groups` : `Orders for ${groupName}`,
                     `Customer Groups > ${groupName}`,
                     data,
                     columns
