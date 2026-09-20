@@ -8,45 +8,6 @@ using System.Windows.Media;
 
 namespace FbApiTool;
 
-/// <summary>What a request view needs from the shell it lives in.</summary>
-public sealed class RequestContext
-{
-    public required ApiCatalog Catalog { get; init; }
-    public required ApiRunner Runner { get; init; }
-    public required Func<string> BaseUrl { get; init; }
-    public required Func<string?> Token { get; init; }
-    public required Action<string> Status { get; init; }
-    public required Action<HistoryEntry> Record { get; init; }
-
-    /// <summary>Read a persisted preference, e.g. whether to keep query results.</summary>
-    public required Func<string, string?> Setting { get; init; }
-
-    public required Action<string, string> SetSetting { get; init; }
-
-    /// <summary>The live variable list, shared with the workspace panel.</summary>
-    public required IReadOnlyCollection<Variable> Variables { get; init; }
-
-    /// <summary>Set or add a variable: name, value, where it came from.</summary>
-    public required Action<string, string, string?> SetVariable { get; init; }
-
-    /// <summary>The signed-in user’s access rights, or null when not connected.</summary>
-    public required Func<IReadOnlySet<string>?> Rights { get; init; }
-
-    public required Func<bool> Authenticated { get; init; }
-
-    /// <summary>Asked before a write; false cancels the send.</summary>
-    public required Func<string, string, bool> ConfirmSend { get; init; }
-
-    public required Action<SavedRequest> Store { get; init; }
-
-    public required Func<DbSchema.Snapshot?> Schema { get; init; }
-
-    public required Func<bool, Task<DbSchema.Snapshot?>> LoadSchema { get; init; }
-
-    /// <summary>A one-line input box, owned by the main window.</summary>
-    public required Func<string, string, string, string?> Ask { get; init; }
-}
-
 /// <summary>
 /// One open request: the form, the payload and the response it produced.
 ///
@@ -735,7 +696,7 @@ public partial class RequestView : UserControl
             }
         }
 
-        if (!_ctx.ConfirmSend(Endpoint.Method, ApiRunner.BuildUrl(baseUrl, path, query))) return;
+        if (!await _ctx.ConfirmSend(Endpoint.Method, ApiRunner.BuildUrl(baseUrl, path, query))) return;
 
         BtnSend.IsEnabled = false;
         BtnSend.Content = "Sending…";
@@ -1348,10 +1309,10 @@ public partial class RequestView : UserControl
     /// currently resolve to, so one saved request works against every server
     /// instead of being welded to the one it was recorded on.
     /// </summary>
-    private void BtnSaveRequest_Click(object sender, RoutedEventArgs e)
+    private async void BtnSaveRequest_Click(object sender, RoutedEventArgs e)
     {
         var suggested = _saved?.Name ?? Endpoint.Name;
-        var name = _ctx.Ask("Save request", "A name for this request:", suggested);
+        var name = await _ctx.Ask("Save request", "A name for this request:", suggested);
         if (string.IsNullOrWhiteSpace(name)) return;
 
         var request = new SavedRequest

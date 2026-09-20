@@ -46,7 +46,55 @@ public partial class MainWindow : Window
 
         TreeEndpoints.SelectionChanged += Tree_SelectionChanged;
 
+        LoadSettings();
+        SetUpConnection();
         BuildTree();
+
+        // After the window is up, not during construction: the connect dialog
+        // needs an owner that has been shown.
+        Opened += async (_, _) => await ShowConnectAsync(firstRun: true);
+    }
+
+    // ── SETTINGS ────────────────────────────────────────────────────────
+
+    private readonly string _settingsFile =
+        System.IO.Path.Combine(ApiCatalog.DataDir, "settings.json");
+
+    private System.Text.Json.Nodes.JsonObject _settings = new();
+
+    private string? Get(string k) => _settings[k]?.GetValue<string>();
+
+    private void Set(string k, string v)
+    {
+        _settings[k] = v;
+        try
+        {
+            System.IO.Directory.CreateDirectory(ApiCatalog.DataDir);
+            System.IO.File.WriteAllText(_settingsFile,
+                _settings.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch { /* a tool must not fall over because it cannot persist a preference */ }
+    }
+
+    private void LoadSettings()
+    {
+        try
+        {
+            if (System.IO.File.Exists(_settingsFile))
+                _settings = System.Text.Json.Nodes.JsonNode.Parse(
+                    System.IO.File.ReadAllText(_settingsFile))?.AsObject() ?? new();
+        }
+        catch { _settings = new(); }
+    }
+
+    /// <summary>
+    /// Every open pane follows a change of connection: the URL it would send
+    /// to, and the access-right chip, which answers a question about whoever
+    /// is signed in now.
+    /// </summary>
+    private void RefreshOpenPanes()
+    {
+        // Nothing to refresh yet — the request pane is the next thing to port.
     }
 
     // ── SIDEBAR ─────────────────────────────────────────────────────────

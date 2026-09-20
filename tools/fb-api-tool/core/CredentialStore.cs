@@ -62,10 +62,21 @@ public static class CredentialStore
     [DllImport("advapi32.dll", EntryPoint = "CredFree")]
     private static extern void CredFree(nint buffer);
 
+    /// <summary>
+    /// Whether there is a vault to talk to at all.
+    ///
+    /// This one is the Windows Credential Manager, reached through advapi32.
+    /// Everything else in the core runs anywhere, so rather than splitting the
+    /// file by platform the calls are guarded and the caller is told plainly
+    /// that remembering a password is not on offer here. On Linux the
+    /// equivalent is libsecret, and this is the seam it would arrive at.
+    /// </summary>
+    public static bool Available => OperatingSystem.IsWindows();
+
     /// <summary>Keep a password. Returns false if the vault refused it.</summary>
     public static bool Save(string target, string username, string password)
     {
-        if (string.IsNullOrEmpty(target)) return false;
+        if (!Available || string.IsNullOrEmpty(target)) return false;
 
         var blob = Encoding.Unicode.GetBytes(password ?? "");
         var blobPtr = Marshal.AllocHGlobal(blob.Length);
@@ -101,7 +112,7 @@ public static class CredentialStore
     /// <summary>The stored password, or null if there is none.</summary>
     public static string? Load(string target)
     {
-        if (string.IsNullOrEmpty(target)) return null;
+        if (!Available || string.IsNullOrEmpty(target)) return null;
 
         nint ptr = 0;
         try
@@ -121,6 +132,7 @@ public static class CredentialStore
 
     public static bool Delete(string target)
     {
+        if (!Available) return false;
         if (string.IsNullOrEmpty(target)) return false;
         try { return CredDelete(target, CRED_TYPE_GENERIC, 0); }
         catch { return false; }

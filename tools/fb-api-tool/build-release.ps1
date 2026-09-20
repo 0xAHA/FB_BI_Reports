@@ -24,10 +24,12 @@ if ($LASTEXITCODE -ne 0) { throw 'help build failed' }
 
 Get-Process FbApiTool -ErrorAction SilentlyContinue | Stop-Process -Force
 Remove-Item dist -Recurse -Force -ErrorAction SilentlyContinue
+# A leftover from a previous failure would make the folder ambiguous.
+Remove-Item *_wpftmp.csproj -Force -ErrorAction SilentlyContinue
 
 foreach ($rid in 'win-x64', 'win-arm64') {
     Write-Host "building $rid..." -ForegroundColor Cyan
-    dotnet publish -c Release -r $rid -o "dist\$rid" --nologo --self-contained `
+    dotnet publish FbApiTool.csproj -c Release -r $rid -o "dist\$rid" --nologo --self-contained `
         -p:PublishSingleFile=true `
         -p:IncludeNativeLibrariesForSelfExtract=true `
         -p:EnableCompressionInSingleFile=true `

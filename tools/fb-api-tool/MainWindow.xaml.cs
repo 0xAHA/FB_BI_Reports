@@ -217,11 +217,11 @@ public partial class MainWindow : Window
         SetVariable = SetVariable,
         Rights = () => _fb.IsLoggedIn ? _fb.Rights : null,
         Authenticated = () => !string.IsNullOrEmpty(_token),
-        ConfirmSend = ConfirmWrite,
+        ConfirmSend = (m, u) => Task.FromResult(ConfirmWrite(m, u)),
         Store = StoreRequest,
         Schema = () => _schema,
         LoadSchema = LoadSchemaAsync,
-        Ask = Prompt,
+        Ask = (t, l, v) => Task.FromResult(Prompt(t, l, v)),
         Record = h => Dispatcher.Invoke(() =>
         {
             _history.Insert(0, h);
