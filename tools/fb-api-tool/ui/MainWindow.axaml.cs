@@ -45,8 +45,10 @@ public partial class MainWindow : Window
         BtnCollapseAll.Click += (_, _) => SetAllExpanded(false);
 
         TreeEndpoints.SelectionChanged += Tree_SelectionChanged;
+        TreeEndpoints.DoubleTapped += (_, _) => OpenSelected();
 
         LoadSettings();
+        LoadVariables();
         SetUpConnection();
         BuildTree();
 
@@ -94,7 +96,11 @@ public partial class MainWindow : Window
     /// </summary>
     private void RefreshOpenPanes()
     {
-        // Nothing to refresh yet — the request pane is the next thing to port.
+        foreach (var v in OpenViews())
+        {
+            v.UpdateUrl();
+            v.RefreshRights();
+        }
     }
 
     // ── SIDEBAR ─────────────────────────────────────────────────────────
@@ -150,6 +156,26 @@ public partial class MainWindow : Window
 
     private void Tree_SelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
-        if (TreeEndpoints.SelectedItem is EndpointNode n) TxtStatus.Text = n.Summary;
+        if (TreeEndpoints.SelectedItem is not EndpointNode n) return;
+        TxtStatus.Text = n.Summary;
+        OpenEndpoint(n.Endpoint);
+    }
+
+    /// <summary>
+    /// A single click opens the endpoint.
+    ///
+    /// The WPF build wanted a double-click, which is a thing people discover
+    /// by accident. Selecting an endpoint in a list of endpoints can only mean
+    /// one thing.
+    /// </summary>
+    private void OpenSelected()
+    {
+        if (TreeEndpoints.SelectedItem is EndpointNode n) OpenEndpoint(n.Endpoint);
+    }
+
+    private void LoadVariables()
+    {
+        _vars.Clear();
+        foreach (var v in Variables.Load()) _vars.Add(v);
     }
 }
