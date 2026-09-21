@@ -90,6 +90,7 @@ public partial class RequestView : UserControl
                 FontSize = 13,
                 VerticalAlignment = VerticalAlignment.Center,
                 Width = 150,
+                Margin = new Avalonia.Thickness(0, 0, 8, 0),
             };
             var box = new TextBox { Tag = name, FontSize = 13 };
             box.TextChanged += (_, _) => UpdateUrl();
