@@ -120,17 +120,26 @@ public partial class RequestView : UserControl
     /// <summary>A key/value row with a remove button, for queries and headers.</summary>
     private Control Row(Panel owner, string key, string value, string? description)
     {
-        var k = new TextBox { Text = key, FontSize = 13, Width = 210 };
+        // The gaps are the point: a key box hard against its value box reads as
+        // one wide field, and a remove button hard against that reads as part
+        // of it.
+        var k = new TextBox
+        {
+            Text = key,
+            FontSize = 13,
+            Width = 210,
+            Margin = new Avalonia.Thickness(0, 0, 8, 0),
+        };
         var v = new TextBox { Text = value, FontSize = 13 };
+
         var x = new Button
         {
             Content = "×",
-            Width = 26,
-            Padding = new Avalonia.Thickness(0),
-            Background = Brushes.Transparent,
-            BorderThickness = new Avalonia.Thickness(0),
-            Foreground = (IBrush)Application.Current!.FindResource("FbTextMuted")!,
+            Margin = new Avalonia.Thickness(8, 0, 0, 0),
+            VerticalAlignment = VerticalAlignment.Center,
+            [ToolTip.TipProperty] = "Remove",
         };
+        x.Classes.Add("rowkill");
 
         k.TextChanged += (_, _) => UpdateUrl();
         v.TextChanged += (_, _) => UpdateUrl();

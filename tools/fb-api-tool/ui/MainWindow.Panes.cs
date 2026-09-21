@@ -82,6 +82,7 @@ public partial class MainWindow
 
         var view = new RequestView(Context, ep);
         var tab = new TabItem { Content = view, Header = TabHeader(ep, out var close) };
+        tab.Classes.Add("req");
         close.Click += (_, _) =>
         {
             Tabs.Items.Remove(tab);
