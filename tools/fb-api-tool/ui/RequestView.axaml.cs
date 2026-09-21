@@ -318,19 +318,32 @@ public partial class RequestView : UserControl
     // ── THE URL ─────────────────────────────────────────────────────────
 
     private bool _urlEdited;
-    private bool _writingUrl;
+
+    /// <summary>
+    /// The last URL this pane wrote into the box.
+    ///
+    /// Telling our own write apart from the user's used to be a flag raised
+    /// around the assignment, which only works if TextChanged is raised inside
+    /// it. It is not always: one write that arrived after the flag had been
+    /// lowered marked the box as hand-edited, and from then on the fields
+    /// silently stopped driving the URL — a path parameter typed in did
+    /// nothing at all. Comparing the value cannot be beaten by event timing.
+    /// </summary>
+    private string _builtUrl = "";
 
     public void UpdateUrl()
     {
         if (_urlEdited) return;
-        _writingUrl = true;
-        TxtUrl.Text = ApiRunner.BuildUrl(_ctx.BaseUrl(), ResolvedPath(), CollectQuery());
-        _writingUrl = false;
+
+        _builtUrl = ApiRunner.BuildUrl(_ctx.BaseUrl(), ResolvedPath(), CollectQuery());
+        if (TxtUrl.Text != _builtUrl) TxtUrl.Text = _builtUrl;
     }
 
     private void UrlEdited()
     {
-        if (_writingUrl) return;
+        // Our own write, arriving whenever it arrives.
+        if (TxtUrl.Text == _builtUrl) return;
+
         _urlEdited = true;
         BtnRevertUrl.IsVisible = true;
     }
