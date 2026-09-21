@@ -50,6 +50,14 @@ public partial class MainWindow : Window
         LoadSettings();
         LoadVariables();
         SetUpConnection();
+        SetUpWorkspace();
+
+        // Built when the tab is first shown: most sessions never open it.
+        Shell.SelectionChanged += (_, e) =>
+        {
+            if (!ReferenceEquals(e.Source, Shell)) return;
+            if (ReferenceEquals(Shell.SelectedItem, TabData)) ShowDataTab();
+        };
         BuildTree();
 
         // After the window is up, not during construction: the connect dialog

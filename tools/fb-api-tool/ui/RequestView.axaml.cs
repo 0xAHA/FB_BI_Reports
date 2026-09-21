@@ -187,9 +187,21 @@ public partial class RequestView : UserControl
         BtnResetBody.IsVisible = takesBody;
         BtnCopyBody.IsVisible = takesBody;
 
-        GridFields.ItemsSource = Endpoint.Attributes.Select(a => new FieldRow(a)).ToList();
-        TxtFieldCount.Text = Endpoint.Attributes.Count + " DOCUMENTED FIELD" +
-                             (Endpoint.Attributes.Count == 1 ? "" : "S");
+        var fields = Endpoint.Attributes.Select(a => new FieldRow(a)).ToList();
+        GridFields.ItemsSource = fields;
+        GridFields.IsVisible = fields.Count > 0;
+
+        TxtFieldCount.Text = fields.Count > 0
+            ? fields.Count + (takesBody ? " DOCUMENTED FIELD" : " RESPONSE FIELD") + (fields.Count == 1 ? "" : "S")
+            : (takesBody ? "REQUEST FIELDS" : "RESPONSE FIELDS");
+
+        // There are two reasons this table is empty and they mean different
+        // things: a GET with no body has nothing to document, whereas a POST
+        // with nothing documented means the server published no field list for
+        // it. A blank panel says neither, and reads as a broken control.
+        TogFields.IsVisible = fields.Count > 0;
+        TxtNoFields.IsVisible = fields.Count == 0;
+        TxtNoFields.Text = fields.Count > 0 ? "" : NoFieldsReason(takesBody);
 
         TogFields.IsCheckedChanged += (_, _) => FoldFields(TogFields.IsChecked == true);
 
@@ -213,6 +225,18 @@ public partial class RequestView : UserControl
         rows[3].Height = new GridLength(show ? 3 : 0, GridUnitType.Star);
     }
 
+    /// <summary>Why the field table has nothing in it.</summary>
+    private string NoFieldsReason(bool takesBody)
+    {
+        if (!takesBody)
+            return Endpoint.Method.ToUpperInvariant() + " sends no body, and this server's documentation "
+                 + "does not list the fields it returns — send it once and the response itself is the "
+                 + "reference.";
+
+        return "This server's documentation lists no fields for this endpoint. The body above is whatever "
+             + "the catalog carries; check the Documentation tab, or send it and read the error.";
+    }
+
     private void FormatBody()
     {
         var text = TxtBody.Text ?? "";
@@ -231,6 +255,64 @@ public partial class RequestView : UserControl
         };
 
         BtnCopyResp.Click += (_, _) => Copy(_last?.Body ?? "", "Response");
+    }
+
+    // ── FILLING IT IN ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Put a saved request back in the form.
+    ///
+    /// Restored with its {{placeholders}} intact rather than with what they
+    /// resolved to when it was saved, so one saved request works against every
+    /// server instead of being welded to the one it was recorded on.
+    /// </summary>
+    public void LoadFrom(SavedRequest saved)
+    {
+        Replace(PanelQuery, saved.Query.Select(p => (p.Name, p.Value)));
+        Replace(PanelHeaders, saved.Headers.Select(p => (p.Name, p.Value)));
+
+        if (saved.Body is not null && TxtBody.IsVisible) TxtBody.Text = saved.Body;
+
+        UpdateUrl();
+    }
+
+    /// <summary>
+    /// Put a past call back in the form.
+    ///
+    /// The path arrives with its parameters already substituted, so they are
+    /// read back out of it by position against the endpoint's own template —
+    /// /api/parts/42 against /api/parts/{id} gives id = 42.
+    /// </summary>
+    public void LoadFrom(ApiEndpoint ep, string path, List<KeyValuePair<string, string>> query, string? body)
+    {
+        var template = ep.Path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var actual = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+        if (template.Length == actual.Length)
+        {
+            var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (var i = 0; i < template.Length; i++)
+                if (template[i].StartsWith('{') && template[i].EndsWith('}'))
+                    values[template[i][1..^1]] = Uri.UnescapeDataString(actual[i]);
+
+            foreach (var row in PanelPath.Children.OfType<DockPanel>())
+                if (row.Children.OfType<TextBox>().FirstOrDefault() is { Tag: string name } box
+                    && values.TryGetValue(name, out var v))
+                    box.Text = v;
+        }
+
+        Replace(PanelQuery, query.Select(p => (p.Key, p.Value)));
+        if (body is not null && TxtBody.IsVisible) TxtBody.Text = body;
+
+        UpdateUrl();
+    }
+
+    /// <summary>Swap a panel's rows for a given set, leaving one blank row to type in.</summary>
+    private void Replace(Panel panel, IEnumerable<(string Key, string Value)> pairs)
+    {
+        panel.Children.Clear();
+        foreach (var (k, v) in pairs) panel.Children.Add(Row(panel, k, v, null));
+        panel.Children.Add(Row(panel, "", "", null));
     }
 
     // ── THE URL ─────────────────────────────────────────────────────────

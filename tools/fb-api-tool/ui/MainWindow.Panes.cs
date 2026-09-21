@@ -136,7 +136,46 @@ public partial class MainWindow
         return row;
     }
 
+    // ── THE DATA TAB ────────────────────────────────────────────────────
+
+    private RequestView? _dataView;
+
+    /// <summary>
+    /// The Data tab hosts the data-query endpoint itself rather than a second
+    /// SQL screen, so there is only ever one of them to maintain and the
+    /// endpoint still opens in the sidebar like any other.
+    ///
+    /// Built when the tab is first shown, not at start-up: most sessions never
+    /// open it, and the pane costs a catalog lookup and a form to build.
+    /// </summary>
+    private void ShowDataTab()
+    {
+        if (_dataView is not null) return;
+
+        var ep = _catalog.Endpoints.FirstOrDefault(e => e.QueryParams.Any(SqlFormat.IsSqlParam));
+        if (ep is null)
+        {
+            DataHost.Children.Add(new TextBlock
+            {
+                Text = "This catalog has no data-query endpoint, so there is nothing to run SQL through.",
+                Margin = new Avalonia.Thickness(24),
+                FontSize = 13,
+                TextWrapping = Avalonia.Media.TextWrapping.Wrap,
+                Foreground = Brand.BlueAccent,
+            });
+            return;
+        }
+
+        _dataView = new RequestView(Context, ep);
+        DataHost.Children.Add(_dataView);
+    }
+
     /// <summary>Every open pane, so a change of connection reaches all of them.</summary>
-    private IEnumerable<RequestView> OpenViews() =>
-        Tabs.Items.OfType<TabItem>().Select(t => t.Content).OfType<RequestView>();
+    private IEnumerable<RequestView> OpenViews()
+    {
+        foreach (var v in Tabs.Items.OfType<TabItem>().Select(t => t.Content).OfType<RequestView>())
+            yield return v;
+
+        if (_dataView is not null) yield return _dataView;
+    }
 }
