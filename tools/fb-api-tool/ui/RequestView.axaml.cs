@@ -182,9 +182,26 @@ public partial class RequestView : UserControl
         TxtFieldCount.Text = Endpoint.Attributes.Count + " DOCUMENTED FIELD" +
                              (Endpoint.Attributes.Count == 1 ? "" : "S");
 
+        TogFields.IsCheckedChanged += (_, _) => FoldFields(TogFields.IsChecked == true);
+
         BtnFormatBody.Click += (_, _) => FormatBody();
         BtnResetBody.Click += (_, _) => TxtBody.Text = Endpoint.BodySample ?? "";
         BtnCopyBody.Click += (_, _) => Copy(TxtBody.Text ?? "", "Body");
+    }
+
+    /// <summary>
+    /// Fold the field reference away.
+    ///
+    /// The two share the right-hand column, so hiding one is only useful if
+    /// the other takes the room: the body grows into it rather than leaving a
+    /// gap where the table was.
+    /// </summary>
+    private void FoldFields(bool show)
+    {
+        GridFields.IsVisible = show;
+        var rows = ((Grid)SecBody.Child!).RowDefinitions;
+        rows[1].Height = new GridLength(show ? 2 : 1, GridUnitType.Star);
+        rows[3].Height = new GridLength(show ? 3 : 0, GridUnitType.Star);
     }
 
     private void FormatBody()
