@@ -1,12 +1,16 @@
-# Deployed/
+# Deployed exports — on request only
 
-Every source file in this repo, wrapped in the JSON envelope the Fishbowl
-client uses for BI import/export. **Generated — do not hand-edit.** Change the
-source file, then re-run:
+`build-deployed.js` wraps a source file in the JSON envelope the Fishbowl client
+uses for BI import/export, ready to drop into an import. It is **run on request,
+not after every edit**, and its output folder `Deployed/` is gitignored — the
+exports were not earning their place in every commit.
 
 ```
 node tools/deploy/build-deployed.js
 ```
+
+It regenerates every export at once (there is no single-file mode); take the one
+you need from `Deployed/` and ignore the rest.
 
 | Source | Type | Output |
 |---|---|---|
@@ -14,9 +18,9 @@ node tools/deploy/build-deployed.js
 | `scripts/*.js` | `Script` | `Deployed/fb-lib-Script.json` |
 | `scripts/*.css` | `Style` | `Deployed/fb-styles-Style.json` |
 
-**Flat — every export sits directly in this folder, no subfolders.** That is
-how the Fishbowl client itself exports, so this folder is a drop-in match for a
-client export directory and the two can be diffed against each other without
+**Flat — every export sits directly in the folder, no subfolders.** That is how
+the Fishbowl client itself exports, so the folder is a drop-in match for a client
+export directory and the two can be diffed against each other without
 reorganising either. Filenames are `<name>-<type>.json`; `manifest.json` maps
 each one back to the repo file it came from.
 
@@ -46,8 +50,8 @@ does it — which is *not* what `JSON.stringify` produces:
   characters (emoji) are escaped, as a `\uXXXX` surrogate pair
 
 Verified by round-tripping all 27 real exports in `Documents/BI` — every one
-reproduces byte-for-byte. `fb-lib`, `fb-mfg` and `fb-styles` in this folder are
-currently **byte-identical** to their live exports.
+reproduces byte-for-byte. When this was written, the generated `fb-lib`, `fb-mfg` and
+`fb-styles` were **byte-identical** to their live exports.
 
 ## Names are load-bearing
 
@@ -55,10 +59,10 @@ Fishbowl keys an import on the record **name**: a matching name *updates* that
 record, a new one *creates a duplicate beside it*. `manifest.json` records
 which is which for every file:
 
-- **`updates-existing`** (27) — the name was recovered from a real export in
+- **`updates-existing`** (31 at the last run) — the name was recovered from a real export in
   `Documents/BI`, by matching the banner `PATH:` line and then the `<title>`.
   These are the live record names; don't tidy them.
-- **`creates-new`** (53) — no deployed counterpart was found, so the name comes
+- **`creates-new`** (55 at the last run) — no deployed counterpart was found, so the name comes
   from the file's `<title>` (house suffix trimmed) or its filename. Importing
   one of these makes a new page.
 - A `note` field marks anything auto-renamed because two sources derived the

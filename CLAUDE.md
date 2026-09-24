@@ -4,28 +4,29 @@ This guide covers every built-in JavaScript function available in Fishbowl BI re
 
 ---
 
-## ⚠ After ANY edit: regenerate `Deployed/`
+## Importable JSON exports — only when asked
 
-Every `*.htm` and `scripts/*.{js,css}` in this repo has a JSON-wrapped twin in
-**`Deployed/`** — the form the Fishbowl client imports. **Whenever you change a
-source file, regenerate:**
+**Do not regenerate or commit JSON exports after editing a report.** Produce one
+only when the user asks for it specifically. The exports were a committed
+`Deployed/` folder regenerated after every edit; it was dropped because it was
+not earning its place.
+
+When one is requested:
 
 ```
 node tools/deploy/build-deployed.js
 ```
 
-- The folder is **flat** — every export sits directly in `Deployed/`, no
-  subfolders. That matches how the client exports, so the folder is a drop-in
-  match for a client export directory.
+- It rebuilds **every** export into `Deployed/` (no single-file mode); hand over
+  the one asked for. `Deployed/` is gitignored — never commit it.
 - Filenames are `<name>-<type>.json`; type is `Page` (.htm), `Script` (.js),
-  `Style` (.css). `Deployed/manifest.json` maps each back to its source.
+  `Style` (.css).
 - The envelope is Jackson's `DefaultPrettyPrinter` output, **not**
-  `JSON.stringify` — space on both sides of the colon, CRLF, `[ {` … `} ]` with
-  no trailing newline. `tools/deploy/fbwrap.js` owns it; don't hand-roll it.
+  `JSON.stringify`. `tools/deploy/fbwrap.js` owns it; don't hand-roll it.
 - **Names key the import.** A name matching a live record UPDATES it; a new name
   CREATES a duplicate. The recovered live names live in `DEPLOYED_NAMES` in the
-  generator — do not "tidy" them. See `Deployed/README.md` for the full contract
-  and the known caveats.
+  generator — do not "tidy" them. Say which case the requested export is.
+  `tools/deploy/README.md` has the full contract and the known caveats.
 
 ---
 
