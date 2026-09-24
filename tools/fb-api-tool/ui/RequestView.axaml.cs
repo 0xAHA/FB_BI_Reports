@@ -1,9 +1,12 @@
+using System.IO;
 using System.Text.Json.Nodes;
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Templates;
 using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
+using Avalonia.VisualTree;
 
 namespace FbApiTool.Ui;
 
@@ -22,6 +25,16 @@ public partial class RequestView : UserControl
 
     private ApiResult? _last;
 
+    /// <summary>
+    /// The parameter that carries a whole SQL statement, when there is one.
+    ///
+    /// /api/data-query documents its statement as an ordinary query parameter
+    /// named "query". Rendered as one it is a single-line box, which is no way
+    /// to write a join — so when it is present the right-hand column becomes
+    /// an editor and this parameter stops appearing in the parameter list.
+    /// </summary>
+    private ApiParam? _sqlParam;
+
     public RequestView(RequestContext ctx, ApiEndpoint ep)
     {
         InitializeComponent();
@@ -30,16 +43,20 @@ public partial class RequestView : UserControl
         Endpoint = ep;
 
         TxtMethod.Text = ep.Method.ToUpperInvariant();
-        TxtMethod.Foreground = Brand.ForMethod(ep.Method);
-        BadgeMethod.Background = Brand.FillForMethod(ep.Method);
+        TxtMethod.Bind(TextBlock.ForegroundProperty, App.Token(Brand.InkKeyForMethod(ep.Method)));
+        BadgeMethod.Bind(Border.BackgroundProperty, App.Token(Brand.FillKeyForMethod(ep.Method)));
 
         TxtEpDesc.Text = string.IsNullOrWhiteSpace(ep.Description)
             ? "(no description in the catalog)" : ep.Description;
 
+        _sqlParam = ep.QueryParams.FirstOrDefault(SqlFormat.IsSqlParam);
+
         BuildPathParams();
         BuildQueryParams();
         BuildHeaders();
-        SetUpBody();
+        if (ep.IsImport) SetUpImport();
+        else if (_sqlParam is not null) SetUpSql();
+        else SetUpBody();
         SetUpResponse();
         RefreshRights();
 
@@ -47,11 +64,12 @@ public partial class RequestView : UserControl
         BtnAddQuery.Click += (_, _) => PanelQuery.Children.Add(Row(PanelQuery, "", "", null));
         BtnAddHeader.Click += (_, _) => PanelHeaders.Children.Add(Row(PanelHeaders, "", "", null));
         BtnRevertUrl.Click += (_, _) => RevertUrl();
-        TxtUrl.TextChanged += (_, _) => UrlEdited();
+        WhenTyped(TxtUrl, UrlEdited);
 
         MnuCopyUrl.Click += (_, _) => Copy(TxtUrl.Text ?? "", "URL");
         MnuCopyCurl.Click += (_, _) => CopyCurl();
         MnuCopyBi.Click += (_, _) => CopyBi();
+        MnuPasteCurl.Click += async (_, _) => await PasteCurlAsync();
         BtnSaveRequest.Click += async (_, _) => await SaveRequestAsync();
 
         // Enter sends from any field; inside an editor it has to be Ctrl+Enter,
@@ -65,8 +83,14 @@ public partial class RequestView : UserControl
     {
         if (e.Key != Key.Enter) return;
 
-        var inEditor = TopLevel.GetTopLevel(this)?.FocusManager?.GetFocusedElement()
-                       is TextBox { AcceptsReturn: true };
+        var focused = TopLevel.GetTopLevel(this)?.FocusManager?.GetFocusedElement();
+
+        // AvaloniaEdit puts focus on its TextArea, which is not a TextBox, so
+        // the editor has to be recognised by where the focus sits rather than
+        // by what kind of control holds it. Without this, Enter in the SQL
+        // editor sends the request instead of making a new line.
+        var inEditor = focused is TextBox { AcceptsReturn: true }
+                       || (focused as Visual)?.FindAncestorOfType<SqlEditor>() is not null;
 
         if (inEditor && (e.KeyModifiers & KeyModifiers.Control) == 0) return;
 
@@ -86,14 +110,15 @@ public partial class RequestView : UserControl
             var label = new TextBlock
             {
                 Text = "{" + name + "}",
-                FontFamily = (FontFamily)Application.Current!.FindResource("FbMono")!,
+                FontFamily = Brand.Mono,
                 FontSize = 13,
                 VerticalAlignment = VerticalAlignment.Center,
                 Width = 150,
                 Margin = new Avalonia.Thickness(0, 0, 8, 0),
             };
             var box = new TextBox { Tag = name, FontSize = 13 };
-            box.TextChanged += (_, _) => UpdateUrl();
+            WhenTyped(box, UpdateUrl);
+            VarComplete.Attach(box, () => _ctx.Variables);
 
             var row = new DockPanel();
             DockPanel.SetDock(label, Dock.Left);
@@ -141,8 +166,9 @@ public partial class RequestView : UserControl
         };
         x.Classes.Add("rowkill");
 
-        k.TextChanged += (_, _) => UpdateUrl();
-        v.TextChanged += (_, _) => UpdateUrl();
+        WhenTyped(k, UpdateUrl);
+        WhenTyped(v, UpdateUrl);
+        VarComplete.Attach(v, () => _ctx.Variables);
 
         var grid = new DockPanel { Margin = new Avalonia.Thickness(0, 0, 0, 2) };
         DockPanel.SetDock(k, Dock.Left);
@@ -163,7 +189,7 @@ public partial class RequestView : UserControl
                 Text = description,
                 FontSize = 11.5,
                 TextWrapping = TextWrapping.Wrap,
-                Foreground = (IBrush)Application.Current!.FindResource("FbTextMuted")!,
+                Foreground = Brand.Muted,
                 Margin = new Avalonia.Thickness(2, 1, 0, 0),
             });
         }
@@ -171,6 +197,73 @@ public partial class RequestView : UserControl
         x.Click += (_, _) => { owner.Children.Remove(outer); UpdateUrl(); };
         return outer;
     }
+
+    /// <summary>
+    /// Hand the right-hand column to the SQL editor.
+    ///
+    /// The body pane is not just hidden but taken out of play: everything that
+    /// reads a payload keys off TxtBody.IsVisible, so leaving it visible here
+    /// would send an empty JSON body alongside the statement.
+    /// </summary>
+    private void SetUpSql()
+    {
+        SecBody.IsVisible = false;
+        TxtBody.IsVisible = false;
+        SecSql.IsVisible = true;
+
+        TxtSql.SchemaSource = () => _ctx.Schema();
+        TxtSql.VariableSource = () => _ctx.Variables;
+        TxtSql.TextChanged += (_, _) => UpdateUrl();
+
+        ChkLimit.IsChecked = Prefs.RowLimitOnOr(_ctx.Setting);
+        TxtLimit.Text = Prefs.RowLimit(_ctx.Setting).ToString();
+        TxtLimit.IsEnabled = ChkLimit.IsChecked == true;
+
+        ChkLimit.IsCheckedChanged += (_, _) =>
+        {
+            TxtLimit.IsEnabled = ChkLimit.IsChecked == true;
+            _ctx.SetSetting(Prefs.RowLimitOn, ChkLimit.IsChecked == true ? "1" : "0");
+            UpdateUrl();
+        };
+
+        // Written back on every keystroke, and read back through the clamped
+        // reader — so a half-typed "5" is stored but never sent as LIMIT 5
+        // once it has become "500".
+        WhenTyped(TxtLimit, () =>
+        {
+            if (int.TryParse((TxtLimit.Text ?? "").Trim(), out var n) && n >= 1)
+                _ctx.SetSetting(Prefs.RowLimit_, n.ToString());
+            UpdateUrl();
+        });
+
+        BtnFormatSql.Click += (_, _) => FormatSql();
+        BtnCopySql.Click += (_, _) => Copy(TxtSql.Text, "Query");
+        BtnClearSql.Click += (_, _) => TxtSql.Clear();
+
+        // Completion is only worth having once the schema is known, and the
+        // schema is a round trip. Asking for it now means it is there before
+        // the first statement is typed rather than after it.
+        _ = _ctx.LoadSchema(false);
+
+        SetUpSaved();
+    }
+
+    private void FormatSql()
+    {
+        if (TxtSql.Text.Trim().Length == 0) return;
+        TxtSql.Text = SqlFormat.Pretty(TxtSql.Text);
+    }
+
+    /// <summary>Put a name from the schema browser into the statement, at the caret.</summary>
+    public void InsertSql(string text)
+    {
+        if (_sqlParam is null) return;
+        TxtSql.InsertAtCaret(text);
+    }
+
+    /// <summary>Is this the parameter the editor owns?</summary>
+    private bool IsSqlNamed(string? name) =>
+        _sqlParam is not null && string.Equals(name, _sqlParam.Name, StringComparison.OrdinalIgnoreCase);
 
     private void SetUpBody()
     {
@@ -208,6 +301,8 @@ public partial class RequestView : UserControl
         BtnFormatBody.Click += (_, _) => FormatBody();
         BtnResetBody.Click += (_, _) => TxtBody.Text = Endpoint.BodySample ?? "";
         BtnCopyBody.Click += (_, _) => Copy(TxtBody.Text ?? "", "Body");
+
+        VarComplete.Attach(TxtBody, () => _ctx.Variables);
     }
 
     /// <summary>
@@ -255,6 +350,120 @@ public partial class RequestView : UserControl
         };
 
         BtnCopyResp.Click += (_, _) => Copy(_last?.Body ?? "", "Response");
+        BtnCapture.Click += async (_, _) => await CaptureAsync();
+        BtnSaveResp.Click += async (_, _) => await SaveResponseAsync();
+    }
+
+    // ── CAPTURE ────────────────────────────────────────────
+
+    /// <summary>
+    /// Put a value from this response into a variable.
+    ///
+    /// The step that turns a list of endpoints into a sequence: create an
+    /// order, capture its id, address it in the next request. Copying the id
+    /// across by hand works once and is wrong against any other server.
+    /// </summary>
+    private async Task CaptureAsync()
+    {
+        if (_last is null) { _ctx.Status("Run the request first — there is nothing to capture."); return; }
+
+        var paths = Variables.Paths(_last.Body);
+        if (paths.Count == 0) { _ctx.Status("Nothing in that response looks capturable."); return; }
+
+        if (TopLevel.GetTopLevel(this) is not Window owner) return;
+
+        var pick = await CaptureDialog.ShowAsync(owner, paths, _last.Body);
+        if (pick is null) return;
+
+        var value = Variables.Capture(_last.Body, pick.Path);
+        if (value is null) { _ctx.Status("No value at " + pick.Path + "."); return; }
+
+        _ctx.SetVariable(pick.Name, value, "captured from " + Endpoint.Name);
+        _ctx.Status("{{" + pick.Name + "}} = " + Variables.Preview(value));
+
+        if (!pick.Remember) return;
+
+        // Re-run on every success from now on, so a sequence keeps itself up
+        // to date without anyone remembering to press this again.
+        _captures.RemoveAll(c => c.Variable.Equals(pick.Name, StringComparison.OrdinalIgnoreCase));
+        _captures.Add(new CaptureRule { Path = pick.Path, Variable = pick.Name });
+    }
+
+    private readonly List<CaptureRule> _captures = [];
+
+    /// <summary>Apply the standing capture rules to a fresh response.</summary>
+    private void RunCaptures(ApiResult r)
+    {
+        if (_captures.Count == 0 || !r.Ok) return;
+
+        var done = new List<string>();
+        foreach (var rule in _captures)
+        {
+            var value = Variables.Capture(r.Body, rule.Path);
+            if (value is null) continue;
+
+            _ctx.SetVariable(rule.Variable, value, "captured from " + Endpoint.Name);
+            done.Add("{{" + rule.Variable + "}} = " + Variables.Preview(value));
+        }
+
+        if (done.Count > 0) _ctx.Status(string.Join("  ·  ", done));
+    }
+
+    // ── SAVING THE RESPONSE ─────────────────────────────────
+
+    /// <summary>
+    /// Write the response out.
+    ///
+    /// Rows first when there are rows: what someone asked for when they ran a
+    /// query is usually a spreadsheet, not a JSON document. The response
+    /// verbatim is still one pick away.
+    /// </summary>
+    private async Task SaveResponseAsync()
+    {
+        if (_last is null || string.IsNullOrEmpty(_last.Body)) { _ctx.Status("Nothing to save."); return; }
+        if (TopLevel.GetTopLevel(this) is not TopLevel top) return;
+
+        var json = _last.IsJson;
+        var (columns, rows) = json ? ApiRunner.Tabulate(_last.Body) : ([], []);
+        var tabular = rows.Count > 0 && columns.Count > 0;
+
+        var types = new List<Avalonia.Platform.Storage.FilePickerFileType>();
+        if (tabular)
+            types.Add(new("CSV for a spreadsheet") { Patterns = ["*.csv"] });
+        if (json)
+            types.Add(new("JSON") { Patterns = ["*.json"] });
+        types.Add(new("Text") { Patterns = ["*.txt"] });
+        types.Add(new("All files") { Patterns = ["*"] });
+
+        var file = await top.StorageProvider.SaveFilePickerAsync(new()
+        {
+            Title = "Save response",
+            SuggestedFileName = ResultExport.SuggestName(Endpoint.Name, tabular ? "csv" : json ? "json" : "txt"),
+            DefaultExtension = tabular ? "csv" : json ? "json" : "txt",
+            FileTypeChoices = types,
+        });
+        if (file is null) return;
+
+        var path = file.Path.LocalPath;
+        var asCsv = tabular && path.EndsWith(".csv", StringComparison.OrdinalIgnoreCase);
+
+        try
+        {
+            if (asCsv)
+            {
+                // With a BOM: Excel reads a CSV without one as the system code
+                // page and mangles every non-ASCII name in it.
+                await File.WriteAllTextAsync(path, ResultExport.ToCsv(columns, rows),
+                                             new System.Text.UTF8Encoding(true));
+                _ctx.Status("Saved " + rows.Count + " row(s) as CSV — " + path);
+            }
+            else
+            {
+                await File.WriteAllTextAsync(path, _last.Body);
+                _ctx.Status("Saved " + path);
+            }
+        }
+        catch (Exception ex) { _ctx.Status("Could not save: " + ex.Message); }
     }
 
     // ── FILLING IT IN ───────────────────────────────────────────────────
@@ -268,8 +477,10 @@ public partial class RequestView : UserControl
     /// </summary>
     public void LoadFrom(SavedRequest saved)
     {
-        Replace(PanelQuery, saved.Query.Select(p => (p.Name, p.Value)));
+        Replace(PanelQuery, saved.Query.Where(p => !IsSqlNamed(p.Name)).Select(p => (p.Name, p.Value)));
         Replace(PanelHeaders, saved.Headers.Select(p => (p.Name, p.Value)));
+
+        if (saved.Query.FirstOrDefault(p => IsSqlNamed(p.Name)) is { } sql) TxtSql.Text = sql.Value;
 
         if (saved.Body is not null && TxtBody.IsVisible) TxtBody.Text = saved.Body;
 
@@ -301,7 +512,9 @@ public partial class RequestView : UserControl
                     box.Text = v;
         }
 
-        Replace(PanelQuery, query.Select(p => (p.Key, p.Value)));
+        Replace(PanelQuery, query.Where(p => !IsSqlNamed(p.Key)).Select(p => (p.Key, p.Value)));
+        if (_sqlParam is not null && query.FirstOrDefault(p => IsSqlNamed(p.Key)) is { Key: not null } sql)
+            TxtSql.Text = sql.Value;
         if (body is not null && TxtBody.IsVisible) TxtBody.Text = body;
 
         UpdateUrl();
@@ -357,10 +570,39 @@ public partial class RequestView : UserControl
     }
 
     /// <summary>What to actually send: the form's pieces, or the typed URL.</summary>
-    private (string BaseUrl, string Path, List<KeyValuePair<string, string>> Query) Target() =>
-        _urlEdited
-            ? ApiRunner.SplitUrl(Fill(TxtUrl.Text), _ctx.BaseUrl())
-            : (_ctx.BaseUrl(), ResolvedPath(), CollectQuery());
+    private (string BaseUrl, string Path, List<KeyValuePair<string, string>> Query) Target()
+    {
+        // A hand-edited URL is sent verbatim, limit and all: whatever the box
+        // says is what goes. _limitApplied is cleared so the pill does not
+        // report a limit this path never appended.
+        if (!_urlEdited) return (_ctx.BaseUrl(), ResolvedPath(), CollectQuery());
+
+        _limitApplied = 0;
+        var (b, p, q) = ApiRunner.SplitUrl(Fill(TxtUrl.Text), _ctx.BaseUrl());
+        return (b, p, q);
+    }
+
+    /// <summary>
+    /// Run something whenever a box's text actually changes.
+    ///
+    /// Not the TextChanged event: Avalonia can raise that before the Text
+    /// property has settled, so a handler reading Text back gets the value
+    /// from BEFORE the keystroke and the URL trails a character behind. The
+    /// property's own observable carries the committed value, so it cannot.
+    /// </summary>
+    private static void WhenTyped(TextBox box, Action then) =>
+        box.GetObservable(TextBox.TextProperty).Subscribe(new Sink(then));
+
+    /// <summary>
+    /// A minimal observer. Avalonia's GetObservable wants an IObserver and the
+    /// Rx package is not worth taking on for three subscriptions.
+    /// </summary>
+    private sealed class Sink(Action then) : IObserver<string?>
+    {
+        public void OnNext(string? value) => then();
+        public void OnCompleted() { }
+        public void OnError(Exception error) { }
+    }
 
     private string ResolvedPath()
     {
@@ -376,6 +618,11 @@ public partial class RequestView : UserControl
             if (value.Length > 0)
                 path = path.Replace("{" + name + "}", Uri.EscapeDataString(value), StringComparison.Ordinal);
         }
+        // /api/import/{name} takes its name from the picker rather than from a
+        // parameter row, so it is substituted here like any other.
+        if (Endpoint.IsImport && SelectedImportName() is { Length: > 0 } importName)
+            path = path.Replace("{name}", Uri.EscapeDataString(importName), StringComparison.Ordinal);
+
         return path;
     }
 
@@ -389,14 +636,61 @@ public partial class RequestView : UserControl
             if (k.Length > 0 && !string.IsNullOrEmpty(pair[1].Text))
                 list.Add(new KeyValuePair<string, string>(k, pair[1].Text!));
         }
+
+        // The statement is a query parameter too — just an enormous one. Adding
+        // it here rather than at each call site means the URL bar, the cURL
+        // line, the history entry and a saved request all carry it for free.
+        if (ReferenceEquals(panel, PanelQuery) && _sqlParam is not null
+            && TxtSql.Text.Trim().Length > 0)
+            list.Add(new KeyValuePair<string, string>(_sqlParam.Name, TxtSql.Text.Trim()));
+
         return list;
     }
 
-    private List<KeyValuePair<string, string>> CollectQuery() => Filled(RawPairs(PanelQuery));
+    private List<KeyValuePair<string, string>> CollectQuery() => Filled(WithRowLimit(RawPairs(PanelQuery)));
+
+    /// <summary>
+    /// Append the row limit to the statement, when it can be appended safely.
+    ///
+    /// Done here rather than at send time so the URL bar, the cURL line and the
+    /// history entry all show the statement that actually went to the server.
+    /// A saved request is built from the raw rows instead, so it keeps the
+    /// statement as it was written.
+    /// </summary>
+    private List<KeyValuePair<string, string>> WithRowLimit(List<KeyValuePair<string, string>> raw)
+    {
+        _limitApplied = 0;
+        if (_sqlParam is null || ChkLimit.IsChecked != true) return raw;
+
+        var rows = Prefs.RowLimit(_ctx.Setting);
+
+        for (var i = 0; i < raw.Count; i++)
+        {
+            if (!IsSqlNamed(raw[i].Key)) continue;
+            if (!SqlLimit.Applies(raw[i].Value)) break;
+
+            _limitApplied = rows;
+            raw[i] = new KeyValuePair<string, string>(raw[i].Key, SqlLimit.Apply(raw[i].Value, rows));
+            break;
+        }
+        return raw;
+    }
+
+    /// <summary>The limit that went out with the last collection, or 0.</summary>
+    private int _limitApplied;
     private List<KeyValuePair<string, string>> CollectHeaders() => Filled(RawPairs(PanelHeaders));
 
     private List<KeyValuePair<string, string>> Filled(List<KeyValuePair<string, string>> raw) =>
         [.. raw.Select(p => new KeyValuePair<string, string>(Fill(p.Key), Fill(p.Value)))];
+
+    /// <summary>
+    /// What the payload is sent as. An import carries rows, not an object, and
+    /// the server decides how to read them from this header alone — sending
+    /// CSV as application/json is accepted and then silently misparsed.
+    /// </summary>
+    private string ContentType => Endpoint.IsImport
+        ? (JsonMode ? ImportPayload.JsonContentType : ImportPayload.CsvContentType)
+        : "application/json";
 
     private Dictionary<string, string> Vars => Variables.ToMap(_ctx.Variables);
     private string Fill(string? text) => Variables.Expand(text, Vars);
@@ -431,12 +725,21 @@ public partial class RequestView : UserControl
             return;
         }
 
-        var payload = TxtBody.IsVisible ? (TxtBody.Text ?? "") : "";
+        var payload = Endpoint.IsImport ? (TxtImport.Text ?? "")
+                    : TxtBody.IsVisible ? (TxtBody.Text ?? "")
+                    : "";
         var body = payload.Trim().Length > 0 ? Fill(payload) : null;
 
-        // Invalid JSON comes back as a generic 400 that says nothing useful, so
-        // say what is actually wrong before spending the round trip.
-        if (body is not null)
+        if (Endpoint.IsImport && SelectedImportName().Length == 0)
+        {
+            await Tell("Choose an import type first — the server only accepts the names in that list.");
+            return;
+        }
+
+        // A CSV payload is not JSON and must not be checked as though it were.
+        // Invalid JSON otherwise comes back as a generic 400 that says nothing
+        // useful, so say what is actually wrong before spending the round trip.
+        if (body is not null && ContentType == "application/json")
         {
             try { JsonNode.Parse(body); }
             catch (System.Text.Json.JsonException jx)
@@ -455,7 +758,9 @@ public partial class RequestView : UserControl
         try
         {
             var r = await _ctx.Runner.SendAsync(baseUrl, Endpoint.Method, path, query,
-                                                CollectHeaders(), body, "application/json", _ctx.Token());
+                                                CollectHeaders(), body, ContentType, _ctx.Token());
+            Log.Info(Endpoint.Method + " " + path + " -> " + r.Status + " in " + r.Millis + " ms");
+
             Show(r);
             _ctx.Record(new HistoryEntry
             {
@@ -467,6 +772,7 @@ public partial class RequestView : UserControl
         }
         catch (Exception ex)
         {
+            Log.Error("send failed: " + Endpoint.Method + " " + path, ex);
             _ctx.Status("Send failed: " + ex.Message);
             await Tell("The request could not be sent.\n\n" + ex.Message);
         }
@@ -502,8 +808,8 @@ public partial class RequestView : UserControl
 
         ChipStatus.IsVisible = true;
         TxtStatusCode.Text = r.Status + " " + r.Reason;
-        ChipStatus.Background = r.Ok ? Brand.Sage : Brand.Maroon;
-        TxtStatusCode.Foreground = r.Ok ? Brand.Success : Brand.Negative;
+        ChipStatus.Bind(Border.BackgroundProperty, App.Token(r.Ok ? "AccSage" : "AccMaroonBg"));
+        TxtStatusCode.Bind(TextBlock.ForegroundProperty, App.Token(r.Ok ? "FbSuccess" : "FbNegative"));
 
         TxtTiming.Text = r.Millis + " ms  ·  " + Size(r.Body) +
                          (r.IsJson ? "  ·  JSON" : "");
@@ -515,6 +821,9 @@ public partial class RequestView : UserControl
             .Select(h => new HeaderRow(h.Key, h.Value)).ToList();
 
         ShowTable(r);
+        ShowLimitNote(r);
+        RunCaptures(r);
+        KeepRun(r);
 
         Views.SelectedIndex = OpenOn(r);
         _ctx.Status(Endpoint.Method + " " + Endpoint.Path + " — " + r.Status + " in " + r.Millis + " ms");
@@ -533,6 +842,35 @@ public partial class RequestView : UserControl
         return GridRows.ItemsSource is not null && GridRows.Columns.Count > 0 ? 2 : 0;
     }
 
+    /// <summary>
+    /// Say whether the limit bit.
+    ///
+    /// A result that stopped exactly at the limit is the one case that matters:
+    /// it looks like a complete answer and is not. Below the limit the query
+    /// simply finished, and saying so in amber would train people to ignore the
+    /// pill on the occasion it means something.
+    /// </summary>
+    private void ShowLimitNote(ApiResult r)
+    {
+        if (_limitApplied <= 0 || !r.Ok) { ChipLimit.IsVisible = false; return; }
+
+        var rows = GridRows.ItemsSource?.Cast<object>().Count() ?? 0;
+        var hit = rows >= _limitApplied;
+
+        ChipLimit.IsVisible = true;
+        ChipLimit.Bind(Border.BackgroundProperty, App.Token(hit ? "AccYellowBg" : "FbTint"));
+        TxtLimitNote.Bind(TextBlock.ForegroundProperty, App.Token(hit ? "FbAmber" : "FbBlueAccent"));
+        TxtLimitNote.Text = hit
+            ? "LIMIT " + _limitApplied + " reached — there are probably more rows"
+            : "LIMIT " + _limitApplied + " — not reached";
+
+        ToolTip.SetTip(ChipLimit, hit
+            ? "The statement returned as many rows as the limit allowed, so this is very likely a partial "
+              + "answer. Raise the limit, or narrow the query."
+            : "A row limit was appended to this statement, but the result came in under it, so nothing was "
+              + "cut off.");
+    }
+
     private void ShowTable(ApiResult r)
     {
         GridRows.Columns.Clear();
@@ -542,19 +880,104 @@ public partial class RequestView : UserControl
         var table = ApiRunner.Tabulate(r.Body);
         if (table.Columns.Count == 0) return;
 
-        foreach (var name in table.Columns)
+        FillGrid(table.Columns, table.Rows);
+    }
+
+    /// <summary>
+    /// Put a set of rows in the grid.
+    ///
+    /// Separate from ShowTable because three things fill this grid — a fresh
+    /// response, a result read back off disk, and a comparison between the two
+    /// — and only the first of them has an ApiResult to hand.
+    /// </summary>
+    private void FillGrid(List<string> columns, List<Dictionary<string, string>> rows)
+    {
+        GridRows.Columns.Clear();
+        GridRows.ItemsSource = null;
+
+        foreach (var name in columns)
         {
+            var column = name;   // captured per column, not per loop variable
+
+            if (CellStyle.IsPillColumn(column, rows.Select(row => Cell(row, column))))
+            {
+                GridRows.Columns.Add(PillColumn(column));
+                continue;
+            }
+
             GridRows.Columns.Add(new DataGridTextColumn
             {
-                Header = name,
+                Header = column,
                 // Indexed into the row dictionary by column name: the rows are
                 // shaped by whatever the response had, so there is nothing to
                 // bind a property path to.
-                Binding = new Avalonia.Data.Binding("[" + name + "]"),
+                Binding = new Avalonia.Data.Binding("[" + column + "]"),
             });
         }
-        GridRows.ItemsSource = table.Rows;
+        GridRows.ItemsSource = rows;
     }
+
+    /// <summary>One cell out of a row, whatever shape the row turned out to be.</summary>
+    private static string Cell(object? row, string column) =>
+        row is IDictionary<string, string> d && d.TryGetValue(column, out var v) ? v : "";
+
+    /// <summary>
+    /// A column of states, drawn as pills.
+    ///
+    /// A template column rather than a text one, which costs the sorting a
+    /// bound column gets for free — hence the explicit comparer. It sorts on
+    /// the text, not on the tone: a user clicking a status header is looking
+    /// for all the Voids together, not for the reds together.
+    /// </summary>
+    private static DataGridColumn PillColumn(string column) => new DataGridTemplateColumn
+    {
+        Header = column,
+        IsReadOnly = true,
+        SortMemberPath = column,
+        CustomSortComparer = Comparer<object?>.Create((a, b) =>
+            string.Compare(Cell(a, column), Cell(b, column), StringComparison.OrdinalIgnoreCase)),
+        CellTemplate = new FuncDataTemplate<object?>((row, _) => Pill(Cell(row, column), column), true),
+    };
+
+    /// <summary>
+    /// The pill itself, or plain text when the value has no tone — a blank
+    /// cell stays blank rather than becoming an empty coloured box.
+    /// </summary>
+    private static Control Pill(string value, string column)
+    {
+        var tone = CellStyle.For(column, value);
+        if (tone == ValueTone.None)
+            return new TextBlock
+            {
+                Text = value,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Avalonia.Thickness(4, 0),
+            };
+
+        var (inkKey, fillKey) = Brand.KeysForTone(tone);
+
+        var text = new TextBlock
+        {
+            Text = value,
+            FontSize = 11.5,
+            FontWeight = FontWeight.SemiBold,
+        };
+        text.Bind(TextBlock.ForegroundProperty, App.Token(inkKey));
+
+        var pill = new Border
+        {
+            CornerRadius = new Avalonia.CornerRadius(3),
+            Padding = new Avalonia.Thickness(7, 1),
+            Margin = new Avalonia.Thickness(4, 2),
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Center,
+            Child = text,
+        };
+        pill.Bind(Border.BackgroundProperty, App.Token(fillKey));
+
+        return pill;
+    }
+
 
     private static string Size(string body)
     {
@@ -582,13 +1005,13 @@ public partial class RequestView : UserControl
         {
             true => Brand.Sage,
             false => Brand.Maroon,
-            _ => (IBrush)Application.Current!.FindResource("FbBg2")!,
+            _ => Brand.Bg2,
         };
         TxtRight.Foreground = check.Held switch
         {
             true => Brand.Success,
             false => Brand.Negative,
-            _ => (IBrush)Application.Current!.FindResource("FbTextSub")!,
+            _ => Brand.Sub,
         };
     }
 
@@ -656,6 +1079,12 @@ public partial class RequestView : UserControl
     {
         if (TopLevel.GetTopLevel(this) is Window w)
             await Dialogs.TellAsync(w, "Fishbowl API Tool", message);
+    }
+
+    private async Task<bool> Confirm(string title, string message)
+    {
+        if (TopLevel.GetTopLevel(this) is not Window w) return false;
+        return await Dialogs.ConfirmAsync(w, title, message, "Delete", "Keep it");
     }
 }
 

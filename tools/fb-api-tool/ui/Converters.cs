@@ -1,31 +1,71 @@
 using System.Globalization;
+using Avalonia;
 using Avalonia.Data.Converters;
 using Avalonia.Media;
 
 namespace FbApiTool.Ui;
 
 /// <summary>
-/// The brand palette, as brushes.
+/// The brand palette, reached from code.
 ///
-/// The same values as Brand.axaml and as scripts/fb-styles.css. They are
-/// needed from code as well as from markup — a badge whose colour depends on
-/// a verb cannot be a static resource — so they live here too, frozen once.
+/// Every one of these is a LOOKUP, not a constant. They used to be frozen
+/// literals, which is fine until there are two themes: a badge built in code
+/// kept its light-theme tint while the markup around it went dark, and the
+/// result was a pale blue chip on a near-black page. Reading the resource each
+/// time costs a dictionary hit and means the answer follows the theme.
+///
+/// The keys are the ones in Brand.axaml, which are the ones in
+/// scripts/fb-styles.css — so this tool, the WPF build and the reports cannot
+/// drift apart.
 /// </summary>
 public static class Brand
 {
-    public static readonly IBrush Blue = Make("#2d9cdb");
-    public static readonly IBrush BlueAccent = Make("#1e7bb4");
-    public static readonly IBrush Success = Make("#1B7A46");
-    public static readonly IBrush Warning = Make("#B26A14");
-    public static readonly IBrush Negative = Make("#C43046");
-    public static readonly IBrush Purple = Make("#845EEB");
+    public static IBrush Blue => Get("FbBlue", "#2d9cdb");
+    public static IBrush BlueAccent => Get("FbBlueAccent", "#1e7bb4");
+    public static IBrush Success => Get("FbSuccess", "#1B7A46");
+    public static IBrush Warning => Get("FbWarning", "#B26A14");
+    public static IBrush Negative => Get("FbNegative", "#C43046");
+    public static IBrush Purple => Get("AccPurple", "#845EEB");
+    public static IBrush Muted => Get("FbTextMuted", "#8FA1A7");
+    public static IBrush Text => Get("FbText", "#101010");
+    public static IBrush Sub => Get("FbTextSub", "#506872");
 
-    public static readonly IBrush TintBlue = Make("#DEEAF4");
-    public static readonly IBrush Sage = Make("#DBE8E1");
-    public static readonly IBrush Maroon = Make("#F0D7DD");
-    public static readonly IBrush PurpleBg = Make("#D9CEF7");
-    public static readonly IBrush Amber = Make("#B26A14");
-    public static readonly IBrush AmberBg = Make("#FBEDC4");
+    public static IBrush Surface => Get("FbBgPrimary", "#FFFFFF");
+    public static IBrush Panel => Get("FbBgPanel", "#F7FAFC");
+    public static IBrush Border => Get("FbBorder", "#E3E3E3");
+    public static IBrush Bg2 => Get("FbBg2", "#EBEEED");
+
+    /// <summary>
+    /// The monospace family. Not themed, but reached the same way: a
+    /// variant-less FindResource against a dictionary that HAS variants
+    /// returns UnsetValue, and casting that threw on every endpoint with a
+    /// documented parameter.
+    /// </summary>
+    public static FontFamily Mono
+    {
+        get
+        {
+            var app = Application.Current;
+            if (app is not null &&
+                app.TryGetResource("FbMono", app.ActualThemeVariant, out var found) &&
+                found is FontFamily family)
+                return family;
+
+            return FontFamily.Default;
+        }
+    }
+
+    /// <summary>The bar, and what reads on it. Blue in both themes.</summary>
+    public static IBrush BrandBar => Get("FbBrandBar", "#2d9cdb");
+    public static IBrush OnBrand => Get("FbOnBrand", "#FFFFFF");
+    public static IBrush OnBrandSub => Get("FbOnBrandSub", "#DEEAF4");
+
+    public static IBrush TintBlue => Get("FbTint", "#DEEAF4");
+    public static IBrush Sage => Get("AccSage", "#DBE8E1");
+    public static IBrush Maroon => Get("AccMaroonBg", "#F0D7DD");
+    public static IBrush PurpleBg => Get("AccPurpleBg", "#D9CEF7");
+    public static IBrush Amber => Get("FbAmber", "#B26A14");
+    public static IBrush AmberBg => Get("AccYellowBg", "#FBEDC4");
 
     /// <summary>
     /// A verb's ink: blue for a read, green for a write, red for a delete,
@@ -40,6 +80,35 @@ public static class Brand
         _ => Purple,
     };
 
+    /// <summary>
+    /// The same answers as ForMethod / FillForMethod, but as token NAMES.
+    ///
+    /// A control built in code and handed a brush keeps that brush for ever,
+    /// so every pill painted this way stayed on whichever theme was current
+    /// when it was built. Given the key instead it can Bind, which is the code
+    /// equivalent of {DynamicResource} and follows the theme like the markup
+    /// does.
+    /// </summary>
+    public static string InkKeyForMethod(string? method) => (method ?? "").ToUpperInvariant() switch
+    {
+        "GET" => "MethodGet",
+        "POST" or "PUT" or "PATCH" => "MethodPost",
+        "DELETE" => "MethodDelete",
+        _ => "MethodOther",
+    };
+
+    public static string FillKeyForMethod(string? method) => InkKeyForMethod(method) + "Bg";
+
+    /// <summary>A value's tone, as the pair of token names that draw it.</summary>
+    public static (string Ink, string Fill) KeysForTone(ValueTone tone) => tone switch
+    {
+        ValueTone.Positive => ("FbSuccess", "AccSage"),
+        ValueTone.Active => ("FbBlueAccent", "FbTint"),
+        ValueTone.Warning => ("FbAmber", "AccYellowBg"),
+        ValueTone.Negative => ("FbNegative", "AccMaroonBg"),
+        _ => ("FbTextMuted", "FbBg2"),
+    };
+
     /// <summary>The tint that verb sits on.</summary>
     public static IBrush FillForMethod(string? method) => (method ?? "").ToUpperInvariant() switch
     {
@@ -49,11 +118,20 @@ public static class Brand
         _ => PurpleBg,
     };
 
-    private static IBrush Make(string hex)
+    /// <summary>
+    /// The current theme's value for a token, or the light one if the
+    /// application is not up yet — which happens when a converter is exercised
+    /// by the designer or by a test.
+    /// </summary>
+    private static IBrush Get(string key, string fallback)
     {
-        var b = new SolidColorBrush(Color.Parse(hex));
-        b.ToImmutable();
-        return b.ToImmutable();
+        var app = Application.Current;
+        if (app is not null &&
+            app.TryGetResource(key, app.ActualThemeVariant, out var found) &&
+            found is IBrush brush)
+            return brush;
+
+        return new SolidColorBrush(Color.Parse(fallback)).ToImmutable();
     }
 }
 

@@ -37,8 +37,8 @@ public partial class MainWindow
         Authenticated = () => !string.IsNullOrEmpty(_token),
         ConfirmSend = ConfirmWriteAsync,
         Store = StoreRequest,
-        Schema = () => null,
-        LoadSchema = _ => Task.FromResult<DbSchema.Snapshot?>(null),
+        Schema = () => _schema,
+        LoadSchema = LoadSchemaAsync,
         Ask = (title, label, initial) => Dialogs.AskAsync(this, title, label, initial),
         Record = h => Dispatcher.UIThread.Post(() =>
         {
@@ -46,6 +46,64 @@ public partial class MainWindow
             while (_history.Count > 60) _history.RemoveAt(_history.Count - 1);
         }),
     };
+
+    private DbSchema.Snapshot? _schema;
+
+    /// <summary>
+    /// The database's own table and column list, for SQL completion.
+    ///
+    /// One round trip per server, cached on disk afterwards: the answer only
+    /// changes when the schema does, and asking again on every keystroke would
+    /// make completion cost a network call. A second, optional query marks the
+    /// views MySQL cannot filter cheaply — the difference between a 2 ms query
+    /// and a 2 s one, which is worth knowing before writing the WHERE.
+    /// </summary>
+    private async Task<DbSchema.Snapshot?> LoadSchemaAsync(bool force)
+    {
+        if (_schema is not null && !force && _schema.Server == _fb.BaseUrl) return _schema;
+
+        // A cached schema still has to reach the tree. Returning it here and
+        // leaving the browser as it was is why the second run against a server
+        // showed an empty tree until Refresh was pressed — the data was there,
+        // nobody had told the control.
+        if (!force && DbSchema.Cached(_fb.BaseUrl) is { } cached)
+        {
+            _schema = cached;
+            Dispatcher.UIThread.Post(RefreshSchemaTree);
+            return _schema;
+        }
+
+        if (string.IsNullOrEmpty(_token)) return null;
+
+        try
+        {
+            var r = await _runner.SendAsync(_fb.BaseUrl, "GET", "/api/data-query",
+                [new("query", DbSchema.Query)], [], null, "application/json", _token);
+            if (!r.Ok) return null;
+
+            var snap = DbSchema.Parse(_fb.BaseUrl, r.Body);
+            if (snap.Tables.Count == 0) return null;
+
+            try
+            {
+                var hv = await _runner.SendAsync(_fb.BaseUrl, "GET", "/api/data-query",
+                    [new("query", DbSchema.HeavyViewQuery)], [], null, "application/json", _token);
+                if (hv.Ok) DbSchema.ApplyHeavyViews(snap, hv.Body);
+            }
+            catch { /* the schema is still usable without the warnings */ }
+
+            DbSchema.Cache(snap);
+            _schema = snap;
+
+            Dispatcher.UIThread.Post(RefreshSchemaTree);
+            Dispatcher.UIThread.Post(() => TxtStatus.Text =
+                "Schema loaded — " + (snap.Tables.Count - snap.ViewCount) + " tables, " +
+                snap.ViewCount + " views, " + snap.ColumnCount.ToString("N0") + " columns.");
+
+            return _schema;
+        }
+        catch { return null; }
+    }
 
     private void SetVariable(string name, string value, string? note)
     {
@@ -80,7 +138,24 @@ public partial class MainWindow
             }
         }
 
-        var view = new RequestView(Context, ep);
+        Log.Info("opening " + ep.Method + " " + ep.Path);
+
+        RequestView view;
+        try
+        {
+            view = new RequestView(Context, ep);
+        }
+        catch (Exception ex)
+        {
+            // A catalog entry with an unexpected shape should cost one
+            // endpoint, not the window. Before this, building a pane that
+            // threw took the whole application down with nothing written
+            // anywhere to say which endpoint it was.
+            Log.Crash("opening " + ep.Method + " " + ep.Path, ex);
+            TxtStatus.Text = "Could not open " + ep.Name + " — see " + Log.CrashFile;
+            return;
+        }
+
         var tab = new TabItem { Content = view, Header = TabHeader(ep, out var close) };
         tab.Classes.Add("req");
         close.Click += (_, _) =>
@@ -99,20 +174,22 @@ public partial class MainWindow
     /// <summary>A verb pill, the endpoint's name, and a close cross.</summary>
     private static Control TabHeader(ApiEndpoint ep, out Button close)
     {
+        var verb = new TextBlock
+        {
+            Text = ep.Method.ToUpperInvariant(),
+            FontSize = 9,
+            FontWeight = FontWeight.Bold,
+        };
+        verb.Bind(TextBlock.ForegroundProperty, App.Token(Brand.InkKeyForMethod(ep.Method)));
+
         var pill = new Border
         {
-            Background = Brand.FillForMethod(ep.Method),
             CornerRadius = new Avalonia.CornerRadius(3),
             Padding = new Avalonia.Thickness(5, 1),
             VerticalAlignment = VerticalAlignment.Center,
-            Child = new TextBlock
-            {
-                Text = ep.Method.ToUpperInvariant(),
-                Foreground = Brand.ForMethod(ep.Method),
-                FontSize = 9,
-                FontWeight = FontWeight.Bold,
-            },
+            Child = verb,
         };
+        pill.Bind(Border.BackgroundProperty, App.Token(Brand.FillKeyForMethod(ep.Method)));
 
         close = new Button
         {
@@ -166,8 +243,23 @@ public partial class MainWindow
             return;
         }
 
-        _dataView = new RequestView(Context, ep);
-        DataHost.Children.Add(_dataView);
+        try
+        {
+            _dataView = new RequestView(Context, ep);
+            DataHost.Children.Add(_dataView);
+        }
+        catch (Exception ex)
+        {
+            Log.Crash("opening the Data tab", ex);
+            DataHost.Children.Add(new TextBlock
+            {
+                Text = "The SQL workspace could not be built. See " + Log.CrashFile,
+                Margin = new Avalonia.Thickness(24),
+                FontSize = 13,
+                TextWrapping = Avalonia.Media.TextWrapping.Wrap,
+                Foreground = Brand.Negative,
+            });
+        }
     }
 
     /// <summary>Every open pane, so a change of connection reaches all of them.</summary>

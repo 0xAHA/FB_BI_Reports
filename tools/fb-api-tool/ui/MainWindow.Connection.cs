@@ -66,6 +66,15 @@ public partial class MainWindow
         _fb.AppId = p.AppId;
         Set("profile", p.Id);
 
+        if (moved)
+        {
+            // Another server is another database. Leaving the old one's tables
+            // in the browser would offer completions for columns that are not
+            // there, which is worse than offering none.
+            _schema = null;
+            RefreshSchemaTree();
+        }
+
         if (moved && _token is not null)
         {
             _token = null;
@@ -82,9 +91,10 @@ public partial class MainWindow
     private void ApplyProductionWarning()
     {
         var prod = OnProduction;
-        BrandBar.Background = prod
-            ? (IBrush)Brand.Negative
-            : (IBrush)Brand.Blue;
+        // FbBrandBar, not FbBlue: the bar has its own token because the dark
+        // theme needs a deeper blue behind white text. Assigning the plain
+        // brand blue here put the light-theme bar back on a dark window.
+        BrandBar.Background = prod ? Brand.Negative : Brand.BrandBar;
         ProdBanner.IsVisible = prod;
         TxtProdBanner.Text = prod
             ? "PRODUCTION — " + _fb.BaseUrl +
@@ -133,9 +143,19 @@ public partial class MainWindow
             Profiles.Save(_profiles);
         }
 
+        Log.Info("connected to " + _fb.BaseUrl + " as " + _connectedAs
+                 + (_tokenPasted ? " (pasted token)" : ""));
+
         RefreshAuth();
         RefreshOpenPanes();
+        SetIdleWatch(true);
         TxtStatus.Text = "Connected to " + _fb.BaseUrl + " as " + _connectedAs + ".";
+
+        // Reading the schema needs a token, so this is the first moment it can
+        // be done. Asking only when the Data tab is built meant connecting
+        // AFTER opening that tab left the browser empty with no way back but
+        // the Refresh button.
+        _ = LoadSchemaAsync(false);
     }
 
     /// <summary>
@@ -155,8 +175,11 @@ public partial class MainWindow
         _tokenPasted = false;
         _connectedAs = "";
 
+        Log.Info("signed out: " + why);
+
         RefreshAuth();
         RefreshOpenPanes();
+        SetIdleWatch(false);
         TxtStatus.Text = why;
     }
 

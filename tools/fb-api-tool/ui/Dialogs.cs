@@ -104,8 +104,8 @@ public static class Dialogs
 
         var foot = new Border
         {
-            Background = new SolidColorBrush(Color.Parse("#F7F7F7")),
-            BorderBrush = new SolidColorBrush(Color.Parse("#E3E3E3")),
+            Background = Brand.Panel,
+            BorderBrush = Brand.Border,
             BorderThickness = new Avalonia.Thickness(0, 1, 0, 0),
             Padding = new Avalonia.Thickness(18, 12),
             Child = row,

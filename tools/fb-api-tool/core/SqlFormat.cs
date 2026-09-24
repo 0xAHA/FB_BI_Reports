@@ -31,13 +31,29 @@ public static class SqlFormat
         ["LEFT", "JOIN"], ["RIGHT", "JOIN"], ["INNER", "JOIN"], ["OUTER", "JOIN"],
         ["FULL", "JOIN"], ["CROSS", "JOIN"],
         ["SELECT"], ["FROM"], ["WHERE"], ["HAVING"], ["LIMIT"], ["OFFSET"], ["UNION"],
-        ["INTERSECT"], ["EXCEPT"], ["JOIN"], ["VALUES"], ["UPDATE"], ["SET"], ["WITH"], ["ON"],
+        ["INTERSECT"], ["EXCEPT"], ["JOIN"], ["VALUES"], ["UPDATE"], ["SET"], ["WITH"],
     ];
 
     /// <summary>Indented under the condition they extend, rather than starting a clause.</summary>
     private static readonly HashSet<string> Continuations = new(StringComparer.OrdinalIgnoreCase)
     {
-        "AND", "OR",
+        // ON belongs to the JOIN above it rather than starting something of
+        // its own, and indenting it says so: a list of joins reads as pairs
+        // instead of as twice as many clauses.
+        "AND", "OR", "ON", "USING",
+    };
+
+    /// <summary>
+    /// Clauses whose body is a comma-separated list.
+    ///
+    /// These break after the keyword so that EVERY item is indented on its own
+    /// line, the first included. Leaving the first one up beside SELECT makes
+    /// it read as more important than the rest, and means adding a column
+    /// changes two lines in a diff rather than one.
+    /// </summary>
+    private static readonly HashSet<string> ListClauses = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "SELECT", "GROUP BY", "ORDER BY", "SET", "VALUES",
     };
 
     /// <summary>
@@ -71,6 +87,11 @@ public static class SqlFormat
         var atLineStart = true;
         SqlToken? prev = null;
 
+        // How deep in brackets the cursor is, so a comma can be told apart from
+        // a comma. One separating select columns starts a new line; one inside
+        // COALESCE(a, b) is part of a single expression and must not.
+        var depth = 0;
+
         for (var i = 0; i < tokens.Count; i++)
         {
             var t = tokens[i];
@@ -98,9 +119,21 @@ public static class SqlFormat
                         if (k > 0) sb.Append(' ');
                         sb.Append(tokens[i + k].Text.ToUpperInvariant());
                     }
+                    var head = string.Join(' ', Enumerable.Range(0, run)
+                                                     .Select(k => tokens[i + k].Text.ToUpperInvariant()));
+
                     prev = tokens[i + run - 1];
                     i += run - 1;
                     atLineStart = false;
+
+                    // Only when there really is a list. "SELECT *" and
+                    // "SELECT COUNT(*)" are one item, and pushing those onto a
+                    // second line is ceremony with nothing to line up.
+                    if (ListClauses.Contains(head) && HasListComma(tokens, i + 1))
+                    {
+                        sb.Append("\n  ");
+                        atLineStart = true;
+                    }
                     continue;
                 }
 
@@ -114,10 +147,24 @@ public static class SqlFormat
                 }
             }
 
+            if (text == "(") depth++;
+            else if (text == ")") depth = Math.Max(0, depth - 1);
+
             if (!atLineStart && NeedsSpace(sb, prev, text)) sb.Append(' ');
             sb.Append(text);
-            atLineStart = false;
             prev = t;
+
+            // One item per line for a comma-separated list. A twelve-column
+            // SELECT on one line is a line nobody reads to the end, and this is
+            // the single change that makes a wide query diffable.
+            if (text == "," && depth == 0)
+            {
+                sb.Append("\n  ");
+                atLineStart = true;
+                continue;
+            }
+
+            atLineStart = false;
         }
 
         return string.Join('\n', sb.ToString().Split('\n').Select(l => l.TrimEnd()))
@@ -125,8 +172,32 @@ public static class SqlFormat
     }
 
     /// <summary>
-    /// How many tokens from <paramref name="i"/> form a clause, or 0 if none
-    /// do.
+    /// Does the clause starting here hold more than one item?
+    ///
+    /// Looks for a comma before the next clause keyword, ignoring any inside
+    /// brackets — a comma in COUNT(a, b) separates arguments, not columns, and
+    /// treating it as a list would expand a single-column SELECT.
+    /// </summary>
+    private static bool HasListComma(List<SqlToken> tokens, int from)
+    {
+        var depth = 0;
+
+        for (var i = from; i < tokens.Count; i++)
+        {
+            var text = tokens[i].Text;
+
+            if (text == "(") { depth++; continue; }
+            if (text == ")") { depth = Math.Max(0, depth - 1); continue; }
+            if (depth > 0) continue;
+
+            if (text == ",") return true;
+            if (tokens[i].Kind == SqlTokenKind.Keyword && ClauseAt(tokens, i) > 0) return false;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// How many tokens from <paramref name="i"/> form a clause, or 0 if none do.
     /// </summary>
     private static int ClauseAt(List<SqlToken> tokens, int i)
     {
@@ -209,7 +280,11 @@ public static class SqlFormat
     public static string StripComments(string sql)
     {
         var outp = new StringBuilder();
-        var inString = false;
+        // Which delimiter opened the run we are inside, or nothing. A flag was
+        // not enough: it only tracked the apostrophe, so a comment marker
+        // inside a "…" literal read as a real comment and the rest of the line
+        // was thrown away.
+        var quote = '\0';
         var pendingSpace = false;
         var i = 0;
 
@@ -217,20 +292,20 @@ public static class SqlFormat
         {
             var c = sql[i];
 
-            if (inString)
+            if (quote != '\0')
             {
                 outp.Append(c);
-                if (c == '\'')
+                if (c == quote)
                 {
-                    if (i + 1 < sql.Length && sql[i + 1] == '\'') { outp.Append('\''); i++; }  // '' escape
-                    else inString = false;
+                    if (i + 1 < sql.Length && sql[i + 1] == quote) { outp.Append(quote); i++; }  // doubled = escape
+                    else quote = '\0';
                 }
                 i++;
             }
-            else if (c == '\'')
+            else if (c is '\'' or '"' or '`')
             {
                 if (pendingSpace) { outp.Append(' '); pendingSpace = false; }
-                inString = true;
+                quote = c;
                 outp.Append(c);
                 i++;
             }

@@ -12,7 +12,7 @@ namespace FbApiTool.Ui;
 /// </summary>
 public partial class MainWindow : Window
 {
-    private readonly ApiCatalog _catalog;
+    private ApiCatalog _catalog;
     private readonly ObservableCollection<CategoryNode> _tree = [];
 
     public MainWindow()
@@ -48,21 +48,31 @@ public partial class MainWindow : Window
         TreeEndpoints.DoubleTapped += (_, _) => OpenSelected();
 
         LoadSettings();
+        Theming.Apply(Prefs.ThemeOr(Get));
         LoadVariables();
         SetUpConnection();
         SetUpWorkspace();
+        SetUpSchemaBrowser();
+        SetUpSettings();
+        SetUpDocs();
 
         // Built when the tab is first shown: most sessions never open it.
         Shell.SelectionChanged += (_, e) =>
         {
             if (!ReferenceEquals(e.Source, Shell)) return;
             if (ReferenceEquals(Shell.SelectedItem, TabData)) ShowDataTab();
+            if (ReferenceEquals(Shell.SelectedItem, TabDocs)) ShowDocs();
+            PlaceWorkspace();
         };
         BuildTree();
 
         // After the window is up, not during construction: the connect dialog
         // needs an owner that has been shown.
-        Opened += async (_, _) => await ShowConnectAsync(firstRun: true);
+        Opened += async (_, _) =>
+        {
+            await ShowConnectAsync(firstRun: true);
+            OfferTour();
+        };
     }
 
     // ── SETTINGS ────────────────────────────────────────────────────────

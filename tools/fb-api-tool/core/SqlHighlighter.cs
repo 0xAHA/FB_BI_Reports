@@ -70,21 +70,30 @@ public static class SqlHighlighter
                 continue;
             }
 
-            // '…', with '' as the escape
-            if (c == '\'')
+            // A quoted run. MySQL reads '…' and "…" as literals and `…` as an
+            // identifier, and in all three the delimiter doubled inside is the
+            // escape. Only the apostrophe used to be recognised, so a
+            // double-quoted LIKE pattern shattered into punctuation runs and
+            // the formatter spaced them: "%e%" came back as "% e %".
+            if (c is '\'' or '"' or '`')
             {
                 var j = i + 1;
                 while (j < sql.Length)
                 {
-                    if (sql[j] == '\'')
+                    if (sql[j] == c)
                     {
-                        if (j + 1 < sql.Length && sql[j + 1] == '\'') { j += 2; continue; }
+                        if (j + 1 < sql.Length && sql[j + 1] == c) { j += 2; continue; }
                         j++;
                         break;
                     }
                     j++;
                 }
-                tokens.Add(new(sql[i..Math.Min(j, sql.Length)], SqlTokenKind.String));
+
+                // A backtick names a column rather than holding data, so it is
+                // not coloured as a literal — but it is still one token, which
+                // is what stops anything being inserted into it.
+                tokens.Add(new(sql[i..Math.Min(j, sql.Length)],
+                               c == '`' ? SqlTokenKind.Plain : SqlTokenKind.String));
                 i = j;
                 continue;
             }
@@ -110,7 +119,8 @@ public static class SqlHighlighter
 
             // Whitespace and punctuation, gathered so the run count stays low.
             var k = i;
-            while (k < sql.Length && !char.IsLetterOrDigit(sql[k]) && sql[k] != '_' && sql[k] != '\''
+            while (k < sql.Length && !char.IsLetterOrDigit(sql[k]) && sql[k] != '_'
+                   && sql[k] is not ('\'' or '"' or '`')
                    && !(sql[k] == '-' && k + 1 < sql.Length && sql[k + 1] == '-')
                    && !(sql[k] == '/' && k + 1 < sql.Length && sql[k + 1] == '*')) k++;
             if (k == i) k++;                       // never stall

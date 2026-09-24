@@ -39,7 +39,7 @@ public static class Tone
     {
         "Fulfilled", "Shipped", "Received", "Closed", "Completed", "Complete", "Finished",
         "Approved", "Paid", "Posted", "Packed", "Picked", "Committed", "Active", "Enabled",
-        "Success", "Successful", "true", "yes",
+        "Success", "Successful", "Available", "OK", "true", "yes",
     };
 
     private static readonly HashSet<string> Active = new(StringComparer.OrdinalIgnoreCase)
@@ -52,7 +52,7 @@ public static class Tone
     {
         "Pending Approval", "Bid Request", "Estimate", "Expired", "On Hold", "Hold",
         "Closed Short", "Short", "Backordered", "Back Ordered", "Overdue", "Late",
-        "Warning", "Unapproved", "Awaiting Approval",
+        "Warning", "Unapproved", "Awaiting Approval", "Quote", "Not Available", "Unpaid",
     };
 
     private static readonly HashSet<string> Negative = new(StringComparer.OrdinalIgnoreCase)

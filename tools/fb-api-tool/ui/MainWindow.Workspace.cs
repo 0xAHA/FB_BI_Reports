@@ -99,6 +99,22 @@ public partial class MainWindow
     /// The X on a saved row. This one asks: a saved request is something
     /// somebody built and named, and there is no undo for it.
     /// </summary>
+    /// <summary>
+    /// Drop one variable.
+    ///
+    /// Not confirmed, unlike a saved request: a variable is a value someone
+    /// captured a minute ago and can capture again, and a dialog for each one
+    /// makes tidying up a list of eight a chore. Clear all still asks.
+    /// </summary>
+    private void KillVar(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not Control { Tag: Variable v }) return;
+
+        _vars.Remove(v);
+        Variables.Save(_vars);
+        TxtStatus.Text = "Removed {{" + v.Name + "}}.";
+    }
+
     private async void KillSaved(object? sender, RoutedEventArgs e)
     {
         if (sender is not Control { Tag: SavedRequest r }) return;

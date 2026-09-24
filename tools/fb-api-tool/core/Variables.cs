@@ -255,6 +255,25 @@ public static partial class Variables
     }
 
     /// <summary>A short, readable rendering of a value for the variables list.</summary>
+    /// <summary>
+    /// A name for a variable captured from a path.
+    ///
+    /// customer.id becomes customerId rather than id, because a request
+    /// sequence usually captures several ids and a workspace full of
+    /// {{id}}, {{id2}}, {{id3}} is one nobody can read a month later.
+    /// Array subscripts are dropped: the value is one element, not a list.
+    /// </summary>
+    public static string SuggestName(string path)
+    {
+        var parts = (path ?? "").Replace("[0]", "").Split('.', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 0) return "value";
+        if (parts.Length == 1) return parts[0];
+
+        var last = parts[^1];
+        var parent = parts[^2];
+        return last.Length == 0 ? parent : parent + char.ToUpperInvariant(last[0]) + last[1..];
+    }
+
     public static string Preview(string? value, int max = 60)
     {
         var v = (value ?? "").Replace('\n', ' ').Replace('\r', ' ').Trim();
