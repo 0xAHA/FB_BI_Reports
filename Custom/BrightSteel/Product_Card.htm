@@ -1,0 +1,2410 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  REPORT: Bright Steel — Product Card
+  PATH:   Custom/BrightSteel/Product_Card.htm
+  --------------------------------------------------------------------------------
+  The paper product card, in Fishbowl. One card per product: a date-ordered
+  ledger of everything bought and everything sold, with the batch, the average
+  bar length, the bar count and a running kilo balance — exactly the columns of
+  the hand-written card it replaces:
+
+      Date | Customer / Supplier | Invoice No | Order No | Price |
+      Shipment | Length | Bars | In/Out | Balance
+
+  IT IS DRIVEN BY ORDER LINES, NOT BY THE INVENTORY LOG
+  ----------------------------------------------------
+  Four branches, UNION-ed and sorted by the date the stock is expected to move:
+
+    IN   Receipt   one row per receiptitem, dated receiptitem.dateReceived
+         On order  the UNRECEIVED remainder of the poitem, dated
+                   poitem.dateScheduledFulfillment
+    OUT  Shipment  one row per shipitem, dated ship.dateShipped
+         Due out   the UNSHIPPED remainder of the soitem, dated
+                   soitem.dateScheduledFulfillment
+
+  So a line that ships in three goes gets three rows at three dates plus, while
+  anything is still owed, a fourth row at its scheduled date. A line nobody has
+  touched yet appears once, at the date it is due. That is the "expected
+  movement date" ordering the card is kept in.
+
+  COLUMN MAPPING  (confirmed with the business before build)
+    Date                 IN  receiptitem.dateReceived, else poitem.dateScheduledFulfillment
+                         OUT ship.dateShipped,         else soitem.dateScheduledFulfillment
+    Customer / Supplier  IN  vendor.name via po.vendorId · OUT customer.name via so.customerId
+    Invoice No           IN  po.vendorSO   (the SUPPLIER's invoice number)
+                         OUT so.num        (our own invoice number)
+    Order No             IN  po.num        (our purchase order)
+                         OUT so.customerPO (their PO, or the name of whoever rang)
+    Price                IN  poitem.unitCost · OUT soitem.unitPrice — both per kilo and both in
+                         the HOME currency (the plain columns are home; mc* are the order's own
+                         currency and ride along in hidden columns)
+    Shipment             the BATCH: the part's text tracking value for that movement
+    Length               the batch's AVERAGE LENGTH tracking value, in metres per bar
+    Bars                 parsed out of the sales order line note ("5 bars"), falling back to
+                         kg / (kg-per-metre x length) where the note says nothing
+    In / Out             the movement in the part's base unit, + for in, - for out
+    Balance              running, from a brought-forward opening figure
+
+  A row that has not moved yet has NO batch and NO length — there is no tag
+  behind it, so there is nothing to read. Those cells are deliberately blank.
+
+  BALANCE, AND HOW IT TIES BACK TO REAL STOCK
+  -------------------------------------------
+    B/F        = on hand now  -  every NET inventorylog movement since the range
+                 start (i.e. what was genuinely on hand the day the card opens).
+                 "Net" is load-bearing: inventorylog type 40 (`yld`) duplicates
+                 movements other rows already carry, so it is excluded. Summing
+                 it in produced a B/F of -228 on a part holding 26.5 and a
+                 fictitious +228 reconciliation row to cover the gap.
+    Balance    = B/F + every In/Out above this row, rolled in TWO passes:
+                 history first (closing on real on-hand), then the forecast
+                 continuing from that close. One combined pass let an overdue
+                 On-order row in the middle of the card shift every later
+                 historical balance.
+    A card built only from orders cannot see stock adjustments, cycle counts or
+    transfers. Rather than let the closing figure quietly drift away from what
+    is really in the rack, the difference is shown as its OWN dated row —
+    "Adjustments / transfers (not on an order)" — so the running balance ties
+    to real on-hand at today's date and the projection past today starts from
+    the right number. If that row is absent, nothing is unaccounted for.
+
+  SCOPE  all location groups the user can see, with an optional filter.
+  The Balance column is a running total in DATE order. Sorting the grid by
+  another column reorders the rows but each keeps the balance it had on the
+  date it happened — as a reprinted ledger does.
+
+  STATUS: desk-built against the Fishbowl schema. NOT yet exercised against a
+  live Bright Steel database — the "Weight per Meter" custom field and the
+  "Batch Number" / "Length" tracking fields do not exist in any test database,
+  so their auto-detection needs a first run on site (Settings > Fields
+  overrides all three).
+
+  DEPLOY ORDER (re-save on the server, in this order, or the report breaks):
+    1. fb-styles  (Style  named exactly "fb-styles", source scripts/fb-styles.css)
+    2. fb-lib     (Script named exactly "fb-lib",    source scripts/fb-lib.js)
+    3. THIS report (the shared-asset directives only re-run on save)
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>- Part - Bright Steel Product Card - Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+
+    <!-- Moment.js — date formatting parity with the rest of the suite
+         (FBLib.Common.formatDate prefers it when present). -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script>
+
+    <!-- Shared Fishbowl BI lib — inlined by Fishbowl from the saved "fb-lib"
+         Script. Source of truth: scripts/fb-lib.js. Provides FBLib.Common
+         (formatting, drawers, multi-select, debug drawer), FBLib.Settings,
+         FBLib.Table and FBLib.Export. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Shared Fishbowl BI stylesheet — inlined from the saved "fb-styles"
+         Style (scripts/fb-styles.css). MUST come BEFORE the inline block so
+         per-report rules win the cascade on identical selectors. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <style>
+        /* =====================================================
+           BASE + LAYOUT — tokens live in fb-styles; style new work off
+           var(--…), never a hardcoded hex.
+           ===================================================== */
+        * { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; height: 100%; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            font-size: 13px; color: var(--c-primary); background: var(--bg-1);
+            display: flex; flex-direction: column; min-height: 100vh;
+            padding-bottom: var(--debug-drawer-h, 0px);
+            transition: padding-bottom 0.12s ease;
+        }
+        header h1 { font-size: 16px; font-weight: 700; color: var(--c-primary); margin: 0; line-height: 1.15; }
+        #statusLine { font-size: 12px; color: var(--c-tertiary); line-height: 1.15; margin: 2px 0 0; }
+        .hdr-actions { display: flex; align-items: center; gap: 8px; }
+
+        /* =====================================================
+           INPUT BAR
+           ===================================================== */
+        #inputBar {
+            display: flex; align-items: flex-end; flex-wrap: wrap; gap: 10px 14px;
+            background: #fff; border-bottom: 1px solid var(--border);
+            padding: 9px 20px; flex-shrink: 0;
+            position: relative; z-index: 30;   /* dropdowns escape the bar */
+        }
+        .fbar-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+        .fbar-field > label {
+            font-size: 10px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.05em; color: var(--c-secondary);
+        }
+        .fbar-field select,
+        .fbar-field input[type=text],
+        .fbar-field input[type=date] {
+            padding: 4px 8px; font-size: 12px; border: 1px solid var(--border-strong);
+            border-radius: 6px; background: #fff; font-family: inherit; color: #415157;
+            height: 28px;
+        }
+        .fbar-field select:focus, .fbar-field input:focus {
+            outline: none; border-color: var(--color-primary);
+            box-shadow: 0 0 0 2px rgba(45,156,219,0.18);
+        }
+        .fbar-ms { width: 200px; }
+        .fbar-ms .ms-trigger { min-height: 28px; }
+        .fbar-dates { display: flex; align-items: center; gap: 5px; }
+        .fbar-dates span { color: var(--c-tertiary); font-size: 12px; }
+        .fbar-dates input[type=date] { width: 132px; }
+        .fbar-btn {
+            height: 28px; padding: 0 11px; font-size: 12px; font-weight: 600;
+            border: 1px solid var(--border-strong); border-radius: 6px;
+            background: #fff; color: #415157; cursor: pointer; font-family: inherit;
+        }
+        .fbar-btn:hover { background: var(--bg-2); }
+        .fbar-spacer { flex: 1 1 auto; min-width: 8px; }
+        #partInput { width: 250px; }
+
+        /* Typeahead popup under the part input. */
+        .ac-wrap { position: relative; }
+        .ac-dropdown {
+            position: absolute; z-index: 700; top: calc(100% + 3px); left: 0;
+            min-width: 320px; max-width: 520px;
+            background: #fff; border: 1px solid var(--border-strong); border-radius: 7px;
+            box-shadow: var(--sh2); max-height: 320px; overflow-y: auto;
+        }
+        .ac-dropdown.hidden { display: none; }
+        .ac-item {
+            display: flex; align-items: baseline; gap: 9px;
+            padding: 6px 10px; cursor: pointer; font-size: 12px;
+            border-bottom: 1px solid var(--bg-1);
+        }
+        .ac-item:last-child { border-bottom: none; }
+        .ac-item:hover, .ac-item.active { background: var(--tint-blue); }
+        .ac-item .ac-label { font-weight: 700; color: var(--c-primary); white-space: nowrap; }
+        .ac-item .ac-sub   { color: var(--c-tertiary); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .ac-empty, .ac-loading { padding: 12px; color: var(--c-tertiary); font-size: 12px; text-align: center; }
+        .ac-loading { font-style: italic; }
+
+        /* =====================================================
+           CARD HEAD — the printed head of the paper card: size / grade /
+           kg per metre / brought-forward, plus the reconciliation strip.
+           ===================================================== */
+        #cardHead {
+            display: none; align-items: center; flex-wrap: wrap; gap: 0 24px;
+            background: var(--menu-bg); color: #fff; padding: 9px 20px; flex-shrink: 0;
+        }
+        #cardHead.on { display: flex; }
+        .ch-main { display: flex; flex-direction: column; gap: 1px; margin-right: 6px; }
+        .ch-num  { font-size: 17px; font-weight: 800; letter-spacing: 0.01em; }
+        .ch-desc { font-size: 11.5px; color: #B7CBD4; }
+        .ch-stat { display: flex; flex-direction: column; align-items: flex-end; line-height: 1.2; }
+        .ch-stat .k {
+            font-size: 9.5px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.05em; color: #8FAEBB;
+        }
+        .ch-stat .v { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+        .ch-stat.hero .v { color: #7FD3F5; font-size: 18px; }
+        .ch-stat.proj .v { color: #F7C23A; }
+        .ch-spacer { flex: 1 1 auto; }
+        .ch-warn {
+            background: var(--acc-orange-bg); color: var(--acc-orange-con);
+            border: 1px solid var(--acc-orange); border-radius: var(--r-pill);
+            padding: 3px 11px; font-size: 11px; font-weight: 700; white-space: nowrap;
+        }
+
+        /* =====================================================
+           APP SHELL + TABLE — the classes FBLib.Table.init expects.
+           ===================================================== */
+        .app-shell { width: 100%; margin: 0; padding: 0; flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+        .fb-table-container { flex: 1 1 auto; min-height: 0; overflow: auto; background: #fff; }
+        table.fb-table { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
+        table.fb-table th {
+            background: var(--menu-bg); color: #fff; font-weight: 500;
+            padding: 0 10px; height: 32px; text-align: left; white-space: nowrap;
+            cursor: grab; user-select: none; position: sticky; top: 0; z-index: 10;
+            overflow: hidden; text-overflow: ellipsis;
+        }
+        table.fb-table th:active { cursor: grabbing; }
+        table.fb-table th:hover { background: #164A5F; }
+        table.fb-table th.sort-asc::after  { content: ' \2191'; opacity: 0.8; }
+        table.fb-table th.sort-desc::after { content: ' \2193'; opacity: 0.8; }
+        table.fb-table th.col-drag-over { background: #164A5F; border-left: 3px solid #CBE5FB; }
+        table.fb-table tr.filter-row { display: none; }
+        table.fb-table td {
+            padding: 3px 10px; border-bottom: 1px solid var(--border); white-space: nowrap;
+            vertical-align: middle; overflow: hidden; text-overflow: ellipsis;
+        }
+        table.fb-table tr:nth-child(even) td { background: var(--bg-1); }
+        table.fb-table tr:hover td { background: var(--tint-blue) !important; }
+        .fb-col-resize { position: absolute; right: 0; top: 0; width: 6px; height: 100%; cursor: col-resize; user-select: none; }
+        .fb-col-resize:hover { background: rgba(255,255,255,0.3); }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+
+        .num-cell { text-align: right; font-variant-numeric: tabular-nums; }
+        .muted-cell { color: var(--c-tertiary); }
+
+        /* A header that carries an explanation. The cursor stays `grab` —
+           the header is still the drag handle for reordering — so the hint
+           has to be visual: a dotted rule under the label. */
+        table.fb-table th.has-tip {
+            text-decoration: underline dotted rgba(255, 255, 255, 0.4);
+            text-underline-offset: 3px;
+        }
+        table.fb-table th.has-tip:hover { text-decoration-color: rgba(255, 255, 255, 0.85); }
+        /* .app-tooltip itself ships from fb-styles; these are the IN/OUT rows
+           this report adds inside it. */
+        .app-tooltip .tt-io { display: block; margin-top: 5px; }
+        .app-tooltip .tt-io b { color: #7FD3F5; font-weight: 700; }
+        .app-tooltip .tt-io.out b { color: #F7C23A; }
+        .app-tooltip code {
+            background: rgba(255,255,255,0.12); border-radius: 3px;
+            padding: 0 3px; font-size: 10.5px;
+        }
+
+        /* The paper card used red ink for purchases and black for sales. The
+           sign does that job here, on the one column where it matters. */
+        .io-in   { text-align: right; font-variant-numeric: tabular-nums; font-weight: 700; color: var(--fb-success); }
+        .io-out  { text-align: right; font-variant-numeric: tabular-nums; font-weight: 700; color: var(--fb-negative); }
+        .io-adj  { text-align: right; font-variant-numeric: tabular-nums; font-weight: 700; color: var(--acc-orange-con); }
+        .bal-cell { text-align: right; font-variant-numeric: tabular-nums; font-weight: 700; color: var(--c-primary); }
+        .bal-cell.proj { color: var(--c-secondary); font-weight: 600; font-style: italic; }
+
+        /* A row that has not happened yet. Kept fully legible — it is real
+           demand and real supply — but visibly not history. */
+        tr.sched td { background: #FCFBF6 !important; }
+        tr.sched:nth-child(even) td { background: #F7F5EE !important; }
+        tr.sched:hover td { background: var(--tint-blue) !important; }
+        tr.sched td:first-child { box-shadow: inset 3px 0 0 0 var(--acc-yellow); }
+        /* The reconciliation row. Deliberately loud — it is the report telling
+           you the orders do not explain all of the stock movement. */
+        tr.adj td { background: var(--acc-orange-bg) !important; }
+        tr.adj:hover td { background: #F0DBC8 !important; }
+        tr.adj td:first-child { box-shadow: inset 3px 0 0 0 var(--acc-orange); }
+
+        .pill {
+            display: inline-block; padding: 1px 8px; border-radius: var(--r-pill);
+            font-size: 10px; font-weight: 700; white-space: nowrap; letter-spacing: 0.02em;
+        }
+        .pill-recv  { background: var(--acc-sage);      color: var(--acc-sage-con); }
+        .pill-order { background: var(--tint-blue);     color: var(--fb-blue-accent); }
+        .pill-ship  { background: var(--acc-maroon-bg); color: var(--acc-maroon-con); }
+        .pill-due   { background: var(--acc-yellow-bg); color: var(--acc-yellow-con); }
+        .pill-adj   { background: var(--acc-orange-bg); color: var(--acc-orange-con); border: 1px solid var(--acc-orange); }
+
+        /* Empty / prompt state. */
+        #emptyState {
+            flex: 1 1 auto; display: flex; flex-direction: column;
+            align-items: center; justify-content: center; gap: 9px;
+            color: var(--c-tertiary); text-align: center; padding: 40px 20px;
+        }
+        #emptyState.hidden { display: none; }
+        #emptyState .es-title { font-size: 15px; font-weight: 700; color: var(--c-secondary); }
+        #emptyState .es-sub { font-size: 12.5px; max-width: 470px; line-height: 1.55; }
+
+        /* Columns panel. */
+        .col-wrap { position: relative; }
+        #colPanel {
+            position: absolute; right: 0; top: calc(100% + 4px); z-index: 600;
+            width: 236px; max-height: 340px; overflow-y: auto;
+            background: #fff; border: 1px solid var(--border-strong);
+            border-radius: 8px; box-shadow: var(--sh2);
+        }
+        #colPanel.hidden { display: none; }
+        #colPanel .col-head {
+            padding: 7px 11px; font-size: 10px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.05em; color: var(--c-tertiary);
+            border-bottom: 1px solid var(--bg-2); position: sticky; top: 0; background: #fff;
+        }
+        #colPanel label {
+            display: flex; align-items: center; gap: 8px; padding: 5px 11px;
+            font-size: 12px; cursor: pointer; color: #415157;
+        }
+        #colPanel label:hover { background: var(--tint-blue); }
+        #colPanel .col-foot { padding: 6px 10px; border-top: 1px solid var(--bg-2); position: sticky; bottom: 0; background: #fff; }
+
+        /* Drawer chrome (settings / help). */
+        .ds-btn { padding: 7px 13px; font-size: 12px; border-radius: 7px; border: 1px solid var(--border-strong); background: #fff; cursor: pointer; font-family: inherit; font-weight: 600; color: #415157; }
+        .ds-btn:hover { background: var(--bg-2); }
+        .ds-btn-primary { background: var(--color-primary); color: #fff; border-color: var(--color-primary); }
+        .ds-btn-primary:hover { background: var(--color-primary-dark); }
+        .ds-btn-admin { background: var(--acc-orange-bg); border-color: var(--acc-orange); color: var(--acc-orange-con); margin-right: 6px; }
+        .ds-lock-badge { background: var(--acc-orange-bg); color: var(--acc-orange-con); border: 1px solid var(--acc-orange); padding: 7px 10px; border-radius: 7px; font-size: 12px; margin-bottom: 14px; }
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 220px; min-width: 220px; }
+        .fb-grid-cols { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); align-items: start; }
+        .fb-grid-cols .fb-group { flex: none; min-width: 0; }
+        .fb-group-title {
+            font-size: 12px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.04em; color: var(--c-secondary); border-bottom: 1px solid var(--border);
+            padding-bottom: 4px; margin-bottom: 8px;
+        }
+        .fb-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+        .fb-field label { font-size: 11px; font-weight: 600; color: var(--c-secondary); }
+        .fb-field select, .fb-field input[type=text] {
+            padding: 4px 8px; font-size: 12px; border: 1px solid var(--border);
+            border-radius: 6px; background: var(--bg-1); font-family: inherit; color: #415157;
+        }
+        .fb-hint { font-size: 11px; color: var(--c-tertiary); line-height: 1.45; }
+        .help-p { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .help-l { font-size: 12px; color: #415157; padding-left: 18px; margin: 4px 0; line-height: 1.55; }
+        .help-tbl { width: 100%; border-collapse: collapse; font-size: 11.5px; margin: 6px 0; }
+        .help-tbl th, .help-tbl td { text-align: left; padding: 3px 7px; border-bottom: 1px solid var(--border); vertical-align: top; }
+        .help-tbl th { color: var(--c-secondary); font-weight: 700; white-space: nowrap; }
+        .help-tbl td code { font-size: 11px; color: var(--fb-blue-accent); }
+        /* The drawer backdrop scrim is injected + managed by fb-lib
+           (registerDrawer -> #fbDrawerScrim). Never add a local scrim, and
+           never override `.fb-drawer.open { z-index }` — the drawer must keep
+           the fb-styles z-index (10001) that sits above fb-lib's scrim. */
+
+        .fb-drawer-body::-webkit-scrollbar, .fb-table-container::-webkit-scrollbar, #colPanel::-webkit-scrollbar, .ac-dropdown::-webkit-scrollbar { width: 8px; height: 8px; }
+        .fb-drawer-body::-webkit-scrollbar-track, .fb-table-container::-webkit-scrollbar-track, #colPanel::-webkit-scrollbar-track, .ac-dropdown::-webkit-scrollbar-track { background: var(--bg-2); border-radius: 4px; }
+        .fb-drawer-body::-webkit-scrollbar-thumb, .fb-table-container::-webkit-scrollbar-thumb, #colPanel::-webkit-scrollbar-thumb, .ac-dropdown::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+
+        @media print {
+            html, body { overflow: visible; }
+            @page { size: A4 landscape; margin: 0.5in; }
+            header, #inputBar, .hdr-btn, .fb-drawer, .fblib-debug-drawer, #colPanel { display: none !important; }
+            .fb-table-container { overflow: visible !important; }
+            table.fb-table th { position: static !important; background: #ddd !important; color: #000 !important; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="toast-container" id="toastContainer"></div>
+<!-- Shared styled tooltip — content is swapped in on hover by tipShow().
+     The .app-tooltip skin ships from fb-styles. -->
+<div id="appTooltip" class="app-tooltip"></div>
+
+<!-- ==================== HEADER ==================== -->
+<header>
+    <div>
+        <h1>Bright Steel &mdash; Product Card</h1>
+        <p id="statusLine">Loading&hellip;</p>
+    </div>
+    <div class="hdr-actions">
+        <div class="col-wrap" id="colWrap">
+            <button id="colBtn" class="hdr-btn" type="button" onclick="toggleColPanel()" title="Show / hide columns (drag a header to reorder, drag its edge to resize)">
+                <svg fill="currentColor" viewBox="0 0 24 24"><circle cx="8" cy="6" r="1.5"/><circle cx="8" cy="12" r="1.5"/><circle cx="8" cy="18" r="1.5"/><circle cx="16" cy="6" r="1.5"/><circle cx="16" cy="12" r="1.5"/><circle cx="16" cy="18" r="1.5"/></svg>
+                Columns
+            </button>
+            <div id="colPanel" class="hidden">
+                <div class="col-head">Show / hide</div>
+                <div id="colList"></div>
+                <div class="col-foot">
+                    <button type="button" class="fbar-btn" style="width:100%;" onclick="resetColLayout()" title="Reset column order, widths and visibility">Reset layout</button>
+                </div>
+            </div>
+        </div>
+
+        <button id="refreshBtn" class="hdr-btn" type="button" onclick="loadCard()" title="Re-read the card">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <button id="csvBtn" class="hdr-btn" type="button" onclick="exportCsv()" title="Download the card as CSV">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            CSV
+        </button>
+        <button id="xlsxBtn" class="hdr-btn" type="button" onclick="exportXlsx()" title="Download as a formatted Excel workbook">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 8l8 8M16 8l-8 8" stroke-linecap="round"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" onclick="printReport()" title="Print the card">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span style="width:1px; height:18px; background:var(--border); margin:0 4px;"></span>
+        <button id="helpBtn" class="hdr-btn" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How to use this report">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            Help
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ==================== INPUT BAR ==================== -->
+<div id="inputBar">
+
+    <div class="fbar-field ac-wrap">
+        <label for="partInput">Product #</label>
+        <input type="text" id="partInput" placeholder="Start typing&hellip;" autocomplete="off" spellcheck="false" />
+        <div id="acDropdown" class="ac-dropdown hidden"></div>
+    </div>
+
+    <div class="fbar-field">
+        <label for="datePreset">Range</label>
+        <select id="datePreset" onchange="onPresetChange()">
+            <option value="all">Whole card</option>
+            <option value="365">Last 12 months</option>
+            <option value="730">Last 2 years</option>
+            <option value="ytd">This year</option>
+            <option value="fy">This financial year (Jul&ndash;Jun)</option>
+            <option value="custom">Custom&hellip;</option>
+        </select>
+    </div>
+
+    <div class="fbar-field">
+        <label>From / To</label>
+        <div class="fbar-dates">
+            <input type="date" id="dateFrom" onchange="onCustomDateChange()" />
+            <span>&rarr;</span>
+            <input type="date" id="dateTo" onchange="onCustomDateChange()" />
+        </div>
+    </div>
+
+    <div class="fbar-field">
+        <label for="lgMs-trigger">Location group</label>
+        <div class="ms-container fbar-ms" id="lgMs">
+            <div class="ms-trigger" id="lgMs-trigger">
+                <span class="ms-placeholder" id="lgMs-placeholder">All location groups</span>
+            </div>
+            <div class="ms-dropdown hidden" id="lgMs-dropdown">
+                <div class="ms-search"><input type="text" id="lgMs-search" placeholder="Search location groups&hellip;" /></div>
+                <div class="ms-actions"><span id="lgMs-all">Select All</span><span id="lgMs-clear">Clear All</span></div>
+                <div class="ms-list" id="lgMs-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="fbar-field">
+        <label>&nbsp;</label>
+        <button type="button" class="fbar-btn" onclick="clearAll()" title="Clear the product and start again">Clear</button>
+    </div>
+
+    <div class="fbar-spacer"></div>
+</div>
+
+<!-- ==================== CARD HEAD ==================== -->
+<div id="cardHead">
+    <div class="ch-main">
+        <span class="ch-num" id="chNum">&mdash;</span>
+        <span class="ch-desc" id="chDesc"></span>
+    </div>
+    <div class="ch-stat"><span class="k">Kg per metre</span><span class="v" id="chKgpm">&mdash;</span></div>
+    <div class="ch-stat"><span class="k">B / F</span><span class="v" id="chBf">&mdash;</span></div>
+    <div class="ch-stat"><span class="k">In</span><span class="v" id="chIn">&mdash;</span></div>
+    <div class="ch-stat"><span class="k">Out</span><span class="v" id="chOut">&mdash;</span></div>
+    <div class="ch-stat hero"><span class="k">On hand now</span><span class="v" id="chOnHand">&mdash;</span></div>
+    <div class="ch-stat proj"><span class="k">Projected</span><span class="v" id="chProj">&mdash;</span></div>
+    <div class="ch-spacer"></div>
+    <span class="ch-warn" id="chWarn" style="display:none;"></span>
+</div>
+
+<!-- ==================== TABLE ==================== -->
+<div class="app-shell">
+    <div id="emptyState">
+        <div class="es-title">Pick a product to open its card</div>
+        <div class="es-sub">Start typing a product number or description above and choose it from the list.
+            The card shows every purchase and every sale in date order, with the batch, the bar length and a
+            running kilo balance &mdash; including what is still on order and still due out.</div>
+    </div>
+    <div class="fb-table-container" id="tableWrap" style="display:none;">
+        <table id="reportTable" class="fb-table"></table>
+    </div>
+</div>
+
+<!-- ==================== SETTINGS DRAWER ==================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>&#9881; Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div id="dsLockBadge" class="ds-lock-badge" style="display:none;">Locked by admin &mdash; your changes won't be saved.</div>
+        <div class="fb-grid fb-grid-cols">
+
+            <div class="fb-group">
+                <div class="fb-group-title">Fields</div>
+                <div class="fb-field">
+                    <label>Weight per metre (part custom field)</label>
+                    <select id="setKgpmCf" onchange="onFieldSettingChange()">
+                        <option value="">(auto-detect)</option>
+                    </select>
+                    <span class="fb-hint">Bright Steel&rsquo;s is <strong>Weight per Meter</strong>. Only used to work a bar count back out of the kilos when a line note does not give one.</span>
+                </div>
+                <div class="fb-field">
+                    <label>Batch tracking field &mdash; the "Shipment" column</label>
+                    <span class="fb-hint">Bright Steel&rsquo;s is <strong>Batch Number</strong>.</span>
+                    <select id="setBatchTrk" onchange="onFieldSettingChange()">
+                        <option value="">(auto-detect)</option>
+                    </select>
+                </div>
+                <div class="fb-field">
+                    <label>Average length tracking field</label>
+                    <select id="setLenTrk" onchange="onFieldSettingChange()">
+                        <option value="">(auto-detect)</option>
+                    </select>
+                    <span class="fb-hint">Metres per bar. Bright Steel&rsquo;s is <strong>Length</strong>.</span>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">The card</div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setShowScheduled" onchange="onSettingsChange()" style="margin-top:2px;" />
+                        <span>Include what is on order and due out</span>
+                    </label>
+                    <span class="fb-hint">Off gives pure history &mdash; receipts and shipments only &mdash; and the balance stops at today.</span>
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setShowRecon" onchange="onSettingsChange()" style="margin-top:2px;" />
+                        <span>Show the adjustments / transfers reconciliation row</span>
+                    </label>
+                    <span class="fb-hint">Turning this off does not change the numbers, it only hides the row that explains why the balance and the stock on hand differ.</span>
+                </div>
+                <div class="fb-field">
+                    <label>Default range</label>
+                    <select id="setDefaultPreset" onchange="onSettingsChange()">
+                        <option value="all">Whole card</option>
+                        <option value="365">Last 12 months</option>
+                        <option value="730">Last 2 years</option>
+                        <option value="ytd">This year</option>
+                        <option value="fy">This financial year</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <div class="fb-field">
+                    <label>Decimals on kilos</label>
+                    <select id="setKgDp" onchange="onSettingsChange()">
+                        <option value="0">0</option>
+                        <option value="1">1</option>
+                        <option value="2">2</option>
+                        <option value="3">3</option>
+                    </select>
+                </div>
+                <div class="fb-field">
+                    <label>Newest first</label>
+                    <select id="setDateDir" onchange="onSettingsChange()">
+                        <option value="asc">No &mdash; oldest at the top, like the paper card</option>
+                        <option value="desc">Yes &mdash; newest at the top</option>
+                    </select>
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setShowDebug" onchange="onSettingsChange()" />
+                        <span>Show debug console</span>
+                    </label>
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setRemember" onchange="onSettingsChange()" />
+                        <span>Remember the last product and range</span>
+                    </label>
+                </div>
+            </div>
+
+        </div>
+
+        <div id="dsAdminSection" style="display:none; margin-top:14px; padding-top:14px; border-top: 1px dashed var(--border-strong);">
+            <div class="fb-group-title">Admin</div>
+            <button type="button" class="ds-btn ds-btn-admin" onclick="publishDefaults()">Publish as default for everyone</button>
+            <button type="button" class="ds-btn ds-btn-admin" id="dsLockBtn" onclick="toggleUserEditing()">Lock user editing</button>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn" onclick="resetSettings()">Reset to defaults</button>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ==================== HELP DRAWER ==================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>&#128214; How to Use This Report</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group" style="flex:1 1 340px;">
+                <div class="fb-group-title">What a row is</div>
+                <p class="help-p">One row per <strong>movement</strong>, in the order the stock is expected to move.
+                   A purchase order line received in two deliveries is two rows on two dates; anything still owed
+                   gets one more row on the date it is due. Same on the sales side.</p>
+                <p class="help-p">Rows are colour-coded by what they are:</p>
+                <ul class="help-l">
+                    <li><span class="pill pill-recv">Receipt</span> and <span class="pill pill-ship">Shipment</span>
+                        have happened &mdash; real dates, real batches.</li>
+                    <li><span class="pill pill-order">On order</span> and <span class="pill pill-due">Due out</span>
+                        have not. They sit on a cream background, and they carry no batch or length because there
+                        is no stock behind them yet.</li>
+                    <li><span class="pill pill-adj">Adjust</span> is the report telling you the orders do not
+                        explain everything &mdash; see below.</li>
+                </ul>
+            </div>
+            <div class="fb-group" style="flex:1 1 340px;">
+                <div class="fb-group-title">Where each column comes from</div>
+                <table class="help-tbl">
+                    <tr><th>Invoice No</th><td>IN the supplier's invoice, from the PO's <code>Vendor SO #</code>.<br/>OUT our own invoice number, which is the SO number.</td></tr>
+                    <tr><th>Order No</th><td>IN our purchase order number.<br/>OUT the customer's PO field &mdash; their order number, or whoever rang.</td></tr>
+                    <tr><th>Price</th><td>Per kilo, in your home currency. The order's own currency is available as a hidden column.</td></tr>
+                    <tr><th>Shipment</th><td>The batch recorded against that movement.</td></tr>
+                    <tr><th>Length</th><td>The batch's average bar length, in metres.</td></tr>
+                    <tr><th>Bars</th><td>Read out of the sales order line note ("5 bars"). Where the note says nothing, it is worked back out of the kilos and shown in grey as an estimate.</td></tr>
+                </table>
+            </div>
+            <div class="fb-group" style="flex:1 1 340px;">
+                <div class="fb-group-title">The balance, and the Adjust row</div>
+                <p class="help-p"><strong>B/F</strong> is what was genuinely on hand the day the card opens. Every
+                   row then adds or subtracts from it.</p>
+                <p class="help-p">A card built from orders cannot see stock adjustments, cycle counts or transfers
+                   between sites. Rather than let the closing figure quietly drift away from what is really in the
+                   rack, the difference is given its own <strong>Adjust</strong> row at today's date. If there is no
+                   Adjust row, every kilo is accounted for by an order.</p>
+                <p class="help-p">The balance beyond today is a <em>projection</em> &mdash; shown in grey italics. It
+                   is B/F plus everything above it, including what is still on order and still due out.</p>
+                <p class="help-p"><strong>History rolls first, and closes on real on-hand.</strong> The forecast rows
+                   then carry on from that closing figure, which is why they are grouped <em>below</em> the history
+                   instead of being slotted in by date &mdash; an overdue purchase order mixed into last month would
+                   otherwise shift every historical balance after it.</p>
+                <p class="help-p">Sorting by a different column reorders the rows but each keeps the balance it had
+                   on its own date, the way a reprinted ledger does. Sort back by <strong>Date</strong> to read it
+                   as a running total again.</p>
+                <p class="help-p">Hover any <strong>column heading</strong> for what that column holds &mdash; several
+                   are filled from different fields on a purchase than on a sale.</p>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('helpOverlay')">Close</button>
+    </div>
+</div>
+
+<script>
+// ============================================================================
+//  RUNTIME GUARD
+// ============================================================================
+(function () {
+    var missing = [];
+    if (typeof runQueryAsync !== 'function' && typeof runQuery !== 'function') missing.push('runQuery / runQueryAsync');
+    if (!window.FBLib)                     missing.push('FBLib');
+    else {
+        if (!FBLib.Common)                 missing.push('FBLib.Common');
+        if (!FBLib.Settings)               missing.push('FBLib.Settings');
+        if (!FBLib.Table)                  missing.push('FBLib.Table');
+        if (FBLib.Common && !FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+    }
+    if (!missing.length) return;
+    document.body.innerHTML =
+        '<div style="padding:40px;font-family:sans-serif;color:#415157;max-width:640px;">' +
+        '<h2 style="color:#0B3140;">This report cannot start</h2>' +
+        '<p>Missing: <strong>' + missing.join(', ') + '</strong></p>' +
+        '<p>It must run inside the Fishbowl client, and the shared <em>fb-lib</em> Script and ' +
+        '<em>fb-styles</em> Style must be saved on this server (save them first, then re-save ' +
+        'this report so its includes re-run).</p></div>';
+    throw new Error('Product Card: prerequisites missing — ' + missing.join(', '));
+})();
+
+// ============================================================================
+//  SETTINGS
+// ============================================================================
+FBLib.Settings.init({
+    masterStorage: 'userProperties',   // shared admin defaults via userproperties, not report data (which needs a SAVED report — see FBLib.SharedData)
+    userKey:   'cdx.bi.bsProductCard.user.v1',
+    masterKey: 'cdx.bi.bsProductCard.master.v1',
+    defaults: {
+        v: 1,
+        kgpmCf: '', batchTrk: '', lenTrk: '',
+        showScheduled: true,
+        showRecon: true,
+        defaultPreset: 'all',
+        kgDp: '1',
+        dateDir: 'asc',
+        showDebug: false,
+        remember: true,
+        lastPart: '',
+        lgIds: null,
+        preset: null, dateFrom: '', dateTo: '',
+        tablePrefs: null
+    },
+    propFallback: {
+        showDebug: { name: 'BI_SHOW_DEBUG', dflt: 'false', parse: function (v) { return v === 'true' || v === true; } }
+    }
+});
+
+function _resolve(key, dflt) {
+    try {
+        var v = FBLib.Settings.resolve(key);
+        return (v === undefined || v === null) ? dflt : v;
+    } catch (_) { return dflt; }
+}
+function _setUserKey(key, value) {
+    try { FBLib.Settings.setUserKey(key, value); FBLib.Settings.saveUser(); } catch (_) {}
+}
+function debugLog(msg, type) { try { FBLib.Common.debugLog(msg, type || 'info'); } catch (_) {} }
+
+// ============================================================================
+//  CONSTANTS + STATE
+// ============================================================================
+
+// parttrackingtype ids, verified against a live table:
+//   10 Text · 20 Date · 30 Expiration Date · 40 Serial Number
+//   50 Money · 60 Quantity · 70 Count · 80 Checkbox
+// At Bright Steel the two fields are named "Batch Number" (Text) and
+// "Length" (Quantity).
+var TRK_TEXT    = [10];
+var TRK_DECIMAL = [50, 60];
+// Count (70) is an integer type and cannot hold 5.82 m, so auto-detect will
+// never land on one — but it is offered in the Settings drop-down anyway, so a
+// site that configured its length field that way is not left with an override
+// list that cannot reach it. trkIsInt() then reads the right til column.
+var TRK_INTEGER = [70];
+var TRK_LENGTH  = TRK_DECIMAL.concat(TRK_INTEGER);
+
+// Fishbowl's internal numeric table identifiers, as stamped on
+// inventorylog.tableId. Only the two the card needs are listed.
+var TID_RECEIPTITEM = 1259138490;
+var TID_SHIPITEM    = 1555030112;
+
+// tag.typeId 30/40 are the two that count as on-hand inventory.
+var ONHAND_TAG_TYPES = '30,40';
+
+// inventorylog.typeId 40 is `yld` (work-order yield) and its changeQty is NOT
+// an independent delta — it DUPLICATES a movement another row already
+// recorded. Proof from a live database: log id 653738 (`rcv`, +457,
+// qtyOnHand 631) is immediately followed by id 653854 (`yld`, +457,
+// qtyOnHand 631) — the same 457 units and the same resulting on-hand.
+// Summed in, it wrecks the opening balance: over 10 sampled parts
+// SUM(changeQty) came to 197,619 on a part holding 503, and excluding
+// type 40 tied to on-hand EXACTLY on every one of them. Never include it in
+// a net-movement sum.
+var LOG_TYPE_YIELD = 40;
+
+// The row kinds, in the order they should read when two land on one date:
+// what came in before what went out, history before forecast.
+var TYPE_META = {
+    RECEIPT:  { label: 'Receipt',  pill: 'pill-recv',  ord: 1, actual: true,  dir: 1  },
+    SHIPMENT: { label: 'Shipment', pill: 'pill-ship',  ord: 2, actual: true,  dir: -1 },
+    ADJUST:   { label: 'Adjust',   pill: 'pill-adj',   ord: 3, actual: true,  dir: 0  },
+    ONORDER:  { label: 'On order', pill: 'pill-order', ord: 4, actual: false, dir: 1  },
+    DUEOUT:   { label: 'Due out',  pill: 'pill-due',   ord: 5, actual: false, dir: -1 }
+};
+
+var _part     = null;    // { id, num, description, uomid, uomcode, kgpm, kgpmField }
+var _rows     = [];      // the card, in date order, each with its running balance
+var _summary  = { bf: 0, onhand: 0, inKg: 0, outKg: 0, close: 0, projected: 0, unrecon: 0 };
+var _partCfs  = [];
+var _partTrks = [];
+var _batchTrk = null;
+var _lenTrk   = null;
+var _table    = null;
+var _lgMs     = null;
+var _lgAll    = [];
+var _debugApi = null;
+var _loadSeq  = 0;
+
+var fmtDate = function (v) { return FBLib.Common.formatDate(v); };
+var fmtMoney = function (v) { return FBLib.Common.formatMoney(v); };
+
+// ============================================================================
+//  COLUMNS — the paper card's columns, in the paper card's order.
+// ============================================================================
+var _columns = [
+    { key: 'evdate', label: 'Date', width: 100,
+      format: function (v) { return escHtml(fmtDate(v)); } },
+    { key: 'rowtype', label: 'Type', width: 96, align: 'center', filter: 'select',
+      format: function (v) {
+          var m = TYPE_META[v]; if (!m) return escHtml(v || '');
+          return '<span class="pill ' + m.pill + '">' + escHtml(m.label) + '</span>';
+      } },
+    { key: 'party', label: 'Customer / Supplier', width: 200,
+      format: function (v, row) {
+          if (!v) return '<span class="muted-cell">&mdash;</span>';
+          if (row.rowtype === 'ADJUST') return '<span class="muted-cell">' + escHtml(v) + '</span>';
+          return moduleLink(v, row.ordertype === 'PO' ? 'Vendor' : 'Customer', v);
+      } },
+    { key: 'invoiceno', label: 'Invoice No', width: 110,
+      format: function (v, row) {
+          if (!v) return '<span class="muted-cell">&mdash;</span>';
+          // OUT rows: the invoice number IS the SO number, so make it open the order.
+          if (row.ordertype === 'SO' && row.ordernum && String(v) === String(row.ordernum)) {
+              return moduleLink(v, 'Sales Order', row.ordernum);
+          }
+          return escHtml(v);
+      } },
+    { key: 'orderno', label: 'Order No', width: 120,
+      format: function (v, row) {
+          if (!v) return '<span class="muted-cell">&mdash;</span>';
+          // IN rows: the order number IS our PO, so make it open the order.
+          if (row.ordertype === 'PO' && row.ordernum && String(v) === String(row.ordernum)) {
+              return moduleLink(v, 'Purchase Order', row.ordernum);
+          }
+          return escHtml(v);   // OUT rows carry the customer's own reference
+      } },
+    { key: 'price', label: 'Price', width: 100, align: 'right', money: true,
+      format: function (v, row) {
+          if (!v) return '<span class="num-cell muted-cell">&mdash;</span>';
+          var t = (row.currcode && row.mcprice) ? (row.currcode + ' ' + num(row.mcprice, 4) + ' in the order currency') : '';
+          return '<span class="num-cell"' + (t ? ' title="' + escHtml(t) + '"' : '') + '>' + escHtml(fmtMoney(v)) + '</span>';
+      } },
+    { key: 'batch', label: 'Shipment', width: 120,
+      format: function (v, row) {
+          if (v) return '<strong>' + escHtml(v) + '</strong>';
+          return TYPE_META[row.rowtype] && !TYPE_META[row.rowtype].actual
+              ? '<span class="muted-cell" title="Not yet received or shipped, so no batch exists for it yet.">&mdash;</span>'
+              : '<span class="muted-cell">&mdash;</span>';
+      } },
+    { key: 'avglen', label: 'Length', width: 84, align: 'right', qty: true,
+      format: function (v) { return v ? '<span class="num-cell">' + num(v, 3) + '</span>' : '<span class="num-cell muted-cell">&mdash;</span>'; } },
+    { key: 'bars', label: 'Bars', width: 74, align: 'right', qty: true,
+      format: function (v, row) {
+          if (v == null) return '<span class="num-cell muted-cell">&mdash;</span>';
+          // A bar count read from the line note is what the customer asked
+          // for; one worked back out of the kilos is an inference, and the
+          // card should not present the two as equally solid.
+          return row.barsderived
+              ? '<span class="num-cell muted-cell" title="Estimated from the weight — no bar count in the line note.">' + num(v, 0) + '</span>'
+              : '<span class="num-cell">' + num(v, 0) + '</span>';
+      } },
+    { key: 'qtybase', label: 'In / Out', width: 110, align: 'right', qty: true,
+      format: function (v, row) {
+          var n = parseNum(v);
+          var cls = row.rowtype === 'ADJUST' ? 'io-adj' : (n >= 0 ? 'io-in' : 'io-out');
+          return '<span class="' + cls + '">' + (n > 0 ? '+' : '') + kg(n) + '</span>';
+      } },
+    { key: 'balance', label: 'Balance', width: 115, align: 'right', qty: true,
+      format: function (v, row) {
+          return '<span class="bal-cell' + (row.projected ? ' proj' : '') + '">' + kg(v) + '</span>';
+      } },
+
+    /* ── hidden by default ── */
+    { key: 'linenote',  label: 'Line note',       width: 260, vis: false, format: function (v) { return '<span class="muted-cell">' + escHtml(oneLine(v)) + '</span>'; } },
+    { key: 'lgname',    label: 'Location group',  width: 150, vis: false },
+    { key: 'ordernum',  label: 'Order document',  width: 120, vis: false },
+    { key: 'currcode',  label: 'Order currency',  width: 110, vis: false },
+    { key: 'mcprice',   label: 'Price (order ccy)', width: 130, vis: false, align: 'right', money: true, format: function (v) { return v ? '<span class="num-cell">' + num(v, 4) + '</span>' : ''; } },
+    { key: 'qtyline',   label: 'Qty (line UOM)',  width: 120, vis: false, align: 'right', qty: true, format: function (v) { return '<span class="num-cell">' + num(v, 3) + '</span>'; } },
+    { key: 'uomcode',   label: 'Line UOM',        width: 90,  vis: false }
+];
+
+// ============================================================================
+//  PART TYPEAHEAD
+// ============================================================================
+var _acRows = [], _acActive = -1, _acSeq = 0;
+
+function onPartInput() {
+    var v = document.getElementById('partInput').value.trim();
+    if (v.length === 0) { closeAc(); return; }
+    showAc('<div class="ac-loading">Searching&hellip;</div>');
+    _acDebounced(v);
+}
+var _acDebounced = debounce(function (term) { acFetch(term); }, 180);
+
+async function acFetch(term) {
+    var mySeq = ++_acSeq;
+    var t = escSQL(term);
+    var sql = [
+        'SELECT p.id AS partid, p.num AS partnum, p.description AS partdesc,',
+        '       p.uomId AS uomid, u.code AS uomcode',
+        'FROM part p',
+        'JOIN uom u ON u.id = p.uomId',
+        "WHERE p.activeFlag = 1 AND p.typeId = 10",
+        "  AND (p.num LIKE '%" + t + "%' OR p.description LIKE '%" + t + "%')",
+        "ORDER BY (p.num LIKE '" + t + "%') DESC, p.num",
+        'LIMIT 25'
+    ].join('\n');
+    try {
+        var rows = await qp(sql);
+        if (mySeq !== _acSeq) return;
+        _acRows = rows || [];
+        _acActive = _acRows.length ? 0 : -1;
+        renderAc();
+    } catch (e) {
+        if (mySeq !== _acSeq) return;
+        showAc('<div class="ac-empty">Search failed: ' + escHtml(errText(e)) + '</div>');
+    }
+}
+
+function renderAc() {
+    if (!_acRows.length) { showAc('<div class="ac-empty">No matching products</div>'); return; }
+    var html = _acRows.map(function (r, i) {
+        return '<div class="ac-item' + (i === _acActive ? ' active' : '') + '" data-i="' + i + '">' +
+               '<span class="ac-label">' + escHtml(r.partnum) + '</span>' +
+               '<span class="ac-sub">' + escHtml(r.partdesc || '') + '</span></div>';
+    }).join('');
+    showAc(html);
+    document.querySelectorAll('#acDropdown .ac-item').forEach(function (el) {
+        // mousedown, not click — it beats the input's blur-triggered close.
+        el.addEventListener('mousedown', function (e) {
+            e.preventDefault();
+            pickPart(parseInt(el.dataset.i, 10));
+        });
+    });
+}
+function showAc(html) { var dd = document.getElementById('acDropdown'); dd.innerHTML = html; dd.classList.remove('hidden'); }
+function closeAc()   { var dd = document.getElementById('acDropdown'); if (dd) dd.classList.add('hidden'); _acRows = []; _acActive = -1; }
+
+function pickPart(i) {
+    var row = _acRows[i];
+    if (!row) return;
+    document.getElementById('partInput').value = row.partnum;
+    closeAc();
+    selectPart(rowToPart(row));
+}
+function rowToPart(r) {
+    return {
+        id: parseInt(r.partid, 10),
+        num: r.partnum,
+        description: r.partdesc || '',
+        uomid: parseInt(r.uomid, 10),
+        uomcode: r.uomcode || ''
+    };
+}
+
+function onPartKeydown(e) {
+    var dd = document.getElementById('acDropdown');
+    var open = dd && !dd.classList.contains('hidden') && _acRows.length > 0;
+    if (e.key === 'ArrowDown' && open) { e.preventDefault(); _acActive = (_acActive + 1) % _acRows.length; renderAc(); }
+    else if (e.key === 'ArrowUp' && open) { e.preventDefault(); _acActive = (_acActive - 1 + _acRows.length) % _acRows.length; renderAc(); }
+    else if (e.key === 'Enter') {
+        if (open && _acActive >= 0) { e.preventDefault(); pickPart(_acActive); }
+        else { e.preventDefault(); closeAc(); resolveTypedPart(); }
+    } else if (e.key === 'Escape') { closeAc(); }
+}
+
+async function resolveTypedPart() {
+    var v = document.getElementById('partInput').value.trim();
+    if (!v) return;
+    try {
+        var rows = await qp(
+            'SELECT p.id AS partid, p.num AS partnum, p.description AS partdesc, p.uomId AS uomid, u.code AS uomcode ' +
+            'FROM part p JOIN uom u ON u.id = p.uomId ' +
+            "WHERE p.num = '" + escSQL(v) + "' LIMIT 1");
+        if (rows && rows.length) selectPart(rowToPart(rows[0]));
+        else setStatus('No product numbered "' + v + '".');
+    } catch (e) { setStatus('Lookup failed — ' + errText(e)); }
+}
+
+// ============================================================================
+//  PART SELECTION -> FIELD RESOLUTION
+//  (Shared with the Bars-to-Kilos report — same three fields, same detector.)
+// ============================================================================
+async function selectPart(p) {
+    _part = p;
+    _rows = [];
+    if (_resolve('remember', true)) _setUserKey('lastPart', p.num);
+    await resolvePartFields();
+    await loadCard();
+}
+
+async function resolvePartFields() {
+    if (!_part) return;
+
+    var chosenCf = String(_resolve('kgpmCf', '') || '');
+    var cf = chosenCf || autoDetectKgpmField();
+    _part.kgpmField = cf;
+    _part.kgpm = 0;
+    if (cf) {
+        try {
+            var rows = await qp(
+                "SELECT CustomFieldByName(p.customFields, '" + escSQL(cf) + "') AS v " +
+                'FROM part p WHERE p.id = ' + _part.id + ' LIMIT 1');
+            _part.kgpm = parseNum(rows && rows.length ? rows[0].v : null);
+        } catch (e) { debugLog('Kg-per-metre lookup failed: ' + errText(e), 'warn'); }
+    }
+
+    _partTrks = [];
+    try {
+        _partTrks = await qp([
+            'SELECT pt.id AS trkid, pt.name AS trkname, pt.abbr AS trkabbr,',
+            '       pt.typeId AS trktype, pt.sortOrder AS sortorder',
+            'FROM parttotracking p2t',
+            'JOIN parttracking pt ON pt.id = p2t.partTrackingId',
+            'WHERE p2t.partId = ' + _part.id + ' AND pt.activeFlag = 1',
+            'ORDER BY pt.sortOrder, pt.name'
+        ].join('\n'));
+    } catch (e) { debugLog('Tracking lookup failed: ' + errText(e), 'warn'); }
+
+    _batchTrk = pickTracking(String(_resolve('batchTrk', '') || ''), TRK_TEXT,   /batch|lot|heat|cast|shipment/i);
+    _lenTrk   = pickTracking(String(_resolve('lenTrk',   '') || ''), TRK_LENGTH, /len|length/i);
+
+    debugLog('Part ' + _part.num + ' — kg/m field "' + (cf || '(none)') + '" = ' + _part.kgpm +
+             ', batch = ' + (_batchTrk ? _batchTrk.trkname : '(none)') +
+             ', length = ' + (_lenTrk ? _lenTrk.trkname : '(none)'), 'info');
+    refreshFieldSelects();
+}
+
+// Bright Steel's field is named "Weight per Meter" — WEIGHT, not kg — so the
+// detector matches any mass word. Same implementation as the Bars-to-Kilos
+// report; keep the two in step.
+function autoDetectKgpmField() {
+    var norm = function (s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); };
+    var MASS  = /\b(kgs?|kilos?|kilograms?|weight|wt|mass)\b/;
+    // Bare "m" is safe here because norm() splits on punctuation, so "gm" in
+    // "Unit Weight gm" stays one token and cannot match.
+    var METRE = /\b(metres?|meters?|m|lm|lin|linear)\b/;
+    var exact = _partCfs.find(function (n) {
+        return /^(kgs?|kilos?|kilograms?|weight|wt|mass) (per )?(metre|meter|m|lm)$/.test(norm(n));
+    });
+    if (exact) return exact;
+    var both = _partCfs.find(function (n) { var x = norm(n); return MASS.test(x) && METRE.test(x); });
+    if (both) return both;
+    return _partCfs.find(function (n) { return /^kgs?\b/.test(norm(n)); }) || '';
+}
+
+// tiinventorylog splits its numeric payload the same way the tag tables do:
+// Count lands in infoInteger, everything else numeric in infoDouble.
+function trkIsInt(def) {
+    return TRK_INTEGER.indexOf(parseInt(def.trktype, 10)) !== -1;
+}
+
+// `wanted` is a saved tracking NAME — ids differ per database, names do not.
+function pickTracking(wanted, typeIds, nameRe) {
+    var pool = _partTrks.filter(function (t) { return typeIds.indexOf(parseInt(t.trktype, 10)) !== -1; });
+    if (!pool.length) return null;
+    if (wanted) {
+        var exact = pool.find(function (t) { return String(t.trkname) === wanted; });
+        if (exact) return exact;
+        // The override names a field this part does not carry — fall through
+        // to auto rather than silently showing nothing.
+    }
+    return pool.find(function (t) { return nameRe.test(String(t.trkname)) || nameRe.test(String(t.trkabbr)); }) || pool[0];
+}
+
+// ============================================================================
+//  THE CARD QUERY
+//  Four branches UNION-ed, wrapped so ORDER BY / LIMIT apply to the whole set.
+//  Each branch converts its line quantity into the PART's base unit, because
+//  the balance column has to add up in one unit:
+//      qty_in_part_uom = qty_in_line_uom * uomconversion.multiply / .factor
+//  Conversion rows only exist for pairs an administrator created, so a missing
+//  row COALESCEs to 1 — which is correct whenever the line is already in the
+//  part's own unit, and is the only safe assumption otherwise.
+// ============================================================================
+function dateClause(col) {
+    var out = [];
+    var from = safeDate(document.getElementById('dateFrom').value);
+    var to   = safeDate(document.getElementById('dateTo').value);
+    if (from) out.push(col + " >= '" + from + " 00:00:00'");
+    // `< to + 1 day` rather than `<= to`, so a movement stamped at 14:32 on
+    // the To date is still inside the range.
+    if (to)   out.push(col + " < DATE_ADD('" + to + " 00:00:00', INTERVAL 1 DAY)");
+    return out;
+}
+
+function lgClause(col) {
+    var ids = selectedLgIds();
+    return ids.length ? [col + ' IN (' + ids.join(',') + ')'] : [];
+}
+
+function buildCardSQL() {
+    var P = _part.id;
+    var U = _part.uomid;
+    var withSched = !!_resolve('showScheduled', true);
+    var conv = 'COALESCE(uc.multiply / uc.factor, 1)';
+
+    // ── IN: what has actually been received ──────────────────────────────
+    var recv = [
+        'SELECT',
+        "  'RECEIPT'                                            AS rowtype,",
+        '  COALESCE(ri.dateReceived, ri.dateLastModified)       AS evdate,',
+        "  COALESCE(v.name, rcust.name, CONCAT('Transfer from ', fromlg.name), '') AS party,",
+        // The SUPPLIER's invoice number lives on the PO header's Vendor SO #.
+        // A receipt against a SALES order is a customer return coming back in;
+        // it has no vendor invoice, so the SO number is the reference that
+        // actually identifies it. Verified against a live database, where
+        // every return receipt otherwise showed a blank Invoice No.
+        "  COALESCE(NULLIF(po.vendorSO, ''), rso.num, '')       AS invoiceno,",
+        "  COALESCE(po.num, rso.num, rxo.num, '')               AS orderno,",
+        '  COALESCE(poi.unitCost, ri.billedUnitCost, 0)         AS price,',
+        '  COALESCE(poi.mcUnitCost, ri.mcBilledUnitCost, 0)     AS mcprice,',
+        "  COALESCE(pcur.code, '')                              AS currcode,",
+        '  ri.qty * ' + conv + '                                AS qtybase,',
+        '  ri.qty                                               AS qtyline,',
+        "  COALESCE(poi.note, '')                               AS linenote,",
+        '  ri.id                                                AS recid,',
+        '  ' + TID_RECEIPTITEM + '                              AS tabid,',
+        "  COALESCE(po.num, rso.num, rxo.num, '')               AS ordernum,",
+        "  CASE WHEN po.id IS NOT NULL THEN 'PO'",
+        "       WHEN rso.id IS NOT NULL THEN 'SO'",
+        "       WHEN rxo.id IS NOT NULL THEN 'XO' ELSE '' END   AS ordertype,",
+        "  COALESCE(rlg.name, '')                               AS lgname,",
+        "  COALESCE(ru.code, '')                                AS uomcode",
+        'FROM receiptitem ri',
+        'JOIN receipt rc                ON rc.id     = ri.receiptId',
+        'LEFT JOIN poitem poi           ON poi.id    = ri.poItemId',
+        'LEFT JOIN po                   ON po.id     = COALESCE(poi.poId, rc.poId)',
+        'LEFT JOIN vendor v             ON v.id      = po.vendorId',
+        'LEFT JOIN currency pcur        ON pcur.id   = po.currencyId',
+        'LEFT JOIN so rso               ON rso.id    = rc.soId',
+        'LEFT JOIN customer rcust       ON rcust.id  = rso.customerId',
+        'LEFT JOIN xo rxo               ON rxo.id    = rc.xoId',
+        'LEFT JOIN locationgroup fromlg ON fromlg.id = rxo.fromLGId',
+        'LEFT JOIN locationgroup rlg    ON rlg.id    = rc.locationGroupId',
+        'LEFT JOIN uom ru               ON ru.id     = ri.uomId',
+        'LEFT JOIN uomconversion uc     ON uc.fromUomId = ri.uomId AND uc.toUomId = ' + U,
+        // statusId >= 30 is Received / Fulfilled. A line still Entered or
+        // Reconciled has not physically arrived, and counting it would put
+        // stock on the card that is not in the rack.
+        'WHERE ri.partId = ' + P + ' AND ri.statusId >= 30 AND ri.qty <> 0'
+    ].concat(pfx(dateClause('COALESCE(ri.dateReceived, ri.dateLastModified)')))
+     .concat(pfx(lgClause('rc.locationGroupId')));
+
+    // ── OUT: what has actually shipped ───────────────────────────────────
+    var ship = [
+        'SELECT',
+        "  'SHIPMENT',",
+        '  COALESCE(sh.dateShipped, sh.dateLastModified),',
+        '  c.name,',
+        // Our own invoice number IS the sales order number.
+        '  so.num,',
+        "  COALESCE(so.customerPO, ''),",
+        '  COALESCE(soi.unitPrice, 0),',
+        // soitem carries no mcUnitPrice — only the line total in the order
+        // currency — so the per-unit figure has to be derived.
+        '  COALESCE(soi.mcTotalPrice / NULLIF(soi.qtyOrdered, 0), 0),',
+        "  COALESCE(scur.code, ''),",
+        '  -si.qtyShipped * ' + conv + ',',
+        '  -si.qtyShipped,',
+        "  COALESCE(soi.note, ''),",
+        '  si.id,',
+        '  ' + TID_SHIPITEM + ',',
+        '  so.num,',
+        "  'SO',",
+        "  COALESCE(slg.name, ''),",
+        "  COALESCE(su.code, '')",
+        'FROM shipitem si',
+        'JOIN ship sh               ON sh.id  = si.shipId',
+        'JOIN soitem soi            ON soi.id = si.soItemId',
+        'JOIN so                    ON so.id  = soi.soId',
+        'JOIN customer c            ON c.id   = so.customerId',
+        'JOIN product pr            ON pr.id  = soi.productId',
+        'LEFT JOIN currency scur    ON scur.id = so.currencyId',
+        'LEFT JOIN locationgroup slg ON slg.id = sh.locationGroupId',
+        'LEFT JOIN uom su           ON su.id  = si.uomId',
+        'LEFT JOIN uomconversion uc ON uc.fromUomId = si.uomId AND uc.toUomId = ' + U,
+        // ship.statusId 30 = Shipped. A packed-but-not-shipped carton has not
+        // left, so it belongs on the Due out side, not here.
+        'WHERE pr.partId = ' + P + ' AND sh.statusId = 30 AND si.qtyShipped <> 0'
+    ].concat(pfx(dateClause('COALESCE(sh.dateShipped, sh.dateLastModified)')))
+     .concat(pfx(lgClause('sh.locationGroupId')));
+
+    var parts = [recv.join('\n'), ship.join('\n')];
+
+    if (withSched) {
+        // ── IN: still on order ───────────────────────────────────────────
+        var onorder = [
+            'SELECT',
+            "  'ONORDER',",
+            '  poi.dateScheduledFulfillment,',
+            '  v.name,',
+            "  COALESCE(po.vendorSO, ''),",
+            '  po.num,',
+            '  COALESCE(poi.unitCost, 0),',
+            '  COALESCE(poi.mcUnitCost, 0),',
+            "  COALESCE(pcur.code, ''),",
+            '  (poi.qtyToFulfill - COALESCE(poi.qtyFulfilled, 0)) * ' + conv + ',',
+            '  (poi.qtyToFulfill - COALESCE(poi.qtyFulfilled, 0)),',
+            "  COALESCE(poi.note, ''),",
+            '  poi.id,',
+            '  0,',
+            '  po.num,',
+            "  'PO',",
+            "  COALESCE(plg.name, ''),",
+            "  COALESCE(pu.code, '')",
+            'FROM poitem poi',
+            'JOIN po                    ON po.id = poi.poId',
+            'JOIN vendor v              ON v.id  = po.vendorId',
+            'LEFT JOIN currency pcur    ON pcur.id = po.currencyId',
+            'LEFT JOIN locationgroup plg ON plg.id = po.locationGroupId',
+            'LEFT JOIN uom pu           ON pu.id = poi.uomId',
+            'LEFT JOIN uomconversion uc ON uc.fromUomId = poi.uomId AND uc.toUomId = ' + U,
+            // typeId 10/11 are the purchase lines — the ones that bring stock
+            // in. 20/30 are out-of-stock and credit-return lines and are not
+            // incoming supply.
+            // po.statusId 20..55 is Issued through Shipped: an order that has
+            // been placed and not yet closed. A Bid Request is not supply.
+            'WHERE poi.partId = ' + P,
+            '  AND poi.typeId IN (10, 11)',
+            '  AND po.statusId BETWEEN 20 AND 55',
+            '  AND (poi.qtyToFulfill - COALESCE(poi.qtyFulfilled, 0)) > 0'
+        ].concat(pfx(dateClause('poi.dateScheduledFulfillment')))
+         .concat(pfx(lgClause('po.locationGroupId')));
+
+        // ── OUT: still due out ───────────────────────────────────────────
+        var dueout = [
+            'SELECT',
+            "  'DUEOUT',",
+            '  soi.dateScheduledFulfillment,',
+            '  c.name,',
+            '  so.num,',
+            "  COALESCE(so.customerPO, ''),",
+            '  COALESCE(soi.unitPrice, 0),',
+            '  COALESCE(soi.mcTotalPrice / NULLIF(soi.qtyOrdered, 0), 0),',
+            "  COALESCE(scur.code, ''),",
+            '  -(soi.qtyOrdered - COALESCE(soi.qtyFulfilled, 0)) * ' + conv + ',',
+            '  -(soi.qtyOrdered - COALESCE(soi.qtyFulfilled, 0)),',
+            "  COALESCE(soi.note, ''),",
+            '  soi.id,',
+            '  0,',
+            '  so.num,',
+            "  'SO',",
+            "  COALESCE(slg.name, ''),",
+            "  COALESCE(su.code, '')",
+            'FROM soitem soi',
+            'JOIN so                    ON so.id = soi.soId',
+            'JOIN customer c            ON c.id  = so.customerId',
+            'JOIN product pr            ON pr.id = soi.productId',
+            'LEFT JOIN currency scur    ON scur.id = so.currencyId',
+            'LEFT JOIN locationgroup slg ON slg.id = so.locationGroupId',
+            'LEFT JOIN uom su           ON su.id = soi.uomId',
+            'LEFT JOIN uomconversion uc ON uc.fromUomId = soi.uomId AND uc.toUomId = ' + U,
+            // so.statusId 20/25 = Issued / In Progress — a live order.
+            // soitem.typeId 20/21 are credit returns (stock coming back, not
+            // going out) and 30/40 are discount lines; none of them is demand.
+            // soitem.statusId 50/60/70/75 = Fulfilled / Closed Short / Voided /
+            // Cancelled — nothing left to ship.
+            'WHERE pr.partId = ' + P,
+            '  AND so.statusId IN (20, 25)',
+            '  AND soi.typeId NOT IN (20, 21, 30, 40)',
+            '  AND soi.statusId NOT IN (50, 60, 70, 75)',
+            '  AND (soi.qtyOrdered - COALESCE(soi.qtyFulfilled, 0)) > 0'
+        ].concat(pfx(dateClause('soi.dateScheduledFulfillment')))
+         .concat(pfx(lgClause('so.locationGroupId')));
+
+        parts.push(onorder.join('\n'), dueout.join('\n'));
+    }
+
+    return 'SELECT * FROM (\n' + parts.join('\nUNION ALL\n') +
+           '\n) card\nORDER BY evdate, rowtype\nLIMIT 5000';
+}
+function pfx(list) { return list.map(function (c) { return '  AND ' + c; }); }
+
+// Batch + average length for the movements that have actually happened.
+// Kept as its own small query rather than joined into each UNION branch: the
+// branches would each materialise their own copy of it, and the shipped line's
+// tracking cannot be read off shipitem.tagId at all (it is always 0) — it has
+// to come through inventorylog -> tiinventorylog.
+function buildTrackingSQL() {
+    if (!_batchTrk && !_lenTrk) return null;
+    var ids = [];
+    if (_batchTrk) ids.push(parseInt(_batchTrk.trkid, 10));
+    if (_lenTrk)   ids.push(parseInt(_lenTrk.trkid, 10));
+    return [
+        'SELECT il.tableId AS tabid, il.recordId AS recid,',
+        _batchTrk
+            ? "  GROUP_CONCAT(DISTINCT CASE WHEN pt.id = " + parseInt(_batchTrk.trkid, 10) + " THEN NULLIF(TRIM(til.info), '') END SEPARATOR ' | ') AS batch,"
+            : '  NULL AS batch,',
+        _lenTrk
+            ? '  AVG(CASE WHEN pt.id = ' + parseInt(_lenTrk.trkid, 10) + ' THEN ' +
+              (trkIsInt(_lenTrk) ? 'til.infoInteger' : 'til.infoDouble') + ' END) AS avglen'
+            : '  NULL AS avglen',
+        'FROM inventorylog il',
+        'JOIN tiinventorylog til ON til.inventoryLogId = il.id',
+        'JOIN parttracking pt    ON pt.id = til.partTrackingId',
+        'WHERE il.partId = ' + _part.id,
+        '  AND il.tableId IN (' + TID_RECEIPTITEM + ', ' + TID_SHIPITEM + ')',
+        '  AND til.partTrackingId IN (' + ids.join(',') + ')',
+        'GROUP BY il.tableId, il.recordId'
+    ].join('\n');
+}
+
+// Two scalars that anchor the card to reality:
+//   onhandnow      what is physically in the rack right now
+//   movedafterfrom every inventorylog movement since the range start, so
+//                  B/F = onhandnow - movedafterfrom is what was on hand the
+//                  day the card opens
+//   movedinrange   the same sum bounded by the To date, so the closing ACTUAL
+//                  balance is B/F + movedinrange even on a back-dated range
+function buildScalarsSQL() {
+    var P = _part.id;
+    var lgTag = selectedLgIds().length ? ' AND l.locationGroupId IN (' + selectedLgIds().join(',') + ')' : '';
+    var lgLog = selectedLgIds().length ? ' AND il.locationGroupId IN (' + selectedLgIds().join(',') + ')' : '';
+    // See LOG_TYPE_YIELD — those rows double-count, so any net-movement sum
+    // that includes them makes B/F nonsense.
+    var exYld = ' AND il.typeId <> ' + LOG_TYPE_YIELD;
+    var from = safeDate(document.getElementById('dateFrom').value);
+    var to   = safeDate(document.getElementById('dateTo').value);
+    var afterFrom = from ? " AND il.eventDate >= '" + from + " 00:00:00'" : '';
+    var inRange = afterFrom + (to ? " AND il.eventDate < DATE_ADD('" + to + " 00:00:00', INTERVAL 1 DAY)" : '');
+    return [
+        'SELECT',
+        '  (SELECT COALESCE(SUM(t.qty), 0) FROM tag t',
+        '     JOIN location l ON l.id = t.locationId',
+        '    WHERE t.partId = ' + P + ' AND t.typeId IN (' + ONHAND_TAG_TYPES + ')' + lgTag + ') AS onhandnow,',
+        '  (SELECT COALESCE(SUM(il.changeQty), 0) FROM inventorylog il',
+        '    WHERE il.partId = ' + P + lgLog + exYld + afterFrom + ') AS movedafterfrom,',
+        '  (SELECT COALESCE(SUM(il.changeQty), 0) FROM inventorylog il',
+        '    WHERE il.partId = ' + P + lgLog + exYld + inRange + ') AS movedinrange'
+    ].join('\n');
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+async function loadCard() {
+    if (!_part) { renderAll(); return; }
+    var mySeq = ++_loadSeq;
+    var btn = document.getElementById('refreshBtn');
+    if (btn) btn.disabled = true;
+    setStatus('Building the card for ' + _part.num + '…');
+    try {
+        var cardSql = buildCardSQL();
+        var trkSql  = buildTrackingSQL();
+        var scaSql  = buildScalarsSQL();
+        debugLog('Card query:\n' + cardSql, 'query');
+        if (trkSql) debugLog('Tracking query:\n' + trkSql, 'query');
+        debugLog('Scalars query:\n' + scaSql, 'query');
+
+        var results = await Promise.all([
+            qp(cardSql),
+            trkSql ? qp(trkSql) : Promise.resolve([]),
+            qp(scaSql)
+        ]);
+        if (mySeq !== _loadSeq) return;        // a newer load superseded us
+
+        _rows = buildCard(results[0] || [], results[1] || [], (results[2] || [])[0] || {});
+        debugLog('Card built — ' + _rows.length + ' row(s), B/F ' + kg(_summary.bf) +
+                 ', close ' + kg(_summary.close) + ', on hand ' + kg(_summary.onhand), 'success');
+        renderAll();
+    } catch (e) {
+        if (mySeq !== _loadSeq) return;
+        console.error('[Product Card] load failed:', e);
+        _rows = [];
+        renderAll();
+        setStatus('Load failed — ' + errText(e));
+        debugLog('Load failed: ' + errText(e), 'error');
+        showToast('Could not build the card: ' + errText(e), 'error', 8000);
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+// Merge the three result sets into the finished card and roll the balance
+// forward. Everything downstream reads `_rows` and `_summary`.
+function buildCard(raw, trkRows, scalars) {
+    // ── tracking, keyed on (tableId, recordId) ───────────────────────────
+    var trk = Object.create(null);
+    trkRows.forEach(function (t) {
+        trk[String(t.tabid) + ':' + String(t.recid)] = {
+            batch: t.batch || '',
+            avglen: parseNum(t.avglen)
+        };
+    });
+
+    var kgpm = _part ? parseNum(_part.kgpm) : 0;
+
+    var rows = raw.map(function (r) {
+        var meta = TYPE_META[r.rowtype] || TYPE_META.RECEIPT;
+        var key = String(r.tabid) + ':' + String(r.recid);
+        var t = (meta.actual && trk[key]) ? trk[key] : { batch: '', avglen: 0 };
+        var qtybase = parseNum(r.qtybase);
+
+        // Bars. The line note is what the customer actually asked for, so it
+        // wins; the weight-derived figure is a fallback and is marked as one.
+        var noted = barsFromNote(r.linenote);
+        var bars = noted;
+        var derived = false;
+        if (bars == null && kgpm > 0 && t.avglen > 0) {
+            bars = Math.abs(qtybase) / (kgpm * t.avglen);
+            derived = true;
+        }
+
+        return {
+            rowtype:  r.rowtype,
+            // Normalised to the ISO "T" form. The Date column sorts as a
+            // STRING, and mixing "2026-09-18 14:00" with "2026-09-18T00:00"
+            // sorted the space-separated row first (space is below "T"), so
+            // clicking Date reordered the grid out of step with the balances,
+            // which are computed in real date order.
+            evdate:   normDate(r.evdate),
+            party:    r.party || '',
+            invoiceno: r.invoiceno || '',
+            orderno:  r.orderno || '',
+            price:    parseNum(r.price),
+            mcprice:  parseNum(r.mcprice),
+            currcode: r.currcode || '',
+            batch:    t.batch,
+            avglen:   t.avglen || null,
+            bars:     bars == null ? null : bars,
+            barsderived: derived,
+            qtybase:  qtybase,
+            qtyline:  parseNum(r.qtyline),
+            uomcode:  r.uomcode || '',
+            linenote: r.linenote || '',
+            lgname:   r.lgname || '',
+            ordernum: r.ordernum || '',
+            ordertype: r.ordertype || '',
+            actual:   meta.actual,
+            _ord:     meta.ord,
+            _t:       dateMs(r.evdate)
+        };
+    });
+
+    // Date order, with the tie-break that reads correctly on a ledger: on one
+    // date, what came in before what went out, and history before forecast.
+    rows.sort(function (a, b) { return (a._t - b._t) || (a._ord - b._ord); });
+
+    // ── OPENING BALANCE ──────────────────────────────────────────────────
+    // B/F is on-hand NOW less every net movement since the range start, so on
+    // the whole card it comes out at 0 and the closing figure lands on real
+    // on-hand. That only holds because the yield duplicates are kept out of
+    // the sum — see LOG_TYPE_YIELD.
+    var onhand    = parseNum(scalars.onhandnow);
+    var afterFrom = parseNum(scalars.movedafterfrom);
+    var inRange   = parseNum(scalars.movedinrange);
+    var bf = onhand - afterFrom;
+
+    // ── TWO PASSES, and the split is the whole point ─────────────────────
+    // A forecast row must NEVER shift a historical balance. Rolling one
+    // sequence across every row in date order let an overdue On-order line
+    // sitting in the middle of the card lift every later Receipt and Shipment
+    // balance with it, so the card could not close on real on-hand. History
+    // rolls on its own; the forecast then continues from where history ended.
+    var actualRows = [];
+    var schedRows  = [];
+    rows.forEach(function (r) { (r.actual ? actualRows : schedRows).push(r); });
+
+    var byDate = function (a, b) { return (a._t - b._t) || (a._ord - b._ord); };
+
+    var actualSum = actualRows.reduce(function (a, r) { return a + r.qtybase; }, 0);
+    var unrecon = inRange - actualSum;
+
+    // Stock the log saw that no order explains — an adjustment, a cycle
+    // count, a transfer between sites. It gets its own dated row so the
+    // running balance ties to real on-hand rather than quietly drifting. When
+    // the orders already account for everything this is 0 and no row appears.
+    if (Math.abs(unrecon) > 0.0005 && _resolve('showRecon', true)) {
+        actualRows.push({
+            rowtype: 'ADJUST',
+            evdate: isoDateTime(new Date()),
+            party: 'Adjustments / transfers (not on an order)',
+            invoiceno: '', orderno: '', price: 0, mcprice: 0, currcode: '',
+            batch: '', avglen: null, bars: null, barsderived: false,
+            qtybase: unrecon, qtyline: unrecon, uomcode: _part ? _part.uomcode : '',
+            linenote: 'The difference between what the orders account for and what Fishbowl actually holds.',
+            lgname: '', ordernum: '', ordertype: '',
+            actual: true, _ord: TYPE_META.ADJUST.ord, _t: Date.now()
+        });
+    }
+    actualRows.sort(byDate);
+    schedRows.sort(byDate);
+
+    // PASS 1 — history only.
+    var bal = bf, inKg = 0, outKg = 0;
+    actualRows.forEach(function (r) {
+        bal += r.qtybase;
+        r.balance = bal;
+        r.projected = false;
+        if (r.qtybase > 0) inKg += r.qtybase; else outKg += -r.qtybase;
+    });
+    var close = bal;            // == on-hand whenever the range runs to today
+
+    // PASS 2 — the forecast, continuing from the closing actual balance.
+    schedRows.forEach(function (r) {
+        bal += r.qtybase;
+        r.balance = bal;
+        r.projected = true;
+        if (r.qtybase > 0) inKg += r.qtybase; else outKg += -r.qtybase;
+    });
+
+    _summary = {
+        bf: bf, onhand: onhand, inKg: inKg, outKg: outKg,
+        close: close, projected: bal, unrecon: unrecon,
+        // How far the closing actual balance misses real on-hand. Non-zero
+        // only when the reconciliation row is switched off, or the range is
+        // capped before today.
+        drift: onhand - close
+    };
+
+    // History above the forecast, each in date order, so the Balance column
+    // reads straight down the page. Interleaving them by date would print a
+    // forecast balance in the middle of history it does not belong to.
+    return actualRows.concat(schedRows);
+}
+
+// "5 bars", "5 BAR", "bars: 5", "5x bars" — Courtney types it the way she
+// types it, and the pick ticket has to carry whatever she wrote.
+function barsFromNote(note) {
+    var s = oneLine(note);
+    if (!s) return null;
+    var m = s.match(/(\d+(?:[.,]\d+)?)\s*(?:x\s*)?bars?\b/i) ||
+            s.match(/\bbars?\s*[:=]?\s*(\d+(?:[.,]\d+)?)/i);
+    if (!m) return null;
+    var n = parseNum(m[1]);
+    return n > 0 ? n : null;
+}
+
+// ============================================================================
+//  COLUMN HELP
+//  Several columns are filled from DIFFERENT places depending on whether the
+//  row is a purchase or a sale — Invoice No and Order No especially, which is
+//  exactly the kind of thing nobody can infer from a 10-character heading.
+//  Hovering the heading explains it.
+// ============================================================================
+var COL_HELP = {
+    evdate: {
+        t: 'Date',
+        d: 'The date the stock is expected to move.',
+        in: 'the date it was actually received; for a row still on order, the scheduled date on the PO line.',
+        out: 'the date it actually shipped; for a row still due out, the scheduled date on the SO line.'
+    },
+    rowtype: {
+        t: 'Type',
+        d: 'What kind of movement this is. Receipt and Shipment have happened. On order and Due out have not, and sit below the history on a cream background. Adjust is stock the orders do not explain.'
+    },
+    party: {
+        t: 'Customer / Supplier',
+        d: 'Click to open the record.',
+        in: 'the vendor on the purchase order.',
+        out: 'the customer on the sales order.'
+    },
+    invoiceno: {
+        t: 'Invoice No',
+        d: 'Filled from a different place on each side of the card.',
+        in: 'the SUPPLIER&rsquo;s invoice number, read from the purchase order header field <code>Vendor SO #</code>. A receipt against a SALES order is a customer return, which has no vendor invoice, so that row shows the sales order number instead.',
+        out: 'OUR OWN invoice number, which is the sales order number. Click it to open the order.'
+    },
+    orderno: {
+        t: 'Order No',
+        d: 'Also filled from a different place on each side.',
+        in: 'our own purchase order number. Click it to open the order.',
+        out: 'the customer&rsquo;s reference, from the sales order field <code>Customer PO</code>. Usually their order number, but it is free text, so it is often just the name of whoever rang.'
+    },
+    price: {
+        t: 'Price',
+        d: 'Per kilo, in your home currency.',
+        in: 'the unit cost on the purchase order line.',
+        out: 'the unit price on the sales order line.',
+        meta: 'When the order is in another currency, hover the cell for its own figure, or turn on the hidden Price (order ccy) and Order currency columns.'
+    },
+    batch: {
+        t: 'Shipment',
+        d: 'The BATCH recorded against this movement — the part&rsquo;s Batch Number tracking value. Named Shipment because that is what the paper card called it. Blank on a row that has not moved yet: there is no stock behind it, so there is no batch to read.'
+    },
+    avglen: {
+        t: 'Length',
+        d: 'The batch&rsquo;s average bar length in METRES PER BAR, from the part&rsquo;s Length tracking field. Blank on a row that has not moved yet.'
+    },
+    bars: {
+        t: 'Bars',
+        d: 'Read out of the sales order line note — the way Courtney writes it, e.g. <code>5 bars</code>.',
+        meta: 'Where the note says nothing, the count is worked back out of the weight and shown in grey. That is an estimate: bars are cut to an average length.'
+    },
+    qtybase: {
+        t: 'In / Out',
+        d: 'The movement itself, in the part&rsquo;s own unit. Green and signed + for stock coming in, red and signed - for stock going out.'
+    },
+    balance: {
+        t: 'Balance',
+        d: 'A running total: B/F plus every In/Out above this row.',
+        meta: 'History rolls first and closes on real on-hand. The forecast rows then continue from that closing figure and are shown in grey italics — which is why they are grouped below the history rather than interleaved by date.'
+    },
+    qtyline:  { t: 'Qty (line UOM)', d: 'The raw quantity as it appears on the order line, before conversion into the part&rsquo;s own unit. Shown so a UOM conversion can be checked.' },
+    uomcode:  { t: 'Line UOM',       d: 'The unit the order line was written in.' },
+    linenote: { t: 'Line note',      d: 'The note on the order line. This is where the bar count comes from on a sale.' },
+    lgname:   { t: 'Location group',  d: 'The location group the movement belongs to.' },
+    ordernum: { t: 'Order document', d: 'The PO or SO number the row came from — the document a link on this row opens.' },
+    currcode: { t: 'Order currency', d: 'The currency the order itself was raised in. Blank means your home currency.' },
+    mcprice:  { t: 'Price (order ccy)', d: 'The unit price or cost in the ORDER&rsquo;s currency, rather than converted to home.' }
+};
+
+function helpHtml(key) {
+    var h = COL_HELP[key];
+    if (!h) return '';
+    var out = '<span class="tt-title">' + h.t + '</span>';
+    if (h.d) out += '<span class="tt-desc">' + h.d + '</span>';
+    if (h['in'])  out += '<span class="tt-io"><b>Purchases:</b> ' + h['in'] + '</span>';
+    if (h.out)    out += '<span class="tt-io out"><b>Sales:</b> ' + h.out + '</span>';
+    if (h.meta)   out += '<span class="tt-meta">' + h.meta + '</span>';
+    return out;
+}
+
+// Positioned against the hovered header, flipping below it when there is no
+// room above. Mirrors the tipShow in CustomerStatus / BOM_Cost.
+function tipShow(event, html) {
+    var el = document.getElementById('appTooltip');
+    if (!el) return;
+    el.innerHTML = html;
+    var tw = 340;
+    var r = event.currentTarget.getBoundingClientRect();
+    var x = Math.min(window.innerWidth - tw - 12, r.left);
+    el.style.left = Math.max(12, x) + 'px';
+    // A sticky header sits at the very top of the scroll container, so there
+    // is almost never room above it — below is the normal case here.
+    var aboveY = r.top - el.offsetHeight - 8;
+    el.style.top = (aboveY < 8 ? (r.bottom + 8) : aboveY) + 'px';
+    el.classList.add('show');
+}
+function tipHide() {
+    var el = document.getElementById('appTooltip');
+    if (el) el.classList.remove('show');
+}
+
+// FBLib.Table rebuilds the <thead> on every render, so the handlers are
+// rebound each time rather than once at init.
+function applyHeaderTips() {
+    var ths = document.querySelectorAll('#reportTable thead tr:first-child th[data-col-key]');
+    Array.prototype.forEach.call(ths, function (th) {
+        var html = helpHtml(th.dataset.colKey);
+        if (!html) return;
+        th.classList.add('has-tip');
+        th.addEventListener('mouseenter', function (e) { tipShow(e, html); });
+        th.addEventListener('mouseleave', tipHide);
+    });
+}
+
+// ============================================================================
+//  RENDER
+// ============================================================================
+function cardRows() {
+    // Sorted newest-first purely as a VIEW preference; the balance on each row
+    // was computed in date order and travels with the row.
+    if (String(_resolve('dateDir', 'asc')) === 'desc') return _rows.slice().reverse();
+    return _rows;
+}
+
+function renderAll() {
+    var has = !!_part;
+    document.getElementById('emptyState').classList.toggle('hidden', has);
+    document.getElementById('tableWrap').style.display = has ? '' : 'none';
+    renderHead();
+    if (_table) _table.render();
+    applyRowClasses();
+    applyHeaderTips();
+    updateStatus();
+}
+
+// FBLib.Table builds plain <tr>s, so the row-kind styling is applied after
+// each paint rather than from inside a column formatter.
+function applyRowClasses() {
+    var tbody = document.querySelector('#reportTable tbody');
+    if (!tbody) return;
+    var rows = cardRows();
+    Array.prototype.forEach.call(tbody.rows, function (tr, i) {
+        var r = rows[i];
+        if (!r) return;
+        tr.classList.toggle('sched', !r.actual);
+        tr.classList.toggle('adj', r.rowtype === 'ADJUST');
+    });
+}
+
+function renderHead() {
+    var el = document.getElementById('cardHead');
+    if (!_part) { el.classList.remove('on'); return; }
+    el.classList.add('on');
+    document.getElementById('chNum').textContent  = _part.num;
+    document.getElementById('chDesc').textContent = _part.description || '';
+
+    var kgpm = parseNum(_part.kgpm);
+    var u = _part.uomcode ? ' ' + _part.uomcode : '';
+    document.getElementById('chKgpm').textContent   = kgpm > 0 ? num(kgpm, 3) + ' kg/m' : '—';
+    document.getElementById('chBf').textContent     = kg(_summary.bf) + u;
+    document.getElementById('chIn').textContent     = '+' + kg(_summary.inKg);
+    document.getElementById('chOut').textContent    = '-' + kg(_summary.outKg);
+    document.getElementById('chOnHand').textContent = kg(_summary.onhand) + u;
+
+    var proj = document.getElementById('chProj');
+    var hasSched = _rows.some(function (r) { return !r.actual; });
+    proj.textContent = hasSched ? kg(_summary.projected) + u : '—';
+    proj.parentNode.style.display = hasSched ? '' : 'none';
+
+    var warn = document.getElementById('chWarn');
+    var msgs = [];
+    // Drift means the closing history balance does NOT equal real on-hand —
+    // only possible with the reconciliation row switched off or the range
+    // capped before today. Say so rather than letting the column read as
+    // authoritative.
+    if (Math.abs(_summary.drift || 0) > 0.0005) {
+        msgs.push('Closing balance is ' + kg(_summary.drift) + ' kg off real on-hand');
+    }
+    if (!_batchTrk) msgs.push('No batch tracking on this part');
+    if (!_lenTrk)   msgs.push('No average-length tracking');
+    if (!(kgpm > 0)) msgs.push('No weight per metre');
+    if (msgs.length) {
+        warn.textContent = msgs.join('  ·  ') + '  —  Settings › Fields';
+        warn.style.display = '';
+    } else {
+        warn.style.display = 'none';
+    }
+}
+
+function updateStatus() {
+    if (!_part) { setStatus('Pick a product to open its card.'); return; }
+    var sched = _rows.filter(function (r) { return !r.actual; }).length;
+    var bits = [
+        _rows.length.toLocaleString() + ' movement' + (_rows.length === 1 ? '' : 's'),
+        'closing ' + kg(_summary.close) + (_part.uomcode ? ' ' + _part.uomcode : '')
+    ];
+    if (sched) bits.push(sched + ' still to come');
+    if (Math.abs(_summary.unrecon) > 0.0005) {
+        bits.push((_resolve('showRecon', true)
+            ? 'incl. ' : 'plus ') + kg(_summary.unrecon) + ' not explained by an order');
+    }
+    setStatus(bits.join(' — '));
+}
+
+// A link cell whose openModule target is not the displayed text.
+function moduleLink(text, moduleName, item) {
+    var a = document.createElement('a');
+    a.href = 'javascript:void(0)';
+    a.className = 'fb-row-link';
+    a.textContent = String(text);
+    a.title = 'Open ' + moduleName + ' ' + item;
+    a.addEventListener('click', function (e) {
+        e.preventDefault();
+        if (typeof openModule === 'function') openModule(moduleName, item);
+    });
+    return a;
+}
+
+// ============================================================================
+//  DATE RANGE
+//  A preset writes concrete dates into the From / To inputs, so the SQL only
+//  ever reads those two values and "custom" needs no special case.
+// ============================================================================
+function applyPresetToInputs() {
+    var preset = document.getElementById('datePreset').value;
+    var fromEl = document.getElementById('dateFrom');
+    var toEl   = document.getElementById('dateTo');
+    if (preset === 'custom') return;
+
+    var today = new Date();
+    var from = null, to = null;
+    if (preset === 'all') {
+        from = null; to = null;
+    } else if (preset === 'ytd') {
+        from = new Date(today.getFullYear(), 0, 1); to = null;
+    } else if (preset === 'fy') {
+        // Australian financial year — July to June.
+        var y = today.getMonth() >= 6 ? today.getFullYear() : today.getFullYear() - 1;
+        from = new Date(y, 6, 1); to = null;
+    } else {
+        var days = parseInt(preset, 10);
+        if (!isNaN(days)) { from = new Date(today.getTime()); from.setDate(from.getDate() - days); to = null; }
+    }
+    fromEl.value = from ? isoDate(from) : '';
+    // The To box is left alone by every preset: the card is meant to run right
+    // through today and on into what is still due, so capping it is always a
+    // deliberate act.
+    if (to) toEl.value = isoDate(to);
+}
+
+function onPresetChange() { applyPresetToInputs(); onDateControlChange(); }
+function onCustomDateChange() {
+    document.getElementById('datePreset').value = 'custom';
+    onDateControlChange();
+}
+function onDateControlChange() {
+    persistFilters();
+    if (_part) loadCard();
+}
+
+function persistFilters() {
+    if (!_resolve('remember', true)) return;
+    _setUserKey('preset',   document.getElementById('datePreset').value);
+    _setUserKey('dateFrom', document.getElementById('dateFrom').value);
+    _setUserKey('dateTo',   document.getElementById('dateTo').value);
+}
+
+function hydrateFilters() {
+    document.getElementById('datePreset').value = _resolve('defaultPreset', 'all');
+    if (_resolve('remember', true)) {
+        var p = _resolve('preset', null);
+        if (p) document.getElementById('datePreset').value = p;
+    }
+    applyPresetToInputs();
+    if (document.getElementById('datePreset').value === 'custom') {
+        document.getElementById('dateFrom').value = String(_resolve('dateFrom', '') || '');
+        document.getElementById('dateTo').value   = String(_resolve('dateTo', '') || '');
+    }
+}
+
+// ============================================================================
+//  LOCATION GROUPS
+// ============================================================================
+async function loadLocationGroups() {
+    var ids = [];
+    try { if (typeof getLocationGroupList === 'function') ids = getLocationGroupList() || []; } catch (_) {}
+    var clean = (ids || []).map(function (n) { return parseInt(n, 10); }).filter(function (n) { return !isNaN(n); });
+    var where = clean.length ? 'WHERE lg.id IN (' + clean.join(',') + ')' : '';
+    try {
+        var rows = await qp('SELECT lg.id, lg.name FROM locationgroup lg ' + where + ' ORDER BY lg.name');
+        _lgAll = (rows || []).map(function (r) { return { value: String(r.id), label: r.name }; });
+    } catch (e) {
+        _lgAll = [];
+        debugLog('Location groups unavailable: ' + errText(e), 'warn');
+    }
+    if (_lgMs) _lgMs.setItems(_lgAll);
+}
+
+function selectedLgIds() {
+    if (!_lgMs) return [];
+    return (_lgMs.getSelected() || [])
+        .map(function (v) { return parseInt(v, 10); })
+        .filter(function (n) { return !isNaN(n); });
+}
+
+// ============================================================================
+//  CUSTOM FIELD + TRACKING CATALOGUES  (for the Settings drop-downs)
+// ============================================================================
+async function loadPartCfs() {
+    try {
+        var rows = await qp([
+            'SELECT cf.name AS name',
+            'FROM tablereference tr',
+            'JOIN customfield cf ON cf.tableId = tr.tableId',
+            "WHERE LOWER(tr.tableRefName) = 'part' AND cf.activeFlag = 1",
+            'ORDER BY cf.sortOrder, cf.name'
+        ].join('\n'));
+        _partCfs = (rows || []).map(function (r) { return r.name; }).filter(Boolean);
+    } catch (e) {
+        _partCfs = [];
+        debugLog('Part custom fields unavailable: ' + errText(e), 'warn');
+    }
+    refreshFieldSelects();
+}
+
+function refreshFieldSelects() {
+    fillSelect('setKgpmCf', _partCfs.map(function (n) { return { v: n, l: n }; }),
+               String(_resolve('kgpmCf', '') || ''), autoLabel(_part && _part.kgpmField));
+
+    var txt = _partTrks.filter(function (t) { return TRK_TEXT.indexOf(parseInt(t.trktype, 10)) !== -1; });
+    var dec = _partTrks.filter(function (t) { return TRK_LENGTH.indexOf(parseInt(t.trktype, 10)) !== -1; });
+    fillSelect('setBatchTrk', txt.map(function (t) { return { v: t.trkname, l: t.trkname }; }),
+               String(_resolve('batchTrk', '') || ''), autoLabel(_batchTrk && _batchTrk.trkname));
+    fillSelect('setLenTrk', dec.map(function (t) { return { v: t.trkname, l: t.trkname }; }),
+               String(_resolve('lenTrk', '') || ''), autoLabel(_lenTrk && _lenTrk.trkname));
+}
+function autoLabel(detected) {
+    return detected ? '(auto-detect — currently "' + detected + '")' : '(auto-detect — nothing found)';
+}
+function fillSelect(id, items, current, autoText) {
+    var sel = document.getElementById(id);
+    if (!sel) return;
+    sel.innerHTML = '';
+    var auto = document.createElement('option');
+    auto.value = ''; auto.textContent = autoText;
+    sel.appendChild(auto);
+    var seen = Object.create(null);
+    items.forEach(function (it) {
+        if (seen[it.v]) return;
+        seen[it.v] = true;
+        var o = document.createElement('option');
+        o.value = it.v; o.textContent = it.l;
+        sel.appendChild(o);
+    });
+    // A saved override for a field this part does not carry still has to be
+    // visible, or "Reset to defaults" is the only way out of it.
+    if (current && !seen[current]) {
+        var o2 = document.createElement('option');
+        o2.value = current; o2.textContent = current + '  (not on this product)';
+        sel.appendChild(o2);
+    }
+    sel.value = current || '';
+}
+
+// ============================================================================
+//  COLUMNS PANEL
+//  FBLib.Table owns order / width / sort (and persists them itself on drag).
+//  Visibility has no public setter, so toggling writes the same settings blob
+//  the Table reads — keeping every other field it holds — and then repaints.
+// ============================================================================
+function buildColPanel() {
+    var host = document.getElementById('colList');
+    host.innerHTML = '';
+    _table.getColumns().forEach(function (col) {
+        var label = document.createElement('label');
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = col.vis !== false;
+        if (col.key === 'evdate' || col.key === 'qtybase' || col.key === 'balance') {
+            cb.disabled = true;
+            label.title = 'Date, In/Out and Balance are what makes this a card';
+        }
+        cb.addEventListener('change', function () { setColumnVisible(col.key, cb.checked); });
+        var span = document.createElement('span');
+        span.textContent = col.label;
+        label.appendChild(cb); label.appendChild(span);
+        host.appendChild(label);
+    });
+}
+
+function setColumnVisible(key, visible) {
+    var cols = _table.getColumns();
+    var col = cols.find(function (c) { return c.key === key; });
+    if (!col) return;
+    col.vis = !!visible;
+    var saved = _resolve('tablePrefs', null);
+    if (!saved || typeof saved !== 'object') saved = {};
+    saved.order = cols.map(function (c) { return c.key; });
+    saved.hidden = cols.filter(function (c) { return c.vis === false; }).map(function (c) { return c.key; });
+    _setUserKey('tablePrefs', saved);
+    _table.render();
+    applyRowClasses();
+    applyHeaderTips();
+}
+
+function toggleColPanel() { document.getElementById('colPanel').classList.toggle('hidden'); }
+
+function resetColLayout() {
+    if (!confirm('Reset column order, widths and visibility to the defaults?')) return;
+    _setUserKey('tablePrefs', null);
+    _table.setColumns(_columns.map(function (c) { return Object.assign({}, c); }));
+    buildColPanel();
+    _table.render();
+    applyRowClasses();
+    applyHeaderTips();
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+function visibleExportCols() {
+    return _table.getColumns().filter(function (c) { return c.vis !== false; });
+}
+
+// Plain text for a cell — the on-screen formatter emits HTML or a Node, so
+// format the underlying value here instead of scraping the DOM.
+function cellText(col, row) {
+    var raw = row[col.key];
+    if (col.key === 'evdate')  return fmtDate(raw);
+    if (col.key === 'rowtype') return (TYPE_META[raw] || {}).label || String(raw || '');
+    if (raw == null || raw === '') return '';
+    if (col.key === 'avglen')  return num(raw, 3);
+    if (col.key === 'bars')    return num(raw, 0);
+    if (col.money) return fmtMoney(raw);
+    if (col.qty)   return num(raw, kgDp());
+    return oneLine(String(raw));
+}
+
+function exportTitle() {
+    return 'Product card — ' + (_part ? _part.num : '');
+}
+function exportSubtitle() {
+    var u = _part && _part.uomcode ? ' ' + _part.uomcode : '';
+    var bits = [
+        _part ? (_part.description || '') : '',
+        'B/F ' + kg(_summary.bf) + u,
+        'closing ' + kg(_summary.close) + u,
+        'on hand ' + kg(_summary.onhand) + u
+    ];
+    if (_part && _part.kgpm > 0) bits.splice(1, 0, num(_part.kgpm, 3) + ' kg/m');
+    return bits.filter(Boolean);
+}
+function exportFilename() {
+    return 'BrightSteel_ProductCard_' +
+           FBLib.Export.slug(_part ? _part.num : 'part') + '_' + FBLib.Export.stamp();
+}
+
+function exportCsv() {
+    var rows = cardRows();
+    if (!rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    var cols = visibleExportCols();
+    // Every cell is pre-formatted to text here, so the exported columns carry
+    // no money/date/qty type — FBLib.Export must not re-format what is already
+    // formatted.
+    var flatCols = cols.map(function (c) { return { key: c.key, label: c.label }; });
+    var flatRows = rows.map(function (r) {
+        var o = {};
+        cols.forEach(function (c) { o[c.key] = cellText(c, r); });
+        return o;
+    });
+    FBLib.Export.csv({ cols: flatCols, rows: flatRows, filename: exportFilename() });
+    debugLog('Exported ' + rows.length + ' row(s) to CSV', 'success');
+}
+
+async function exportXlsx() {
+    var rows = cardRows();
+    if (!rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    var cols = visibleExportCols();
+    try {
+        await FBLib.Export.xlsx({
+            filename: exportFilename(),
+            sheet: {
+                name: 'Product card',
+                title: exportTitle(),
+                subtitle: exportSubtitle().concat([new Date().toLocaleString()]),
+                cols: cols.map(function (c) {
+                    return {
+                        key: c.key, label: c.label,
+                        w: Math.round((c.width || 110) / 7),
+                        // Balance is a running figure, so it must NOT be
+                        // totalled — it is typed as text-ish qty without the
+                        // totals contribution by being excluded below.
+                        qty: !!c.qty && c.key !== 'balance',
+                        money: !!c.money,
+                        date: c.key === 'evdate'
+                    };
+                }),
+                rows: rows.map(function (r) {
+                    var o = {};
+                    cols.forEach(function (c) {
+                        if (c.key === 'balance') { o[c.key] = num(r.balance, kgDp()); return; }
+                        if (c.key === 'evdate')  { o[c.key] = r.evdate; return; }
+                        if (c.qty || c.money)    { o[c.key] = r[c.key] == null ? '' : parseNum(r[c.key]); return; }
+                        o[c.key] = cellText(c, r);
+                    });
+                    return o;
+                }),
+                totals: true
+            }
+        });
+        debugLog('Exported ' + rows.length + ' row(s) to xlsx', 'success');
+    } catch (e) {
+        showToast('Excel export failed: ' + errText(e), 'error', 6000);
+        debugLog('xlsx export failed: ' + errText(e), 'error');
+    }
+}
+
+// window.print() is unreliable in JxBrowser — build the document, open a new
+// window and print THAT. This is the one that replaces the paper card, so it
+// is laid out to be readable pinned to a wall.
+function printReport() {
+    var rows = cardRows();
+    var cols = visibleExportCols();
+    var hdr = cols.map(function (c) {
+        return '<th' + (c.align === 'right' ? ' class="nr"' : '') + '>' + escHtml(c.label) + '</th>';
+    }).join('');
+    var body = rows.map(function (r) {
+        var cls = r.rowtype === 'ADJUST' ? ' class="adj"' : (!r.actual ? ' class="sched"' : '');
+        return '<tr' + cls + '>' + cols.map(function (c) {
+            var v = cellText(c, r);
+            if (c.key === 'qtybase' && parseNum(r.qtybase) > 0) v = '+' + v;
+            return '<td' + (c.align === 'right' ? ' class="nr"' : '') + '>' + escHtml(v) + '</td>';
+        }).join('') + '</tr>';
+    }).join('');
+
+    var u = _part && _part.uomcode ? ' ' + _part.uomcode : '';
+    var html = '<!DOCTYPE html><html><head><meta charset="UTF-8"/><title>Product Card</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:.4in;color:#111}' +
+        'h2{font-size:13pt;margin:0 0 2px;color:#0B3140}' +
+        '.sub{font-size:8pt;color:#506872;margin:0 0 4px}' +
+        '.bf{font-size:9pt;font-weight:bold;margin:0 0 9px;color:#0B3140}' +
+        'table{border-collapse:collapse;width:100%}' +
+        'th{background:#0B3140;color:#fff;font-size:7.5pt;padding:4px 5px;text-align:left;-webkit-print-color-adjust:exact;print-color-adjust:exact}' +
+        'td{font-size:8pt;padding:3px 5px;border-bottom:1px solid #E3E3E3}' +
+        'tr:nth-child(even) td{background:#F7F7F7;-webkit-print-color-adjust:exact;print-color-adjust:exact}' +
+        'tr.sched td{background:#FCFBF6;font-style:italic;-webkit-print-color-adjust:exact;print-color-adjust:exact}' +
+        'tr.adj td{background:#F5E7DD;font-weight:bold;-webkit-print-color-adjust:exact;print-color-adjust:exact}' +
+        '.nr{text-align:right}@page{size:A4 landscape;margin:.4in}' +
+        '</style></head><body>' +
+        '<h2>' + escHtml(_part ? _part.num : '') + '</h2>' +
+        '<p class="sub">' + escHtml(exportSubtitle().join('  ·  ')) + '</p>' +
+        '<p class="bf">B/F = ' + escHtml(kg(_summary.bf) + u) + '</p>' +
+        '<table><thead><tr>' + hdr + '</tr></thead><tbody>' + body + '</tbody></table>' +
+        '<p class="sub" style="margin-top:8px;">Printed ' + escHtml(new Date().toLocaleString()) +
+        '. Italic rows have not happened yet.</p>' +
+        '</body></html>';
+
+    var w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+    debugLog('Printed ' + rows.length + ' row(s)', 'success');
+}
+
+// ============================================================================
+//  SETTINGS PANEL
+// ============================================================================
+function hydrateSettings() {
+    document.getElementById('setShowScheduled').checked = !!_resolve('showScheduled', true);
+    document.getElementById('setShowRecon').checked = !!_resolve('showRecon', true);
+    document.getElementById('setDefaultPreset').value = String(_resolve('defaultPreset', 'all'));
+    document.getElementById('setKgDp').value = String(_resolve('kgDp', '1'));
+    document.getElementById('setDateDir').value = String(_resolve('dateDir', 'asc'));
+    document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+    document.getElementById('setRemember').checked = !!_resolve('remember', true);
+    refreshFieldSelects();
+}
+
+function onSettingsChange() {
+    var wasSched = !!_resolve('showScheduled', true);
+    var wasRecon = !!_resolve('showRecon', true);
+    _setUserKey('showScheduled', document.getElementById('setShowScheduled').checked);
+    _setUserKey('showRecon', document.getElementById('setShowRecon').checked);
+    _setUserKey('defaultPreset', document.getElementById('setDefaultPreset').value);
+    _setUserKey('kgDp', document.getElementById('setKgDp').value);
+    _setUserKey('dateDir', document.getElementById('setDateDir').value);
+    _setUserKey('remember', document.getElementById('setRemember').checked);
+    var showDebug = document.getElementById('setShowDebug').checked;
+    _setUserKey('showDebug', showDebug);
+    applyDebugDrawer(showDebug);
+
+    // Both of these change WHICH rows exist, not just how they look, and the
+    // balance has to be rolled again — so they re-query rather than repaint.
+    var needReload = wasSched !== document.getElementById('setShowScheduled').checked ||
+                     wasRecon !== document.getElementById('setShowRecon').checked;
+    if (needReload && _part) loadCard(); else renderAll();
+}
+
+async function onFieldSettingChange() {
+    _setUserKey('kgpmCf',   document.getElementById('setKgpmCf').value);
+    _setUserKey('batchTrk', document.getElementById('setBatchTrk').value);
+    _setUserKey('lenTrk',   document.getElementById('setLenTrk').value);
+    if (!_part) { refreshFieldSelects(); return; }
+    await resolvePartFields();
+    await loadCard();
+}
+
+function resetSettings() {
+    if (!confirm('Reset your personal settings to defaults?')) return;
+    try { FBLib.Settings.clearUser(); } catch (_) {}
+    hydrateSettings();
+    applyDebugDrawer(!!_resolve('showDebug', false));
+    hydrateFilters();
+    if (_part) { resolvePartFields().then(loadCard); } else { renderAll(); }
+}
+
+function publishDefaults() {
+    if (!FBLib.Settings.isAdmin()) return;
+    if (!confirm('Publish the current Settings values as the default for all users?')) return;
+    try {
+        // publishMaster REPLACES the whole master object, so send every field
+        // the org default is meant to carry — not just the one that changed.
+        FBLib.Settings.publishMaster({
+            kgpmCf:   document.getElementById('setKgpmCf').value,
+            batchTrk: document.getElementById('setBatchTrk').value,
+            lenTrk:   document.getElementById('setLenTrk').value,
+            showScheduled: document.getElementById('setShowScheduled').checked,
+            showRecon: document.getElementById('setShowRecon').checked,
+            defaultPreset: document.getElementById('setDefaultPreset').value,
+            kgDp: document.getElementById('setKgDp').value,
+            dateDir: document.getElementById('setDateDir').value
+        });
+        showToast('Published as the default for everyone.', 'success');
+        debugLog('Defaults published', 'success');
+    } catch (e) { debugLog('publishDefaults: ' + errText(e), 'error'); }
+}
+
+function toggleUserEditing() {
+    if (!FBLib.Settings.isAdmin()) return;
+    try { FBLib.Settings.setLock(FBLib.Settings.userEditingAllowed()); refreshAdminUi(); }
+    catch (e) { debugLog('toggleUserEditing: ' + errText(e), 'error'); }
+}
+
+function refreshAdminUi() {
+    var isAdmin = FBLib.Settings.isAdmin();
+    document.getElementById('dsAdminSection').style.display = isAdmin ? 'block' : 'none';
+    var allowed = FBLib.Settings.userEditingAllowed();
+    document.getElementById('dsLockBadge').style.display = (!allowed && !isAdmin) ? 'block' : 'none';
+    var lockBtn = document.getElementById('dsLockBtn');
+    if (lockBtn) lockBtn.textContent = allowed ? 'Lock user editing' : 'Unlock user editing';
+}
+
+// ============================================================================
+//  DEBUG DRAWER
+// ============================================================================
+function applyDebugDrawer(showIt) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (showIt) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    if (_debugApi.element) observeDebugDrawer(_debugApi.element);
+}
+function observeDebugDrawer(el) {
+    if (!el || el._observed) return;
+    el._observed = true;
+    var apply = function () {
+        var visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        var h = (visible && open) ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    if (typeof ResizeObserver === 'function') { try { new ResizeObserver(apply).observe(el); } catch (_) {} }
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+
+// ============================================================================
+//  SMALL HELPERS
+// ============================================================================
+function setStatus(msg) { document.getElementById('statusLine').textContent = msg; }
+
+// runQueryAsync resolves to an already-parsed array; runQuery returns a JSON
+// string. Prefer the async one and fall back so the report still works on an
+// older client. NOTE the name — a report-level function called runQuery would
+// shadow the built-in and recurse forever.
+async function qp(sql) {
+    if (typeof runQueryAsync === 'function') return normalise(await runQueryAsync(sql));
+    return normalise(safeParse(runQuery(sql, 'true')));
+}
+function normalise(r) { if (!r) return []; return Array.isArray(r) ? r : [r]; }
+function safeParse(s) { try { return JSON.parse(s); } catch (_) { return null; } }
+
+function escSQL(s) {
+    if (window.FBLib && FBLib.Common && FBLib.Common.escSQL) return FBLib.Common.escSQL(s);
+    return String(s == null ? '' : s).replace(/'/g, "''").replace(/\\/g, '\\\\');
+}
+function escHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function oneLine(s) { return String(s == null ? '' : s).replace(/\s*[\r\n]+\s*/g, ' ').trim(); }
+
+// Tolerant number parse — custom-field values arrive as free text, so "0.761",
+// "0,761" and "0.761 kg/m" all have to land on the same number.
+function parseNum(v) {
+    if (v == null) return 0;
+    if (typeof v === 'number') return isFinite(v) ? v : 0;
+    var s = String(v).trim();
+    if (!s) return 0;
+    if (s.indexOf(',') !== -1 && s.indexOf('.') === -1) s = s.replace(',', '.');
+    else s = s.replace(/,/g, '');
+    var m = s.match(/-?\d*\.?\d+/);
+    var n = m ? parseFloat(m[0]) : NaN;
+    return isFinite(n) ? n : 0;
+}
+
+function kgDp() { var d = parseInt(_resolve('kgDp', '1'), 10); return isNaN(d) ? 1 : d; }
+function kg(v)  { return num(v, kgDp()); }
+function num(v, dp) {
+    var n = parseNum(v);
+    return n.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
+}
+
+// MySQL hands datetimes back as "YYYY-MM-DD HH:MM:SS" or ISO with a T. Safari
+// and some Chromium builds refuse the space form, so normalise before Date.
+function dateMs(v) {
+    if (!v) return 0;
+    var s = String(v).replace(' ', 'T');
+    var t = Date.parse(s);
+    return isNaN(t) ? 0 : t;
+}
+// MySQL hands back "YYYY-MM-DD HH:MM:SS" on some drivers and the ISO "T"
+// form on others. Normalise to "T" so a lexicographic sort of the Date column
+// is also a chronological one.
+function normDate(v) { return String(v == null ? '' : v).replace(' ', 'T'); }
+function safeDate(s) { return /^\d{4}-\d{2}-\d{2}$/.test(s || '') ? s : ''; }
+function isoDate(d) {
+    // Local date parts, not toISOString — that shifts to UTC and can land a
+    // day early for anyone east of Greenwich.
+    var m = String(d.getMonth() + 1).padStart(2, '0');
+    var day = String(d.getDate()).padStart(2, '0');
+    return d.getFullYear() + '-' + m + '-' + day;
+}
+function isoDateTime(d) {
+    // "T", not a space — see normDate().
+    return isoDate(d) + 'T' +
+        String(d.getHours()).padStart(2, '0') + ':' +
+        String(d.getMinutes()).padStart(2, '0') + ':00';
+}
+
+function errText(e) {
+    if (!e) return 'unknown error';
+    if (typeof e === 'string') return e;
+    if (e.message) return e.message + (e.status != null ? ' (HTTP ' + e.status + ')' : '');
+    if (e.status != null) return 'HTTP ' + e.status;
+    try { return JSON.stringify(e); } catch (_) { return String(e); }
+}
+
+function showToast(message, type, duration) {
+    var host = document.getElementById('toastContainer');
+    var el = document.createElement('div');
+    el.className = 'toast ' + (type || 'info');
+    var ico = { success: '✓', error: '✕', warn: '⚠', info: 'ℹ' }[type || 'info'];
+    var icon = document.createElement('span'); icon.className = 'toast-icon'; icon.textContent = ico;
+    var msg = document.createElement('span'); msg.className = 'toast-msg'; msg.textContent = message;
+    var x = document.createElement('button'); x.className = 'toast-x'; x.innerHTML = '&times;';
+    x.addEventListener('click', function () { el.remove(); });
+    el.appendChild(icon); el.appendChild(msg); el.appendChild(x);
+    host.appendChild(el);
+    setTimeout(function () {
+        el.style.opacity = '0';
+        setTimeout(function () { el.remove(); }, 260);
+    }, duration || 4000);
+}
+
+function debounce(fn, ms) {
+    var t = null;
+    return function () {
+        var args = arguments, self = this;
+        clearTimeout(t);
+        t = setTimeout(function () { fn.apply(self, args); }, ms);
+    };
+}
+
+function clearAll() {
+    _part = null; _rows = [];
+    _summary = { bf: 0, onhand: 0, inKg: 0, outKg: 0, close: 0, projected: 0, unrecon: 0 };
+    document.getElementById('partInput').value = '';
+    closeAc();
+    if (_resolve('remember', true)) _setUserKey('lastPart', '');
+    renderAll();
+    document.getElementById('partInput').focus();
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async function () {
+    try {
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn'  });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+
+        hydrateSettings();
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        refreshAdminUi();
+
+        var partEl = document.getElementById('partInput');
+        partEl.addEventListener('input', onPartInput);
+        partEl.addEventListener('keydown', onPartKeydown);
+        partEl.addEventListener('blur', function () { setTimeout(closeAc, 120); });
+
+        // Location group is applied in SQL, so a change re-reads the card.
+        // Wired on close, not on every tick — one query per dropdown session.
+        _lgMs = FBLib.Common.MultiSelect.create({
+            containerId: 'lgMs', items: [], placeholder: 'All location groups',
+            onClose: function () {
+                _setUserKey('lgIds', _lgMs.getSelected());
+                if (_part) loadCard();
+            }
+        });
+
+        document.addEventListener('click', function (e) {
+            var wrap = document.getElementById('colWrap');
+            if (wrap && !wrap.contains(e.target)) document.getElementById('colPanel').classList.add('hidden');
+        });
+
+        _table = FBLib.Table.init({
+            tableEl: document.getElementById('reportTable'),
+            columns: _columns,
+            getRows: cardRows,
+            chunkSize: 250,
+            settingsKey: 'tablePrefs',
+            // The row tinting has to be re-applied after every repaint, and a
+            // lazy chunk append counts as one.
+            onSort: function () { setTimeout(function () { applyRowClasses(); applyHeaderTips(); }, 0); }
+        });
+        buildColPanel();
+        // Lazy chunks append on scroll without going through onSort, so tint
+        // whatever has just landed.
+        var wrap = document.querySelector('.fb-table-container');
+        if (wrap) wrap.addEventListener('scroll', debounce(applyRowClasses, 60));
+
+        hydrateFilters();
+        await Promise.all([loadLocationGroups(), loadPartCfs()]);
+
+        var savedLg = _resolve('lgIds', null);
+        if (_lgMs && Array.isArray(savedLg) && savedLg.length) _lgMs.setSelected(savedLg);
+
+        var last = _resolve('remember', true) ? String(_resolve('lastPart', '') || '') : '';
+        if (last) {
+            partEl.value = last;
+            await resolveTypedPart();
+        } else {
+            renderAll();
+            partEl.focus();
+        }
+
+        debugLog('Report initialised', 'success');
+    } catch (e) {
+        console.error('[Product Card init] failed:', e);
+        setStatus('Init failed — ' + errText(e));
+        debugLog('Init failed: ' + (e && e.stack ? e.stack : errText(e)), 'error');
+    }
+});
+</script>
+</body>
+</html>

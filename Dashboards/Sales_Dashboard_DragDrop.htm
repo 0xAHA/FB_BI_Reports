@@ -564,6 +564,95 @@ let _isAdmin = false;
 let _userEditingAllowed = true;
 let _globalData = {};
 
+/* ── SHARED (ORG-WIDE) STORE ──────────────────────────────────────
+   An admin publishes one payload; every user reads it back.
+
+   This used to be loadReportData/saveReportData. Those only work on a SAVED
+   report: the BI Script Editor previews with report id -1, so the first read
+   raised the client's own "Loading data is only available on reports" modal
+   (its dialog title reads "Save Report Error") and the write was a silent
+   no-op — an admin published, saw no error, and nothing persisted.
+
+   Instead: saveSettings() writes the CURRENT user's userproperties row under
+   propertycategory 'Dashboard', and every user can SELECT that table. So the
+   admin writing a well-known key produces a row the company can read. Both
+   work in preview. Report-scoped becomes key-scoped, hence the explicit key.
+
+   TRUST. The SQL trusts the same accounts the admin test below does — the
+   BI_ADMIN_USER_ID / BI_ADMIN_USER this install designates, plus the built-in
+   `admin`. Widen one without the other and either the admin's publish goes
+   unread, or a row they did not write gets believed.
+
+   A write REPLACES the whole value — read, merge, write. */
+const _sdSHARED_KEY = 'cdx.bi.salesDashDD.shared.v1';
+let _sdsharedCache = null, _sdsharedRead = false;
+
+function _sdtrustedPublishers() {
+    const prop = (n, d) => { try { return (typeof getProperty === 'function') ? getProperty(n, d) : d; } catch (_) { return d; } };
+    return {
+        id:    String(prop('BI_ADMIN_USER_ID', '1') || '1'),
+        name:  String(prop('BI_ADMIN_USER', '') || '')
+    };
+}
+
+// Pass fresh=true to bypass the per-load cache (a read-back after a write).
+function _sdsharedLoad(fresh) {
+    if (_sdsharedRead && !fresh) return _sdsharedCache;
+    _sdsharedRead = true;
+    _sdsharedCache = null;
+    if (typeof runQuery !== 'function') return null;
+    try {
+        const esc = v => String(v == null ? '' : v).replace(/'/g, "''");
+        const t = _sdtrustedPublishers();
+        const names = ["'admin'"].concat(t.name ? ["'" + esc(t.name.toLowerCase()) + "'"] : []);
+        const rows = JSON.parse(runQuery(
+            "SELECT up.id AS rowid, up.userValue AS shareddata " +
+            "FROM userproperties up " +
+            "INNER JOIN propertycategory pc ON pc.id = up.categoryId " +
+            "INNER JOIN sysuser su ON su.id = up.userId " +
+            "WHERE pc.name = 'Dashboard' " +
+            "AND up.userKey = '" + esc(_sdSHARED_KEY) + "' " +
+            "AND (LOWER(su.userName) IN (" + names.join(', ') + ") " +
+            "OR su.id = " + (parseInt(t.id, 10) || 0) + ") " +
+            "ORDER BY up.id DESC"
+        ) || '[]');
+        let bestValue = null, bestStamp = '', bestId = -1;
+        (Array.isArray(rows) ? rows : []).forEach(row => {
+            // runQuery lower-cases every result key.
+            const value = String((row.shareddata != null ? row.shareddata : row.uservalue) || '');
+            let stamp = '';
+            try { stamp = String((JSON.parse(value) || {})._sharedAt || ''); } catch (_) {}
+            const rowId = parseInt(row.rowid, 10) || 0;
+            if (bestValue === null ||
+                (stamp && (!bestStamp || stamp > bestStamp)) ||
+                (!stamp && !bestStamp && rowId > bestId)) {
+                bestValue = value; bestStamp = stamp; bestId = rowId;
+            }
+        });
+        if (!bestValue) return null;
+        const parsed = JSON.parse(bestValue);
+        _sdsharedCache = (parsed && typeof parsed === 'object') ? parsed : null;
+    } catch (e) {
+        try { console.warn('shared defaults unavailable:', e); } catch (_) {}
+        _sdsharedCache = null;
+    }
+    return _sdsharedCache;
+}
+
+// True only when the payload verifiably round-tripped. An in-memory success
+// proves nothing — that was exactly the trap the report-data write set.
+function _sdsharedSave(payload) {
+    if (typeof saveSettings !== 'function') return false;
+    const next = Object.assign({}, payload || {});
+    next._sharedAt = new Date().toISOString();
+    try { next._sharedBy = (JSON.parse(getUser() || '{}') || {}).userName || ''; } catch (_) {}
+    try { saveSettings(_sdSHARED_KEY, JSON.stringify(next)); }
+    catch (e) { try { console.warn('shared defaults save failed:', e); } catch (_) {} return false; }
+    const back = _sdsharedLoad(true);
+    return !!(back && back._sharedAt === next._sharedAt);
+}
+
+
 function _biSave(data) {
   if (typeof saveSettings === 'function') {
     try { saveSettings(SETTINGS_KEY, JSON.stringify(data)); } catch(e) {}
@@ -1818,7 +1907,7 @@ function refreshDashboard() { qclear(); rerenderAll(); updateKPIBadges(); }
 function toggleUserEditing() {
   _userEditingAllowed = !_userEditingAllowed;
   _globalData.userEditing = _userEditingAllowed;
-  try { saveReportData(JSON.stringify(_globalData)); } catch(e) {}
+  if (!_sdsharedSave(_globalData)) debugLog('Shared settings did not persist', 'warning');
   updateAdminUI();
   showToast(_userEditingAllowed ? 'User editing enabled' : 'User editing disabled', 'success');
   debugLog('userEditing set to: ' + _userEditingAllowed, 'click');
@@ -1843,7 +1932,7 @@ function publishMasterLayout() {
   };
   _globalData.masterBadgeConfig = [..._badgeConfig];
   _globalData.userEditing = _userEditingAllowed;
-  try { saveReportData(JSON.stringify(_globalData)); } catch(e) {}
+  if (!_sdsharedSave(_globalData)) debugLog('Shared settings did not persist', 'warning');
   debugLog(`Master layout published (${layout.length} widgets, userEditing: ${_userEditingAllowed})`, 'success');
   showToast('Master layout published', 'success');
 }
@@ -1916,13 +2005,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     console.warn('[Sales Dashboard] getUser() failed:', e);
   }
 
-  // Load global (report-scoped) admin settings — readable by all users
+  // Load global admin settings from the shared store — readable by all users
   try {
-    const rd = loadReportData();
-    if (rd) _globalData = JSON.parse(rd);
+    const rd = _sdsharedLoad();
+    if (rd) _globalData = rd;
     _userEditingAllowed = _globalData.userEditing !== false;
     debugLog(`Global settings loaded | userEditing: ${_userEditingAllowed}`, 'info');
-  } catch(e) { debugLog('loadReportData() failed: ' + e, 'warning'); }
+  } catch(e) { debugLog('shared settings read failed: ' + e, 'warning'); }
 
   await loadFilters();
   debugLog('Filters loaded', 'success');

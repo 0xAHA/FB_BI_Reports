@@ -7,9 +7,43 @@
   Inventory transaction log surfacing every event type (Receive, Ship,
   Transfer, WO consume/yield, Adjust, Cycle Count, COGS, Landed Cost,
   Tracking, etc.) with consolidated PO/SO/WO/TO reference resolution.
-  Flat + Pivot views, signed-qty colouring, filters by event/part/user/
-  location/begin+end LG/tag/date plus part custom fields; supports CSV /
+  Flat + Pivot views, signed-qty colouring, filters by event/part/part type/
+  user/location/begin+end LG/tag/date plus part custom fields; supports CSV /
   Print export and saved pivot presets.
+
+  SCOPE — TWO SOURCES.
+
+  1. `inventorylog` (always) — the ledger of INVENTORY movement. Fishbowl
+     writes no row there for a Non-Inventory, Service, Labor or Overhead part:
+     those types hold no quantity, so there is nothing to move.
+
+  2. `receiptitem` + `shipitem` + `woitem` (opt-in, non-inventory ONLY) —
+     "Include non-inventory movements" in the Filters panel UNIONs in three
+     branches for parts the log cannot see:
+        Receive     +qty   receiptitem   what was BOUGHT
+        Ship        -qty   shipitem      what was SOLD
+        Consume(WO) -qty   woitem.qtyUsed  what was USED in manufacturing
+     All three land in the ordinary Change Qty column on the log's own sign
+     convention, so the existing Part × Month pivot works on them unchanged.
+     With everything on it reads as NET flow; the Event Type filter separates
+     the three again.
+
+     The receipts branch is a PROXY, not measured usage — a purchase spikes in
+     the month it was ordered, not the months it was drawn down. The WO branch
+     IS measured usage, but only for what goes through manufacturing.
+
+  Known gaps:
+    • a Service or Shipping SO line never produces a shipitem (nothing to pick
+      and pack), so it shows on the order but never as a movement. That is the
+      ORDER question, which SalesOrderSummary answers at SO-line grain;
+    • WO consumption is dated by the WO's finish, so a long-running WO books
+      its whole usage on one day;
+    • finishing a WO to status 40 forces a LABOUR line's qtyUsed to its target,
+      so Labor rows report plan, not clocked time;
+    • non-inventory FINISHED GOODS (woitem typeId 10) are not surfaced.
+
+  Each Part Type in the dropdown carries its real log-row and receipt counts,
+  so which source (if any) has data is visible before you pick.
 ================================================================================
 -->
 <html lang="en">
@@ -227,7 +261,7 @@
 
       <div class="w-px h-6 bg-slate-200 mx-1"></div>
 
-      <button onclick="runQuery()" class="hdr-btn">
+      <button onclick="refreshData()" class="hdr-btn">
         <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
         Refresh
       </button>
@@ -395,22 +429,6 @@
             <option value="ly">Last Year (Jan–Dec)</option>
           </select>
         </div>
-        <div>
-          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Quick Range</div>
-          <select id="dateRange" style="width:100%;" onchange="applyDateRange(this.value)">
-            <option value="custom">Custom…</option>
-            <option value="today">Today</option>
-            <option value="l7">Last 7 Days</option>
-            <option value="n7">Next 7 Days</option>
-            <option value="l30">Last 30 Days</option>
-            <option value="n30">Next 30 Days</option>
-            <option value="l90">Last 90 Days</option>
-            <option value="tm">This Month</option>
-            <option value="lm">Last Month</option>
-            <option value="fy">This FY (Jul–Jun)</option>
-            <option value="ytd">Year to Date</option>
-          </select>
-        </div>
         <div class="flex items-center gap-1">
           <input type="date" id="dateFrom" style="flex:1;" />
           <span class="text-slate-400 text-xs">→</span>
@@ -419,7 +437,12 @@
       </div>
 
       <!-- ── WHO + WHAT ───────────────────────────────────────────── -->
-      <div class="flex flex-col gap-2" style="min-width:230px;">
+      <!-- max-width is load-bearing: this is the only section carrying a
+           paragraph of helper text (the non-inventory checkbox), and a flex
+           item sizes to its max-content. Uncapped, that sentence rendered on
+           ONE line and the column grew to ~1360px, shoving every other filter
+           group onto its own row. The cap makes the text wrap instead. -->
+      <div class="flex flex-col gap-2" style="min-width:230px; max-width:280px;">
         <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide border-b border-slate-200 pb-1">Who &amp; What</div>
         <div>
           <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Location Group</div>
@@ -441,6 +464,34 @@
               <div class="ms-list" id="partList"></div>
             </div>
           </div>
+        </div>
+        <div>
+          <!-- Part TYPE (part.typeId -> parttype). inventorylog only ever
+               carries INVENTORY parts, so on its own this filter returns
+               nothing for the other types — tick "Include non-inventory
+               movements" below to bring in their receipts and shipments from
+               receiptitem / shipitem. See the PART TYPE note in the script. -->
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Part Type</div>
+          <div class="ms-container" id="ptype-ms">
+            <div class="ms-trigger" id="ptypeTrigger"><span class="ms-placeholder" id="ptypePlaceholder">All part types</span></div>
+            <div class="ms-dropdown hidden" id="ptypeDropdown">
+              <div class="ms-actions" style="padding:5px 10px;"><span id="ptypeAll">Select All</span><span id="ptypeClear">Clear All</span></div>
+              <div class="ms-list" id="ptypeList"></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <label style="display:flex; align-items:flex-start; gap:6px; cursor:pointer; font-size:11px; color:#475569; line-height:1.4;">
+            <!-- id kept as includeNonInvReceipts so saved settings and saved
+                 views from the receipts-only version keep working; it now
+                 gates shipments too. -->
+            <input type="checkbox" id="includeNonInvReceipts" style="margin-top:2px; flex-shrink:0;" />
+            <span>Include non-inventory <b>movements</b>
+              <span class="text-slate-400">— receipts (+), shipments (&minus;) and WO consumption (&minus;)
+              for parts that have no inventory to log. Use the Event Type filter to separate them:
+              Receive alone for what was bought, Ship for what was sold, Consume (WO) for what was
+              used in manufacturing.</span></span>
+          </label>
         </div>
         <div>
           <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">User</div>
@@ -754,6 +805,10 @@ function formatQty(v) {
      - 'skip'    — not shown in pivot dropdowns (free text, multi-field refs, tags). */
 let _columns = [
   {key:'partnum',      label:'Part #',         vis:true,  date:false, qty:false, datetime:false, link:'Part',  truncate:false, pivotRole:'dim'},
+  // Part TYPE — Inventory / Service / Labor / Overhead / Non-Inventory / …
+  // In practice this reads "Inventory" on essentially every row; see the PART
+  // TYPE note below for why, and what to use instead for non-inventory usage.
+  {key:'parttype',     label:'Part Type',      vis:true,  date:false, qty:false, datetime:false, link:null,    truncate:false, pivotRole:'dim'},
   {key:'groupname',    label:'Location Group', vis:true,  date:false, qty:false, datetime:false, link:null,    truncate:false, pivotRole:'dim'},
   {key:'location',     label:'Location',       vis:true,  date:false, qty:false, datetime:false, link:null,    truncate:false, pivotRole:'dim'},
   // Named "Date Created" to match the other summary reports, which all label
@@ -783,8 +838,8 @@ let _columns = [
 
 let _dataset = [];
 let _sortCol = null, _sortDir = 'asc';
-let _lgList = [], _partList = [], _userList = [], _locList = [];
-let _selLg = new Set(), _selPart = new Set(), _selUser = new Set();
+let _lgList = [], _partList = [], _userList = [], _locList = [], _ptypeList = [];
+let _selLg = new Set(), _selPart = new Set(), _selUser = new Set(), _selPtype = new Set();
 let _selBegLg = new Set(), _selEndLg = new Set();
 let _selBegLoc = new Set(), _selEndLoc = new Set();
 let _partCFNames = [], _selPartCF = new Set();
@@ -866,7 +921,7 @@ async function init() {
   buildCFValueMS('cfpartval', () => _selPartCF, 'part',
     () => _partCFValuesList, v => { _partCFValuesList = v; }, () => _selPartCFValues);
 
-  await Promise.all([populateLG(), populatePart(), populateUser(), populateLoc()]);
+  await Promise.all([populateLG(), populatePart(), populatePtype(), populateUser(), populateLoc()]);
 
   buildColPanel();
 
@@ -905,7 +960,7 @@ async function init() {
   });
   renderViewPicker();
 
-  runQuery();
+  refreshData();
 }
 
 /* ── TOOLTIP (fb-styles .app-tooltip — navy shared skin) ──
@@ -969,15 +1024,16 @@ const _autoApplyIds = [
   'referenceFilter', 'infoFilter', 'trackFilter',
   'filterBegTag', 'filterEndTag',
   'dateFrom', 'dateTo', 'dateField',
+  'includeNonInvReceipts',
 ];
 function autoApply() {
   // A view apply writes every filter at once and re-runs the query itself.
   if (_suppressAutoApply) return;
   // Don't fire while the panel is still booting and dropdowns aren't
-  // populated yet — init() calls runQuery() at the end so the first
+  // populated yet — init() calls refreshData() at the end so the first
   // load happens through that path.
   if (!_partList.length) return;
-  runQuery();
+  refreshData();
 }
 function wireAutoApply() {
   for (const id of _autoApplyIds) {
@@ -1099,18 +1155,18 @@ function toggleFilters() {
 
    ORG-WIDE SHARING. There is no API to write into another user's settings, so
    an admin cannot push straight into someone's account. Instead the admin
-   PUBLISHES a set of views into the report-scoped shared blob (saveReportData
-   — one payload per report, readable by every user) stamped with a revision
+   PUBLISHES a set of views into the shared blob (FBLib.SharedData — one
+   payload readable by every user) stamped with a revision
    number. On load each user's report compares that revision with its own
    `viewsAdoptedRev` and COPIES across any view it does not already hold under
    that name — additive, never destructive. The admin reset is the same trick
    in reverse: a `viewsReset` revision each report acknowledges exactly once
    by clearing its own list.
 
-   CAVEAT: loadReportData/saveReportData only work on a SAVED report. In the
-   BI Script Editor preview they no-op, so the publish/reset buttons would
-   appear to work and change nothing — hence writeSharedBlob() reads the
-   payload back and the admin gets told when it didn't stick.
+   This used to sit in report data, which only works on a SAVED report: in the
+   BI Script Editor preview the publish/reset buttons appeared to work and
+   changed nothing. writeSharedBlob() still reads the payload back, so the
+   admin is told whenever a publish does not stick.
    ══════════════════════════════════════════════════════════════════ */
 let _savedViews      = [];    // [{id, name, filters, viewMode, shared, savedAt}]
 let _viewsAdoptedRev = 0;     // highest published share revision merged in
@@ -1146,6 +1202,7 @@ const _FILTER_SETS = [
   {key:'etypes',           get: () => _selEtype,        ms:'etype-ms', skipEmpty:true},
   {key:'selLg',            get: () => _selLg,           ms:'lg-ms'},
   {key:'selPart',          get: () => _selPart,         ms:'part-ms'},
+  {key:'selPtype',         get: () => _selPtype,        ms:'ptype-ms'},
   {key:'selUser',          get: () => _selUser,         ms:'user-ms'},
   {key:'selBegLg',         get: () => _selBegLg,        ms:'beglg-ms'},
   {key:'selEndLg',         get: () => _selEndLg,        ms:'endlg-ms'},
@@ -1160,11 +1217,15 @@ const _FILTER_INPUTS = [
   'filterBegTag', 'filterEndTag',
   'cfpartvalSearch',
 ];
+/* Checkboxes — captured/restored by .checked rather than .value, so they are
+   kept in their own list. Same settings key = the element id. */
+const _FILTER_CHECKS = ['includeNonInvReceipts'];
 
 function captureFilterState() {
   const f = {};
   _FILTER_SETS.forEach(d => { f[d.key] = [...d.get()].map(String); });
   _FILTER_INPUTS.forEach(id => { const el = document.getElementById(id); f[id] = el ? el.value : ''; });
+  _FILTER_CHECKS.forEach(id => { const el = document.getElementById(id); f[id] = !!(el && el.checked); });
   return f;
 }
 
@@ -1193,45 +1254,46 @@ function applyFilterState(f, syncWidgets) {
     const el = document.getElementById(id);
     if (el) el.value = f[id];
   });
+  _FILTER_CHECKS.forEach(id => {
+    if (f[id] === undefined) return;
+    const el = document.getElementById(id);
+    if (el) el.checked = !!f[id];
+  });
   // A relative Quick Range (Last 30 Days, This Month…) must recompute against
   // TODAY rather than replay the dates captured when the view was saved.
   if (f.dateRange && f.dateRange !== 'custom') applyDateRange(f.dateRange);
 }
 
-/* ── SHARED (ORG-WIDE) BLOB ──
-   One JSON payload per SAVED report, identical for every user. Read once per
-   load and cached; every write MERGES onto the cached object because
-   saveReportData REPLACES the whole payload. */
-let _sharedBlob = null, _sharedRead = false;
+const SHARED_KEY = 'cdx.bi.partActivity.shared.v1';
 
+/* ── SHARED (ORG-WIDE) BLOB ──
+   One JSON payload every user reads and an admin writes, held in
+   FBLib.SharedData under 'cdx.bi.partActivity.shared.v1'.
+
+   It used to live in report data (loadReportData/saveReportData). That only
+   works on a SAVED report: in the BI Script Editor, which previews with report
+   id -1, the first read raised the client's native "Loading data is only
+   available on reports" modal and the publish was a silent no-op — the admin
+   pressed Share, saw no error, and nothing reached any other user.
+
+   SharedData caches the read for the load, so calling readSharedBlob() from
+   several places costs one query. Every write still MERGES onto the current
+   payload because a write replaces the whole value. */
 function readSharedBlob() {
-  if (_sharedRead) return _sharedBlob;
-  _sharedRead = true;
-  _sharedBlob = {};
   try {
-    if (typeof loadReportData === 'function') {
-      const raw = loadReportData();
-      if (raw) { const o = JSON.parse(raw); if (o && typeof o === 'object') _sharedBlob = o; }
-    }
-  } catch(e) { console.warn('loadReportData unavailable (unsaved report?)', e); }
-  return _sharedBlob;
+    if (window.FBLib && FBLib.SharedData) return FBLib.SharedData.readJson(SHARED_KEY, {}) || {};
+  } catch (e) { console.warn('shared blob unavailable', e); }
+  return {};
 }
 
-/* Returns true only when the payload verifiably round-tripped to the server.
-   An in-memory success proves nothing: saveReportData is a silent no-op on an
-   unsaved report / editor preview, which is exactly the case an admin needs
-   warning about. */
+/* Returns true only when the payload verifiably round-tripped to the server —
+   SharedData.write re-reads it. An in-memory success proves nothing, which is
+   exactly the trap the old report-data write set for an admin in preview. */
 function writeSharedBlob(next) {
-  _sharedBlob = next; _sharedRead = true;
   try {
-    if (typeof saveReportData !== 'function' || typeof loadReportData !== 'function') return false;
-    saveReportData(JSON.stringify(next));
-    const raw  = loadReportData();
-    const disk = raw ? JSON.parse(raw) : null;
-    if (!disk) return false;
-    return JSON.stringify(disk.paViews || null)      === JSON.stringify(next.paViews || null) &&
-           JSON.stringify(disk.paViewsReset || null) === JSON.stringify(next.paViewsReset || null);
-  } catch(e) { console.warn('saveReportData failed', e); return false; }
+    if (!(window.FBLib && FBLib.SharedData)) return false;
+    return FBLib.SharedData.writeJson(SHARED_KEY, next, { adminOnly: true });
+  } catch (e) { console.warn('shared blob write failed', e); return false; }
 }
 
 /* Reconcile this user's list against what the admin has published. Runs once
@@ -1260,7 +1322,8 @@ function syncOrgViews() {
       have.add(k);
       _savedViews.push({
         id: newViewId(), name: String(v.name), filters: v.filters,
-        viewMode: v.viewMode || 'flat', shared: true, savedAt: pub.at || ''
+        viewMode: v.viewMode || 'flat', pivot: v.pivot || null,
+        shared: true, savedAt: pub.at || ''
       });
     });
     _viewsAdoptedRev = Number(pub.rev);
@@ -1295,6 +1358,7 @@ function _viewKey(f) {
   const n = {};
   _FILTER_SETS.forEach(d => { n[d.key] = [...(f[d.key] || [])].map(String).sort(); });
   _FILTER_INPUTS.forEach(id => { n[id] = f[id] || ''; });
+  _FILTER_CHECKS.forEach(id => { n[id] = !!f[id]; });
   if (n.dateRange && n.dateRange !== 'custom') { n.dateFrom = ''; n.dateTo = ''; }
   return JSON.stringify(n);
 }
@@ -1302,9 +1366,73 @@ function _viewKey(f) {
    mode still match. Switching mode has to drop the picker to "Custom
    (unsaved)" too, or the header keeps claiming you're looking at the saved
    version when you aren't. */
+/* ---- WHAT A SAVED VIEW REMEMBERS BEYOND ITS FILTERS ----
+   A view used to record only `viewMode`. Applying a saved PIVOT view therefore
+   put the report back into pivot mode and then showed whatever rows / columns /
+   measure happened to be on screen: the saved pivot was silently lost. The
+   pivot config travels with the view now.
+
+   Views saved before this change carry neither key. They are treated as "no
+   opinion": the mode is restored, nothing else is touched, and they still
+   match in the picker. */
+function capturePivotCfg() {
+  return Object.assign({}, _pivotCfg);
+}
+
+function applyPivotCfg(cfg) {
+  if (!cfg || typeof cfg !== 'object') return;
+  Object.assign(_pivotCfg, cfg);
+  syncPivotBarFromCfg();
+}
+
+/* Push _pivotCfg into the pivot bar's own controls. Shared with
+   _applyPresetById, which needs exactly the same DOM sync. */
+function syncPivotBarFromCfg() {
+  const set = (id, val) => { const el = document.getElementById(id); if (el) el.value = val; };
+  set('pivotRowDim',     _pivotCfg.rowDim || '');
+  set('pivotRowDim2',    _pivotCfg.rowDim2 || '');
+  set('pivotColDim',     _pivotCfg.colDim || '');
+  set('pivotRowBucket',  _pivotCfg.rowBucket || 'month');
+  set('pivotRowBucket2', _pivotCfg.rowBucket2 || 'month');
+  set('pivotColBucket',  _pivotCfg.colBucket || 'month');
+  set('pivotMeasure',    _pivotCfg.measure);
+  set('pivotAgg',        _pivotCfg.agg);
+  const rt = document.getElementById('pivotShowRowTotals');
+  if (rt) rt.checked = !!_pivotCfg.showRowTotals;
+  const ct = document.getElementById('pivotShowColTotals');
+  if (ct) ct.checked = !!_pivotCfg.showColTotals;
+  _updatePivotBucketVisibility();
+  _renderPresetDropdown();
+}
+
+/* The pivot / expansion detail for a view's one-line summary. Two pivot views
+   differ by their pivot, not their filters, so without this the drawer shows
+   several identical-looking rows called "Pivot". */
+function _viewModeDetail(v) {
+  let out = '';
+  if (v.viewMode === 'pivot' && v.pivot) {
+    const lbl = k => (_columns.find(c => c.key === k) || {}).label || k;
+    const bits = [lbl(v.pivot.rowDim)];
+    if (v.pivot.rowDim2) bits.push('→ ' + lbl(v.pivot.rowDim2));
+    if (v.pivot.colDim)  bits.push('× ' + lbl(v.pivot.colDim));
+    const mea = v.pivot.measure === '__count__' ? 'Row count' : lbl(v.pivot.measure);
+    out += ': ' + bits.join(' ') + ' — ' + (v.pivot.agg || 'sum') + ' of ' + mea;
+  }
+  return out;
+}
+
 function _findMatchingView() {
   const k = _viewKey(captureFilterState());
-  const v = _savedViews.find(x => _viewKey(x.filters) === k && (x.viewMode || 'flat') === _viewMode);
+  const liveCfg = _cfgKey(_pivotCfg);
+  const v = _savedViews.find(x => {
+    if (_viewKey(x.filters) !== k) return false;
+    if ((x.viewMode || 'flat') !== _viewMode) return false;
+    // In pivot mode the pivot IS the report, so a view stops being the one on
+    // screen the moment the rows / columns / measure change. A view saved
+    // before the pivot config was captured has no opinion, so it still matches.
+    if (_viewMode === 'pivot' && x.pivot) return _cfgKey(x.pivot) === liveCfg;
+    return true;
+  });
   return v ? v.id : '';
 }
 
@@ -1330,18 +1458,28 @@ async function applySavedView(id) {
   if (!id) return;                                     // "Custom" / placeholder
   const v = _savedViews.find(x => x.id === id);
   if (!v) return;
+  // Get out of the way FIRST. The drawer is a full-width overlay sitting on top
+  // of the table, so applying from its Apply button used to look like it did
+  // nothing at all: the view was applied correctly underneath, the user just
+  // could not see any of it. Closing first also means the spinner and the rows
+  // arriving are visible, which is the feedback that the click registered.
+  // (Harmless when the caller is the header picker -- already closed.)
+  try { FBLib.Common.closeDrawer('viewsDrawer'); } catch (_) {}
   // One re-run at the end: applyFilterState writes a dozen fields and can call
   // applyDateRange, each of which would otherwise fire its own query.
   _suppressAutoApply = true;
   try {
     applyFilterState(v.filters, true);
+    // Before setViewMode: switching INTO pivot renders immediately, and it
+    // must render the view's own pivot rather than the one already on screen.
+    applyPivotCfg(v.pivot);
     if (v.viewMode) setViewMode(v.viewMode);
   } finally {
     _suppressAutoApply = false;
   }
   // Awaited so the confirmation isn't immediately overwritten by the refresh's
   // own row count.
-  await runQuery();
+  await refreshData();
   renderViewsDrawer();
   setStatus('View applied: ' + v.name + (typeof _statusSuffix !== 'undefined' && _statusSuffix ? ' — ' + _statusSuffix : ''));
 }
@@ -1356,7 +1494,8 @@ function saveCurrentView() {
   }
   const rec = {
     id: newViewId(), name: name, filters: captureFilterState(),
-    viewMode: _viewMode, shared: false, savedAt: new Date().toISOString()
+    viewMode: _viewMode, pivot: capturePivotCfg(),
+    shared: false, savedAt: new Date().toISOString()
   };
   const idx = _savedViews.findIndex(v => String(v.name).toLowerCase() === name.toLowerCase());
   if (idx >= 0) {
@@ -1384,6 +1523,7 @@ function updateViewFromCurrent(id) {
       !confirm('Update "' + v.name + '" to the filters currently set?\n\nThe view\'s saved filters are replaced.')) return;
   v.filters  = captureFilterState();
   v.viewMode = _viewMode;
+  v.pivot    = capturePivotCfg();
   v.shared   = false;
   v.savedAt  = new Date().toISOString();
   persistViews();
@@ -1426,7 +1566,7 @@ function _viewSummary(v) {
   const parts = [];
   const et = (f.etypes || []).length;
   if (et) parts.push(et + ' event type' + (et === 1 ? '' : 's'));
-  [[f.selPart, 'part'], [f.selLg, 'loc. group'], [f.selUser, 'user'],
+  [[f.selPart, 'part'], [f.selPtype, 'part type'], [f.selLg, 'loc. group'], [f.selUser, 'user'],
    [f.selBegLoc, 'from location'], [f.selEndLoc, 'to location']].forEach(([arr, label]) => {
     const n = (arr || []).length;
     if (n) parts.push(n + ' ' + label + (n === 1 ? '' : 's'));
@@ -1443,7 +1583,8 @@ function _viewSummary(v) {
     parts.push(formatDate(f.dateFrom) + ' → ' + formatDate(f.dateTo));
   }
   const MODE_LABEL = {flat:'Flat', pivot:'Pivot'};
-  parts.push(MODE_LABEL[v.viewMode] || MODE_LABEL['flat'] || '');
+  let mode = (MODE_LABEL[v.viewMode] || MODE_LABEL['flat'] || '') + _viewModeDetail(v);
+  parts.push(mode);
   return parts.filter(Boolean).join(' · ');
 }
 
@@ -1490,6 +1631,9 @@ function renderViewsDrawer() {
     apply.className = 'btn btn-sm';
     apply.textContent = v.id === activeId ? 'Active' : 'Apply';
     apply.disabled = (v.id === activeId);
+    apply.title = v.id === activeId
+      ? 'This view is already on screen'
+      : 'Apply "' + v.name + '" and close this drawer';
     apply.addEventListener('click', () => applySavedView(v.id));
 
     // Overwrite this view with whatever the filter panel currently holds.
@@ -1541,14 +1685,29 @@ function renderViewsDrawer() {
     }
   }
 
-  // The shared layer needs a SAVED report. Say so up front rather than letting
-  // an admin publish into the void from the BI Script Editor preview.
+  // The shared layer needs runQuery + saveSettings (FBLib.SharedData). Say so up
+  // front rather than letting an admin publish into the void.
   const warn = document.getElementById('viewsShareWarn');
   if (warn) {
-    const noStore = (typeof saveReportData !== 'function' || typeof loadReportData !== 'function');
+    // Name the missing piece. "it needs fb-lib + runQuery" sent people
+    // reinstalling an fb-lib they already had: the usual cause is an fb-lib
+    // that predates FBLib.SharedData still being INLINED in this report,
+    // because the directives only expand when the REPORT is saved. Updating
+    // the Script alone changes nothing until each report is re-saved.
+    const missing = [];
+    if (!window.FBLib) missing.push('FBLib');
+    else if (!FBLib.SharedData) missing.push('FBLib.SharedData (the fb-lib inlined here is too old)');
+    if (typeof runQuery !== 'function') missing.push('runQuery()');
+    const noStore = missing.length > 0;
     warn.style.display = noStore ? '' : 'none';
-    if (noStore) warn.textContent = 'Sharing is unavailable in this context — it needs the report-data ' +
-      'store, which only exists on a report SAVED in Fishbowl.';
+    if (noStore) {
+      warn.textContent = 'Sharing is unavailable — missing: ' + missing.join(' and ') + '. ' +
+        (missing.join(' ').indexOf('SharedData') !== -1
+          ? 'Save a Script named exactly "fb-lib" with the current contents of scripts/fb-lib.js, ' +
+            'then RE-SAVE this report — the include only re-expands when the report is saved. ' +
+            'Your own saved views are unaffected either way.'
+          : 'Your own saved views are unaffected; only org-wide sharing needs this.');
+    }
   }
 }
 
@@ -1564,7 +1723,7 @@ function adminShareViews() {
       'Each user picks them up the next time they open this report. A view they already have under the ' +
       'same name is left untouched, and nothing is removed from their list.')) return;
 
-  // MERGE onto the current shared payload — saveReportData replaces the whole
+  // MERGE onto the current shared payload — a write replaces the whole
   // thing, so anything else stored there would be lost by a blind write.
   const next = Object.assign({}, readSharedBlob());
   const rev  = Number((next.paViews || {}).rev || 0) + 1;
@@ -1574,7 +1733,8 @@ function adminShareViews() {
     rev: rev,
     at:  new Date().toISOString(),
     by:  by,
-    views: _savedViews.map(v => ({name: v.name, filters: v.filters, viewMode: v.viewMode}))
+    views: _savedViews.map(v => ({name: v.name, filters: v.filters, viewMode: v.viewMode,
+                                 pivot: v.pivot}))
   };
   const stuck = writeSharedBlob(next);
 
@@ -1657,7 +1817,8 @@ function loadSavedSettings() {
         .filter(v => v && v.name && v.filters)
         .forEach(v => _savedViews.push({
           id: v.id || newViewId(), name: String(v.name), filters: v.filters,
-          viewMode: v.viewMode || _viewMode, shared: !!v.shared, savedAt: v.savedAt || ''
+          viewMode: v.viewMode || _viewMode, pivot: v.pivot || null,
+          shared: !!v.shared, savedAt: v.savedAt || ''
         }));
     }
     _viewsAdoptedRev = Number(s.viewsAdoptedRev || 0);
@@ -1676,6 +1837,7 @@ function loadSavedSettings() {
     }
     if (s.selLg)   _selLg   = new Set(s.selLg);
     if (s.selPart) _selPart = new Set(s.selPart);
+    if (s.selPtype)    _selPtype = new Set(s.selPtype.map(String));
     if (s.selUser)     _selUser = new Set(s.selUser);
     if (s.selBegLg)  _selBegLg  = new Set(s.selBegLg);
     if (s.selEndLg)  _selEndLg  = new Set(s.selEndLg);
@@ -1689,6 +1851,10 @@ function loadSavedSettings() {
     if (Array.isArray(s.selPartCF))        _selPartCF        = new Set(s.selPartCF);
     if (Array.isArray(s.selPartCFValues))  _selPartCFValues  = new Set(s.selPartCFValues);
     if (s.cfpartvalSearch) { const el = document.getElementById('cfpartvalSearch'); if (el) el.value = s.cfpartvalSearch; }
+    if (typeof s.includeNonInvReceipts === 'boolean') {
+      const el = document.getElementById('includeNonInvReceipts');
+      if (el) el.checked = s.includeNonInvReceipts;
+    }
 
     if (Array.isArray(s.cols)) {
       const savedMap  = Object.fromEntries(s.cols.map(c => [c.key, c]));
@@ -1706,19 +1872,6 @@ function loadSavedSettings() {
         const tc = _columns.find(c => c.key === 'trackinfo');
         if (tc) tc.vis = true;
       }
-    }
-    if (s.viewMode) {
-      _viewMode = (s.viewMode === 'flat' || s.viewMode === 'pivot') ? s.viewMode : 'flat';
-      const sel = document.getElementById('viewModeSelect');
-      if (sel) sel.value = _viewMode;
-    }
-    // Pivot config — restored before _initPivotUI() runs so the dropdowns
-    // hydrate with the user's last values.
-    if (s.pivot && typeof s.pivot === 'object') {
-      Object.assign(_pivotCfg, s.pivot);
-    }
-    if (Array.isArray(s.savedPresets)) {
-      _savedPresets = s.savedPresets.filter(p => p && p.name && p.cfg);
     }
     if (s.viewMode) {
       _viewMode = (s.viewMode === 'flat' || s.viewMode === 'pivot') ? s.viewMode : 'flat';
@@ -1757,6 +1910,7 @@ function saveCurrentSettings() {
     dateTo:    document.getElementById('dateTo').value,
     selLg:       [..._selLg],
     selPart:     [..._selPart],
+    selPtype:    [..._selPtype],
     // Marks the Tracking Info default-visible migration as applied — see
     // loadSavedSettings. Once this is set, the user's own choice stands.
     trackinfoShown: true,
@@ -1773,6 +1927,7 @@ function saveCurrentSettings() {
     selPartCF:        [..._selPartCF],
     selPartCFValues:  [..._selPartCFValues],
     cfpartvalSearch:  document.getElementById('cfpartvalSearch')?.value || '',
+    includeNonInvReceipts: !!document.getElementById('includeNonInvReceipts')?.checked,
     cols:        _columns.map(c => ({key:c.key, vis:c.vis})),
     viewMode:    _viewMode,
     pivot:       Object.assign({}, _pivotCfg),
@@ -1812,6 +1967,58 @@ async function populatePart() {
     ORDER BY p.num LIMIT 3000`);
   _partList = rows.map(r => ({val:r.num, lbl:r.num}));
   FBLib.Common.MultiSelect.get('part-ms').setItems(_partList);
+}
+
+/* ── PART TYPE ───────────────────────────────────────────────────────────
+   Every type in `parttype` is offered, but each carries a count of how many
+   log rows it ACTUALLY has in the user's location groups — because on a
+   normal Fishbowl database that count is zero for every type except
+   Inventory, and a filter that silently returns nothing is worse than one
+   that says why.
+
+   WHY. inventorylog is the ledger of INVENTORY movement. Fishbowl writes no
+   inventory transaction for a Non-Inventory, Service, Labor or Overhead part
+   — there is no quantity on hand to move — so those parts never reach this
+   table. Consuming one on a work order records the usage on the WO line
+   (woitem.qtyUsed), not in the log. A Part Type filter therefore slices the
+   inventory activity you already have; it cannot conjure non-inventory
+   consumption into this report. That needs a woitem-sourced query. */
+async function populatePtype() {
+  const lgIds = getLocationGroupList();
+  const rows = await qp(`
+    SELECT pt.id, pt.name,
+           COALESCE(act.n, 0) AS logrows,
+           COALESCE(rcv.n, 0) AS recvrows
+    FROM parttype pt
+    LEFT JOIN (
+      SELECT p.typeId AS tid, COUNT(*) AS n
+      FROM inventorylog il
+      INNER JOIN part p ON p.id = il.partid
+      WHERE il.locationgroupid IN (${lgIds.join(',')})
+      GROUP BY p.typeId
+    ) act ON act.tid = pt.id
+    LEFT JOIN (
+      SELECT p.typeId AS tid, COUNT(*) AS n
+      FROM receiptitem ri
+      INNER JOIN part p      ON p.id = ri.partId
+      INNER JOIN receipt rec ON rec.id = ri.receiptId
+      WHERE p.typeId <> 10
+        AND ri.statusId >= 30
+        AND rec.locationGroupId IN (${lgIds.join(',')})
+      GROUP BY p.typeId
+    ) rcv ON rcv.tid = pt.id
+    ORDER BY COALESCE(act.n, 0) DESC, COALESCE(rcv.n, 0) DESC, pt.name`);
+  _ptypeList = rows.map(r => {
+    const logs = Number(r.logrows) || 0;
+    const recv = Number(r.recvrows) || 0;
+    let sub;
+    if (logs > 0)      sub = logs.toLocaleString() + ' logged event(s)';
+    else if (recv > 0) sub = 'no inventory log — ' + recv.toLocaleString() +
+                             ' receipt(s), tick "Include non-inventory receipts"';
+    else               sub = 'no activity of either kind';
+    return { value: String(r.id), label: r.name, sub: sub };
+  });
+  FBLib.Common.MultiSelect.get('ptype-ms').setItems(_ptypeList);
 }
 
 async function populateUser() {
@@ -1867,6 +2074,7 @@ function _createFilterMS() {
     { id: 'etype-ms',  sel: _selEtype,  ph: 'Select types', items: EVENT_TYPES },
     { id: 'lg-ms',     sel: _selLg,     ph: 'All location groups' },
     { id: 'part-ms',   sel: _selPart,   ph: 'All parts' },
+    { id: 'ptype-ms',  sel: _selPtype,  ph: 'All part types' },
     { id: 'user-ms',   sel: _selUser,   ph: 'All users' },
     { id: 'beglg-ms',  sel: _selBegLg,  ph: 'Any begin LG' },
     { id: 'begloc-ms', sel: _selBegLoc, ph: 'Any begin location' },
@@ -2051,6 +2259,13 @@ function buildSQL() {
     where.push(`part.num IN (${nums.join(',')})`);
   }
 
+  // Part type. Filtered on part.typeId rather than the joined name so a
+  // renamed type can't quietly stop matching.
+  if (_selPtype.size > 0) {
+    const ids = [..._selPtype].map(v => parseInt(v)).filter(n => !isNaN(n));
+    if (ids.length) where.push(`part.typeid IN (${ids.join(',')})`);
+  }
+
   if (_selUser.size > 0) {
     const users = [..._selUser].map(v => `'${escSQL(v)}'`);
     where.push(`sysuser.username IN (${users.join(',')})`);
@@ -2113,9 +2328,10 @@ function buildSQL() {
     .map(c => `  CustomFieldByName(${c.cfTable}.customfields, '${c.cfField.replace(/'/g,"''")}') AS \`${c.key}\``)
     .join(',\n');
 
-  return `SELECT
+  let sql = `SELECT
   inventorylog.id AS inventorylogid,
   part.num AS partnum,
+  parttype.name AS parttype,
   locgrp.name AS groupname,
   inventorylog.locationgroupid,
   CASE
@@ -2159,6 +2375,10 @@ INNER JOIN locationgroup beglocgrp ON begloc.locationgroupid = beglocgrp.id
 INNER JOIN location endloc         ON inventorylog.endlocationid = endloc.id
 INNER JOIN locationgroup endlocgrp ON endloc.locationgroupid = endlocgrp.id
 INNER JOIN part                    ON inventorylog.partid = part.id
+-- LEFT, not INNER: part.typeId is NOT NULL, but a row pointing at a type that
+-- is no longer in parttype would otherwise drop the whole log entry rather
+-- than just show a blank type.
+LEFT JOIN  parttype                ON parttype.id = part.typeid
 INNER JOIN uom                     ON part.uomid = uom.id
 INNER JOIN sysuser                 ON inventorylog.userid = sysuser.id
 -- TRACKING INFO — one labelled value per tracking type the part carries, so a
@@ -2259,12 +2479,263 @@ LEFT JOIN xo          refxoH    ON inventorylog.tableId = 605251168   AND refxoH
 LEFT JOIN xoitem      refxoitem ON inventorylog.tableId = 378289056   AND refxoitem.id = inventorylog.recordId
 LEFT JOIN xo          refxoL    ON refxoL.id = refxoitem.xoId
 LEFT JOIN locationgroup refxolg ON refxolg.id = COALESCE(refxoH.shipToLGId, refxoL.shipToLGId)
-WHERE ${where.join('\n  AND ')}
-ORDER BY locgrp.name, part.num, inventorylog.datecreated, inventorylog.id
+WHERE ${where.join('\n  AND ')}`;
+
+  /* ── NON-INVENTORY RECEIPTS (opt-in) ──────────────────────────────────
+     A second source, UNION-ed onto the log rows above.
+
+     WHY IT EXISTS. A Non-Inventory / Service / Overhead part never reaches
+     inventorylog, so the report is blind to it — but those parts are still
+     BOUGHT, and for a true consumable the purchase is a serviceable stand-in
+     for the usage: 100 received in March and 200 in April reads as roughly
+     100 then 200 consumed. That inference is the user's to make, which is why
+     the qty lands in the ordinary Change Qty column and nothing here is
+     labelled "consumption" — the existing Part × Month pivot then answers the
+     question with no extra UI.
+
+     WHAT IT IS NOT. These are PURCHASES. A part bought in bulk and drawn down
+     slowly will spike in the month it was ordered, not the months it was used.
+     And a non-inventory part that is consumed on work orders but never
+     purchased (labour, most obviously) contributes nothing here at all — its
+     usage lives in woitem.qtyUsed.
+
+     SCOPE. Deliberately non-inventory ONLY (part.typeid <> 10). Inventory
+     receipts are already in the log above; including them here would double
+     every receipt in the report.
+
+     statusId >= 30 (Received / Fulfilled) — a line still at Entered (10) or
+     Reconciled (20) has not actually arrived, and counting it would report
+     intent as usage. */
+  /* Filters with no meaning for a non-inventory row (begin/end location + tag,
+     tracking text, Info text) cannot be applied to either branch — so if the
+     user has set one they are narrowing to log-shaped rows, and the branches
+     are dropped entirely rather than returning rows that ignore what was
+     asked for. */
+  const logOnlyFilters = [
+    _selBegLg.size, _selEndLg.size, _selBegLoc.size, _selEndLoc.size,
+    begTagFilter, endTagFilter, infoFilter, trackFilter
+  ].some(Boolean);
+
+  const nonInvOn = !!document.getElementById('includeNonInvReceipts')?.checked
+    // A part-type filter naming only inventory types excludes both branches by
+    // definition — don't run them just to return nothing.
+    && (!_selPtype.size || [..._selPtype].some(v => parseInt(v, 10) !== 10))
+    && !logOnlyFilters;
+
+  /* Predicates both branches share, against a caller-chosen part-type-bearing
+     alias. Emitted twice, from one source, so receipts and shipments can never
+     answer to different filters. */
+  const nonInvCommon = () => {
+    const p = ['part.typeid <> 10'];
+    if (_selPart.size > 0) p.push(`part.num IN (${[..._selPart].map(v => `'${escSQL(v)}'`).join(',')})`);
+    if (_selPtype.size > 0) {
+      const ids = [..._selPtype].map(v => parseInt(v)).filter(n => !isNaN(n) && n !== 10);
+      if (ids.length) p.push(`part.typeid IN (${ids.join(',')})`);
+    }
+    if (_selUser.size > 0) p.push(`sysuser.username IN (${[..._selUser].map(v => `'${escSQL(v)}'`).join(',')})`);
+    if (_selPartCF.size > 0 && cfPartVals.length) {
+      const conds = [..._selPartCF].flatMap(f => cfPartVals.map(v => `CustomFieldByName(part.customfields, '${escSQL(f)}') LIKE '%${escSQL(v)}%'`));
+      if (conds.length) p.push(`(${conds.join(' OR ')})`);
+    }
+    return p;
+  };
+
+  // ── RECEIPTS (inbound, +qty) — gated on the Receive event type ──
+  if (nonInvOn && etypes.indexOf(10) !== -1) {
+    const rWhere = nonInvCommon();
+    rWhere.push('ri.statusId >= 30', 'ri.dateReceived IS NOT NULL',
+                `rec.locationGroupId IN (${selLgIds.join(',')})`);
+    if (from && to) rWhere.push(`DATE(ri.dateReceived) BETWEEN '${safeDate(from)}' AND '${safeDate(to)}'`);
+    if (refFilter) {
+      const t = escSQL(refFilter);
+      rWhere.push(`(COALESCE(refvendor.name,'') LIKE '%${t}%' OR COALESCE(refpo.num,'') LIKE '%${t}%')`);
+    }
+    // Column list matches the main SELECT position for position — a UNION
+    // takes its names from the first branch, so only the ORDER matters.
+    sql += `
+UNION ALL
+SELECT
+  NULL                                   AS inventorylogid,
+  part.num,
+  parttype.name,
+  locgrp.name,
+  rec.locationGroupId,
+  COALESCE(recloc.name, '(non-inventory receipt)'),
+  ri.dateReceived,
+  ri.dateReceived,
+  'Receive',
+  10,
+  CONCAT('Non-inventory receipt', COALESCE(CONCAT(' - ', NULLIF(ri.refNo, '')), '')),
+  ri.qty,
+  NULL,
+  uom.code,
+  NULL, NULL, NULL,
+  NULL, NULL, NULL,
+  sysuser.username,
+  NULL,
+  refpo.num,
+  refvendor.name,
+  NULL, NULL, NULL, NULL, NULL${cfSelects ? ',\n' + cfSelects : ''}
+FROM receiptitem ri
+INNER JOIN part                 ON part.id = ri.partId
+LEFT  JOIN parttype             ON parttype.id = part.typeid
+INNER JOIN receipt rec          ON rec.id = ri.receiptId
+INNER JOIN locationgroup locgrp ON locgrp.id = rec.locationGroupId
+LEFT  JOIN location recloc      ON recloc.id = ri.locationId
+LEFT  JOIN uom                  ON uom.id = COALESCE(ri.uomId, part.uomid)
+LEFT  JOIN po refpo             ON refpo.id = rec.poId
+LEFT  JOIN vendor refvendor     ON refvendor.id = refpo.vendorId
+LEFT  JOIN sysuser              ON sysuser.id = rec.userId
+WHERE ${rWhere.join('\n  AND ')}`;
+  }
+
+  /* ── SHIPMENTS (outbound, −qty) — gated on the Ship event type ──
+     The other half of the movement: a non-inventory part can be SOLD, and the
+     shipment is the moment it left. Qty is NEGATED so it carries the same sign
+     convention as the log's own Ship rows (verified: log typeid 10 is always
+     positive, typeid 20 always negative). With both branches on, the Part ×
+     Month pivot therefore reads as NET flow — bought minus sold — and the
+     Event Type filter separates them again: Receive alone for purchases, Ship
+     alone for sales.
+
+     ship.statusId = 30 (Shipped) only. A Packed (20) or Entered (10) shipment
+     has not left, and its dateShipped is NULL — there is no date to bucket it
+     under. ship.orderTypeId = 20 restricts to SALES shipments; the same table
+     also carries PO returns (10) and transfer-order shipments (40).
+
+     NOT every non-inventory sale reaches here. A Service or Shipping SO line
+     never produces a shipitem at all — there is nothing to pick and pack — so
+     those show on the order but never as a movement. That is the ORDER
+     question, and SalesOrderSummary already answers it at SO-line grain. */
+  if (nonInvOn && etypes.indexOf(20) !== -1) {
+    const sWhere = nonInvCommon();
+    sWhere.push('sh.statusId = 30', 'sh.orderTypeId = 20', 'sh.dateShipped IS NOT NULL',
+                `sh.locationGroupId IN (${selLgIds.join(',')})`);
+    if (from && to) sWhere.push(`DATE(sh.dateShipped) BETWEEN '${safeDate(from)}' AND '${safeDate(to)}'`);
+    if (refFilter) {
+      const t = escSQL(refFilter);
+      sWhere.push(`(COALESCE(refcust.name,'') LIKE '%${t}%' OR COALESCE(refso.num,'') LIKE '%${t}%')`);
+    }
+    sql += `
+UNION ALL
+SELECT
+  NULL                                   AS inventorylogid,
+  part.num,
+  parttype.name,
+  locgrp.name,
+  sh.locationGroupId,
+  '(non-inventory shipment)',
+  sh.dateShipped,
+  sh.dateShipped,
+  'Ship',
+  20,
+  CONCAT('Non-inventory shipment', COALESCE(CONCAT(' - ', NULLIF(sh.num, '')), '')),
+  -shi.qtyShipped,
+  NULL,
+  uom.code,
+  NULL, NULL, NULL,
+  NULL, NULL, NULL,
+  sysuser.username,
+  NULL,
+  NULL, NULL,
+  refso.num,
+  refcust.name,
+  NULL, NULL, NULL${cfSelects ? ',\n' + cfSelects : ''}
+FROM shipitem shi
+INNER JOIN ship sh              ON sh.id = shi.shipId
+INNER JOIN soitem si            ON si.id = shi.soItemId
+INNER JOIN product pr           ON pr.id = si.productId
+INNER JOIN part                 ON part.id = pr.partId
+LEFT  JOIN parttype             ON parttype.id = part.typeid
+INNER JOIN locationgroup locgrp ON locgrp.id = sh.locationGroupId
+LEFT  JOIN uom                  ON uom.id = COALESCE(shi.uomId, part.uomid)
+LEFT  JOIN so refso             ON refso.id = sh.soId
+LEFT  JOIN customer refcust     ON refcust.id = refso.customerId
+-- ship.shippedBy is a sysuser ID, not a name.
+LEFT  JOIN sysuser              ON sysuser.id = sh.shippedBy
+WHERE ${sWhere.join('\n  AND ')}`;
+  }
+
+  /* ── WO CONSUMPTION (outbound, −qty) — gated on the Consume (WO) type ──
+     The third movement. Consuming a non-inventory part on a work order writes
+     nothing to inventorylog — there is no quantity to take away — so the usage
+     is recorded on the WO LINE as woitem.qtyUsed and nowhere else. This is the
+     one that answers "how much do we actually get through", as opposed to the
+     receipts branch's "how much did we buy".
+
+     DATE. woitem has no date column of its own, so the consumption is dated by
+     its WO: dateFinished, falling back to dateLastModified for a WO that is
+     still open but has partial usage recorded. That means a long-running WO
+     books its whole consumption on the day it was finished, not spread across
+     the days it ran.
+
+     wi.typeId = 20 is a component line; typeId 10 is the finished good, which
+     would be a yield rather than a consumption. Non-inventory finished goods
+     do exist (demodb has a handful) but are deliberately NOT surfaced here —
+     "manufacturing" a service or a labour line is not a movement anyone is
+     asking this report about.
+
+     qtyUsed > 0 only. A line left at 0 was not consumed — which is a real and
+     common state: finishing a WO short leaves its unconsumed components at
+     zero, exactly as it does for inventory parts.
+
+     CAVEAT on labour: finishing a WO to status 40 forces a labour line's
+     qtyUsed to its TARGET rather than anything measured, so Labor rows here
+     report what was planned, not what was clocked. */
+  if (nonInvOn && etypes.indexOf(50) !== -1) {
+    const cWhere = nonInvCommon();
+    cWhere.push('wi.typeId = 20', 'wi.qtyUsed > 0',
+                `w.locationGroupId IN (${selLgIds.join(',')})`,
+                'COALESCE(w.dateFinished, w.dateLastModified) IS NOT NULL');
+    if (from && to) {
+      cWhere.push(`DATE(COALESCE(w.dateFinished, w.dateLastModified)) BETWEEN '${safeDate(from)}' AND '${safeDate(to)}'`);
+    }
+    if (refFilter) cWhere.push(`COALESCE(w.num,'') LIKE '%${escSQL(refFilter)}%'`);
+    sql += `
+UNION ALL
+SELECT
+  NULL                                   AS inventorylogid,
+  part.num,
+  parttype.name,
+  locgrp.name,
+  w.locationGroupId,
+  '(non-inventory WO consumption)',
+  COALESCE(w.dateFinished, w.dateLastModified),
+  COALESCE(w.dateFinished, w.dateLastModified),
+  'Consume',
+  50,
+  CONCAT('Non-inventory WO consumption', COALESCE(CONCAT(' - target ', TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM CAST(wi.qtyTarget AS DECIMAL(18,4))))), '')),
+  -wi.qtyUsed,
+  NULL,
+  uom.code,
+  NULL, NULL, NULL,
+  NULL, NULL, NULL,
+  sysuser.username,
+  NULL,
+  NULL, NULL,
+  NULL, NULL,
+  w.num,
+  NULL, NULL${cfSelects ? ',\n' + cfSelects : ''}
+FROM woitem wi
+INNER JOIN wo w                 ON w.id = wi.woId
+INNER JOIN part                 ON part.id = wi.partId
+LEFT  JOIN parttype             ON parttype.id = part.typeid
+INNER JOIN locationgroup locgrp ON locgrp.id = w.locationGroupId
+LEFT  JOIN uom                  ON uom.id = COALESCE(wi.uomId, part.uomid)
+LEFT  JOIN sysuser              ON sysuser.id = w.userId
+WHERE ${cWhere.join('\n  AND ')}`;
+  }
+
+  // ORDER BY on the SELECT ALIASES, not the source columns: under a UNION the
+  // sort applies to the combined result and can only name the first branch's
+  // output columns.
+  sql += `
+ORDER BY groupname, partnum, datecreated, inventorylogid
 LIMIT 10000`;
+  return sql;
 }
 
-async function runQuery() {
+async function refreshData() {
   // Every filter change funnels through here, so this is where the Views
   // picker re-syncs — a hand-edited filter drops it to "Custom (unsaved)".
   renderViewPicker();
@@ -3033,17 +3504,8 @@ function _applyPresetById(id) {
   }
   if (!cfg) return;
   Object.assign(_pivotCfg, cfg);
-  // Push to the UI selects so they reflect the applied preset.
-  document.getElementById('pivotRowDim').value     = _pivotCfg.rowDim || '';
-  document.getElementById('pivotRowDim2').value    = _pivotCfg.rowDim2 || '';
-  document.getElementById('pivotColDim').value     = _pivotCfg.colDim || '';
-  document.getElementById('pivotRowBucket').value  = _pivotCfg.rowBucket || 'month';
-  document.getElementById('pivotRowBucket2').value = _pivotCfg.rowBucket2 || 'month';
-  document.getElementById('pivotColBucket').value  = _pivotCfg.colBucket || 'month';
-  document.getElementById('pivotMeasure').value    = _pivotCfg.measure;
-  document.getElementById('pivotAgg').value        = _pivotCfg.agg;
-  _updatePivotBucketVisibility();
-  _renderPresetDropdown();
+  syncPivotBarFromCfg();
+  renderViewPicker();        // a preset change can leave the saved view behind
   if (_viewMode === 'pivot') renderPivot();
 }
 
@@ -3186,6 +3648,7 @@ function _onPivotConfigChange() {
   }
   _updatePivotBucketVisibility();
   _renderPresetDropdown();   // hand-editing drops the preset menu to "Custom"
+  renderViewPicker();        // ...and can drop the saved VIEW to "Custom" too
   if (_viewMode === 'pivot') renderPivot();
 }
 
@@ -3238,9 +3701,19 @@ function exportPivotCSV() {
 function showSpinner() { document.getElementById('loadingOverlay').style.display = 'block'; }
 function hideSpinner() { document.getElementById('loadingOverlay').style.display = 'none'; }
 
+/* Run a SELECT, preferring the async built-in and falling back to the sync one.
+   NOTE the report's own refresh function is called refreshData(), NOT
+   runQuery() — the name below must reach Fishbowl's BUILT-IN runQuery. It used
+   to be shadowed by the refresh function, so the moment runQueryAsync rejected
+   (any SQL error) this fallback re-entered the report: qp → runQuery →
+   qp → … until the stack blew, firing ~190 repeat queries and presenting a
+   simple "unknown column" as a frozen report with no message. */
 async function qp(sql) {
   try { return normalise(await runQueryAsync(sql)); }
-  catch(e) { try { return normalise(runQuery(sql)); } catch(e2) { throw e2; } }
+  catch(e) {
+    if (typeof runQuery !== 'function') throw e;
+    return normalise(runQuery(sql));
+  }
 }
 function normalise(r) {
   if (r == null) return [];

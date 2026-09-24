@@ -367,6 +367,7 @@ if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
 
 /* ── FB-LIB SETTINGS ── */
 FBLib.Settings.init({
+  masterStorage: 'userProperties',   // shared admin defaults via userproperties, not report data (which needs a SAVED report — see FBLib.SharedData)
   userKey:   'cdx.bi.cycleCount.user.v1',
   masterKey: 'cdx.bi.cycleCount.master.v1',
   defaults: { v: 1, lgSel: [], locSel: [], blind: false, showVar: true, globalNote: '', discFrom: '', discTo: '', discNote: 'Stocktake', discLgSel: [], discLocSel: [], trackingConfirm: 'variance', debug: false },
@@ -540,7 +541,18 @@ function persistControls() {
   } catch (_) {}
 }
 
-/* ── STOCKTAKE SESSION (shared across users via report data; stores only completed loc ids) ──
+/* ── STOCKTAKE SESSION (shared across every user; stores only completed loc ids) ──
+   Held in FBLib.SharedData under SESSION_KEY with adminOnly:false, because any
+   counter — not just an admin — has to be able to finalise a location. It used
+   to live in report data, which needs a SAVED report: in the BI Script Editor,
+   which previews with report id -1, the first read raised the native "Loading
+   data is only available on reports" modal and every write was a silent no-op.
+
+   adminOnly:false means newest-write-wins across users, decided by a
+   client-generated timestamp, so badly skewed clocks could in principle invert
+   two writes. The read-merge-write below tolerates that: each write re-reads
+   FRESH and unions the completed set, so a losing order costs at worst one
+   extra round trip, never someone else's finalisation.
    Writes are read-merge-write so two users finalising different locations at the same time don't
    clobber each other (plain last-write-wins would drop one user's completions). A session `id`
    keeps the merge scoped to the current stocktake run. */
@@ -555,17 +567,27 @@ function parseSession(raw) {
   } catch (e) { dbg('session parse failed: ' + e.message, 'warning'); }
   return null;
 }
+const SESSION_KEY = 'cdx.bi.cycleCount.session.v1';
+// Always FRESH — commitCompletion re-reads to merge, so a cached value would
+// silently drop another counter's finalisation.
 function readPersistedSession() {
-  try { return parseSession((typeof loadReportData === 'function') ? loadReportData() : null); }
-  catch (e) { dbg('loadReportData failed: ' + e.message, 'warning'); return null; }
+  try {
+    if (!(window.FBLib && FBLib.SharedData)) return null;
+    return parseSession(FBLib.SharedData.read(SESSION_KEY, { adminOnly: false, fresh: true }));
+  } catch (e) { dbg('session read failed: ' + e.message, 'warning'); return null; }
 }
 function loadSession() { const o = readPersistedSession(); if (o) _session = o; }
 function writeSession() {
   try {
-    if (typeof saveReportData === 'function') {
-      saveReportData(JSON.stringify({ v: 2, id: _session.id, note: _session.note, started: _session.started, completed: [..._session.completed] }));
-    } else { dbg('saveReportData unavailable (unsaved report?) — finalised flags not persisted', 'warning'); }
-  } catch (e) { dbgForce('saveReportData failed: ' + (e.message || e), 'warning'); }
+    if (!(window.FBLib && FBLib.SharedData)) {
+      dbg('shared store unavailable — finalised flags not persisted', 'warning');
+      return;
+    }
+    const stuck = FBLib.SharedData.writeJson(SESSION_KEY,
+      { v: 2, id: _session.id, note: _session.note, started: _session.started, completed: [..._session.completed] },
+      { adminOnly: false });
+    if (!stuck) dbgForce('session write did not persist — finalised flags may be lost', 'warning');
+  } catch (e) { dbgForce('session write failed: ' + (e.message || e), 'warning'); }
 }
 // Re-reads the shared session and merges this user's completed-flag change into it, returning
 // false if a different stocktake run is now active (caller should abort the toggle).

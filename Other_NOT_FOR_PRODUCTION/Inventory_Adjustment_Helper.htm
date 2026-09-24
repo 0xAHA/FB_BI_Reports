@@ -127,6 +127,11 @@
     #outTotalCell { color: #b91c1c; }
     #inTotalCell { color: #047857; }
     .avg-up { color: #b45309; font-weight: 600; }
+    /* An OUT line asking for more than the location's uncommitted stock. */
+    .over-commit { color: #b91c1c; font-weight: 600; }
+    .adj-table input.qty-bad { border-color: #ef4444; background: #fef2f2; }
+    .adj-table input.qty-bad:focus { box-shadow: 0 0 0 3px rgba(239,68,68,0.15); }
+    .adj-table option:disabled { color: #94a3b8; }
     .avg-down { color: #047857; font-weight: 600; }
 
     /* ── AUTOCOMPLETE ── */
@@ -160,6 +165,8 @@
     .badge .badge-sub { font-size: 11px; font-weight: 500; opacity: 0.85; }
     .badge.zero { background: #d1fae5; color: #065f46; }
     .badge.warn { background: #fef3c7; color: #92400e; }
+    /* Discrepancy that is blocking the import (Require balanced is on). */
+    .badge.block { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
     .method-tag {
       font-size: 11px; font-weight: 600; color: #475569;
       background: #f1f5f9; border: 1px solid #e2e8f0; padding: 4px 10px; border-radius: 999px;
@@ -384,6 +391,10 @@
         <div class="ds-section ds-checks">
           <label class="ds-label">Options</label>
           <label><input type="checkbox" id="dsRememberLg" /> Remember last location group</label>
+          <label><input type="checkbox" id="dsRequireBalanced" /> Require in / out totals to balance before importing</label>
+          <div style="font-size:11px;color:#94a3b8;margin:-2px 0 6px 21px;line-height:1.4;">
+            On: a cost difference disables Process Adjustments. Off: you are warned and may continue.
+          </div>
           <label><input type="checkbox" id="dsDebug" /> Show debug console</label>
         </div>
 
@@ -413,6 +424,7 @@ if (typeof runQuery !== 'function' || typeof runApiRequest !== 'function') {
    Layered preference resolver shared with the Individual-Pages reports.
    Only Common + Settings are used here (no custom-field/column modules). */
 FBLib.Settings.init({
+  masterStorage: 'userProperties',   // shared admin defaults via userproperties, not report data (which needs a SAVED report — see FBLib.SharedData)
   userKey:   'cdx.bi.invAdjust.user.v1',
   masterKey: 'cdx.bi.invAdjust.master.v1',
   defaults: {
@@ -420,6 +432,10 @@ FBLib.Settings.init({
     costMethod: 'value',   // default: apportion incoming costs by value
     locationGroupId: 1,
     rememberLg: true,
+    // When on, an out/in money difference blocks the import outright instead
+    // of only warning. Off by default so existing behaviour is unchanged and
+    // a deliberate one-sided write-off still works.
+    requireBalanced: false,
     debug: false
   },
   propFallback: {
@@ -454,6 +470,7 @@ let allParts = [];         // IN  — all active parts
 let locationGroups = [];
 let selectedLocationGroupId = null;
 let costMethod = FBLib.Settings.resolve('costMethod') || 'manual';
+let requireBalanced = !!FBLib.Settings.resolve('requireBalanced');
 
 const METHOD_LABEL = { manual: 'Manual entry', value: 'Proportional by value', qty: 'Proportional by quantity' };
 
@@ -723,24 +740,49 @@ function loadLocationsForPart(partNum, locationSelectId, type) {
         locSel.innerHTML = '<option value="">-- No Locations Available --</option>';
       }
     } else {
+      // Removable stock is on-hand MINUS committed: ImportCycleCountData
+      // rejects any counted qty below what is committed at that location
+      // ("New quantity is less than what has been committed"). Committed is
+      // order-type agnostic — an SO pick, a WO or a TO all hold stock here.
       const q = runQuery(
-        "SELECT CASE WHEN COALESCE(lg.name,'')!='' AND COALESCE(loc.name,'')!='' THEN CONCAT(lg.name,'-',loc.name) " +
+        "SELECT loc.id AS locid, " +
+        "CASE WHEN COALESCE(lg.name,'')!='' AND COALESCE(loc.name,'')!='' THEN CONCAT(lg.name,'-',loc.name) " +
         "WHEN COALESCE(lg.name,'')!='' THEN lg.name WHEN COALESCE(loc.name,'')!='' THEN loc.name ELSE 'Unknown Location' END AS location, " +
-        "SUM(qoh.qty) AS qty " +
-        "FROM part INNER JOIN QOHVIEW qoh ON part.id = qoh.partid " +
-        "INNER JOIN location loc ON qoh.locationid = loc.id " +
-        "INNER JOIN locationgroup lg ON qoh.locationgroupid = lg.id " +
-        "WHERE part.num = '" + esc(partNum) + "' AND qoh.locationgroupid = " + selectedLocationGroupId + " AND qoh.qty > 0 " +
-        "GROUP BY lg.name, loc.name ORDER BY SUM(qoh.qty) DESC");
+        "SUM(t.qty) AS qty, SUM(t.qtyCommitted) AS committed, SUM(t.qty - t.qtyCommitted) AS available " +
+        "FROM tag t " +
+        "INNER JOIN part ON part.id = t.partid " +
+        "INNER JOIN location loc ON loc.id = t.locationid " +
+        "INNER JOIN locationgroup lg ON lg.id = loc.locationgroupid " +
+        "WHERE part.num = '" + esc(partNum) + "' AND t.typeid IN (30,40) " +
+        "AND loc.locationgroupid = " + selectedLocationGroupId + " " +
+        "GROUP BY loc.id, lg.name, loc.name HAVING SUM(t.qty) > 0 " +
+        "ORDER BY available DESC, qty DESC");
       let locs = JSON.parse(q); if (locs && !Array.isArray(locs)) locs = [locs];
       locSel.innerHTML = '<option value="">-- Select Location --</option>';
       if (locs && locs.length) {
+        let firstFree = null;
         locs.forEach(function (l) {
+          const onhand = parseFloat(l.qty) || 0;
+          const committed = parseFloat(l.committed) || 0;
+          const avail = parseFloat(l.available) || 0;
           const o = document.createElement('option');
-          o.value = l.location; o.textContent = l.location + ' (Qty: ' + fmtQty(l.qty) + ')';
+          o.value = l.location;
+          o.setAttribute('data-locid', l.locid);
+          o.setAttribute('data-onhand', onhand);
+          o.setAttribute('data-committed', committed);
+          o.setAttribute('data-avail', avail);
+          o.textContent = l.location + ' — ' + fmtQty(avail) + ' free'
+            + (committed > 0 ? ' (' + fmtQty(onhand) + ' on hand, ' + fmtQty(committed) + ' committed)' : '');
+          // Fully committed locations stay visible so the user can see WHY the
+          // stock is untouchable, but they cannot be chosen.
+          if (avail <= 0) { o.disabled = true; o.textContent += ' — all committed'; }
+          else if (firstFree === null) firstFree = l.location;
           locSel.appendChild(o);
         });
-        locSel.value = locs[0].location;
+        locSel.value = firstFree === null ? '' : firstFree;
+        if (firstFree === null) {
+          setStatus('Part ' + partNum + ' has stock in this location group, but every unit is committed to an order — nothing can be removed.');
+        }
       }
     }
     recalc();
@@ -825,10 +867,22 @@ function collectOut() {
     const partnum = pin.getAttribute('data-partnum') || '';
     const qty = parseFloat(qtyEl.value) || 0;
     const avgcost = parseFloat(pin.getAttribute('data-avgcost')) || 0;
+    const opt = loc.selectedOptions && loc.selectedOptions[0];
+    const avail = opt ? (parseFloat(opt.getAttribute('data-avail')) || 0) : 0;
+    const committed = opt ? (parseFloat(opt.getAttribute('data-committed')) || 0) : 0;
+    const onhand = opt ? (parseFloat(opt.getAttribute('data-onhand')) || 0) : 0;
+    const locid = opt ? (parseInt(opt.getAttribute('data-locid'), 10) || null) : null;
+    // Over-commit is the failure this report used to hit at import time; catch
+    // it while the row is still being typed.
+    const overCommitted = !!(partnum && loc.value && qty > avail);
     out.push({
-      row: row, valid: !!(partnum && qty > 0 && loc.value),
+      row: row, valid: !!(partnum && qty > 0 && loc.value && !overCommitted),
+      overCommitted: overCommitted,
       partnum: partnum, description: pin.getAttribute('data-description') || '',
-      location: loc.value, qty: qty, avgcost: avgcost, uom: pin.getAttribute('data-uom') || '',
+      location: loc.value, locid: locid, qty: qty, avgcost: avgcost,
+      avail: avail, committed: committed, onhand: onhand,
+      uom: pin.getAttribute('data-uom') || '',
+      qtyEl: qtyEl,
       extEl: row.querySelector('[id^="out-ext-"]')
     });
   });
@@ -867,8 +921,17 @@ function recalc() {
   let totalOut = 0;
   out.forEach(function (o) {
     const ext = o.qty * o.avgcost;
-    o.extEl.textContent = o.valid ? fmtMoney(ext) : '—';
-    o.extEl.classList.toggle('muted', !o.valid);
+    if (o.overCommitted) {
+      o.extEl.textContent = 'max ' + fmtQty(o.avail);
+      o.extEl.className = 'nr num-cell over-commit';
+      o.extEl.title = o.location + ' holds ' + fmtQty(o.onhand) + ' on hand but ' + fmtQty(o.committed)
+        + ' are committed to an order, so at most ' + fmtQty(o.avail) + ' can be removed.';
+    } else {
+      o.extEl.textContent = o.valid ? fmtMoney(ext) : '—';
+      o.extEl.className = 'nr num-cell' + (o.valid ? '' : ' muted');
+      o.extEl.title = '';
+    }
+    o.qtyEl.classList.toggle('qty-bad', !!o.overCommitted);
     if (o.valid) totalOut += ext;
   });
 
@@ -966,15 +1029,30 @@ function updateSummary(out, ins, totalOut, totalIn) {
   const badge = document.getElementById('discBadge');
   document.getElementById('discValue').textContent = (disc > 0 ? '+' : '') + fmtMoney(disc);
   const lbl = document.getElementById('discLabel');
+  const balanceBlocked = requireBalanced && disc !== 0;
   if (disc === 0) { badge.className = 'badge zero'; lbl.textContent = 'Balanced'; }
+  else if (balanceBlocked) { badge.className = 'badge block'; lbl.textContent = 'Must balance'; }
   else { badge.className = 'badge warn'; lbl.textContent = 'Discrepancy'; }
+  badge.title = balanceBlocked
+    ? 'Settings ▸ Require in / out totals to balance is on, so this difference blocks the import.'
+    : '';
 
   const nOut = out.filter(function (o) { return o.valid; }).length;
   const nIn = ins.filter(function (i) { return i.valid; }).length;
-  setStatus(nOut + ' line(s) to remove · ' + nIn + ' line(s) to add' +
-    (selectedLocationGroupId ? '' : ' · select a location group'));
+  const blocked = out.filter(function (o) { return o.overCommitted; });
+  if (balanceBlocked && (nOut + nIn) > 0) {
+    setStatus('Out and in differ by ' + fmtMoney(Math.abs(disc)) +
+      ' — they must balance before you can import (change this in Settings).');
+  } else if (blocked.length) {
+    setStatus(blocked.length + ' line(s) exceed the uncommitted stock at their location — reduce the qty to continue.');
+  } else {
+    setStatus(nOut + ' line(s) to remove · ' + nIn + ' line(s) to add' +
+      (selectedLocationGroupId ? '' : ' · select a location group'));
+  }
 
-  document.getElementById('importBtn').disabled = (nOut + nIn === 0) || !selectedLocationGroupId;
+  document.getElementById('importBtn').disabled =
+    (nOut + nIn === 0) || !selectedLocationGroupId || blocked.length > 0
+    || balanceBlocked;
 }
 
 /* ── SETTINGS PERSISTENCE ── */
@@ -1008,6 +1086,14 @@ function importToFishbowl() {
     let totalOut = 0; out.forEach(function (o) { totalOut += o.qty * o.avgcost; });
     let totalIn = 0; ins.forEach(function (i) { totalIn += i.qty * (parseFloat(i.costEl.getAttribute('data-cost')) || 0); });
     const disc = round2(totalIn - totalOut);
+    // Belt and braces: the button is already disabled in this state, but a
+    // stale click or a programmatic call must not slip past the setting.
+    if (requireBalanced && Math.abs(disc) >= 0.01) {
+      alert('Out and in differ by ' + fmtMoney(Math.abs(disc)) + '.\n\n' +
+        'Settings has "Require in / out totals to balance" switched on, so this cannot be imported. ' +
+        'Balance the two sides, or turn the option off.');
+      return;
+    }
     let confirmMsg = 'Process ' + out.length + ' removal line(s) and ' + ins.length + ' addition line(s)?';
     if (Math.abs(disc) >= 0.01) confirmMsg += '\n\nCost discrepancy of ' + (disc > 0 ? '+' : '') + fmtMoney(disc) + ' will remain. Continue?';
     if (!confirm(confirmMsg)) return;
@@ -1024,23 +1110,39 @@ function importToFishbowl() {
     if (out.length) {
       try {
         const rows = ['"PartNumber","Location","Qty","UOM","Date","Note","Customer"'];
+        const blockers = [];
         out.forEach(function (item) {
-          const parts = item.location.split('-');
-          const lgName = parts[0];
-          const locName = parts.length > 1 ? parts.slice(1).join('-') : '';
-          let q = "SELECT SUM(qoh.qty) AS currentqty FROM part " +
-            "INNER JOIN QOHVIEW qoh ON part.id = qoh.partid " +
-            "INNER JOIN locationgroup lg ON qoh.locationgroupid = lg.id " +
-            "LEFT JOIN location loc ON qoh.locationid = loc.id " +
-            "WHERE part.num = '" + esc(item.partnum) + "' AND lg.name = '" + esc(lgName) + "'";
-          if (locName) q += " AND loc.name = '" + esc(locName) + "'";
+          // Re-read on-hand AND committed straight from tag, keyed on the
+          // location ID captured when the dropdown was built. The old code
+          // split the "LG-Location" label on its first hyphen, which mis-parses
+          // any location group whose name contains one.
+          let q = "SELECT SUM(t.qty) AS currentqty, SUM(t.qtyCommitted) AS committed " +
+            "FROM tag t INNER JOIN part ON part.id = t.partid " +
+            "WHERE part.num = '" + esc(item.partnum) + "' AND t.typeid IN (30,40)";
+          q += item.locid
+            ? " AND t.locationid = " + item.locid
+            : " AND t.locationid IN (SELECT loc.id FROM location loc INNER JOIN locationgroup lg " +
+              "ON lg.id = loc.locationgroupid WHERE CONCAT(lg.name,'-',loc.name) = '" + esc(item.location) + "')";
           let qd = JSON.parse(runQuery(q));
           if (Array.isArray(qd) && qd.length) qd = qd[0];
           const currentQty = (qd && qd.currentqty != null) ? parseFloat(qd.currentqty) : 0;
+          const committed = (qd && qd.committed != null) ? parseFloat(qd.committed) : 0;
           const counted = currentQty - item.qty;
+          // Fishbowl refuses a counted qty below the committed qty. Catching it
+          // here names the part and the real ceiling, instead of letting the
+          // import come back with a bare line number.
+          if (counted < committed) {
+            blockers.push(item.partnum + ' @ ' + item.location + ': ' + fmtQty(committed) +
+              ' of ' + fmtQty(currentQty) + ' committed, so at most ' +
+              fmtQty(currentQty - committed) + ' can be removed (you asked for ' + fmtQty(item.qty) + ')');
+            return;
+          }
           rows.push('"' + item.partnum + '","' + item.location + '","' + counted + '","' + item.uom +
             '","' + meta.date + '","' + meta.note + '",""');
         });
+        if (blockers.length) {
+          throw new Error('Nothing was imported. ' + blockers.join('  ·  '));
+        }
         const payload = { ImportRq: { Type: 'ImportCycleCountData', Rows: { Row: rows } } };
         dbg('Cycle Count Request', payload, 'query');
         const resp = runApiRequest('ImportRq', JSON.stringify(payload));
@@ -1052,7 +1154,10 @@ function importToFishbowl() {
     }
 
     // ── Add Inventory (IN) ──
-    if (ins.length) {
+    // Only ever runs when the removal leg succeeded. Adding stock after a
+    // failed removal would book value in without taking the matching value
+    // out, which is exactly the imbalance this tool exists to avoid.
+    if (ins.length && !errors.length) {
       try {
         const rows = ['"PartNumber","PartDescription","Location","Qty","UOM","Cost","QBClass","Date","Note"'];
         ins.forEach(function (item) {
@@ -1069,6 +1174,10 @@ function importToFishbowl() {
         if (r && r.ImportRs && r.ImportRs.statusCode === 1000) results.push('Add Inventory: ' + ins.length + ' line(s) imported');
         else errors.push('Add Inventory failed: ' + apiError(r, resp));
       } catch (e) { errors.push('Add Inventory error: ' + e.message); }
+    }
+
+    if (ins.length && errors.length) {
+      errors.push('Add Inventory skipped — the removal step failed, so nothing was added');
     }
 
     btn.disabled = false;
@@ -1158,6 +1267,7 @@ window.PageSettings = (function () {
     const eff = FBLib.Settings.effective();
     document.getElementById('dsCostMethod').value = eff.costMethod || 'manual';
     document.getElementById('dsRememberLg').checked = eff.rememberLg !== false;
+    document.getElementById('dsRequireBalanced').checked = !!eff.requireBalanced;
     document.getElementById('dsDebug').checked = !!eff.debug;
     refreshLockUI();
     document.getElementById('setOverlay').style.display = 'flex';
@@ -1168,6 +1278,7 @@ window.PageSettings = (function () {
     return {
       costMethod: document.getElementById('dsCostMethod').value,
       rememberLg: document.getElementById('dsRememberLg').checked,
+      requireBalanced: document.getElementById('dsRequireBalanced').checked,
       debug: document.getElementById('dsDebug').checked
     };
   }
@@ -1175,6 +1286,7 @@ window.PageSettings = (function () {
     closePanel();
     // Reflect resolved settings into the live controls.
     costMethod = FBLib.Settings.resolve('costMethod') || 'manual';
+    requireBalanced = !!FBLib.Settings.resolve('requireBalanced');
     document.getElementById('costMethod').value = costMethod;
     applyCostLock();
     document.getElementById('debugConsole').style.display = FBLib.Common.DEBUG_MODE ? 'block' : 'none';

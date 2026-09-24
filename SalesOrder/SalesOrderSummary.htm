@@ -268,7 +268,7 @@
 
       <div class="w-px h-6 bg-slate-200 mx-1"></div>
 
-      <button onclick="runQuery()" class="hdr-btn">
+      <button onclick="refreshData()" class="hdr-btn">
         <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
         Refresh
       </button>
@@ -535,6 +535,17 @@
       <div class="flex flex-col gap-2" style="min-width:210px;">
         <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide border-b border-slate-200 pb-1">Logistics</div>
         <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Ship-To State</div>
+          <div class="ms-container" id="state-ms">
+            <div class="ms-trigger" id="stateTrigger"><span class="ms-placeholder" id="statePlaceholder">All states</span></div>
+            <div class="ms-dropdown hidden" id="stateDropdown">
+              <div class="ms-search"><input type="text" placeholder="Search..." id="stateSearch" /></div>
+              <div class="ms-actions"><span id="stateAll">Select All</span><span id="stateClear">Clear All</span></div>
+              <div class="ms-list" id="stateList"></div>
+            </div>
+          </div>
+        </div>
+        <div>
           <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Carrier</div>
           <div class="ms-container" id="car-ms">
             <div class="ms-trigger" id="carTrigger"><span class="ms-placeholder" id="carPlaceholder">All carriers</span></div>
@@ -568,6 +579,11 @@
         <div>
           <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Customer PO</div>
           <input type="text" id="filterCustPO" placeholder="contains…" style="width:100%;" />
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Ship To</div>
+          <input type="text" id="filterShipTo" placeholder="contains…" style="width:100%;"
+                 title="Matches the whole Ship To line as the column shows it &mdash; name, contact, street, suburb, state and postcode &mdash; so a search can span two of them (e.g. &quot;Southport, QLD&quot;)." />
         </div>
         <div>
           <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Description</div>
@@ -831,7 +847,11 @@ let _columns = [
   {key:'status',                   label:'Status',         vis:true,  money:false, date:false, qty:false, link:null, badge:true, pivotRole:'dim'},
   {key:'lg',                       label:'Location Group', vis:false, money:false, date:false, qty:false, link:null,           pivotRole:'dim'},
   {key:'salesman',                 label:'Sales Person',   vis:true,  money:false, date:false, qty:false, link:null,           pivotRole:'dim'},
-  {key:'shiptostate',              label:'Ship-To State',  vis:false, money:false, date:false, qty:false, link:null,           pivotRole:'dim'},
+  // Visible by default as of 2026-09-16, alongside the Ship-To State filter.
+  // See the shiptostateShown migration in loadSavedSettings — without it a
+  // saved layout from before today pins the column off and the new filter
+  // looks like it does nothing.
+  {key:'shiptostate',              label:'Ship-To State',  vis:true,  money:false, date:false, qty:false, link:null,           pivotRole:'dim'},
   // Ship-To address as one line: address name, contact, street, suburb,
   // state, postcode - built in SQL from the SO's own ship-to snapshot.
   {key:'shiptofull',               label:'Ship To',        vis:true,  money:false, date:false, qty:false, link:null, truncate:true, pivotRole:'dim'},
@@ -872,6 +892,11 @@ let _custList = [], _prodList = [], _lgList = [], _salList = [], _qbList = [];
 let _selCust = new Set(), _selProd = new Set(), _selLg = new Set(), _selSal = new Set(), _selQb = new Set();
 let _uomList = [], _carList = [];
 let _selUom = new Set(), _selCar = new Set();
+// Ship-to state. Keyed by stateconst.id, NOT the code: `code` is not unique
+// (this database alone has NT and WA twice — Northern Territory / Northwest
+// Territories, and Washington / Western Australia), so filtering on the code
+// would silently pull in the other country's state.
+let _stateList = [], _selState = new Set();
 let _soCFNames = [], _soiCFNames = [];
 let _selSoCF = new Set(), _selSoiCF = new Set();
 let _soCFValuesList = [], _selSoCFValues = new Set();
@@ -938,18 +963,18 @@ let _savedPresets = [];   // [{name, cfg}] — loaded from settings.
 
    ORG-WIDE SHARING. There is no API to write into another user's settings, so
    an admin cannot push straight into someone's account. Instead the admin
-   PUBLISHES a set of views into the report-scoped shared blob
-   (saveReportData — one payload per report, readable by every user) stamped
+   PUBLISHES a set of views into the shared blob (FBLib.SharedData — one
+   payload readable by every user) stamped
    with a revision number. On load, each user's report compares that revision
    with its own `viewsAdoptedRev` and COPIES across any view it does not
    already hold under that name — additive, never destructive. The admin reset
    is the same trick in reverse: a `viewsReset` revision each user's report
    acknowledges exactly once by clearing its own list.
 
-   CAVEAT: loadReportData/saveReportData only work on a SAVED report. In the
-   BI Script Editor preview they no-op, so the publish/reset buttons would
-   appear to work and change nothing — hence writeSharedBlob() reads the
-   payload back and the admin gets told when it didn't stick. */
+   The payload lives in FBLib.SharedData (an admin-published userproperties
+   row), not report data, so publishing works in the BI Script Editor too.
+   writeSharedBlob() still reads the payload back and the admin is told when
+   it didn't stick. */
 let _savedViews      = [];    // [{id, name, filters, viewMode, shared, savedAt}]
 let _viewsAdoptedRev = 0;     // highest published share revision merged in
 let _viewsResetAck   = 0;     // highest admin reset revision applied
@@ -980,6 +1005,7 @@ const _FILTER_SETS = [
   {key:'selItemType',    get: () => _selItemType,    ms:'itype-ms'},
   {key:'selUom',         get: () => _selUom,         ms:'uom-ms'},
   {key:'selCar',         get: () => _selCar,         ms:'car-ms'},
+  {key:'selState',       get: () => _selState,       ms:'state-ms'},
   {key:'selQb',          get: () => _selQb,          ms:'qb-ms'},
   {key:'selSoCF',        get: () => _selSoCF,        ms:'cfso-ms'},
   {key:'selSoiCF',       get: () => _selSoiCF,       ms:'cfsoi-ms'},
@@ -990,7 +1016,7 @@ const _FILTER_SETS = [
    here because their text doubles as a SQL LIKE value for the CF filters. */
 const _FILTER_INPUTS = [
   'dateField', 'dateRange', 'dateFrom', 'dateTo',
-  'filterSoNum', 'filterCustPO', 'filterSoDesc', 'filterOrderNote', 'filterSoNote',
+  'filterSoNum', 'filterCustPO', 'filterShipTo', 'filterSoDesc', 'filterOrderNote', 'filterSoNote',
   'cfsovalSearch', 'cfsoivalSearch',
 ];
 
@@ -1031,40 +1057,36 @@ function applyFilterState(f, syncWidgets) {
   if (f.dateRange && f.dateRange !== 'custom') applyDateRange(f.dateRange);
 }
 
-/* ── SHARED (ORG-WIDE) BLOB ──
-   One JSON payload per SAVED report, identical for every user. Read once per
-   load and cached; every write MERGES onto the cached object because
-   saveReportData REPLACES the whole payload. */
-let _sharedBlob = null, _sharedRead = false;
+const SHARED_KEY = 'cdx.bi.soSummary.shared.v1';
 
+/* ── SHARED (ORG-WIDE) BLOB ──
+   One JSON payload every user reads and an admin writes, held in
+   FBLib.SharedData under 'cdx.bi.soSummary.shared.v1'.
+
+   It used to live in report data (loadReportData/saveReportData). That only
+   works on a SAVED report: in the BI Script Editor, which previews with report
+   id -1, the first read raised the client's native "Loading data is only
+   available on reports" modal and the publish was a silent no-op — the admin
+   pressed Share, saw no error, and nothing reached any other user.
+
+   SharedData caches the read for the load, so calling readSharedBlob() from
+   several places costs one query. Every write still MERGES onto the current
+   payload because a write replaces the whole value. */
 function readSharedBlob() {
-  if (_sharedRead) return _sharedBlob;
-  _sharedRead = true;
-  _sharedBlob = {};
   try {
-    if (typeof loadReportData === 'function') {
-      const raw = loadReportData();
-      if (raw) { const o = JSON.parse(raw); if (o && typeof o === 'object') _sharedBlob = o; }
-    }
-  } catch(e) { console.warn('loadReportData unavailable (unsaved report?)', e); }
-  return _sharedBlob;
+    if (window.FBLib && FBLib.SharedData) return FBLib.SharedData.readJson(SHARED_KEY, {}) || {};
+  } catch (e) { console.warn('shared blob unavailable', e); }
+  return {};
 }
 
-/* Returns true only when the payload verifiably round-tripped to the server.
-   An in-memory success proves nothing: saveReportData is a silent no-op on an
-   unsaved report / editor preview, which is exactly the case an admin needs
-   warning about. */
+/* Returns true only when the payload verifiably round-tripped to the server —
+   SharedData.write re-reads it. An in-memory success proves nothing, which is
+   exactly the trap the old report-data write set for an admin in preview. */
 function writeSharedBlob(next) {
-  _sharedBlob = next; _sharedRead = true;
   try {
-    if (typeof saveReportData !== 'function' || typeof loadReportData !== 'function') return false;
-    saveReportData(JSON.stringify(next));
-    const raw  = loadReportData();
-    const disk = raw ? JSON.parse(raw) : null;
-    if (!disk) return false;
-    return JSON.stringify(disk.soViews || null)      === JSON.stringify(next.soViews || null) &&
-           JSON.stringify(disk.soViewsReset || null) === JSON.stringify(next.soViewsReset || null);
-  } catch(e) { console.warn('saveReportData failed', e); return false; }
+    if (!(window.FBLib && FBLib.SharedData)) return false;
+    return FBLib.SharedData.writeJson(SHARED_KEY, next, { adminOnly: true });
+  } catch (e) { console.warn('shared blob write failed', e); return false; }
 }
 
 /* Reconcile this user's list against what the admin has published. Runs once
@@ -1093,7 +1115,8 @@ function syncOrgViews() {
       have.add(k);
       _savedViews.push({
         id: newViewId(), name: String(v.name), filters: v.filters,
-        viewMode: v.viewMode || 'flat', shared: true, savedAt: pub.at || ''
+        viewMode: v.viewMode || 'flat', pivot: v.pivot || null, expandAll: !!v.expandAll,
+        shared: true, savedAt: pub.at || ''
       });
     });
     _viewsAdoptedRev = Number(pub.rev);
@@ -1137,7 +1160,7 @@ async function init() {
   buildCFValueMS('cfsoival', () => _selSoiCF, 'soitem',
     () => _soiCFValuesList, v => { _soiCFValuesList = v; }, () => _selSoiCFValues);
 
-  await Promise.all([populateLG(), populateQBClass(), populateSalesman(), populateCust(), populateProd(), populateUOM(), populateCar(), populateItemType()]);
+  await Promise.all([populateLG(), populateQBClass(), populateSalesman(), populateCust(), populateProd(), populateUOM(), populateCar(), populateState(), populateItemType()]);
 
   buildColPanel();
   // Saved-views drawer + header picker. registerDrawer only manages the
@@ -1174,7 +1197,7 @@ async function init() {
     if (!cw.contains(e.target)) document.getElementById('colPanel').classList.add('hidden');
   });
 
-  runQuery();
+  refreshData();
 }
 
 /* ── FILTERS TOGGLE ── */
@@ -1229,16 +1252,16 @@ function wireFilterHelp() {
 
 /* ── AUTO-APPLY ── */
 const _autoApplyIds = [
-  'filterSoNum', 'filterCustPO', 'filterSoDesc', 'filterOrderNote', 'filterSoNote',
+  'filterSoNum', 'filterCustPO', 'filterShipTo', 'filterSoDesc', 'filterOrderNote', 'filterSoNote',
   'dateFrom', 'dateTo', 'dateField',
 ];
 function autoApply() {
-  // Suppress before dropdowns finish populating; init() does the first runQuery().
+  // Suppress before dropdowns finish populating; init() does the first refreshData().
   if (!_custList.length) return;
   // …and while a saved view is being applied — that writes a dozen fields and
   // fires one query of its own at the end.
   if (_suppressAutoApply) return;
-  runQuery();
+  refreshData();
 }
 function wireAutoApply() {
   for (const id of _autoApplyIds) {
@@ -1362,6 +1385,17 @@ function loadSavedSettings() {
       const extras    = _columns.filter(c => !savedMap[c.key]);
       _columns = [...reordered, ...extras];
       _columns.forEach(c => { if (savedMap[c.key]) c.vis = savedMap[c.key].vis; });
+
+      // Ship-To State became visible by default on 2026-09-16, but a layout
+      // saved before then carries vis:false and would pin it off — so the new
+      // filter would appear to do nothing for exactly the people who already
+      // use this report. Force it on once, record that we have, and after that
+      // the user's own choice stands. Deliberately NOT a settings-key bump,
+      // which would discard their column order and widths too.
+      if (!s.shiptostateShown) {
+        const st = _columns.find(c => c.key === 'shiptostate');
+        if (st) st.vis = true;
+      }
     }
     // Column widths — kept only for columns that still exist, so a width
     // saved against a since-removed custom field doesn't linger.
@@ -1397,7 +1431,8 @@ function loadSavedSettings() {
         .filter(v => v && v.name && v.filters)
         .forEach(v => _savedViews.push({
           id: v.id || newViewId(), name: String(v.name), filters: v.filters,
-          viewMode: v.viewMode || 'flat', shared: !!v.shared, savedAt: v.savedAt || ''
+          viewMode: v.viewMode || 'flat', pivot: v.pivot || null, expandAll: !!v.expandAll,
+          shared: !!v.shared, savedAt: v.savedAt || ''
         }));
     }
     _viewsAdoptedRev = Number(s.viewsAdoptedRev) || 0;
@@ -1408,6 +1443,9 @@ function loadSavedSettings() {
 function saveCurrentSettings() {
   const s = Object.assign({ v: 1 }, captureFilterState(), {
     cols:       _columns.map(c => ({key:c.key, vis:c.vis})),
+    // Marks the Ship-To State default-visible migration as applied — see
+    // loadSavedSettings. Once set, the user's own visibility choice wins.
+    shiptostateShown: true,
     colWidths:  _colWidths,
     viewMode:   _viewMode,
     pivot:      Object.assign({}, _pivotCfg),
@@ -1479,9 +1517,92 @@ function _viewKey(f) {
    mode still match. Switching Flat → Pivot has to drop the picker to "Custom
    (unsaved)" too, or the header keeps claiming you're looking at the saved
    version when you aren't. */
+/* ---- WHAT A SAVED VIEW REMEMBERS BEYOND ITS FILTERS ----
+   A view used to record only `viewMode`. Applying a saved PIVOT view therefore
+   put the report back into pivot mode and then showed whatever rows / columns /
+   measure happened to be on screen: the saved pivot was silently lost. The
+   pivot config travels with the view now.
+
+   The expand/collapse state rides along too, as a BOOLEAN rather than the set
+   of expanded group keys. The keys are worthless to a saved view -- the refresh
+   clears them and the next query returns different groups anyway -- so the only
+   durable question is "does this view open expanded or collapsed?".
+
+   Views saved before this change carry neither key. They are treated as "no
+   opinion": the mode is restored, nothing else is touched, and they still
+   match in the picker. */
+function capturePivotCfg() {
+  return Object.assign({}, _pivotCfg);
+}
+
+function applyPivotCfg(cfg) {
+  if (!cfg || typeof cfg !== 'object') return;
+  Object.assign(_pivotCfg, cfg);
+  syncPivotBarFromCfg();
+}
+
+/* Push _pivotCfg into the pivot bar's own controls. Shared with
+   _applyPresetById, which needs exactly the same DOM sync. */
+function syncPivotBarFromCfg() {
+  const set = (id, val) => { const el = document.getElementById(id); if (el) el.value = val; };
+  set('pivotRowDim',     _pivotCfg.rowDim || '');
+  set('pivotRowDim2',    _pivotCfg.rowDim2 || '');
+  set('pivotColDim',     _pivotCfg.colDim || '');
+  set('pivotRowBucket',  _pivotCfg.rowBucket || 'month');
+  set('pivotRowBucket2', _pivotCfg.rowBucket2 || 'month');
+  set('pivotColBucket',  _pivotCfg.colBucket || 'month');
+  set('pivotMeasure',    _pivotCfg.measure);
+  set('pivotAgg',        _pivotCfg.agg);
+  const rt = document.getElementById('pivotShowRowTotals');
+  if (rt) rt.checked = !!_pivotCfg.showRowTotals;
+  const ct = document.getElementById('pivotShowColTotals');
+  if (ct) ct.checked = !!_pivotCfg.showColTotals;
+  _updatePivotBucketVisibility();
+  _renderPresetDropdown();
+}
+
+/* The pivot / expansion detail for a view's one-line summary. Two pivot views
+   differ by their pivot, not their filters, so without this the drawer shows
+   several identical-looking rows called "Pivot". */
+function _viewModeDetail(v) {
+  let out = '';
+  if (v.viewMode === 'pivot' && v.pivot) {
+    const lbl = k => (_columns.find(c => c.key === k) || {}).label || k;
+    const bits = [lbl(v.pivot.rowDim)];
+    if (v.pivot.rowDim2) bits.push('→ ' + lbl(v.pivot.rowDim2));
+    if (v.pivot.colDim)  bits.push('× ' + lbl(v.pivot.colDim));
+    const mea = v.pivot.measure === '__count__' ? 'Row count' : lbl(v.pivot.measure);
+    out += ': ' + bits.join(' ') + ' — ' + (v.pivot.agg || 'sum') + ' of ' + mea;
+  }
+  if (v.viewMode !== 'flat' && v.viewMode !== 'pivot' && v.expandAll) out += ', expanded';
+  return out;
+}
+
+/* Grouped modes only. Partially expanded counts as collapsed. */
+function captureExpandAll() {
+  if (_viewMode === 'flat' || _viewMode === 'pivot') return false;
+  return _groups.length > 0 && _expanded.size === _groups.length;
+}
+
 function _findMatchingView() {
   const k = _viewKey(captureFilterState());
-  const v = _savedViews.find(x => _viewKey(x.filters) === k && (x.viewMode || 'flat') === _viewMode);
+  const liveCfg = _cfgKey(_pivotCfg);
+  const v = _savedViews.find(x => {
+    if (_viewKey(x.filters) !== k) return false;
+    if ((x.viewMode || 'flat') !== _viewMode) return false;
+    // In pivot mode the pivot IS the report, so a view stops being the one on
+    // screen the moment the rows / columns / measure change. A view saved
+    // before the pivot config was captured has no opinion, so it still matches.
+    if (_viewMode === 'pivot' && x.pivot) return _cfgKey(x.pivot) === liveCfg;
+    // Grouped modes: collapsing an all-expanded view is a real change to the
+    // view, so it must drop the picker to Custom -- otherwise the drawer's
+    // Update button stays disabled and the change cannot be saved. Expanding
+    // ONE group does not flip this, so ordinary browsing never disturbs it.
+    if (_viewMode !== 'flat' && _viewMode !== 'pivot' && x.expandAll !== undefined) {
+      return !!x.expandAll === captureExpandAll();
+    }
+    return true;
+  });
   return v ? v.id : '';
 }
 
@@ -1507,18 +1628,31 @@ async function applySavedView(id) {
   if (!id) return;                                     // "Custom" / placeholder
   const v = _savedViews.find(x => x.id === id);
   if (!v) return;
+  // Get out of the way FIRST. The drawer is a full-width overlay sitting on top
+  // of the table, so applying from its Apply button used to look like it did
+  // nothing at all: the view was applied correctly underneath, the user just
+  // could not see any of it. Closing first also means the spinner and the rows
+  // arriving are visible, which is the feedback that the click registered.
+  // (Harmless when the caller is the header picker -- already closed.)
+  try { FBLib.Common.closeDrawer('viewsDrawer'); } catch (_) {}
   // One re-run at the end: applyFilterState writes a dozen fields and can call
   // applyDateRange, each of which would otherwise fire its own query.
   _suppressAutoApply = true;
   try {
     applyFilterState(v.filters, true);
+    // Before setViewMode: switching INTO pivot renders immediately, and it
+    // must render the view's own pivot rather than the one already on screen.
+    applyPivotCfg(v.pivot);
     if (v.viewMode) setViewMode(v.viewMode);
   } finally {
     _suppressAutoApply = false;
   }
   // Awaited so the confirmation isn't immediately overwritten by runQuery's
   // own row count.
-  await runQuery();
+  await refreshData();
+  // Strictly after the query: the refresh rebuilds _groups and clears
+  // _expanded, so expanding any earlier would be undone.
+  if (v.expandAll) expandAll();
   renderViewsDrawer();
   setStatus('View applied: ' + v.name + (_statusSuffix ? ' — ' + _statusSuffix : ''));
 }
@@ -1533,7 +1667,8 @@ function saveCurrentView() {
   }
   const rec = {
     id: newViewId(), name: name, filters: captureFilterState(),
-    viewMode: _viewMode, shared: false, savedAt: new Date().toISOString()
+    viewMode: _viewMode, pivot: capturePivotCfg(), expandAll: captureExpandAll(),
+    shared: false, savedAt: new Date().toISOString()
   };
   const idx = _savedViews.findIndex(v => String(v.name).toLowerCase() === name.toLowerCase());
   if (idx >= 0) {
@@ -1561,6 +1696,8 @@ function updateViewFromCurrent(id) {
       !confirm('Update "' + v.name + '" to the filters currently set?\n\nThe view\'s saved filters are replaced.')) return;
   v.filters  = captureFilterState();
   v.viewMode = _viewMode;
+  v.pivot    = capturePivotCfg();
+  v.expandAll = captureExpandAll();
   v.shared   = false;
   v.savedAt  = new Date().toISOString();
   persistViews();
@@ -1613,19 +1750,20 @@ function _viewSummary(v) {
   const counts = [
     [f.selCust, 'customer'], [f.selProd, 'product'], [f.selSal, 'sales person'],
     [f.selLg, 'loc. group'], [f.selCar, 'carrier'], [f.selQb, 'QB class'],
-    [f.selUom, 'UOM'], [f.selItemType, 'item type'],
+    [f.selUom, 'UOM'], [f.selItemType, 'item type'], [f.selState, 'ship-to state'],
   ];
   counts.forEach(([arr, label]) => {
     const n = (arr || []).length;
     if (n) parts.push(n + ' ' + label + (n === 1 ? '' : 's'));
   });
-  const texts = ['filterSoNum','filterCustPO','filterSoDesc','filterOrderNote','filterSoNote']
+  const texts = ['filterSoNum','filterCustPO','filterShipTo','filterSoDesc','filterOrderNote','filterSoNote']
     .filter(k => (f[k] || '').trim()).length;
   if (texts) parts.push(texts + ' text filter' + (texts === 1 ? '' : 's'));
   const cfs = ((f.selSoCF || []).length + (f.selSoiCF || []).length);
   if (cfs) parts.push(cfs + ' custom field' + (cfs === 1 ? '' : 's'));
   const MODE_LABEL = {flat:'Flat', byso:'By SO', bycustomer:'By Customer', byproduct:'By Product', pivot:'Pivot'};
-  parts.push(MODE_LABEL[v.viewMode] || 'Flat');
+  let mode = (MODE_LABEL[v.viewMode] || 'Flat') + _viewModeDetail(v);
+  parts.push(mode);
   return parts.join(' · ');
 }
 
@@ -1672,6 +1810,9 @@ function renderViewsDrawer() {
     apply.className = 'btn btn-sm';
     apply.textContent = v.id === activeId ? 'Active' : 'Apply';
     apply.disabled = (v.id === activeId);
+    apply.title = v.id === activeId
+      ? 'This view is already on screen'
+      : 'Apply "' + v.name + '" and close this drawer';
     apply.addEventListener('click', () => applySavedView(v.id));
 
     // Overwrite this view with whatever the filter panel currently holds.
@@ -1723,14 +1864,29 @@ function renderViewsDrawer() {
     }
   }
 
-  // The shared layer needs a SAVED report. Say so up front rather than letting
-  // an admin publish into the void from the BI Script Editor preview.
+  // The shared layer needs runQuery + saveSettings (FBLib.SharedData). Say so up
+  // front rather than letting an admin publish into the void.
   const warn = document.getElementById('viewsShareWarn');
   if (warn) {
-    const noStore = (typeof saveReportData !== 'function' || typeof loadReportData !== 'function');
+    // Name the missing piece. "it needs fb-lib + runQuery" sent people
+    // reinstalling an fb-lib they already had: the usual cause is an fb-lib
+    // that predates FBLib.SharedData still being INLINED in this report,
+    // because the directives only expand when the REPORT is saved. Updating
+    // the Script alone changes nothing until each report is re-saved.
+    const missing = [];
+    if (!window.FBLib) missing.push('FBLib');
+    else if (!FBLib.SharedData) missing.push('FBLib.SharedData (the fb-lib inlined here is too old)');
+    if (typeof runQuery !== 'function') missing.push('runQuery()');
+    const noStore = missing.length > 0;
     warn.style.display = noStore ? '' : 'none';
-    if (noStore) warn.textContent = 'Sharing is unavailable in this context — it needs the report-data ' +
-      'store, which only exists on a report SAVED in Fishbowl.';
+    if (noStore) {
+      warn.textContent = 'Sharing is unavailable — missing: ' + missing.join(' and ') + '. ' +
+        (missing.join(' ').indexOf('SharedData') !== -1
+          ? 'Save a Script named exactly "fb-lib" with the current contents of scripts/fb-lib.js, ' +
+            'then RE-SAVE this report — the include only re-expands when the report is saved. ' +
+            'Your own saved views are unaffected either way.'
+          : 'Your own saved views are unaffected; only org-wide sharing needs this.');
+    }
   }
 }
 
@@ -1746,7 +1902,7 @@ function adminShareViews() {
       'Each user picks them up the next time they open this report. A view they already have under the ' +
       'same name is left untouched, and nothing is removed from their list.')) return;
 
-  // MERGE onto the current shared payload — saveReportData replaces the whole
+  // MERGE onto the current shared payload — a write replaces the whole
   // thing, so anything else stored there would be lost by a blind write.
   const next = Object.assign({}, readSharedBlob());
   const rev  = Number((next.soViews || {}).rev || 0) + 1;
@@ -1756,7 +1912,8 @@ function adminShareViews() {
     rev: rev,
     at:  new Date().toISOString(),
     by:  by,
-    views: _savedViews.map(v => ({name: v.name, filters: v.filters, viewMode: v.viewMode}))
+    views: _savedViews.map(v => ({name: v.name, filters: v.filters, viewMode: v.viewMode,
+                                 pivot: v.pivot, expandAll: v.expandAll}))
   };
   const stuck = writeSharedBlob(next);
 
@@ -1869,6 +2026,21 @@ async function populateCar() {
   FBLib.Common.MultiSelect.get('car-ms').setItems(_carList);
 }
 
+// Only the states that actually appear on a sales order — the full
+// stateconst table is 80 rows of mostly-unused US/CA/AU entries. The label
+// carries the name as well as the code because the code alone is ambiguous
+// (see the _selState note above); the VALUE is the id, so the filter is exact.
+async function populateState() {
+  const rows = await qp(`SELECT DISTINCT sc.id, sc.code, sc.name
+    FROM so INNER JOIN stateconst sc ON sc.id = so.shiptostateid
+    WHERE sc.code IS NOT NULL ORDER BY sc.code, sc.name LIMIT 300`);
+  _stateList = rows.map(r => ({
+    val: String(r.id),
+    lbl: r.name && String(r.name) !== String(r.code) ? r.code + ' — ' + r.name : String(r.code)
+  }));
+  FBLib.Common.MultiSelect.get('state-ms').setItems(_stateList);
+}
+
 async function populateItemType() {
   const rows = await qp(`SELECT id, name FROM soitemtype ORDER BY name`);
   _itemTypeList = rows.map(r => ({val:String(r.id), lbl:r.name}));
@@ -1927,6 +2099,7 @@ function _createFilterMS() {
     { id: 'itype-ms',  sel: _selItemType, ph: 'All types' },
     { id: 'uom-ms',    sel: _selUom,      ph: 'All UOMs' },
     { id: 'car-ms',    sel: _selCar,      ph: 'All carriers' },
+    { id: 'state-ms',  sel: _selState,    ph: 'All states' },
     { id: 'qb-ms',     sel: _selQb,       ph: 'All classes' },
     { id: 'cfso-ms',   sel: _selSoCF,     ph: 'Select fields', items: _soCFNames.map(n => ({val:n, lbl:n})) },
     { id: 'cfsoi-ms',  sel: _selSoiCF,    ph: 'Select fields', items: _soiCFNames.map(n => ({val:n, lbl:n})) },
@@ -2096,6 +2269,27 @@ function buildSQL() {
   const lgIds = getLocationGroupList();
   const safeDF = DATE_FIELDS_OK.has(df) ? df : 'so.datefirstship';
 
+  // Ship-To as one readable line. CONCAT_WS drops NULL parts, so each part is
+  // NULLIF-ed to NULL when blank; the contact is skipped when it just repeats
+  // the address name, and an embedded newline in the street becomes ', '.
+  //
+  // Held in ONE place because the Ship To filter has to match exactly what the
+  // column displays. MySQL will not take a SELECT alias in WHERE, and testing
+  // the underlying columns separately would miss anything spanning two of them
+  // — searching "Southport, QLD" crosses city into state and would find
+  // nothing. Repeating the expression costs nothing: the optimiser evaluates it
+  // per row either way.
+  const shipToExpr = `NULLIF(CONCAT_WS(', ',
+    NULLIF(TRIM(so.shiptoname), ''),
+    NULLIF(TRIM(CASE WHEN TRIM(COALESCE(so.customercontact, '')) <> ''
+                      AND TRIM(COALESCE(so.customercontact, '')) <> TRIM(COALESCE(so.shiptoname, ''))
+                     THEN so.customercontact END), ''),
+    NULLIF(TRIM(REPLACE(REPLACE(COALESCE(so.shiptoaddress, ''), CHAR(13), ''), CHAR(10), ', ')), ''),
+    NULLIF(TRIM(so.shiptocity), ''),
+    NULLIF(TRIM(stateconst.code), ''),
+    NULLIF(TRIM(so.shiptozip), '')
+  ), '')`;
+
   const where = [`so.statusid IN (${statuses.join(',')})`];
 
   const selLgIds = _selLg.size > 0
@@ -2129,6 +2323,10 @@ function buildSQL() {
   const custPOFilter = (document.getElementById('filterCustPO')?.value || '').trim();
   if (custPOFilter) where.push(`so.customerpo LIKE '%${escSQL(custPOFilter)}%'`);
 
+  // Filters the ASSEMBLED line, not the parts — see shipToExpr above.
+  const shipToFilter = (document.getElementById('filterShipTo')?.value || '').trim();
+  if (shipToFilter) where.push(`${shipToExpr} LIKE '%${escSQL(shipToFilter)}%'`);
+
   const soDescFilter = (document.getElementById('filterSoDesc')?.value || '').trim();
   if (soDescFilter) where.push(`soitem.description LIKE '%${escSQL(soDescFilter)}%'`);
 
@@ -2149,6 +2347,13 @@ function buildSQL() {
 
   if (_selCar.size > 0) {
     where.push(`carrier.name IN (${[..._selCar].map(v => `'${escSQL(v)}'`).join(',')})`);
+  }
+
+  // By stateconst.id rather than the code — see the _selState note. Filters
+  // so.shiptostateid directly, so it never has to reach through the LEFT JOIN.
+  if (_selState.size > 0) {
+    const stIds = [..._selState].map(v => parseInt(v, 10)).filter(n => !isNaN(n));
+    if (stIds.length) where.push(`so.shiptostateid IN (${stIds.join(',')})`);
   }
 
   const cfSoText   = (document.getElementById('cfsovalSearch')?.value  || '').trim();
@@ -2195,19 +2400,7 @@ function buildSQL() {
   so.salesman AS salesman,
   qbclass.name AS class,
   stateconst.code AS shiptostate,
-  -- Ship-To as one readable line. CONCAT_WS drops NULL parts, so each part is
-  -- NULLIF-ed to NULL when blank; the contact is skipped when it just repeats
-  -- the address name, and an embedded newline in the street becomes ', '.
-  NULLIF(CONCAT_WS(', ',
-    NULLIF(TRIM(so.shiptoname), ''),
-    NULLIF(TRIM(CASE WHEN TRIM(COALESCE(so.customercontact, '')) <> ''
-                      AND TRIM(COALESCE(so.customercontact, '')) <> TRIM(COALESCE(so.shiptoname, ''))
-                     THEN so.customercontact END), ''),
-    NULLIF(TRIM(REPLACE(REPLACE(COALESCE(so.shiptoaddress, ''), CHAR(13), ''), CHAR(10), ', ')), ''),
-    NULLIF(TRIM(so.shiptocity), ''),
-    NULLIF(TRIM(stateconst.code), ''),
-    NULLIF(TRIM(so.shiptozip), '')
-  ), '') AS shiptofull,
+  ${shipToExpr} AS shiptofull,
   COALESCE(product.num, soitem.productnum) AS productnum,
   soitem.description AS description,
   uom.code AS uomcode,
@@ -2281,7 +2474,7 @@ ORDER BY customer.name, LENGTH(so.num), so.num, soitem.id
 LIMIT 10000`;
 }
 
-async function runQuery() {
+async function refreshData() {
   const sql = buildSQL();
   // Every filter change funnels through here, so this is where the Views
   // picker re-syncs — a hand-edited filter drops it to "Custom (unsaved)".
@@ -2303,6 +2496,10 @@ async function runQuery() {
     }
     setStatus(_statusSuffix);
     renderTable();
+    // AGAIN, deliberately. The call at the top of this function runs before
+    // _groups is rebuilt and _expanded is cleared, so it judges the picker on
+    // the PREVIOUS query's expand state.
+    renderViewPicker();
   } catch(e) {
     setStatus('Error: ' + (e.message || String(e)));
     console.error(e);
@@ -2832,6 +3029,7 @@ function buildGroupHeader(g, vis) {
   tr.addEventListener('click', () => {
     if (_expanded.has(g.groupKey)) _expanded.delete(g.groupKey); else _expanded.add(g.groupKey);
     renderBody(_columns.filter(c => c.vis));
+    renderViewPicker();
   });
   return tr;
 }
@@ -2842,8 +3040,8 @@ function soSortBy(key) {
   renderTable();
 }
 
-function expandAll()   { _groups.forEach(g => _expanded.add(g.groupKey)); renderBody(_columns.filter(c=>c.vis)); }
-function collapseAll() { _expanded.clear();                                 renderBody(_columns.filter(c=>c.vis)); }
+function expandAll()   { _groups.forEach(g => _expanded.add(g.groupKey)); renderBody(_columns.filter(c=>c.vis)); renderViewPicker(); }
+function collapseAll() { _expanded.clear();                                 renderBody(_columns.filter(c=>c.vis)); renderViewPicker(); }
 
 function setViewMode(mode) {
   _viewMode = mode;
@@ -3327,16 +3525,8 @@ function _applyPresetById(id) {
   }
   if (!cfg) return;
   Object.assign(_pivotCfg, cfg);
-  document.getElementById('pivotRowDim').value     = _pivotCfg.rowDim || '';
-  document.getElementById('pivotRowDim2').value    = _pivotCfg.rowDim2 || '';
-  document.getElementById('pivotColDim').value     = _pivotCfg.colDim || '';
-  document.getElementById('pivotRowBucket').value  = _pivotCfg.rowBucket || 'month';
-  document.getElementById('pivotRowBucket2').value = _pivotCfg.rowBucket2 || 'month';
-  document.getElementById('pivotColBucket').value  = _pivotCfg.colBucket || 'month';
-  document.getElementById('pivotMeasure').value    = _pivotCfg.measure;
-  document.getElementById('pivotAgg').value        = _pivotCfg.agg;
-  _updatePivotBucketVisibility();
-  _renderPresetDropdown();
+  syncPivotBarFromCfg();
+  renderViewPicker();        // a preset change can leave the saved view behind
   if (_viewMode === 'pivot') renderPivot();
 }
 
@@ -3474,6 +3664,7 @@ function _onPivotConfigChange() {
   }
   _updatePivotBucketVisibility();
   _renderPresetDropdown();   // hand-editing drops the preset menu to "Custom"
+  renderViewPicker();        // ...and can drop the saved VIEW to "Custom" too
   if (_viewMode === 'pivot') renderPivot();
 }
 
@@ -3675,9 +3866,19 @@ function printTable() {
 function showSpinner() { document.getElementById('loadingOverlay').style.display = 'block'; }
 function hideSpinner() { document.getElementById('loadingOverlay').style.display = 'none'; }
 
+/* Run a SELECT, preferring the async built-in and falling back to the sync one.
+   NOTE the report's own refresh function is called refreshData(), NOT
+   runQuery() — the name below must reach Fishbowl's BUILT-IN runQuery. It used
+   to be shadowed by the refresh function, so the moment runQueryAsync rejected
+   (any SQL error) this fallback re-entered the report: qp -> runQuery ->
+   qp -> ... until the stack blew, firing ~190 repeat queries and presenting a
+   simple "unknown column" as a frozen report with no message. */
 async function qp(sql) {
   try { return normalise(await runQueryAsync(sql)); }
-  catch(e) { try { return normalise(runQuery(sql)); } catch(e2) { throw e2; } }
+  catch(e) {
+    if (typeof runQuery !== 'function') throw e;
+    return normalise(runQuery(sql));
+  }
 }
 function normalise(r) {
   if (r == null) return [];

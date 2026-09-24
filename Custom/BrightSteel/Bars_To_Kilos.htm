@@ -1,0 +1,1888 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  REPORT: Bright Steel — Bars to Kilos
+  PATH:   Custom/BrightSteel/Bars_To_Kilos.htm
+  --------------------------------------------------------------------------------
+  Bright Steel sell steel BY THE KILO but customers order BY THE BAR. This is
+  the quoting screen for that gap: pick a product, type a bar count, read the
+  kilos — broken down by BATCH, because each batch was cut to its own average
+  length and therefore weighs a different amount per bar.
+
+      kg for N bars  =  N  x  Avg Length (m of the batch)  x  Kg per Metre (of the part)
+
+  So 5 bars of batch MM7 at 5.82 m is not the same weight as 5 bars of batch
+  AS13 at 5.08 m, and the quote has to say which batch it was priced from.
+  Each row carries a COPY button that puts a ready-made line note on the
+  clipboard ("5 bars - Batch MM7 @ 5.82 m = 22.14 kg") for the sales order, so
+  the warehouse picks the batch the quote was based on.
+
+  WHERE THE THREE NUMBERS COME FROM
+    Kg per Metre   a PART CUSTOM FIELD, named "Weight per Meter" at Bright
+                   Steel. Constant for the part (it is a function of diameter
+                   and grade), so it lives on the part, not the batch. The
+                   field is auto-detected by name — any field naming both a
+                   weight and a length — and can be overridden in
+                   Settings > Fields.
+    Batch          a TEXT tracking field (parttracking.typeId = 10) whose
+                   value is held per tag in `trackingtext`. Named "Batch
+                   Number" at Bright Steel.
+    Avg Length     a DECIMAL tracking field (parttracking.typeId 50 or 60)
+                   whose value is held per tag in `trackingdecimal`. It is
+                   METRES PER BAR. Named "Length" at Bright Steel.
+    Both tracking fields are auto-detected from the tracking types the part
+    actually carries, and can be overridden in Settings > Fields. Nothing is
+    hard-coded to a tracking id, because those differ per database.
+
+  QUANTITIES  (per part + location group, from tag x location in one pass)
+    On hand       SUM(tag.qty)                      for tag.typeId IN (30,40)
+    Committed     SUM(tag.qtyCommitted)             reserved on committed picks
+    Not available SUM(qty - qtyCommitted)           in locations with
+                                                    countedAsAvailable = 0 and
+                                                    location.typeId <> 100
+    Available     On hand - Committed - Not available, floored at 0
+  That is Fishbowl's own available-to-pick formula. "Allocated" (open order
+  demand) is deliberately NOT subtracted — it is demand, not reserved stock.
+  The quantity views (QTYONHAND etc.) are TEMPTABLE, so a partId filter does
+  not push down; the tag/location aggregation is reproduced inline instead.
+
+  BARS ON HAND is DERIVED — kg on hand / (kg per metre x avg length). It is an
+  estimate: bars are cut to an AVERAGE length and the real bar in the rack may
+  be a few centimetres either way. Treat it as "about this many".
+
+  SCOPE
+    All location groups the user can see by default, with an optional
+    location-group multi-select.
+
+  STATUS: desk-built against the Fishbowl schema. NOT yet exercised against a
+  live Bright Steel database — the part custom field and the two tracking
+  fields do not exist in any test database, so the auto-detection and the
+  Settings override both need a first run on site.
+
+  DEPLOY ORDER (re-save on the server, in this order, or the report breaks):
+    1. fb-styles  (Style  named exactly "fb-styles", source scripts/fb-styles.css)
+    2. fb-lib     (Script named exactly "fb-lib",    source scripts/fb-lib.js)
+    3. THIS report (the shared-asset directives only re-run on save)
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>- Sales - Bright Steel Bars to Kilos - Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+
+    <!-- Moment.js — date formatting parity with the rest of the suite
+         (FBLib.Common.formatDate prefers it when present). -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script>
+
+    <!-- Shared Fishbowl BI lib — inlined by Fishbowl from the saved "fb-lib"
+         Script. Source of truth: scripts/fb-lib.js. Provides FBLib.Common
+         (formatting, drawers, multi-select, debug drawer), FBLib.Settings,
+         FBLib.Table and FBLib.Export. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Shared Fishbowl BI stylesheet — inlined from the saved "fb-styles"
+         Style (scripts/fb-styles.css). MUST come BEFORE the inline block so
+         per-report rules win the cascade on identical selectors. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <style>
+        /* =====================================================
+           BASE + LAYOUT — tokens live in fb-styles; style new work off
+           var(--…), never a hardcoded hex.
+           ===================================================== */
+        * { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; height: 100%; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            font-size: 13px; color: var(--c-primary); background: var(--bg-1);
+            display: flex; flex-direction: column; min-height: 100vh;
+            padding-bottom: var(--debug-drawer-h, 0px);
+            transition: padding-bottom 0.12s ease;
+        }
+        header h1 { font-size: 16px; font-weight: 700; color: var(--c-primary); margin: 0; line-height: 1.15; }
+        #statusLine { font-size: 12px; color: var(--c-tertiary); line-height: 1.15; margin: 2px 0 0; }
+        .hdr-actions { display: flex; align-items: center; gap: 8px; }
+
+        /* =====================================================
+           INPUT BAR — always visible. This report IS its inputs, so they
+           never hide behind a drawer.
+           ===================================================== */
+        #inputBar {
+            display: flex; align-items: flex-end; flex-wrap: wrap; gap: 10px 14px;
+            background: #fff; border-bottom: 1px solid var(--border);
+            padding: 9px 20px; flex-shrink: 0;
+            /* An open .ms-dropdown or the part typeahead must escape the bar
+               rather than be clipped by it. */
+            position: relative; z-index: 30;
+        }
+        .fbar-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+        .fbar-field > label {
+            font-size: 10px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.05em; color: var(--c-secondary);
+        }
+        .fbar-field input[type=text] {
+            padding: 4px 8px; font-size: 12px; border: 1px solid var(--border-strong);
+            border-radius: 6px; background: #fff; font-family: inherit; color: #415157;
+            height: 28px;
+        }
+        .fbar-field input:focus {
+            outline: none; border-color: var(--color-primary);
+            box-shadow: 0 0 0 2px rgba(45,156,219,0.18);
+        }
+        .fbar-ms { width: 210px; }
+        .fbar-ms .ms-trigger { min-height: 28px; }
+        .fbar-btn {
+            height: 28px; padding: 0 11px; font-size: 12px; font-weight: 600;
+            border: 1px solid var(--border-strong); border-radius: 6px;
+            background: #fff; color: #415157; cursor: pointer; font-family: inherit;
+        }
+        .fbar-btn:hover { background: var(--bg-2); }
+        .fbar-spacer { flex: 1 1 auto; min-width: 8px; }
+
+        /* The part input is wide — a Bright Steel part number carries the
+           diameter and the grade, so 60px of box is useless. */
+        #partInput { width: 250px; }
+        /* Bars is deliberately type=text with inputmode, NOT type=number: the
+           spinner arrows land on top of the digits at this height. */
+        #barsInput { width: 88px; text-align: right; font-variant-numeric: tabular-nums;
+                     font-weight: 700; font-size: 14px; }
+
+        /* Typeahead popup under the part input. Mirrors the .ms-dropdown look
+           so the bar reads as one design system. */
+        .ac-wrap { position: relative; }
+        .ac-dropdown {
+            position: absolute; z-index: 700; top: calc(100% + 3px); left: 0;
+            min-width: 320px; max-width: 520px;
+            background: #fff; border: 1px solid var(--border-strong); border-radius: 7px;
+            box-shadow: var(--sh2); max-height: 320px; overflow-y: auto;
+        }
+        .ac-dropdown.hidden { display: none; }
+        .ac-item {
+            display: flex; align-items: baseline; gap: 9px;
+            padding: 6px 10px; cursor: pointer; font-size: 12px;
+            border-bottom: 1px solid var(--bg-1);
+        }
+        .ac-item:last-child { border-bottom: none; }
+        .ac-item:hover, .ac-item.active { background: var(--tint-blue); }
+        .ac-item .ac-label { font-weight: 700; color: var(--c-primary); white-space: nowrap; }
+        .ac-item .ac-sub   { color: var(--c-tertiary); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .ac-empty, .ac-loading { padding: 12px; color: var(--c-tertiary); font-size: 12px; text-align: center; }
+        .ac-loading { font-style: italic; }
+
+        /* =====================================================
+           PART BANNER — the head of the old paper card: size / grade /
+           kg per metre / what is in the racks right now.
+           ===================================================== */
+        #partBanner {
+            display: none; align-items: center; flex-wrap: wrap; gap: 0 26px;
+            background: var(--menu-bg); color: #fff;
+            padding: 9px 20px; flex-shrink: 0;
+        }
+        #partBanner.on { display: flex; }
+        .pb-main { display: flex; flex-direction: column; gap: 1px; margin-right: 8px; }
+        .pb-num  { font-size: 17px; font-weight: 800; letter-spacing: 0.01em; }
+        .pb-desc { font-size: 11.5px; color: #B7CBD4; }
+        .pb-stat { display: flex; flex-direction: column; align-items: flex-end; line-height: 1.2; }
+        .pb-stat .k {
+            font-size: 9.5px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.05em; color: #8FAEBB;
+        }
+        .pb-stat .v { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+        .pb-stat.hero .v { color: #7FD3F5; font-size: 19px; }
+        .pb-spacer { flex: 1 1 auto; }
+        /* A missing kg/m makes every kilo on the page wrong, so it is called
+           out on the banner itself rather than left to the status line. */
+        .pb-warn {
+            background: var(--acc-orange-bg); color: var(--acc-orange-con);
+            border: 1px solid var(--acc-orange); border-radius: var(--r-pill);
+            padding: 3px 11px; font-size: 11px; font-weight: 700; white-space: nowrap;
+        }
+
+        /* =====================================================
+           APP SHELL + TABLE — the classes FBLib.Table.init expects.
+           ===================================================== */
+        .app-shell { width: 100%; margin: 0; padding: 0; flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+        .fb-table-container { flex: 1 1 auto; min-height: 0; overflow: auto; background: #fff; }
+        table.fb-table { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
+        table.fb-table th {
+            background: var(--menu-bg); color: #fff; font-weight: 500;
+            padding: 0 10px; height: 32px; text-align: left; white-space: nowrap;
+            cursor: grab; user-select: none; position: sticky; top: 0; z-index: 10;
+            overflow: hidden; text-overflow: ellipsis;
+        }
+        table.fb-table th:active { cursor: grabbing; }
+        table.fb-table th:hover { background: #164A5F; }
+        table.fb-table th.sort-asc::after  { content: ' \2191'; opacity: 0.8; }
+        table.fb-table th.sort-desc::after { content: ' \2193'; opacity: 0.8; }
+        table.fb-table th.col-drag-over { background: #164A5F; border-left: 3px solid #CBE5FB; }
+        /* Everything worth filtering is in the bar above; hide the empty
+           per-column filter row FBLib.Table renders. */
+        table.fb-table tr.filter-row { display: none; }
+        table.fb-table td {
+            padding: 4px 10px; border-bottom: 1px solid var(--border); white-space: nowrap;
+            vertical-align: middle; overflow: hidden; text-overflow: ellipsis;
+        }
+        table.fb-table tr:nth-child(even) td { background: var(--bg-1); }
+        table.fb-table tr:hover td { background: var(--tint-blue) !important; }
+        .fb-col-resize { position: absolute; right: 0; top: 0; width: 6px; height: 100%; cursor: col-resize; user-select: none; }
+        .fb-col-resize:hover { background: rgba(255,255,255,0.3); }
+
+        .num-cell { text-align: right; font-variant-numeric: tabular-nums; }
+        .muted-cell { color: var(--c-tertiary); }
+        .batch-cell { font-weight: 700; color: var(--c-primary); letter-spacing: 0.02em; }
+        /* The answer column. One thing on this screen is what she came for. */
+        .quote-cell {
+            text-align: right; font-variant-numeric: tabular-nums;
+            font-weight: 800; font-size: 13px; color: var(--fb-blue-accent);
+        }
+        .quote-cell.short { color: var(--c-tertiary); font-weight: 700; }
+
+        .pill {
+            display: inline-block; padding: 1px 8px; border-radius: var(--r-pill);
+            font-size: 10.5px; font-weight: 700; white-space: nowrap;
+        }
+        .pill-ok    { background: var(--acc-sage);      color: var(--acc-sage-con); }
+        .pill-short { background: var(--acc-maroon-bg); color: var(--acc-maroon-con); }
+        .pill-part  { background: var(--acc-yellow-bg); color: var(--acc-yellow-con); }
+
+        .copy-btn {
+            display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+            height: 21px; padding: 0 9px; font-size: 11px; font-weight: 700;
+            font-family: inherit; border-radius: 5px; cursor: pointer;
+            border: 1px solid var(--color-primary); background: #fff; color: var(--fb-blue-accent);
+            white-space: nowrap;
+        }
+        .copy-btn:hover:not(:disabled) { background: var(--tint-blue); }
+        .copy-btn:disabled { border-color: var(--border-strong); color: var(--c-tertiary); cursor: not-allowed; }
+        .copy-btn svg { width: 11px; height: 11px; }
+
+        /* Empty / prompt state — the report starts with no part chosen, and
+           an empty grid looks broken rather than expectant. */
+        #emptyState {
+            flex: 1 1 auto; display: flex; flex-direction: column;
+            align-items: center; justify-content: center; gap: 9px;
+            color: var(--c-tertiary); text-align: center; padding: 40px 20px;
+        }
+        #emptyState.hidden { display: none; }
+        #emptyState .es-title { font-size: 15px; font-weight: 700; color: var(--c-secondary); }
+        #emptyState .es-sub { font-size: 12.5px; max-width: 460px; line-height: 1.55; }
+
+        /* Columns panel — a plain dropdown off the header button. Ordering and
+           resizing happen on the header itself (FBLib.Table). */
+        .col-wrap { position: relative; }
+        #colPanel {
+            position: absolute; right: 0; top: calc(100% + 4px); z-index: 600;
+            width: 232px; max-height: 340px; overflow-y: auto;
+            background: #fff; border: 1px solid var(--border-strong);
+            border-radius: 8px; box-shadow: var(--sh2);
+        }
+        #colPanel.hidden { display: none; }
+        #colPanel .col-head {
+            padding: 7px 11px; font-size: 10px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.05em; color: var(--c-tertiary);
+            border-bottom: 1px solid var(--bg-2); position: sticky; top: 0; background: #fff;
+        }
+        #colPanel label {
+            display: flex; align-items: center; gap: 8px; padding: 5px 11px;
+            font-size: 12px; cursor: pointer; color: #415157;
+        }
+        #colPanel label:hover { background: var(--tint-blue); }
+        #colPanel .col-foot { padding: 6px 10px; border-top: 1px solid var(--bg-2); position: sticky; bottom: 0; background: #fff; }
+
+        /* Drawer chrome (settings / help). */
+        .ds-btn { padding: 7px 13px; font-size: 12px; border-radius: 7px; border: 1px solid var(--border-strong); background: #fff; cursor: pointer; font-family: inherit; font-weight: 600; color: #415157; }
+        .ds-btn:hover { background: var(--bg-2); }
+        .ds-btn-primary { background: var(--color-primary); color: #fff; border-color: var(--color-primary); }
+        .ds-btn-primary:hover { background: var(--color-primary-dark); }
+        .ds-btn-admin { background: var(--acc-orange-bg); border-color: var(--acc-orange); color: var(--acc-orange-con); margin-right: 6px; }
+        .ds-lock-badge { background: var(--acc-orange-bg); color: var(--acc-orange-con); border: 1px solid var(--acc-orange); padding: 7px 10px; border-radius: 7px; font-size: 12px; margin-bottom: 14px; }
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 220px; min-width: 220px; }
+        .fb-grid-cols { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); align-items: start; }
+        .fb-grid-cols .fb-group { flex: none; min-width: 0; }
+        .fb-group-title {
+            font-size: 12px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.04em; color: var(--c-secondary); border-bottom: 1px solid var(--border);
+            padding-bottom: 4px; margin-bottom: 8px;
+        }
+        .fb-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+        .fb-field label { font-size: 11px; font-weight: 600; color: var(--c-secondary); }
+        .fb-field select, .fb-field input[type=text] {
+            padding: 4px 8px; font-size: 12px; border: 1px solid var(--border);
+            border-radius: 6px; background: var(--bg-1); font-family: inherit; color: #415157;
+        }
+        .fb-hint { font-size: 11px; color: var(--c-tertiary); line-height: 1.45; }
+        .help-p { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .help-l { font-size: 12px; color: #415157; padding-left: 18px; margin: 4px 0; line-height: 1.55; }
+        .help-eq {
+            font-family: var(--mono); font-size: 11.5px; background: var(--bg-2);
+            border-radius: 6px; padding: 8px 10px; margin: 7px 0; color: var(--c-primary);
+            line-height: 1.6;
+        }
+        /* The drawer backdrop scrim is injected + managed by fb-lib
+           (registerDrawer -> #fbDrawerScrim). Never add a local scrim, and
+           never override `.fb-drawer.open { z-index }` — the drawer must keep
+           the fb-styles z-index (10001) that sits above fb-lib's scrim. */
+
+        .fb-drawer-body::-webkit-scrollbar, .fb-table-container::-webkit-scrollbar, #colPanel::-webkit-scrollbar, .ac-dropdown::-webkit-scrollbar { width: 8px; height: 8px; }
+        .fb-drawer-body::-webkit-scrollbar-track, .fb-table-container::-webkit-scrollbar-track, #colPanel::-webkit-scrollbar-track, .ac-dropdown::-webkit-scrollbar-track { background: var(--bg-2); border-radius: 4px; }
+        .fb-drawer-body::-webkit-scrollbar-thumb, .fb-table-container::-webkit-scrollbar-thumb, #colPanel::-webkit-scrollbar-thumb, .ac-dropdown::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+
+        @media print {
+            html, body { overflow: visible; }
+            @page { size: A4 landscape; margin: 0.5in; }
+            header, #inputBar, .hdr-btn, .fb-drawer, .fblib-debug-drawer, #colPanel { display: none !important; }
+            .fb-table-container { overflow: visible !important; }
+            table.fb-table th { position: static !important; background: #ddd !important; color: #000 !important; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<!-- ==================== HEADER ==================== -->
+<header>
+    <div>
+        <h1>Bright Steel &mdash; Bars to Kilos</h1>
+        <p id="statusLine">Loading&hellip;</p>
+    </div>
+    <div class="hdr-actions">
+        <div class="col-wrap" id="colWrap">
+            <button id="colBtn" class="hdr-btn" type="button" onclick="toggleColPanel()" title="Show / hide columns (drag a header to reorder, drag its edge to resize)">
+                <svg fill="currentColor" viewBox="0 0 24 24"><circle cx="8" cy="6" r="1.5"/><circle cx="8" cy="12" r="1.5"/><circle cx="8" cy="18" r="1.5"/><circle cx="16" cy="6" r="1.5"/><circle cx="16" cy="12" r="1.5"/><circle cx="16" cy="18" r="1.5"/></svg>
+                Columns
+            </button>
+            <div id="colPanel" class="hidden">
+                <div class="col-head">Show / hide</div>
+                <div id="colList"></div>
+                <div class="col-foot">
+                    <button type="button" class="fbar-btn" style="width:100%;" onclick="resetColLayout()" title="Reset column order, widths and visibility">Reset layout</button>
+                </div>
+            </div>
+        </div>
+
+        <button id="refreshBtn" class="hdr-btn" type="button" onclick="loadStock()" title="Re-read the stock for this part">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <button id="csvBtn" class="hdr-btn" type="button" onclick="exportCsv()" title="Download the visible rows and columns as CSV">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            CSV
+        </button>
+        <button id="xlsxBtn" class="hdr-btn" type="button" onclick="exportXlsx()" title="Download as a formatted Excel workbook">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 8l8 8M16 8l-8 8" stroke-linecap="round"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" onclick="printReport()" title="Print the quote breakdown">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span style="width:1px; height:18px; background:var(--border); margin:0 4px;"></span>
+        <button id="helpBtn" class="hdr-btn" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How to use this report">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            Help
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ==================== INPUT BAR ==================== -->
+<div id="inputBar">
+
+    <div class="fbar-field ac-wrap">
+        <label for="partInput">Product #</label>
+        <input type="text" id="partInput" placeholder="Start typing&hellip;" autocomplete="off" spellcheck="false" />
+        <div id="acDropdown" class="ac-dropdown hidden"></div>
+    </div>
+
+    <div class="fbar-field">
+        <label for="barsInput">Bars</label>
+        <input type="text" id="barsInput" inputmode="decimal" value="1" />
+    </div>
+
+    <div class="fbar-field">
+        <label for="lgMs-trigger">Location group</label>
+        <div class="ms-container fbar-ms" id="lgMs">
+            <div class="ms-trigger" id="lgMs-trigger">
+                <span class="ms-placeholder" id="lgMs-placeholder">All location groups</span>
+            </div>
+            <div class="ms-dropdown hidden" id="lgMs-dropdown">
+                <div class="ms-search"><input type="text" id="lgMs-search" placeholder="Search location groups&hellip;" /></div>
+                <div class="ms-actions"><span id="lgMs-all">Select All</span><span id="lgMs-clear">Clear All</span></div>
+                <div class="ms-list" id="lgMs-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="fbar-field">
+        <label>&nbsp;</label>
+        <button type="button" class="fbar-btn" onclick="clearAll()" title="Clear the product and start again">Clear</button>
+    </div>
+
+    <div class="fbar-spacer"></div>
+</div>
+
+<!-- ==================== PART BANNER ==================== -->
+<div id="partBanner">
+    <div class="pb-main">
+        <span class="pb-num" id="pbNum">&mdash;</span>
+        <span class="pb-desc" id="pbDesc"></span>
+    </div>
+    <div class="pb-stat"><span class="k">Kg per metre</span><span class="v" id="pbKgpm">&mdash;</span></div>
+    <div class="pb-stat"><span class="k">Batches in stock</span><span class="v" id="pbBatches">&mdash;</span></div>
+    <div class="pb-stat"><span class="k">Kg on hand</span><span class="v" id="pbOnHand">&mdash;</span></div>
+    <div class="pb-stat"><span class="k">Kg available</span><span class="v" id="pbAvail">&mdash;</span></div>
+    <div class="pb-spacer"></div>
+    <span class="pb-warn" id="pbWarn" style="display:none;"></span>
+    <div class="pb-stat hero"><span class="k" id="pbQuoteK">Kg for 1 bar</span><span class="v" id="pbQuote">&mdash;</span></div>
+</div>
+
+<!-- ==================== TABLE ==================== -->
+<div class="app-shell">
+    <div id="emptyState">
+        <div class="es-title">Pick a product to quote</div>
+        <div class="es-sub">Start typing a product number or description above, choose it from the list, then
+            enter how many bars the customer asked for. The kilos are worked out per batch, because every
+            batch has its own average bar length.</div>
+    </div>
+    <div class="fb-table-container" id="tableWrap" style="display:none;">
+        <table id="reportTable" class="fb-table"></table>
+    </div>
+</div>
+
+<!-- ==================== SETTINGS DRAWER ==================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>&#9881; Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div id="dsLockBadge" class="ds-lock-badge" style="display:none;">Locked by admin &mdash; your changes won't be saved.</div>
+        <div class="fb-grid fb-grid-cols">
+
+            <div class="fb-group">
+                <div class="fb-group-title">Fields</div>
+                <div class="fb-field">
+                    <label>Weight per metre (part custom field)</label>
+                    <select id="setKgpmCf" onchange="onFieldSettingChange()">
+                        <option value="">(auto-detect)</option>
+                    </select>
+                    <span class="fb-hint">Bright Steel&rsquo;s is <strong>Weight per Meter</strong>. Auto-detect takes any part custom field naming both a weight (weight / kg / mass) and a length (metre / meter / m).</span>
+                </div>
+                <div class="fb-field">
+                    <label>Batch tracking field</label>
+                    <select id="setBatchTrk" onchange="onFieldSettingChange()">
+                        <option value="">(auto-detect)</option>
+                    </select>
+                    <span class="fb-hint">Bright Steel&rsquo;s is <strong>Batch Number</strong>. Auto-detect takes the part&rsquo;s text tracking field named batch / lot / heat / shipment, else its first text field.</span>
+                </div>
+                <div class="fb-field">
+                    <label>Average length tracking field</label>
+                    <select id="setLenTrk" onchange="onFieldSettingChange()">
+                        <option value="">(auto-detect)</option>
+                    </select>
+                    <span class="fb-hint">Metres per bar. Bright Steel&rsquo;s is <strong>Length</strong>. Auto-detect takes the part&rsquo;s numeric tracking field named length / len, else its first decimal field.</span>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Quoting</div>
+                <div class="fb-field">
+                    <label>Default bar count</label>
+                    <input type="text" id="setDefaultBars" inputmode="decimal" onchange="onSettingsChange()" />
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setHideEmpty" onchange="onSettingsChange()" style="margin-top:2px;" />
+                        <span>Hide batches with nothing left on hand</span>
+                    </label>
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setQuoteOnAvailable" onchange="onSettingsChange()" style="margin-top:2px;" />
+                        <span>Judge "enough?" on available stock rather than on hand</span>
+                    </label>
+                    <span class="fb-hint">Available subtracts what is already committed to a pick and anything sitting in a non-available location.</span>
+                </div>
+                <div class="fb-field">
+                    <label>Line-note wording</label>
+                    <input type="text" id="setNoteTpl" onchange="onSettingsChange()" />
+                    <span class="fb-hint">Placeholders: {bars} {batch} {length} {kg} {part}</span>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <div class="fb-field">
+                    <label>Decimals on kilos</label>
+                    <select id="setKgDp" onchange="onSettingsChange()">
+                        <option value="0">0</option>
+                        <option value="1">1</option>
+                        <option value="2">2</option>
+                        <option value="3">3</option>
+                    </select>
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setShowDebug" onchange="onSettingsChange()" />
+                        <span>Show debug console</span>
+                    </label>
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setRemember" onchange="onSettingsChange()" />
+                        <span>Remember the last product and bar count</span>
+                    </label>
+                </div>
+            </div>
+
+        </div>
+
+        <div id="dsAdminSection" style="display:none; margin-top:14px; padding-top:14px; border-top: 1px dashed var(--border-strong);">
+            <div class="fb-group-title">Admin</div>
+            <button type="button" class="ds-btn ds-btn-admin" onclick="publishDefaults()">Publish as default for everyone</button>
+            <button type="button" class="ds-btn ds-btn-admin" id="dsLockBtn" onclick="toggleUserEditing()">Lock user editing</button>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn" onclick="resetSettings()">Reset to defaults</button>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ==================== HELP DRAWER ==================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>&#128214; How to Use This Report</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group" style="flex:1 1 330px;">
+                <div class="fb-group-title">Quoting a bar order</div>
+                <p class="help-p">Type the product number (or part of the description) and pick it from the list.
+                   Then type how many <strong>bars</strong> the customer asked for.</p>
+                <p class="help-p">Every batch in the rack gets its own row, because every batch was cut to its own
+                   average length &mdash; so the same 5 bars weigh different amounts depending on which batch they
+                   come out of. Read the kilos off the batch you intend to supply.</p>
+                <div class="help-eq">kg for N bars&nbsp; = &nbsp;N&nbsp; &times; &nbsp;Avg Length&nbsp; &times; &nbsp;Kg per Metre</div>
+                <p class="help-p">Hit <strong>Copy note</strong> on the batch you picked and paste it into the sales
+                   order line note. That is what tells the warehouse which batch the quote was based on.</p>
+            </div>
+            <div class="fb-group" style="flex:1 1 330px;">
+                <div class="fb-group-title">The numbers</div>
+                <ul class="help-l">
+                    <li><strong>Kg per metre</strong> comes from the <em>Weight per Meter</em> custom field on the part &mdash; it is the same for
+                        every batch, since it only depends on the diameter and the grade.</li>
+                    <li><strong>Avg length</strong> is the batch's own tracking value, in metres per bar.</li>
+                    <li><strong>Kg on hand</strong> is everything in the rack. <strong>Kg available</strong> takes off
+                        what is already committed to a pick and anything in a location that is not counted as
+                        available.</li>
+                    <li><strong>Bars on hand</strong> is worked back out of the kilos, so it is an estimate &mdash;
+                        bars are cut to an <em>average</em> length and the real bar may be a little over or under.
+                        It is shown to one decimal on purpose: <em>0.8</em> means there is not a whole bar left,
+                        which is why <strong>Enough?</strong> can say <em>No</em> on a batch that still has weight
+                        in it.</li>
+                </ul>
+            </div>
+            <div class="fb-group" style="flex:1 1 330px;">
+                <div class="fb-group-title">If the numbers look wrong</div>
+                <p class="help-p">The three inputs are all configurable in <strong>Settings &rarr; Fields</strong>. If a
+                   product shows no kilos, or the batch column is empty, the report has not found the right field:</p>
+                <ul class="help-l">
+                    <li>no <strong>weight per metre</strong> &rarr; pick the correct part custom field (<em>Weight per Meter</em>);</li>
+                    <li>no <strong>batch</strong> &rarr; pick the part's text tracking field;</li>
+                    <li>no <strong>avg length</strong> &rarr; pick the part's decimal tracking field.</li>
+                </ul>
+                <p class="help-p">Stock that was received before tracking was switched on has no batch and no length.
+                   It is grouped into a single <em>(no batch)</em> row and cannot be quoted by the bar.</p>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('helpOverlay')">Close</button>
+    </div>
+</div>
+
+<script>
+// ============================================================================
+//  RUNTIME GUARD
+//  The report is useless outside the Fishbowl client (no runQueryAsync) and
+//  equally useless without the shared lib, so say which is missing rather than
+//  dying on an undefined reference 300 lines later.
+// ============================================================================
+(function () {
+    var missing = [];
+    if (typeof runQueryAsync !== 'function' && typeof runQuery !== 'function') missing.push('runQuery / runQueryAsync');
+    if (!window.FBLib)                     missing.push('FBLib');
+    else {
+        if (!FBLib.Common)                 missing.push('FBLib.Common');
+        if (!FBLib.Settings)               missing.push('FBLib.Settings');
+        if (!FBLib.Table)                  missing.push('FBLib.Table');
+        if (FBLib.Common && !FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+    }
+    if (!missing.length) return;
+    document.body.innerHTML =
+        '<div style="padding:40px;font-family:sans-serif;color:#415157;max-width:640px;">' +
+        '<h2 style="color:#0B3140;">This report cannot start</h2>' +
+        '<p>Missing: <strong>' + missing.join(', ') + '</strong></p>' +
+        '<p>It must run inside the Fishbowl client, and the shared <em>fb-lib</em> Script and ' +
+        '<em>fb-styles</em> Style must be saved on this server (save them first, then re-save ' +
+        'this report so its includes re-run).</p></div>';
+    throw new Error('Bars to Kilos: prerequisites missing — ' + missing.join(', '));
+})();
+
+// ============================================================================
+//  SETTINGS
+//  Layered resolver: this user's saved value -> the admin-published master ->
+//  a Fishbowl system property -> the defaults below.
+// ============================================================================
+FBLib.Settings.init({
+    masterStorage: 'userProperties',   // shared admin defaults via userproperties, not report data (which needs a SAVED report — see FBLib.SharedData)
+    userKey:   'cdx.bi.bsBarsKg.user.v1',
+    masterKey: 'cdx.bi.bsBarsKg.master.v1',
+    defaults: {
+        v: 1,
+        // Empty means auto-detect. A site that names its fields something the
+        // detector does not recognise sets these once and is done.
+        kgpmCf:  '',
+        batchTrk: '',
+        lenTrk:   '',
+        defaultBars: '1',
+        hideEmpty: true,
+        quoteOnAvailable: false,
+        noteTpl: '{bars} bars - Batch {batch} @ {length} m = {kg} kg',
+        kgDp: '1',
+        showDebug: false,
+        remember: true,
+        lastPart: '',
+        lastBars: '',
+        lgIds: null,
+        tablePrefs: null
+    },
+    propFallback: {
+        showDebug: { name: 'BI_SHOW_DEBUG', dflt: 'false', parse: function (v) { return v === 'true' || v === true; } }
+    }
+});
+
+function _resolve(key, dflt) {
+    try {
+        var v = FBLib.Settings.resolve(key);
+        return (v === undefined || v === null) ? dflt : v;
+    } catch (_) { return dflt; }
+}
+function _setUserKey(key, value) {
+    try { FBLib.Settings.setUserKey(key, value); FBLib.Settings.saveUser(); } catch (_) {}
+}
+function debugLog(msg, type) { try { FBLib.Common.debugLog(msg, type || 'info'); } catch (_) {} }
+
+// ============================================================================
+//  CONSTANTS + STATE
+// ============================================================================
+
+// parttrackingtype ids, verified against a live table:
+//   10 Text · 20 Date · 30 Expiration Date · 40 Serial Number
+//   50 Money · 60 Quantity · 70 Count · 80 Checkbox
+// At Bright Steel the two fields are named "Batch Number" (Text) and
+// "Length" (Quantity). Batch values live in trackingtext; Length in
+// trackingdecimal, which backs both 50 and 60.
+var TRK_TEXT    = [10];
+var TRK_DECIMAL = [50, 60];
+// Count (70) is an integer type and cannot hold 5.82 m, so auto-detect will
+// never land on one — but it is offered in the Settings drop-down anyway, so a
+// site that configured its length field that way is not left with an override
+// list that cannot reach it. trkTable() then reads from the right table.
+var TRK_INTEGER = [70];
+var TRK_LENGTH  = TRK_DECIMAL.concat(TRK_INTEGER);
+
+// tag.typeId 30/40 are the two that count as on-hand inventory. location
+// typeId 100 is a shipping location — goods staged to ship are on their way
+// out, not "not available".
+var ONHAND_TAG_TYPES = '30,40';
+var LOC_TYPE_SHIPPING = 100;
+
+var _part      = null;   // { id, num, description, uomcode, kgpm, kgpmField }
+var _batches   = [];     // one row per batch, built by loadStock()
+var _partCfs   = [];     // active part custom field names
+var _partTrks  = [];     // tracking types this part carries
+var _batchTrk  = null;   // chosen tracking def for Batch
+var _lenTrk    = null;   // chosen tracking def for Avg Length
+var _table     = null;
+var _lgMs      = null;
+var _lgAll     = [];     // [{value,label}] location groups the user can see
+var _debugApi  = null;
+var _loadSeq   = 0;      // guards against an out-of-order stock load
+
+var fmtQty = function (v) { return FBLib.Common.formatQty(v); };
+
+// ============================================================================
+//  COLUMNS
+//  `vis:false` columns are shipped but hidden — the Columns panel turns them
+//  on. Order here is the first-run order; the user's drag order wins after
+//  that (FBLib.Table restores it from settings).
+// ============================================================================
+var _columns = [
+    {
+        key: 'batch', label: 'Batch', width: 150,
+        format: function (v, row) {
+            return '<span class="batch-cell">' + escHtml(v || '(no batch)') + '</span>' +
+                   (row.lenmixed ? ' <span class="pill pill-part" title="The tags in this batch do not all carry the same average length; the figure shown is weighted by weight on hand.">mixed</span>' : '');
+        }
+    },
+    { key: 'avglen',     label: 'Avg length (m)', width: 120, align: 'right', qty: true,
+      format: function (v) { return v ? '<span class="num-cell">' + num(v, 3) + '</span>' : '<span class="num-cell muted-cell">&mdash;</span>'; } },
+    { key: 'kgperbar',   label: 'Kg / bar', width: 100, align: 'right', qty: true,
+      format: function (v) { return v ? '<span class="num-cell">' + num(v, 3) + '</span>' : '<span class="num-cell muted-cell">&mdash;</span>'; } },
+    { key: 'barsonhand', label: 'Bars on hand', width: 115, align: 'right', qty: true,
+      format: function (v, row) { return barsCell(v, row); } },
+    { key: 'onhand',     label: 'Kg on hand', width: 115, align: 'right', qty: true,
+      format: function (v) { return '<span class="num-cell">' + kg(v) + '</span>'; } },
+    { key: 'available',  label: 'Kg available', width: 120, align: 'right', qty: true,
+      format: function (v) { return '<span class="num-cell">' + kg(v) + '</span>'; } },
+    { key: 'barsavail',  label: 'Bars available', width: 120, align: 'right', qty: true,
+      format: function (v, row) { return barsCell(v, row); } },
+    {
+        key: 'quotekg', label: 'Kg for these bars', width: 145, align: 'right', qty: true,
+        format: function (v, row) {
+            if (v == null) return '<span class="num-cell muted-cell">&mdash;</span>';
+            return '<span class="quote-cell' + (row.enough === 'short' ? ' short' : '') + '">' + kg(v) + '</span>';
+        }
+    },
+    {
+        key: 'enough', label: 'Enough?', width: 105, align: 'center', sortable: true, filter: false,
+        format: function (v, row) {
+            if (!v) return '';
+            if (v === 'ok')    return '<span class="pill pill-ok">Yes</span>';
+            if (v === 'part')  return '<span class="pill pill-part" title="' + escHtml(num(row.barsfit, 0) + " bars' worth is all that is free in this batch") + '">Part only</span>';
+            // Spell the shortfall out. "No" against a Bars-on-hand of 0.8 is
+            // otherwise the most confusing cell on the screen.
+            return '<span class="pill pill-short" title="' + escHtml(
+                'This batch holds ' + kg(row.pool) + ' kg. One bar at ' + num(row.avglen, 3) +
+                ' m weighs ' + kg(row.kgperbar) + ' kg, so there is less than one whole bar left.') +
+                '">No</span>';
+        }
+    },
+    {
+        key: '_copy', label: 'Line note', width: 118, align: 'center',
+        sortable: false, filter: false,
+        format: function (_v, row) { return buildCopyButton(row); }
+    },
+
+    /* ── hidden by default ── */
+    { key: 'committed', label: 'Kg committed',     width: 120, vis: false, align: 'right', qty: true, format: function (v) { return '<span class="num-cell">' + kg(v) + '</span>'; } },
+    { key: 'notavail',  label: 'Kg not available', width: 130, vis: false, align: 'right', qty: true, format: function (v) { return '<span class="num-cell">' + kg(v) + '</span>'; } },
+    { key: 'lgnames',   label: 'Location groups',  width: 180, vis: false, format: function (v) { return '<span class="muted-cell">' + escHtml(v) + '</span>'; } },
+    { key: 'locnames',  label: 'Locations',        width: 240, vis: false, format: function (v) { return '<span class="muted-cell">' + escHtml(v) + '</span>'; } },
+    { key: 'tagcount',  label: 'Tags',             width: 70,  vis: false, align: 'right', type: 'number' }
+];
+
+// ============================================================================
+//  PART TYPEAHEAD
+//  The list is queried per keystroke (debounced) rather than pre-loaded — a
+//  steel merchant's part list is long and the user always knows roughly what
+//  they are after.
+// ============================================================================
+var _acRows = [], _acActive = -1, _acSeq = 0;
+
+function onPartInput() {
+    var v = document.getElementById('partInput').value.trim();
+    if (v.length === 0) { closeAc(); return; }
+    showAc('<div class="ac-loading">Searching&hellip;</div>');
+    _acDebounced(v);
+}
+
+var _acDebounced = debounce(function (term) { acFetch(term); }, 180);
+
+async function acFetch(term) {
+    var mySeq = ++_acSeq;
+    var t = escSQL(term);
+    // typeId 10 = Inventory. Only an inventory part holds tags, and only a
+    // part that holds tags can have batches to quote from.
+    var sql = [
+        'SELECT p.id AS partid, p.num AS partnum, p.description AS partdesc, u.code AS uomcode',
+        'FROM part p',
+        'JOIN uom u ON u.id = p.uomId',
+        "WHERE p.activeFlag = 1 AND p.typeId = 10",
+        "  AND (p.num LIKE '%" + t + "%' OR p.description LIKE '%" + t + "%')",
+        // Prefix matches first — typing "11.11" should not bury the part whose
+        // number starts with it under every description that mentions it.
+        "ORDER BY (p.num LIKE '" + t + "%') DESC, p.num",
+        'LIMIT 25'
+    ].join('\n');
+    try {
+        var rows = await qp(sql);
+        if (mySeq !== _acSeq) return;          // a newer keystroke superseded us
+        _acRows = rows || [];
+        _acActive = _acRows.length ? 0 : -1;
+        renderAc();
+    } catch (e) {
+        if (mySeq !== _acSeq) return;
+        showAc('<div class="ac-empty">Search failed: ' + escHtml(errText(e)) + '</div>');
+    }
+}
+
+function renderAc() {
+    if (!_acRows.length) { showAc('<div class="ac-empty">No matching products</div>'); return; }
+    var html = _acRows.map(function (r, i) {
+        return '<div class="ac-item' + (i === _acActive ? ' active' : '') + '" data-i="' + i + '">' +
+               '<span class="ac-label">' + escHtml(r.partnum) + '</span>' +
+               '<span class="ac-sub">' + escHtml(r.partdesc || '') + '</span></div>';
+    }).join('');
+    showAc(html);
+    document.querySelectorAll('#acDropdown .ac-item').forEach(function (el) {
+        // mousedown, not click — it fires before the input's blur, so we beat
+        // the blur-triggered close.
+        el.addEventListener('mousedown', function (e) {
+            e.preventDefault();
+            pickPart(parseInt(el.dataset.i, 10));
+        });
+    });
+}
+
+function showAc(html) {
+    var dd = document.getElementById('acDropdown');
+    dd.innerHTML = html;
+    dd.classList.remove('hidden');
+}
+function closeAc() {
+    var dd = document.getElementById('acDropdown');
+    if (dd) dd.classList.add('hidden');
+    _acRows = []; _acActive = -1;
+}
+
+function pickPart(i) {
+    var row = _acRows[i];
+    if (!row) return;
+    document.getElementById('partInput').value = row.partnum;
+    closeAc();
+    selectPart({
+        id: parseInt(row.partid, 10),
+        num: row.partnum,
+        description: row.partdesc || '',
+        uomcode: row.uomcode || ''
+    });
+}
+
+function onPartKeydown(e) {
+    var dd = document.getElementById('acDropdown');
+    var open = dd && !dd.classList.contains('hidden') && _acRows.length > 0;
+    if (e.key === 'ArrowDown' && open) {
+        e.preventDefault(); _acActive = (_acActive + 1) % _acRows.length; renderAc();
+    } else if (e.key === 'ArrowUp' && open) {
+        e.preventDefault(); _acActive = (_acActive - 1 + _acRows.length) % _acRows.length; renderAc();
+    } else if (e.key === 'Enter') {
+        if (open && _acActive >= 0) { e.preventDefault(); pickPart(_acActive); }
+        else { e.preventDefault(); closeAc(); resolveTypedPart(); }
+    } else if (e.key === 'Escape') {
+        closeAc();
+    }
+}
+
+// Enter with nothing highlighted means "I typed the whole number" — resolve it
+// as an exact match so a fast typist never has to touch the list.
+async function resolveTypedPart() {
+    var v = document.getElementById('partInput').value.trim();
+    if (!v) return;
+    try {
+        var rows = await qp(
+            'SELECT p.id AS partid, p.num AS partnum, p.description AS partdesc, u.code AS uomcode ' +
+            'FROM part p JOIN uom u ON u.id = p.uomId ' +
+            "WHERE p.num = '" + escSQL(v) + "' LIMIT 1");
+        if (rows && rows.length) {
+            selectPart({
+                id: parseInt(rows[0].partid, 10),
+                num: rows[0].partnum,
+                description: rows[0].partdesc || '',
+                uomcode: rows[0].uomcode || ''
+            });
+        } else {
+            setStatus('No product numbered "' + v + '".');
+        }
+    } catch (e) { setStatus('Lookup failed — ' + errText(e)); }
+}
+
+// ============================================================================
+//  PART SELECTION -> FIELD RESOLUTION -> STOCK
+// ============================================================================
+async function selectPart(p) {
+    _part = p;
+    _batches = [];
+    if (_resolve('remember', true)) _setUserKey('lastPart', p.num);
+    await resolvePartFields();
+    await loadStock();
+}
+
+// Reads the part's kg-per-metre custom field and works out which of the
+// part's tracking types are the Batch and the Avg Length. Both are overridable
+// in Settings, because no two databases name these the same.
+async function resolvePartFields() {
+    if (!_part) return;
+
+    // ── kg per metre ──────────────────────────────────────────────────────
+    var chosenCf = String(_resolve('kgpmCf', '') || '');
+    var cf = chosenCf || autoDetectKgpmField();
+    _part.kgpmField = cf;
+    _part.kgpm = 0;
+    if (cf) {
+        try {
+            var rows = await qp(
+                "SELECT CustomFieldByName(p.customFields, '" + escSQL(cf) + "') AS v " +
+                'FROM part p WHERE p.id = ' + _part.id + ' LIMIT 1');
+            // The UDF hands back a string; a comma decimal separator or a
+            // trailing unit ("0.761 kg/m") would otherwise parse to NaN.
+            var raw = rows && rows.length ? rows[0].v : null;
+            _part.kgpm = parseNum(raw);
+        } catch (e) {
+            debugLog('Kg-per-metre lookup failed: ' + errText(e), 'warn');
+        }
+    }
+
+    // ── tracking fields ───────────────────────────────────────────────────
+    _partTrks = [];
+    try {
+        _partTrks = await qp([
+            'SELECT pt.id AS trkid, pt.name AS trkname, pt.abbr AS trkabbr,',
+            '       pt.typeId AS trktype, pt.sortOrder AS sortorder',
+            'FROM parttotracking p2t',
+            'JOIN parttracking pt ON pt.id = p2t.partTrackingId',
+            'WHERE p2t.partId = ' + _part.id + ' AND pt.activeFlag = 1',
+            'ORDER BY pt.sortOrder, pt.name'
+        ].join('\n'));
+    } catch (e) {
+        debugLog('Tracking lookup failed: ' + errText(e), 'warn');
+    }
+    _batchTrk = pickTracking(String(_resolve('batchTrk', '') || ''), TRK_TEXT,   /batch|lot|heat|cast|shipment/i);
+    _lenTrk   = pickTracking(String(_resolve('lenTrk',   '') || ''), TRK_LENGTH, /len|length/i);
+
+    debugLog('Part ' + _part.num + ' — kg/m field "' + (cf || '(none)') + '" = ' + _part.kgpm +
+             ', batch = ' + (_batchTrk ? _batchTrk.trkname : '(none)') +
+             ', length = ' + (_lenTrk ? _lenTrk.trkname : '(none)'), 'info');
+    refreshFieldSelects();
+}
+
+// The part custom field carrying weight per metre. Bright Steel's is named
+// "Weight per Meter" — note it says WEIGHT, not kg — so the detector matches
+// on any mass word, not just "kg". Preference order: one of the canonical
+// shapes exactly, then anything naming both a mass and a length word, then a
+// field that simply starts "kg".
+function autoDetectKgpmField() {
+    var names = _partCfs.slice();
+    var norm = function (s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); };
+    var MASS  = /\b(kgs?|kilos?|kilograms?|weight|wt|mass)\b/;
+    // Bare "m" is safe here because norm() splits on punctuation, so "gm" in
+    // "Unit Weight gm" stays one token and cannot match.
+    var METRE = /\b(metres?|meters?|m|lm|lin|linear)\b/;
+    var exact = names.find(function (n) {
+        return /^(kgs?|kilos?|kilograms?|weight|wt|mass) (per )?(metre|meter|m|lm)$/.test(norm(n));
+    });
+    if (exact) return exact;
+    var both = names.find(function (n) { var x = norm(n); return MASS.test(x) && METRE.test(x); });
+    if (both) return both;
+    var kg = names.find(function (n) { return /^kgs?\b/.test(norm(n)); });
+    return kg || '';
+}
+
+// Which tracking-value table holds this definition's values. Everything
+// numeric except Count lives in trackingdecimal.
+function trkTable(def) {
+    return TRK_INTEGER.indexOf(parseInt(def.trktype, 10)) !== -1 ? 'trackinginteger' : 'trackingdecimal';
+}
+
+// `wanted` is a saved tracking NAME (ids differ per database, names do not).
+function pickTracking(wanted, typeIds, nameRe) {
+    var pool = _partTrks.filter(function (t) { return typeIds.indexOf(parseInt(t.trktype, 10)) !== -1; });
+    if (!pool.length) return null;
+    if (wanted) {
+        var exact = pool.find(function (t) { return String(t.trkname) === wanted; });
+        if (exact) return exact;
+        // The override names a field this part does not carry — fall through
+        // to auto rather than silently showing nothing.
+    }
+    return pool.find(function (t) { return nameRe.test(String(t.trkname)) || nameRe.test(String(t.trkabbr)); }) || pool[0];
+}
+
+// ── STOCK ───────────────────────────────────────────────────────────────────
+// One indexed pass over tag x location. The quantity views (QTYONHAND etc.)
+// are TEMPTABLE, so a partId filter does not push down and MySQL would build
+// totals for every part in the database first.
+function buildStockSQL() {
+    var sel = [
+        'SELECT',
+        '  lg.id                          AS lgid,',
+        '  lg.name                        AS lgname,',
+        '  l.id                           AS locid,',
+        '  l.name                         AS locname,',
+        // bit(1) arrives in JS as a raw byte (String.fromCharCode(1)) and the
+        // Fishbowl client strips control characters out of inline script, so
+        // force it to a number here rather than comparing it in JS.
+        '  (l.countedAsAvailable + 0)     AS counted,',
+        '  l.typeId                       AS loctypeid,',
+        '  t.id                           AS tagid,',
+        '  t.qty                          AS qty,',
+        '  COALESCE(t.qtyCommitted, 0)    AS committed'
+    ];
+    var joins = [
+        'FROM tag t',
+        'JOIN location l       ON l.id  = t.locationId',
+        'JOIN locationgroup lg ON lg.id = l.locationGroupId'
+    ];
+    if (_batchTrk) {
+        sel.push('  , tt.info AS batch');
+        joins.push('LEFT JOIN trackingtext tt ON tt.tagId = t.id AND tt.partTrackingId = ' + parseInt(_batchTrk.trkid, 10));
+    } else {
+        sel.push("  , NULL AS batch");
+    }
+    if (_lenTrk) {
+        sel.push('  , td.info AS avglen');
+        joins.push('LEFT JOIN ' + trkTable(_lenTrk) + ' td ON td.tagId = t.id AND td.partTrackingId = ' + parseInt(_lenTrk.trkid, 10));
+    } else {
+        sel.push('  , NULL AS avglen');
+    }
+
+    var where = [
+        't.partId = ' + _part.id,
+        't.typeId IN (' + ONHAND_TAG_TYPES + ')'
+    ];
+    var lgIds = selectedLgIds();
+    if (lgIds.length) where.push('l.locationGroupId IN (' + lgIds.join(',') + ')');
+
+    return sel.join('\n') + '\n' + joins.join('\n') + '\nWHERE ' + where.join('\n  AND ') + '\nLIMIT 20000';
+}
+
+async function loadStock() {
+    if (!_part) { renderAll(); return; }
+    var mySeq = ++_loadSeq;
+    var btn = document.getElementById('refreshBtn');
+    if (btn) btn.disabled = true;
+    setStatus('Reading stock for ' + _part.num + '…');
+    try {
+        var sql = buildStockSQL();
+        debugLog('Stock query:\n' + sql, 'query');
+        var rows = await qp(sql);
+        if (mySeq !== _loadSeq) return;        // a newer load superseded us
+        _batches = groupByBatch(rows || []);
+        debugLog('Loaded ' + (rows || []).length + ' tag(s) in ' + _batches.length + ' batch(es)', 'success');
+        renderAll();
+    } catch (e) {
+        if (mySeq !== _loadSeq) return;
+        console.error('[Bars to Kilos] stock load failed:', e);
+        _batches = [];
+        renderAll();
+        setStatus('Load failed — ' + errText(e));
+        debugLog('Load failed: ' + errText(e), 'error');
+        showToast('Could not read stock: ' + errText(e), 'error', 8000);
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+// Collapse the tag rows into one row per batch, applying Fishbowl's
+// available-to-pick formula as it goes.
+//
+//   available = on hand - committed - not available        (floored at 0)
+//
+// QTYNOTAVAILABLE sums (qty - qtyCommitted), NOT qty — stock that is both
+// committed AND in a non-available location is therefore subtracted once, not
+// twice. The three-term formula is only self-consistent because of that.
+function groupByBatch(rows) {
+    var map = Object.create(null);
+    rows.forEach(function (r) {
+        var key = (r.batch == null || String(r.batch).trim() === '') ? '' : String(r.batch).trim();
+        var b = map[key];
+        if (!b) {
+            b = map[key] = {
+                batch: key, onhand: 0, committed: 0, notavail: 0,
+                _lenWeighted: 0, _lenWeight: 0, _lens: Object.create(null),
+                tagcount: 0, _lgs: Object.create(null), _locs: Object.create(null)
+            };
+        }
+        var qty = parseNum(r.qty);
+        var cmt = parseNum(r.committed);
+        var counted = parseInt(r.counted, 10) === 1;
+        var locType = parseInt(r.loctypeid, 10);
+
+        b.onhand += qty;
+        b.committed += cmt;
+        if (!counted && locType !== LOC_TYPE_SHIPPING) b.notavail += (qty - cmt);
+        b.tagcount += 1;
+        if (r.lgname)  b._lgs[r.lgname] = true;
+        if (r.locname) b._locs[r.locname] = true;
+
+        var len = parseNum(r.avglen);
+        if (len > 0) {
+            // Weight by the kilos sitting on the tag: a 2 t tag at 5.82 m
+            // should dominate a 5 kg offcut tag that was keyed in at 2.5 m.
+            var w = Math.abs(qty) || 1;
+            b._lenWeighted += len * w;
+            b._lenWeight += w;
+            b._lens[len.toFixed(4)] = true;
+        }
+    });
+
+    var kgpm = _part ? parseNum(_part.kgpm) : 0;
+    var out = Object.keys(map).map(function (k) {
+        var b = map[k];
+        var avglen = b._lenWeight > 0 ? (b._lenWeighted / b._lenWeight) : 0;
+        var available = Math.max(0, b.onhand - b.committed - b.notavail);
+        var kgperbar = (kgpm > 0 && avglen > 0) ? kgpm * avglen : 0;
+        return {
+            batch:      b.batch,
+            avglen:     avglen,
+            kgperbar:   kgperbar,
+            onhand:     b.onhand,
+            committed:  b.committed,
+            notavail:   b.notavail,
+            available:  available,
+            barsonhand: kgperbar > 0 ? (b.onhand / kgperbar) : null,
+            barsavail:  kgperbar > 0 ? (available / kgperbar) : null,
+            lenmixed:   Object.keys(b._lens).length > 1,
+            tagcount:   b.tagcount,
+            lgnames:    Object.keys(b._lgs).sort().join(', '),
+            locnames:   Object.keys(b._locs).sort().join(', ')
+        };
+    });
+
+    // Most stock first — the batch she is most likely to quote from is the one
+    // with enough of it.
+    out.sort(function (a, b) {
+        if (!a.batch && b.batch) return 1;          // the (no batch) bucket last
+        if (a.batch && !b.batch) return -1;
+        return b.onhand - a.onhand;
+    });
+    return out;
+}
+
+// ============================================================================
+//  QUOTE MATHS
+//  Recomputed on every keystroke in the Bars box — no re-query, it is pure
+//  arithmetic over what is already loaded.
+// ============================================================================
+function barsWanted() {
+    var v = parseNum(document.getElementById('barsInput').value);
+    return v > 0 ? v : 0;
+}
+
+function applyQuote() {
+    var n = barsWanted();
+    var onAvail = !!_resolve('quoteOnAvailable', false);
+    _batches.forEach(function (b) {
+        if (!(b.kgperbar > 0) || n <= 0) {
+            b.quotekg = null; b.enough = ''; b.barsfit = null;
+            b.pool = onAvail ? b.available : b.onhand;
+            return;
+        }
+        b.quotekg = n * b.kgperbar;
+        var pool = onAvail ? b.available : b.onhand;
+        b.pool = pool;
+        // FLOOR, not round: 0.83 of a bar cannot be shipped as a bar. This is
+        // why the Bars columns print a fraction — see barsCell().
+        b.barsfit = Math.floor(pool / b.kgperbar);
+        b.enough = (b.quotekg <= pool + 1e-9) ? 'ok' : (b.barsfit > 0 ? 'part' : 'short');
+    });
+}
+
+function visibleBatches() {
+    var hide = !!_resolve('hideEmpty', true);
+    return _batches.filter(function (b) { return !hide || b.onhand > 1e-9; });
+}
+
+// ============================================================================
+//  RENDER
+// ============================================================================
+function renderAll() {
+    applyQuote();
+    renderBanner();
+    var rows = visibleBatches();
+    var has = !!_part;
+    document.getElementById('emptyState').classList.toggle('hidden', has);
+    document.getElementById('tableWrap').style.display = has ? '' : 'none';
+    if (_table) _table.render();
+    updateStatus(rows);
+}
+
+function renderBanner() {
+    var el = document.getElementById('partBanner');
+    if (!_part) { el.classList.remove('on'); return; }
+    el.classList.add('on');
+    document.getElementById('pbNum').textContent  = _part.num;
+    document.getElementById('pbDesc').textContent = _part.description || '';
+
+    var kgpm = parseNum(_part.kgpm);
+    document.getElementById('pbKgpm').textContent = kgpm > 0 ? num(kgpm, 3) + ' kg/m' : '—';
+
+    var rows = visibleBatches();
+    var onhand = rows.reduce(function (a, b) { return a + b.onhand; }, 0);
+    var avail  = rows.reduce(function (a, b) { return a + b.available; }, 0);
+    document.getElementById('pbBatches').textContent = String(rows.filter(function (b) { return b.batch; }).length);
+    document.getElementById('pbOnHand').textContent  = kg(onhand) + ' ' + (_part.uomcode || '');
+    document.getElementById('pbAvail').textContent   = kg(avail) + ' ' + (_part.uomcode || '');
+
+    // The headline figure: what the BEST batch gives for the bars asked for.
+    // "Best" = the batch that can actually supply them, largest stock first;
+    // if none can, the largest batch, so the number is still the honest one
+    // for the stock she has.
+    var n = barsWanted();
+    var q = document.getElementById('pbQuote');
+    document.getElementById('pbQuoteK').textContent =
+        'Kg for ' + (n > 0 ? num(n, 0) : '0') + ' bar' + (n === 1 ? '' : 's');
+    var best = rows.find(function (b) { return b.enough === 'ok'; }) ||
+               rows.find(function (b) { return b.quotekg != null; });
+    q.textContent = (best && best.quotekg != null)
+        ? kg(best.quotekg) + ' kg' + (best.batch ? '  ·  ' + best.batch : '')
+        : '—';
+
+    // A missing kg/m is not a cosmetic problem — every kilo on the page
+    // depends on it, so it is stated on the banner, not buried.
+    var warn = document.getElementById('pbWarn');
+    var msgs = [];
+    if (!(kgpm > 0)) {
+        msgs.push(_part.kgpmField
+            ? 'No value in the "' + _part.kgpmField + '" part field'
+            : 'No weight-per-metre field found');
+    }
+    if (!_batchTrk) msgs.push('No batch tracking on this part');
+    if (!_lenTrk)   msgs.push('No average-length tracking on this part');
+    if (msgs.length) {
+        warn.textContent = msgs.join('  ·  ') + '  —  set it in Settings › Fields';
+        warn.style.display = '';
+    } else {
+        warn.style.display = 'none';
+    }
+}
+
+function updateStatus(rows) {
+    if (!_part) { setStatus('Pick a product to begin.'); return; }
+    var n = barsWanted();
+    var hidden = _batches.length - rows.length;
+    setStatus(
+        rows.length.toLocaleString() + ' batch' + (rows.length === 1 ? '' : 'es') +
+        (hidden > 0 ? ' (' + hidden + ' with no stock hidden)' : '') +
+        (n > 0 ? ' — quoting ' + num(n, 0) + ' bar' + (n === 1 ? '' : 's') : ' — enter a bar count')
+    );
+}
+
+// ============================================================================
+//  LINE NOTE
+//  The thing the whole report exists to hand over: a one-line instruction for
+//  the sales order that names the batch the quote was priced from.
+// ============================================================================
+function noteFor(row) {
+    var tpl = String(_resolve('noteTpl', '{bars} bars - Batch {batch} @ {length} m = {kg} kg'));
+    var n = barsWanted();
+    return tpl
+        .replace(/\{bars\}/g,   num(n, 0))
+        .replace(/\{batch\}/g,  row.batch || '(no batch)')
+        .replace(/\{length\}/g, num(row.avglen, 3))
+        .replace(/\{kg\}/g,     kg(row.quotekg))
+        .replace(/\{part\}/g,   _part ? _part.num : '');
+}
+
+function buildCopyButton(row) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'copy-btn';
+    btn.innerHTML =
+        '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' +
+        '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>' +
+        '<span>Copy note</span>';
+    if (row.quotekg == null) {
+        btn.disabled = true;
+        btn.title = "Needs a bar count, a batch average length and the part's kg per metre.";
+        return btn;
+    }
+    btn.title = noteFor(row);
+    btn.addEventListener('click', function (e) {
+        e.preventDefault(); e.stopPropagation();
+        copyText(noteFor(row), btn);
+    });
+    return btn;
+}
+
+// Reports run from a data: URL, which is an opaque origin — navigator.clipboard
+// is not always granted there, so the execCommand path has to stay as the
+// fallback rather than being treated as legacy.
+function copyText(text, btn) {
+    var done = function () {
+        showToast('Copied: ' + text, 'success', 3500);
+        if (btn) {
+            var lbl = btn.querySelector('span');
+            if (lbl) { var old = lbl.textContent; lbl.textContent = 'Copied'; setTimeout(function () { lbl.textContent = old; }, 1400); }
+        }
+        debugLog('Copied line note: ' + text, 'success');
+    };
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(done, function () { legacyCopy(text, done); });
+            return;
+        }
+    } catch (_) {}
+    legacyCopy(text, done);
+}
+function legacyCopy(text, done) {
+    try {
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.cssText = 'position:fixed;top:-1000px;left:-1000px;opacity:0;';
+        document.body.appendChild(ta);
+        ta.select();
+        var ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        if (ok) { done(); return; }
+    } catch (_) {}
+    // Last resort — show it so it can be copied by hand rather than failing
+    // silently and leaving her to retype it.
+    showToast('Could not reach the clipboard. Copy this by hand: ' + text, 'warn', 12000);
+}
+
+// ============================================================================
+//  LOCATION GROUPS
+// ============================================================================
+async function loadLocationGroups() {
+    var ids = [];
+    try { if (typeof getLocationGroupList === 'function') ids = getLocationGroupList() || []; } catch (_) {}
+    var clean = (ids || []).map(function (n) { return parseInt(n, 10); }).filter(function (n) { return !isNaN(n); });
+    var where = clean.length ? 'WHERE lg.id IN (' + clean.join(',') + ')' : '';
+    try {
+        var rows = await qp('SELECT lg.id, lg.name FROM locationgroup lg ' + where + ' ORDER BY lg.name');
+        _lgAll = (rows || []).map(function (r) { return { value: String(r.id), label: r.name }; });
+    } catch (e) {
+        _lgAll = [];
+        debugLog('Location groups unavailable: ' + errText(e), 'warn');
+    }
+    if (_lgMs) _lgMs.setItems(_lgAll);
+}
+
+function selectedLgIds() {
+    if (!_lgMs) return [];
+    return (_lgMs.getSelected() || [])
+        .map(function (v) { return parseInt(v, 10); })
+        .filter(function (n) { return !isNaN(n); });
+}
+
+// ============================================================================
+//  CUSTOM FIELD + TRACKING CATALOGUES  (for the Settings drop-downs)
+// ============================================================================
+async function loadPartCfs() {
+    try {
+        var rows = await qp([
+            'SELECT cf.name AS name',
+            'FROM tablereference tr',
+            'JOIN customfield cf ON cf.tableId = tr.tableId',
+            "WHERE LOWER(tr.tableRefName) = 'part' AND cf.activeFlag = 1",
+            'ORDER BY cf.sortOrder, cf.name'
+        ].join('\n'));
+        _partCfs = (rows || []).map(function (r) { return r.name; }).filter(Boolean);
+    } catch (e) {
+        _partCfs = [];
+        debugLog('Part custom fields unavailable: ' + errText(e), 'warn');
+    }
+    refreshFieldSelects();
+}
+
+// The two tracking drop-downs list what THIS part carries (plus whatever is
+// currently saved, so an override for another part is never silently dropped).
+function refreshFieldSelects() {
+    fillSelect('setKgpmCf', _partCfs.map(function (n) { return { v: n, l: n }; }),
+               String(_resolve('kgpmCf', '') || ''), autoLabel(_part && _part.kgpmField));
+
+    var txt = _partTrks.filter(function (t) { return TRK_TEXT.indexOf(parseInt(t.trktype, 10)) !== -1; });
+    var dec = _partTrks.filter(function (t) { return TRK_LENGTH.indexOf(parseInt(t.trktype, 10)) !== -1; });
+    fillSelect('setBatchTrk', txt.map(function (t) { return { v: t.trkname, l: t.trkname }; }),
+               String(_resolve('batchTrk', '') || ''), autoLabel(_batchTrk && _batchTrk.trkname));
+    fillSelect('setLenTrk', dec.map(function (t) { return { v: t.trkname, l: t.trkname }; }),
+               String(_resolve('lenTrk', '') || ''), autoLabel(_lenTrk && _lenTrk.trkname));
+}
+function autoLabel(detected) {
+    return detected ? '(auto-detect — currently "' + detected + '")' : '(auto-detect — nothing found)';
+}
+function fillSelect(id, items, current, autoText) {
+    var sel = document.getElementById(id);
+    if (!sel) return;
+    sel.innerHTML = '';
+    var auto = document.createElement('option');
+    auto.value = ''; auto.textContent = autoText;
+    sel.appendChild(auto);
+    var seen = Object.create(null);
+    items.forEach(function (it) {
+        if (seen[it.v]) return;
+        seen[it.v] = true;
+        var o = document.createElement('option');
+        o.value = it.v; o.textContent = it.l;
+        sel.appendChild(o);
+    });
+    // A saved override for a field this part does not carry still has to be
+    // visible, or "Reset to defaults" is the only way out of it.
+    if (current && !seen[current]) {
+        var o2 = document.createElement('option');
+        o2.value = current; o2.textContent = current + '  (not on this product)';
+        sel.appendChild(o2);
+    }
+    sel.value = current || '';
+}
+
+// ============================================================================
+//  COLUMNS PANEL
+//  FBLib.Table owns order / width / sort (and persists them itself on drag).
+//  Visibility has no public setter, so toggling writes the same settings blob
+//  the Table reads — keeping every other field it holds — and then repaints.
+// ============================================================================
+function buildColPanel() {
+    var host = document.getElementById('colList');
+    host.innerHTML = '';
+    _table.getColumns().forEach(function (col) {
+        var label = document.createElement('label');
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = col.vis !== false;
+        if (col.key === 'batch' || col.key === 'quotekg') {
+            cb.disabled = true;
+            label.title = 'The batch and the quoted kilos are the point of the report';
+        }
+        cb.addEventListener('change', function () { setColumnVisible(col.key, cb.checked); });
+        var span = document.createElement('span');
+        span.textContent = col.label;
+        label.appendChild(cb); label.appendChild(span);
+        host.appendChild(label);
+    });
+}
+
+function setColumnVisible(key, visible) {
+    var cols = _table.getColumns();       // same column objects the Table holds
+    var col = cols.find(function (c) { return c.key === key; });
+    if (!col) return;
+    col.vis = !!visible;
+    var saved = _resolve('tablePrefs', null);
+    if (!saved || typeof saved !== 'object') saved = {};
+    saved.order = cols.map(function (c) { return c.key; });
+    saved.hidden = cols.filter(function (c) { return c.vis === false; }).map(function (c) { return c.key; });
+    _setUserKey('tablePrefs', saved);
+    _table.render();
+}
+
+function toggleColPanel() { document.getElementById('colPanel').classList.toggle('hidden'); }
+
+function resetColLayout() {
+    if (!confirm('Reset column order, widths and visibility to the defaults?')) return;
+    _setUserKey('tablePrefs', null);
+    _table.setColumns(_columns.map(function (c) { return Object.assign({}, c); }));
+    buildColPanel();
+    _table.render();
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+function visibleExportCols() {
+    return _table.getColumns().filter(function (c) { return c.vis !== false && c.key !== '_copy'; });
+}
+
+// Plain text for a cell — the on-screen formatter emits HTML or a Node, so
+// format the underlying value here instead of scraping the DOM.
+function cellText(col, row) {
+    var raw = row[col.key];
+    if (col.key === 'batch')  return raw || '(no batch)';
+    if (col.key === 'enough') return raw === 'ok' ? 'Yes' : raw === 'part' ? 'Part only' : raw === 'short' ? 'No' : '';
+    if (raw == null || raw === '') return '';
+    if (col.key === 'barsonhand' || col.key === 'barsavail') return barsNum(raw);
+    if (col.qty) return num(raw, col.key === 'avglen' || col.key === 'kgperbar' ? 3 : kgDp());
+    return String(raw);
+}
+
+function exportTitle() {
+    var n = barsWanted();
+    return 'Bars to kilos — ' + (_part ? _part.num : '') +
+           (n > 0 ? ' — ' + num(n, 0) + ' bar' + (n === 1 ? '' : 's') : '');
+}
+function exportFilename() {
+    return 'BrightSteel_BarsToKilos_' +
+           FBLib.Export.slug(_part ? _part.num : 'part') + '_' + FBLib.Export.stamp();
+}
+
+function exportCsv() {
+    var rows = visibleBatches();
+    if (!rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    var cols = visibleExportCols();
+    // Every cell is pre-formatted to text here, so the exported columns carry
+    // no qty type — FBLib.Export must not re-format what is already formatted.
+    var flatCols = cols.map(function (c) { return { key: c.key, label: c.label }; });
+    var flatRows = rows.map(function (r) {
+        var o = {};
+        cols.forEach(function (c) { o[c.key] = cellText(c, r); });
+        return o;
+    });
+    FBLib.Export.csv({ cols: flatCols, rows: flatRows, filename: exportFilename() });
+    debugLog('Exported ' + rows.length + ' batch row(s) to CSV', 'success');
+}
+
+async function exportXlsx() {
+    var rows = visibleBatches();
+    if (!rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    var cols = visibleExportCols();
+    try {
+        await FBLib.Export.xlsx({
+            filename: exportFilename(),
+            sheet: {
+                name: 'Bars to kilos',
+                title: exportTitle(),
+                subtitle: [
+                    (_part ? _part.description : ''),
+                    (_part && _part.kgpm > 0 ? num(_part.kgpm, 3) + ' kg per metre' : 'kg per metre NOT SET'),
+                    new Date().toLocaleString()
+                ],
+                // Real numeric cells here, unlike the CSV path — Excel should
+                // be able to add the kilos up.
+                cols: cols.map(function (c) {
+                    return { key: c.key, label: c.label, w: Math.round((c.width || 110) / 7), qty: !!c.qty };
+                }),
+                rows: rows.map(function (r) {
+                    var o = {};
+                    cols.forEach(function (c) {
+                        o[c.key] = c.qty ? (r[c.key] == null ? '' : parseNum(r[c.key])) : cellText(c, r);
+                    });
+                    return o;
+                }),
+                totals: true
+            }
+        });
+        debugLog('Exported ' + rows.length + ' batch row(s) to xlsx', 'success');
+    } catch (e) {
+        showToast('Excel export failed: ' + errText(e), 'error', 6000);
+        debugLog('xlsx export failed: ' + errText(e), 'error');
+    }
+}
+
+// window.print() is unreliable in JxBrowser — build the document, open a new
+// window and print THAT.
+function printReport() {
+    var rows = visibleBatches();
+    var cols = visibleExportCols();
+    var hdr = cols.map(function (c) { return '<th' + (c.align === 'right' ? ' class="nr"' : '') + '>' + escHtml(c.label) + '</th>'; }).join('');
+    var body = rows.map(function (r) {
+        return '<tr>' + cols.map(function (c) {
+            return '<td' + (c.align === 'right' ? ' class="nr"' : '') + '>' + escHtml(cellText(c, r)) + '</td>';
+        }).join('') + '</tr>';
+    }).join('');
+
+    var html = '<!DOCTYPE html><html><head><meta charset="UTF-8"/><title>Bars to Kilos</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:.4in;color:#111}' +
+        'h2{font-size:12pt;margin:0 0 3px;color:#0B3140}.sub{font-size:8pt;color:#506872;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}' +
+        'th{background:#0B3140;color:#fff;font-size:7.5pt;padding:4px 5px;text-align:left;-webkit-print-color-adjust:exact;print-color-adjust:exact}' +
+        'td{font-size:8pt;padding:3px 5px;border-bottom:1px solid #E3E3E3}' +
+        'tr:nth-child(even) td{background:#F7F7F7;-webkit-print-color-adjust:exact;print-color-adjust:exact}' +
+        '.nr{text-align:right}@page{size:A4 landscape;margin:.4in}' +
+        '</style></head><body><h2>' + escHtml(exportTitle()) + '</h2>' +
+        '<p class="sub">' + escHtml(_part ? (_part.description || '') : '') +
+        (_part && _part.kgpm > 0 ? ' &mdash; ' + num(_part.kgpm, 3) + ' kg per metre' : '') +
+        ' &mdash; printed ' + new Date().toLocaleString() + '</p>' +
+        '<table><thead><tr>' + hdr + '</tr></thead><tbody>' + body + '</tbody></table></body></html>';
+
+    var w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+    debugLog('Printed ' + rows.length + ' row(s)', 'success');
+}
+
+// ============================================================================
+//  SETTINGS PANEL
+// ============================================================================
+function hydrateSettings() {
+    document.getElementById('setDefaultBars').value = String(_resolve('defaultBars', '1'));
+    document.getElementById('setHideEmpty').checked = !!_resolve('hideEmpty', true);
+    document.getElementById('setQuoteOnAvailable').checked = !!_resolve('quoteOnAvailable', false);
+    document.getElementById('setNoteTpl').value = String(_resolve('noteTpl', '{bars} bars - Batch {batch} @ {length} m = {kg} kg'));
+    document.getElementById('setKgDp').value = String(_resolve('kgDp', '1'));
+    document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+    document.getElementById('setRemember').checked = !!_resolve('remember', true);
+    refreshFieldSelects();
+}
+
+function onSettingsChange() {
+    _setUserKey('defaultBars', document.getElementById('setDefaultBars').value);
+    _setUserKey('hideEmpty', document.getElementById('setHideEmpty').checked);
+    _setUserKey('quoteOnAvailable', document.getElementById('setQuoteOnAvailable').checked);
+    _setUserKey('noteTpl', document.getElementById('setNoteTpl').value);
+    _setUserKey('kgDp', document.getElementById('setKgDp').value);
+    _setUserKey('remember', document.getElementById('setRemember').checked);
+    var showDebug = document.getElementById('setShowDebug').checked;
+    _setUserKey('showDebug', showDebug);
+    applyDebugDrawer(showDebug);
+    renderAll();
+}
+
+// Changing which field is which invalidates everything on screen, so it
+// re-resolves and re-queries rather than just repainting.
+async function onFieldSettingChange() {
+    _setUserKey('kgpmCf',  document.getElementById('setKgpmCf').value);
+    _setUserKey('batchTrk', document.getElementById('setBatchTrk').value);
+    _setUserKey('lenTrk',   document.getElementById('setLenTrk').value);
+    if (!_part) { refreshFieldSelects(); return; }
+    await resolvePartFields();
+    await loadStock();
+}
+
+function resetSettings() {
+    if (!confirm('Reset your personal settings to defaults?')) return;
+    try { FBLib.Settings.clearUser(); } catch (_) {}
+    hydrateSettings();
+    applyDebugDrawer(!!_resolve('showDebug', false));
+    document.getElementById('barsInput').value = String(_resolve('defaultBars', '1'));
+    if (_part) { resolvePartFields().then(loadStock); } else { renderAll(); }
+}
+
+function publishDefaults() {
+    if (!FBLib.Settings.isAdmin()) return;
+    if (!confirm('Publish the current Settings values as the default for all users?')) return;
+    try {
+        // publishMaster REPLACES the whole master object, so send every field
+        // the org default is meant to carry — not just the one that changed.
+        FBLib.Settings.publishMaster({
+            kgpmCf:   document.getElementById('setKgpmCf').value,
+            batchTrk: document.getElementById('setBatchTrk').value,
+            lenTrk:   document.getElementById('setLenTrk').value,
+            defaultBars: document.getElementById('setDefaultBars').value,
+            hideEmpty: document.getElementById('setHideEmpty').checked,
+            quoteOnAvailable: document.getElementById('setQuoteOnAvailable').checked,
+            noteTpl: document.getElementById('setNoteTpl').value,
+            kgDp: document.getElementById('setKgDp').value
+        });
+        showToast('Published as the default for everyone.', 'success');
+        debugLog('Defaults published', 'success');
+    } catch (e) { debugLog('publishDefaults: ' + errText(e), 'error'); }
+}
+
+function toggleUserEditing() {
+    if (!FBLib.Settings.isAdmin()) return;
+    try { FBLib.Settings.setLock(FBLib.Settings.userEditingAllowed()); refreshAdminUi(); }
+    catch (e) { debugLog('toggleUserEditing: ' + errText(e), 'error'); }
+}
+
+function refreshAdminUi() {
+    var isAdmin = FBLib.Settings.isAdmin();
+    document.getElementById('dsAdminSection').style.display = isAdmin ? 'block' : 'none';
+    var allowed = FBLib.Settings.userEditingAllowed();
+    document.getElementById('dsLockBadge').style.display = (!allowed && !isAdmin) ? 'block' : 'none';
+    var lockBtn = document.getElementById('dsLockBtn');
+    if (lockBtn) lockBtn.textContent = allowed ? 'Lock user editing' : 'Unlock user editing';
+}
+
+// ============================================================================
+//  DEBUG DRAWER
+// ============================================================================
+function applyDebugDrawer(showIt) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (showIt) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    if (_debugApi.element) observeDebugDrawer(_debugApi.element);
+}
+function observeDebugDrawer(el) {
+    if (!el || el._observed) return;
+    el._observed = true;
+    var apply = function () {
+        var visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        var h = (visible && open) ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    if (typeof ResizeObserver === 'function') { try { new ResizeObserver(apply).observe(el); } catch (_) {} }
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+
+// ============================================================================
+//  SMALL HELPERS
+// ============================================================================
+function setStatus(msg) { document.getElementById('statusLine').textContent = msg; }
+
+// runQueryAsync resolves to an already-parsed array; runQuery returns a JSON
+// string. Prefer the async one and fall back so the report still works on an
+// older client. NOTE the name — a report-level function called runQuery would
+// shadow the built-in and recurse forever.
+async function qp(sql) {
+    if (typeof runQueryAsync === 'function') return normalise(await runQueryAsync(sql));
+    return normalise(safeParse(runQuery(sql, 'true')));
+}
+function normalise(r) { if (!r) return []; return Array.isArray(r) ? r : [r]; }
+function safeParse(s) { try { return JSON.parse(s); } catch (_) { return null; } }
+
+function escSQL(s) {
+    if (window.FBLib && FBLib.Common && FBLib.Common.escSQL) return FBLib.Common.escSQL(s);
+    return String(s == null ? '' : s).replace(/'/g, "''").replace(/\\/g, '\\\\');
+}
+function escHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Tolerant number parse. Custom-field values arrive as free text, so "0.761",
+// "0,761" and "0.761 kg/m" all have to land on the same number.
+function parseNum(v) {
+    if (v == null) return 0;
+    if (typeof v === 'number') return isFinite(v) ? v : 0;
+    var s = String(v).trim();
+    if (!s) return 0;
+    // A comma with no dot is a decimal separator; a comma with a dot is a
+    // thousands separator.
+    if (s.indexOf(',') !== -1 && s.indexOf('.') === -1) s = s.replace(',', '.');
+    else s = s.replace(/,/g, '');
+    var m = s.match(/-?\d*\.?\d+/);
+    var n = m ? parseFloat(m[0]) : NaN;
+    return isFinite(n) ? n : 0;
+}
+
+// A bar count DERIVED from weight is rarely whole, and rounding it lies in
+// the worst possible way: 0.83 of a bar printed as "1" next to an "Enough? No"
+// that had correctly floored it to zero. One decimal, trailing .0 trimmed, so
+// a partial bar is visibly partial and the two columns agree.
+function barsNum(v) {
+    var r = Math.round(parseNum(v) * 10) / 10;
+    return (r % 1 === 0) ? num(r, 0) : num(r, 1);
+}
+function barsCell(v, row) {
+    if (v == null) return '<span class="num-cell muted-cell">&mdash;</span>';
+    var whole = Math.floor(parseNum(v));
+    var t = 'Worked back out of the weight: ' + kg(row.onhand) + ' kg at ' +
+            kg(row.kgperbar) + ' kg a bar. ' +
+            (whole > 0 ? whole + ' whole bar' + (whole === 1 ? '' : 's') + ' fit.'
+                       : 'Not a whole bar.');
+    return '<span class="num-cell" title="' + escHtml(t) + '">' + barsNum(v) + '</span>';
+}
+
+function kgDp() { var d = parseInt(_resolve('kgDp', '1'), 10); return isNaN(d) ? 1 : d; }
+function kg(v)  { return num(v, kgDp()); }
+function num(v, dp) {
+    var n = parseNum(v);
+    return n.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
+}
+
+function errText(e) {
+    if (!e) return 'unknown error';
+    if (typeof e === 'string') return e;
+    if (e.message) return e.message + (e.status != null ? ' (HTTP ' + e.status + ')' : '');
+    if (e.status != null) return 'HTTP ' + e.status;
+    try { return JSON.stringify(e); } catch (_) { return String(e); }
+}
+
+function showToast(message, type, duration) {
+    var host = document.getElementById('toastContainer');
+    var el = document.createElement('div');
+    el.className = 'toast ' + (type || 'info');
+    var ico = { success: '✓', error: '✕', warn: '⚠', info: 'ℹ' }[type || 'info'];
+    var icon = document.createElement('span'); icon.className = 'toast-icon'; icon.textContent = ico;
+    var msg = document.createElement('span'); msg.className = 'toast-msg'; msg.textContent = message;
+    var x = document.createElement('button'); x.className = 'toast-x'; x.innerHTML = '&times;';
+    x.addEventListener('click', function () { el.remove(); });
+    el.appendChild(icon); el.appendChild(msg); el.appendChild(x);
+    host.appendChild(el);
+    setTimeout(function () {
+        el.style.opacity = '0';
+        setTimeout(function () { el.remove(); }, 260);
+    }, duration || 4000);
+}
+
+function debounce(fn, ms) {
+    var t = null;
+    return function () {
+        var args = arguments, self = this;
+        clearTimeout(t);
+        t = setTimeout(function () { fn.apply(self, args); }, ms);
+    };
+}
+
+function clearAll() {
+    _part = null; _batches = [];
+    document.getElementById('partInput').value = '';
+    closeAc();
+    if (_resolve('remember', true)) _setUserKey('lastPart', '');
+    renderAll();
+    document.getElementById('partInput').focus();
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async function () {
+    try {
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn'  });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+
+        hydrateSettings();
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        refreshAdminUi();
+
+        // Bars is pure arithmetic over loaded data — repaint, never re-query.
+        var bars = document.getElementById('barsInput');
+        bars.value = String(_resolve('remember', true)
+            ? (_resolve('lastBars', '') || _resolve('defaultBars', '1'))
+            : _resolve('defaultBars', '1'));
+        bars.addEventListener('input', debounce(function () {
+            if (_resolve('remember', true)) _setUserKey('lastBars', bars.value);
+            renderAll();
+        }, 120));
+        bars.addEventListener('focus', function () { bars.select(); });
+
+        var partEl = document.getElementById('partInput');
+        partEl.addEventListener('input', onPartInput);
+        partEl.addEventListener('keydown', onPartKeydown);
+        partEl.addEventListener('blur', function () { setTimeout(closeAc, 120); });
+
+        // Location group filters in SQL, so a change re-reads the stock. Wired
+        // on close, not on every tick — one query per dropdown session.
+        _lgMs = FBLib.Common.MultiSelect.create({
+            containerId: 'lgMs', items: [], placeholder: 'All location groups',
+            onClose: function () {
+                _setUserKey('lgIds', _lgMs.getSelected());
+                loadStock();
+            }
+        });
+
+        document.addEventListener('click', function (e) {
+            var wrap = document.getElementById('colWrap');
+            if (wrap && !wrap.contains(e.target)) document.getElementById('colPanel').classList.add('hidden');
+        });
+
+        _table = FBLib.Table.init({
+            tableEl: document.getElementById('reportTable'),
+            columns: _columns,
+            getRows: visibleBatches,
+            chunkSize: 200,
+            settingsKey: 'tablePrefs'
+        });
+        buildColPanel();
+
+        await Promise.all([loadLocationGroups(), loadPartCfs()]);
+
+        var savedLg = _resolve('lgIds', null);
+        if (_lgMs && Array.isArray(savedLg) && savedLg.length) _lgMs.setSelected(savedLg);
+
+        // Courtney keeps this in a permanent tab — come back to the product she
+        // was last on rather than to an empty screen.
+        var last = _resolve('remember', true) ? String(_resolve('lastPart', '') || '') : '';
+        if (last) {
+            partEl.value = last;
+            await resolveTypedPart();
+        } else {
+            renderAll();
+            partEl.focus();
+        }
+
+        debugLog('Report initialised', 'success');
+    } catch (e) {
+        console.error('[Bars to Kilos init] failed:', e);
+        setStatus('Init failed — ' + errText(e));
+        debugLog('Init failed: ' + (e && e.stack ? e.stack : errText(e)), 'error');
+    }
+});
+</script>
+</body>
+</html>

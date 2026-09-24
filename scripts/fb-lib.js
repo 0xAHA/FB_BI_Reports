@@ -1113,9 +1113,200 @@ window.FBLib = (function () {
     })();
 
     // ====================================================================
+    // FBLib.SharedData — an org-wide payload every user can READ and an
+    // admin can WRITE, without touching loadReportData/saveReportData.
+    //
+    // THE PROBLEM IT REPLACES. saveReportData/loadReportData give a report one
+    // shared slot, but they only work on a SAVED report: with no saved-report
+    // context (BI Script Editor, which always previews with report id -1, or a
+    // page opened with no report ID) the very first read raises the client's
+    // native "Loading data is only available on reports" modal — whose dialog
+    // title confusingly reads "Save Report Error". No try/catch suppresses it
+    // and no typeof guard helps: the function exists, it just refuses. And on
+    // an unsaved report the WRITE is a silent no-op, so an admin publishes,
+    // sees no error, and the payload is gone on reload.
+    //
+    // HOW THIS WORKS INSTEAD. saveSettings() writes the CURRENT user's own
+    // userproperties row under propertycategory 'Dashboard', and every user
+    // can SELECT that table. So an admin writing a well-known key produces a
+    // row the whole company can read back through runQuery(). Report-scoped
+    // becomes key-scoped: give each report its own key.
+    //
+    //   FBLib.SharedData.read(key)                 -> raw string or null
+    //   FBLib.SharedData.write(key, value)         -> true only if it PERSISTED
+    //   FBLib.SharedData.readJson(key, fallback)   -> parsed, never throws
+    //   FBLib.SharedData.writeJson(key, obj)       -> stamps + writes
+    //   FBLib.SharedData.invalidate(key?)          -> drop the read cache
+    //
+    // Options on read/write:
+    //   adminOnly  (default true)  Only rows owned by an account passing the
+    //              admin test are trusted on read, and only an admin may write.
+    //              Pass false for genuinely collaborative state (a shared
+    //              stocktake session) where every user must be able to write.
+    //   alsoTrust  extra publisher user name(s) to trust, for reports that
+    //              designate an admin through their own property (BI_ADMIN_USER)
+    //              rather than the built-in test. Read and write must be given
+    //              the SAME list or a publish lands in an untrusted row.
+    //   fresh      (read) bypass the per-load cache
+    //   verify     (write, default true) read back and confirm it persisted
+    //
+    // WATCH-OUTS
+    //  - The admin filter in the SQL is the server-side twin of isAdmin(). Widen
+    //    one without the other and an account the query trusts but isAdmin()
+    //    rejects can have a forged payload believed.
+    //  - On a real database there is no 'Admin' row in useraccess (the closest
+    //    is 'Server Administration-View'), so hasUserAccess('Admin') is always
+    //    false and admin in practice means userName === 'admin'. The group
+    //    clause is kept deliberately, to mirror isAdmin() exactly.
+    //  - adminOnly:false means newest-write-wins across users and the stamp is
+    //    generated client-side, so badly skewed clocks can invert the order.
+    //    Callers that merge (read, union, write) tolerate this; blind
+    //    last-write-wins callers should not use it.
+    //  - A write REPLACES the whole value. Read-merge-write, never write a
+    //    partial object.
+    // ====================================================================
+    const SharedData = (function () {
+        const _cache = new Map();
+
+        function _esc(v) { return String(v == null ? '' : v).replace(/'/g, "''"); }
+
+        function currentUserName() {
+            try {
+                if (typeof getUser !== 'function') return '';
+                return (JSON.parse(getUser() || '{}') || {}).userName || '';
+            } catch (_) { return ''; }
+        }
+        // The client-side twin of the SQL filter below. Keep them in step.
+        function isAdmin(alsoTrust) {
+            const me = String(currentUserName() || '').toLowerCase();
+            if (me === 'admin') return true;
+            const extra = [].concat(alsoTrust || []).filter(Boolean).map(function (x) { return String(x).toLowerCase(); });
+            if (me && extra.indexOf(me) >= 0) return true;
+            try { return (typeof hasUserAccess === 'function') && !!hasUserAccess('Admin'); } catch (_) { return false; }
+        }
+
+        function _cacheKey(key, adminOnly, extra) {
+            return key + '|' + (adminOnly ? 'a' : '*') + '|' + extra.join(',');
+        }
+
+        function read(key, opts) {
+            opts = opts || {};
+            if (!key) return null;
+            const adminOnly = opts.adminOnly !== false;
+            const extra = [].concat(opts.alsoTrust || []).filter(Boolean).map(function (x) { return String(x).toLowerCase(); });
+            const ck = _cacheKey(key, adminOnly, extra);
+            if (!opts.fresh && _cache.has(ck)) return _cache.get(ck);
+            let out = null;
+            if (typeof runQuery === 'function') {
+                try {
+                    let trust = '';
+                    if (adminOnly) {
+                        const names = ["'admin'"].concat(extra.map(function (x) { return "'" + _esc(x) + "'"; }));
+                        trust =
+                            "AND (LOWER(su.userName) IN (" + names.join(', ') + ") OR EXISTS (" +
+                            "SELECT 1 FROM usergrouprel ugr " +
+                            "INNER JOIN useraccess ua ON ua.groupId = ugr.groupId " +
+                            "WHERE ugr.userId = su.id AND LOWER(ua.moduleName) = 'admin' " +
+                            "AND (ua.viewFlag = 1 OR ua.modifyFlag = 1))) ";
+                    }
+                    const rows = JSON.parse(runQuery(
+                        "SELECT up.id AS rowid, up.userValue AS shareddata " +
+                        "FROM userproperties up " +
+                        "INNER JOIN propertycategory pc ON pc.id = up.categoryId " +
+                        "INNER JOIN sysuser su ON su.id = up.userId " +
+                        "WHERE pc.name = 'Dashboard' " +
+                        "AND up.userKey = '" + _esc(key) + "' " +
+                        trust +
+                        "ORDER BY up.id DESC"
+                    ) || '[]');
+                    let found = false, bestValue = '', bestStamp = '', bestId = -1;
+                    (Array.isArray(rows) ? rows : []).forEach(function (row) {
+                        // runQuery lower-cases every result key.
+                        let value = row.shareddata;
+                        if (value == null) value = row.uservalue;
+                        value = (value == null) ? '' : String(value);
+                        let stamp = '';
+                        try { stamp = String((JSON.parse(value) || {})._sharedAt || (JSON.parse(value) || {})._masterPublishedAt || ''); } catch (_) {}
+                        const rowId = parseInt(row.rowid, 10) || 0;
+                        if (!found ||
+                            (stamp && (!bestStamp || stamp > bestStamp)) ||
+                            (!stamp && !bestStamp && rowId > bestId)) {
+                            found = true; bestValue = value; bestStamp = stamp; bestId = rowId;
+                        }
+                    });
+                    out = found && bestValue !== '' ? bestValue : null;
+                } catch (e) {
+                    try { console.warn('[FBLib.SharedData] read failed for ' + key + ':', e); } catch (_) {}
+                    out = null;
+                }
+            } else {
+                try { out = localStorage.getItem(key); } catch (_) { out = null; }
+            }
+            _cache.set(ck, out);
+            return out;
+        }
+
+        function readJson(key, fallback, opts) {
+            const raw = read(key, opts);
+            if (!raw) return (fallback === undefined ? null : fallback);
+            try {
+                const o = JSON.parse(raw);
+                return (o && typeof o === 'object') ? o : (fallback === undefined ? null : fallback);
+            } catch (_) { return (fallback === undefined ? null : fallback); }
+        }
+
+        function invalidate(key) {
+            if (!key) { _cache.clear(); return; }
+            Array.from(_cache.keys()).forEach(function (ck) {
+                if (ck.indexOf(key + '|') === 0) _cache.delete(ck);
+            });
+        }
+
+        // Returns TRUE only when the value verifiably round-tripped. An in-memory
+        // success proves nothing — that is exactly the trap saveReportData set.
+        function write(key, value, opts) {
+            opts = opts || {};
+            if (!key) return false;
+            const adminOnly = opts.adminOnly !== false;
+            const extra = [].concat(opts.alsoTrust || []).filter(Boolean);
+            if (adminOnly && !isAdmin(extra)) return false;
+            const str = String(value == null ? '' : value);
+            try {
+                if (typeof saveSettings === 'function') saveSettings(key, str);
+                else localStorage.setItem(key, str);
+            } catch (e) {
+                try { console.warn('[FBLib.SharedData] write failed for ' + key + ':', e); } catch (_) {}
+                return false;
+            }
+            invalidate(key);
+            if (opts.verify === false) return true;
+            const back = read(key, { adminOnly: adminOnly, alsoTrust: extra, fresh: true });
+            return back === str;
+        }
+
+        // Stamps the payload so the newest publish is identifiable, then writes it.
+        function writeJson(key, obj, opts) {
+            const payload = Object.assign({}, obj || {});
+            payload._sharedAt = new Date().toISOString();
+            payload._sharedBy = currentUserName();
+            return write(key, JSON.stringify(payload), opts);
+        }
+
+        return {
+            read: read,
+            readJson: readJson,
+            write: write,
+            writeJson: writeJson,
+            invalidate: invalidate,
+            isAdmin: isAdmin,
+            currentUserName: currentUserName
+        };
+    })();
+
+    // ====================================================================
     // FBLib.Settings — layered preference resolver
     //   1. per-user payload   (loadSettings / saveSettings)
-    //   2. admin master       (loadReportData / saveReportData)
+    //   2. admin master       (masterStorage: reportData|userProperties|none)
     //   3. getProperty(name)  via propFallback map
     //   4. defaults literal
     // Mirrors the working DashboardSettingsCore in Dashboard_Combined.htm.
@@ -1128,15 +1319,33 @@ window.FBLib = (function () {
         let _propFallback = {};
         let _defaultTileOrder = [];
         let _tileToTable = {};
-        // Admin "master" layer is backed by Fishbowl's loadReportData/saveReportData,
-        // which only work on a SAVED report. Pages that run WITHOUT a saved-report
-        // context (embedded/opened with no report ID, or an editor preview) make the
+        // Admin "master" layer — where the shared payload lives. Picked with
+        // `masterStorage` on init():
+        //
+        //   'reportData'     (default) Fishbowl's loadReportData/saveReportData.
+        //                    Report-scoped: one payload per SAVED report.
+        //   'none'           No shared layer at all — resolve() falls straight through
+        //                    to propFallback/defaults. For reports whose settings are
+        //                    purely personal preferences.
+        //   'userProperties' Shared payload published by an admin through their own
+        //                    saveSettings() entry and read back by EVERY user with
+        //                    runQuery() against userproperties. Works in preview.
+        //
+        // Why this exists: loadReportData/saveReportData only work on a SAVED report.
+        // A page with no saved-report context (the BI Script Editor, which always
+        // previews with report id -1, or a page opened with no report ID) makes the
         // client throw a native "Loading data is only available on reports" dialog on
-        // the very first read — the try/catch below swallows the JS return but cannot
-        // suppress the native modal. Such pages pass `useReportDataMaster: false` to
-        // skip that layer entirely (per-user loadSettings/saveSettings are unaffected —
-        // they are account-scoped, not report-scoped, so they never trigger it).
-        let _useReportDataMaster = true;
+        // the very first read. The try/catch below swallows the JS return but CANNOT
+        // suppress that native modal, and neither can a typeof guard — the function
+        // exists, it just refuses. So a report that must preview cleanly picks
+        // 'none' (personal prefs) or 'userProperties' (shared admin defaults).
+        //
+        // Per-user loadSettings/saveSettings are unaffected by any of this — they are
+        // account-scoped, not report-scoped, so they never trigger the dialog.
+        //
+        // Legacy alias: `useReportDataMaster: false` === `masterStorage: 'none'`.
+        let _masterStorage = 'reportData';
+        let _userName = '';
 
         let USER = {};
         let MASTER = {};
@@ -1154,14 +1363,34 @@ window.FBLib = (function () {
             }
             try { localStorage.setItem(key, value); } catch (_) {}
         }
+        // The 'userProperties' layer is FBLib.SharedData — see its doc block above
+        // for the mechanism, the admin-trust rule and the watch-outs.
+        function _readMasterFromUserProperties() {
+            return SharedData.read(_masterKey, { adminOnly: true });
+        }
+        // publishMaster/setLock already gate on _isAdmin; SharedData.write gates
+        // again, so a future call site cannot publish from a normal account.
+        function _writeMasterToUserProperties(value) {
+            let payload = {};
+            try { payload = JSON.parse(String(value || '{}')) || {}; } catch (_) { payload = {}; }
+            // Legacy stamp names, kept so payloads published by the earlier
+            // report-local shims still sort correctly against new ones.
+            payload._masterPublishedAt = new Date().toISOString();
+            payload._masterPublisher = _userName || '';
+            SharedData.write(_masterKey, JSON.stringify(payload), { adminOnly: true, verify: false });
+        }
         function _readMaster() {
-            if (_useReportDataMaster && typeof loadReportData === 'function') {
+            if (_masterStorage === 'none') return null;
+            if (_masterStorage === 'userProperties') return _readMasterFromUserProperties();
+            if (typeof loadReportData === 'function') {
                 try { return loadReportData(); } catch (_) { return null; }
             }
             try { return localStorage.getItem(_masterKey); } catch (_) { return null; }
         }
         function _writeMaster(value) {
-            if (_useReportDataMaster && typeof saveReportData === 'function') {
+            if (_masterStorage === 'none') return;
+            if (_masterStorage === 'userProperties') { _writeMasterToUserProperties(value); return; }
+            if (typeof saveReportData === 'function') {
                 try { saveReportData(value); return; } catch (_) {}
             }
             try { localStorage.setItem(_masterKey, value); } catch (_) {}
@@ -1183,21 +1412,32 @@ window.FBLib = (function () {
             _propFallback = config.propFallback || {};
             _defaultTileOrder = (config.defaultTileOrder || []).slice();
             _tileToTable = Object.assign({}, config.tileToTable || {});
-            // Default ON (every saved report keeps the admin-master layer). Pages with
-            // no saved-report context pass useReportDataMaster:false to skip it.
-            _useReportDataMaster = (config.useReportDataMaster !== false);
+            // Shared-payload backing store. Defaults to report data, so every saved
+            // report keeps its existing admin-master layer untouched. See the
+            // _masterStorage doc block above for when to pick the other two.
+            if (config.masterStorage) {
+                _masterStorage = String(config.masterStorage);
+            } else if (config.useReportDataMaster === false) {
+                _masterStorage = 'none';        // legacy alias
+            } else {
+                _masterStorage = 'reportData';
+            }
 
-            USER   = _loadJson(_readSettings(_userKey))   || {};
-            MASTER = _loadJson(_readMaster())             || {};
-
+            // Resolved BEFORE the master read: 'userProperties' needs the user name
+            // to stamp a publish, and the read itself is admin-filtered.
             _isAdmin = false;
+            _userName = '';
             try {
                 if (typeof getUser === 'function') {
                     const u = JSON.parse(getUser() || '{}');
+                    _userName = (u && u.userName) || '';
                     _isAdmin = (u && u.userName === 'admin') ||
                         (typeof hasUserAccess === 'function' && hasUserAccess('Admin'));
                 }
             } catch (_) { _isAdmin = false; }
+
+            USER   = _loadJson(_readSettings(_userKey))   || {};
+            MASTER = _loadJson(_readMaster())             || {};
 
             _initialised = true;
         }
@@ -3131,6 +3371,7 @@ window.FBLib = (function () {
 
     return {
         Common: Common,
+        SharedData: SharedData,
         Export: Export,
         Settings: Settings,
         CfCatalog: CfCatalog,

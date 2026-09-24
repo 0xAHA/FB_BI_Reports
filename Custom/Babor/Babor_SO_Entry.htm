@@ -1,0 +1,3885 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Babor — SO Entry (pricing-rule capture)
+  PATH:   Custom/Babor/Babor_SO_Entry.htm
+  --------------------------------------------------------------------------------
+  A Sales Order entry screen that records WHICH PRICING RULE produced each
+  line's price.
+
+  Why this exists: `soitem` stores only the resulting unitPrice. Several of
+  this client's rules resolve to the SAME price for DIFFERENT reasons
+  (distributor samples, media giveaways, free bags, Business Development
+  Fund are all separate 100%-off rules), so the applied rule cannot be
+  recovered by inference afterwards — and the desktop client displays which
+  rule COULD have produced a price, not the one the operator chose. Without
+  a record of the reason there is no "what did we give away, and why"
+  report. This screen captures the reason at entry time into an soitem
+  custom field, which Babor_Pricing_Rule_Sales.htm then reports on.
+
+  Design constraints that shaped it:
+    * The operator will not accept extra clicks. Today she hunts the rule in
+      a modal, per line. Here the rule is one cell in the grid, pre-filled
+      from the customer's note, and reachable by keyboard.
+    * One order legitimately mixes many reasons across its lines, so the
+      rule is per LINE, never per order.
+
+  KNOWN LIMITATION: only the rule NAME is stored, so renaming a pricing rule
+  orphans the history written before the rename. The fix is a second
+  "Pricing Rule Id" custom field; deliberately not built.
+
+  CREATE-ONLY. The REST API has no update-an-existing-SO endpoint, so this
+  screen cannot edit an order once written. Status defaults to Estimate.
+
+  Requires: the SO_PRICE_OVERRIDE access right (setting a line unitPrice is
+  gated), and an soitem custom field named in Settings (default
+  "Pricing Rule").
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sales Order Entry — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib — inlined by Fishbowl from the saved script.
+         Source of truth: scripts/fb-lib.js. Included exactly ONCE. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Shared stylesheet — source of truth: scripts/fb-styles.css. Must come
+         before the local block so local rules win on identical selectors. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <style>
+        * { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; height: 100%; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            font-size: 13px; color: var(--c-primary); background: var(--bg-1);
+            display: flex; flex-direction: column; min-height: 100vh;
+            padding-bottom: var(--debug-drawer-h, 0px);
+            transition: padding-bottom 0.12s ease;
+        }
+        header h1 { font-size: 16px; font-weight: 700; color: var(--c-primary); margin: 0; line-height: 1.15; }
+        #statusLine { font-size: 12px; color: var(--c-tertiary); line-height: 1.15; margin: 2px 0 0; }
+        .hdr-actions { display: flex; align-items: center; gap: 8px; }
+        .hdr-sep { width: 1px; height: 18px; background: var(--border); margin: 0 4px; }
+
+        /* =====================================================
+           APP SHELL — order header, then a grid that eats the rest
+           ===================================================== */
+        .app-shell {
+            flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0;
+            padding: 12px 16px; gap: 10px;
+            /* The shell scrolls when its contents cannot fit the viewport.
+               Without this the order header is unreachable on a short screen,
+               because the grid below it absorbs every spare pixel. */
+            overflow-y: auto;
+        }
+
+        .card {
+            background: var(--bg-primary); border: 1px solid var(--border);
+            border-radius: var(--r-card); box-shadow: var(--sh1);
+        }
+
+        /* ── ORDER HEADER ─────────────────────────────────────
+           Collapses to a one-line summary so the line grid owns the
+           vertical space. The desktop client uses tabs; in a single pane a
+           collapse is the honest equivalent. */
+        .oh-head {
+            display: flex; align-items: center; gap: 10px;
+            padding: 8px 12px; cursor: pointer; user-select: none;
+        }
+        .oh-caret { font-size: 11px; color: var(--c-tertiary); transition: transform .15s; }
+        .oh-head.collapsed .oh-caret { transform: rotate(-90deg); }
+        .oh-title { font-size: 12px; font-weight: 700; letter-spacing: .02em; text-transform: uppercase; color: var(--c-secondary); }
+        .oh-summary { font-size: 12px; color: var(--c-secondary); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .oh-body { padding: 4px 12px 12px; border-top: 1px solid var(--border); }
+        .oh-body.hidden { display: none; }
+        .oh-grid {
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+            gap: 10px 14px; align-items: start;
+        }
+        .fld { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+        .fld label { font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--c-tertiary); }
+        .fld label .req { color: var(--fb-negative); }
+        .fld input, .fld select, .fld textarea {
+            font-family: inherit; font-size: 12.5px; color: var(--c-primary);
+            padding: 6px 8px; border: 1px solid var(--border-strong); border-radius: var(--r-btn);
+            background: #fff; width: 100%; min-width: 0;
+        }
+        .fld input:focus, .fld select:focus, .fld textarea:focus {
+            outline: none; border-color: var(--fb-blue); box-shadow: 0 0 0 3px rgba(45,156,219,.15);
+        }
+        .fld .ro { background: var(--bg-2); color: var(--c-secondary); }
+        .fb-field textarea {
+            width: 100%; font-family: var(--mono, ui-monospace, monospace); font-size: 11.5px;
+            padding: 6px 8px; border: 1px solid var(--border-strong); border-radius: var(--r-btn);
+            background: #fff; resize: vertical; line-height: 1.5;
+        }
+        .fb-field textarea:focus { outline: none; border-color: var(--fb-blue); box-shadow: 0 0 0 3px rgba(45,156,219,.15); }
+        .with-btn { display: flex; gap: 4px; align-items: stretch; min-width: 0; }
+        .with-btn input { flex: 1; min-width: 0; }
+        .mini-btn {
+            flex: 0 0 auto; width: 30px; font-size: 14px; line-height: 1; cursor: pointer;
+            border: 1px solid var(--border-strong); border-radius: var(--r-btn);
+            background: #fff; color: var(--c-secondary); font-family: inherit;
+        }
+        .mini-btn:hover { background: var(--bg-2); color: var(--c-primary); }
+        .fld-wide { grid-column: span 2; }
+
+        /* Status segmented control */
+        .seg { display: inline-flex; border: 1px solid var(--border-strong); border-radius: var(--r-btn); overflow: hidden; }
+        .seg button {
+            font-family: inherit; font-size: 12px; font-weight: 600; padding: 6px 12px;
+            border: 0; background: #fff; color: var(--c-secondary); cursor: pointer;
+        }
+        .seg button + button { border-left: 1px solid var(--border-strong); }
+        .seg button.on { background: var(--fb-blue); color: #fff; }
+
+        /* ── DEFAULT-RULE BANNER ─────────────────────────────── */
+        .rule-banner {
+            display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap;
+            margin: 8px 0 0; padding: 8px 10px; border-radius: var(--r-btn);
+            font-size: 12px; line-height: 1.45;
+        }
+        .rule-banner.hidden { display: none; }
+        .rule-banner.ok   { background: var(--tint-blue); color: #14425c; border: 1px solid #b9d8ec; }
+        .rule-banner.warn { background: var(--acc-orange-bg); color: var(--acc-orange-con); border: 1px solid #ecd2b8; }
+        .rule-banner b { font-weight: 700; }
+        .rule-banner .lnk { color: var(--link); cursor: pointer; text-decoration: underline; font-weight: 600; }
+        .rule-banner .lnk:hover { color: var(--link-hover); }
+
+        /* ── LINE GRID ────────────────────────────────────────
+           A CSS grid rather than a <table>: a Note row has to span the data
+           columns cleanly, and the zero-height insert band between rows is
+           trivial in grid and ugly in a table. */
+        /* Grows to fill a tall window, but never collapses to nothing on a
+           short one — below this the whole shell scrolls instead. */
+        .grid-card { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 280px; overflow: hidden; }
+        .grid-scroll { flex: 1; overflow: auto; min-height: 0; }
+
+        /* grid-template-columns and min-width are written by applyGridTemplate()
+           from the live column model — the widths are draggable and the order
+           is rearrangeable, so they cannot live in the stylesheet. A trailing
+           minmax(0,1fr) spacer track absorbs any leftover width. */
+        .so-grid { display: grid; }
+        .so-row { display: contents; }
+        .so-grid > .c {
+            padding: 4px 6px; border-bottom: 1px solid var(--bg-3);
+            display: flex; align-items: center; min-width: 0; min-height: 34px;
+        }
+        .so-grid > .c.num { justify-content: flex-end; font-variant-numeric: tabular-nums; }
+        .so-grid > .c.ctr { justify-content: center; text-align: center; }
+        .so-grid > .c.ctr .cell-ro,
+        .so-grid > .c.ctr .taxcode { width: 100%; text-align: center; }
+
+        /* A hairline between columns. Narrow headings like UOM and Tax Code
+           otherwise run together and it stops being obvious which heading
+           belongs to which column. Light on the navy header, barely there in
+           the body — enough to guide the eye down a column of figures without
+           turning the grid into graph paper. */
+        .so-grid > .hd { border-right: 1px solid rgba(255,255,255,.16); }
+        .so-grid > .c  { border-right: 1px solid rgba(16,16,16,.045); }
+        .so-grid > .hd {
+            position: sticky; top: 0; z-index: 3;
+            background: var(--menu-bg); color: #fff;
+            font-size: 10.5px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+            padding: 8px 6px; border-bottom: 0; min-height: 0;
+            /* the resize grip is absolutely positioned against this */
+            position: -webkit-sticky; position: sticky;
+        }
+        .so-grid > .hd.num { justify-content: flex-end; }
+        .so-grid > .hd.ctr { justify-content: center; text-align: center; }
+        .so-grid > .hd.movable { cursor: grab; }
+        .so-grid > .hd.movable:active { cursor: grabbing; }
+        .so-grid > .hd:hover { background: #164A5F; }
+        .so-grid > .hd.col-drag-over { box-shadow: inset 3px 0 0 var(--fb-blue-hover); }
+        .so-grid > .hd.col-drag-over-r { box-shadow: inset -3px 0 0 var(--fb-blue-hover); }
+        .so-grid > .hd.dragging { opacity: .45; }
+
+        /* Resize grip on the right edge of a header cell. The header is
+           position:sticky, which is also a containing block, so absolute
+           positioning inside it lands where it should. */
+        .col-rz {
+            position: absolute; right: 0; top: 0; width: 7px; height: 100%;
+            cursor: col-resize; user-select: none; z-index: 4;
+        }
+        .col-rz:hover, .col-rz.active { background: rgba(255,255,255,.4); }
+        body.col-resizing { cursor: col-resize; user-select: none; }
+
+        /* Row drop indicator — the whole row is a drop target, not just the
+           thin band between rows, so a drag can land anywhere sensible. */
+        .so-grid > .c.drop-before { box-shadow: inset 0 2px 0 var(--fb-blue); }
+        .so-grid > .c.drop-after  { box-shadow: inset 0 -2px 0 var(--fb-blue); }
+        .so-grid > .c.row-dragging { opacity: .4; }
+
+        /* Row hover — every cell of the hovered row tints together. There is
+           no row element to hang :hover on in a display:contents grid, so JS
+           stamps .hov on the cells. */
+        .so-grid > .c.hov { background: var(--tint-blue); }
+        .so-grid > .c.rowsel { background: var(--tint-blue-2); }
+
+        .cell-in {
+            font-family: inherit; font-size: 12.5px; color: var(--c-primary);
+            border: 1px solid transparent; border-radius: 4px; background: transparent;
+            padding: 4px 5px; width: 100%; min-width: 0;
+        }
+        .cell-in:hover { border-color: var(--border-strong); background: #fff; }
+        .cell-in:focus { outline: none; border-color: var(--fb-blue); background: #fff; box-shadow: 0 0 0 2px rgba(45,156,219,.18); }
+        /* Never type=number in a grid cell — the spinner arrows sit on top of
+           the digits at this width. */
+        .cell-in.n { text-align: right; font-variant-numeric: tabular-nums; }
+        .cell-ro { font-size: 12.5px; color: var(--c-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .cell-ro.n { text-align: right; width: 100%; font-variant-numeric: tabular-nums; color: var(--c-primary); }
+
+        /* The unit price turns Fishbowl blue the moment it stops being the
+           product's list price — the at-a-glance confirmation that a discount
+           actually landed on the line. */
+        .cell-in.moved, .cell-ro.moved { color: var(--fb-blue-accent); font-weight: 600; }
+        .disc { font-size: 11.5px; font-weight: 700; font-variant-numeric: tabular-nums; }
+        .disc.off  { color: var(--fb-success); }
+        .disc.up   { color: var(--acc-orange-con); }
+        .disc.free { color: var(--fb-negative); }
+        .disc.zero { color: var(--c-tertiary); font-weight: 400; }
+        .taxcode { font-size: 11px; color: var(--c-secondary); }
+        .taxcode.none { color: var(--c-tertiary); font-style: italic; }
+        .cfval {
+            font-size: 11.5px; color: var(--acc-purple-con); font-weight: 600;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%;
+        }
+        .cfval.none { color: var(--c-tertiary); font-style: italic; font-weight: 400; }
+
+        .drag-h { cursor: grab; color: var(--bg-4); font-size: 12px; line-height: 1; user-select: none; }
+        .drag-h:hover { color: var(--c-tertiary); }
+        .row-x {
+            border: 0; background: transparent; color: var(--bg-4); cursor: pointer;
+            font-size: 15px; line-height: 1; padding: 2px 4px; border-radius: 4px;
+        }
+        .row-x:hover { color: var(--fb-negative); background: #fbe9ec; }
+
+        /* Pricing-rule cell */
+        .rule-btn {
+            font-family: inherit; font-size: 12px; text-align: left;
+            border: 1px solid transparent; border-radius: 4px; background: transparent;
+            padding: 4px 6px; width: 100%; cursor: pointer; color: var(--c-primary);
+            display: flex; align-items: center; gap: 6px; min-width: 0;
+        }
+        .rule-btn:hover { border-color: var(--border-strong); background: #fff; }
+        .rule-btn:focus { outline: none; border-color: var(--fb-blue); background: #fff; box-shadow: 0 0 0 2px rgba(45,156,219,.18); }
+        .rule-btn .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .rule-btn .nm.none { color: var(--c-tertiary); font-style: italic; }
+        .rule-btn .nm.gone { text-decoration: line-through; color: var(--acc-orange-con); }
+        .chip {
+            font-size: 9px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+            padding: 1px 5px; border-radius: var(--r-pill); flex-shrink: 0;
+        }
+        .chip.auto { background: var(--tint-blue-2); color: #14425c; }
+        .chip.off  { background: var(--acc-purple-bg); color: var(--acc-purple-con); }
+        .chip.man  { background: var(--acc-yellow-bg); color: var(--acc-yellow-con); }
+        .chip.ne   { background: var(--acc-orange-bg); color: var(--acc-orange-con); }
+
+        /* Note rows */
+        /* 3 / -3 = from just after the pinned # column to just before the
+           pinned actions column, whatever the middle columns have been
+           rearranged into. */
+        .so-grid > .c.note-c {
+            grid-column: 3 / -3; background: #fcfcfa; align-items: flex-start; padding-top: 6px;
+        }
+        .so-grid > .c.new-band { grid-column: 3 / -3; }
+        .so-grid > .c.note-g { background: #fcfcfa; }
+        .note-in {
+            font-family: inherit; font-size: 12.5px; font-style: italic; color: var(--c-secondary);
+            border: 1px solid transparent; border-radius: 4px; background: transparent;
+            padding: 3px 5px; width: 100%; resize: none; overflow: hidden; line-height: 1.4;
+        }
+        .note-in:hover { border-color: var(--border-strong); background: #fff; }
+        .note-in:focus { outline: none; border-color: var(--fb-blue); background: #fff; box-shadow: 0 0 0 2px rgba(45,156,219,.18); }
+        .note-glyph { font-size: 11px; color: var(--c-tertiary); }
+
+        /* ── INSERT BAND ──────────────────────────────────────
+           Always present at a fixed 7px so revealing the "+" never shifts
+           anything below it — the failure that makes most inline-insert
+           affordances feel broken. */
+        .gap { grid-column: 1 / -1; position: relative; height: 7px; }
+        .gap::before {
+            content: ''; position: absolute; left: 0; right: 0; top: 3px; height: 2px;
+            background: var(--fb-blue); opacity: 0; transition: opacity .12s;
+        }
+        .gap:hover::before, .gap.act::before { opacity: .38; }
+        .gap-btn {
+            position: absolute; left: 6px; top: -6px;
+            width: 19px; height: 19px; border-radius: 50%;
+            border: 1px solid var(--fb-blue); background: #fff; color: var(--fb-blue);
+            font-size: 14px; line-height: 1; cursor: pointer; padding: 0;
+            display: flex; align-items: center; justify-content: center;
+            opacity: 0; transition: opacity .12s;
+        }
+        .gap:hover .gap-btn, .gap-btn:focus-visible { opacity: 1; }
+        .gap-btn:hover { background: var(--fb-blue); color: #fff; }
+
+        .empty-note { grid-column: 1 / -1; padding: 26px 12px; text-align: center; color: var(--c-tertiary); font-size: 12.5px; }
+
+        /* The blank last row of the grid, where the next product is picked.
+           Kept inside the grid rather than lifted into a bar above it, so a
+           line is entered where it appears. */
+        .so-grid > .c.new-c { background: #fafcfe; }
+        .entry-hint { font-size: 11px; color: var(--c-tertiary); white-space: nowrap; }
+
+        /* ── ADDRESS PANELS ───────────────────────────────────
+           Blue-headed Bill To / Ship To cards, as the client draws them. The
+           picker lives in the header bar so the address itself stays legible. */
+        .addr-panel { border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: #fff; }
+        .addr-head {
+            background: var(--fb-blue); color: #fff; padding: 4px 8px;
+            display: flex; align-items: center; gap: 8px;
+            font-size: 11px; font-weight: 700; letter-spacing: .02em;
+        }
+        .addr-head select {
+            margin-left: auto; max-width: 62%; font-family: inherit; font-size: 11px;
+            padding: 2px 4px; border: 0; border-radius: 4px; background: rgba(255,255,255,.92); color: var(--c-primary);
+        }
+        .addr-body {
+            padding: 6px 9px; font-size: 12px; line-height: 1.45;
+            color: var(--c-primary); min-height: 68px; white-space: pre-line;
+        }
+        .addr-body.empty { color: var(--c-tertiary); font-style: italic; }
+
+        /* ── TYPEAHEAD ───────────────────────────────────────── */
+        .ta-pop, .rule-pop {
+            position: fixed; z-index: 1200; background: #fff;
+            border: 1px solid var(--border-strong); border-radius: 8px;
+            box-shadow: var(--sh3); overflow: hidden; display: none;
+            flex-direction: column; max-height: 340px;
+        }
+        .ta-pop.open, .rule-pop.open { display: flex; }
+        .ta-list, .rule-list { overflow-y: auto; flex: 1; }
+        .ta-item {
+            padding: 6px 10px; cursor: pointer; font-size: 12.5px;
+            display: flex; gap: 8px; align-items: baseline; border-bottom: 1px solid var(--bg-2);
+        }
+        .ta-item:last-child { border-bottom: 0; }
+        .ta-item.hl, .ta-item:hover { background: var(--tint-blue); }
+        .ta-item .pn { font-weight: 700; color: var(--link); flex-shrink: 0; }
+        .ta-item .pd { color: var(--c-secondary); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .ta-item .pp { color: var(--c-primary); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+        .ta-empty { padding: 12px; text-align: center; color: var(--c-tertiary); font-style: italic; font-size: 12px; }
+
+        /* ── COLUMN PICKER ────────────────────────── */
+        .col-pop {
+            position: fixed; z-index: 1200; width: 240px; background: #fff;
+            border: 1px solid var(--border-strong); border-radius: 8px;
+            box-shadow: var(--sh3); overflow: hidden; display: none; flex-direction: column;
+        }
+        .col-pop.open { display: flex; }
+        .col-pop-head {
+            padding: 7px 10px; background: var(--bg-2); color: var(--c-secondary);
+            font-size: 9.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+        }
+        .col-list { max-height: 340px; overflow-y: auto; padding: 4px 0; }
+        .col-row {
+            display: flex; align-items: center; gap: 8px; padding: 5px 10px;
+            font-size: 12.5px; color: var(--c-primary); cursor: pointer;
+        }
+        .col-row:hover { background: var(--tint-blue); }
+        .col-row.req { cursor: default; color: var(--c-tertiary); }
+        .col-row.req:hover { background: transparent; }
+        .col-row span { flex: 1; min-width: 0; }
+        .col-req {
+            flex: 0 0 auto; font-size: 9px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: .04em; color: var(--c-tertiary);
+        }
+
+        /* ── RULE POPOVER ────────────────────────────────────── */
+        .rule-pop { width: 420px; }
+        .rule-search { padding: 8px; border-bottom: 1px solid var(--bg-3); }
+        .rule-search input {
+            width: 100%; font-family: inherit; font-size: 12.5px; padding: 6px 8px;
+            border: 1px solid var(--border-strong); border-radius: var(--r-btn);
+        }
+        .rule-search input:focus { outline: none; border-color: var(--fb-blue); box-shadow: 0 0 0 3px rgba(45,156,219,.15); }
+        .rule-grp {
+            padding: 5px 10px; background: var(--bg-2); color: var(--c-secondary);
+            font-size: 9.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+            position: sticky; top: 0; z-index: 1;
+        }
+        .rule-item {
+            padding: 6px 10px; cursor: pointer; border-bottom: 1px solid var(--bg-2);
+            display: flex; gap: 8px; align-items: center;
+        }
+        .rule-item:hover, .rule-item.hl { background: var(--tint-blue); }
+        .rule-item.dis { opacity: .55; cursor: not-allowed; }
+        .rule-item.dis:hover { background: transparent; }
+        .rule-item.sel { background: var(--tint-blue-2); }
+        .rule-item .ri-main { flex: 1; min-width: 0; }
+        .rule-item .ri-nm { font-size: 12.5px; font-weight: 600; color: var(--c-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .rule-item .ri-sub { font-size: 11px; color: var(--c-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .rule-item .ri-px { font-size: 12.5px; font-variant-numeric: tabular-nums; text-align: right; flex-shrink: 0; }
+        .rule-item .ri-dl { font-size: 10px; font-weight: 700; color: var(--fb-success); }
+        .rule-foot { padding: 6px 10px; border-top: 1px solid var(--bg-3); display: flex; gap: 8px; justify-content: space-between; align-items: center; }
+        .rule-foot .lnk { font-size: 11.5px; color: var(--link); cursor: pointer; font-weight: 600; }
+
+        /* ── TOTALS BAR ──────────────────────────────────────── */
+        .totals {
+            display: flex; align-items: center; gap: 22px; flex-wrap: wrap;
+            padding: 9px 14px; border-top: 1px solid var(--border); background: var(--bg-2);
+            font-variant-numeric: tabular-nums;
+        }
+        .totals .lc { font-size: 12px; color: var(--c-secondary); flex: 1; min-width: 120px; }
+        .totals .tv { font-size: 12.5px; color: var(--c-secondary); }
+        .totals .tv b { font-size: 14px; color: var(--c-primary); font-weight: 700; margin-left: 6px; }
+        .totals .tv.grand b { color: var(--fb-blue-accent); font-size: 16px; }
+
+        /* ── BLOCKING BANNER (missing custom field, etc.) ─────── */
+        .blocker { margin: 0 16px; }
+        .blocker.hidden { display: none; }
+
+        .toast-container { }
+        .modal-body p { margin: 0 0 10px; line-height: 1.5; }
+        .rev-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        .rev-table th {
+            text-align: left; padding: 5px 7px; background: var(--menu-bg); color: #fff;
+            font-size: 10px; text-transform: uppercase; letter-spacing: .04em; font-weight: 600;
+        }
+        .rev-table th.n, .rev-table td.n { text-align: right; font-variant-numeric: tabular-nums; }
+        .rev-table td { padding: 5px 7px; border-bottom: 1px solid var(--bg-3); }
+        .rev-table tr.note td { font-style: italic; color: var(--c-secondary); }
+
+        .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12px; }
+        .kv dt { color: var(--c-tertiary); font-weight: 600; }
+        .kv dd { margin: 0; color: var(--c-primary); }
+    </style>
+</head>
+<body>
+
+<!-- ====================================================================
+     HEADER
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>Sales Order Entry</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="newBtn" class="hdr-btn" type="button" onclick="newOrder()" title="Clear and start a new order">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 4v16m8-8H4"/></svg>
+            New
+        </button>
+        <button id="colsBtn" class="hdr-btn" type="button" onclick="toggleColPicker()" title="Show or hide line columns">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M10 4v16M16 4v16"/></svg>
+            Columns
+        </button>
+        <button id="helpBtn" class="hdr-btn" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How to use this screen">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            Help
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+        <div class="hdr-sep"></div>
+        <button id="saveBtn" class="hdr-btn hdr-btn-primary" type="button" onclick="reviewAndSave()" title="Review and create this sales order">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg>
+            Save Order
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     HELP DRAWER
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>❔ How this screen works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it captures</div>
+                <p style="font-size:12.5px;line-height:1.55;color:var(--c-secondary);">
+                    Every Sale line carries a <b>Pricing Rule</b>. Choosing one sets the line's
+                    unit price <i>and</i> writes the rule's name into an order-item custom field,
+                    so the companion report can later say what was sold under each rule, and what
+                    was given away and why. Fishbowl itself records only the resulting price —
+                    several rules can produce the same price for entirely different reasons.
+                </p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Keyboard</div>
+                <p style="font-size:12.5px;line-height:1.8;color:var(--c-secondary);">
+                    <b>Type</b> in the blank bottom row to find a product · <b>Enter</b> adds it<br>
+                    <b>Tab</b> moves Qty → Rule → Price<br>
+                    <b>Enter</b> on the rule cell opens the picker; type to filter, Enter to choose<br>
+                    <b>Alt&nbsp;+&nbsp;N</b> inserts a note line below the current row<br>
+                    <b>Alt&nbsp;+&nbsp;Shift&nbsp;+&nbsp;N</b> inserts one above
+                </p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">The rule picker</div>
+                <p style="font-size:12.5px;line-height:1.55;color:var(--c-secondary);">
+                    <b>Fishbowl would apply</b> — the rules Fishbowl's own engine says are in
+                    scope and would fire.<br>
+                    <b>Other rules in scope</b> — applicable, but not the winner.<br>
+                    <b>All active rules</b> — everything else, priced locally. Use these to apply a
+                    rule by hand (a sample or BDF rule on a retail line, for instance). They are
+                    badged <span class="chip off">off‑list</span>.
+                </p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">The customer note</div>
+                <p style="font-size:12.5px;line-height:1.55;color:var(--c-secondary);">
+                    The note names which rules are in play for this customer, and may name
+                    several: <code>PROF 15% &amp; SVC 20%</code> is read as two. Shorthand is
+                    matched by its letters (<i>PROF</i> → Professional, <i>SVC</i> → Service),
+                    and Settings takes a list of aliases for anything it cannot reach.
+                    Numbers must agree exactly — 15% never matches a 20% rule.<br><br>
+                    Naming a rule does not force it onto a line: as each product is added,
+                    every named rule is tested against <b>its own</b> product scope and
+                    quantity bracket, and the first that fits is applied.
+                </p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Limits</div>
+                <p style="font-size:12.5px;line-height:1.55;color:var(--c-secondary);">
+                    Orders are <b>created, never edited</b> — the API has no update endpoint, which
+                    is why Estimate is the default status. Kits and drop-ship products are not
+                    accepted. Setting a line price needs the <b>SO_PRICE_OVERRIDE</b> right.
+                </p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS DRAWER
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙️ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div id="dsLockBadge" class="ds-lock-badge" style="display:none;">Locked by admin — your changes won't be saved.</div>
+        <div class="fb-grid fb-grid-cols">
+
+            <div class="fb-group">
+                <div class="fb-group-title">Pricing rule capture</div>
+                <div class="fb-field">
+                    <label for="setCfName">Order-item custom field</label>
+                    <select id="setCfName"></select>
+                </div>
+                <div class="fb-field">
+                    <label for="setManualCf">When the price is typed by hand</label>
+                    <select id="setManualCf">
+                        <option value="">Record no rule</option>
+                        <option value="Manual override">Record "Manual override"</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Default rule per line</div>
+                <div class="fb-field">
+                    <label for="setRuleSource">Read the prompt from</label>
+                    <select id="setRuleSource">
+                        <option value="note">Customer note</option>
+                        <option value="cf">Customer custom field</option>
+                        <option value="note-then-cf">Customer note, then custom field</option>
+                        <option value="off">Don't default anything</option>
+                    </select>
+                </div>
+                <div class="fb-field">
+                    <label for="setRuleCf">Customer custom field name</label>
+                    <input type="text" id="setRuleCf" placeholder="e.g. Discount Prompt">
+                </div>
+                <div class="fb-field">
+                    <label for="setRuleAliases">Shorthand (one per line)</label>
+                    <textarea id="setRuleAliases" rows="4" spellcheck="false"
+                              placeholder="PROF = Professional&#10;SVC = Service&#10;BDF = Business Development Fund"></textarea>
+                </div>
+                <div class="fb-field">
+                    <label for="setRulePattern">Extraction pattern (regex)</label>
+                    <input type="text" id="setRulePattern">
+                </div>
+                <div class="fb-field">
+                    <label><input type="checkbox" id="setRuleApply"> Apply to each new line</label>
+                </div>
+                <div class="fb-field">
+                    <label><input type="checkbox" id="setRuleNumeric"> Numbers must match exactly</label>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Order defaults</div>
+                <div class="fb-field">
+                    <label for="setStatus">New order status</label>
+                    <select id="setStatus">
+                        <option value="10">Estimate</option>
+                        <option value="20">Issued</option>
+                    </select>
+                </div>
+                <div class="fb-field">
+                    <label for="setModuleOpt">When rules tie</label>
+                    <select id="setModuleOpt">
+                        <option value="low">Lowest price wins</option>
+                        <option value="high">Highest price wins</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Line grid</div>
+                <div class="fb-field" style="font-size:11.5px;color:var(--c-secondary);line-height:1.5;">
+                    Drag a column heading to reorder it, or its right edge to resize.
+                    Both are remembered for you.
+                </div>
+                <button type="button" class="ds-btn" onclick="resetColPrefs()">Reset column layout</button>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Diagnostics</div>
+                <div class="fb-field">
+                    <label><input type="checkbox" id="setDebug"> Show debug console</label>
+                </div>
+            </div>
+
+            <div class="fb-group" id="dsAdminSection" style="display:none;">
+                <div class="fb-group-title">Admin</div>
+                <button type="button" class="ds-btn ds-btn-admin" onclick="Prefs.publish()">Publish as everyone's default</button>
+                <button type="button" class="ds-btn ds-btn-admin" id="dsLockBtn" onclick="Prefs.toggleLock()">Lock user editing</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn" onclick="Prefs.reset()">Reset to defaults</button>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="Prefs.save()">Save</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     BLOCKING BANNER — shown when the screen cannot safely write
+     ==================================================================== -->
+<div id="blocker" class="alert alert-warning blocker hidden"></div>
+
+<!-- ====================================================================
+     APP SHELL
+     ==================================================================== -->
+<div class="app-shell">
+
+    <!-- ORDER HEADER -->
+    <div class="card">
+        <div class="oh-head" id="ohHead" onclick="toggleOrderHeader()">
+            <span class="oh-caret">▼</span>
+            <span class="oh-title">Order</span>
+            <span class="oh-summary" id="ohSummary">No customer selected</span>
+        </div>
+        <div class="oh-body" id="ohBody">
+            <div class="oh-grid">
+                <div class="fld fld-wide">
+                    <label for="fCustomer">Customer <span class="req">*</span></label>
+                    <select id="fCustomer" onchange="onCustomerChange()"></select>
+                </div>
+                <div class="fld">
+                    <label>Status</label>
+                    <div class="seg" id="fStatus">
+                        <button type="button" data-st="10" onclick="setStatus(10)">Estimate</button>
+                        <button type="button" data-st="20" onclick="setStatus(20)">Issued</button>
+                    </div>
+                </div>
+                <div class="fld">
+                    <label for="fTaxRate">Tax rate <span class="req">*</span></label>
+                    <select id="fTaxRate" onchange="onTaxRateChange()"></select>
+                </div>
+                <div class="fld">
+                    <label for="fLocationGroup">Location group</label>
+                    <select id="fLocationGroup"></select>
+                </div>
+                <div class="fld">
+                    <label for="fCustomerPO">Customer PO</label>
+                    <input type="text" id="fCustomerPO" placeholder="optional">
+                </div>
+                <div class="fld">
+                    <label for="fVendorPO">Vendor PO</label>
+                    <input type="text" id="fVendorPO" placeholder="optional">
+                </div>
+                <div class="fld">
+                    <label for="fSoNum">SO No</label>
+                    <div class="with-btn">
+                        <input type="text" id="fSoNum" placeholder="(Fishbowl assigns)"
+                               title="Leave blank to let Fishbowl number the order. Typing a number needs the SO_EDIT_SO_NUM access right.">
+                        <button type="button" class="mini-btn" onclick="fetchNextSoNumber(true)"
+                                title="Ask Fishbowl for the next number. NOTE: this consumes it, whether or not the order is saved.">&#8635;</button>
+                    </div>
+                </div>
+                <div class="fld">
+                    <label for="fScheduled">Scheduled ship</label>
+                    <input type="date" id="fScheduled">
+                </div>
+                <div class="fld">
+                    <label for="fSalesperson">Salesperson</label>
+                    <select id="fSalesperson" onchange="updateOrderSummary()"></select>
+                </div>
+                <div class="fld fld-wide">
+                    <label for="fNote">Order note</label>
+                    <input type="text" id="fNote" placeholder="optional">
+                </div>
+            </div>
+            <div class="oh-grid" style="margin-top:10px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));">
+                <div class="addr-panel">
+                    <div class="addr-head">Bill To <select id="fBillTo" onchange="renderAddressPanels()"></select></div>
+                    <div class="addr-body empty" id="billToBody">No customer selected</div>
+                </div>
+                <div class="addr-panel">
+                    <div class="addr-head">Ship To <select id="fShipTo" onchange="renderAddressPanels()"></select></div>
+                    <div class="addr-body empty" id="shipToBody">No customer selected</div>
+                </div>
+            </div>
+            <div id="ruleBanner" class="rule-banner hidden"></div>
+        </div>
+    </div>
+
+    <!-- LINE GRID -->
+    <div class="card grid-card">
+        <div class="grid-scroll" id="gridScroll">
+            <div class="so-grid" id="soGrid"></div>
+        </div>
+        <div class="totals">
+            <span class="lc" id="lineCount">No lines</span>
+            <span class="tv">Total ex Tax <b id="tSub">—</b></span>
+            <span class="tv">Tax <b id="tTax">—</b></span>
+            <span class="tv grand">Total inc Tax <b id="tTot">—</b></span>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     FLOATING WIDGETS
+     ==================================================================== -->
+<div class="ta-pop" id="taPop"><div class="ta-list" id="taList"></div></div>
+
+<div class="col-pop" id="colPop">
+    <div class="col-pop-head">Line columns</div>
+    <div class="col-list" id="colList"></div>
+    <div class="rule-foot">
+        <span class="lnk" onclick="resetColPrefs()">Reset layout</span>
+        <span class="entry-hint">Drag a heading to reorder</span>
+    </div>
+</div>
+
+<div class="rule-pop" id="rulePop">
+    <div class="rule-search"><input type="text" id="ruleSearch" placeholder="Filter rules…" autocomplete="off"></div>
+    <div class="rule-list" id="ruleList"></div>
+    <div class="rule-foot">
+        <span class="lnk" onclick="pickRule(null)">Clear rule (use list price)</span>
+        <span class="entry-hint" id="ruleCount"></span>
+    </div>
+</div>
+
+<div class="modal-overlay" id="confirmModal">
+    <div class="modal-card" style="max-width:820px;">
+        <div class="modal-head"><h3 id="confirmTitle">Confirm</h3>
+            <button type="button" class="close-x" onclick="_confirmDone(false)">&times;</button></div>
+        <div class="modal-body" id="confirmBody"></div>
+        <div class="modal-foot">
+            <div class="left-grp"></div>
+            <div class="right-grp">
+                <button type="button" class="btn" onclick="_confirmDone(false)">Cancel</button>
+                <button type="button" class="btn btn-primary" id="confirmOk" onclick="_confirmDone(true)">Confirm</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="toast-container" id="toastBox"></div>
+
+<script>
+// ============================================================================
+//  RUNTIME GUARD
+// ----------------------------------------------------------------------------
+//  This screen both reads (runQuery) and WRITES (runRestApiAsync) — outside
+//  Fishbowl neither exists, and a half-working form that silently can't save
+//  is worse than an honest refusal.
+// ============================================================================
+const HAS_QUERY = (typeof runQueryAsync === 'function' || typeof runQuery === 'function');
+const HAS_REST  = (typeof runRestApiAsync === 'function');
+
+if (!HAS_QUERY) {
+    document.body.innerHTML =
+        '<div style="padding:40px;font-family:sans-serif;color:#506872;max-width:620px;">' +
+        '<h2 style="color:#101010;">Not running inside Fishbowl</h2>' +
+        '<p>This screen reads products, customers and pricing rules through the Fishbowl ' +
+        'BI query bridge and creates sales orders through the Fishbowl REST API. Open it ' +
+        'from the Fishbowl client.</p></div>';
+    throw new Error('Fishbowl query bridge unavailable');
+}
+
+// ============================================================================
+//  SETTINGS
+// ----------------------------------------------------------------------------
+//  Nothing about one client's rule naming belongs in the code — the note
+//  matcher is entirely configuration, so another install points it somewhere
+//  else without a code change.
+// ============================================================================
+const DEFAULTS = {
+    v: 1,
+    ruleCfName: 'Pricing Rule',
+    manualOverrideCfValue: '',
+    defaultRuleSource: 'note',          // note | cf | note-then-cf | off
+    defaultRuleCfName: '',
+    // Pulls a rule-shaped phrase ("CP Volume Discount 15%") out of a longer
+    // sentence. The class carries NO full stop on purpose: with one, a match
+    // starts mid-sentence and swallows the preceding clause, e.g.
+    // "day terms. CP Volume Discount 15%", which then equals no rule at all.
+    defaultRulePattern: '([A-Za-z][A-Za-z &/-]*?\\s*\\d+(?:\\.\\d+)?\\s*%)',
+    // Operator shorthand, one per line: "PROF = Professional". Expanded
+    // before a note is matched, for shorthand the letter-matching can't reach.
+    defaultRuleAliases: '',
+    defaultRuleApplyToNewLines: true,
+    defaultRuleRequireNumericMatch: true,
+    defaultStatusId: 10,
+    moduleOpt: 'low',                   // which price wins when rules tie
+    // Column widths + order for the line grid, written by the resize and
+    // reorder handlers. null = the shipped layout.
+    gridCols: null,
+    debug: false,
+};
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',   // shared admin defaults via userproperties, not report data (which needs a SAVED report — see FBLib.SharedData)
+        userKey:   'cdx.bi.baborSoEntry.user.v1',
+        masterKey: 'cdx.bi.baborSoEntry.master.v1',
+        defaults:  DEFAULTS,
+        propFallback: { debug: { name: 'BI_SHOW_DEBUG', dflt: 'false', parse: v => (v === 'true' || v === true) } },
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+function pref(k) {
+    try { const v = FBLib.Settings.resolve(k); return v === undefined ? DEFAULTS[k] : v; }
+    catch (_) { return DEFAULTS[k]; }
+}
+
+let DEBUG = !!pref('debug');
+
+// ============================================================================
+//  SMALL HELPERS
+// ============================================================================
+const C = (typeof FBLib !== 'undefined' && FBLib.Common) ? FBLib.Common : null;
+
+// Money always carries the HOME COMPANY's symbol and locale, not a hardcoded
+// dollar — fb-lib resolves those from Fishbowl's own currencyLocale(). The
+// fallback path asks for the same thing rather than assuming US dollars.
+let _cur = null;
+function curr() {
+    if (_cur) return _cur;
+    try { _cur = (typeof currencyLocale === 'function') ? currencyLocale() : null; } catch (_) { _cur = null; }
+    if (!_cur || typeof _cur !== 'object') _cur = {};
+    if (!_cur.locale) _cur.locale = 'en-US';
+    if (!_cur.symbol) _cur.symbol = '$';
+    return _cur;
+}
+function fmtMoney(v) {
+    if (C && C.formatMoney) return C.formatMoney(v);
+    const n = parseFloat(v); if (isNaN(n)) return '';
+    const c = curr();
+    return (n < 0 ? '-' : '') + c.symbol +
+        Math.abs(n).toLocaleString(c.locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function fmtQty(v) {
+    if (C && C.formatQty) return C.formatQty(v);
+    const n = parseFloat(v); if (isNaN(n)) return '';
+    return n % 1 === 0 ? String(Math.round(n)) : String(+n.toFixed(4));
+}
+function escSQL(s) {
+    if (C && C.escSQL) return C.escSQL(s);
+    return String(s == null ? '' : s).replace(/'/g, "''");
+}
+function escHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function intOf(v) {
+    if (v == null) return null;
+    const n = typeof v === 'number' ? v : parseInt(v, 10);
+    return isNaN(n) ? null : n;
+}
+function numOf(v) { const n = parseFloat(v); return isNaN(n) ? null : n; }
+function roundCents(n) { return Math.round((parseFloat(n) || 0) * 100) / 100; }
+
+// bit(1) reaches JS as 0/1, true/false, '1'/'0' or a base64 byte depending on
+// the driver path. Accept the union.
+function bitTrue(v) {
+    if (v === 1 || v === true || v === '1') return true;
+    if (typeof v === 'object' && v && v[0] === 1) return true;
+    if (typeof v === 'string' && (v === 'AQ==' || v === 'true')) return true;
+    return false;
+}
+
+function dbg(msg, kind) {
+    if (!DEBUG) return;
+    try { C.debugLog(msg, kind || 'info'); } catch (_) { console.log('[so-entry]', msg); }
+}
+
+function setStatusLine(t) { document.getElementById('statusLine').textContent = t; }
+
+function toast(msg, kind, ms) {
+    const box = document.getElementById('toastBox');
+    const el = document.createElement('div');
+    el.className = 'toast ' + (kind || 'info');
+    const icon = kind === 'success' ? '✓' : kind === 'error' ? '✕' : kind === 'warn' ? '⚠' : 'ℹ';
+    el.innerHTML = '<span class="toast-icon">' + icon + '</span>' +
+                   '<span class="toast-msg">' + escHtml(msg) + '</span>' +
+                   '<button class="toast-x" type="button">&times;</button>';
+    el.querySelector('.toast-x').addEventListener('click', () => el.remove());
+    box.appendChild(el);
+    const life = ms || (kind === 'error' ? 12000 : 4500);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, life);
+}
+
+// Replaces window.confirm, which JxBrowser renders as a native Java dialog.
+let _confirmResolve = null;
+function showConfirm(opts) {
+    return new Promise(resolve => {
+        _confirmResolve = resolve;
+        document.getElementById('confirmTitle').textContent = opts.title || 'Confirm';
+        document.getElementById('confirmBody').innerHTML = opts.body || '';
+        document.getElementById('confirmOk').textContent = opts.okLabel || 'Confirm';
+        document.getElementById('confirmModal').classList.add('open');
+    });
+}
+function _confirmDone(v) {
+    document.getElementById('confirmModal').classList.remove('open');
+    const r = _confirmResolve; _confirmResolve = null;
+    if (r) r(v);
+}
+
+// Query bridge. runQueryAsync already returns parsed rows with lowercased
+// keys; runQuery returns a JSON string and may hand back a bare object when
+// there is exactly one row.
+async function qp(sql) {
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : (r ? [r] : []);
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    let r; try { r = JSON.parse(raw); } catch (_) { return []; }
+    if (r == null) return [];
+    return Array.isArray(r) ? r : [r];
+}
+
+// ============================================================================
+//  STATE
+// ============================================================================
+let _customers = [], _products = [], _productById = new Map();
+let _taxRates = [], _locationGroups = [], _addresses = [], _users = [];
+let _soitemCfs = [], _ruleCfId = null;
+
+let _customer = null;
+let _statusId = intOf(pref('defaultStatusId')) || 10;
+// Tax has two modes. 'order' applies one rate to the whole order (the
+// customer's own, or one picked here). 'product' is what a customer with NO
+// tax rate of their own gets: every line resolves its rate from the product's
+// own tax code, and non-taxable products land on None.
+let _taxMode = 'product';
+let _taxRateId = null;
+let _taxRateById = new Map();
+const NONE_TAX_ID = 1;              // apidocs: "Use 1 for None
+let _moduleOpt = pref('moduleOpt') || 'low';
+
+// Pricing-rule state. _activeRules is scoped to the selected customer;
+// _allRulesById is every active rule, which is what the off-list section of
+// the picker offers and what labels a server-returned rule id.
+let _activeRules = [], _allRulesById = new Map();
+let _partCosts = new Map(), _partCostsLoaded = false;
+let _customerLastPrice = new Map();
+
+// The line list. ORDER IS THE MODEL — lineNumber is derived at submit, never
+// stored, so inserting a note never renumbers anything.
+let _lines = [], _lineSeq = 0;
+
+// The rules the customer's note names, in the order they appear, plus the
+// pieces that resolved to nothing. A note routinely names SEVERAL
+// ("PROF 15% & SVC 20%"), and which one lands on a line is decided per line.
+let _defaultRules = [], _defaultRuleMisses = [], _defaultRuleText = '';
+
+let _submitting = false;
+
+// ============================================================================
+//  LOADERS
+// ============================================================================
+async function loadCustomers() {
+    const cfName = String(pref('defaultRuleCfName') || '').trim();
+    // The note is the prompt the operator reads today ("Volume Discount 20%"),
+    // so it is also what the default-rule matcher reads. A custom field is
+    // offered as an alternative source for installs that keep it elsewhere.
+    const cfSel = cfName
+        ? `CustomFieldByName(cu.customFields, '${escSQL(cfName)}') AS ruleprompt`
+        : `'' AS ruleprompt`;
+    const rows = await qp(`
+        SELECT cu.id, cu.number, cu.name, cu.accountId, cu.note,
+               cu.parentId, par.name AS parentname,
+               cu.taxRateId, cu.defaultSalesmanId, cu.defaultCarrierId,
+               ${cfSel},
+               tr.name AS taxratename,
+               sm.userName AS salesmanname
+        FROM customer cu
+        LEFT JOIN customer par ON par.id = cu.parentId
+        LEFT JOIN taxrate tr ON tr.id = cu.taxRateId
+        LEFT JOIN sysuser sm ON sm.id = cu.defaultSalesmanId
+        WHERE cu.activeFlag = 1
+        ORDER BY cu.name
+        LIMIT 5000
+    `);
+    const nameById = new Map();
+    rows.forEach(r => { const i = intOf(r.id); if (i != null) nameById.set(i, String(r.name || '')); });
+
+    _customers = rows.map(r => ({
+        id: intOf(r.id), num: r.number, name: String(r.name || ''),
+        parentId: intOf(r.parentid),
+        parentName: (r.parentid != null ? nameById.get(intOf(r.parentid)) : null) || r.parentname || '',
+        accountId: intOf(r.accountid),
+        note: r.note != null ? String(r.note) : '',
+        rulePrompt: r.ruleprompt != null ? String(r.ruleprompt) : '',
+        taxRateId: intOf(r.taxrateid), taxRateName: r.taxratename || '',
+        salesmanId: intOf(r.defaultsalesmanid), salesmanName: r.salesmanname || '',
+        carrierId: intOf(r.defaultcarrierid),
+    }));
+
+    // Cluster sub-customers under their parent, at the PARENT's alphabetical
+    // position. Picking the wrong record here means the wrong default rule, so
+    // the label has to make the relationship obvious.
+    _customers.sort((a, b) => {
+        const ka = a.parentName || a.name, kb = b.parentName || b.name;
+        const r = ka.localeCompare(kb, undefined, { sensitivity: 'base', numeric: true });
+        if (r !== 0) return r;
+        const ac = a.parentName ? 1 : 0, bc = b.parentName ? 1 : 0;
+        if (ac !== bc) return ac - bc;
+        return a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true });
+    });
+
+    // Only append the customer number where the FULL label is still ambiguous
+    // — "Parent > Child" already distinguishes a same-named sub-customer.
+    const counts = new Map();
+    _customers.forEach(c => { const l = baseLabel(c); counts.set(l, (counts.get(l) || 0) + 1); });
+    const dupes = new Set([...counts.entries()].filter(([, n]) => n > 1).map(([l]) => l));
+    _customers.forEach(c => { c.label = baseLabel(c) + (dupes.has(baseLabel(c)) ? '  (#' + (c.num || c.id) + ')' : ''); });
+
+    const sel = document.getElementById('fCustomer');
+    sel.innerHTML = '<option value="">— Select a customer —</option>' +
+        _customers.map(c => '<option value="' + c.id + '">' + escHtml(c.label) + '</option>').join('');
+}
+function baseLabel(c) { return c.parentName ? c.parentName + ' > ' + c.name : c.name; }
+
+async function loadProducts() {
+    // producttotree is many-to-many, so GROUP_CONCAT collapses the tree
+    // assignments instead of multiplying the product into duplicate rows.
+    const rows = await qp(`
+        SELECT product.id, product.num, product.description, product.price,
+               product.sku, product.upc, product.taxableFlag, product.partId,
+               product.taxId, product.kitFlag, product.defaultSoItemType,
+               GROUP_CONCAT(DISTINCT producttree.id) AS treeids,
+               uom.code AS uomcode
+        FROM product
+        LEFT JOIN producttotree ON product.id = producttotree.productId
+        LEFT JOIN producttree ON producttotree.productTreeId = producttree.id
+        LEFT JOIN uom ON product.uomId = uom.id
+        WHERE product.id > 0 AND product.activeFlag = 1
+        GROUP BY product.id, product.num, product.description, product.price,
+                 product.sku, product.upc, product.taxableFlag, product.partId,
+                 product.taxId, product.kitFlag, product.defaultSoItemType, uom.code
+        ORDER BY product.num
+        LIMIT 10000
+    `);
+    _products = rows.map(r => ({
+        id: intOf(r.id), num: String(r.num || ''), description: String(r.description || ''),
+        price: numOf(r.price) || 0,
+        sku: r.sku || '', upc: r.upc || '',
+        taxableFlag: bitTrue(r.taxableflag),
+        // The product's OWN tax code. Used when the order carries no rate of
+        // its own — see lineTaxRateRow().
+        taxRateId: intOf(r.taxid),
+        partId: intOf(r.partid),
+        // Kits and drop-ship lines are rejected (422) by the REST create, and
+        // this screen has no CSV fallback, so they are refused at the picker.
+        kitFlag: bitTrue(r.kitflag),
+        defaultSoItemType: intOf(r.defaultsoitemtype),
+        treeIds: (r.treeids ? String(r.treeids).split(',') : []).map(s => parseInt(s, 10)).filter(n => !isNaN(n)),
+        uomCode: r.uomcode || 'ea',
+        search: (String(r.num || '') + ' ' + String(r.description || '') + ' ' + (r.sku || '') + ' ' + (r.upc || '')).toLowerCase(),
+    })).filter(p => p.id != null);
+    _productById = new Map(_products.map(p => [p.id, p]));
+}
+
+async function loadUsers() {
+    try {
+        const rows = await qp(`
+            SELECT id, userName, firstName, lastName
+            FROM sysuser WHERE activeFlag = 1 ORDER BY userName
+        `);
+        _users = rows.map(r => {
+            const full = [r.firstname, r.lastname].filter(Boolean).join(' ').trim();
+            return {
+                id: intOf(r.id),
+                userName: String(r.username || ''),
+                label: String(r.username || '') + (full ? '  \u2014  ' + full : ''),
+            };
+        }).filter(u => u.id != null);
+    } catch (e) {
+        dbg('sysuser lookup failed: ' + (e && e.message || e), 'warn');
+        _users = [];
+    }
+    document.getElementById('fSalesperson').innerHTML =
+        '<option value="">\u2014 signed-in user \u2014</option>' +
+        _users.map(u => '<option value="' + u.id + '">' + escHtml(u.label) + '</option>').join('');
+}
+
+// The next SO number, straight from Fishbowl's own auto-numbering.
+//
+// CAUTION, and the reason this is not called when the screen merely opens:
+// the endpoint's own documentation says it "immediately consumes the order
+// number \u2014 the number is incremented and reserved regardless of whether a
+// sales order is subsequently created". So it runs once an order is genuinely
+// being started (a customer chosen), once more after a save, and whenever the
+// operator asks for it \u2014 not on every page view, which would punch holes in
+// the numbering for anyone who just looked.
+async function fetchNextSoNumber(force) {
+    const el = document.getElementById('fSoNum');
+    if (!el) return;
+    if (!HAS_REST) return;
+    if (!force && String(el.value || '').trim()) return;
+    try {
+        const r = await runRestApiAsync({ method: 'GET', path: '/api/sales-orders/next-number' });
+        const o = (typeof r === 'string' ? safeParse(r) : r) || {};
+        const n = o.orderNumber != null ? o.orderNumber
+                : o.number != null ? o.number
+                : o.num != null ? o.num : null;
+        if (n != null) { el.value = String(n); dbg('reserved SO number ' + n); }
+        updateOrderSummary();
+    } catch (e) {
+        // A 400 here means auto-numbering is switched off in Module Options,
+        // which is a legitimate configuration: the operator types the number.
+        const st = restErrStatus(e);
+        dbg('next-number unavailable (' + (st || '?') + '): ' + (e && e.message || e), 'warn');
+        if (force) {
+            toast(st === 400
+                ? 'Fishbowl is not auto-numbering sales orders, so type the number yourself.'
+                : 'Could not reserve a number: ' + (e && e.message || e), 'warn', 9000);
+        }
+    }
+}
+
+async function loadLookups() {
+    const [tax, lgs] = await Promise.all([
+        // Every rate, not just the active ones: a product can still reference
+        // a deactivated code, and showing it blank would be a lie.
+        qp(`SELECT id, name, code, rate, defaultFlag, activeFlag FROM taxrate ORDER BY name`),
+        qp(`SELECT id, name FROM locationgroup WHERE activeFlag = 1 ORDER BY name`),
+    ]);
+    _taxRates = tax.map(r => ({
+        id: intOf(r.id), name: String(r.name || ''), code: r.code || '',
+        rate: numOf(r.rate) || 0, isDefault: bitTrue(r.defaultflag),
+        active: bitTrue(r.activeflag),
+    }));
+    _taxRateById = new Map(_taxRates.map(t => [t.id, t]));
+    _locationGroups = lgs.map(r => ({ id: intOf(r.id), name: String(r.name || '') }));
+
+    document.getElementById('fTaxRate').innerHTML =
+        '<option value="product">Per product — each line uses its own code</option>' +
+        _taxRates.filter(t => t.active).map(t => '<option value="' + t.id + '">' + escHtml(t.name) +
+            (t.rate ? ' (' + (t.rate * 100).toFixed(t.rate * 100 % 1 ? 2 : 0) + '%)' : '') + '</option>').join('');
+
+    let allowed = null;
+    try { if (typeof getLocationGroupList === 'function') allowed = getLocationGroupList(); } catch (_) {}
+    const lgList = (Array.isArray(allowed) && allowed.length)
+        ? _locationGroups.filter(l => allowed.map(Number).includes(l.id))
+        : _locationGroups;
+    document.getElementById('fLocationGroup').innerHTML =
+        '<option value="">— Server default —</option>' +
+        lgList.map(l => '<option value="' + l.id + '">' + escHtml(l.name) + '</option>').join('');
+}
+
+// Every active pricing rule, unfiltered. This is the off-list source in the
+// picker AND the label source for rule ids the server hands back — best-price
+// returns a name and a price but not the adjustment shape.
+async function loadAllRules() {
+    const rows = await qp(`
+        SELECT id, name, description, isActive, isAutoApply, isTier2,
+               customerInclTypeId, customerInclId,
+               productInclTypeId, productInclId,
+               qtyApplies, qtyMin, qtyMax,
+               dateApplies, dateBegin, dateEnd,
+               paTypeId, paBaseAmountTypeId, paApplies, paAmount, paPercent
+        FROM pricingrule
+        WHERE isActive = 1
+          AND (dateApplies = 0
+               OR (CURDATE() BETWEEN COALESCE(dateBegin, '1900-01-01') AND COALESCE(dateEnd, '2999-12-31')))
+        ORDER BY name
+    `);
+    _allRulesById = new Map();
+    rows.forEach(r => { const i = intOf(r.id); if (i != null) _allRulesById.set(i, r); });
+    dbg('Loaded ' + _allRulesById.size + ' active pricing rules');
+    return rows;
+}
+
+// Narrow the active rules to those in scope for this customer. A failed group
+// lookup fails CLOSED — charging another group's pricing is worse than falling
+// back to customer-specific rules and the product price.
+async function loadRulesForCustomer(customer) {
+    if (!customer) { _activeRules = []; return; }
+    const all = [..._allRulesById.values()];
+    let groupIds = new Set();
+    if (customer.accountId != null) {
+        try {
+            const g = await qp(`SELECT groupId AS groupid FROM accountgrouprelation WHERE accountId = ${customer.accountId}`);
+            groupIds = new Set(g.map(r => intOf(r.groupid)).filter(n => n != null));
+        } catch (e) {
+            console.warn('Customer group lookup failed — group-scoped rules disabled:', e);
+            dbg('Customer group lookup failed; group rules disabled for this customer', 'warn');
+        }
+    }
+    // customerincltype: 1 All · 2 Customer · 3 Customer Group
+    _activeRules = all.filter(r => {
+        const t = intOf(r.customerincltypeid);
+        if (t === 1) return true;
+        if (t === 2) return intOf(r.customerinclid) === customer.id;
+        if (t === 3) return groupIds.has(intOf(r.customerinclid));
+        return false;
+    });
+    dbg('Customer "' + customer.name + '": ' + _activeRules.length + ' of ' + all.length +
+        ' rules in scope; groups [' + ([...groupIds].join(', ') || 'none') + ']');
+    if (_activeRules.some(ruleUsesCostBase)) await loadPartCosts();
+}
+
+function ruleUsesCostBase(r) {
+    const b = intOf(r.pabaseamounttypeid);
+    return b === 1 || b === 2 || b === 3 || b === 6 || b === 8;
+}
+
+// One-shot cache of the cost columns cost-based rules resolve against.
+// partcost has at most one row per part; vendorparts has one per vendor × UOM,
+// so the default vendor's cost and the newest cost are kept separately.
+async function loadPartCosts() {
+    if (_partCostsLoaded) return;
+    _partCostsLoaded = true;
+    try {
+        const [costRows, vpRows] = await Promise.all([
+            qp(`SELECT part.id AS partid, part.stdCost AS stdcost, partcost.avgCost AS avgcost
+                FROM part LEFT JOIN partcost ON partcost.partId = part.id`),
+            qp(`SELECT partId AS partid, lastCost AS lastcost, defaultFlag AS defaultflag, lastDate AS lastdate
+                FROM vendorparts WHERE lastCost IS NOT NULL`),
+        ]);
+        costRows.forEach(r => {
+            const pid = intOf(r.partid); if (pid == null) return;
+            _partCosts.set(pid, { avg: numOf(r.avgcost), std: numOf(r.stdcost), vendor: null, last: null, _d: '' });
+        });
+        vpRows.forEach(r => {
+            const pid = intOf(r.partid); if (pid == null) return;
+            let e = _partCosts.get(pid);
+            if (!e) { e = { avg: null, std: null, vendor: null, last: null, _d: '' }; _partCosts.set(pid, e); }
+            const cost = numOf(r.lastcost); if (cost == null) return;
+            if (bitTrue(r.defaultflag) && e.vendor == null) e.vendor = cost;
+            const d = r.lastdate ? String(r.lastdate) : '';
+            if (e.last == null || d > e._d) { e.last = cost; e._d = d; }
+        });
+        dbg('Cached cost bases for ' + _partCosts.size + ' parts');
+    } catch (e) {
+        _partCostsLoaded = false;   // allow a retry on the next customer change
+        console.warn('loadPartCosts failed:', e);
+    }
+}
+
+async function loadCustomerLastPrices(customer) {
+    _customerLastPrice = new Map();
+    if (!customer) return;
+    try {
+        const rows = await qp(`
+            SELECT productId AS productid, lastPrice AS lastprice
+            FROM customerparts WHERE customerId = ${customer.id}
+        `);
+        rows.forEach(r => {
+            const pid = intOf(r.productid), lp = numOf(r.lastprice);
+            if (pid != null && lp != null) _customerLastPrice.set(pid, lp);
+        });
+    } catch (e) { dbg('customerparts lookup failed: ' + e.message, 'warn'); }
+}
+
+async function loadAddresses(customer) {
+    _addresses = [];
+    const ship = document.getElementById('fShipTo'), bill = document.getElementById('fBillTo');
+    ship.innerHTML = bill.innerHTML = '<option value="">— none —</option>';
+    if (!customer || customer.accountId == null) return;
+    // Addresses hang off the ACCOUNT, not the customer row.
+    const rows = await qp(`
+        SELECT a.id, a.name AS label, a.addressName AS recipient, a.address AS street,
+               a.city, a.zip, a.defaultFlag, a.typeID,
+               s.code AS statecode, s.name AS statename,
+               co.name AS country, co.abbreviation AS countryabbrev,
+               t.name AS typename
+        FROM address a
+        LEFT JOIN stateconst s ON s.id = a.stateId
+        LEFT JOIN countryconst co ON co.id = a.countryId
+        LEFT JOIN addresstype t ON t.id = a.typeID
+        WHERE a.accountId = ${customer.accountId}
+        ORDER BY a.defaultFlag DESC, a.typeID, a.name
+    `);
+    _addresses = rows.map(r => ({
+        id: intOf(r.id),
+        label: r.label || r.recipient || ('Address ' + r.id),
+        recipient: r.recipient || r.label || customer.name,
+        street: r.street || '', city: r.city || '',
+        state: r.statecode || r.statename || '', zip: r.zip || '',
+        country: r.country || '', countryAbbrev: r.countryabbrev || '',
+        defaultFlag: bitTrue(r.defaultflag),
+        typeName: String(r.typename || ''),
+    }));
+    const opts = '<option value="">— none —</option>' +
+        _addresses.map(a => '<option value="' + a.id + '">' + escHtml(a.label + (a.typeName ? ' · ' + a.typeName : '')) + '</option>').join('');
+    ship.innerHTML = bill.innerHTML = opts;
+    const find = pred => _addresses.find(pred);
+    if (_addresses.length) {
+        ship.value = String((find(a => /ship/i.test(a.typeName)) || find(a => a.defaultFlag) || _addresses[0]).id);
+        bill.value = String((find(a => /bill/i.test(a.typeName)) || find(a => /main/i.test(a.typeName)) || find(a => a.defaultFlag) || _addresses[0]).id);
+    }
+    renderAddressPanels();
+}
+
+// The client shows each chosen address in full under a blue header, not just
+// its name — which is what lets the operator catch a wrong ship-to before the
+// order is booked. Same here.
+function addrLines(a) {
+    if (!a) return '';
+    const out = [a.recipient, a.street];
+    const cityLine = [a.city, a.state, a.zip].filter(Boolean).join('  ');
+    if (cityLine) out.push(cityLine);
+    if (a.country) out.push(String(a.country).toUpperCase());
+    return out.filter(Boolean).join('\n');
+}
+function renderAddressPanels() {
+    [['fBillTo', 'billToBody'], ['fShipTo', 'shipToBody']].forEach(pair => {
+        const sel = document.getElementById(pair[0]), body = document.getElementById(pair[1]);
+        if (!sel || !body) return;
+        const a = _addresses.find(x => x.id === intOf(sel.value));
+        const txt = addrLines(a);
+        body.textContent = txt || (_customer ? 'No address on file' : 'No customer selected');
+        body.classList.toggle('empty', !txt);
+    });
+    updateOrderSummary();
+}
+
+// ============================================================================
+//  CUSTOM FIELD DISCOVERY
+// ----------------------------------------------------------------------------
+//  Values live in soitem.customFields (a JSON column on the row); the
+//  DEFINITIONS live in `customfield`, keyed to a module through
+//  tablereference. There is no REST endpoint for custom fields, so this is SQL.
+// ============================================================================
+async function loadSoItemCustomFields() {
+    _soitemCfs = [];
+    try {
+        const rows = await qp(`
+            SELECT cf.id, cf.name, cf.sortOrder, cf.required, cft.name AS typename
+            FROM customfield cf
+            JOIN tablereference tr ON tr.tableId = cf.tableId
+            LEFT JOIN customfieldtype cft ON cft.id = cf.customFieldTypeId
+            WHERE cf.activeFlag = 1 AND tr.tableRefName = 'soitem'
+            ORDER BY cf.sortOrder, cf.name
+        `);
+        _soitemCfs = rows.map(r => ({
+            id: intOf(r.id), name: String(r.name || ''),
+            type: String(r.typename || ''), required: bitTrue(r.required),
+        })).filter(c => c.id != null);
+    } catch (e) {
+        console.warn('soitem custom-field discovery failed:', e);
+        dbg('soitem custom-field discovery failed: ' + e.message, 'error');
+    }
+
+    const want = String(pref('ruleCfName') || '').trim().toLowerCase();
+    const hit = _soitemCfs.find(c => c.name.trim().toLowerCase() === want);
+    _ruleCfId = hit ? hit.id : null;
+
+    // Populate the Settings picker so an install with a suitable field already
+    // in place can point at it instead of creating another.
+    const sel = document.getElementById('setCfName');
+    sel.innerHTML = _soitemCfs.length
+        ? _soitemCfs.map(c => '<option value="' + escHtml(c.name) + '">' + escHtml(c.name) + ' (' + escHtml(c.type || '?') + ')</option>').join('')
+        : '<option value="">— no order-item custom fields exist —</option>';
+    if (hit) sel.value = hit.name;
+    else if (_soitemCfs.length) sel.insertAdjacentHTML('afterbegin',
+        '<option value="' + escHtml(pref('ruleCfName')) + '" selected>' + escHtml(pref('ruleCfName')) + ' (missing)</option>');
+
+    renderBlocker();
+    dbg(_ruleCfId
+        ? 'Rule custom field "' + pref('ruleCfName') + '" resolved to customfield.id ' + _ruleCfId
+        : 'Rule custom field "' + pref('ruleCfName') + '" NOT FOUND on soitem');
+}
+
+// The screen still prices and still creates orders without the field, but it
+// would be recording the price and losing the reason — which is the entire
+// point. So say so, loudly, and refuse to save.
+function renderBlocker() {
+    const el = document.getElementById('blocker');
+    const problems = [];
+    if (!HAS_REST) {
+        problems.push('<b>The Fishbowl REST connection is not available.</b> This screen creates orders ' +
+            'through it; without it nothing can be saved. The server must be running with REST enabled.');
+    }
+    if (_ruleCfId == null) {
+        problems.push('<b>The order-item custom field &ldquo;' + escHtml(pref('ruleCfName')) + '&rdquo; does not exist.</b> ' +
+            'Without it this screen can set the price but not record the reason, which is the whole purpose. ' +
+            'Add it in Fishbowl ▸ Settings ▸ Custom Fields, on the <b>Sales Order Item</b> module, as a ' +
+            '<b>Text</b> field with that exact name — then reopen this screen. ' +
+            (_soitemCfs.length ? 'Alternatively, pick an existing order-item field in Settings.' : ''));
+    }
+    if (!problems.length) { el.classList.add('hidden'); el.innerHTML = ''; return; }
+    el.classList.remove('hidden');
+    el.innerHTML = problems.map(p => '<div style="margin:2px 0;line-height:1.5;">' + p + '</div>').join('');
+    refreshSaveButton();
+}
+
+// ============================================================================
+//  PRICING — PRIMARY SOURCE: GET /api/products/:id/best-price
+// ----------------------------------------------------------------------------
+//  This returns Fishbowl's OWN candidate rules for the product, each with the
+//  price Fishbowl's own engine computes and a `valid` flag marking the one it
+//  would auto-apply. Entries marked invalid still carry a price, which is
+//  exactly what a manual application of a sample/BDF rule needs.
+//
+//  Its query parameters are not documented anywhere authoritative — the names
+//  below come from the in-house API tool — so the spelling is PROBED once per
+//  session against a real product and never persisted. A cached shape would
+//  outlive a server upgrade; one wasted round trip per session is cheaper.
+// ============================================================================
+const BP_PARAM_SHAPES = [
+    ['customerId', 'quantity', 'includePricingRules'],
+    ['customerId', 'qty',      'includePricingRules'],
+    ['customerId', 'quantity', 'includeRules'],
+    ['customerId', 'quantity', null],
+];
+let _bpShape = null;            // null = unprobed · false = unusable · array = winning shape
+let _bpProbing = null;
+const _bpCache = new Map();     // key -> {best, rules[]}
+const _bpInflight = new Map();
+
+function bpKey(productId, qty, customerId) { return productId + '|' + qty + '|' + customerId; }
+
+async function bpCall(productId, qty, customerId, shape) {
+    const params = [[shape[0], String(customerId)], [shape[1], String(qty)]];
+    if (shape[2]) params.push([shape[2], 'true']);
+    return await runRestApiAsync({
+        method: 'GET',
+        path: '/api/products/' + productId + '/best-price',
+        queryParameters: params,
+    });
+}
+
+async function probeBestPrice(productId, qty, customerId) {
+    if (_bpShape !== null) return _bpShape;
+    if (_bpProbing) return await _bpProbing;
+    _bpProbing = (async () => {
+        if (!HAS_REST) { _bpShape = false; return false; }
+        for (const shape of BP_PARAM_SHAPES) {
+            try {
+                const r = await bpCall(productId, qty, customerId, shape);
+                const rules = r && (r.pricingRules || r.pricingrules);
+                if (Array.isArray(rules) && rules.length) {
+                    _bpShape = shape;
+                    dbg('best-price parameter shape resolved: ' + JSON.stringify(shape));
+                    return shape;
+                }
+                dbg('best-price shape ' + JSON.stringify(shape) + ' answered without a rule list', 'warn');
+            } catch (e) {
+                dbg('best-price shape ' + JSON.stringify(shape) + ' failed: ' + (e && e.message || e), 'warn');
+            }
+        }
+        _bpShape = false;
+        dbg('best-price is unusable on this server — the picker will price rules locally instead.', 'warn');
+        return false;
+    })();
+    const out = await _bpProbing;
+    _bpProbing = null;
+    return out;
+}
+
+// Server-side candidates for one line. Returns [] when the endpoint can't
+// answer, which is the signal to fall back to the local engine.
+async function serverCandidates(product, qty, customerId) {
+    if (!HAS_REST || !product || customerId == null) return [];
+    const key = bpKey(product.id, qty, customerId);
+    if (_bpCache.has(key)) return _bpCache.get(key).rules;
+    if (_bpInflight.has(key)) { const r = await _bpInflight.get(key); return r.rules; }
+
+    const p = (async () => {
+        const shape = await probeBestPrice(product.id, qty, customerId);
+        if (!shape) return { best: null, rules: [] };
+        let resp;
+        try { resp = await bpCall(product.id, qty, customerId, shape); }
+        catch (e) { dbg('best-price failed for ' + product.num + ': ' + (e && e.message || e), 'warn'); return { best: null, rules: [] }; }
+        const raw = (resp && (resp.pricingRules || resp.pricingrules)) || [];
+        const rules = raw.map(r => ({
+            id: intOf(r.id),
+            name: String(r.name || ''),
+            description: r.description || '',
+            unitPrice: numOf(r.unitPrice != null ? r.unitPrice : r.unitprice),
+            valid: r.valid === true || r.valid === 'true',
+            source: 'server',
+        })).filter(r => r.id != null && r.unitPrice != null);
+        return { best: numOf(resp && (resp.bestUnitPrice || resp.bestunitprice)), rules };
+    })();
+
+    _bpInflight.set(key, p);
+    let out;
+    try { out = await p; } finally { _bpInflight.delete(key); }
+    _bpCache.set(key, out);
+    return out.rules;
+}
+
+// ============================================================================
+//  PRICING — LOCAL ENGINE (fallback + off-list pricing)
+// ----------------------------------------------------------------------------
+//  Ported from QuickOrder.htm. Enum mappings are CALIBRATED against the live
+//  lookup tables (patype, pabaseamounttype, customerincltype), not guessed:
+//    patype:            1 Markdown · 2 Markup · 3 Margin · 4 Percent ·
+//                       5 Amount · 6 Set price
+//    pabaseamounttype:  1 Average Cost · 2 Default Vendor's Cost ·
+//                       3 Last Cost · 4 List Price · 5 Product Price ·
+//                       6 Standard Cost · 7 Customer Last Price ·
+//                       8 Last Manufactured Cost
+//    customerincltype:  1 All · 2 Customer · 3 Customer Group
+// ============================================================================
+function ruleIsTier2(r) { return bitTrue(r.istier2); }
+
+// productInclTypeId: 1 = all · 2 = a specific product · 3 = a product tree
+function productMatchesRule(product, r) {
+    const t = intOf(r.productincltypeid), inclId = intOf(r.productinclid);
+    if (t === 1) return true;
+    if (t === 2) return inclId === product.id;
+    if (t === 3) return inclId != null && (product.treeIds || []).includes(inclId);
+    return false;
+}
+
+// qtyApplies is frequently false on rules that still carry a meaningful
+// bracket, so the bracket is enforced whenever qtyMin/qtyMax is populated.
+function qtyMatchesRule(qty, r) {
+    const mn = numOf(r.qtymin), mx = numOf(r.qtymax);
+    const hasMin = mn != null && mn > 0, hasMax = mx != null && mx > 0;
+    if (!hasMin && !hasMax) return true;
+    if (hasMin && qty < mn) return false;
+    if (hasMax && qty > mx) return false;
+    return true;
+}
+
+// Lower rank wins: 1 Customer · 2 Customer Group · 3 Fixed · 4 Other.
+function ruleTypeRank(r) {
+    const ct = intOf(r.customerincltypeid);
+    if (ct === 2) return 1;
+    if (ct === 3) return 2;
+    return adjustmentType(r) === 'fixed_price' ? 3 : 4;
+}
+
+function adjustmentType(r) {
+    switch (intOf(r.patypeid)) {
+        case 1: return 'markdown';
+        case 2: return 'markup';
+        case 3: return 'margin';
+        case 4: return 'percent';
+        case 5: return 'amount';
+        case 6: return 'fixed_price';
+        default: return 'markdown';
+    }
+}
+
+const PA_BASE_NAMES = {
+    1: 'Average Cost', 2: "Default Vendor's Cost", 3: 'Last Cost', 4: 'List Price',
+    5: 'Product Price', 6: 'Standard Cost', 7: 'Customer Last Price', 8: 'Last Manufactured Cost',
+};
+function baseTypeName(r) { return PA_BASE_NAMES[intOf(r.pabaseamounttypeid)] || 'Product Price'; }
+
+function describeRule(r) {
+    if (!r) return '';
+    const kind = adjustmentType(r);
+    const pct = numOf(r.papercent), amt = numOf(r.paamount);
+    const pctS = pct == null ? '?' : ((pct * 100) % 1 ? (pct * 100).toFixed(1) : (pct * 100).toFixed(0)) + '%';
+    switch (kind) {
+        case 'markdown':    return 'Markdown ' + pctS + ' off ' + baseTypeName(r);
+        case 'markup':      return 'Markup ' + pctS + ' on ' + baseTypeName(r);
+        case 'margin':      return 'Margin ' + pctS + ' on ' + baseTypeName(r);
+        case 'percent':     return pctS + ' of ' + baseTypeName(r);
+        case 'amount':      return amt == null ? baseTypeName(r) : baseTypeName(r) + (amt < 0 ? ' − ' : ' + ') + fmtMoney(Math.abs(amt));
+        case 'fixed_price': return amt == null ? 'Set price' : 'Set price ' + fmtMoney(amt);
+        default:            return '';
+    }
+}
+
+// Returns null when the base can't be resolved (no cost row, the customer has
+// never bought the product, List Price referenced from Tier 2) so the rule is
+// SKIPPED rather than priced at $0.
+function adjustmentBase(r, product, productPrice, listPrice) {
+    const b = intOf(r.pabaseamounttypeid);
+    const costs = product && product.partId != null ? _partCosts.get(product.partId) : null;
+    switch (b) {
+        case 1: return costs && costs.avg    != null ? costs.avg    : null;
+        case 2: return costs && costs.vendor != null ? costs.vendor : null;
+        case 3: return costs && costs.last   != null ? costs.last   : null;
+        case 4: return listPrice != null ? listPrice : null;
+        case 6: return costs && costs.std    != null ? costs.std    : null;
+        case 7: { const lp = product ? _customerLastPrice.get(product.id) : null; return lp != null && lp > 0 ? lp : null; }
+        case 8: return null;
+        case 5:
+        default: return productPrice;
+    }
+}
+
+// paPercent is stored as a DECIMAL FRACTION (0.2 means 20%, 1.0 means 100%),
+// so these formulas do NOT divide by 100. paApplies is deliberately ignored —
+// it is often false on rules that carry a perfectly usable adjustment.
+function applyRuleAdjustment(r, product, productPrice, listPrice) {
+    const base = adjustmentBase(r, product, productPrice, listPrice);
+    if (base == null) return null;
+    const kind = adjustmentType(r);
+    const pct = numOf(r.papercent), amt = numOf(r.paamount);
+    switch (kind) {
+        case 'markdown':    return pct == null ? null : base * (1 - pct);
+        case 'markup':      return pct == null ? null : base * (1 + pct);
+        case 'margin':      return pct == null ? null : (pct >= 1 ? base : base / (1 - pct));
+        case 'percent':     return pct == null ? null : base * pct;
+        case 'amount':      return amt == null ? null : Math.max(0, base + amt);
+        case 'fixed_price': return amt == null ? null : amt;
+        default:            return null;
+    }
+}
+
+// One tier's competition — only the highest-ranked TYPE present competes.
+function competeAtTier(tierRules, product, productPrice, listPrice) {
+    if (!tierRules || !tierRules.length) return { winner: null, winnerPrice: null };
+    const minRank = Math.min(...tierRules.map(ruleTypeRank));
+    const scored = [];
+    for (const r of tierRules.filter(x => ruleTypeRank(x) === minRank)) {
+        const p = applyRuleAdjustment(r, product, productPrice, listPrice);
+        if (p == null || !isFinite(p) || p < 0) continue;
+        scored.push({ rule: r, price: p });
+    }
+    if (!scored.length) return { winner: null, winnerPrice: null };
+    let win = scored[0];
+    for (const s of scored.slice(1)) {
+        if (_moduleOpt === 'high' ? s.price > win.price : s.price < win.price) win = s;
+    }
+    return { winner: win.rule, winnerPrice: win.price };
+}
+
+// Two-stage resolution: Tier 2 produces the list price, Tier 3 competes
+// against it to produce the sales price. The Tier 2 winner loses its rule TYPE
+// before entering Tier 3, which is why the tiers run independently.
+function resolveLocal(product, qty) {
+    if (!product) return { price: 0, listPrice: 0, t2: null, t3: null };
+    const q = qty > 0 ? qty : 1;
+    const applicable = _activeRules.filter(r => productMatchesRule(product, r) && qtyMatchesRule(q, r));
+    const t2 = competeAtTier(applicable.filter(ruleIsTier2), product, product.price, null);
+    const listPrice = t2.winnerPrice != null ? t2.winnerPrice : product.price;
+    const t3 = competeAtTier(applicable.filter(r => !ruleIsTier2(r)), product, product.price, listPrice);
+    const salesPrice = t3.winnerPrice != null ? t3.winnerPrice : listPrice;
+    return { price: roundCents(salesPrice), listPrice: roundCents(listPrice), t2: t2.winner, t3: t3.winner };
+}
+
+// Every rule applicable to this product+qty, priced.
+//
+// This is NOT competeAtTier's `scored` array: that filters to the winning type
+// rank BEFORE scoring, so the rules it discards are only the ones that tied.
+// A manually applied rule is by definition one the ladder eliminated, so the
+// picker has to see all of them.
+function localCandidates(product, qty) {
+    const q = qty > 0 ? qty : 1;
+    const applicable = _activeRules.filter(r => productMatchesRule(product, r) && qtyMatchesRule(q, r));
+    const auto = resolveLocal(product, q);
+    const winners = new Set([auto.t2 && intOf(auto.t2.id), auto.t3 && intOf(auto.t3.id)].filter(v => v != null));
+    const t2 = competeAtTier(applicable.filter(ruleIsTier2), product, product.price, null);
+    const listPrice = t2.winnerPrice != null ? t2.winnerPrice : product.price;
+    const out = [];
+    for (const r of applicable) {
+        const p = applyRuleAdjustment(r, product, product.price, ruleIsTier2(r) ? null : listPrice);
+        if (p == null || !isFinite(p) || p < 0) continue;
+        out.push({
+            id: intOf(r.id), name: String(r.name || ''), description: r.description || '',
+            unitPrice: roundCents(p), valid: winners.has(intOf(r.id)), source: 'local',
+        });
+    }
+    return out;
+}
+
+// The rule Fishbowl would attach BY ITSELF as a product is added — the same
+// two-tier ladder, restricted to rules flagged "apply this rule as products
+// are added" (pricingrule.isAutoApply). Every other rule is applied only
+// because the operator picked it, and that distinction is what makes an
+// automatic attribution safe to RECORD rather than merely display.
+//
+// Note this is not a port: QuickOrder loads isAutoApply but never gates on
+// it. The ladder below is shared; the gate is new.
+function autoApplyWinner(product, qty) {
+    if (!product) return null;
+    const q = qty > 0 ? qty : 1;
+    const auto = _activeRules.filter(r => bitTrue(r.isautoapply)
+        && productMatchesRule(product, r) && qtyMatchesRule(q, r));
+    if (!auto.length) return null;
+    const t2 = competeAtTier(auto.filter(ruleIsTier2), product, product.price, null);
+    const listPrice = t2.winnerPrice != null ? t2.winnerPrice : product.price;
+    const t3 = competeAtTier(auto.filter(r => !ruleIsTier2(r)), product, product.price, listPrice);
+    // Tier 3 sets the sales price, so it is the tier that gets attributed.
+    return t3.winner || t2.winner || null;
+}
+
+// Every OTHER active rule, priced locally, for manual application. Rules whose
+// base can't resolve come back priced null and render disabled with a reason,
+// rather than silently vanishing.
+function offListCandidates(product, qty, excludeIds) {
+    const q = qty > 0 ? qty : 1;
+    const listPrice = resolveLocal(product, q).listPrice;
+    const out = [];
+    for (const r of _allRulesById.values()) {
+        const id = intOf(r.id);
+        if (excludeIds.has(id)) continue;
+        const p = applyRuleAdjustment(r, product, product.price, ruleIsTier2(r) ? null : listPrice);
+        out.push({
+            id, name: String(r.name || ''), description: r.description || '',
+            unitPrice: (p == null || !isFinite(p) || p < 0) ? null : roundCents(p),
+            valid: false, source: 'offlist',
+            blocked: (p == null) ? ('needs ' + baseTypeName(r) + ', which this product has no value for') : null,
+        });
+    }
+    return out.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+}
+
+// Build the whole candidate list for a line: server first (authoritative),
+// local as the fallback, and off-list always appended.
+async function candidatesForLine(line) {
+    const product = line.product, qty = line.qty > 0 ? line.qty : 1;
+    if (!product) return { inScope: [], offList: [], source: 'none' };
+
+    let inScope = [];
+    let source = 'local';
+    if (_bpShape !== false && _customer) {
+        try { inScope = await serverCandidates(product, qty, _customer.id); } catch (_) { inScope = []; }
+        if (inScope.length) source = 'server';
+    }
+    const local = localCandidates(product, qty);
+    if (!inScope.length) {
+        inScope = local;
+    } else {
+        // The server answers with id/name/price but not the adjustment shape,
+        // so the local rows supply the "Markdown 20% off Product Price" label
+        // and flag any price we disagree with.
+        const localById = new Map(local.map(c => [c.id, c]));
+        inScope.forEach(c => {
+            const l = localById.get(c.id);
+            if (l && Math.abs(l.unitPrice - c.unitPrice) >= 0.01) {
+                c.mismatch = l.unitPrice;
+                dbg('rule ' + c.id + ' "' + c.name + '": server ' + c.unitPrice + ' vs local ' + l.unitPrice, 'warn');
+            }
+        });
+    }
+    const seen = new Set(inScope.map(c => c.id));
+    return { inScope, offList: offListCandidates(product, qty, seen), source };
+}
+
+// ============================================================================
+//  DEFAULT RULE FROM THE CUSTOMER'S NOTE
+// ----------------------------------------------------------------------------
+//  The operator's prompt today is free text on the customer ("Volume Discount
+//  20%"), updated by hand each month. Matching it to a rule is what removes
+//  the per-line hunt — but a WRONG default that nobody notices is worse than
+//  no default, so every outcome is reported in the banner and every
+//  auto-picked cell is visibly marked.
+// ============================================================================
+function normText(s) {
+    return String(s == null ? '' : s).toLowerCase()
+        // Replace rather than delete: deleting the hyphen in "30-day" fuses it
+        // into the single nonsense token "30day".
+        .replace(/[^a-z0-9%.]+/g, ' ')
+        // A full stop ENDING a token is sentence punctuation, not part of a
+        // rule name. One between digits ("15.5%") is, so it stays.
+        .replace(/(^|\s)\.+/g, '$1').replace(/\.+(?=\s|$)/g, '')
+        .replace(/\s+/g, ' ').trim();
+}
+function numTokens(s) { return (String(s).match(/\d+(?:\.\d+)?/g) || []); }
+
+// A note names ONE OR MORE rules, joined by "&", "+", a comma, a semicolon or
+// a newline: "PROF 15% & SVC 20%" is two instructions, not one. Each piece is
+// matched to a rule separately, and ALL the matches are kept — which one lands
+// on a given line is then decided by the rules' own product scopes.
+function noteSegments(text) {
+    return String(text == null ? '' : text)
+        .split(/[\n;&+,]+/)
+        .map(x => x.trim())
+        .filter(Boolean);
+}
+
+// Operator shorthand, expanded before matching: "PROF = Professional", one per
+// line in Settings. This is the escape hatch for shorthand the letter-matching
+// below can't reach on its own ("BDF = Business Development Fund").
+let _aliasCache = null, _aliasSrc = null;
+function aliasMap() {
+    const src = String(pref('defaultRuleAliases') || '');
+    if (_aliasCache && _aliasSrc === src) return _aliasCache;
+    const m = new Map();
+    src.split(/[\n;]+/).forEach(line => {
+        const bits = line.split(/[=:]/);
+        if (bits.length < 2) return;
+        const from = normText(bits[0]), to = normText(bits.slice(1).join('='));
+        if (from && to) m.set(from, to);
+    });
+    _aliasSrc = src; _aliasCache = m;
+    return m;
+}
+function expandAliases(segN) {
+    const m = aliasMap();
+    if (!m.size) return segN;
+    // Whole-phrase first, then word by word, so both "PROF 15% = Professional
+    // 15%" and the simpler "PROF = Professional" work.
+    if (m.has(segN)) return m.get(segN);
+    return segN.split(' ').map(w => m.get(w) || w).join(' ');
+}
+
+// Does this shorthand stand for that word?
+//   "prof" -> "professional"  (a plain prefix)
+//   "svc"  -> "service"       (letters in order, first letter shared)
+// The shared first letter and the length floor are what stop it degenerating
+// into "any three letters match almost any word".
+function abbrevMatches(short, word) {
+    if (!short || !word) return false;
+    if (short === word) return true;
+    if (short.length < 2 || short.length >= word.length) return false;
+    if (short[0] !== word[0]) return false;
+    if (word.indexOf(short) === 0) return true;
+    let i = 0;
+    for (let k = 0; k < word.length; k++) {
+        if (word[k] === short[i]) i++;
+        if (i === short.length) return true;
+    }
+    return false;
+}
+
+const _isNumTok = t => /^\d/.test(t) || t === '%';
+
+// Match one note segment to a rule by abbreviation. Words must line up from
+// the START of the rule name, in order, and any numbers must agree EXACTLY —
+// "PROF 15%" must never reach "Professional 20%".
+function matchByAbbrev(segN, rules, requireNumeric) {
+    const segToks = segN.split(' ').filter(Boolean);
+    const segWords = segToks.filter(t => !_isNumTok(t));
+    const segNums = numTokens(segN);
+    if (!segWords.length) return [];
+
+    const hits = [];
+    for (const r of rules) {
+        const nameN = normText(r.name);
+        const nameToks = nameN.split(' ').filter(Boolean);
+        const nameWords = nameToks.filter(t => !_isNumTok(t));
+        if (!nameWords.length || segWords.length > nameWords.length) continue;
+
+        if (requireNumeric) {
+            const rNums = numTokens(nameN);
+            if (rNums.length !== segNums.length) continue;
+            if (rNums.some((n, i) => n !== segNums[i])) continue;
+        }
+        let ok = true, score = 0;
+        for (let i = 0; i < segWords.length; i++) {
+            if (!abbrevMatches(segWords[i], nameWords[i])) { ok = false; break; }
+            score += segWords[i].length;
+        }
+        if (!ok) continue;
+        // A shorthand covering the whole name beats one covering half of it.
+        hits.push({ rule: r, score: score + (segWords.length === nameWords.length ? 10 : 0) });
+    }
+    if (!hits.length) return [];
+    const best = Math.max(...hits.map(h => h.score));
+    return hits.filter(h => h.score === best).map(h => h.rule);
+}
+
+// One segment -> one rule, or a reason it could not be resolved.
+function matchSegment(segRaw, rules, requireNumeric) {
+    const segN0 = normText(segRaw);
+    if (!segN0) return null;
+    const segN = expandAliases(segN0);
+    const alias = segN !== segN0;
+
+    // 1 — the expanded text IS a rule name
+    let hit = rules.find(r => normText(r.name) === segN);
+    if (hit) return { rule: hit, text: segRaw, kind: alias ? 'alias' : 'exact' };
+
+    // 2 — pull a rule-shaped phrase out of a sentence, then retry
+    let pat = null;
+    try { pat = new RegExp(pref('defaultRulePattern'), 'i'); } catch (_) {}
+    if (pat) {
+        const m = segRaw.match(pat);
+        if (m && m[1]) {
+            const capN = expandAliases(normText(m[1]));
+            hit = rules.find(r => normText(r.name) === capN);
+            if (hit) return { rule: hit, text: segRaw, kind: 'pattern', capture: m[1] };
+        }
+    }
+
+    // 3 — abbreviation: "PROF 15%" -> "Professional 15%"
+    const abbrev = matchByAbbrev(segN, rules, requireNumeric);
+    if (abbrev.length === 1) return { rule: abbrev[0], text: segRaw, kind: 'abbreviation' };
+    if (abbrev.length > 1) return { text: segRaw, miss: 'ambiguous', names: abbrev.map(r => r.name) };
+
+    // A bare "SVC" names the right family but not WHICH of them, because the
+    // rules differ only by percentage. Saying "no rule resembles it" would be
+    // misleading — the operator needs to know the note is short a number.
+    if (requireNumeric && !numTokens(segN).length) {
+        const loose = matchByAbbrev(segN, rules, false);
+        if (loose.length > 1) return { text: segRaw, miss: 'ambiguous', names: loose.map(r => r.name) };
+        if (loose.length === 1) return { rule: loose[0], text: segRaw, kind: 'abbreviation' };
+    }
+
+    // 4 — every word of the rule name appears somewhere in the segment. The
+    // numeric guard matters most here: without it "Volume Discount 20%"
+    // happily matches "Volume Discount 25%", which is a silent pricing error.
+    const segTokens = new Set(segN.split(' ').filter(Boolean));
+    const segNums = numTokens(segN);
+    let best = [], bestScore = 0;
+    for (const r of rules) {
+        const nameN = normText(r.name);
+        const toks = nameN.split(' ').filter(Boolean);
+        if (!toks.length || !toks.every(t => segTokens.has(t))) continue;
+        if (requireNumeric) {
+            const rNums = numTokens(nameN);
+            if (rNums.length || segNums.length) {
+                if (rNums.length !== rNums.filter(n => segNums.includes(n)).length) continue;
+                if (!rNums.length) continue;   // the note names a number, the rule doesn't
+            }
+        }
+        if (toks.length > bestScore) { bestScore = toks.length; best = [r]; }
+        else if (toks.length === bestScore) best.push(r);
+    }
+    if (best.length === 1) return { rule: best[0], text: segRaw, kind: 'wording' };
+    if (best.length > 1) return { text: segRaw, miss: 'ambiguous', names: best.map(r => r.name) };
+
+    return { text: segRaw, miss: 'none' };
+}
+
+// Resolve the customer's note into the SET of rules it names. Nothing is
+// applied here: which of them lands on a given line is settled per line, by
+// each rule's own product scope and quantity bracket.
+function resolveDefaultRules(customer) {
+    _defaultRules = []; _defaultRuleMisses = []; _defaultRuleText = '';
+    const mode = pref('defaultRuleSource');
+    if (!customer || mode === 'off') return;
+
+    let text = '';
+    if (mode === 'note') text = customer.note || '';
+    else if (mode === 'cf') text = customer.rulePrompt || '';
+    else text = (customer.note || '').trim() || (customer.rulePrompt || '');
+    _defaultRuleText = String(text || '').trim();
+    if (!_defaultRuleText) { _defaultRuleMisses.push({ miss: 'no-text' }); return; }
+
+    const rules = [..._allRulesById.values()];
+    const requireNumeric = !!pref('defaultRuleRequireNumericMatch');
+    const seen = new Set();
+
+    for (const seg of noteSegments(_defaultRuleText)) {
+        const res = matchSegment(seg, rules, requireNumeric);
+        if (!res) continue;
+        if (res.rule) {
+            const id = intOf(res.rule.id);
+            if (seen.has(id)) continue;          // the same rule named twice
+            seen.add(id);
+            _defaultRules.push(res);
+        } else {
+            // A segment that resolves to nothing is usually just prose
+            // ("call before shipping"), so it is only worth reporting when
+            // NOTHING in the note resolved. That decision is made in the
+            // banner, where the whole picture is visible.
+            _defaultRuleMisses.push(res);
+        }
+    }
+    dbg('customer note resolved to ' + _defaultRules.length + ' rule(s): ' +
+        (_defaultRules.map(d => d.rule.name).join(', ') || 'none'));
+}
+
+const KIND_WORDS = {
+    exact: 'exact match', alias: 'via an alias', pattern: 'matched in the sentence',
+    abbreviation: 'matched as an abbreviation', wording: 'matched on wording',
+};
+
+function renderRuleBanner() {
+    const el = document.getElementById('ruleBanner');
+    if (!_customer || pref('defaultRuleSource') === 'off') {
+        el.classList.add('hidden'); el.innerHTML = ''; return;
+    }
+    el.classList.remove('hidden');
+
+    if (_defaultRules.length) {
+        el.className = 'rule-banner ok';
+        const list = _defaultRules.map(d =>
+            '<b>' + escHtml(d.rule.name) + '</b> <span style="opacity:.7;">(' +
+            // The quote marks are MARKUP, so they stay outside escHtml — passed
+            // through it the ampersand is escaped and the entity renders as
+            // literal "&ldquo;" text.
+            '&ldquo;' + escHtml(d.text) + '&rdquo;, ' + escHtml(KIND_WORDS[d.kind] || d.kind) + ')</span>'
+        ).join(' &nbsp;·&nbsp; ');
+        const amb = _defaultRuleMisses.filter(m => m.miss === 'ambiguous');
+        el.innerHTML = 'From the customer ' + (pref('defaultRuleSource') === 'cf' ? 'field' : 'note') +
+            ', ' + _defaultRules.length + ' rule' + (_defaultRules.length === 1 ? '' : 's') +
+            ' will be tried on each line, in order: ' + list +
+            (amb.length ? ' &nbsp;·&nbsp; <span style="color:var(--acc-orange-con);">' + amb.length +
+                ' ambiguous piece' + (amb.length === 1 ? '' : 's') + ' ignored</span>' : '') +
+            ' <span class="lnk" onclick="explainDefault()">why?</span>';
+        return;
+    }
+
+    el.className = 'rule-banner warn';
+    const amb = _defaultRuleMisses.find(m => m.miss === 'ambiguous');
+    if (amb) {
+        el.innerHTML = '<b>Ambiguous.</b> &ldquo;' + escHtml(amb.text) + '&rdquo; matched ' +
+            amb.names.length + ' rules (' + escHtml(amb.names.join(', ')) + '), so nothing was ' +
+            'defaulted. Pick the rule on each line, or add an alias in Settings. ' +
+            '<span class="lnk" onclick="explainDefault()">why?</span>';
+    } else if (!_defaultRuleText) {
+        el.innerHTML = 'This customer has no discount prompt recorded, so lines start with no rule.';
+    } else {
+        el.innerHTML = '<b>No rule matched</b> this customer&rsquo;s note: &ldquo;' +
+            escHtml(_defaultRuleText.slice(0, 220)) + '&rdquo;. Lines start with no rule — pick one ' +
+            'per line, or teach it the shorthand in Settings (e.g. <code>PROF = Professional</code>). ' +
+            '<span class="lnk" onclick="explainDefault()">why?</span>';
+    }
+}
+
+function explainDefault() {
+    const rows = [];
+    rows.push('<dt>Source</dt><dd>' + escHtml(pref('defaultRuleSource')) + '</dd>');
+    rows.push('<dt>Raw text</dt><dd style="white-space:pre-wrap;">' + escHtml(_defaultRuleText || '—') + '</dd>');
+    rows.push('<dt>Split into</dt><dd>' +
+        escHtml(noteSegments(_defaultRuleText).map(x => '"' + x + '"').join('  ·  ') || '—') + '</dd>');
+    _defaultRules.forEach((d, i) => {
+        rows.push('<dt>Rule ' + (i + 1) + '</dt><dd><b>' + escHtml(d.rule.name) + '</b> — from &ldquo;' +
+            escHtml(d.text) + '&rdquo;, ' + escHtml(KIND_WORDS[d.kind] || d.kind) +
+            (d.capture ? ' (captured &ldquo;' + escHtml(d.capture) + '&rdquo;)' : '') +
+            '<br><span style="color:var(--c-tertiary);">normalised: ' +
+            escHtml(expandAliases(normText(d.text))) + ' → ' + escHtml(normText(d.rule.name)) +
+            '</span></dd>');
+    });
+    _defaultRuleMisses.forEach(m => {
+        if (m.miss === 'no-text') return;
+        rows.push('<dt>Unmatched</dt><dd>&ldquo;' + escHtml(m.text || '') + '&rdquo; — ' +
+            (m.miss === 'ambiguous'
+                ? 'matched ' + m.names.length + ' rules (' + escHtml(m.names.join(', ')) + ')'
+                : 'no rule resembles it') + '</dd>');
+    });
+    const al = aliasMap();
+    rows.push('<dt>Aliases</dt><dd>' + (al.size
+        ? escHtml([...al.entries()].map(([k, v]) => k + ' → ' + v).join('  ·  '))
+        : '<span style="color:var(--c-tertiary);">none configured</span>') + '</dd>');
+    showConfirm({
+        title: 'How the customer note was read',
+        okLabel: 'Close',
+        body: '<p style="color:var(--c-secondary);">Each piece of the note is matched to a pricing rule. ' +
+              'Which of them actually lands on a line is decided per line, by each rule&rsquo;s own ' +
+              'product scope and quantity bracket.</p><dl class="kv">' + rows.join('') + '</dl>',
+    });
+}
+
+// ============================================================================
+//  LINE MODEL
+// ----------------------------------------------------------------------------
+//  An ordered array, not a Map keyed by product: the same product legitimately
+//  appears twice on one order (10 at retail, 2 as free samples), and a note
+//  line has no product at all. lineNumber is DERIVED at submit from array
+//  position — storing it would mean every insert renumbers everything below,
+//  and a stale copy is a silent wrong-order bug.
+// ============================================================================
+const SOITEM_TYPE_SALE = 10;
+const SOITEM_TYPE_DROP_SHIP = 12;
+const SOITEM_TYPE_KIT = 80;
+
+function newLineId() { return 'L' + (++_lineSeq); }
+function lineById(id) { return _lines.find(l => l.lineId === id) || null; }
+function lineIndex(id) { return _lines.findIndex(l => l.lineId === id); }
+
+function makeSaleLine(product, qty) {
+    return {
+        lineId: newLineId(), kind: 'sale',
+        product, qty: qty > 0 ? qty : 1, uomCode: product.uomCode || 'ea',
+        taxable: product.taxableFlag !== false,
+        listPrice: product.price, unitPrice: product.price,
+        priceSource: 'product',
+        ruleId: null, ruleName: '', ruleAuto: false, ruleLocked: false,
+        // Set when the operator picks "None" outright. Distinct from "no rule
+        // chosen yet": a cleared line must STAY at list price through a qty
+        // change instead of quietly picking a rule back up.
+        ruleCleared: false,
+        choices: null, choicesKey: '', choicesState: 'idle',
+        text: '',
+    };
+}
+function makeNoteLine(text) {
+    return { lineId: newLineId(), kind: 'note', text: text || '', product: null, qty: 0 };
+}
+
+function insertLine(line, afterLineId) {
+    if (afterLineId == null || afterLineId === '') { _lines.push(line); return line; }
+    const i = lineIndex(afterLineId);
+    if (i < 0) _lines.push(line); else _lines.splice(i + 1, 0, line);
+    return line;
+}
+function insertLineBefore(line, beforeLineId) {
+    const i = lineIndex(beforeLineId);
+    if (i < 0) _lines.push(line); else _lines.splice(i, 0, line);
+    return line;
+}
+function removeLine(lineId) {
+    const i = lineIndex(lineId);
+    if (i >= 0) _lines.splice(i, 1);
+    renderGrid(); refreshTotals();
+}
+function moveLine(lineId, beforeLineId) {
+    const from = lineIndex(lineId);
+    if (from < 0) return;
+    const [l] = _lines.splice(from, 1);
+    if (beforeLineId == null) { _lines.push(l); }
+    else {
+        const to = lineIndex(beforeLineId);
+        if (to < 0) _lines.push(l); else _lines.splice(to, 0, l);
+    }
+    renderGrid(); refreshTotals();
+}
+
+async function addProductLine(product, afterLineId) {
+    if (product.kitFlag || product.defaultSoItemType === SOITEM_TYPE_KIT || product.defaultSoItemType === SOITEM_TYPE_DROP_SHIP) {
+        toast('“' + product.num + '” is a kit or drop-ship product. The order-create API rejects those, ' +
+              'and this screen has no fallback route — enter it in the Sales Order module instead.', 'error');
+        return null;
+    }
+    const line = makeSaleLine(product, 1);
+    insertLine(line, afterLineId);
+    renderGrid();
+    await priceLine(line, /*applyDefault*/ true);
+    refreshLineCells(line); refreshTotals();
+    return line;
+}
+
+// Load a line's candidates and settle on a price. `applyDefault` is only true
+// for a brand-new line — re-pricing after a qty change must never overwrite a
+// rule the operator chose.
+async function priceLine(line, applyDefault) {
+    if (!line || line.kind !== 'sale' || !line.product) return;
+    const key = bpKey(line.product.id, line.qty, _customer ? _customer.id : 0);
+    if (line.choicesKey === key && line.choices) { settleLinePrice(line, applyDefault); return; }
+
+    line.choicesState = 'loading';
+    refreshLineCells(line);
+    let cand;
+    try { cand = await candidatesForLine(line); }
+    catch (e) { dbg('candidate load failed: ' + (e && e.message || e), 'error'); cand = { inScope: [], offList: [], source: 'none' }; }
+    line.choices = cand; line.choicesKey = key; line.choicesState = 'ready';
+    settleLinePrice(line, applyDefault);
+    refreshLineCells(line);
+}
+
+function allCandidates(line) {
+    if (!line.choices) return [];
+    return line.choices.inScope.concat(line.choices.offList);
+}
+
+function settleLinePrice(line, applyDefault) {
+    if (line.priceSource === 'manual') return;
+
+    // "None" was chosen deliberately: hold the product's list price and record
+    // nothing, whatever the rules would otherwise do here.
+    if (line.ruleCleared) {
+        line.ruleId = null; line.ruleName = '';
+        line.ruleNotApplicable = null; line.autoWould = null;
+        line.unitPrice = line.product.price;
+        line.priceSource = 'product';
+        return;
+    }
+
+    // Recomputed every time, so a qty change that brings the customer's
+    // default rule back into its bracket clears the "n/a" mark instead of
+    // leaving a stale warning on the row.
+    line.ruleNotApplicable = null;
+    line.autoWould = null;
+
+    // A rule already chosen keeps its identity; only its price is refreshed
+    // (the qty may have crossed a break).
+    if (line.ruleId != null) {
+        const c = allCandidates(line).find(x => x.id === line.ruleId);
+        if (c && c.unitPrice != null) { line.unitPrice = c.unitPrice; line.ruleName = c.name; return; }
+        // Still selected, but no longer priceable at this qty/product.
+        line.unitPrice = line.product.price;
+        line.priceSource = 'product';
+        return;
+    }
+
+    if (applyDefault && _defaultRules.length && pref('defaultRuleApplyToNewLines') && !line.ruleLocked) {
+        // The note says which rules are IN PLAY for this customer, not which
+        // one fits a given product — "PROF 15% & SVC 20%" means try the
+        // professional rule and the service rule. So each is tested against
+        // its OWN product scope and quantity bracket, in the order the note
+        // listed them, and the first that applies AND can be priced wins.
+        const q = line.qty > 0 ? line.qty : 1;
+        for (const d of _defaultRules) {
+            const r = d.rule;
+            if (!productMatchesRule(line.product, r) || !qtyMatchesRule(q, r)) continue;
+            const c = allCandidates(line).find(x => x.id === intOf(r.id));
+            if (!c || c.unitPrice == null) continue;
+            line.ruleId = c.id; line.ruleName = c.name; line.unitPrice = c.unitPrice;
+            line.ruleAuto = true;
+            line.priceSource = c.source === 'server' ? 'rule' : 'rule-local';
+            return;
+        }
+        // None of them covers this product. Say so on the row rather than
+        // substituting something else in silence.
+        line.ruleNotApplicable = _defaultRules.map(d => d.rule.name).join(', ');
+    }
+
+    // Nothing came from the customer's note, so fall to Fishbowl's own
+    // auto-apply rules. The price is read back out of the candidate list so it
+    // is the SERVER's figure wherever the server answered.
+    if (applyDefault) {
+        const w = autoApplyWinner(line.product, line.qty);
+        if (w) {
+            const c = allCandidates(line).find(x => x.id === intOf(w.id));
+            if (c && c.unitPrice != null) {
+                line.ruleId = c.id; line.ruleName = c.name; line.unitPrice = c.unitPrice;
+                line.ruleAuto = true;
+                line.priceSource = c.source === 'server' ? 'rule' : 'rule-local';
+                return;
+            }
+        }
+    }
+
+    // Nothing chosen — show what Fishbowl would do on its own.
+    const auto = (line.choices ? line.choices.inScope : []).find(c => c.valid);
+    if (auto && auto.unitPrice != null) {
+        line.unitPrice = auto.unitPrice;
+        line.priceSource = auto.source === 'server' ? 'rule' : 'rule-local';
+        line.ruleId = null; line.ruleName = '';
+        line.autoWould = auto.name;
+    } else {
+        line.unitPrice = line.product.price;
+        line.priceSource = 'product';
+        line.autoWould = null;
+    }
+}
+
+function setLineQty(line, qty) {
+    const q = numOf(qty);
+    line.qty = (q == null || q < 0) ? 0 : q;
+    refreshLineCells(line); refreshTotals();
+    clearTimeout(line._qtyT);
+    // Debounced — a qty change re-asks the server for candidates, and a round
+    // trip per keystroke would be unusable.
+    line._qtyT = setTimeout(async () => {
+        await priceLine(line, /*applyDefault*/ false);
+        refreshLineCells(line); refreshTotals();
+    }, 300);
+}
+
+function setLineManualPrice(line, price) {
+    const p = numOf(price);
+    if (p == null) return;
+    line.unitPrice = roundCents(p);
+    line.priceSource = 'manual';
+    line.ruleLocked = true;
+    line.ruleCleared = false;
+    // A hand-typed price is not the outcome of a rule. Recording the rule
+    // anyway would attribute a number to a reason that didn't produce it.
+    const sentinel = String(pref('manualOverrideCfValue') || '');
+    line.ruleId = null;
+    line.ruleName = sentinel;
+    line.ruleAuto = false;
+    refreshLineCells(line); refreshTotals();
+}
+
+async function repriceAllLines() {
+    const sale = _lines.filter(l => l.kind === 'sale' && l.product);
+    if (!sale.length) return;
+    setStatusLine('Re-pricing ' + sale.length + ' line' + (sale.length === 1 ? '' : 's') + '…');
+    // Cap concurrency — a customer change re-asks for every line at once and
+    // an unbounded fan-out stalls the bridge.
+    const queue = sale.slice();
+    const workers = new Array(Math.min(4, queue.length)).fill(0).map(async () => {
+        while (queue.length) {
+            const l = queue.shift();
+            l.choicesKey = '';                       // customer changed → cache is stale
+            await priceLine(l, /*applyDefault*/ !l.ruleLocked);
+        }
+    });
+    await Promise.all(workers);
+    renderGrid(); refreshTotals();
+    setStatusLine(statusText());
+}
+
+// ============================================================================
+//  COLUMN MODEL
+// ----------------------------------------------------------------------------
+//  Columns are draggable to reorder and draggable to resize, so neither the
+//  order nor the widths can live in the stylesheet — applyGridTemplate()
+//  writes the track list from this model, and it persists per user.
+//
+//  Three columns are PINNED and take no part in either: the drag grip and the
+//  line number on the left, and the remove button on the right. Moving those
+//  would only break the row's shape, and the Note row and the blank entry row
+//  both span "everything between them" (grid-column: 3 / -3), which is what
+//  lets those two rows survive any rearrangement of the middle.
+// ============================================================================
+const COL_DEFS = [
+    { key: 'drag',    label: '',              w: 22,  min: 22,  pin: 'first', ctr: true },
+    { key: 'no',      label: '#',             w: 32,  min: 28,  pin: 'first', num: true },
+    // `req` columns cannot be hidden — without them the row cannot describe
+    // an order line at all.
+    { key: 'num',      label: 'Number',        w: 120, min: 70, req: true },
+    { key: 'desc',     label: 'Description',   w: 190, min: 80 },
+    { key: 'qty',      label: 'Qty',           w: 74,  min: 50, num: true, req: true },
+    { key: 'uom',      label: 'UOM',           w: 52,  min: 40, ctr: true },
+    { key: 'rule',     label: 'Pricing Rule',  w: 200, min: 90, req: true },
+    // What will actually be written to the order-item custom field. Usually
+    // the same text as the Pricing Rule cell, but NOT always — a hand-typed
+    // price records nothing (or a sentinel), and a rule Fishbowl merely WOULD
+    // have applied is shown but not recorded. This column is the honest
+    // answer to "is the capture working?".
+    { key: 'rulecf',   label: 'Rule recorded', w: 180, min: 80 },
+    { key: 'list',     label: 'List',          w: 106, min: 60, num: true },
+    { key: 'price',    label: 'Unit Price',    w: 112, min: 64, num: true, req: true },
+    { key: 'disc',     label: 'Disc',          w: 74,  min: 48, num: true },
+    { key: 'taxcode',  label: 'Tax Code',      w: 88,  min: 52, ctr: true },
+    { key: 'tax',      label: 'Tax Amount',    w: 106, min: 60, num: true },
+    { key: 'taxtotal', label: 'Tax Total',     w: 110, min: 60, num: true },
+    { key: 'ext',      label: 'Total ex Tax',  w: 118, min: 60, num: true },
+    { key: 'totinc',   label: 'Total inc Tax', w: 122, min: 70, num: true },
+    { key: 'del',     label: '',              w: 30,  min: 30, pin: 'last', ctr: true },
+];
+const COL_BY_KEY = new Map(COL_DEFS.map(c => [c.key, c]));
+const COL_TIPS = {
+    list:    'List price on the product record',
+    price:   'The price being charged. Shown in blue when it differs from list.',
+    disc:    'Discount against the product’s list price',
+    taxcode:  'The rate the server will apply to this line: the order rate, or None for a non-taxable product',
+    tax:      'Tax on ONE unit at this line\u2019s rate',
+    taxtotal: 'Tax on the whole line \u2014 quantity \u00d7 tax amount',
+    ext:      'Quantity \u00d7 unit price, before tax',
+    totinc:   'Total ex tax plus the line\u2019s tax',
+    rulecf:   'The exact text this line will store in the order-item custom field',
+};
+const MIDDLE_KEYS = COL_DEFS.filter(c => !c.pin).map(c => c.key);
+
+let _colOrder = MIDDLE_KEYS.slice();   // the rearrangeable middle, in display order
+let _colW = {};                        // key -> px
+let _colHidden = new Set();            // keys the user has switched off
+
+function loadColPrefs() {
+    let saved = null;
+    try { saved = pref('gridCols'); } catch (_) {}
+    if (!saved || typeof saved !== 'object') saved = {};
+    // Keep any saved order, drop keys that no longer exist, and append columns
+    // added since the preference was written — so a new column shows up instead
+    // of silently vanishing for everyone who has saved a layout.
+    const savedOrder = Array.isArray(saved.order) ? saved.order.filter(k => MIDDLE_KEYS.indexOf(k) >= 0) : [];
+    _colOrder = savedOrder.concat(MIDDLE_KEYS.filter(k => savedOrder.indexOf(k) < 0));
+    const w = (saved.widths && typeof saved.widths === 'object') ? saved.widths : {};
+    _colW = {};
+    COL_DEFS.forEach(c => {
+        const v = intOf(w[c.key]);
+        _colW[c.key] = (v != null && v >= c.min) ? Math.min(v, 600) : c.w;
+    });
+    // A required column can never end up hidden, however old the saved layout.
+    _colHidden = new Set((Array.isArray(saved.hidden) ? saved.hidden : [])
+        .filter(k => { const c = COL_BY_KEY.get(k); return c && !c.pin && !c.req; }));
+}
+function saveColPrefs() {
+    try {
+        FBLib.Settings.setUserKey('gridCols', {
+            order: _colOrder.slice(), widths: Object.assign({}, _colW), hidden: [..._colHidden],
+        });
+        FBLib.Settings.saveUser();
+    } catch (_) {}
+}
+function resetColPrefs() {
+    _colOrder = MIDDLE_KEYS.slice();
+    _colW = {};
+    COL_DEFS.forEach(c => { _colW[c.key] = c.w; });
+    _colHidden = new Set();
+    saveColPrefs();
+    renderGrid();
+    renderColPicker();
+}
+// VISIBLE columns, in display order. Everything that paints a row iterates
+// this, so hiding a column removes its cell everywhere at once.
+function orderedKeys() {
+    return COL_DEFS.filter(c => c.pin === 'first').map(c => c.key)
+        .concat(_colOrder.filter(k => !_colHidden.has(k)))
+        .concat(COL_DEFS.filter(c => c.pin === 'last').map(c => c.key));
+}
+function setColVisible(key, on) {
+    const c = COL_BY_KEY.get(key);
+    if (!c || c.pin || c.req) return;
+    if (on) _colHidden.delete(key); else _colHidden.add(key);
+    saveColPrefs();
+    renderGrid();
+    renderColPicker();
+}
+function applyGridTemplate() {
+    const g = document.getElementById('soGrid');
+    if (!g) return;
+    const keys = orderedKeys();
+    const total = keys.reduce((n, k) => n + _colW[k], 0);
+    // The trailing spacer soaks up any width beyond the columns, so the grid
+    // fills its container without stretching a data column.
+    g.style.gridTemplateColumns = keys.map(k => _colW[k] + 'px').join(' ') + ' minmax(0,1fr)';
+    g.style.minWidth = total + 'px';
+}
+
+function renderColPicker() {
+    const box = document.getElementById('colList');
+    if (!box) return;
+    box.innerHTML = _colOrder.map(k => {
+        const c = COL_BY_KEY.get(k);
+        const on = !_colHidden.has(k);
+        return '<label class="col-row' + (c.req ? ' req' : '') + '">' +
+               '<input type="checkbox" data-colvis="' + k + '"' + (on ? ' checked' : '') +
+               (c.req ? ' disabled' : '') + '>' +
+               '<span>' + escHtml(colLabel(c) || k) + '</span>' +
+               (c.req ? '<span class="col-req">always</span>' : '') +
+               '</label>';
+    }).join('');
+    box.querySelectorAll('[data-colvis]').forEach(cb => {
+        cb.addEventListener('change', () => setColVisible(cb.getAttribute('data-colvis'), cb.checked));
+    });
+    const btn = document.getElementById('colsBtn');
+    if (btn) btn.classList.toggle('active', _colHidden.size > 0);
+}
+
+function toggleColPicker() {
+    const pop = document.getElementById('colPop');
+    if (pop.classList.contains('open')) { pop.classList.remove('open'); return; }
+    const r = document.getElementById('colsBtn').getBoundingClientRect();
+    pop.style.left = Math.round(Math.min(r.left, window.innerWidth - 252)) + 'px';
+    pop.style.top = Math.round(r.bottom + 6) + 'px';
+    renderColPicker();
+    pop.classList.add('open');
+}
+
+// ============================================================================
+//  RENDER
+// ============================================================================
+
+// One cell of a Sale row, by column key. Keeping these in a single switch is
+// what lets the row be emitted in whatever order the columns are currently in.
+function cellHtml(key, l, n) {
+    const p = l.product;
+    const id = l.lineId;
+    const open = (extra, cellAttr) =>
+        '<div class="c' + alignClass(key) + (extra || '') +
+        '" data-line="' + id + '"' + (cellAttr ? ' data-cell="' + cellAttr + '"' : '') + '>';
+    switch (key) {
+        case 'drag':
+            return open() + '<span class="drag-h" draggable="true" data-drag="' + id + '">⠿</span></div>';
+        case 'no':
+            return open() + '<span class="cell-ro n">' + n + '</span></div>';
+        case 'num':
+            return open() + '<span class="cell-ro" title="' + escHtml(p.num) + '"><b>' + escHtml(p.num) + '</b></span></div>';
+        case 'desc':
+            return open() + '<span class="cell-ro" title="' + escHtml(p.description) + '">' + escHtml(p.description) + '</span></div>';
+        case 'qty':
+            return open() + '<input class="cell-in n" type="text" inputmode="decimal" data-qty="' + id +
+                   '" value="' + escHtml(fmtQty(l.qty)) + '"></div>';
+        case 'uom':
+            return open() + '<span class="cell-ro">' + escHtml(l.uomCode) + '</span></div>';
+        case 'rule':
+            return open('', 'rule') + ruleCellHtml(l) + '</div>';
+        case 'rulecf':
+            return open('', 'rulecf') + ruleCfCellHtml(l) + '</div>';
+        case 'list':
+            return open() + '<span class="cell-ro n" title="List price on the product record">' +
+                   escHtml(fmtMoney(p.price)) + '</span></div>';
+        case 'price':
+            return open() + '<input class="cell-in n' + (priceMoved(l) ? ' moved' : '') +
+                   '" type="text" inputmode="decimal" data-price="' + id +
+                   '" value="' + escHtml((l.unitPrice != null ? l.unitPrice : 0).toFixed(2)) + '"></div>';
+        case 'disc':
+            return open('', 'disc') + discCellHtml(l) + '</div>';
+        case 'taxcode':
+            return open('', 'taxcode') + taxCodeCellHtml(l) + '</div>';
+        case 'tax':
+            return open('', 'tax') + '<span class="cell-ro n">' + escHtml(fmtMoney(lineTaxPerUnit(l))) + '</span></div>';
+        case 'taxtotal':
+            return open('', 'taxtotal') + '<span class="cell-ro n">' + escHtml(fmtMoney(lineTax(l))) + '</span></div>';
+        case 'ext':
+            return open('', 'ext') + '<span class="cell-ro n">' + escHtml(fmtMoney(lineExt(l))) + '</span></div>';
+        case 'totinc':
+            return open('', 'totinc') + '<span class="cell-ro n">' + escHtml(fmtMoney(lineTotalInc(l))) + '</span></div>';
+        case 'del':
+            return open() + '<button class="row-x" type="button" data-del="' + id + '" title="Remove">&times;</button></div>';
+        default:
+            return open() + '</div>';
+    }
+}
+
+// A heading is aligned by its column, never by hand: a right-aligned number
+// under a left-aligned heading is the classic way a grid stops being readable.
+function alignClass(key) {
+    const c = COL_BY_KEY.get(key);
+    if (!c) return '';
+    return c.num ? ' num' : (c.ctr ? ' ctr' : '');
+}
+
+// The "Rule recorded" heading names the custom field it writes to, and that
+// field is configurable — so the label is resolved at render time rather than
+// baked into COL_DEFS.
+function colLabel(c) {
+    if (!c) return '';
+    if (c.key === 'rulecf') return String(pref('ruleCfName') || c.label);
+    return c.label;
+}
+
+function headerHtml() {
+    const out = orderedKeys().map(k => {
+        const c = COL_BY_KEY.get(k);
+        const movable = !c.pin;
+        const tip = COL_TIPS[k] ? ' title="' + escHtml(COL_TIPS[k]) + '"' : '';
+        return '<div class="hd' + alignClass(k) + (movable ? ' movable' : '') + '" data-col="' + k + '"' +
+               (movable ? ' draggable="true"' : '') + tip + '>' +
+               escHtml(colLabel(c)) +
+               (c.pin === 'last' ? '' : '<span class="col-rz" data-rz="' + k + '"></span>') +
+               '</div>';
+    });
+    out.push('<div class="hd"></div>');            // spacer track
+    return out.join('');
+}
+
+function renderGrid() {
+    const g = document.getElementById('soGrid');
+    const html = [headerHtml(), gapHtml('')];
+    const spacer = '<div class="c"></div>';
+
+    let n = 0;
+    for (const l of _lines) {
+        if (l.kind === 'note') {
+            html.push(
+                '<div class="c note-g ctr" data-line="' + l.lineId + '"><span class="drag-h" draggable="true" data-drag="' + l.lineId + '">⠿</span></div>',
+                '<div class="c note-g ctr" data-line="' + l.lineId + '"><span class="note-glyph">📝</span></div>',
+                '<div class="c note-c" data-line="' + l.lineId + '">' +
+                    '<textarea class="note-in" rows="1" data-note="' + l.lineId + '" placeholder="Note…">' + escHtml(l.text) + '</textarea></div>',
+                '<div class="c note-g ctr" data-line="' + l.lineId + '">' +
+                    '<button class="row-x" type="button" data-del="' + l.lineId + '" title="Remove">&times;</button></div>',
+                '<div class="c note-g" data-line="' + l.lineId + '"></div>');
+        } else {
+            n++;
+            const row = orderedKeys().map(k => cellHtml(k, l, n));
+            row.push(spacer);
+            html.push(row.join(''));
+        }
+        html.push(gapHtml(l.lineId));
+    }
+
+    // The always-present blank row — picking a product here creates a line, the
+    // same affordance the desktop grid gives. Its input spans the whole middle
+    // band so it is unaffected by the column order.
+    html.push(
+        '<div class="c new-c ctr"></div>',
+        '<div class="c new-c num"><span class="cell-ro n" style="color:var(--c-tertiary);">' + (n + 1) + '</span></div>',
+        '<div class="c new-c new-band">' +
+            '<input class="cell-in" type="text" id="newProduct" placeholder="Click here to browse, or type to search…" autocomplete="off"' +
+            (_customer ? '' : ' disabled') + '></div>',
+        '<div class="c new-c ctr"></div>',
+        '<div class="c new-c"></div>');
+
+    if (!_lines.length) {
+        html.push('<div class="empty-note">' +
+            (_customer ? 'No lines yet — pick a product in the row above.' : 'Select a customer to begin.') +
+            '</div>');
+    }
+
+    g.innerHTML = html.join('');
+    applyGridTemplate();
+    wireGrid();
+}
+
+function gapHtml(afterLineId) {
+    return '<div class="gap" data-gap="' + escHtml(afterLineId) + '">' +
+           '<button class="gap-btn" type="button" tabindex="-1" title="Insert a line here (shift-click for a note)">+</button></div>';
+}
+
+function ruleCellHtml(l) {
+    if (l.choicesState === 'loading') {
+        return '<button class="rule-btn" type="button" data-rule="' + l.lineId + '"><span class="nm none">checking…</span></button>';
+    }
+    let label, cls = '', chips = '';
+    if (l.priceSource === 'manual') {
+        label = l.ruleName || 'Price typed by hand';
+        chips = '<span class="chip man">manual</span>';
+    } else if (l.ruleId != null) {
+        label = l.ruleName;
+        if (l.ruleAuto) chips += '<span class="chip auto">auto</span>';
+        const c = allCandidates(l).find(x => x.id === l.ruleId);
+        if (c && c.mismatch != null) chips += '<span class="chip ne" title="This screen computes ' + escHtml(fmtMoney(c.mismatch)) + ' for this rule; Fishbowl says ' + escHtml(fmtMoney(c.unitPrice)) + '. Fishbowl&rsquo;s figure is used.">≠</span>';
+    } else if (l.ruleNotApplicable) {
+        label = l.ruleNotApplicable;
+        cls = ' gone';
+        chips = '<span class="chip ne" title="None of the rules named in the customer&rsquo;s note covers this product or quantity.">n/a</span>';
+    } else if (l.autoWould) {
+        label = l.autoWould + '  (not recorded)';
+        cls = ' none';
+    } else if (l.ruleCleared) {
+        label = 'None — list price';
+        cls = ' none';
+    } else {
+        label = 'No rule — list price';
+        cls = ' none';
+    }
+    return '<button class="rule-btn" type="button" data-rule="' + l.lineId + '" title="' + escHtml(label) + '">' +
+           '<span class="nm' + cls + '">' + escHtml(label) + '</span>' + chips + '</button>';
+}
+
+// ── Per-line money ───────────────────────────────────────────────────
+// `lineExt` is the line total EXCLUDING tax — qty x the price actually being
+// charged. Everything else derives from it.
+function taxCodeCellHtml(l) {
+    const t = lineTaxRateRow(l);
+    if (t) {
+        const why = _taxMode === 'order'
+            ? 'The order\u2019s tax rate'
+            : 'The product\u2019s own tax code';
+        return '<span class="taxcode" title="' + escHtml(t.name + ' \u2014 ' + why) + '">' +
+               escHtml(t.code || t.name) + '</span>';
+    }
+    if (l.product && l.taxable === false) {
+        return '<span class="taxcode none" title="This product is flagged non-taxable, so the line is booked at None.">None</span>';
+    }
+    if (_taxMode === 'product') {
+        return '<span class="taxcode none" title="This product carries no tax code of its own, so the line is booked at None.">None</span>';
+    }
+    return '<span class="taxcode none" title="No order tax rate is selected.">None</span>';
+}
+
+// The literal custom-field value for this line, rendered as it will be
+// stored. Nothing is shown as a muted "not recorded" rather than an empty
+// cell: a blank reads as "nothing to see here", when what it actually means
+// is that the reason for this price is about to be lost.
+function ruleCfCellHtml(l) {
+    const v = ruleValueFor(l);
+    if (!v) return '<span class="cfval none" title="Nothing will be written to the custom field for this line.">not recorded</span>';
+    return '<span class="cfval" title="' + escHtml(v) + '">' + escHtml(v) + '</span>';
+}
+
+function lineExt(l) { return l.kind === 'sale' ? roundCents((l.qty || 0) * (l.unitPrice || 0)) : 0; }
+
+// What the line would have come to at the product's own list price. The
+// discount column is the gap between this and lineExt.
+function lineListExt(l) { return l.kind === 'sale' ? roundCents((l.qty || 0) * (l.product ? l.product.price : 0)) : 0; }
+
+// The tax rate this line will actually be booked at.
+//
+//   * A non-taxable product is always None, whatever the order says — that is
+//     the create endpoint's own rule.
+//   * In 'order' mode the line inherits the order's rate.
+//   * In 'product' mode (a customer with no rate of their own) the line takes
+//     the PRODUCT's own tax code, so a mixed order taxes each line correctly
+//     instead of flattening everything to one rate or to nothing.
+//
+// Derived, never typed: it is what the server will do, shown before it does it.
+function lineTaxRateRow(l) {
+    if (l.kind !== 'sale' || !l.taxable || !l.product) return null;
+    if (_taxMode === 'order') return _taxRateId != null ? (_taxRateById.get(_taxRateId) || null) : null;
+    const pid = l.product.taxRateId;
+    if (pid == null || pid === NONE_TAX_ID) return null;
+    return _taxRateById.get(pid) || null;
+}
+
+// The rate to put on the ORDER. In per-product mode there is no single answer,
+// so the most common line rate is used and only the lines that differ carry an
+// explicit override — which keeps the payload closest to what the server
+// accepts without argument.
+function resolveOrderTaxRateId(lines) {
+    if (_taxMode === 'order' && _taxRateId != null) return _taxRateId;
+    const counts = new Map();
+    (lines || []).filter(l => l.kind === 'sale').forEach(l => {
+        const t = lineTaxRateRow(l);
+        const id = t ? t.id : NONE_TAX_ID;
+        counts.set(id, (counts.get(id) || 0) + 1);
+    });
+    let best = NONE_TAX_ID, bestN = -1;
+    counts.forEach((n, id) => { if (n > bestN) { bestN = n; best = id; } });
+    return best;
+}
+function lineTaxCode(l) {
+    const t = lineTaxRateRow(l);
+    return t ? (t.code || t.name) : 'None';
+}
+// Tax on ONE unit, which is what the client's grid puts beside the unit
+// price. Rounded per unit, so it reads as the money it is.
+function lineTaxPerUnit(l) {
+    const t = lineTaxRateRow(l);
+    return t ? roundCents((l.unitPrice || 0) * (t.rate || 0)) : 0;
+}
+// Tax on the WHOLE line. Deliberately computed from the line total rather
+// than per-unit tax x qty: rounding once at the end is what the order will
+// actually be charged, and the two differ by cents at high quantities.
+function lineTax(l) {
+    const t = lineTaxRateRow(l);
+    return t ? roundCents(lineExt(l) * (t.rate || 0)) : 0;
+}
+function lineTotalInc(l) { return roundCents(lineExt(l) + lineTax(l)); }
+
+// Discount against the product's list price, as a percentage. Negative means
+// the line is priced ABOVE list, which is worth seeing just as plainly.
+function lineDiscountPct(l) {
+    const list = l.product ? (l.product.price || 0) : 0;
+    if (!list) return null;
+    return (1 - (l.unitPrice || 0) / list) * 100;
+}
+function discCellHtml(l) {
+    const d = lineDiscountPct(l);
+    if (d == null) return '<span class="disc zero">—</span>';
+    if (Math.abs(d) < 0.05) return '<span class="disc zero">—</span>';
+    if (d >= 99.995) return '<span class="disc free">FREE</span>';
+    const cls = d > 0 ? 'off' : 'up';
+    const sign = d > 0 ? '−' : '+';   // minus sign, not a hyphen
+    return '<span class="disc ' + cls + '">' + sign + Math.abs(d).toFixed(Math.abs(d) % 1 < 0.05 ? 0 : 1) + '%</span>';
+}
+// True once the line is no longer at the product's list price — drives the
+// blue unit-price text.
+function priceMoved(l) {
+    return !!(l.product && Math.abs((l.unitPrice || 0) - (l.product.price || 0)) >= 0.005);
+}
+
+// Update only the cells whose value changed. A full re-render on every
+// keystroke would steal focus out of the input being typed into.
+function refreshLineCells(l) {
+    const g = document.getElementById('soGrid');
+    const cell = k => g.querySelector('[data-line="' + l.lineId + '"][data-cell="' + k + '"]');
+
+    const rc = cell('rule');
+    if (rc) { rc.innerHTML = ruleCellHtml(l); wireRuleButton(rc.querySelector('[data-rule]')); }
+
+    const dc = cell('disc');     if (dc) dc.innerHTML = discCellHtml(l);
+    const tc = cell('taxcode');  if (tc) tc.innerHTML = taxCodeCellHtml(l);
+    const fc = cell('rulecf');   if (fc) fc.innerHTML = ruleCfCellHtml(l);
+
+    const money = (k, v) => { const e = cell(k); if (e) { const sp = e.querySelector('.cell-ro'); if (sp) sp.textContent = fmtMoney(v); } };
+    money('tax', lineTaxPerUnit(l));
+    money('taxtotal', lineTax(l));
+    money('ext', lineExt(l));
+    money('totinc', lineTotalInc(l));
+
+    const pi = g.querySelector('[data-price="' + l.lineId + '"]');
+    if (pi) {
+        // Don't fight the operator's cursor — only rewrite the value when the
+        // field isn't the one being typed into.
+        if (document.activeElement !== pi) pi.value = (l.unitPrice != null ? l.unitPrice : 0).toFixed(2);
+        pi.classList.toggle('moved', priceMoved(l));
+    }
+}
+
+// Every line's tax cells depend on the ORDER rate, so changing it has to
+// repaint all of them, not just the totals bar.
+function refreshAllLineCells() {
+    _lines.filter(l => l.kind === 'sale').forEach(refreshLineCells);
+}
+
+function refreshTotals() {
+    const sale = _lines.filter(l => l.kind === 'sale');
+    const notes = _lines.length - sale.length;
+    const sub = sale.reduce((s, l) => s + lineExt(l), 0);
+    const tax = sale.reduce((s, l) => s + lineTax(l), 0);
+    document.getElementById('tSub').textContent = fmtMoney(sub);
+    document.getElementById('tTax').textContent = fmtMoney(tax);
+    document.getElementById('tTot').textContent = fmtMoney(sub + tax);
+    const units = sale.reduce((s, l) => s + (l.qty || 0), 0);
+    document.getElementById('lineCount').textContent = sale.length
+        ? sale.length + ' line' + (sale.length === 1 ? '' : 's') + ' · ' + fmtQty(units) + ' units' +
+          (notes ? ' · ' + notes + ' note' + (notes === 1 ? '' : 's') : '')
+        : 'No lines';
+    refreshSaveButton();
+    updateOrderSummary();
+}
+
+function canSave() {
+    const taxed = _taxMode === 'product' || _taxRateId != null;
+    return !!(_customer && taxed && _lines.some(l => l.kind === 'sale' && l.qty > 0)
+              && _ruleCfId != null && HAS_REST && !_submitting);
+}
+function refreshSaveButton() { document.getElementById('saveBtn').disabled = !canSave(); }
+
+function statusText() {
+    if (!_customer) return 'Select a customer to begin.';
+    if (_taxMode !== 'product' && _taxRateId == null) {
+        return 'Choose a tax rate — leaving it unset zero-rates the whole order.';
+    }
+    const n = _lines.filter(l => l.kind === 'sale' && l.qty > 0).length;
+    if (!n) return 'Add a line.';
+    return n + ' line' + (n === 1 ? '' : 's') + ' ready · ' + (_statusId === 20 ? 'will be created as Issued' : 'will be created as an Estimate');
+}
+
+function updateOrderSummary() {
+    const bits = [];
+    const num = (document.getElementById('fSoNum') || {}).value;
+    if (num && String(num).trim()) bits.push('SO ' + String(num).trim());
+    bits.push(_customer ? _customer.label : 'No customer selected');
+    bits.push(_statusId === 20 ? 'Issued' : 'Estimate');
+    if (_taxMode === 'product') bits.push('Tax per product');
+    else {
+        const t = _taxRateById.get(_taxRateId);
+        bits.push(t ? 'Tax ' + t.name : 'NO TAX RATE');
+    }
+    const ship = _addresses.find(a => a.id === intOf(document.getElementById('fShipTo').value));
+    if (ship) bits.push('Ship to ' + (ship.city || ship.label));
+    document.getElementById('ohSummary').textContent = bits.join(' · ');
+}
+
+// ============================================================================
+//  GRID WIRING
+// ============================================================================
+function wireGrid() {
+    const g = document.getElementById('soGrid');
+
+    // Row hover — display:contents leaves no row element to hang :hover on.
+    g.querySelectorAll('[data-line]').forEach(cell => {
+        cell.addEventListener('mouseenter', () => setRowHover(cell.getAttribute('data-line'), true));
+        cell.addEventListener('mouseleave', () => setRowHover(cell.getAttribute('data-line'), false));
+    });
+
+    g.querySelectorAll('[data-qty]').forEach(inp => {
+        const l = lineById(inp.getAttribute('data-qty'));
+        inp.addEventListener('input', () => setLineQty(l, inp.value));
+        inp.addEventListener('keydown', e => onCellKey(e, l, 'qty'));
+    });
+
+    g.querySelectorAll('[data-price]').forEach(inp => {
+        const l = lineById(inp.getAttribute('data-price'));
+        inp.addEventListener('change', () => setLineManualPrice(l, inp.value));
+        inp.addEventListener('keydown', e => onCellKey(e, l, 'price'));
+    });
+
+    g.querySelectorAll('[data-rule]').forEach(wireRuleButton);
+
+    g.querySelectorAll('[data-del]').forEach(b => {
+        b.addEventListener('click', () => removeLine(b.getAttribute('data-del')));
+    });
+
+    g.querySelectorAll('[data-note]').forEach(ta => {
+        const l = lineById(ta.getAttribute('data-note'));
+        autoGrow(ta);
+        ta.addEventListener('input', () => { l.text = ta.value; autoGrow(ta); });
+        // An empty note that loses focus deletes itself — no orphan blank rows.
+        ta.addEventListener('blur', () => { if (!ta.value.trim()) removeLine(l.lineId); });
+        ta.addEventListener('keydown', e => onCellKey(e, l, 'note'));
+    });
+
+    g.querySelectorAll('.gap').forEach(gap => {
+        const after = gap.getAttribute('data-gap');
+        const btn = gap.querySelector('.gap-btn');
+        btn.addEventListener('click', e => {
+            e.stopPropagation();
+            // Shift-click inserts a note outright — the shortcut worth learning.
+            if (e.shiftKey) { addNoteAfter(after); return; }
+            openInsertMenu(btn, after);
+        });
+        gap.addEventListener('dragover', e => { e.preventDefault(); gap.classList.add('act'); });
+        gap.addEventListener('dragleave', () => gap.classList.remove('act'));
+        gap.addEventListener('drop', e => {
+            e.preventDefault(); gap.classList.remove('act');
+            const dragged = e.dataTransfer.getData('text/plain');
+            if (!dragged) return;
+            // Dropping on the band after line X means "sit directly after X".
+            const idx = after === '' ? 0 : lineIndex(after) + 1;
+            const target = _lines[idx] && _lines[idx].lineId !== dragged ? _lines[idx].lineId : null;
+            moveLine(dragged, target);
+        });
+    });
+
+    g.querySelectorAll('[data-drag]').forEach(h => {
+        h.addEventListener('dragstart', e => {
+            _dragLineId = h.getAttribute('data-drag');
+            e.dataTransfer.setData('text/plain', _dragLineId);
+            e.dataTransfer.effectAllowed = 'move';
+            markRow(_dragLineId, 'row-dragging', true);
+        });
+        h.addEventListener('dragend', () => {
+            markRow(_dragLineId, 'row-dragging', false);
+            clearRowDropMarks();
+            _dragLineId = null;
+        });
+    });
+
+    wireRowDrop(g);
+    wireHeader(g);
+
+    const np = document.getElementById('newProduct');
+    if (np) wireProductTypeahead(np);
+}
+
+// ── ROW REORDER ──────────────────────────────────────────────────────
+// Dropping on the 7px band between rows is precise but fiddly, so the ROWS
+// themselves are drop targets too: the top half of a row means "above it",
+// the bottom half "below it", with a line drawn on the edge you would land on.
+let _dragLineId = null;
+
+function markRow(lineId, cls, on) {
+    if (!lineId) return;
+    document.querySelectorAll('#soGrid [data-line="' + lineId + '"]')
+        .forEach(c => c.classList.toggle(cls, !!on));
+}
+function clearRowDropMarks() {
+    document.querySelectorAll('#soGrid .drop-before, #soGrid .drop-after')
+        .forEach(c => c.classList.remove('drop-before', 'drop-after'));
+}
+
+function wireRowDrop(g) {
+    g.querySelectorAll('[data-line]').forEach(cell => {
+        const targetId = cell.getAttribute('data-line');
+        cell.addEventListener('dragover', e => {
+            if (!_dragLineId || _dragLineId === targetId) return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+            const r = cell.getBoundingClientRect();
+            const after = (e.clientY - r.top) > r.height / 2;
+            clearRowDropMarks();
+            markRow(targetId, after ? 'drop-after' : 'drop-before', true);
+        });
+        cell.addEventListener('drop', e => {
+            if (!_dragLineId || _dragLineId === targetId) return;
+            e.preventDefault();
+            e.stopPropagation();
+            const r = cell.getBoundingClientRect();
+            const after = (e.clientY - r.top) > r.height / 2;
+            const dragged = _dragLineId;
+            clearRowDropMarks();
+            _dragLineId = null;
+            moveLineRelative(dragged, targetId, after);
+        });
+    });
+}
+
+// Resolve "put the dragged line above/below this one" into the single
+// before-id that moveLine() takes. The target index is computed with the
+// dragged line already removed, or dropping downwards lands one row short.
+function moveLineRelative(draggedId, targetId, after) {
+    if (!draggedId || draggedId === targetId) return;
+    const rest = _lines.filter(l => l.lineId !== draggedId);
+    const ti = rest.findIndex(l => l.lineId === targetId);
+    if (ti < 0) return;
+    const beforeId = after ? (rest[ti + 1] ? rest[ti + 1].lineId : null) : targetId;
+    moveLine(draggedId, beforeId);
+}
+
+// ── COLUMN RESIZE + REORDER ──────────────────────────────────────────
+let _dragColKey = null;
+
+function wireHeader(g) {
+    // Resize: drag the grip on a header's right edge. Widths are applied live
+    // and only persisted on release, so a drag costs one settings write.
+    g.querySelectorAll('[data-rz]').forEach(grip => {
+        grip.addEventListener('mousedown', e => {
+            e.preventDefault();
+            e.stopPropagation();
+            const key = grip.getAttribute('data-rz');
+            const def = COL_BY_KEY.get(key);
+            const startX = e.clientX, startW = _colW[key];
+            grip.classList.add('active');
+            document.body.classList.add('col-resizing');
+            const onMove = ev => {
+                _colW[key] = Math.max(def.min, Math.min(600, startW + (ev.clientX - startX)));
+                applyGridTemplate();
+            };
+            const onUp = () => {
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup', onUp);
+                grip.classList.remove('active');
+                document.body.classList.remove('col-resizing');
+                saveColPrefs();
+            };
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+        });
+        // The grip sits inside a draggable header; without this a resize
+        // gesture starts a column drag instead.
+        grip.addEventListener('dragstart', e => { e.preventDefault(); e.stopPropagation(); });
+    });
+
+    g.querySelectorAll('.hd.movable').forEach(hd => {
+        const key = hd.getAttribute('data-col');
+        hd.addEventListener('dragstart', e => {
+            _dragColKey = key;
+            e.dataTransfer.setData('text/plain', 'col:' + key);
+            e.dataTransfer.effectAllowed = 'move';
+            hd.classList.add('dragging');
+        });
+        hd.addEventListener('dragend', () => {
+            hd.classList.remove('dragging');
+            clearColDropMarks();
+            _dragColKey = null;
+        });
+        hd.addEventListener('dragover', e => {
+            if (!_dragColKey || _dragColKey === key) return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+            const r = hd.getBoundingClientRect();
+            const after = (e.clientX - r.left) > r.width / 2;
+            clearColDropMarks();
+            hd.classList.add(after ? 'col-drag-over-r' : 'col-drag-over');
+        });
+        hd.addEventListener('drop', e => {
+            if (!_dragColKey || _dragColKey === key) return;
+            e.preventDefault();
+            const r = hd.getBoundingClientRect();
+            const after = (e.clientX - r.left) > r.width / 2;
+            const moved = _dragColKey;
+            clearColDropMarks();
+            _dragColKey = null;
+            moveColumn(moved, key, after);
+        });
+    });
+}
+
+function clearColDropMarks() {
+    document.querySelectorAll('#soGrid .hd').forEach(h => h.classList.remove('col-drag-over', 'col-drag-over-r'));
+}
+
+function moveColumn(dragKey, targetKey, after) {
+    if (dragKey === targetKey) return;
+    // Only the rearrangeable middle takes part. Without this guard a pinned
+    // key spliced into _colOrder and the column appeared twice.
+    if (MIDDLE_KEYS.indexOf(dragKey) < 0 || MIDDLE_KEYS.indexOf(targetKey) < 0) return;
+    const rest = _colOrder.filter(k => k !== dragKey);
+    const ti = rest.indexOf(targetKey);
+    if (ti < 0) return;
+    rest.splice(after ? ti + 1 : ti, 0, dragKey);
+    _colOrder = rest;
+    saveColPrefs();
+    renderGrid();
+}
+
+function setRowHover(lineId, on) {
+    document.querySelectorAll('#soGrid [data-line="' + lineId + '"]').forEach(c => c.classList.toggle('hov', on));
+}
+
+function autoGrow(ta) {
+    ta.style.height = 'auto';
+    ta.style.height = Math.min(ta.scrollHeight, 130) + 'px';
+    ta.style.overflowY = ta.scrollHeight > 130 ? 'auto' : 'hidden';
+}
+
+function addNoteAfter(afterLineId) {
+    const l = insertLine(makeNoteLine(''), afterLineId);
+    renderGrid(); refreshTotals();
+    const ta = document.querySelector('[data-note="' + l.lineId + '"]');
+    if (ta) ta.focus();
+}
+function addNoteBefore(beforeLineId) {
+    const l = insertLineBefore(makeNoteLine(''), beforeLineId);
+    renderGrid(); refreshTotals();
+    const ta = document.querySelector('[data-note="' + l.lineId + '"]');
+    if (ta) ta.focus();
+}
+
+function openInsertMenu(anchor, afterLineId) {
+    const r = anchor.getBoundingClientRect();
+    const pop = document.getElementById('taPop');
+    document.getElementById('taList').innerHTML =
+        '<div class="ta-item" data-ins="note"><span class="pd">📝 Note line</span></div>' +
+        '<div class="ta-item" data-ins="product"><span class="pd">➕ Product line</span></div>';
+    pop.style.left = Math.round(r.left) + 'px';
+    pop.style.top = Math.round(r.bottom + 4) + 'px';
+    pop.style.width = '200px';
+    pop.classList.add('open');
+    pop.querySelectorAll('[data-ins]').forEach(it => {
+        it.addEventListener('click', () => {
+            closeTypeahead();
+            if (it.getAttribute('data-ins') === 'note') addNoteAfter(afterLineId);
+            else openInlineProductPicker(afterLineId);
+        });
+    });
+}
+
+// Inserting a product mid-order: reuse the blank row's typeahead by parking a
+// temporary input in the insert band.
+let _pendingInsertAfter = null;
+function openInlineProductPicker(afterLineId) {
+    _pendingInsertAfter = afterLineId;
+    const np = document.getElementById('newProduct');
+    if (np) { np.focus(); np.placeholder = 'Insert after this point — type a product…'; }
+    toast('Type the product to insert at that position.', 'info', 3000);
+}
+
+function onCellKey(e, line, field) {
+    // Alt+N inserts a note relative to the row being edited — the fastest way
+    // to annotate a line without leaving the keyboard.
+    if (e.altKey && (e.key === 'n' || e.key === 'N')) {
+        e.preventDefault();
+        if (e.shiftKey) addNoteBefore(line.lineId); else addNoteAfter(line.lineId);
+        return;
+    }
+    if (field === 'note') return;
+    if (e.key === 'Enter') {
+        e.preventDefault();
+        if (field === 'qty') {
+            const btn = document.querySelector('[data-rule="' + line.lineId + '"]');
+            if (btn) btn.focus();
+        } else {
+            const np = document.getElementById('newProduct');
+            if (np) np.focus();
+        }
+    }
+}
+
+function wireRuleButton(btn) {
+    if (!btn) return;
+    btn.addEventListener('click', () => openRulePicker(btn.getAttribute('data-rule'), btn));
+    btn.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openRulePicker(btn.getAttribute('data-rule'), btn); }
+        if (e.altKey && (e.key === 'n' || e.key === 'N')) {
+            e.preventDefault();
+            const id = btn.getAttribute('data-rule');
+            if (e.shiftKey) addNoteBefore(id); else addNoteAfter(id);
+        }
+    });
+}
+
+// ============================================================================
+//  PRODUCT TYPEAHEAD
+// ============================================================================
+let _taMatches = [], _taHl = -1, _taInput = null;
+
+function wireProductTypeahead(input) {
+    _taInput = input;
+    input.addEventListener('input', () => showTypeahead(input.value));
+    // Opens on focus with the whole catalogue, not only once something has
+    // been typed — clicking the cell should show what is available.
+    input.addEventListener('focus', () => showTypeahead(input.value));
+    input.addEventListener('mousedown', () => setTimeout(() => showTypeahead(input.value), 0));
+    input.addEventListener('blur', () => setTimeout(closeTypeahead, 180));
+    input.addEventListener('keydown', e => {
+        const pop = document.getElementById('taPop');
+        if (!pop.classList.contains('open')) return;
+        if (e.key === 'ArrowDown') { e.preventDefault(); if (_taHl < _taMatches.length - 1) { _taHl++; hlTypeahead(); } }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); if (_taHl > 0) { _taHl--; hlTypeahead(); } }
+        else if (e.key === 'Enter') {
+            e.preventDefault();
+            const pick = _taMatches[_taHl >= 0 ? _taHl : 0];
+            if (pick) chooseProduct(pick);
+        }
+        else if (e.key === 'Escape') { closeTypeahead(); }
+    });
+}
+
+const TA_LIMIT = 100;
+function showTypeahead(term) {
+    const q = String(term || '').trim().toLowerCase();
+    const pop = document.getElementById('taPop'), list = document.getElementById('taList');
+    if (!_products.length) { closeTypeahead(); return; }
+    // No search term lists the catalogue from the top rather than showing
+    // nothing — the cell is a browser as well as a search box.
+    const all = q ? _products.filter(p => p.search.includes(q)) : _products;
+    _taMatches = all.slice(0, TA_LIMIT);
+    _taHl = _taMatches.length ? 0 : -1;
+    const more = all.length - _taMatches.length;
+    list.innerHTML = _taMatches.length
+        ? _taMatches.map((p, i) =>
+            '<div class="ta-item' + (i === 0 ? ' hl' : '') + '" data-pid="' + p.id + '">' +
+            '<span class="pn">' + escHtml(p.num) + '</span>' +
+            '<span class="pd">' + escHtml(p.description) + '</span>' +
+            '<span class="pp">' + escHtml(fmtMoney(p.price)) + '</span></div>').join('') +
+            (more > 0 ? '<div class="ta-empty">' + more.toLocaleString() + ' more \u2014 keep typing to narrow</div>' : '')
+        : '<div class="ta-empty">No matching product</div>';
+    const r = _taInput.getBoundingClientRect();
+    pop.style.left = Math.round(r.left) + 'px';
+    pop.style.top = Math.round(r.bottom + 3) + 'px';
+    pop.style.width = Math.max(360, Math.round(r.width)) + 'px';
+    pop.classList.add('open');
+    list.querySelectorAll('[data-pid]').forEach(it => {
+        it.addEventListener('mousedown', e => {
+            e.preventDefault();
+            const p = _productById.get(intOf(it.getAttribute('data-pid')));
+            if (p) chooseProduct(p);
+        });
+    });
+}
+function hlTypeahead() {
+    const items = document.querySelectorAll('#taList .ta-item');
+    items.forEach((it, i) => { it.classList.toggle('hl', i === _taHl); if (i === _taHl) it.scrollIntoView({ block: 'nearest' }); });
+}
+function closeTypeahead() { document.getElementById('taPop').classList.remove('open'); _taHl = -1; }
+
+async function chooseProduct(product) {
+    closeTypeahead();
+    const after = _pendingInsertAfter;
+    _pendingInsertAfter = null;
+    const line = await addProductLine(product, after);
+    const np = document.getElementById('newProduct');
+    if (np) { np.value = ''; np.placeholder = 'Type a product number or description…'; np.focus(); }
+    if (line) {
+        const qi = document.querySelector('[data-qty="' + line.lineId + '"]');
+        if (qi) { qi.focus(); qi.select(); }
+    }
+}
+
+// ============================================================================
+//  RULE PICKER
+// ============================================================================
+let _pickLine = null, _ruleFilter = '';
+
+async function openRulePicker(lineId, anchor) {
+    const l = lineById(lineId);
+    if (!l || l.kind !== 'sale') return;
+    _pickLine = l; _ruleFilter = '';
+    if (!l.choices) await priceLine(l, false);
+
+    const pop = document.getElementById('rulePop');
+    const r = anchor.getBoundingClientRect();
+    const w = 420;
+    pop.style.left = Math.round(Math.min(r.left, window.innerWidth - w - 12)) + 'px';
+    const below = window.innerHeight - r.bottom;
+    if (below < 260) { pop.style.top = ''; pop.style.bottom = Math.round(window.innerHeight - r.top + 4) + 'px'; }
+    else { pop.style.bottom = ''; pop.style.top = Math.round(r.bottom + 4) + 'px'; }
+    pop.classList.add('open');
+    const s = document.getElementById('ruleSearch');
+    s.value = '';
+    renderRuleList();
+    s.focus();
+}
+
+function closeRulePicker() {
+    document.getElementById('rulePop').classList.remove('open');
+    _pickLine = null;
+}
+
+function renderRuleList() {
+    const l = _pickLine;
+    const box = document.getElementById('ruleList');
+    if (!l) { box.innerHTML = ''; return; }
+    const f = _ruleFilter.trim().toLowerCase();
+    const match = c => !f || (c.name + ' ' + (c.description || '')).toLowerCase().includes(f);
+
+    const inScope = (l.choices ? l.choices.inScope : []).filter(match);
+    const offList = (l.choices ? l.choices.offList : []).filter(match);
+    const valid = inScope.filter(c => c.valid).sort(byPrice);
+    const other = inScope.filter(c => !c.valid).sort(byPrice);
+
+    const html = [];
+    // None leads the list, so clearing a rule is a choice among the rules
+    // rather than a link the operator has to notice at the bottom.
+    if (!f) {
+        html.push('<div class="rule-item' + (l.ruleCleared ? ' sel' : '') + '" data-rid="none">' +
+            '<div class="ri-main"><div class="ri-nm">None</div>' +
+            '<div class="ri-sub">No rule — charge the list price, record nothing</div></div>' +
+            '<div class="ri-px">' + escHtml(fmtMoney(l.product ? l.product.price : 0)) + '</div></div>');
+    }
+    if (valid.length) { html.push('<div class="rule-grp">Fishbowl would apply</div>'); valid.forEach(c => html.push(itemHtml(c, l))); }
+    if (other.length) { html.push('<div class="rule-grp">Other rules in scope</div>'); other.forEach(c => html.push(itemHtml(c, l))); }
+    // EVERY active rule is listed, always. Hiding the out-of-scope ones behind
+    // a toggle is what makes the operator hunt: the rules applied by hand here
+    // — a sample or BDF rule on a retail line — are precisely the ones
+    // Fishbowl would never offer on its own.
+    if (offList.length) {
+        html.push('<div class="rule-grp">All other active rules — applied by hand</div>');
+        offList.forEach(c => html.push(itemHtml(c, l)));
+    }
+    if (!html.length) html.push('<div class="ta-empty">' + (f ? 'No rule matches “' + escHtml(_ruleFilter) + '”' : 'No active pricing rules') + '</div>');
+    box.innerHTML = html.join('');
+    const cnt = document.getElementById('ruleCount');
+    if (cnt) {
+        const shown = valid.length + other.length + offList.length;
+        cnt.textContent = shown + ' of ' + _allRulesById.size + ' rule' + (_allRulesById.size === 1 ? '' : 's');
+    }
+    box.querySelectorAll('[data-rid]').forEach(it => {
+        if (it.classList.contains('dis')) return;
+        const rid = it.getAttribute('data-rid');
+        it.addEventListener('click', () => pickRule(rid === 'none' ? null : intOf(rid)));
+    });
+}
+function byPrice(a, b) { return (a.unitPrice == null ? 1e15 : a.unitPrice) - (b.unitPrice == null ? 1e15 : b.unitPrice); }
+
+function itemHtml(c, l) {
+    const rule = _allRulesById.get(c.id);
+    let label = rule ? describeRule(rule) : (c.description || '');
+    // Answers "why did that one attach itself?" without leaving the picker.
+    if (rule && bitTrue(rule.isautoapply)) label += '  ·  applies automatically';
+    const sel = l.ruleId === c.id;
+    if (c.unitPrice == null) {
+        return '<div class="rule-item dis" title="' + escHtml(c.blocked || '') + '">' +
+               '<div class="ri-main"><div class="ri-nm">' + escHtml(c.name) + '</div>' +
+               '<div class="ri-sub">' + escHtml(c.blocked || label) + '</div></div>' +
+               '<div class="ri-px">—</div></div>';
+    }
+    const list = l.product.price || 0;
+    let delta = '';
+    if (c.unitPrice === 0) delta = '<div class="ri-dl">FREE</div>';
+    else if (list > 0 && c.unitPrice < list) delta = '<div class="ri-dl">−' + Math.round((1 - c.unitPrice / list) * 100) + '%</div>';
+    return '<div class="rule-item' + (sel ? ' sel' : '') + '" data-rid="' + c.id + '">' +
+           '<div class="ri-main"><div class="ri-nm">' + escHtml(c.name) +
+           (c.source === 'offlist' ? ' <span class="chip off">off-list</span>' : '') + '</div>' +
+           '<div class="ri-sub">' + escHtml(label) + '</div></div>' +
+           '<div class="ri-px">' + escHtml(fmtMoney(c.unitPrice)) + delta + '</div></div>';
+}
+
+function pickRule(ruleId) {
+    const l = _pickLine;
+    closeRulePicker();
+    if (!l) return;
+    // Choosing anything is an explicit decision — stop the customer-note
+    // default from ever overwriting this line again.
+    l.ruleLocked = true;
+    l.ruleAuto = false;
+    l.ruleNotApplicable = null;
+    if (ruleId == null) {
+        l.ruleCleared = true;
+        l.ruleId = null; l.ruleName = '';
+        l.autoWould = null;
+        l.unitPrice = l.product.price; l.priceSource = 'product';
+    } else {
+        const c = allCandidates(l).find(x => x.id === ruleId);
+        if (!c || c.unitPrice == null) return;
+        l.ruleCleared = false;
+        l.ruleId = c.id; l.ruleName = c.name;
+        l.unitPrice = c.unitPrice;
+        l.priceSource = c.source === 'server' ? 'rule' : 'rule-local';
+    }
+    refreshLineCells(l); refreshTotals();
+}
+
+// ============================================================================
+//  ORDER HEADER EVENTS
+// ============================================================================
+function toggleOrderHeader() {
+    document.getElementById('ohHead').classList.toggle('collapsed');
+    document.getElementById('ohBody').classList.toggle('hidden');
+}
+
+function setStatus(id) {
+    _statusId = id;
+    document.querySelectorAll('#fStatus button').forEach(b => b.classList.toggle('on', intOf(b.getAttribute('data-st')) === id));
+    setStatusLine(statusText());
+    updateOrderSummary();
+}
+
+function onTaxRateChange() {
+    const v = document.getElementById('fTaxRate').value;
+    if (v === 'product') { _taxMode = 'product'; _taxRateId = null; }
+    else { _taxMode = 'order'; _taxRateId = intOf(v); }
+    refreshAllLineCells();
+    refreshTotals();
+    setStatusLine(statusText());
+}
+
+async function onCustomerChange() {
+    const id = intOf(document.getElementById('fCustomer').value);
+    _customer = _customers.find(c => c.id === id) || null;
+
+    // Seed the salesperson from the customer, but leave it editable — the
+    // person keying the order is not always the one credited with it.
+    const spSel = document.getElementById('fSalesperson');
+    if (_customer && _customer.salesmanId != null && _users.some(u => u.id === _customer.salesmanId)) {
+        spSel.value = String(_customer.salesmanId);
+    } else if (!_customer) {
+        spSel.value = '';
+    }
+
+    if (!_customer) {
+        _activeRules = []; _defaultRules = []; _defaultRuleMisses = []; _defaultRuleText = '';
+        renderRuleBanner(); renderGrid(); refreshTotals();
+        setStatusLine(statusText());
+        return;
+    }
+
+    setStatusLine('Loading pricing for ' + _customer.name + '…');
+    // A customer WITH a tax rate of their own governs the whole order. A
+    // customer WITHOUT one falls to per-product, so each line is taxed by its
+    // own code. It deliberately does NOT fall back to the system default rate,
+    // which is None and would silently zero-rate the order.
+    if (_customer.taxRateId != null && _taxRateById.has(_customer.taxRateId)) {
+        _taxMode = 'order'; _taxRateId = _customer.taxRateId;
+    } else {
+        _taxMode = 'product'; _taxRateId = null;
+    }
+    document.getElementById('fTaxRate').value = _taxMode === 'product' ? 'product' : String(_taxRateId);
+
+    _bpCache.clear();
+    await Promise.all([
+        loadRulesForCustomer(_customer),
+        loadCustomerLastPrices(_customer),
+        loadAddresses(_customer),
+    ]);
+    resolveDefaultRules(_customer);
+    renderRuleBanner();
+    renderGrid();
+    // Only now — a chosen customer is the first real sign of an order, and the
+    // number is consumed the moment it is asked for.
+    fetchNextSoNumber(false);
+    await repriceAllLines();
+    refreshTotals();
+    setStatusLine(statusText());
+    const np = document.getElementById('newProduct');
+    if (np) np.focus();
+}
+
+function newOrder() {
+    if (_lines.length && !confirmDiscard()) return;
+    _lines = []; _lineSeq = 0;
+    document.getElementById('fCustomerPO').value = '';
+    document.getElementById('fVendorPO').value = '';
+    document.getElementById('fNote').value = '';
+    document.getElementById('fSoNum').value = '';
+    renderGrid(); refreshTotals();
+    if (_customer) fetchNextSoNumber(false);
+    setStatusLine(statusText());
+}
+function confirmDiscard() {
+    // Deliberately the native dialog: this is a discard guard, and awaiting a
+    // custom modal here would let the click through first.
+    return window.confirm('Discard the ' + _lines.length + ' line(s) on this order?');
+}
+
+// ============================================================================
+//  SUBMIT
+// ----------------------------------------------------------------------------
+//  REST only. The CSV importer cannot write line-level custom fields, so
+//  falling back to it would produce an order that looks right and reports as
+//  "no rule recorded" forever — the exact failure this screen exists to fix.
+// ============================================================================
+function addrForRest(a) {
+    if (!a) return null;
+    return {
+        name: a.recipient || (_customer ? _customer.name : ''),
+        street: a.street || '', city: a.city || '', state: a.state || '',
+        postalCode: a.zip || '', country: a.countryAbbrev || a.country || '',
+    };
+}
+
+function submittableLines() {
+    return _lines.filter(l => (l.kind === 'sale' && l.qty > 0 && l.product) ||
+                              (l.kind === 'note' && String(l.text || '').trim()));
+}
+
+function buildPayload() {
+    const ship = _addresses.find(a => a.id === intOf(document.getElementById('fShipTo').value));
+    const bill = _addresses.find(a => a.id === intOf(document.getElementById('fBillTo').value));
+    const lgId = intOf(document.getElementById('fLocationGroup').value);
+    const po = document.getElementById('fCustomerPO').value.trim();
+    const vpo = document.getElementById('fVendorPO').value.trim();
+    const note = document.getElementById('fNote').value.trim();
+    const sched = document.getElementById('fScheduled').value;
+
+    const lines = submittableLines();
+    // Always explicit: omitting the order rate resolves it to the system
+    // default, which is None, and zero-rates everything.
+    const orderTaxId = resolveOrderTaxRateId(lines);
+
+    const body = {
+        status: _statusId === 20 ? 'Issued' : 'Estimate',
+        customer: { id: _customer.id },
+        customerContact: (ship && ship.recipient) || _customer.name,
+        taxRate: { id: orderTaxId },
+        soItems: lines.map((l, i) => {
+            if (l.kind === 'note') {
+                return { type: { name: 'Note' }, product: { description: String(l.text).trim() }, lineNumber: i + 1 };
+            }
+            const item = {
+                product: { id: l.product.id },
+                type: { id: SOITEM_TYPE_SALE },
+                lineNumber: i + 1,
+                // Strings, matching the documented example — these are decimals
+                // and JSON numbers risk float noise on the wire.
+                quantity: String(l.qty),
+                unitPrice: String(l.unitPrice != null ? l.unitPrice : l.product.price),
+            };
+            // A line only carries its own rate when it actually differs from
+            // the order's. Sending a matching one is noise, and on a US
+            // database a DIFFERING line rate is rejected outright unless it is
+            // None — which is why the order rate above is chosen to be the one
+            // most lines already want.
+            const lt = lineTaxRateRow(l);
+            const ltId = lt ? lt.id : NONE_TAX_ID;
+            if (ltId !== orderTaxId) item.taxRate = { id: ltId };
+
+            // Absence is the one representation of "no rule". Writing an empty
+            // string reads back differently and muddies the report's bucket.
+            const v = ruleValueFor(l);
+            if (v) item.customFields = [{ id: _ruleCfId, value: v }];
+            return item;
+        }),
+    };
+    if (ship) body.shipToAddress = addrForRest(ship);
+    if (bill) body.billToAddress = addrForRest(bill);
+    // Setting a number needs SO_EDIT_SO_NUM; blank lets Fishbowl assign one.
+    const soNum = document.getElementById('fSoNum').value.trim();
+    if (soNum) body.number = soNum;
+    const spId = intOf(document.getElementById('fSalesperson').value);
+    if (spId != null) body.salesperson = { id: spId };
+    if (_customer.carrierId) body.carrier = { id: _customer.carrierId };
+    if (lgId) body.locationGroup = { id: lgId };
+    if (po) body.customerPoNumber = po;
+    if (vpo) body.vendorPoNumber = vpo;
+    if (note) body.note = note;
+    if (sched) body.dateScheduled = sched;
+    return body;
+}
+
+function ruleValueFor(l) {
+    if (l.kind !== 'sale') return '';
+    if (l.priceSource === 'manual') return String(pref('manualOverrideCfValue') || '');
+    return l.ruleId != null ? String(l.ruleName || '') : '';
+}
+
+function restErrStatus(err) {
+    if (!err) return 0;
+    const n = parseInt(err.status, 10);
+    if (!isNaN(n)) return n;
+    const m = String(err.message || err);
+    if (/\b403\b|forbidden/i.test(m)) return 403;
+    if (/\b405\b|method not allowed/i.test(m)) return 405;
+    if (/\b404\b|not found/i.test(m)) return 404;
+    if (/\b422\b/.test(m)) return 422;
+    return 0;
+}
+
+async function reviewAndSave() {
+    if (!canSave()) return;
+    const lines = submittableLines();
+    const sale = lines.filter(l => l.kind === 'sale');
+    const unruled = sale.filter(l => !ruleValueFor(l)).length;
+
+    const rows = lines.map((l, i) => {
+        if (l.kind === 'note') {
+            return '<tr class="note"><td class="n">' + (i + 1) + '</td><td colspan="6">📝 ' + escHtml(l.text) + '</td></tr>';
+        }
+        const src = l.priceSource === 'manual' ? 'typed by hand'
+                  : l.priceSource === 'rule' ? 'Fishbowl priced this rule'
+                  : l.priceSource === 'rule-local' ? 'priced by this screen'
+                  : 'product list price';
+        return '<tr><td class="n">' + (i + 1) + '</td>' +
+               '<td><b>' + escHtml(l.product.num) + '</b><br><span style="color:var(--c-tertiary);">' + escHtml(l.product.description) + '</span></td>' +
+               '<td class="n">' + escHtml(fmtQty(l.qty)) + '</td>' +
+               '<td>' + (ruleValueFor(l) ? escHtml(ruleValueFor(l)) : '<i style="color:var(--acc-orange-con);">no rule recorded</i>') +
+               '<br><span style="color:var(--c-tertiary);font-size:11px;">' + escHtml(src) + '</span></td>' +
+               '<td class="n">' + escHtml(fmtMoney(l.unitPrice)) + '</td>' +
+               '<td class="n">' + escHtml(fmtMoney(lineTax(l))) + '</td>' +
+               '<td class="n">' + escHtml(fmtMoney(lineTotalInc(l))) + '</td></tr>';
+    }).join('');
+
+    const sub = sale.reduce((s, l) => s + lineExt(l), 0);
+    const tax = sale.reduce((s, l) => s + lineTax(l), 0);
+    const body =
+        '<p>Creating <b>' + (_statusId === 20 ? 'an Issued order' : 'an Estimate') + '</b> for <b>' + escHtml(_customer.label) + '</b>' +
+        ', tax rate <b>' + escHtml((_taxRates.find(t => t.id === _taxRateId) || {}).name || '?') + '</b>. ' +
+        'Orders cannot be edited through this screen once created.</p>' +
+        (unruled ? '<div class="alert alert-warning" style="margin:0 0 10px;"><b>' + unruled + ' line' + (unruled === 1 ? '' : 's') +
+            '</b> will be created with no pricing rule recorded — they will report as “no rule recorded”.</div>' : '') +
+        '<table class="rev-table"><thead><tr><th class="n">#</th><th>Product</th><th class="n">Qty</th><th>Pricing rule</th>' +
+        '<th class="n">Unit Price</th><th class="n">Tax Total</th><th class="n">Total inc Tax</th></tr></thead>' +
+        '<tbody>' + rows + '</tbody></table>' +
+        '<p style="margin-top:10px;text-align:right;">' +
+        'Total ex Tax <b>' + escHtml(fmtMoney(sub)) + '</b>' +
+        '&nbsp;&nbsp;·&nbsp;&nbsp;Tax <b>' + escHtml(fmtMoney(tax)) + '</b>' +
+        '&nbsp;&nbsp;·&nbsp;&nbsp;Total <b style="font-size:15px;">' + escHtml(fmtMoney(sub + tax)) + '</b></p>';
+
+    const ok = await showConfirm({ title: 'Review this order', body, okLabel: 'Create order' });
+    if (!ok) return;
+    await saveOrder();
+}
+
+async function saveOrder() {
+    if (_submitting) return;
+    _submitting = true; refreshSaveButton();
+    setStatusLine('Creating the order…');
+
+    const body = buildPayload();
+    dbg('POST /api/sales-orders ' + JSON.stringify(body));
+
+    let resp;
+    try {
+        resp = await postSalesOrder(body);
+    } catch (err) {
+        _submitting = false; refreshSaveButton();
+        const st = restErrStatus(err);
+        const msg = String(err && err.message || err);
+        let hint = '';
+        if (st === 403 && /price|override/i.test(msg)) {
+            hint = ' This screen sets each line\'s price, which needs the SO_PRICE_OVERRIDE access right.';
+        } else if (st === 403 && /number/i.test(msg)) {
+            hint = ' Typing an SO number needs the SO_EDIT_SO_NUM access right \u2014 clear the SO No field ' +
+                   'to let Fishbowl assign one.';
+        } else if (st === 403) {
+            hint = ' The signed-in user lacks a right this order needs.';
+        } else if (st === 400 && /tax/i.test(msg)) {
+            hint = ' A line\'s tax rate differs from the order\'s, which some databases reject outright. ' +
+                   'Pick a single order tax rate instead of "Per product".';
+        } else if (st === 422) {
+            hint = ' The server rejected a line — kits and drop-ship products are not supported here.';
+        } else if (st === 404 || st === 405) {
+            hint = ' This server build does not expose the order-create endpoint.';
+        }
+        // Never auto-retry: a failure after the server accepted the write would
+        // create a second order.
+        setStatusLine('The order was NOT created.');
+        toast('Order not created — ' + msg + hint + ' Check the Sales Order module before retrying, in case it was created anyway.', 'error', 20000);
+        dbg('create failed: ' + msg, 'error');
+        return;
+    }
+
+    const created = extractCreatedSo(resp);
+    dbg('created: ' + JSON.stringify(created));
+    await verifyCreated(created, body);
+
+    _submitting = false;
+    _lines = []; _lineSeq = 0;
+    document.getElementById('fSoNum').value = '';
+    fetchNextSoNumber(false);
+    renderGrid(); refreshTotals();
+    setStatusLine(created.num ? 'Created ' + created.num + '.' : 'Order created.');
+    toast('Created ' + (created.num || 'the order') + '.', 'success', 8000);
+    if (created.num && typeof openModule === 'function') {
+        const n = created.num;
+        toast('Open ' + n + ' in the Sales Order module?', 'info', 9000);
+        // The offer is a toast rather than a jump: the operator often wants to
+        // start the next order, not leave the screen.
+        const box = document.getElementById('toastBox');
+        const last = box.lastElementChild;
+        if (last) {
+            last.querySelector('.toast-msg').innerHTML =
+                'Created <b>' + escHtml(n) + '</b> — <span style="color:var(--link);cursor:pointer;text-decoration:underline;" id="openSoLink">open it</span>';
+            const lnk = last.querySelector('#openSoLink');
+            if (lnk) lnk.addEventListener('click', () => { try { openModule('Sales Order', n); } catch (_) {} });
+        }
+    }
+}
+
+// One retry, and only for the salesperson: crediting someone else needs
+// SO_EDIT_SALESPERSON, and an order booked to the signed-in user is far
+// better than no order. Everything else is reported, never retried — a retry
+// after the server has already accepted the write creates a second order.
+async function postSalesOrder(body) {
+    try {
+        return await runRestApiAsync({
+            method: 'POST', path: '/api/sales-orders',
+            body: JSON.stringify(body), contentType: 'application/json',
+        });
+    } catch (err) {
+        if (restErrStatus(err) === 403 && body.salesperson && /salesperson/i.test(String(err && err.message || ''))) {
+            dbg('salesperson override refused (needs SO_EDIT_SALESPERSON) \u2014 retrying credited to the signed-in user', 'warn');
+            const retry = Object.assign({}, body);
+            delete retry.salesperson;
+            const out = await runRestApiAsync({
+                method: 'POST', path: '/api/sales-orders',
+                body: JSON.stringify(retry), contentType: 'application/json',
+            });
+            toast('The order was credited to you: changing the salesperson needs the SO_EDIT_SALESPERSON right.', 'warn', 12000);
+            return out;
+        }
+        throw err;
+    }
+}
+
+function extractCreatedSo(resp) {
+    const o = (typeof resp === 'string' ? safeParse(resp) : resp) || {};
+    const so = o.salesOrder || o.data || o;
+    const num = so.number != null ? so.number : (so.num != null ? so.num : (so.soNumber != null ? so.soNumber : null));
+    return { id: intOf(so.id), num: num != null ? String(num) : null };
+}
+function safeParse(s) { try { return JSON.parse(s); } catch (_) { return null; } }
+
+// Read the order back and compare it to what was sent. A custom field that
+// silently didn't land would be invisible until the reporting screen came up
+// empty months later.
+async function verifyCreated(created, sent) {
+    if (created.id == null) return;
+    try {
+        const got = await runRestApiAsync({ method: 'GET', path: '/api/sales-orders/' + created.id });
+        const items = (got && (got.soItems || got.soitems)) || [];
+        const problems = [];
+        const sentSale = sent.soItems.filter(i => i.customFields);
+        sentSale.forEach(si => {
+            const match = items.find(x => intOf(x.lineNumber) === intOf(si.lineNumber));
+            if (!match) { problems.push('line ' + si.lineNumber + ' is missing'); return; }
+            const want = si.customFields[0].value;
+            const cfs = match.customFields || [];
+            const hit = cfs.find(c => intOf(c.id) === _ruleCfId);
+            if (!hit || String(hit.value || '') !== want) {
+                problems.push('line ' + si.lineNumber + ' did not keep its pricing rule (“' + want + '”)');
+            }
+            if (Math.abs((numOf(match.unitPrice) || 0) - (numOf(si.unitPrice) || 0)) >= 0.005) {
+                problems.push('line ' + si.lineNumber + ' price came back as ' + fmtMoney(match.unitPrice) + ', not ' + fmtMoney(si.unitPrice));
+            }
+        });
+        if (problems.length) {
+            toast('The order was created, but it did not store everything sent: ' + problems.join('; ') +
+                  '. Check it in the Sales Order module.', 'warn', 25000);
+            dbg('read-back mismatch: ' + problems.join('; '), 'warn');
+        } else {
+            dbg('read-back verified ' + sentSale.length + ' line(s)');
+        }
+    } catch (e) {
+        dbg('read-back failed (the order was still created): ' + (e && e.message || e), 'warn');
+    }
+}
+
+// ============================================================================
+//  SETTINGS PANEL
+// ============================================================================
+window.Prefs = (function () {
+    function fill() {
+        const e = FBLib.Settings.effective();
+        document.getElementById('setManualCf').value = e.manualOverrideCfValue || '';
+        document.getElementById('setRuleSource').value = e.defaultRuleSource || 'note';
+        document.getElementById('setRuleCf').value = e.defaultRuleCfName || '';
+        document.getElementById('setRuleAliases').value = e.defaultRuleAliases || '';
+        document.getElementById('setRulePattern').value = e.defaultRulePattern || DEFAULTS.defaultRulePattern;
+        document.getElementById('setRuleApply').checked = e.defaultRuleApplyToNewLines !== false;
+        document.getElementById('setRuleNumeric').checked = e.defaultRuleRequireNumericMatch !== false;
+        document.getElementById('setStatus').value = String(e.defaultStatusId || 10);
+        document.getElementById('setModuleOpt').value = e.moduleOpt || 'low';
+        document.getElementById('setDebug').checked = !!e.debug;
+        const admin = document.getElementById('dsAdminSection');
+        if (admin) admin.style.display = FBLib.Settings.isAdmin() ? '' : 'none';
+        refreshLock();
+    }
+    function refreshLock() {
+        const allowed = FBLib.Settings.userEditingAllowed();
+        const b = document.getElementById('dsLockBadge');
+        if (b) b.style.display = (!allowed && !FBLib.Settings.isAdmin()) ? 'block' : 'none';
+        const lb = document.getElementById('dsLockBtn');
+        if (lb) lb.textContent = allowed ? 'Lock user editing' : 'Unlock user editing';
+    }
+    function read() {
+        return {
+            ruleCfName: document.getElementById('setCfName').value || DEFAULTS.ruleCfName,
+            manualOverrideCfValue: document.getElementById('setManualCf').value,
+            defaultRuleSource: document.getElementById('setRuleSource').value,
+            defaultRuleCfName: document.getElementById('setRuleCf').value.trim(),
+            defaultRuleAliases: document.getElementById('setRuleAliases').value,
+            defaultRulePattern: document.getElementById('setRulePattern').value,
+            defaultRuleApplyToNewLines: document.getElementById('setRuleApply').checked,
+            defaultRuleRequireNumericMatch: document.getElementById('setRuleNumeric').checked,
+            defaultStatusId: intOf(document.getElementById('setStatus').value) || 10,
+            moduleOpt: document.getElementById('setModuleOpt').value,
+            debug: document.getElementById('setDebug').checked,
+        };
+    }
+    async function apply() {
+        DEBUG = !!pref('debug');
+        _moduleOpt = pref('moduleOpt') || 'low';
+        if (DEBUG) { try { if (!window._dbgApi) window._dbgApi = C.mountDebugDrawer(); } catch (_) {} }
+        await loadSoItemCustomFields();
+        if (_customer) {
+            resolveDefaultRules(_customer);
+            renderRuleBanner();
+            _bpCache.clear();
+            await repriceAllLines();
+        }
+        refreshTotals();
+        FBLib.Common.closeDrawer('setOverlay');
+    }
+    return {
+        open: fill,
+        save: async function () {
+            const p = read();
+            Object.keys(p).forEach(k => FBLib.Settings.setUserKey(k, p[k]));
+            if (!FBLib.Settings.saveUser()) { toast('User editing is locked by an administrator.', 'error'); return; }
+            await apply();
+            toast('Settings saved.', 'success');
+        },
+        reset: async function () {
+            if (!window.confirm('Reset your settings for this screen to the defaults?')) return;
+            FBLib.Settings.clearUser();
+            fill(); await apply();
+        },
+        publish: async function () {
+            if (!FBLib.Settings.isAdmin()) return;
+            if (!window.confirm('Publish these values as the default for everyone?')) return;
+            FBLib.Settings.publishMaster(read());
+            toast('Published as the default for everyone.', 'success');
+            await apply();
+        },
+        toggleLock: function () {
+            if (!FBLib.Settings.isAdmin()) return;
+            const nowLocked = FBLib.Settings.userEditingAllowed();
+            FBLib.Settings.setLock(nowLocked);
+            refreshLock();
+            toast('User editing is now ' + (nowLocked ? 'LOCKED' : 'unlocked') + '.', 'info');
+        },
+    };
+})();
+
+// ============================================================================
+//  GLOBAL EVENTS + INIT
+// ============================================================================
+document.addEventListener('click', e => {
+    const pop = document.getElementById('rulePop');
+    if (pop.classList.contains('open') && !pop.contains(e.target) && !e.target.closest('[data-rule]')) closeRulePicker();
+    const ta = document.getElementById('taPop');
+    if (ta.classList.contains('open') && !ta.contains(e.target) && !e.target.closest('#newProduct') && !e.target.closest('.gap-btn')) closeTypeahead();
+    const cp = document.getElementById('colPop');
+    if (cp.classList.contains('open') && !cp.contains(e.target) && !e.target.closest('#colsBtn')) cp.classList.remove('open');
+});
+
+document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+        closeRulePicker(); closeTypeahead();
+        document.getElementById('colPop').classList.remove('open');
+    }
+});
+
+document.getElementById('ruleSearch').addEventListener('input', function () {
+    _ruleFilter = this.value;
+    renderRuleList();
+});
+document.getElementById('ruleSearch').addEventListener('keydown', function (e) {
+    const items = [...document.querySelectorAll('#ruleList .rule-item:not(.dis)')];
+    if (e.key === 'Enter') {
+        e.preventDefault();
+        const hl = document.querySelector('#ruleList .rule-item.hl') || items[0];
+        if (hl) {
+            const rid = hl.getAttribute('data-rid');
+            pickRule(rid === 'none' ? null : intOf(rid));
+        }
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const cur = items.findIndex(i => i.classList.contains('hl'));
+        const next = e.key === 'ArrowDown' ? Math.min(items.length - 1, cur + 1) : Math.max(0, cur - 1);
+        items.forEach(i => i.classList.remove('hl'));
+        if (items[next]) { items[next].classList.add('hl'); items[next].scrollIntoView({ block: 'nearest' }); }
+    }
+});
+
+// Watch the Settings drawer opening so the panel always shows live values.
+document.getElementById('setBtn').addEventListener('click', () => setTimeout(() => Prefs.open(), 0));
+
+window.addEventListener('DOMContentLoaded', async function () {
+    try {
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn'  });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+    } catch (e) { console.warn('drawer registration failed:', e); }
+
+    if (DEBUG) { try { window._dbgApi = C.mountDebugDrawer(); } catch (_) {} }
+
+    setStatus(intOf(pref('defaultStatusId')) || 10);
+    loadColPrefs();
+    document.getElementById('fScheduled').value = new Date().toISOString().slice(0, 10);
+
+    setStatusLine('Loading…');
+    try {
+        await Promise.all([loadLookups(), loadUsers(), loadCustomers(), loadProducts(),
+                           loadAllRules(), loadSoItemCustomFields()]);
+    } catch (e) {
+        console.error(e);
+        setStatusLine('Load failed: ' + (e && e.message || e));
+        toast('Could not load the reference data: ' + (e && e.message || e), 'error', 20000);
+        return;
+    }
+
+    renderGrid();
+    refreshTotals();
+    setStatusLine(statusText());
+    dbg('ready — ' + _products.length + ' products, ' + _customers.length + ' customers, ' +
+        _allRulesById.size + ' active rules, rule CF id ' + _ruleCfId);
+});
+</script>
+</body>
+</html>

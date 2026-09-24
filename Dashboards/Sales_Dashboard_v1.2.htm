@@ -630,6 +630,7 @@ async function runQueryLogged(label, sql) {
 // ============================================================
 function initSettings() {
   FBLib.Settings.init({
+    masterStorage: 'userProperties',   // shared admin defaults via userproperties, not report data (which needs a SAVED report — see FBLib.SharedData)
     userKey:   'cdx.bi.salesdash.user.v1',
     masterKey: 'cdx.bi.salesdash.master.v1',
     defaults: {
@@ -825,8 +826,9 @@ const BASE_JOIN   = `
   LEFT JOIN Product ON Product.Id = SoItem.ProductId
   LEFT JOIN ProductTree ON ProductTree.Id = (SELECT ProductToTree.ProductTreeId FROM ProductToTree WHERE ProductToTree.ProductId = Product.Id ORDER BY ProductToTree.Id ASC LIMIT 1)
   LEFT JOIN Customer ON Customer.Id = So.CustomerId
-  LEFT JOIN SysUser ON SysUser.Id = Customer.DefaultSalesManId
-  LEFT JOIN AccountGroup ON AccountGroup.Id = (SELECT AccountGroupRelation.GroupId FROM AccountGroupRelation WHERE AccountGroupRelation.AccountId = Customer.AccountId ORDER BY AccountGroupRelation.AccountId ASC LIMIT 1)`;
+  LEFT JOIN SysUser ON SysUser.Id = Customer.DefaultSalesManId`;
+// NB: there is deliberately NO AccountGroup join here — group membership is
+// many-to-many and is resolved per query (§5c), never by a LIMIT 1 pick.
 
 // ── Multi-select SQL helpers (empty array = "All", no filter) ──
 // array → " AND col IN (n,n)"  (numeric); '' when empty
@@ -835,6 +837,56 @@ function sdInNum(col, arr){ const v=(arr||[]).map(x=>parseInt(x)).filter(n=>!isN
 function sdInStr(col, arr){ const v=(arr||[]).filter(x=>x!=null && x!==''); return v.length ? ` AND ${col} IN (${v.map(x=>`'${escSQL(x)}'`).join(',')})` : ''; }
 // coerce any saved value (array | '%' | '' | single | null) to a string array
 function toArr(v){ if(Array.isArray(v)) return v.map(String); if(v==null||v==='%'||v==='') return []; return [String(v)]; }
+
+// ============================================================
+// 5c. CUSTOMER GROUP MEMBERSHIP  (many-to-many)
+// ------------------------------------------------------------
+// accountgrouprelation is a JOIN TABLE: one customer account can sit in
+// any number of groups. Until this was fixed, BASE_JOIN resolved a SINGLE
+// group per customer with
+//   AccountGroup.Id = (SELECT … ORDER BY AccountGroupRelation.AccountId LIMIT 1)
+// — an arbitrary pick, since that ORDER BY column is constant inside the
+// subquery — and the filter then tested that one name. A customer in
+// 'Apple' + 'Pear' answered a filter on whichever name the engine happened
+// to return and was invisible to the other; worse, a group that was never
+// anyone's arbitrary pick disappeared from the filter list altogether
+// (demodb: 'Friends' — 1 ordering customer, $946 of revenue, unreachable).
+//
+// Membership is now always tested with EXISTS against the full relation
+// table, and anywhere a row NAMES a customer's group it lists all of them.
+// 'No Group' means the account has no relation row at all (which also
+// covers a customer with no account).
+const CG_NONE = 'No Group';
+
+// Selected group names → ' AND (…)' membership condition; '' when empty.
+// Requires Customer to be in scope — BASE_JOIN provides it.
+function cgMemberCond(names) {
+  const list = (names || []).filter(x => x != null && x !== '');
+  if (!list.length) return '';
+  const real  = list.filter(x => x !== CG_NONE);
+  const parts = [];
+  if (real.length) parts.push(
+    `EXISTS (SELECT 1 FROM AccountGroupRelation AGR_F JOIN AccountGroup AG_F ON AG_F.Id = AGR_F.GroupId` +
+    ` WHERE AGR_F.AccountId = Customer.AccountId AND AG_F.Name IN (${real.map(x => `'${escSQL(x)}'`).join(',')}))`);
+  if (real.length !== list.length) parts.push(
+    `NOT EXISTS (SELECT 1 FROM AccountGroupRelation AGR_N WHERE AGR_N.AccountId = Customer.AccountId)`);
+  return ` AND (${parts.join(' OR ')})`;
+}
+
+// SELECT expression naming EVERY group the customer belongs to
+// ('Bike Club, Family'), or 'No Group'. Used where a row has to label the
+// membership rather than be grouped by it.
+const CG_ALL_EXPR = `COALESCE((SELECT GROUP_CONCAT(DISTINCT AG_L.Name ORDER BY AG_L.Name SEPARATOR ', ')
+    FROM AccountGroupRelation AGR_L JOIN AccountGroup AG_L ON AG_L.Id = AGR_L.GroupId
+    WHERE AGR_L.AccountId = Customer.AccountId), '${CG_NONE}')`;
+
+// Extra joins that fan a row out to ONE ROW PER MEMBERSHIP so revenue can be
+// grouped by group name. A customer in two groups is counted under both —
+// the wedges then overlap and no longer sum to period revenue, which is
+// exactly what makes a wedge equal what the Customer Group FILTER returns.
+const CG_FANOUT_JOIN = `
+  LEFT JOIN AccountGroupRelation AGR_ALL ON AGR_ALL.AccountId = Customer.AccountId
+  LEFT JOIN AccountGroup AG_ALL ON AG_ALL.Id = AGR_ALL.GroupId`;
 
 // margin tier multi-select → OR-group condition; '' when empty
 function marginTierCond(arr){
@@ -847,7 +899,7 @@ function marginTierCond(arr){
 
 function buildFilterConditions(dateCondOverride) {
   let w = `WHERE ${dateCondOverride || getDateCondition()} AND SoItem.typeId NOT IN (30,40)`;
-  w += sdInStr('AccountGroup.Name', F.customerGroup);
+  w += cgMemberCond(F.customerGroup);   // §5c — membership, NOT the arbitrary "first" group
   w += catFilterCond();
   w += sdInNum('So.salesmanId', F.salesperson);
   w += marginTierCond(F.margin);
@@ -1153,18 +1205,34 @@ const Q = {
     );
   }),
 
-  // No SQL LIMIT — same reconciliation rule as categoryMix above.
+  // No SQL LIMIT — the whole list is fetched and the tail folded into
+  // 'Other', as with categoryMix. Unlike categoryMix this canNOT reconcile
+  // to the Revenue KPI: membership is many-to-many (§5c), so CG_FANOUT_JOIN
+  // counts a customer in two groups under BOTH — which is precisely what
+  // makes a wedge equal what the Customer Group filter returns for it.
+  // When the overlap is material the tile says so under the legend.
   customerGroups: () => qget('customerGroups', async () => {
-    const sql = `SELECT COALESCE(AccountGroup.Name,'No Group') as name, SUM(${REV_EXPR}) as revenue ${BASE_JOIN} ${buildFilterConditions()} GROUP BY name ORDER BY revenue DESC`;
-    const rows = await runQueryLogged('Customer Groups', sql);
-    return rollupDonutTail(
-      rows.map(r => ({ name: r.name, revenue: parseFloat(r.revenue || 0) })),
-      'groups'
-    );
+    const sql = `SELECT COALESCE(AG_ALL.Name,'${CG_NONE}') as name, SUM(${REV_EXPR}) as revenue ${BASE_JOIN} ${CG_FANOUT_JOIN} ${buildFilterConditions()} GROUP BY name ORDER BY revenue DESC`;
+    const [rows, kpiRows] = await Promise.all([
+      runQueryLogged('Customer Groups', sql),
+      Q.kpis()            // cached — same filter state, no extra round trip
+    ]);
+    const mapped    = rows.map(r => ({ name: r.name, revenue: parseFloat(r.revenue || 0) }));
+    const wedgeSum  = mapped.reduce((a, r) => a + r.revenue, 0);
+    const periodRev = parseFloat((kpiRows && kpiRows[0] && kpiRows[0].total_revenue) || 0);
+    const out = rollupDonutTail(mapped, 'groups');
+    // 0.5% tolerance absorbs float noise — only flag a real overlap.
+    if (periodRev > 0 && wedgeSum > periodRev * 1.005) {
+      out.overlap = true;
+      out.note = `Customers can belong to several groups, so their revenue counts in each: ` +
+                 `the wedges total ${fmt$(wedgeSum, true)} against ${fmt$(periodRev, true)} of actual revenue.`;
+      debugLog(`Customer Groups: overlapping membership — wedges ${fmt$(wedgeSum,true)} vs revenue ${fmt$(periodRev,true)}`, 'info');
+    }
+    return out;
   }),
 
   topSalespeople: () => qget('topSalespeople', () => {
-    const sql = `SELECT So.salesmanId as salesmanid, COALESCE(NULLIF(TRIM(CONCAT(SalesUser.FirstName,' ',SalesUser.LastName)),''),SalesUser.userName) as name, SUM(${REV_EXPR}) as revenue, COUNT(DISTINCT So.Num) as orders, AVG(${MARGIN_EXPR}) as avg_margin FROM PostSo JOIN PostSoItem ON PostSoItem.PostSoId = PostSo.Id JOIN SoItem ON SoItem.Id = PostSoItem.SoItemId JOIN So ON So.Id = SoItem.SoId JOIN SysUser AS SalesUser ON SalesUser.Id = So.salesmanId LEFT JOIN PostSoItem PSI ON PSI.SoItemId = COALESCE((SELECT K.Id FROM SoItem K WHERE K.SoLineItem = SoItem.SoLineItem+1 AND K.TypeId = 30 AND SoItem.typeId != 30 AND K.SoId = SoItem.SoId ORDER BY K.SoLineItem ASC LIMIT 1),(SELECT K.Id FROM SoItem K WHERE K.SoLineItem > SoItem.SoLineItem AND EXISTS (SELECT 1 FROM SoItem J WHERE J.TypeId = 40 AND J.SoId = K.SoId AND J.SoLineItem >= K.SoLineItem-1 ORDER BY J.SoLineItem ASC) AND K.TypeId = 30 AND SoItem.typeId != 30 AND K.SoId = SoItem.SoId ORDER BY K.SoLineItem ASC LIMIT 1)) AND PSI.PostSoId = PostSo.Id LEFT JOIN Product ON Product.Id = SoItem.ProductId LEFT JOIN ProductTree ON ProductTree.Id = (SELECT ProductToTree.ProductTreeId FROM ProductToTree WHERE ProductToTree.ProductId = Product.Id ORDER BY ProductToTree.Id ASC LIMIT 1) LEFT JOIN Customer ON Customer.Id = So.CustomerId LEFT JOIN AccountGroup ON AccountGroup.Id = (SELECT AccountGroupRelation.GroupId FROM AccountGroupRelation WHERE AccountGroupRelation.AccountId = Customer.AccountId ORDER BY AccountGroupRelation.AccountId ASC LIMIT 1) ${buildFilterConditions()} GROUP BY So.salesmanId, SalesUser.FirstName, SalesUser.LastName ORDER BY revenue DESC LIMIT 8`;
+    const sql = `SELECT So.salesmanId as salesmanid, COALESCE(NULLIF(TRIM(CONCAT(SalesUser.FirstName,' ',SalesUser.LastName)),''),SalesUser.userName) as name, SUM(${REV_EXPR}) as revenue, COUNT(DISTINCT So.Num) as orders, AVG(${MARGIN_EXPR}) as avg_margin FROM PostSo JOIN PostSoItem ON PostSoItem.PostSoId = PostSo.Id JOIN SoItem ON SoItem.Id = PostSoItem.SoItemId JOIN So ON So.Id = SoItem.SoId JOIN SysUser AS SalesUser ON SalesUser.Id = So.salesmanId LEFT JOIN PostSoItem PSI ON PSI.SoItemId = COALESCE((SELECT K.Id FROM SoItem K WHERE K.SoLineItem = SoItem.SoLineItem+1 AND K.TypeId = 30 AND SoItem.typeId != 30 AND K.SoId = SoItem.SoId ORDER BY K.SoLineItem ASC LIMIT 1),(SELECT K.Id FROM SoItem K WHERE K.SoLineItem > SoItem.SoLineItem AND EXISTS (SELECT 1 FROM SoItem J WHERE J.TypeId = 40 AND J.SoId = K.SoId AND J.SoLineItem >= K.SoLineItem-1 ORDER BY J.SoLineItem ASC) AND K.TypeId = 30 AND SoItem.typeId != 30 AND K.SoId = SoItem.SoId ORDER BY K.SoLineItem ASC LIMIT 1)) AND PSI.PostSoId = PostSo.Id LEFT JOIN Product ON Product.Id = SoItem.ProductId LEFT JOIN ProductTree ON ProductTree.Id = (SELECT ProductToTree.ProductTreeId FROM ProductToTree WHERE ProductToTree.ProductId = Product.Id ORDER BY ProductToTree.Id ASC LIMIT 1) LEFT JOIN Customer ON Customer.Id = So.CustomerId ${buildFilterConditions()} GROUP BY So.salesmanId, SalesUser.FirstName, SalesUser.LastName ORDER BY revenue DESC LIMIT 8`;
     return runQueryLogged('Top Salespeople', sql);
   }),
 
@@ -1179,7 +1247,7 @@ const Q = {
   }),
 
   ordersPerSalesperson: () => qget('ordersSP', () => {
-    const sql = `SELECT So.salesmanId as salesmanid, COALESCE(NULLIF(TRIM(CONCAT(SalesUser.FirstName,' ',SalesUser.LastName)),''),SalesUser.userName) as name, COUNT(DISTINCT So.Num) as orders, SUM(${REV_EXPR}) as revenue FROM PostSo JOIN PostSoItem ON PostSoItem.PostSoId = PostSo.Id JOIN SoItem ON SoItem.Id = PostSoItem.SoItemId JOIN So ON So.Id = SoItem.SoId JOIN SysUser AS SalesUser ON SalesUser.Id = So.salesmanId LEFT JOIN PostSoItem PSI ON PSI.SoItemId = COALESCE((SELECT K.Id FROM SoItem K WHERE K.SoLineItem = SoItem.SoLineItem+1 AND K.TypeId = 30 AND SoItem.typeId != 30 AND K.SoId = SoItem.SoId ORDER BY K.SoLineItem ASC LIMIT 1),(SELECT K.Id FROM SoItem K WHERE K.SoLineItem > SoItem.SoLineItem AND EXISTS (SELECT 1 FROM SoItem J WHERE J.TypeId = 40 AND J.SoId = K.SoId AND J.SoLineItem >= K.SoLineItem-1 ORDER BY J.SoLineItem ASC) AND K.TypeId = 30 AND SoItem.typeId != 30 AND K.SoId = SoItem.SoId ORDER BY K.SoLineItem ASC LIMIT 1)) AND PSI.PostSoId = PostSo.Id LEFT JOIN Product ON Product.Id = SoItem.ProductId LEFT JOIN ProductTree ON ProductTree.Id = (SELECT ProductToTree.ProductTreeId FROM ProductToTree WHERE ProductToTree.ProductId = Product.Id ORDER BY ProductToTree.Id ASC LIMIT 1) LEFT JOIN Customer ON Customer.Id = So.CustomerId LEFT JOIN AccountGroup ON AccountGroup.Id = (SELECT AccountGroupRelation.GroupId FROM AccountGroupRelation WHERE AccountGroupRelation.AccountId = Customer.AccountId ORDER BY AccountGroupRelation.AccountId ASC LIMIT 1) ${buildFilterConditions()} GROUP BY So.salesmanId, SalesUser.FirstName, SalesUser.LastName ORDER BY orders DESC LIMIT 8`;
+    const sql = `SELECT So.salesmanId as salesmanid, COALESCE(NULLIF(TRIM(CONCAT(SalesUser.FirstName,' ',SalesUser.LastName)),''),SalesUser.userName) as name, COUNT(DISTINCT So.Num) as orders, SUM(${REV_EXPR}) as revenue FROM PostSo JOIN PostSoItem ON PostSoItem.PostSoId = PostSo.Id JOIN SoItem ON SoItem.Id = PostSoItem.SoItemId JOIN So ON So.Id = SoItem.SoId JOIN SysUser AS SalesUser ON SalesUser.Id = So.salesmanId LEFT JOIN PostSoItem PSI ON PSI.SoItemId = COALESCE((SELECT K.Id FROM SoItem K WHERE K.SoLineItem = SoItem.SoLineItem+1 AND K.TypeId = 30 AND SoItem.typeId != 30 AND K.SoId = SoItem.SoId ORDER BY K.SoLineItem ASC LIMIT 1),(SELECT K.Id FROM SoItem K WHERE K.SoLineItem > SoItem.SoLineItem AND EXISTS (SELECT 1 FROM SoItem J WHERE J.TypeId = 40 AND J.SoId = K.SoId AND J.SoLineItem >= K.SoLineItem-1 ORDER BY J.SoLineItem ASC) AND K.TypeId = 30 AND SoItem.typeId != 30 AND K.SoId = SoItem.SoId ORDER BY K.SoLineItem ASC LIMIT 1)) AND PSI.PostSoId = PostSo.Id LEFT JOIN Product ON Product.Id = SoItem.ProductId LEFT JOIN ProductTree ON ProductTree.Id = (SELECT ProductToTree.ProductTreeId FROM ProductToTree WHERE ProductToTree.ProductId = Product.Id ORDER BY ProductToTree.Id ASC LIMIT 1) LEFT JOIN Customer ON Customer.Id = So.CustomerId ${buildFilterConditions()} GROUP BY So.salesmanId, SalesUser.FirstName, SalesUser.LastName ORDER BY orders DESC LIMIT 8`;
     return runQueryLogged('Orders per Salesperson', sql);
   }),
 
@@ -1483,10 +1551,14 @@ async function renderDonut(el, dataFn, opts = {}) {
   if (W < 80 || H < 50) return;
 
   const data  = raw.map(d => ({ name: d.name, value: parseFloat(d.revenue||0), isOther: !!d.isOther, members: d.members }));
-  // Percentages run against the TRUE arithmetic total (which now equals
-  // the period revenue); the wedge geometry clamps at zero because
-  // d3.pie cannot draw a negative angle for a credit-heavy group.
+  // Percentages run against the TRUE arithmetic total of the wedges; the
+  // wedge geometry clamps at zero because d3.pie cannot draw a negative
+  // angle for a credit-heavy group. For most donuts that total IS period
+  // revenue. Customer Groups is the exception — overlapping membership
+  // (§5c) lets the wedges exceed it, so it sets raw.overlap and the wording
+  // drops the claim that a wedge is a share 'of total'.
   const total = d3.sum(data,d=>d.value) || 1;
+  const pctOf = raw.overlap ? 'of chart' : 'of total';
   const csz   = Math.min(W*0.48, H-4, 220);
   const r     = csz/2;
   const palette = d3.scaleOrdinal().domain(data.map(d=>d.name)).range(COLOR_PALETTE);
@@ -1508,7 +1580,7 @@ async function renderDonut(el, dataFn, opts = {}) {
       d3.select(this).transition().duration(100).attr('d',arcHov);
       // The Other wedge names what it swallowed — the grouping is never a black box.
       const members = d.data.members ? `<br><span style="opacity:.7">${d.data.members.join(', ')}</span>` : '';
-      showTip(ev,`<strong>${d.data.name}</strong><br>${fmt$(d.data.value)}<br>${(d.data.value/total*100).toFixed(1)}% of total${members}${opts.clickable?'<br><em>Click to drill in</em>':''}`);
+      showTip(ev,`<strong>${d.data.name}</strong><br>${fmt$(d.data.value)}<br>${(d.data.value/total*100).toFixed(1)}% ${pctOf}${members}${opts.clickable?'<br><em>Click to drill in</em>':''}`);
     })
     .on('mousemove',moveTip).on('mouseout', function(){ d3.select(this).transition().duration(100).attr('d',arc); hideTip(); })
     .on('click', opts.clickable ? ((ev,d) => { hideTip(); opts.clickable(d.data); }) : null);
@@ -1523,6 +1595,18 @@ async function renderDonut(el, dataFn, opts = {}) {
     row.append('div').style('width','9px').style('height','9px').style('background',color(d.name)).style('border-radius','2px').style('flex-shrink','0');
     row.append('span').style('color','#506872').style('line-height','1.3').text(`${d.name} (${fmt$(d.value,true)})`);
   });
+
+  // Data-supplied caveat (currently only: overlapping customer-group
+  // membership, §5c). Sits under the legend so the reader sees why the
+  // wedges do not add up to the Revenue KPI.
+  if (raw.note) {
+    legWrap.append('div')
+      .style('margin-top','6px').style('padding-top','5px')
+      .style('border-top','1px solid var(--bg-2)')
+      .style('font-size','9.5px').style('line-height','1.35')
+      .style('color','var(--c-tertiary)').style('font-style','italic')
+      .text(raw.note);
+  }
 
   // CSV export payload — name + value (§2). Exports `fullRows` when the
   // data function supplied one, so a rolled-up "Other" wedge still exports
@@ -1699,7 +1783,7 @@ const WIDGET_REGISTRY = {
     render: (el,cfg) => renderDonut(el, Q.categoryMix, { clickable: (d) => drilldownCategory(d.name, d.members) })
   },
   'customer-groups': {
-    title:'Customer Groups', description:'Revenue split by customer account group — every group is counted, so the wedges add up to total revenue. Past the top 9 the tail is grouped into "Other"; click it to drill into all of them.', category:'chart',
+    title:'Customer Groups', description:'Revenue split by customer account group. A customer can belong to several groups, so their revenue is counted in each one and the wedges can add up to more than total revenue — each wedge matches exactly what the Customer Group filter returns for that group. Past the top 9 the tail is grouped into "Other"; click it to drill into all of them.', category:'chart',
     icon:'<path d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/>',
     defaultW:4, defaultH:10, hasChartToggle:false,
     render: (el,cfg) => renderDonut(el, Q.customerGroups, { clickable: (d) => drilldownCustomerGroup(d.name, d.members) })
@@ -2645,14 +2729,12 @@ async function drilldownCustomerGroup(groupName, memberNames) {
     debugLog(`Drilldown: customer group "${groupName}"`, 'click');
     const isOther = !!(memberNames && memberNames.length);
     const names   = isOther ? memberNames : [groupName];
-    const real    = names.filter(n => n !== 'No Group');
-    const conds   = [];
-    if (real.length) conds.push(`AccountGroup.Name IN (${real.map(n => `'${escSQL(n)}'`).join(',')})`);
-    if (names.length !== real.length) conds.push(`(AccountGroup.Name IS NULL OR AccountGroup.Name = '')`);
-    const grpCond = `AND (${conds.join(' OR ')})`;
+    // Membership, not the arbitrary "first" group (§5c) — an order from a
+    // customer in Apple+Pear has to appear under BOTH.
+    const grpCond = cgMemberCond(names);
     const rowCap  = isOther ? 500 : 200;   // "Other" spans several groups
     const sql = `SELECT So.Num as order_num, PostSo.DateCreated as order_date, Customer.Name as customer_name,
-        COALESCE(AccountGroup.Name,'No Group') as group_name,
+        ${CG_ALL_EXPR} as group_name,
         COUNT(DISTINCT SoItem.Id) as item_count,
         SUM(${REV_EXPR}) as total_revenue,
         (SUM(${REV_EXPR}) - SUM(PostSoItem.PostedTotalCost)) / NULLIF(SUM(${REV_EXPR}), 0) as margin_percent
@@ -2665,8 +2747,9 @@ async function drilldownCustomerGroup(groupName, memberNames) {
       { key: 'order_num',      label: 'Order #',  type: 'string' },
       { key: 'order_date',     label: 'Date',     type: 'date' },
       { key: 'customer_name',  label: 'Customer', type: 'string' },
-      // Only worth a column when several groups are in play.
-      ...(isOther ? [{ key: 'group_name', label: 'Group', type: 'string' }] : []),
+      // Always shown now: with many-to-many membership (§5c) a row inside
+      // 'Family' may also belong to Bike Club, and that is worth seeing.
+      { key: 'group_name',     label: 'Groups',   type: 'string' },
       { key: 'item_count',     label: 'Items',    type: 'number' },
       { key: 'total_revenue',  label: 'Total',    type: 'currency' },
       { key: 'margin_percent', label: 'Margin %', type: 'percent' }
@@ -2754,7 +2837,21 @@ async function drilldownNewRepeat(segmentName) {
 async function loadFilters() {
   debugLog('Loading filter options…', 'info');
   try {
-    const cgSql = `SELECT DISTINCT COALESCE(AccountGroup.Name,'No Group') as name FROM So JOIN Customer ON Customer.Id = So.CustomerId LEFT JOIN AccountGroup ON AccountGroup.Id = (SELECT AccountGroupRelation.GroupId FROM AccountGroupRelation WHERE AccountGroupRelation.AccountId = Customer.AccountId ORDER BY AccountGroupRelation.AccountId ASC LIMIT 1) ORDER BY name`;
+    // EVERY group that any ordering customer belongs to (§5c). The old
+    // LIMIT-1 version only listed groups that happened to be some customer's
+    // arbitrary "first" group, so whole groups were missing from the filter.
+    const cgSql = `SELECT DISTINCT AG.Name as name
+        FROM So
+        JOIN Customer ON Customer.Id = So.CustomerId
+        JOIN AccountGroupRelation AGR ON AGR.AccountId = Customer.AccountId
+        JOIN AccountGroup AG ON AG.Id = AGR.GroupId
+        WHERE AG.Name IS NOT NULL AND AG.Name <> ''
+      UNION
+      SELECT '${CG_NONE}'
+        FROM So
+        JOIN Customer ON Customer.Id = So.CustomerId
+        WHERE NOT EXISTS (SELECT 1 FROM AccountGroupRelation AGR2 WHERE AGR2.AccountId = Customer.AccountId)
+      ORDER BY name`;
     const cg = await runQueryP(cgSql);
     debugLog(`Customer Groups filter: ${cg.length} options loaded`, cg.length ? 'success' : 'warning');
     _filterOpts.customerGroups = cg.map(r => r.name).filter(Boolean);

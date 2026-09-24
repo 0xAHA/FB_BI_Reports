@@ -35,6 +35,15 @@ const OUT = path.join(REPO, 'Deployed');
    the mapping has to survive without them. */
 const DEPLOYED_NAMES = {
   'Audit/Audit_Trail.htm':                                 ['Audit Trail', 'Audit Trail'],
+  // Client-specific pair: the entry screen captures the pricing rule into an
+  // soitem custom field, the report reads it back. New records on first import.
+  'Custom/Babor/Babor_SO_Entry.htm':                       ['- Sales - Babor SO Entry', '- Sales - Babor SO Entry'],
+  'Custom/Babor/Babor_Pricing_Rule_Sales.htm':             ['- Sales - Babor Sales by Pricing Rule', '- Sales - Babor Sales by Pricing Rule'],
+  // Bright Steel: they sell by the kilo but are ordered by the bar. The
+  // quoting screen and the replacement for the hand-written product card.
+  // New records on first import.
+  'Custom/BrightSteel/Bars_To_Kilos.htm':                  ['- Sales - Bright Steel Bars to Kilos', '- Sales - Bright Steel Bars to Kilos'],
+  'Custom/BrightSteel/Product_Card.htm':                   ['- Part - Bright Steel Product Card', '- Part - Bright Steel Product Card'],
   'Dashboards/Dashboard_Combined.htm':                     ['Dashboard - Company', 'Dashboard - Company'],
   'Dashboards/Individual Pages/Items_To_Be_Picked.htm':    ['Dashboard - Tiles - Items to be Picked', 'Dashboard - Tiles - Items to be Picked'],
   'Dashboards/Individual Pages/Items_To_Be_Received.htm':  ['Dashboard - Tiles - Items to be Received', 'Dashboard - Tiles - Items to be Received'],

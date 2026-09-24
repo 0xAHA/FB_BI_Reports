@@ -573,20 +573,6 @@
             </select>
             <span class="muted" style="font-size:11px; line-height:1.35;">Restrict the Build action to one user group (applies only when enabled above).</span>
           </div>
-          <div class="fb-field">
-            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
-              <input type="checkbox" id="dsMoCreateDryRun" onchange="setCreateMODryRun(this.checked)" />
-              <span>Dry run &mdash; build the payload but create nothing</span>
-            </label>
-            <span class="muted" style="font-size:11px; line-height:1.35;">
-              <strong>On by default.</strong> The overridden-component payload shape
-              (<code>configurations[].items[]</code>) is not yet verified against a live install &mdash; no
-              other report here sends it. Leave this on for the first runs, check the payload in the debug
-              console, then turn it off. The report always creates as <em>Entered</em>, verifies the
-              <code>moitem</code> rows against what it asked for, and only then issues &mdash; deleting the
-              MO instead if they disagree.
-            </span>
-          </div>
           <div class="fb-group-title" style="margin-top:10px;">Admin &mdash; Settings</div>
           <button type="button" class="ds-btn ds-btn-admin" onclick="publishMaster()">Publish as default for everyone</button>
           <button type="button" class="ds-btn ds-btn-admin" id="dsLockBtn" onclick="toggleUserEditing()">Lock user editing</button>
@@ -875,79 +861,15 @@ Caffeine: 50mg</div>
     }
 
     // ── Settings init ──────────────────────────────────────────────
-    // Fishbowl's BI Script Editor always previews with report id -1. Calling
-    // its native loadReportData() then raises the modal "Loading data is only
-    // available on reports." Personal preferences can already use
-    // loadSettings/saveSettings in previews, so bridge the shared admin payload
-    // through an admin publisher's Dashboard property as well. This keeps the
-    // safety-critical Create-MO gates shared without invoking the
-    // report-id-only API during editor preview.
-    function installPreviewSafeMasterSettings(masterKey) {
-      var safeKey = String(masterKey || '').replace(/'/g, "''");
-
-      window.loadReportData = function () {
-        try {
-          if (typeof runQuery !== 'function') return '';
-          var rows = JSON.parse(runQuery(
-            "SELECT up.id AS rowid, up.userValue AS masterdata " +
-            "FROM userproperties up " +
-            "INNER JOIN propertycategory pc ON pc.id = up.categoryId " +
-            "INNER JOIN sysuser su ON su.id = up.userId " +
-            "WHERE pc.name = 'Dashboard' " +
-            "AND up.userKey = '" + safeKey + "' " +
-            "AND (LOWER(su.userName) = 'admin' OR EXISTS (" +
-            "SELECT 1 FROM usergrouprel ugr " +
-            "INNER JOIN useraccess ua ON ua.groupId = ugr.groupId " +
-            "WHERE ugr.userId = su.id AND LOWER(ua.moduleName) = 'admin' " +
-            "AND (ua.viewFlag = 1 OR ua.modifyFlag = 1))) " +
-            "ORDER BY up.id DESC"
-          ) || '[]');
-
-          var found = false, bestValue = '', bestStamp = '', bestId = -1;
-          rows.forEach(function (row) {
-            var value = row.masterdata;
-            if (value == null) value = row.masterData;
-            if (value == null) value = row.uservalue;
-            if (value == null) value = row.userValue;
-            value = value == null ? '' : String(value);
-
-            var stamp = '';
-            try { stamp = String((JSON.parse(value) || {})._masterPublishedAt || ''); } catch (_) {}
-            var rowId = parseInt(row.rowid != null ? row.rowid : row.rowId, 10) || 0;
-            if (!found || (stamp && (!bestStamp || stamp > bestStamp)) ||
-                (!stamp && !bestStamp && rowId > bestId)) {
-              found = true; bestValue = value; bestStamp = stamp; bestId = rowId;
-            }
-          });
-          return found ? bestValue : '';
-        } catch (e) {
-          try { console.warn('[Custom Supplement WO] Shared defaults unavailable:', e); } catch (_) {}
-          return '';
-        }
-      };
-
-      window.saveReportData = function (value) {
-        try {
-          if (typeof saveSettings !== 'function') return false;
-          var user = (typeof getUser === 'function') ? JSON.parse(getUser() || '{}') : {};
-          var isAdmin = String(user.userName || '').toLowerCase() === 'admin';
-          if (!isAdmin && typeof hasUserAccess === 'function') isAdmin = !!hasUserAccess('Admin');
-          if (!isAdmin) return false;
-
-          var payload = JSON.parse(String(value || '{}')) || {};
-          payload._masterPublishedAt = new Date().toISOString();
-          payload._masterPublisher = user.userName || '';
-          return saveSettings(masterKey, JSON.stringify(payload)) !== false;
-        } catch (e) {
-          try { console.warn('[Custom Supplement WO] Shared defaults save failed:', e); } catch (_) {}
-          return false;
-        }
-      };
-    }
-
-    installPreviewSafeMasterSettings('cdx.bi.customsupp.master.v1');
+    // The shared admin payload (the Create-MO gates) is published and read
+    // through FBLib.SharedData — masterStorage: 'userProperties' below. It used
+    // to go through loadReportData/saveReportData, which only work on a SAVED
+    // report: the BI Script Editor previews with report id -1, so the first read
+    // raised the native "Loading data is only available on reports" modal and an
+    // admin publish was a silent no-op. See the FBLib.SharedData doc block.
 
     FBLib.Settings.init({
+      masterStorage: 'userProperties',   // shared admin defaults via userproperties, not report data (which needs a SAVED report — see FBLib.SharedData)
       userKey:   'cdx.bi.customsupp.user.v1',
       masterKey: 'cdx.bi.customsupp.master.v1',
       defaults: {
@@ -973,15 +895,15 @@ Caffeine: 50mg</div>
         // Create-MO gates (admin-published to the master payload):
         //   enableCreateMO  - master switch for the Build buttons (off by default)
         //   createMOGroupId - optional user-group restriction ('' = all users)
-        //   moCreateDryRun  - build + log the payload, POST nothing
+        //
+        // enableCreateMO is the gate on the write path: until an admin turns it
+        // on, nobody sees a Build button. Beyond that the create flow guards
+        // itself - it always creates as Entered, verifies the moitem rows
+        // against what it asked for, and DELETES the MO rather than issue one
+        // that does not match. The payload is logged to the debug console on
+        // every run either way.
         enableCreateMO: false,
         createMOGroupId: '',
-        // Defaults ON, unlike the other gates. The configurations[].items[]
-        // override is untrodden ground - no existing report in this repo sends
-        // items[] - so the first runs on any install should inspect the payload
-        // before anything is written. An admin turns this off once the
-        // read-back verification has been seen to pass.
-        moCreateDryRun: true,
         // THE RECIPE CONFIGURATION — the source of truth for every variable
         // quantity, deliberately SEPARATE from the Fishbowl BOM. Seeded from
         // DEFAULT_RECIPE_CONFIG below when unset; an admin publishes an edited
@@ -1151,12 +1073,25 @@ Caffeine: 50mg</div>
     // product was deleted stays visible.
     //
     // TODO(Infinit): moves into the Setup tab's config (Stage 1/6) so a second
-    // range can be added without a code change. Narrowed to PF-CUST for the
-    // initial PF75 testing; '%CUST%' is the intended production default and
-    // also matches PF-CUST.
+    // range can be added without a code change.
+    //
+    // The rule is: any product whose NUMBER contains CUSTOM. That covers the
+    // PF-CUSTOM-75G / PF-CUSTOM-90G range and anything added to it later,
+    // without this file having to be edited again.
+    //
+    // The description pattern is kept but DISABLED. Leaving it on would match
+    // products whose number does NOT contain CUSTOM, which contradicts the
+    // rule above — a SKU is either in the custom range or it is not, and the
+    // number is what says so. Flip `enabled` if a description-worded range
+    // ever needs picking up too.
+    //
+    // NOTE MySQL's default collation makes LIKE case-insensitive, so this also
+    // matches a product numbered 'Custom Trailer'. A stray match is visible
+    // but harmless: a product with no pack configured renders BLOCKED in the
+    // drawer's preflight rather than being built with defaults.
     var DISCOVERY_PATTERNS = [
-      { field: 'product.num',         op: 'LIKE', value: '%PF-CUST%', enabled: true },
-      { field: 'product.description', op: 'LIKE', value: '%PF-CUST%', enabled: true }
+      { field: 'product.num',         op: 'LIKE', value: '%CUSTOM%', enabled: true },
+      { field: 'product.description', op: 'LIKE', value: '%CUSTOM%', enabled: false }
     ];
 
     function activeDiscoveryPatterns() {
@@ -1165,7 +1100,19 @@ Caffeine: 50mg</div>
       });
     }
     // Human-readable form for the status line and the empty state. "No open
-    // lines matched %PF-CUST%" is diagnosable; "none found" is not.
+    // lines matched %CUSTOM%" is diagnosable; "none found" is not.
+    // Which FIELDS the active patterns actually search, for the empty state.
+    // Derived rather than hardcoded: the description pattern ships disabled,
+    // so a fixed "number or description" would send someone hunting for a
+    // match that was never looked for.
+    function describeDiscoveryFields() {
+      var f = activeDiscoveryPatterns().map(function (p) {
+        return p.field === 'product.description' ? 'description' : 'product number';
+      });
+      var uniq = f.filter(function (v, i) { return f.indexOf(v) === i; });
+      return uniq.join(' or ') || 'nothing';
+    }
+
     function describeDiscovery() {
       var vals = activeDiscoveryPatterns().map(function (p) { return p.value; });
       var uniq = vals.filter(function (v, i) { return vals.indexOf(v) === i; });
@@ -2535,12 +2482,12 @@ Caffeine: 50mg</div>
       });
 
       if (!shown) {
-        // Name the pattern. "No open lines matched %PF-CUST%" tells you where to
-        // look; "no lines found" does not.
+        // Name the pattern AND the field. "No open lines matched %CUSTOM% on the
+        // product number" tells you where to look; "no lines found" does not.
         var msg = state.rows.length
           ? 'No lines match the current filters.'
           : 'No open sales-order lines matched ' + describeDiscovery() +
-            ' on the product number or description. Check the product exists and is on an ' +
+            ' on the ' + describeDiscoveryFields() + '. Check the product exists and is on an ' +
             'open order (Estimate / Issued / In Progress), widen the pattern in DISCOVERY_PATTERNS, ' +
             'or switch the data source to Sample in Settings.';
         tbody.innerHTML = '<tr><td colspan="' + COLSPAN + '" class="empty">' + esc(msg) + '</td></tr>';
@@ -2852,7 +2799,7 @@ Caffeine: 50mg</div>
     //  - A line added to an order that already has an MO can't join it:
     //    POST /api/manufacture-orders/:id is a destructive full-replace that
     //    regenerates every WO under the order. So the next build takes a
-    //    SUFFIXED number (SO-40001-2) covering only the new lines.
+    //    SUFFIXED number (SO-40001_2) covering only the new lines.
     //  - Which lines a given MO covers therefore can't be inferred from the
     //    number. moitem.soItemId is NULL on REST-created MOs (the create body
     //    has no SO reference at all), so coverage is recorded in mo.note as an
@@ -2886,6 +2833,19 @@ Caffeine: 50mg</div>
     //   via 'marker'  - created by this report (number-matched, lines parsed)
     //   via 'soLink'  - Fishbowl-native, linked through moitem.soItemId
     // statusid < 50 keeps a closed MO from blocking a genuine re-run.
+    // A LIKE test for "starts with this exact text".
+    //
+    // Needed because the suffix separator is now an underscore, which LIKE
+    // reads as "any single character" — an unescaped 'SO-40001_%' would also
+    // match SO-40001X2, so a build could be judged a duplicate of an unrelated
+    // order. An explicit ESCAPE clause neutralises _ and % without threading
+    // backslashes through two parsers (the string literal AND the LIKE), and
+    // the escape character is escaped in the prefix too.
+    function likePrefixSQL(col, prefix) {
+      var p = String(prefix == null ? '' : prefix).replace(/([%_!])/g, '!$1');
+      return col + " LIKE '" + escSQL(p) + "%' ESCAPE '!'";
+    }
+
     function findExistingBuilds(order) {
       var soNum = escSQL(order.so_num);
 
@@ -2896,9 +2856,15 @@ Caffeine: 50mg</div>
         'FROM mo',
         'LEFT JOIN sysuser su ON su.id = mo.userid',
         'WHERE mo.statusid < 50',
-        // Number-matched (mo.num = so.num, or a -N suffix), so a hand-edited
-        // note can't hide an MO that already owns the number.
-        "  AND (mo.num = '" + soNum + "' OR mo.num LIKE '" + soNum + "-%')",
+        // Number-matched (mo.num = so.num, or a suffix), so a hand-edited note
+        // can't hide an MO that already owns the number.
+        //
+        // BOTH separators are matched. New builds suffix with _, but an MO
+        // created before that change carries -, and missing it would lose which
+        // lines that MO already covers — i.e. build them a second time.
+        '  AND (mo.num = ' + "'" + soNum + "'" +
+          ' OR ' + likePrefixSQL('mo.num', order.so_num + '_') +
+          ' OR ' + likePrefixSQL('mo.num', order.so_num + '-') + ')',
         'UNION ALL',
         "SELECT DISTINCT mo.num, mo.statusid, mo.datecreated, COALESCE(mo.note, ''),",
         "       COALESCE(su.username, ''), 'soLink', si.solineitem",
@@ -2927,14 +2893,18 @@ Caffeine: 50mg</div>
     }
 
     // Which MO number this build should take: the SO number, or the next free
-    // -N suffix when it's already used. Driven off the numbers actually present
-    // rather than a count, so a gap (SO-1, SO-1-3) still resolves cleanly.
+    // _N suffix when it's already used. Driven off the numbers actually present
+    // rather than a count, so a gap (SO-1, SO-1_3) still resolves cleanly.
+    //
+    // UNDERSCORE, not hyphen: SO numbers routinely contain hyphens themselves,
+    // so SO-40001-2 is ambiguous on sight — it reads as an order number as
+    // easily as a second build of one. SO-40001_2 cannot.
     function nextMoNumber(soNum, existing) {
       var taken = {};
       (existing || []).forEach(function (e) { if (e.mo_num) taken[String(e.mo_num)] = 1; });
       if (!taken[String(soNum)]) return String(soNum);
       for (var i = 2; i < 200; i++) {
-        var cand = soNum + '-' + i;
+        var cand = soNum + '_' + i;
         if (!taken[cand]) return cand;
       }
       return null;   // absurd; treated as a blocker by the caller
@@ -3007,7 +2977,7 @@ Caffeine: 50mg</div>
           soId: String(soId), order: order, status: 'loading',
           lines: [], existing: [], moNum: null,
           blockers: [], steps: [],
-          created: null, issued: false, issueError: null, dryRun: false, lastError: null
+          created: null, issued: false, issueError: null, lastError: null
         };
         active = st;
         renderDrawer();
@@ -3194,7 +3164,6 @@ Caffeine: 50mg</div>
       function bannerHtml(st) {
         var tone = 'warn', chips = [], action = '';
         var moStatus = FBLib.Settings.resolve('moCreateStatus') || 'Issued';
-        var dryRun = !!FBLib.Settings.resolve('moCreateDryRun');
         var build = buildableLines(st);
 
         if (st.status === 'loading') {
@@ -3204,20 +3173,14 @@ Caffeine: 50mg</div>
           (st.steps || []).forEach(function (s) { chips.push(psSpill('neutral', s)); });
         } else if (st.status === 'done') {
           tone = 'ok';
-          if (st.dryRun) {
+          chips.push(psSpill('success', 'MO ' + (st.created || 'created'), { dot: true }));
+          chips.push(psSpill(st.issued ? 'active' : 'neutral', st.issued ? 'Issued' : 'Entered'));
+          if (st.issueError) {
             tone = 'warn';
-            chips.push(psSpill('caution', 'Dry run — nothing created', { dot: true }));
-            chips.push(psSpill('neutral', 'Payload in the debug console'));
-          } else {
-            chips.push(psSpill('success', 'MO ' + (st.created || 'created'), { dot: true }));
-            chips.push(psSpill(st.issued ? 'active' : 'neutral', st.issued ? 'Issued' : 'Entered'));
-            if (st.issueError) {
-              tone = 'warn';
-              chips.push(psSpill('caution', 'Issue failed', { title: st.issueError }));
-            }
-            action = '<button class="ps-btn sm primary" onclick="openMO(\'' +
-              esc(String(st.created || '').replace(/'/g, '&#39;')) + '\')">Open MO</button>';
+            chips.push(psSpill('caution', 'Issue failed', { title: st.issueError }));
           }
+          action = '<button class="ps-btn sm primary" onclick="openMO(\'' +
+            esc(String(st.created || '').replace(/'/g, '&#39;')) + '\')">Open MO</button>';
         } else if (st.status === 'error' || st.blockers.length) {
           tone = 'late';
           chips.push(psSpill('blocked', st.blockers.length
@@ -3225,9 +3188,8 @@ Caffeine: 50mg</div>
             : 'Nothing to build', { dot: true }));
           action = '<button class="ps-btn sm" onclick="CSBuild.recheck()">Re-check</button>';
         } else {
-          tone = dryRun ? 'warn' : 'ok';
-          if (dryRun) chips.push(psSpill('caution', 'DRY RUN', { dot: true, title: 'Nothing will be created. An admin can turn this off in Settings.' }));
-          else        chips.push(psSpill('success', 'Ready to build', { dot: true }));
+          tone = 'ok';
+          chips.push(psSpill('success', 'Ready to build', { dot: true }));
           chips.push(psSpill('neutral', build.length + ' work order' + (build.length === 1 ? '' : 's')));
           chips.push(psSpill('neutral', 'MO ' + st.moNum));
           if (st.moNum !== st.order.so_num) {
@@ -3242,8 +3204,7 @@ Caffeine: 50mg</div>
             { title: moStatus === 'Issued'
                 ? 'Created as Entered, verified against the moitem rows, then issued — which is what generates the work orders.'
                 : 'Created as Entered and left there: no work orders until someone issues it.' }));
-          action = '<button class="ps-btn sm primary" onclick="CSBuild.create()">' +
-                   (dryRun ? 'Build payload' : 'Create MO') + '</button>';
+          action = '<button class="ps-btn sm primary" onclick="CSBuild.create()">Create MO</button>';
         }
 
         return '<div class="pf-banner ' + tone + '">' +
@@ -3422,11 +3383,10 @@ Caffeine: 50mg</div>
         }
         var disabled = (st.status !== 'ready') || st.blockers.length || inFlight ||
                        !buildableLines(st).length;
-        var dryRun = !!FBLib.Settings.resolve('moCreateDryRun');
         return '<div class="dsec" style="text-align:right;display:flex;gap:8px;justify-content:flex-end">' +
           '<button class="ps-btn" onclick="CSBuild.close()">Cancel</button>' +
           '<button class="ps-btn primary" ' + (disabled ? 'disabled' : '') +
-            ' onclick="CSBuild.create()">' + (dryRun ? 'Build payload (dry run)' : 'Create MO') + '</button>' +
+            ' onclick="CSBuild.create()">Create MO</button>' +
           '</div>';
       }
 
@@ -3627,7 +3587,6 @@ Caffeine: 50mg</div>
 
         var order = st.order;
         var wantIssued = (FBLib.Settings.resolve('moCreateStatus') !== 'Entered');
-        var dryRun = !!FBLib.Settings.resolve('moCreateDryRun');
         var nativeDup = (st.existing || []).filter(function (e) { return e.via === 'soLink'; });
         var skipped = (st.lines || []).filter(function (L) { return L.covered || L.blockers.length; });
 
@@ -3653,11 +3612,6 @@ Caffeine: 50mg</div>
         }
 
         var tone = 'warn';
-        if (dryRun) {
-          msg = 'DRY RUN — nothing will be created.\n\nThe payload will be built and written to the ' +
-                'debug console so you can check it. An admin can turn the dry run off in Settings.\n\n' + msg;
-          tone = 'info';
-        }
         if (nativeDup.length) {
           msg += '\n\nWARNING: MO ' + nativeDup[0].mo_num + ' is already linked to this sales order ' +
                  'in Fishbowl. Creating another may duplicate a build.';
@@ -3665,24 +3619,15 @@ Caffeine: 50mg</div>
         }
 
         psConfirm({
-          title: dryRun ? 'Dry run' : (nativeDup.length ? 'This order already has an MO' : 'Create Manufacture Order'),
+          title: nativeDup.length ? 'This order already has an MO' : 'Create Manufacture Order',
           message: msg, tone: tone,
-          confirmLabel: dryRun ? 'Build payload' : (nativeDup.length ? 'Create anyway' : 'Create MO')
+          confirmLabel: nativeDup.length ? 'Create anyway' : 'Create MO'
         }).then(function (ok) {
           if (!ok || active !== st) return;
 
           // Always create Entered; issuing is a separate, later step.
           var payload = buildPayload(st, 'Entered');
           dbg('MO create payload:\n' + JSON.stringify(payload, null, 2), 'query');
-
-          if (dryRun) {
-            st.status = 'done';
-            st.created = '(dry run)';
-            st.dryRun = true;
-            renderDrawer();
-            showToast('Dry run — payload written to the debug console, nothing created', 'info', 5000);
-            return;
-          }
 
           inFlight = true;
           st.status = 'submitting'; st.lastError = null;
@@ -4623,17 +4568,6 @@ Caffeine: 50mg</div>
         render();
       } catch (e) { dbg('setCreateMOEnabled: ' + (e && e.message), 'error'); }
     }
-    function setCreateMODryRun(on) {
-      if (!FBLib.Settings.isAdmin()) { showToast('Only an admin can change this', 'error'); return; }
-      try {
-        var master = Object.assign({}, FBLib.Settings.getMaster());
-        master.moCreateDryRun = !!on;
-        if (!FBLib.Settings.publishMaster(master)) { showToast('Could not save — admin only', 'error'); return; }
-        showToast(on ? 'Dry run ON — nothing will be created'
-                     : 'Dry run OFF — Build will create real Manufacture Orders', on ? 'success' : 'info', 5000);
-        render();
-      } catch (e) { dbg('setCreateMODryRun: ' + (e && e.message), 'error'); }
-    }
     function setCreateMOGroup(groupId) {
       if (!FBLib.Settings.isAdmin()) { showToast('Only an admin can change this', 'error'); return; }
       try {
@@ -4648,7 +4582,6 @@ Caffeine: 50mg</div>
       } catch (e) { dbg('setCreateMOGroup: ' + (e && e.message), 'error'); }
     }
     window.setCreateMOEnabled = setCreateMOEnabled;
-    window.setCreateMODryRun = setCreateMODryRun;
     window.setCreateMOGroup = setCreateMOGroup;
 
     // ============================================================
@@ -4911,9 +4844,6 @@ Caffeine: 50mg</div>
 
       var en = document.getElementById('dsEnableCreateMO');
       if (en) { try { en.checked = !!FBLib.Settings.resolve('enableCreateMO'); } catch (_) {} }
-
-      var dr = document.getElementById('dsMoCreateDryRun');
-      if (dr) { try { dr.checked = !!FBLib.Settings.resolve('moCreateDryRun'); } catch (_) {} }
 
       var sel = document.getElementById('dsCreateMOGroup');
       if (sel) {

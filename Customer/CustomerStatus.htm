@@ -1,0 +1,2673 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  REPORT: Customer Status
+  PATH:   Customer/CustomerStatus.htm
+  --------------------------------------------------------------------------------
+  Customer-grain status board. One row per customer showing its Fishbowl
+  STATUS (Normal / Preferred / Hold Sales / Hold Shipment / Hold All)
+  alongside the account defaults, the default address, contact details and
+  the customer's open / completed order exposure — so whoever owns credit can
+  see what is actually at risk behind a hold.
+
+  EDITING. The Status cell is a drop-down. Change one row, or tick several and
+  use the bulk bar. Every edit is held as a PENDING change (nothing is written
+  yet) and reviewed in the "Status changes" drawer before it is saved. Saving
+  posts one Fishbowl Customer IMPORT per customer — the only write path
+  Fishbowl exposes for a customer record (there is no REST verb: POST
+  /api/customers answers 405 and no PUT exists). See the STATUS WRITE-BACK
+  block in the script for the full contract and its traps.
+
+  Filters across status, active flag, customer, group, sales person, state,
+  country, payment terms, priority, QB class, currency + free-text name /
+  account # / city / alert-note, an order-exposure filter and a last-ordered
+  cutoff. Flat / By-Status / By-Group / By-Sales-Person / By-State views,
+  show / hide / reorder / resize columns, CSV + Excel + Print export.
+================================================================================
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>- Customer - Customer Status - Fishbowl BI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+
+  <!-- Shared Fishbowl BI lib — inlined by Fishbowl from the saved "fb-lib"
+       Script. Source of truth: scripts/fb-lib.js. Powers the multi-select
+       filter widgets (FBLib.Common.MultiSelect), the drawer plumbing, the
+       debug drawer and the CSV / real-xlsx exporters. Must sit BEFORE the
+       shared style include so window.FBLib exists by the time inline code
+       runs. -->
+  <script>
+    {% Script fb-lib %}
+  </script>
+
+  <!-- Shared Fishbowl BI stylesheet — injected from the saved "fb-styles"
+       Style. Source of truth: scripts/fb-styles.css. Provides .hdr-btn, .btn,
+       modal-*, toasts, scrollbar, spinner, tokens, .rpt-table, .ms-*,
+       .row-link, .fb-drawer and the .b* status badges. MUST come BEFORE the
+       inline block so per-report rules win the cascade on identical
+       selectors. -->
+  <style>
+    {% Style fb-styles %}
+  </style>
+
+  <style>
+    html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family: 'Inter', sans-serif; }
+
+    /* Filters panel — same idiom as SalesOrderSummary / PurchaseOrderSummary. */
+    #filtersPanel { background: white; border-bottom: 1px solid #e2e8f0; padding: 10px 20px; display: none; flex-shrink: 0; }
+    #filtersPanel.open { display: block; }
+    #filtersPanel select, #filtersPanel input[type=text], #filtersPanel input[type=date], #filtersPanel input[type=number] {
+      padding: 4px 8px; border: 1px solid #e2e8f0; border-radius: 6px;
+      font-size: 12px; color: #374151; background: #f9fafb; font-family: 'Inter', sans-serif;
+    }
+    #filtersPanel input[type=date] { background: white; }
+
+    /* The .ms-* skin ships from fb-styles (§32); the widgets themselves are
+       built by FBLib.Common.MultiSelect. Nothing local needed. */
+
+    /* Table — the compact report tier ships from fb-styles (§29) as
+       .rpt-table; the table keeps id="dataTable" for JS. Only the
+       report-specific cells live here. */
+    .num-cell { text-align: right; font-variant-numeric: tabular-nums; }
+    .desc-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* Once explicit column widths are set the table runs on fixed layout and
+       the col width IS the column — the 200px cap would then clip a cell the
+       user deliberately widened. */
+    #dataTable.cols-fixed .desc-cell { max-width: none; }
+
+    /* Row-select checkbox column — pinned first, outside the column registry
+       so it can never be hidden or dragged away from the rows it selects. */
+    .sel-cell, .sel-head { width: 30px; text-align: center; padding-left: 8px !important; padding-right: 4px !important; }
+    .sel-head { cursor: pointer !important; }
+    .sel-cell input, .sel-head input { cursor: pointer; margin: 0; vertical-align: middle; }
+
+    /* Status editor. A select, deliberately — a numeric input's spinner arrows
+       cover the value in a 4px-tall report row, and the status set is a closed
+       list of five. min-width rather than width: a th width is only a hint, so
+       the control has to defend its own size. */
+    .st-sel {
+      font-family: inherit; font-size: 11px; font-weight: 500;
+      padding: 1px 4px; border-radius: 4px; min-width: 116px;
+      border: 1px solid transparent; background: transparent; color: inherit;
+      cursor: pointer; max-width: 100%;
+    }
+    .st-sel:hover   { border-color: #C6D0D4; }
+    .st-sel:focus   { outline: none; border-color: var(--color-primary); box-shadow: 0 0 0 2px rgba(45,156,219,0.18); }
+    .st-sel:disabled { cursor: not-allowed; opacity: 0.75; border-color: transparent; }
+    /* Tint the select to match the badge palette so the column still reads as
+       a status at a glance rather than as a row of identical grey boxes. */
+    .st-sel.b10 { background: var(--bg-2);          color: var(--fb-neutral); }
+    .st-sel.b20 { background: var(--tint-blue);     color: var(--fb-blue-accent); }
+    .st-sel.b25 { background: var(--acc-orange-bg); color: var(--acc-orange-con); }
+    .st-sel.b60 { background: var(--acc-sage);      color: var(--fb-success); }
+    .st-sel.b70 { background: var(--acc-yellow-bg); color: var(--acc-yellow-con); }
+    .st-sel.b80 { background: var(--acc-maroon-bg); color: #8A1E30; }
+
+    /* A cell holding an unsaved change. The left rule survives the zebra +
+       hover background overrides in fb-styles, which a full-cell tint does
+       not. */
+    td.cell-dirty { box-shadow: inset 3px 0 0 0 #F69133; }
+    td.cell-dirty .st-sel { font-weight: 700; }
+    .dirty-from { font-size: 10px; color: #8A4E10; margin-left: 5px; white-space: nowrap; }
+
+    /* A row the import cannot key on. Kept visible and readable — the report
+       is still worth looking at — but the editor is disabled and the reason
+       sits in the tooltip. */
+    tr.not-writable td.sel-cell { box-shadow: inset 3px 0 0 0 #D9A4B2; }
+    .lock-ico { color: #8A1E30; margin-left: 4px; cursor: help; font-size: 11px; }
+
+    /* Group rows (By Status / By Group / By Sales Person / By State). */
+    .grp-hdr td { background: #EBEEED !important; font-weight: 600; cursor: pointer; border-top: 1px solid #C6D0D4; }
+    .grp-hdr:hover td { background: #E1E6E5 !important; }
+    .grp-hdr-inner { display: flex; align-items: center; gap: 7px; }
+    .grp-toggle { color: #748A94; font-size: 10px; width: 10px; flex-shrink: 0; }
+    .grp-id { font-weight: 700; color: #0B3140; }
+    .grp-meta { font-size: 11px; color: #748A94; font-weight: 500; }
+    .grp-total { font-weight: 700; color: #0B3140; }
+    tr.item-row.even-item td { background: var(--bg-1); }
+
+    /* Status focus chips — counts across the loaded rows, click to narrow the
+       view without re-querying. Distinct from the Filters panel's Status
+       multi-select, which decides what is FETCHED. */
+    #chipBar {
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+      padding: 7px 20px; background: #fff; border-bottom: 1px solid #e2e8f0; flex-shrink: 0;
+    }
+    #chipBar .chip-lbl { font-size: 10px; font-weight: 700; letter-spacing: 0.05em;
+      text-transform: uppercase; color: #748A94; margin-right: 2px; }
+
+    /* Bulk-edit bar. Only shown when at least one row is ticked. */
+    #bulkBar {
+      display: none; align-items: center; gap: 10px; flex-wrap: wrap;
+      padding: 8px 20px; background: #DEEAF4; border-bottom: 1px solid #CBE5FB; flex-shrink: 0;
+    }
+    #bulkBar.open { display: flex; }
+    #bulkBar select { padding: 4px 8px; border: 1px solid #CBE5FB; border-radius: 6px; font-size: 12px; font-family: inherit; background: #fff; }
+    #bulkBar .bulk-count { font-size: 12px; font-weight: 700; color: #1e7bb4; }
+
+    /* .hdr-pill — a select wearing the .hdr-btn shell, so the view-mode
+       dropdown lines up with the buttons either side of it. Still a per-report
+       rule (it has not been lifted into fb-styles yet); this copy matches
+       SalesOrderSummary's so the two headers stay identical. Lock the height
+       to exactly what .hdr-btn computes — 12px text at 1.4 line-height, 4px
+       padding top and bottom, 1px border — and let the select fill it rather
+       than set its own. */
+    .hdr-pill {
+      display: flex; align-items: center; gap: 5px;
+      box-sizing: border-box; height: calc(12px * 1.4 + 8px + 2px);
+      padding: 0 6px 0 10px; border: 1px solid #e2e8f0; border-radius: 8px;
+      background: #fff; flex-shrink: 0;
+    }
+    .hdr-pill > svg { flex-shrink: 0; }
+    .hdr-pill > select {
+      height: 100%; padding: 0; margin: 0; border: none; background: transparent;
+      outline: none; cursor: pointer; font-family: 'Inter', sans-serif;
+      font-size: 12px; font-weight: 500; line-height: 1.4; color: #475569;
+    }
+
+    /* Unsaved-changes pill in the header. */
+    .dirty-pill {
+      display: none; align-items: center; gap: 6px; padding: 4px 10px;
+      border-radius: 999px; font-size: 11px; font-weight: 700;
+      background: #F5E7DD; color: #8A4E10; border: 1px solid #EBC49B; white-space: nowrap;
+    }
+    .dirty-pill.open { display: inline-flex; }
+
+    /* Column resize grip — the right edge of every header cell. Sits above the
+       header's own drag-to-reorder and click-to-sort handlers, both of which
+       are suppressed while a resize is in progress. */
+    .col-resizer { position: absolute; top: 0; right: 0; width: 7px; height: 100%;
+      cursor: col-resize; user-select: none; z-index: 12; }
+    .col-resizer::after { content: ''; position: absolute; top: 25%; right: 3px; height: 50%;
+      border-right: 1px solid rgba(255,255,255,0.35); }
+    .rpt-table th { padding-right: 14px; }
+    body.col-resizing { cursor: col-resize; user-select: none; }
+    body.col-resizing * { cursor: col-resize !important; }
+
+    /* Columns picker dropdown — positioned per report because the trigger
+       lives in this header. */
+    #colPanel {
+      position: absolute; right: 0; top: calc(100% + 6px); z-index: 600;
+      width: 250px; max-height: 420px; overflow-y: auto;
+      background: #fff; border: 1px solid #C6D0D4; border-radius: 8px;
+      box-shadow: 0 8px 24px -8px rgba(16,16,16,0.3);
+    }
+    #colPanel.hidden { display: none; }
+    .col-row { display: flex; align-items: center; gap: 8px; padding: 5px 10px; font-size: 12px; cursor: grab; }
+    .col-row:hover { background: var(--tint-blue); }
+    .col-row.dragging { opacity: 0.4; }
+    .col-row.drag-over { border-top: 2px solid var(--color-primary); }
+    .col-row label { cursor: pointer; flex: 1; }
+    .drag-handle { color: #C6D0D4; display: flex; align-items: center; }
+
+    /* Review drawer. */
+    .rv-sect { margin-bottom: 16px; }
+    .rv-sect-hd { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+      color: #506872; margin-bottom: 8px; border-bottom: 1px solid #E3E3E3; padding-bottom: 4px; }
+    .rv-hint { font-size: 11.5px; color: #748A94; line-height: 1.5; }
+    .rv-row { display: flex; align-items: center; gap: 10px; padding: 7px 9px; border: 1px solid #E3E3E3;
+      border-radius: 7px; background: #fff; margin-bottom: 6px; font-size: 12px; flex-wrap: wrap; }
+    .rv-row.bad  { border-color: #D9A4B2; background: #F0D7DD; }
+    .rv-row.done { border-color: #A9CDBA; background: #DBE8E1; }
+    .rv-name { font-weight: 700; color: #0B3140; flex: 1 1 200px; min-width: 0; }
+    .rv-arrow { color: #748A94; }
+    .rv-msg { flex: 1 1 100%; font-size: 11px; color: #8A1E30; word-break: break-word; }
+    .rv-x { background: none; border: none; color: #8FA1A7; cursor: pointer; font-size: 16px; line-height: 1; padding: 0 4px; }
+    .rv-x:hover { color: #C43046; }
+    #rvProgress { height: 6px; border-radius: 3px; background: #E3E3E3; overflow: hidden; margin-bottom: 10px; display: none; }
+    #rvProgress.open { display: block; }
+    #rvProgressBar { height: 100%; width: 0; background: var(--color-primary); transition: width 0.2s; }
+
+    /* Tooltip — the styled hover card used by the filter help + lock icons. */
+    .app-tooltip {
+      position: absolute; z-index: 9999; max-width: 340px; padding: 9px 11px;
+      background: #0f172a; color: #e2e8f0; border-radius: 7px; font-size: 11.5px;
+      line-height: 1.5; box-shadow: 0 8px 20px -6px rgba(0,0,0,0.45);
+      opacity: 0; pointer-events: none; transition: opacity 0.12s;
+    }
+    .app-tooltip.show { opacity: 1; }
+    .app-tooltip .lbl { color: #fff; font-weight: 700; }
+    .app-tooltip code { background: #1e293b; padding: 0 3px; border-radius: 3px; }
+    .app-tooltip .kbd { background: #334155; padding: 0 4px; border-radius: 3px; }
+
+    /* @keyframes spin + .loading-overlay ship from fb-styles. */
+  </style>
+</head>
+
+<body class="bg-slate-50 flex flex-col">
+
+<!-- Shared styled tooltip — content is swapped in on hover by tipShow. -->
+<div id="appTooltip" class="app-tooltip"></div>
+<div class="toast-container" id="toastContainer"></div>
+
+  <!-- HEADER -->
+  <header class="bg-white border-b border-slate-200 px-5 flex items-center justify-between flex-shrink-0 shadow-sm" style="height:56px;">
+    <div>
+      <h1 class="text-base font-bold text-slate-900 leading-tight">Customer Status</h1>
+      <p id="statusLine" class="text-xs text-slate-400 leading-tight">Initialising...</p>
+    </div>
+    <div class="flex items-center gap-2">
+
+      <!-- Unsaved-changes pill + the review drawer trigger. -->
+      <span id="dirtyPill" class="dirty-pill" title="Status changes that have not been written to Fishbowl yet">
+        <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24"><path d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span id="dirtyCount">0</span> unsaved
+      </span>
+      <button id="reviewBtn" class="hdr-btn" onclick="FBLib.Common.toggleDrawer('reviewDrawer')" title="Review and save pending status changes">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
+        Review &amp; Save
+      </button>
+
+      <div class="w-px h-6 bg-slate-200 mx-1"></div>
+
+      <!-- Filters toggle -->
+      <button id="filtersBtn" onclick="toggleFilters()" class="hdr-btn">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+        Filters
+      </button>
+
+      <!-- Columns toggle -->
+      <div class="relative" id="colWrap">
+        <button onclick="toggleColPanel()" class="hdr-btn" id="colBtn">
+          <svg fill="currentColor" viewBox="0 0 24 24"><circle cx="8" cy="6" r="1.5"/><circle cx="8" cy="12" r="1.5"/><circle cx="8" cy="18" r="1.5"/><circle cx="16" cy="6" r="1.5"/><circle cx="16" cy="12" r="1.5"/><circle cx="16" cy="18" r="1.5"/></svg>
+          Columns
+        </button>
+        <div id="colPanel" class="hidden">
+          <div class="px-3 py-2 text-xs font-semibold text-slate-400 border-b border-slate-100 sticky top-0 bg-white">Show / Reorder</div>
+          <div id="colList"></div>
+          <div style="padding:6px 10px; border-top:1px solid #f1f5f9; position:sticky; bottom:0; background:#fff;">
+            <button type="button" onclick="resetColWidths()"
+              style="width:100%; font-size:11px; padding:4px 8px; border:1px solid #cbd5e1;
+                     border-radius:5px; background:#f8fafc; color:#475569; cursor:pointer;"
+              title="Hand every column back to automatic width. You can also drag a column edge in the header to resize one, or double-click an edge to reset.">
+              Reset widths
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <button onclick="loadData()" class="hdr-btn">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+        Refresh
+      </button>
+
+      <!-- View mode selector -->
+      <div class="hdr-pill" style="padding:0 10px;">
+        <svg width="14" height="14" fill="none" stroke="#94a3b8" stroke-width="2" viewBox="0 0 24 24"><path d="M3 5h18M3 10h10M3 15h18M3 20h10" stroke-linecap="round"/></svg>
+        <select id="viewModeSelect" onchange="setViewMode(this.value)">
+          <option value="flat">Flat</option>
+          <option value="bystatus">By Status</option>
+          <option value="bygroup">By Group</option>
+          <option value="bysalesman">By Sales Person</option>
+          <option value="bystate">By State</option>
+        </select>
+      </div>
+
+      <!-- Expand / Collapse (only visible in grouped mode) -->
+      <div id="expandBtnGroup" class="hidden flex" style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;flex-shrink:0;">
+        <button onclick="expandAll()" class="hdr-btn" style="border:none;border-radius:0;border-right:1px solid #e2e8f0;" title="Expand all">
+          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+          Expand
+        </button>
+        <button onclick="collapseAll()" class="hdr-btn" style="border:none;border-radius:0;" title="Collapse all">
+          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 12h14" stroke-linecap="round"/></svg>
+          Collapse
+        </button>
+      </div>
+
+      <div class="flex" style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;flex-shrink:0;">
+        <button onclick="saveCurrentSettings()" class="hdr-btn" style="border:none;border-radius:0;border-right:1px solid #e2e8f0;" title="Save filters, columns and widths against your Fishbowl user account">
+          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+          Save
+        </button>
+        <button onclick="resetSettings()" class="hdr-btn" style="border:none;border-radius:0;" title="Reset to defaults">
+          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+          Reset
+        </button>
+      </div>
+
+      <div class="w-px h-6 bg-slate-200 mx-1"></div>
+
+      <button onclick="exportCSV()" class="hdr-btn" title="Download the visible columns as CSV">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+        CSV
+      </button>
+      <button onclick="exportXLSX()" class="hdr-btn" title="Download as a formatted Excel workbook">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 8l8 8M16 8l-8 8" stroke-linecap="round"/></svg>
+        Excel
+      </button>
+      <button onclick="printTable()" class="hdr-btn">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+        Print
+      </button>
+
+    </div>
+  </header>
+
+  <!-- REVIEW & SAVE DRAWER — must be a SIBLING of <header> (fb-drawer is
+       fixed-positioned below the live header height). Registered with
+       FBLib.Common.registerDrawer in init(); never override the .fb-drawer.open
+       z-index or it drops behind fb-lib's shared scrim. -->
+  <div id="reviewDrawer" class="fb-drawer">
+    <div class="fb-drawer-head">
+      <h2>Status changes</h2>
+      <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('reviewDrawer')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+
+      <div id="rvNoWrite" class="alert alert-danger" style="display:none;"></div>
+
+      <div class="rv-sect">
+        <div class="rv-sect-hd">Pending <span id="rvCount" class="rv-hint"></span></div>
+        <div id="rvProgress"><div id="rvProgressBar"></div></div>
+        <div id="rvList"></div>
+      </div>
+
+      <div class="rv-sect">
+        <div class="rv-sect-hd">What saving does</div>
+        <div class="rv-hint">
+          Fishbowl exposes no REST verb that edits a customer, so each change is written as a
+          one-row <b>Customer import</b> keyed on the customer's name. The import also requires the
+          customer's default address on every row, so the address columns are sent back exactly as
+          they were read — nothing else on the record is touched, because no other column is sent.
+          <br><br>
+          Rows are saved one at a time. If one fails, the rest still go, and the failure keeps its
+          pending change so you can retry it.
+        </div>
+      </div>
+
+    </div>
+    <div class="fb-drawer-foot">
+      <button type="button" class="btn btn-sm btn-danger" onclick="discardAllPending()">Discard all</button>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button type="button" class="btn btn-sm" onclick="FBLib.Common.closeDrawer('reviewDrawer')">Close</button>
+        <button type="button" class="btn btn-sm btn-primary" id="rvSaveBtn" onclick="savePending()">Save to Fishbowl</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- FILTERS PANEL — side-by-side column groups. -->
+  <div id="filtersPanel">
+    <div class="flex flex-wrap items-start" style="gap:14px 22px;">
+
+      <!-- ── STATUS & STANDING ─────────────────────────────────────── -->
+      <div class="flex flex-col gap-2" style="min-width:210px;">
+        <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide border-b border-slate-200 pb-1 flex items-center justify-between gap-2">
+          <span>Status &amp; standing</span>
+          <button type="button" tabindex="-1" id="filterHelpBtn"
+                  class="flex items-center justify-center rounded-full text-slate-400 hover:text-blue-600 hover:bg-blue-50 transition-colors cursor-help"
+                  style="width:18px; height:18px; border:1px solid #e2e8f0; flex-shrink:0;"
+                  aria-label="Filter help">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>
+            </svg>
+          </button>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Status</div>
+          <div class="ms-container" id="status-ms">
+            <div class="ms-trigger" id="statusTrigger"><span class="ms-placeholder" id="statusPlaceholder">All statuses</span></div>
+            <div class="ms-dropdown hidden" id="statusDropdown">
+              <div class="ms-actions" style="padding:5px 10px;"><span id="statusAll">Select All</span><span id="statusClear">Clear All</span></div>
+              <div class="ms-list" id="statusList"></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Active</div>
+          <select id="filterActive" style="width:100%;">
+            <option value="1">Active only</option>
+            <option value="0">Inactive only</option>
+            <option value="">Active + inactive</option>
+          </select>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Order exposure</div>
+          <select id="filterExposure" style="width:100%;">
+            <option value="">Any</option>
+            <option value="open">Has open orders</option>
+            <option value="noopen">No open orders</option>
+            <option value="never">Never ordered</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- ── WHO ───────────────────────────────────────────────────── -->
+      <div class="flex flex-col gap-2" style="min-width:230px;">
+        <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide border-b border-slate-200 pb-1">Who</div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Customer</div>
+          <div class="ms-container" id="cust-ms">
+            <div class="ms-trigger" id="custTrigger"><span class="ms-placeholder" id="custPlaceholder">All customers</span></div>
+            <div class="ms-dropdown hidden" id="custDropdown">
+              <div class="ms-search"><input type="text" placeholder="Search..." id="custSearch" /></div>
+              <div class="ms-actions"><span id="custAll">Select All</span><span id="custClear">Clear All</span></div>
+              <div class="ms-list" id="custList"></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Customer group</div>
+          <div class="ms-container" id="grp-ms">
+            <div class="ms-trigger" id="grpTrigger"><span class="ms-placeholder" id="grpPlaceholder">All groups</span></div>
+            <div class="ms-dropdown hidden" id="grpDropdown">
+              <div class="ms-search"><input type="text" placeholder="Search..." id="grpSearch" /></div>
+              <div class="ms-actions"><span id="grpAll">Select All</span><span id="grpClear">Clear All</span></div>
+              <div class="ms-list" id="grpList"></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Sales person</div>
+          <div class="ms-container" id="sal-ms">
+            <div class="ms-trigger" id="salTrigger"><span class="ms-placeholder" id="salPlaceholder">All sales people</span></div>
+            <div class="ms-dropdown hidden" id="salDropdown">
+              <div class="ms-search"><input type="text" placeholder="Search..." id="salSearch" /></div>
+              <div class="ms-actions"><span id="salAll">Select All</span><span id="salClear">Clear All</span></div>
+              <div class="ms-list" id="salList"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── WHERE ─────────────────────────────────────────────────── -->
+      <div class="flex flex-col gap-2" style="min-width:210px;">
+        <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide border-b border-slate-200 pb-1">Where</div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">State</div>
+          <div class="ms-container" id="state-ms">
+            <div class="ms-trigger" id="stateTrigger"><span class="ms-placeholder" id="statePlaceholder">All states</span></div>
+            <div class="ms-dropdown hidden" id="stateDropdown">
+              <div class="ms-search"><input type="text" placeholder="Search..." id="stateSearch" /></div>
+              <div class="ms-actions"><span id="stateAll">Select All</span><span id="stateClear">Clear All</span></div>
+              <div class="ms-list" id="stateList"></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Country</div>
+          <div class="ms-container" id="country-ms">
+            <div class="ms-trigger" id="countryTrigger"><span class="ms-placeholder" id="countryPlaceholder">All countries</span></div>
+            <div class="ms-dropdown hidden" id="countryDropdown">
+              <div class="ms-search"><input type="text" placeholder="Search..." id="countrySearch" /></div>
+              <div class="ms-actions"><span id="countryAll">Select All</span><span id="countryClear">Clear All</span></div>
+              <div class="ms-list" id="countryList"></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">City contains</div>
+          <input type="text" id="filterCity" placeholder="e.g. Bris%" style="width:100%;" />
+        </div>
+      </div>
+
+      <!-- ── ACCOUNT DEFAULTS ──────────────────────────────────────── -->
+      <div class="flex flex-col gap-2" style="min-width:210px;">
+        <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide border-b border-slate-200 pb-1">Account defaults</div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Payment terms</div>
+          <div class="ms-container" id="pt-ms">
+            <div class="ms-trigger" id="ptTrigger"><span class="ms-placeholder" id="ptPlaceholder">All terms</span></div>
+            <div class="ms-dropdown hidden" id="ptDropdown">
+              <div class="ms-search"><input type="text" placeholder="Search..." id="ptSearch" /></div>
+              <div class="ms-actions"><span id="ptAll">Select All</span><span id="ptClear">Clear All</span></div>
+              <div class="ms-list" id="ptList"></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Priority</div>
+          <div class="ms-container" id="pri-ms">
+            <div class="ms-trigger" id="priTrigger"><span class="ms-placeholder" id="priPlaceholder">All priorities</span></div>
+            <div class="ms-dropdown hidden" id="priDropdown">
+              <div class="ms-actions" style="padding:5px 10px;"><span id="priAll">Select All</span><span id="priClear">Clear All</span></div>
+              <div class="ms-list" id="priList"></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">QuickBooks class</div>
+          <div class="ms-container" id="qb-ms">
+            <div class="ms-trigger" id="qbTrigger"><span class="ms-placeholder" id="qbPlaceholder">All classes</span></div>
+            <div class="ms-dropdown hidden" id="qbDropdown">
+              <div class="ms-search"><input type="text" placeholder="Search..." id="qbSearch" /></div>
+              <div class="ms-actions"><span id="qbAll">Select All</span><span id="qbClear">Clear All</span></div>
+              <div class="ms-list" id="qbList"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── TEXT & DATES ──────────────────────────────────────────── -->
+      <div class="flex flex-col gap-2" style="min-width:210px;">
+        <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide border-b border-slate-200 pb-1">Text &amp; dates</div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Customer name contains</div>
+          <input type="text" id="filterName" placeholder="e.g. %bike%" style="width:100%;" />
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Account # contains</div>
+          <input type="text" id="filterAcct" placeholder="e.g. 13%" style="width:100%;" />
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Alert note contains</div>
+          <input type="text" id="filterNote" placeholder="e.g. %overdue%" style="width:100%;" />
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Last ordered on or before</div>
+          <input type="date" id="filterLastOrder" style="width:100%;" />
+        </div>
+      </div>
+
+      <!-- ── CUSTOM FIELDS ─────────────────────────────────────────── -->
+      <div class="flex flex-col gap-2" style="min-width:210px;">
+        <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide border-b border-slate-200 pb-1">Custom fields</div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Field</div>
+          <div class="ms-container" id="cf-ms">
+            <div class="ms-trigger" id="cfTrigger"><span class="ms-placeholder" id="cfPlaceholder">Select fields</span></div>
+            <div class="ms-dropdown hidden" id="cfDropdown">
+              <div class="ms-search"><input type="text" placeholder="Search..." id="cfSearch" /></div>
+              <div class="ms-actions"><span id="cfAll">Select All</span><span id="cfClear">Clear All</span></div>
+              <div class="ms-list" id="cfList"></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Value contains</div>
+          <input type="text" id="filterCfValue" placeholder="applies to the fields above" style="width:100%;" />
+        </div>
+        <div class="text-[10px] text-slate-400 leading-snug" style="max-width:200px;">
+          Tick one or more customer custom fields to bring them in as columns; add a value to
+          filter on them.
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- STATUS FOCUS CHIPS -->
+  <div id="chipBar"><span class="chip-lbl">Focus</span><span id="chipHost" class="flex items-center gap-2 flex-wrap"></span></div>
+
+  <!-- BULK EDIT BAR -->
+  <div id="bulkBar">
+    <span class="bulk-count"><span id="bulkCount">0</span> selected</span>
+    <span style="font-size:12px;color:#1e7bb4;">Set status to</span>
+    <select id="bulkStatus"></select>
+    <button class="btn btn-sm btn-primary" onclick="applyBulkStatus()">Apply to selected</button>
+    <button class="btn btn-sm" onclick="clearSelection()">Clear selection</button>
+    <span style="flex:1"></span>
+    <span class="rv-hint" style="color:#1e7bb4;">Applying stages the change — nothing is written until you save.</span>
+  </div>
+
+  <!-- TABLE -->
+  <div id="tableWrap" class="flex-1 overflow-auto" style="min-height:0; position:relative;">
+    <div id="loadingOverlay" class="loading-overlay" style="display:none;">
+      <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="var(--color-primary)" stroke-width="2.5" style="animation:spin 0.9s linear infinite;">
+        <path d="M21 12a9 9 0 11-6.219-8.56" stroke-linecap="round"/>
+      </svg>
+      <span class="lo-label">Loading customers…</span>
+    </div>
+    <table id="dataTable" class="rpt-table">
+      <thead id="tHead"></thead>
+      <tbody id="tBody"></tbody>
+      <tfoot id="tFoot"></tfoot>
+    </table>
+  </div>
+
+<script>
+/* ── RUNTIME GUARD ── */
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+  document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#475569;"><h2>Not running inside Fishbowl</h2><p>This report requires the Fishbowl BI environment.</p></div>';
+  throw new Error('Fishbowl API not available');
+}
+/* fb-lib guard — the multi-select filters, the drawer plumbing and the
+   exporters all come from fb-lib. If the Script isn't deployed/expanded,
+   surface the fix instead of a half-dead page. (fb-styles may be missing for
+   the same reason.) */
+if (!window.FBLib || !FBLib.Common || !FBLib.Common.MultiSelect) {
+  document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#8A1E30;background:#F0D7DD;">' +
+    '<h2>fb-lib not loaded</h2><p>This report requires the shared <code>fb-lib</code> script. ' +
+    'In BI Script Editor, confirm a Script named exactly <code>fb-lib</code> exists with the current ' +
+    'contents of scripts/fb-lib.js, then re-save THIS report (directives expand at save time).</p></div>';
+  throw new Error('FBLib not available');
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   CONFIG
+   ════════════════════════════════════════════════════════════════════════ */
+const _KEY = 'customer.bi.status.v1';
+
+/* customerstatus, verified against the table: 10 Normal · 20 Preferred ·
+   30 Hold Sales · 40 Hold Shipment · 50 Hold All. The badge classes are the
+   shared .b* tones from fb-styles (§33), mapped by MEANING rather than by
+   number — the .b* numbers are SO status codes, not customer ones. */
+const STATUS_LIST = [
+  { id: 10, label: 'Normal',        cls: 'b10' },
+  { id: 20, label: 'Preferred',     cls: 'b60' },
+  { id: 30, label: 'Hold Sales',    cls: 'b25' },
+  { id: 40, label: 'Hold Shipment', cls: 'b70' },
+  { id: 50, label: 'Hold All',      cls: 'b80' },
+];
+const STATUS_MAP = {};
+STATUS_LIST.forEach(s => { STATUS_MAP[s.id] = s; });
+/* Anything at or above Hold Sales stops something happening on an order. */
+function isHold(statusId) { return parseInt(statusId, 10) >= 30; }
+
+/* The Status column is only editable for a user who can edit customers —
+   the import would be refused server-side anyway, and a live-looking
+   drop-down that always fails is worse than a read-only one. */
+const _CAN_EDIT = (function () {
+  try { return typeof hasUserAccess !== 'function' || !!hasUserAccess('Customer-Edit'); }
+  catch (_) { return true; }
+})();
+
+/* ── HOME CURRENCY ── */
+var _currencyLocale = (function () {
+  try { return typeof currencyLocale === 'function' ? currencyLocale() : { locale: 'en-US', symbol: '$' }; }
+  catch (e) { return { locale: 'en-US', symbol: '$' }; }
+})();
+var _currSym = _currencyLocale.symbol || '$';
+var _localeCode = _currencyLocale.locale || 'en-US';
+
+/* ── DATE FORMAT (respects Fishbowl's DateFormatShort property) ── */
+var _dateFmt = 'MM/DD/YYYY';
+(function () {
+  try {
+    var jf = typeof getProperty === 'function' ? getProperty('DateFormatShort', 'MM/dd/yyyy') : 'MM/dd/yyyy';
+    _dateFmt = jf.replace(/yyyy/g, 'YYYY').replace(/dd/g, 'DD');
+  } catch (e) {}
+})();
+
+function formatDate(s) {
+  if (!s || String(s).length < 10) return '';
+  var str = String(s);
+  return _dateFmt.replace('YYYY', str.substring(0, 4)).replace('MM', str.substring(5, 7)).replace('DD', str.substring(8, 10));
+}
+function formatMoney(val) {
+  var num = parseFloat(val || 0);
+  if (isNaN(num)) return '';
+  var neg = num < 0, abs = Math.abs(num);
+  return (neg ? '-' : '') + _currSym + abs.toLocaleString(_localeCode, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function formatQty(v) {
+  if (v == null || isNaN(v)) return '';
+  return v % 1 === 0 ? String(Math.round(v)) : parseFloat(v).toFixed(4).replace(/\.?0+$/, '');
+}
+
+/* ── COLUMNS ──
+   `edit:'status'` marks the one editable column. `type` feeds the xlsx
+   exporter's cell formats (FBLib.Export). */
+let _columns = [
+  { key: 'customer',        label: 'Customer',        vis: true,  link: 'Customer' },
+  { key: 'acctnum',         label: 'Account #',       vis: true },
+  { key: 'status',          label: 'Status',          vis: true,  edit: 'status' },
+  { key: 'active',          label: 'Active',          vis: true },
+  { key: 'custgroup',       label: 'Group',           vis: true,  truncate: true },
+  { key: 'salesman',        label: 'Sales Person',    vis: true },
+  { key: 'priority',        label: 'Priority',        vis: false },
+  { key: 'paymentterms',    label: 'Payment Terms',   vis: true },
+  { key: 'creditlimit',     label: 'Credit Limit',    vis: true,  money: true },
+  { key: 'currency',        label: 'Currency',        vis: false },
+  { key: 'taxcode',         label: 'Tax Code',        vis: false },
+  { key: 'taxexempt',       label: 'Tax Exempt',      vis: false },
+  { key: 'issuable',        label: 'Issuable Status', vis: false },
+  { key: 'carrier',         label: 'Carrier',         vis: false },
+  { key: 'shipterms',       label: 'Ship Terms',      vis: false },
+  { key: 'qbclass',         label: 'QB Class',        vis: false },
+  { key: 'parent',          label: 'Parent',          vis: false },
+  { key: 'city',            label: 'City',            vis: true },
+  { key: 'state',           label: 'State',           vis: true },
+  { key: 'zip',             label: 'Post Code',       vis: false },
+  { key: 'country',         label: 'Country',         vis: false },
+  { key: 'street',          label: 'Street',          vis: false, truncate: true },
+  { key: 'addrtype',        label: 'Default Address', vis: false },
+  { key: 'email',           label: 'Email',           vis: true,  truncate: true },
+  { key: 'phone',           label: 'Phone',           vis: true },
+  { key: 'openorders',      label: 'Open Orders',     vis: true,  qty: true },
+  { key: 'openvalue',       label: 'Open Value',      vis: true,  money: true },
+  { key: 'completedorders', label: 'Completed Orders', vis: false, qty: true },
+  { key: 'completedvalue',  label: 'Completed Value', vis: true,  money: true },
+  { key: 'lastorder',       label: 'Last Order',      vis: true,  date: true },
+  { key: 'dayssince',       label: 'Days Since',      vis: true,  qty: true },
+  { key: 'url',             label: 'URL',             vis: false, truncate: true },
+  { key: 'alertnote',       label: 'Alert Note',      vis: false, truncate: true },
+  { key: 'datecreated',     label: 'Date Created',    vis: false, date: true },
+  { key: 'datemodified',    label: 'Last Modified',   vis: false, date: true },
+];
+
+/* ── STATE ── */
+let _dataset = [];                 // every row returned by the last query
+let _rowById = new Map();          // customerid -> row
+let _sortCol = null, _sortDir = 'asc';
+let _viewMode = 'flat';
+let _groups = [], _expanded = new Set();
+let _grpSortCol = null, _grpSortDir = 'asc';
+let _focusStatus = null;           // client-side chip filter (status id) or null
+let _selected = new Set();         // ticked customerids
+let _pending = new Map();          // customerid -> new status id (unsaved)
+let _saveResults = new Map();      // customerid -> {ok, msg} from the last save
+let _dragIdx = null, _dragColKey = null;
+const CHUNK_SIZE = 250;
+let _renderOffset = 0, _visRows = [];
+let _statusSuffix = '';
+let _saving = false;
+
+/* Filter dropdown lists + their selections. The Sets are the single source of
+   truth for buildSQL and for settings persistence — the widgets close over the
+   objects, so they are ALWAYS mutated in place (.clear() + .add()), never
+   reassigned. */
+let _custList = [], _grpList = [], _salList = [], _stateList = [], _countryList = [], _ptList = [], _priList = [], _qbList = [];
+let _selStatus = new Set(), _selCust = new Set(), _selGrp = new Set(), _selSal = new Set();
+let _selState = new Set(), _selCountry = new Set(), _selPt = new Set(), _selPri = new Set(), _selQb = new Set();
+let _cfNames = [], _selCf = new Set();
+
+const _FILTER_SETS = [
+  { key: 'statuses',  get: () => _selStatus,  ms: 'status-ms' },
+  { key: 'customers', get: () => _selCust,    ms: 'cust-ms' },
+  { key: 'groups',    get: () => _selGrp,     ms: 'grp-ms' },
+  { key: 'salesmen',  get: () => _selSal,     ms: 'sal-ms' },
+  { key: 'states',    get: () => _selState,   ms: 'state-ms' },
+  { key: 'countries', get: () => _selCountry, ms: 'country-ms' },
+  { key: 'terms',     get: () => _selPt,      ms: 'pt-ms' },
+  { key: 'priorities',get: () => _selPri,     ms: 'pri-ms' },
+  { key: 'qbclasses', get: () => _selQb,      ms: 'qb-ms' },
+  { key: 'cfields',   get: () => _selCf,      ms: 'cf-ms' },
+];
+const _FILTER_INPUTS = ['filterActive', 'filterExposure', 'filterCity', 'filterName', 'filterAcct',
+                        'filterNote', 'filterLastOrder', 'filterCfValue'];
+
+/* ════════════════════════════════════════════════════════════════════════
+   SETTINGS
+   ════════════════════════════════════════════════════════════════════════
+   Persisted per Fishbowl USER via the built-in saveSettings/loadSettings.
+   Never shadow those names with report-local functions — a local
+   `saveSettings` would call itself forever. */
+function captureFilterState() {
+  const out = {};
+  _FILTER_SETS.forEach(f => { out[f.key] = [...f.get()]; });
+  _FILTER_INPUTS.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) out[id] = el.value;
+  });
+  return out;
+}
+
+function applyFilterState(s, syncWidgets) {
+  _FILTER_SETS.forEach(f => {
+    if (!Array.isArray(s[f.key])) return;
+    const set = f.get();
+    set.clear();
+    s[f.key].forEach(v => set.add(String(v)));
+    if (syncWidgets) {
+      const api = FBLib.Common.MultiSelect.get(f.ms);
+      if (api) api.setSelected([...set]);
+    }
+  });
+  _FILTER_INPUTS.forEach(id => {
+    if (s[id] === undefined) return;
+    const el = document.getElementById(id);
+    if (el) el.value = s[id];
+  });
+}
+
+function loadSavedSettings() {
+  try {
+    const raw = loadSettings(_KEY);
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    if (s.v !== 1) return;
+
+    applyFilterState(s, false);
+
+    if (Array.isArray(s.cols)) {
+      const savedMap = Object.fromEntries(s.cols.map(c => [c.key, c]));
+      const reordered = s.cols.map(sc => _columns.find(c => c.key === sc.key)).filter(Boolean);
+      const extras = _columns.filter(c => !savedMap[c.key]);
+      _columns = [...reordered, ...extras];
+      _columns.forEach(c => { if (savedMap[c.key]) c.vis = savedMap[c.key].vis; });
+    }
+    if (s.colWidths && typeof s.colWidths === 'object') {
+      const known = new Set(_columns.map(c => c.key));
+      _colWidths = {};
+      Object.keys(s.colWidths).forEach(k => {
+        const px = parseInt(s.colWidths[k], 10);
+        if (known.has(k) && isFinite(px) && px >= MIN_COL_W) _colWidths[k] = px;
+      });
+    }
+    if (s.viewMode) {
+      _viewMode = s.viewMode;
+      const sel = document.getElementById('viewModeSelect');
+      if (sel) sel.value = _viewMode;
+    }
+  } catch (e) { console.warn('loadSettings error', e); }
+}
+
+function saveCurrentSettings() {
+  const s = Object.assign({ v: 1 }, captureFilterState(), {
+    cols: _columns.map(c => ({ key: c.key, vis: c.vis })),
+    colWidths: _colWidths,
+    viewMode: _viewMode,
+  });
+  saveSettings(_KEY, JSON.stringify(s));
+  setStatus('Settings saved. ' + _statusSuffix);
+  showToast('Settings saved to your Fishbowl account.', 'success');
+}
+
+function resetSettings() {
+  const n = _pending.size;
+  const warn = 'Reset this report to its defaults?\n\nThis clears your filters, columns and column widths'
+    + (n ? '.\n\nYou also have ' + n + ' unsaved status change' + (n === 1 ? '' : 's') + ' — reloading discards ' + (n === 1 ? 'it' : 'them') + '.' : '.');
+  if (typeof confirm === 'function' && !confirm(warn)) return;
+  saveSettings(_KEY, '');
+  location.reload();
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   INIT
+   ════════════════════════════════════════════════════════════════════════ */
+async function init() {
+  setStatus('Loading...');
+  FBLib.Common.mountDebugDrawer();
+
+  await loadCustomFields();
+  loadSavedSettings();
+  _createFilterMS();
+  buildStatusSelectOptions();
+
+  await Promise.all([populateCust(), populateGrp(), populateSal(), populateState(),
+                     populateCountry(), populatePt(), populatePri(), populateQb()]);
+
+  buildColPanel();
+  FBLib.Common.registerDrawer({ id: 'reviewDrawer', triggerId: 'reviewBtn', onBeforeOpen: renderReviewDrawer });
+  setViewMode(_viewMode);
+
+  document.getElementById('tableWrap').addEventListener('scroll', function () {
+    if (_viewMode === 'flat' && _renderOffset < (_visRows || []).length &&
+        this.scrollTop + this.clientHeight >= this.scrollHeight - 400) {
+      appendChunk(_columns.filter(c => c.vis), document.getElementById('tBody'));
+    }
+  });
+
+  wireFilterHelp();
+  wireAutoApply();
+
+  document.addEventListener('click', e => {
+    const cw = document.getElementById('colWrap');
+    if (cw && !cw.contains(e.target)) document.getElementById('colPanel').classList.add('hidden');
+  });
+
+  // Leaving with unsaved edits is the one genuinely lossy exit here.
+  window.addEventListener('beforeunload', e => {
+    if (!_pending.size) return;
+    e.preventDefault();
+    e.returnValue = '';
+  });
+
+  if (!_CAN_EDIT) {
+    showToast('You do not hold the Customer-Edit right — status is read-only in this report.', 'info', 6000);
+  }
+
+  loadData();
+}
+
+/* ── FILTERS TOGGLE ── */
+function toggleFilters() {
+  const panel = document.getElementById('filtersPanel');
+  const btn = document.getElementById('filtersBtn');
+  panel.classList.toggle('open');
+  btn.classList.toggle('active', panel.classList.contains('open'));
+}
+
+/* ── TOOLTIP ── */
+function tipShow(event, html) {
+  const el = document.getElementById('appTooltip');
+  el.innerHTML = html;
+  const tw = 340;
+  const r = event.currentTarget.getBoundingClientRect();
+  const x = Math.min(window.innerWidth - tw - 12, r.left + window.scrollX);
+  const aboveY = r.top + window.scrollY - el.offsetHeight - 8;
+  el.style.left = Math.max(12, x) + 'px';
+  el.style.top = aboveY + 'px';
+  el.classList.add('show');
+  if (aboveY < window.scrollY + 8) el.style.top = (r.bottom + window.scrollY + 8) + 'px';
+}
+function tipHide() { document.getElementById('appTooltip').classList.remove('show'); }
+
+function wireFilterHelp() {
+  const btn = document.getElementById('filterHelpBtn');
+  if (!btn) return;
+  const html =
+    '<div><span class="lbl">Auto-apply:</span> filters re-run on <span class="kbd">Enter</span>, ' +
+    'blur (clicking out of a field), or closing a multi-select dropdown.</div>' +
+    '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #334155;">' +
+    '<span class="lbl">Wildcards (text filters):</span><br>' +
+    '<code>%</code> matches any sequence of characters<br>' +
+    '<code>_</code> matches a single character</div>' +
+    '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #334155;">' +
+    '<span class="lbl">Examples:</span><br>' +
+    '<code>BIKE%</code> — starts with BIKE<br>' +
+    '<code>%Pty Ltd</code> — ends with Pty Ltd</div>';
+  btn.addEventListener('mouseenter', e => tipShow(e, html));
+  btn.addEventListener('mouseleave', tipHide);
+  btn.addEventListener('focus', e => tipShow(e, html));
+  btn.addEventListener('blur', tipHide);
+}
+
+/* ── AUTO-APPLY ── */
+function autoApply() {
+  if (!_custList.length) return;   // dropdowns still populating; init() runs the first query
+  loadData();
+}
+function wireAutoApply() {
+  _FILTER_INPUTS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('change', autoApply);
+    if (el.tagName === 'INPUT' && el.type === 'text') {
+      el.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); el.blur(); } });
+    }
+  });
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   DROPDOWN POPULATION
+   ════════════════════════════════════════════════════════════════════════ */
+function _setItems(msId, items) {
+  const api = FBLib.Common.MultiSelect.get(msId);
+  if (api) api.setItems(items);
+}
+
+async function populateCust() {
+  _custList = await qp('SELECT id, name FROM customer ORDER BY name');
+  _setItems('cust-ms', _custList.map(r => ({ value: r.id, label: r.name })));
+}
+async function populateGrp() {
+  _grpList = await qp('SELECT id, name FROM accountgroup ORDER BY name');
+  _setItems('grp-ms', _grpList.map(r => ({ value: r.id, label: r.name })));
+}
+async function populateSal() {
+  _salList = await qp(`
+    SELECT u.id,
+           NULLIF(TRIM(CONCAT(COALESCE(u.firstName,''),' ',COALESCE(u.lastName,''))),'') AS nm,
+           u.userName
+    FROM sysuser u
+    WHERE u.id IN (SELECT DISTINCT defaultSalesmanId FROM customer WHERE defaultSalesmanId IS NOT NULL)
+    ORDER BY 2`);
+  _setItems('sal-ms', _salList.map(r => ({ value: r.id, label: r.nm || r.username })));
+}
+async function populateState() {
+  /* Keyed by stateconst.id, NOT the code: `code` is not unique across
+     countries (NT and WA each appear twice — Northern Territory / Northwest
+     Territories and Washington / Western Australia), so filtering on the code
+     would silently pull in the other country's state. The FK column is
+     `countryConstID`, which breaks the usual fooId -> foo.id convention. */
+  _stateList = await qp(`
+    SELECT s.id, s.code, s.name, c.name AS country
+    FROM stateconst s
+    LEFT JOIN countryconst c ON c.id = s.countryConstID
+    WHERE s.id IN (SELECT DISTINCT stateId FROM address WHERE stateId IS NOT NULL)
+    ORDER BY c.name, s.name`);
+  _setItems('state-ms', _stateList.map(r => ({
+    value: r.id, label: (r.code || r.name), tagLabel: r.code || r.name,
+    sub: r.name + (r.country ? ' — ' + r.country : '')
+  })));
+}
+async function populateCountry() {
+  _countryList = await qp(`
+    SELECT c.id, c.name FROM countryconst c
+    WHERE c.id IN (SELECT DISTINCT countryId FROM address WHERE countryId IS NOT NULL)
+    ORDER BY c.name`);
+  _setItems('country-ms', _countryList.map(r => ({ value: r.id, label: r.name })));
+}
+async function populatePt() {
+  _ptList = await qp('SELECT id, name FROM paymentterms ORDER BY name');
+  _setItems('pt-ms', _ptList.map(r => ({ value: r.id, label: r.name })));
+}
+async function populatePri() {
+  _priList = await qp('SELECT id, name FROM priority ORDER BY id');
+  _setItems('pri-ms', _priList.map(r => ({ value: r.id, label: r.name })));
+}
+async function populateQb() {
+  _qbList = await qp('SELECT id, name FROM qbclass ORDER BY name');
+  _setItems('qb-ms', _qbList.map(r => ({ value: r.id, label: r.name })));
+}
+
+/* ── CUSTOM FIELDS ──
+   Active customer CFs become optional columns (hidden by default) and the
+   value filter's field list. Values are read with Fishbowl's
+   CustomFieldByName() SQL function against customer.customFields. */
+async function loadCustomFields() {
+  try {
+    const rows = await qp(`
+      SELECT cf.name, cf.sortOrder
+      FROM tablereference tr
+      JOIN customfield cf ON cf.tableId = tr.tableId
+      WHERE tr.tableRefName = 'customer' AND cf.activeFlag = 1
+      ORDER BY cf.sortOrder, cf.name`);
+    rows.forEach(r => {
+      const name = r.name || '';
+      if (!name) return;
+      const key = 'cf_' + name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+      if (!_columns.find(c => c.key === key)) {
+        _columns.push({ key, label: 'CF: ' + name, vis: false, cfField: name, truncate: true });
+      }
+      if (!_cfNames.includes(name)) _cfNames.push(name);
+    });
+  } catch (e) { console.warn('Custom fields unavailable:', e.message || e); }
+}
+
+/* ── MULTI-SELECT (FBLib.Common.MultiSelect) ──
+   The _sel* Sets stay the single source of truth for buildSQL + persistence;
+   onChange only syncs them (always .clear()+.add(), never reassigned after
+   create). onClose → autoApply keeps the query-once-per-dropdown-session
+   semantics — onChange fires per checkbox, so never query there. */
+function _createFilterMS() {
+  const defs = [
+    { id: 'status-ms',  sel: _selStatus,  ph: 'All statuses', items: STATUS_LIST.map(s => ({ value: s.id, label: s.label })) },
+    { id: 'cust-ms',    sel: _selCust,    ph: 'All customers' },
+    { id: 'grp-ms',     sel: _selGrp,     ph: 'All groups' },
+    { id: 'sal-ms',     sel: _selSal,     ph: 'All sales people' },
+    { id: 'state-ms',   sel: _selState,   ph: 'All states' },
+    { id: 'country-ms', sel: _selCountry, ph: 'All countries' },
+    { id: 'pt-ms',      sel: _selPt,      ph: 'All terms' },
+    { id: 'pri-ms',     sel: _selPri,     ph: 'All priorities' },
+    { id: 'qb-ms',      sel: _selQb,      ph: 'All classes' },
+    { id: 'cf-ms',      sel: _selCf,      ph: 'Select fields', items: _cfNames.map(n => ({ value: n, label: n })) },
+  ];
+  defs.forEach(d => FBLib.Common.MultiSelect.create({
+    containerId: d.id,
+    items: d.items || [],            // async lists arrive via setItems in populate*()
+    selected: [...d.sel],
+    placeholder: d.ph,
+    flipUp: true,
+    onClose: function () { if (d.id === 'cf-ms') { buildColPanel(); } autoApply(); },
+    onChange: function (vals) { d.sel.clear(); vals.forEach(v => d.sel.add(String(v))); }
+  }));
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   QUERY
+   ════════════════════════════════════════════════════════════════════════ */
+function buildSQL() {
+  const cfSelects = _columns
+    .filter(c => c.cfField)
+    .map(c => `,\n  CustomFieldByName(c.customFields, '${escSQL(c.cfField)}') AS \`${c.key}\``)
+    .join('');
+
+  const where = [];
+
+  if (_selStatus.size) {
+    const ids = [..._selStatus].map(v => parseInt(v, 10)).filter(n => !isNaN(n));
+    if (ids.length) where.push(`c.statusId IN (${ids.join(',')})`);
+  }
+  const act = document.getElementById('filterActive').value;
+  if (act === '1') where.push('c.activeFlag = 1');
+  else if (act === '0') where.push('c.activeFlag = 0');
+
+  if (_selCust.size) {
+    const ids = [..._selCust].map(v => parseInt(v, 10)).filter(n => !isNaN(n));
+    if (ids.length) where.push(`c.id IN (${ids.join(',')})`);
+  }
+  if (_selGrp.size) {
+    const ids = [..._selGrp].map(v => parseInt(v, 10)).filter(n => !isNaN(n));
+    if (ids.length) {
+      where.push(`EXISTS (SELECT 1 FROM accountgrouprelation agx
+                          WHERE agx.accountId = c.accountId AND agx.groupId IN (${ids.join(',')}))`);
+    }
+  }
+  if (_selSal.size) {
+    const ids = [..._selSal].map(v => parseInt(v, 10)).filter(n => !isNaN(n));
+    if (ids.length) where.push(`c.defaultSalesmanId IN (${ids.join(',')})`);
+  }
+  if (_selState.size) {
+    const ids = [..._selState].map(v => parseInt(v, 10)).filter(n => !isNaN(n));
+    if (ids.length) where.push(`a.stateId IN (${ids.join(',')})`);
+  }
+  if (_selCountry.size) {
+    const ids = [..._selCountry].map(v => parseInt(v, 10)).filter(n => !isNaN(n));
+    if (ids.length) where.push(`a.countryId IN (${ids.join(',')})`);
+  }
+  if (_selPt.size) {
+    const ids = [..._selPt].map(v => parseInt(v, 10)).filter(n => !isNaN(n));
+    if (ids.length) where.push(`c.defaultPaymentTermsId IN (${ids.join(',')})`);
+  }
+  if (_selPri.size) {
+    const ids = [..._selPri].map(v => parseInt(v, 10)).filter(n => !isNaN(n));
+    if (ids.length) where.push(`c.defaultPriorityId IN (${ids.join(',')})`);
+  }
+  if (_selQb.size) {
+    const ids = [..._selQb].map(v => parseInt(v, 10)).filter(n => !isNaN(n));
+    if (ids.length) where.push(`c.qbClassId IN (${ids.join(',')})`);
+  }
+
+  const like = (id, expr) => {
+    const v = (document.getElementById(id).value || '').trim();
+    if (!v) return;
+    // A term with no wildcard of its own is treated as "contains" — that is
+    // what people mean when they type a fragment into a filter box.
+    const pat = /[%_]/.test(v) ? v : '%' + v + '%';
+    where.push(`${expr} LIKE '${escSQL(pat)}'`);
+  };
+  like('filterName', 'c.name');
+  like('filterAcct', 'c.number');
+  like('filterCity', 'a.city');
+  like('filterNote', 'c.note');
+
+  const lastOrd = safeDate(document.getElementById('filterLastOrder').value);
+  if (lastOrd) {
+    // "on or before" includes a customer that has never ordered — that is the
+    // dormant end of the same question.
+    where.push(`(so_last.lastdate IS NULL OR DATE(so_last.lastdate) <= '${lastOrd}')`);
+  }
+
+  const exposure = document.getElementById('filterExposure').value;
+  if (exposure === 'open')   where.push('COALESCE(so_open.n, 0) > 0');
+  if (exposure === 'noopen') where.push('COALESCE(so_open.n, 0) = 0');
+  if (exposure === 'never')  where.push('so_last.lastdate IS NULL');
+
+  // Custom-field value filter — OR across every ticked field.
+  const cfVal = (document.getElementById('filterCfValue').value || '').trim();
+  if (cfVal && _selCf.size) {
+    const pat = /[%_]/.test(cfVal) ? cfVal : '%' + cfVal + '%';
+    const ors = [..._selCf].map(n => `CustomFieldByName(c.customFields, '${escSQL(n)}') LIKE '${escSQL(pat)}'`);
+    where.push('(' + ors.join(' OR ') + ')');
+  }
+
+  const whereSql = where.length ? 'WHERE ' + where.join('\n  AND ') : '';
+
+  /* The default address, resolved ONCE per account.
+
+     Two traps live in this join:
+      1. defaultFlag is per address TYPE, so an account can legitimately carry
+         several default addresses (a default Ship To AND a default Bill To AND
+         a Main Office). Picking MIN(id) would hand back whichever happened to
+         be created first.
+      2. The Customer import demands a complete address on every row even when
+         the only column being changed is Status, and it wants the customer's
+         main/default one.
+     So the preference is: a DEFAULT Main Office → any default → a Main Office →
+     anything. GROUP_CONCAT + SUBSTRING_INDEX is an argmin: the concat may be
+     truncated at group_concat_max_len, but only ever at the tail, and we read
+     the head. addresstype ids differ per install (Main Office is 50 here, not
+     10), so the type is matched on its NAME, never a hard-coded id. */
+  const sql = `
+SELECT
+  c.id                                            AS customerid,
+  c.accountId                                     AS accountid,
+  c.name                                          AS customer,
+  c.number                                        AS acctnum,
+  c.statusId                                      AS statusid,
+  cs.name                                         AS status,
+  CASE WHEN c.activeFlag THEN 'Active' ELSE 'Inactive' END AS active,
+  pc.name                                         AS parent,
+  grp.groupnames                                  AS custgroup,
+  NULLIF(TRIM(CONCAT(COALESCE(su.firstName,''),' ',COALESCE(su.lastName,''))),'') AS salesman,
+  pt.name                                         AS paymentterms,
+  pr.name                                         AS priority,
+  cur.code                                        AS currency,
+  tr.name                                         AS taxcode,
+  isu.name                                        AS issuable,
+  car.name                                        AS carrier,
+  stm.name                                        AS shipterms,
+  qb.name                                         AS qbclass,
+  c.creditLimit                                   AS creditlimit,
+  CASE WHEN c.taxExempt THEN 'Yes' ELSE 'No' END  AS taxexempt,
+  c.url                                           AS url,
+  c.note                                          AS alertnote,
+  DATE(c.dateCreated)                             AS datecreated,
+  DATE(c.dateLastModified)                        AS datemodified,
+  a.id                                            AS addrid,
+  a.name                                          AS addrname,
+  a.addressName                                   AS addrcontact,
+  a.typeID                                        AS addrtypeid,
+  at.name                                         AS addrtype,
+  CASE WHEN a.defaultFlag THEN 1 ELSE 0 END       AS addrdefault,
+  a.address                                       AS street,
+  a.city                                          AS city,
+  COALESCE(sc.code, sc.name)                      AS state,
+  a.zip                                           AS zip,
+  co.name                                         AS country,
+  CASE WHEN a.residentialFlag THEN 'true' ELSE 'false' END AS residential,
+  ct.email                                        AS email,
+  ct.phone                                        AS phone,
+  COALESCE(so_open.n, 0)                          AS openorders,
+  COALESCE(so_open.v, 0)                          AS openvalue,
+  COALESCE(so_done.n, 0)                          AS completedorders,
+  COALESCE(so_done.v, 0)                          AS completedvalue,
+  DATE(so_last.lastdate)                          AS lastorder,
+  DATEDIFF(CURDATE(), DATE(so_last.lastdate))     AS dayssince,
+  COALESCE(dup.n, 1)                              AS namecount${cfSelects}
+FROM customer c
+LEFT JOIN customerstatus  cs  ON cs.id  = c.statusId
+LEFT JOIN customer        pc  ON pc.id  = c.parentId
+LEFT JOIN sysuser         su  ON su.id  = c.defaultSalesmanId
+LEFT JOIN paymentterms    pt  ON pt.id  = c.defaultPaymentTermsId
+LEFT JOIN priority        pr  ON pr.id  = c.defaultPriorityId
+LEFT JOIN currency        cur ON cur.id = c.currencyId
+LEFT JOIN taxrate         tr  ON tr.id  = c.taxRateId
+LEFT JOIN issuablestatus  isu ON isu.id = c.issuableStatusId
+LEFT JOIN carrier         car ON car.id = c.defaultCarrierId
+LEFT JOIN shipterms       stm ON stm.id = c.defaultShipTermsId
+LEFT JOIN qbclass         qb  ON qb.id  = c.qbClassId
+LEFT JOIN (
+    SELECT agr.accountId, GROUP_CONCAT(DISTINCT ag.name ORDER BY ag.name SEPARATOR '; ') AS groupnames
+    FROM accountgrouprelation agr
+    JOIN accountgroup ag ON ag.id = agr.groupId
+    GROUP BY agr.accountId
+) grp ON grp.accountId = c.accountId
+LEFT JOIN (
+    SELECT x.accountId,
+           CAST(SUBSTRING_INDEX(GROUP_CONCAT(x.id ORDER BY
+                 CASE WHEN x.defaultFlag AND atx.name LIKE '%Main%' THEN 0
+                      WHEN x.defaultFlag                            THEN 1
+                      WHEN atx.name LIKE '%Main%'                   THEN 2
+                      ELSE 3 END,
+                 x.id), ',', 1) AS UNSIGNED) AS addrid
+    FROM address x
+    LEFT JOIN addresstype atx ON atx.id = x.typeID
+    GROUP BY x.accountId
+) da ON da.accountId = c.accountId
+LEFT JOIN address     a  ON a.id  = da.addrid
+LEFT JOIN addresstype at ON at.id = a.typeID
+LEFT JOIN stateconst  sc ON sc.id = a.stateId
+LEFT JOIN countryconst co ON co.id = a.countryId
+LEFT JOIN (
+    SELECT k.accountId,
+           MAX(CASE WHEN k.typeId = 60 THEN k.datus END) AS email,
+           MAX(CASE WHEN k.typeId IN (50,20,30,10) THEN k.datus END) AS phone
+    FROM contact k
+    WHERE k.datus IS NOT NULL AND k.datus <> ''
+    GROUP BY k.accountId
+) ct ON ct.accountId = c.accountId
+LEFT JOIN (
+    SELECT s.customerId, COUNT(*) n, SUM(s.totalPrice) v
+    FROM so s WHERE s.statusId IN (20,25) GROUP BY s.customerId
+) so_open ON so_open.customerId = c.id
+LEFT JOIN (
+    SELECT s.customerId, COUNT(*) n, SUM(s.totalPrice) v
+    FROM so s WHERE s.statusId IN (60,70) GROUP BY s.customerId
+) so_done ON so_done.customerId = c.id
+LEFT JOIN (
+    SELECT s.customerId, MAX(COALESCE(s.dateIssued, s.dateCreated)) lastdate
+    FROM so s WHERE s.statusId NOT IN (80,85) GROUP BY s.customerId
+) so_last ON so_last.customerId = c.id
+LEFT JOIN (
+    SELECT name, COUNT(*) n FROM customer GROUP BY name HAVING COUNT(*) > 1
+) dup ON dup.name = c.name
+${whereSql}
+ORDER BY c.name
+LIMIT 10000`;
+  return sql;
+}
+
+async function loadData() {
+  if (_pending.size && !confirm(
+      'You have ' + _pending.size + ' unsaved status change' + (_pending.size === 1 ? '' : 's') +
+      '.\n\nRefreshing discards ' + (_pending.size === 1 ? 'it' : 'them') + '. Continue?')) return;
+
+  setStatus('Loading...');
+  showSpinner();
+  const t0 = Date.now();
+  try {
+    _dataset = await qp(buildSQL());
+    _rowById = new Map();
+    _dataset.forEach(r => {
+      r.statusid = parseInt(r.statusid, 10);
+      r.customerid = parseInt(r.customerid, 10);
+      _rowById.set(r.customerid, r);
+    });
+    _pending.clear();
+    _selected.clear();
+    _saveResults.clear();
+    const ms = Date.now() - t0;
+    _statusSuffix = `${_dataset.length.toLocaleString()} customers (${(ms / 1000).toFixed(1)}s)`
+      + (_dataset.length === 10000 ? ' — limit reached, refine filters' : '');
+    setStatus(_statusSuffix);
+    renderChips();
+    renderTable();
+    syncDirtyUi();
+  } catch (e) {
+    setStatus('Error: ' + (e.message || String(e)));
+    console.error(e);
+  } finally {
+    hideSpinner();
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   WRITABILITY
+   ════════════════════════════════════════════════════════════════════════
+   The Customer import keys a row on the customer's NAME, and it insists on a
+   complete address even when the only column changing is Status. Both are
+   things this report can check BEFORE anyone edits anything, so a row that
+   could never be written says so up front rather than failing at save time.
+
+   Duplicate names are the sharp one: with two customers called "Adventure
+   Cyclery", a name-keyed import row is ambiguous and Fishbowl would apply it
+   to whichever it resolved first — silently updating the wrong record. */
+function writeBlocker(row) {
+  if (!_CAN_EDIT) return 'You do not hold the Customer-Edit access right.';
+  if (!_IMPORT_AVAILABLE) return _IMPORT_UNAVAILABLE_MSG;
+  if ((parseInt(row.namecount, 10) || 1) > 1) {
+    return 'Another customer shares the name "' + row.customer + '". The Fishbowl customer import '
+         + 'keys on the name, so a write here could land on the wrong record. Rename one of them '
+         + '(or edit this status in the Customer module) to unblock it.';
+  }
+  if (!row.addrid) {
+    return 'No address on file. The customer import requires the customer’s address on every '
+         + 'row, so there is nothing to send. Add an address in the Customer module first.';
+  }
+  return null;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   TABLE
+   ════════════════════════════════════════════════════════════════════════ */
+function visibleColumns() { return _columns.filter(c => c.vis); }
+
+/* Rows after the chip focus filter — the dataset the table, the totals and
+   the exports all agree on. */
+function focusedRows() {
+  if (_focusStatus == null) return _dataset;
+  return _dataset.filter(r => effectiveStatus(r) === _focusStatus);
+}
+
+/* The status a row currently SHOWS: its pending edit if it has one, else the
+   value that came back from the database. */
+function effectiveStatus(row) {
+  return _pending.has(row.customerid) ? _pending.get(row.customerid) : row.statusid;
+}
+
+function renderTable() {
+  const vis = visibleColumns();
+  if (_viewMode !== 'flat') {
+    _groups = buildGroups(focusedRows());
+  }
+  renderHead(vis);
+  renderBody(vis);
+  renderTotals(vis);
+  applyColWidths(vis);
+  syncBulkBar();
+}
+
+const _SUM_COLS = new Set(['openorders', 'openvalue', 'completedorders', 'completedvalue', 'creditlimit']);
+
+function renderTotals(vis) {
+  const foot = document.getElementById('tFoot');
+  if (!foot) return;
+  foot.innerHTML = '';
+  const rows = focusedRows();
+  if (!rows.length) return;
+
+  const sums = {};
+  _SUM_COLS.forEach(k => sums[k] = 0);
+  rows.forEach(r => _SUM_COLS.forEach(k => { sums[k] += parseFloat(r[k]) || 0; }));
+
+  const tr = document.createElement('tr');
+  const selTd = document.createElement('td');
+  selTd.className = 'sel-cell';
+  tr.appendChild(selTd);
+
+  let labelled = false;
+  vis.forEach(col => {
+    const td = document.createElement('td');
+    if (_SUM_COLS.has(col.key)) {
+      td.className = 'num-cell';
+      td.textContent = col.money ? formatMoney(sums[col.key]) : formatQty(sums[col.key]);
+    } else if (!labelled) {
+      td.textContent = `Total — ${rows.length.toLocaleString()} customer${rows.length === 1 ? '' : 's'}`;
+      labelled = true;
+    }
+    tr.appendChild(td);
+  });
+  foot.appendChild(tr);
+}
+
+function _buildColHeader(vis, topOffset) {
+  const tr = document.createElement('tr');
+  tr.className = 'col-head-row';   // snapshotColWidths reads this row specifically
+
+  const selTh = document.createElement('th');
+  selTh.className = 'sel-head';
+  if (topOffset) selTh.style.top = topOffset;
+  const selAll = document.createElement('input');
+  selAll.type = 'checkbox';
+  selAll.title = 'Select every row currently shown';
+  const shown = focusedRows();
+  selAll.checked = shown.length > 0 && shown.every(r => _selected.has(r.customerid));
+  selAll.addEventListener('click', e => {
+    e.stopPropagation();
+    const all = e.target.checked;
+    shown.forEach(r => { if (all) _selected.add(r.customerid); else _selected.delete(r.customerid); });
+    renderTable();
+  });
+  selTh.appendChild(selAll);
+  tr.appendChild(selTh);
+
+  vis.forEach(col => {
+    const th = document.createElement('th');
+    th.textContent = col.label;
+    th.draggable = true;
+    if (topOffset) th.style.top = topOffset;
+    if (col.money || col.qty) th.style.textAlign = 'right';
+    else if (col.date) th.style.textAlign = 'center';
+    if (_sortCol === col.key) th.classList.add('sort-' + _sortDir);
+    th.addEventListener('click', () => sortBy(col.key));
+    th.addEventListener('dragstart', e => {
+      _dragColKey = col.key; setTimeout(() => th.style.opacity = '0.4', 0); e.dataTransfer.effectAllowed = 'move';
+    });
+    th.addEventListener('dragend', () => {
+      _dragColKey = null; th.style.opacity = '';
+      tr.querySelectorAll('th').forEach(h => h.classList.remove('col-drag-over'));
+    });
+    th.addEventListener('dragover', e => {
+      e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+      tr.querySelectorAll('th').forEach(h => h.classList.remove('col-drag-over'));
+      if (_dragColKey && _dragColKey !== col.key) th.classList.add('col-drag-over');
+    });
+    th.addEventListener('dragleave', () => th.classList.remove('col-drag-over'));
+    th.addEventListener('drop', e => {
+      e.preventDefault(); th.classList.remove('col-drag-over');
+      if (!_dragColKey || _dragColKey === col.key) return;
+      const fi = _columns.findIndex(c => c.key === _dragColKey), ti = _columns.findIndex(c => c.key === col.key);
+      if (fi === -1 || ti === -1) return;
+      const [mv] = _columns.splice(fi, 1); _columns.splice(ti, 0, mv); renderTable(); buildColPanel();
+    });
+    addColResizer(th, col);
+    tr.appendChild(th);
+  });
+  return tr;
+}
+
+/* ── COLUMN RESIZING ──
+   The table runs on the browser's AUTOMATIC layout until the user drags a
+   column edge. On that first drag the current rendered widths are snapshotted
+   into a <colgroup> and the table switches to table-layout: fixed — going
+   fixed up front would mean inventing a width for every column, whereas
+   snapshotting what is already on screen makes the switch invisible. */
+const MIN_COL_W = 40;
+let _colWidths = {};
+
+function colWidthsActive() { return Object.keys(_colWidths).length > 0; }
+
+function applyColWidths(vis) {
+  const table = document.getElementById('dataTable');
+  if (!table) return;
+  const old = table.querySelector('colgroup');
+  if (old) old.parentNode.removeChild(old);
+
+  if (!colWidthsActive()) {
+    table.style.tableLayout = '';
+    table.style.width = '';
+    table.classList.remove('cols-fixed');
+    return;
+  }
+  const cg = document.createElement('colgroup');
+  let total = 30;
+  const selCol = document.createElement('col');
+  selCol.style.width = '30px';
+  cg.appendChild(selCol);
+  vis.forEach(col => {
+    const px = _colWidths[col.key] || 110;
+    const c = document.createElement('col');
+    c.style.width = px + 'px';
+    cg.appendChild(c);
+    total += px;
+  });
+  table.insertBefore(cg, table.firstChild);
+  table.style.tableLayout = 'fixed';
+  table.classList.add('cols-fixed');
+  // An explicit total, not 100%: under fixed layout a table wider than the sum
+  // of its columns redistributes the slack, so every drag would nudge the
+  // columns either side of the one being dragged.
+  table.style.width = total + 'px';
+}
+
+function snapshotColWidths(vis) {
+  const ths = document.querySelectorAll('#tHead tr.col-head-row th');
+  if (!ths.length) return;
+  _colWidths = {};
+  // Offset by one: the first th is the pinned select column.
+  vis.forEach((col, i) => {
+    const th = ths[i + 1];
+    _colWidths[col.key] = Math.round(th ? th.offsetWidth : 110) || 110;
+  });
+}
+
+function resetColWidths() {
+  _colWidths = {};
+  renderTable();
+  setStatus('Column widths reset to automatic. ' + _statusSuffix);
+}
+
+function beginColResize(e, col, th) {
+  // Claim the gesture before the header reads it as a sort click or the start
+  // of a column-reorder drag.
+  e.preventDefault();
+  e.stopPropagation();
+
+  const vis = visibleColumns();
+  if (!colWidthsActive()) snapshotColWidths(vis);
+
+  const startX = e.clientX;
+  const startW = _colWidths[col.key] || Math.round(th.offsetWidth) || 110;
+  const wasDraggable = th.draggable;
+  th.draggable = false;
+  document.body.classList.add('col-resizing');
+
+  function onMove(ev) {
+    _colWidths[col.key] = Math.max(MIN_COL_W, Math.round(startW + (ev.clientX - startX)));
+    applyColWidths(vis);
+  }
+  function onUp() {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    document.body.classList.remove('col-resizing');
+    th.draggable = wasDraggable;
+    // mouseup on a header is about to fire a click, which would sort the
+    // column the user was only resizing. Swallow exactly one.
+    const swallow = ev => { ev.stopPropagation(); ev.preventDefault(); };
+    document.addEventListener('click', swallow, true);
+    setTimeout(() => document.removeEventListener('click', swallow, true), 0);
+  }
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+}
+
+function addColResizer(th, col) {
+  const grip = document.createElement('span');
+  grip.className = 'col-resizer';
+  grip.draggable = false;
+  grip.title = 'Drag to resize this column. Double-click to reset every column to automatic width.';
+  grip.addEventListener('mousedown', e => beginColResize(e, col, th));
+  grip.addEventListener('click', e => { e.stopPropagation(); e.preventDefault(); });
+  grip.addEventListener('dragstart', e => { e.stopPropagation(); e.preventDefault(); });
+  grip.addEventListener('dblclick', e => { e.stopPropagation(); e.preventDefault(); resetColWidths(); });
+  th.appendChild(grip);
+}
+
+function renderHead(vis) {
+  const head = document.getElementById('tHead');
+  head.innerHTML = '';
+  if (_viewMode !== 'flat') {
+    head.appendChild(_buildGroupSortRow(vis));
+    head.appendChild(_buildColHeader(vis, '27px'));
+  } else {
+    head.appendChild(_buildColHeader(vis, null));
+  }
+}
+
+/* Group-level sort strip. Real <td>s per column, not one colspan — the group
+   totals have to line up with the data columns underneath them. */
+function _buildGroupSortRow(vis) {
+  const tr = document.createElement('tr');
+  const cells = [
+    { key: '', label: '' },
+    { key: 'groupKey', label: _GROUP_LABEL[_viewMode] || 'Group', span: 1 },
+    { key: 'count', label: 'Customers' },
+    { key: 'totalOpen', label: 'Open Value' },
+    { key: 'totalDone', label: 'Completed Value' },
+  ];
+  cells.forEach((c, i) => {
+    const th = document.createElement('th');
+    th.style.cssText = 'top:0; height:27px; font-size:10.5px; text-transform:uppercase; letter-spacing:0.04em; cursor:pointer;';
+    th.textContent = c.label;
+    if (i === 1) th.colSpan = Math.max(1, vis.length - 3);
+    if (c.key) {
+      if (_grpSortCol === c.key) th.classList.add('sort-' + _grpSortDir);
+      th.addEventListener('click', () => grpSortBy(c.key));
+    }
+    tr.appendChild(th);
+  });
+  return tr;
+}
+
+const _GROUP_LABEL = {
+  bystatus: 'Status', bygroup: 'Customer Group', bysalesman: 'Sales Person', bystate: 'State'
+};
+
+function renderBody(vis) {
+  const tbody = document.getElementById('tBody');
+  tbody.innerHTML = '';
+  const colspan = vis.length + 1;
+
+  if (_viewMode !== 'flat') {
+    const groups = sortedGroups();
+    if (!groups.length) {
+      tbody.innerHTML = `<tr><td style="padding:2rem;color:#9ca3af;text-align:center;" colspan="${colspan}">No customers match the current filters.</td></tr>`;
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    groups.forEach(g => {
+      frag.appendChild(buildGroupHeader(g, vis));
+      if (_expanded.has(g.groupKey)) {
+        sortedRows(g.items).forEach((row, idx) => {
+          const tr = buildItemRow(row, vis);
+          tr.classList.add('item-row');
+          if (idx % 2 === 1) tr.classList.add('even-item');
+          frag.appendChild(tr);
+        });
+      }
+    });
+    tbody.appendChild(frag);
+    return;
+  }
+
+  _visRows = sortedRows(focusedRows());
+  _renderOffset = 0;
+  if (!_visRows.length) {
+    tbody.innerHTML = `<tr><td style="padding:2rem;color:#9ca3af;text-align:center;" colspan="${colspan}">No customers match the current filters.</td></tr>`;
+    return;
+  }
+  appendChunk(vis, tbody);
+}
+
+function buildItemRow(row, vis) {
+  const tr = document.createElement('tr');
+  const blocker = writeBlocker(row);
+  if (blocker) tr.classList.add('not-writable');
+
+  /* ── select cell ── */
+  const selTd = document.createElement('td');
+  selTd.className = 'sel-cell';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = _selected.has(row.customerid);
+  cb.disabled = !!blocker;
+  if (blocker) cb.title = blocker;
+  cb.addEventListener('change', () => {
+    if (cb.checked) _selected.add(row.customerid); else _selected.delete(row.customerid);
+    syncBulkBar();
+    // Repaint only the header's select-all tri-state, not the whole table —
+    // re-rendering here would drop the user's scroll position mid-tick.
+    const hdr = document.querySelector('#tHead tr.col-head-row th.sel-head input');
+    if (hdr) {
+      const shown = focusedRows();
+      hdr.checked = shown.length > 0 && shown.every(r => _selected.has(r.customerid));
+    }
+  });
+  selTd.appendChild(cb);
+  tr.appendChild(selTd);
+
+  /* ── data cells ── */
+  vis.forEach(col => {
+    const td = document.createElement('td');
+    const raw = row[col.key];
+
+    if (col.edit === 'status') {
+      buildStatusCell(td, row, blocker);
+    } else if (col.link) {
+      if (raw) {
+        const a = document.createElement('a');
+        a.className = 'row-link'; a.href = '#'; a.textContent = raw;
+        a.addEventListener('click', e => { e.preventDefault(); openModule(col.link, raw); });
+        td.appendChild(a);
+        if (blocker) {
+          const lock = document.createElement('span');
+          lock.className = 'lock-ico';
+          lock.textContent = '⚠';
+          lock.addEventListener('mouseenter', e => tipShow(e, '<span class="lbl">Not editable here</span><br>' + escHtml(blocker)));
+          lock.addEventListener('mouseleave', tipHide);
+          td.appendChild(lock);
+        }
+      }
+    } else if (col.date) {
+      td.textContent = raw ? formatDate(String(raw)) : '';
+    } else if (col.money) {
+      td.className = 'num-cell'; td.textContent = raw != null ? formatMoney(parseFloat(raw)) : '';
+    } else if (col.qty) {
+      td.className = 'num-cell'; td.textContent = raw != null ? formatQty(parseFloat(raw)) : '';
+    } else if (col.truncate) {
+      td.className = 'desc-cell'; td.textContent = raw ?? ''; if (raw) td.title = raw;
+    } else {
+      td.textContent = raw ?? '';
+    }
+    tr.appendChild(td);
+  });
+  return tr;
+}
+
+/* The editable Status cell. Read-only rows still render a select so the column
+   keeps one shape — it is simply disabled and carries the reason. */
+function buildStatusCell(td, row, blocker) {
+  const cur = effectiveStatus(row);
+  const dirty = _pending.has(row.customerid);
+  const sel = document.createElement('select');
+  sel.className = 'st-sel ' + (STATUS_MAP[cur] ? STATUS_MAP[cur].cls : '');
+  sel.disabled = !!blocker || _saving;
+  if (blocker) sel.title = blocker;
+  STATUS_LIST.forEach(s => {
+    const o = document.createElement('option');
+    o.value = s.id; o.textContent = s.label;
+    if (s.id === cur) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.addEventListener('click', e => e.stopPropagation());   // never toggles a group header
+  sel.addEventListener('change', () => {
+    setPending(row.customerid, parseInt(sel.value, 10));
+    // Repaint this cell in place so the row does not jump under the cursor.
+    td.innerHTML = '';
+    buildStatusCell(td, row, blocker);
+    td.classList.toggle('cell-dirty', _pending.has(row.customerid));
+  });
+  td.appendChild(sel);
+
+  if (dirty) {
+    const from = document.createElement('span');
+    from.className = 'dirty-from';
+    from.textContent = 'was ' + (STATUS_MAP[row.statusid] ? STATUS_MAP[row.statusid].label : row.statusid);
+    td.appendChild(from);
+  }
+  td.classList.toggle('cell-dirty', dirty);
+
+  const res = _saveResults.get(row.customerid);
+  if (res && !res.ok) {
+    const warn = document.createElement('span');
+    warn.className = 'lock-ico';
+    warn.textContent = '⚠';
+    warn.addEventListener('mouseenter', e => tipShow(e, '<span class="lbl">Last save failed</span><br>' + escHtml(res.msg)));
+    warn.addEventListener('mouseleave', tipHide);
+    td.appendChild(warn);
+  }
+}
+
+function appendChunk(vis, tbody) {
+  const slice = _visRows.slice(_renderOffset, _renderOffset + CHUNK_SIZE);
+  if (!slice.length) return;
+  const frag = document.createDocumentFragment();
+  slice.forEach(row => frag.appendChild(buildItemRow(row, vis)));
+  tbody.appendChild(frag);
+  _renderOffset += slice.length;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   PENDING EDITS
+   ════════════════════════════════════════════════════════════════════════ */
+function setPending(customerId, statusId) {
+  const row = _rowById.get(customerId);
+  if (!row) return;
+  // Setting a row back to the value it already holds is not a change.
+  if (statusId === row.statusid) _pending.delete(customerId);
+  else _pending.set(customerId, statusId);
+  _saveResults.delete(customerId);
+  syncDirtyUi();
+}
+
+function syncDirtyUi() {
+  const n = _pending.size;
+  document.getElementById('dirtyCount').textContent = n;
+  document.getElementById('dirtyPill').classList.toggle('open', n > 0);
+  const btn = document.getElementById('reviewBtn');
+  if (btn) btn.classList.toggle('active', n > 0);
+  renderChips();
+}
+
+function discardAllPending() {
+  if (!_pending.size) return;
+  if (typeof confirm === 'function' &&
+      !confirm('Discard all ' + _pending.size + ' pending status change(s)?')) return;
+  _pending.clear();
+  _saveResults.clear();
+  syncDirtyUi();
+  renderTable();
+  renderReviewDrawer();
+}
+
+function discardOne(customerId) {
+  _pending.delete(customerId);
+  _saveResults.delete(customerId);
+  syncDirtyUi();
+  renderTable();
+  renderReviewDrawer();
+}
+
+/* ── BULK ── */
+function buildStatusSelectOptions() {
+  const sel = document.getElementById('bulkStatus');
+  sel.innerHTML = '';
+  STATUS_LIST.forEach(s => sel.appendChild(mkOpt(s.id, s.label)));
+}
+
+function syncBulkBar() {
+  const bar = document.getElementById('bulkBar');
+  document.getElementById('bulkCount').textContent = _selected.size;
+  bar.classList.toggle('open', _selected.size > 0);
+}
+
+function clearSelection() {
+  _selected.clear();
+  renderTable();
+}
+
+function applyBulkStatus() {
+  const target = parseInt(document.getElementById('bulkStatus').value, 10);
+  if (isNaN(target)) return;
+  let n = 0, skipped = 0;
+  _selected.forEach(id => {
+    const row = _rowById.get(id);
+    if (!row) return;
+    if (writeBlocker(row)) { skipped++; return; }
+    setPending(id, target);
+    n++;
+  });
+  renderTable();
+  const lbl = STATUS_MAP[target] ? STATUS_MAP[target].label : target;
+  showToast(`${n} customer(s) staged as ${lbl}${skipped ? ` — ${skipped} skipped (not writable)` : ''}. Nothing is saved yet.`,
+            skipped ? 'warn' : 'info', 5000);
+}
+
+/* ── STATUS FOCUS CHIPS ── */
+function renderChips() {
+  const host = document.getElementById('chipHost');
+  if (!host) return;
+  host.innerHTML = '';
+  const counts = {};
+  STATUS_LIST.forEach(s => counts[s.id] = 0);
+  _dataset.forEach(r => { const s = effectiveStatus(r); if (counts[s] != null) counts[s]++; });
+
+  const mkChip = (label, count, statusId, tone) => {
+    const el = document.createElement('span');
+    el.className = 'stat-badge kpi ' + tone + (_focusStatus === statusId ? ' active' : '');
+    el.innerHTML = `<span class="stat-number">${count.toLocaleString()}</span><span class="stat-label">${escHtml(label)}</span><span class="kpi-x">&times;</span>`;
+    el.title = statusId == null ? 'Show every status' : 'Show only ' + label;
+    el.addEventListener('click', () => {
+      _focusStatus = (_focusStatus === statusId) ? null : statusId;
+      _expanded.clear();
+      renderChips();
+      renderTable();
+      setStatus(_focusStatus == null ? _statusSuffix
+        : `${focusedRows().length.toLocaleString()} of ${_dataset.length.toLocaleString()} shown — ${STATUS_MAP[_focusStatus].label}`);
+    });
+    host.appendChild(el);
+  };
+
+  mkChip('All', _dataset.length, null, 'total');
+  STATUS_LIST.forEach(s => {
+    const tone = s.id === 20 ? 'ready' : s.id === 10 ? 'info' : s.id === 50 ? 'missing' : 'issues';
+    mkChip(s.label, counts[s.id], s.id, tone);
+  });
+
+  const holds = _dataset.filter(r => isHold(effectiveStatus(r))).length;
+  const sep = document.createElement('span');
+  sep.style.cssText = 'width:1px;height:20px;background:#E3E3E3;';
+  host.appendChild(sep);
+  const hint = document.createElement('span');
+  hint.className = 'rv-hint';
+  hint.textContent = holds
+    ? `${holds} customer${holds === 1 ? '' : 's'} on hold`
+    : 'No customers on hold';
+  host.appendChild(hint);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   GROUPING
+   ════════════════════════════════════════════════════════════════════════ */
+function groupKeyFor(row) {
+  switch (_viewMode) {
+    case 'bystatus': {
+      const s = effectiveStatus(row);
+      return STATUS_MAP[s] ? STATUS_MAP[s].label : String(s);
+    }
+    case 'bygroup':    return row.custgroup || '(no group)';
+    case 'bysalesman': return row.salesman || '(no sales person)';
+    case 'bystate':    return row.state || '(no state)';
+    default:           return '';
+  }
+}
+
+function buildGroups(data) {
+  const map = new Map();
+  data.forEach(row => {
+    const key = groupKeyFor(row);
+    if (!map.has(key)) map.set(key, { groupKey: key, items: [], count: 0, totalOpen: 0, totalDone: 0, holds: 0 });
+    const g = map.get(key);
+    g.items.push(row);
+    g.count++;
+    g.totalOpen += parseFloat(row.openvalue) || 0;
+    g.totalDone += parseFloat(row.completedvalue) || 0;
+    if (isHold(effectiveStatus(row))) g.holds++;
+  });
+  return [...map.values()];
+}
+
+function sortedGroups() {
+  if (!_grpSortCol) {
+    // Default order: By Status follows the status ladder (Normal → Hold All),
+    // everything else is alphabetical.
+    if (_viewMode === 'bystatus') {
+      const order = {};
+      STATUS_LIST.forEach((s, i) => order[s.label] = i);
+      return [..._groups].sort((a, b) => (order[a.groupKey] ?? 99) - (order[b.groupKey] ?? 99));
+    }
+    return [..._groups].sort((a, b) => naturalCompare(a.groupKey, b.groupKey));
+  }
+  const numeric = new Set(['count', 'totalOpen', 'totalDone']);
+  return [..._groups].sort((a, b) => {
+    let va = a[_grpSortCol], vb = b[_grpSortCol];
+    if (numeric.has(_grpSortCol)) {
+      va = parseFloat(va) || 0; vb = parseFloat(vb) || 0;
+      return (va < vb ? -1 : va > vb ? 1 : 0) * (_grpSortDir === 'asc' ? 1 : -1);
+    }
+    return naturalCompare(va, vb) * (_grpSortDir === 'asc' ? 1 : -1);
+  });
+}
+
+function buildGroupHeader(g, vis) {
+  const tr = document.createElement('tr');
+  tr.className = 'grp-hdr';
+  const expanded = _expanded.has(g.groupKey);
+
+  // Identity cell spans the select column plus every data column up to the
+  // three trailing summary cells, so the totals land under the same columns
+  // the sort strip labels. Row width must come to vis.length + 1 (the pinned
+  // select column) — (vis.length - 2) + 3 does.
+  const idTd = document.createElement('td');
+  idTd.colSpan = Math.max(1, vis.length - 2);
+  const inner = document.createElement('div');
+  inner.className = 'grp-hdr-inner';
+  const tog = document.createElement('span');
+  tog.className = 'grp-toggle';
+  tog.textContent = expanded ? '▼' : '▶';
+  const id = document.createElement('span');
+  id.className = 'grp-id';
+  id.textContent = g.groupKey;
+  // The customer count has its own trailing column under the sort strip, so
+  // the inline meta carries only what that column cannot: how much of the
+  // group is on hold. In By-Status that is all-or-nothing, so it is omitted.
+  const meta = document.createElement('span');
+  meta.className = 'grp-meta';
+  meta.textContent = (g.holds && _viewMode !== 'bystatus')
+    ? g.holds + ' on hold'
+    : '';
+  inner.appendChild(tog); inner.appendChild(id); inner.appendChild(meta);
+  idTd.appendChild(inner);
+  tr.appendChild(idTd);
+
+  const mkTotal = (txt) => {
+    const td = document.createElement('td');
+    td.className = 'num-cell';
+    const s = document.createElement('span');
+    s.className = 'grp-total';
+    s.textContent = txt;
+    td.appendChild(s);
+    tr.appendChild(td);
+  };
+  mkTotal(String(g.count));
+  mkTotal(formatMoney(g.totalOpen));
+  mkTotal(formatMoney(g.totalDone));
+
+  tr.addEventListener('click', () => {
+    if (_expanded.has(g.groupKey)) _expanded.delete(g.groupKey); else _expanded.add(g.groupKey);
+    renderBody(visibleColumns());
+  });
+  return tr;
+}
+
+function grpSortBy(key) {
+  _grpSortDir = (_grpSortCol === key && _grpSortDir === 'asc') ? 'desc' : 'asc';
+  _grpSortCol = key;
+  renderTable();
+}
+function expandAll() { _groups.forEach(g => _expanded.add(g.groupKey)); renderBody(visibleColumns()); }
+function collapseAll() { _expanded.clear(); renderBody(visibleColumns()); }
+
+function setViewMode(mode) {
+  _viewMode = mode;
+  const sel = document.getElementById('viewModeSelect');
+  if (sel) sel.value = mode;
+  document.getElementById('expandBtnGroup').classList.toggle('hidden', mode === 'flat');
+  _expanded.clear();
+  renderTable();
+}
+
+/* ── SORTING ── */
+function naturalCompare(a, b) {
+  const re = /(\d+)|(\D+)/g;
+  const ax = String(a ?? '').match(re) || [];
+  const bx = String(b ?? '').match(re) || [];
+  const len = Math.max(ax.length, bx.length);
+  for (let i = 0; i < len; i++) {
+    const an = ax[i] ?? '', bn = bx[i] ?? '';
+    const ad = /^\d+$/.test(an), bd = /^\d+$/.test(bn);
+    if (ad && bd) { const n = parseInt(an, 10) - parseInt(bn, 10); if (n) return n; }
+    else { const n = an.toLowerCase().localeCompare(bn.toLowerCase()); if (n) return n; }
+  }
+  return 0;
+}
+
+const _NATURAL_SORT_KEYS = new Set(['customer', 'acctnum', 'parent', 'zip', 'phone']);
+
+function sortedRows(rows) {
+  if (!_sortCol) return rows;
+  const col = _columns.find(c => c.key === _sortCol);
+  return [...rows].sort((a, b) => {
+    // The Status column sorts on the status LADDER, and on what the row
+    // currently shows — sorting a staged "Hold All" back under "Normal"
+    // because the database still says Normal would be actively misleading.
+    if (_sortCol === 'status') {
+      const va = effectiveStatus(a), vb = effectiveStatus(b);
+      return (va < vb ? -1 : va > vb ? 1 : 0) * (_sortDir === 'asc' ? 1 : -1);
+    }
+    let va = a[_sortCol], vb = b[_sortCol];
+    if (col && (col.money || col.qty)) {
+      va = parseFloat(va) || 0; vb = parseFloat(vb) || 0;
+      return (va < vb ? -1 : va > vb ? 1 : 0) * (_sortDir === 'asc' ? 1 : -1);
+    }
+    if (_NATURAL_SORT_KEYS.has(_sortCol)) return naturalCompare(va, vb) * (_sortDir === 'asc' ? 1 : -1);
+    va = (va ?? '').toString().toLowerCase(); vb = (vb ?? '').toString().toLowerCase();
+    return (va < vb ? -1 : va > vb ? 1 : 0) * (_sortDir === 'asc' ? 1 : -1);
+  });
+}
+
+function sortBy(key) {
+  _sortDir = _sortCol === key ? (_sortDir === 'asc' ? 'desc' : 'asc') : 'asc';
+  _sortCol = key;
+  renderTable();
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   COLUMN PANEL
+   ════════════════════════════════════════════════════════════════════════ */
+function buildColPanel() {
+  const list = document.getElementById('colList');
+  list.innerHTML = '';
+  _columns.forEach((col, i) => {
+    const div = document.createElement('div');
+    div.className = 'col-row';
+    div.draggable = true;
+    div.dataset.idx = i;
+
+    const handle = document.createElement('span');
+    handle.className = 'drag-handle';
+    handle.innerHTML = '<svg width="12" height="10" viewBox="0 0 12 10" fill="currentColor"><rect y="0" width="12" height="2" rx="1"/><rect y="4" width="12" height="2" rx="1"/><rect y="8" width="12" height="2" rx="1"/></svg>';
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = col.vis; cb.id = 'cv_' + col.key;
+    cb.addEventListener('change', () => { col.vis = cb.checked; renderTable(); });
+
+    const lbl = document.createElement('label');
+    lbl.htmlFor = cb.id; lbl.textContent = col.label;
+
+    div.appendChild(handle); div.appendChild(cb); div.appendChild(lbl);
+
+    div.addEventListener('dragstart', e => {
+      _dragIdx = i; setTimeout(() => div.classList.add('dragging'), 0); e.dataTransfer.effectAllowed = 'move';
+    });
+    div.addEventListener('dragend', () => {
+      _dragIdx = null; div.classList.remove('dragging');
+      list.querySelectorAll('.col-row').forEach(r => r.classList.remove('drag-over'));
+    });
+    div.addEventListener('dragover', e => {
+      e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+      list.querySelectorAll('.col-row').forEach(r => r.classList.remove('drag-over'));
+      if (_dragIdx !== null && _dragIdx !== i) div.classList.add('drag-over');
+    });
+    div.addEventListener('dragleave', () => div.classList.remove('drag-over'));
+    div.addEventListener('drop', e => {
+      e.preventDefault(); div.classList.remove('drag-over');
+      const from = _dragIdx;
+      if (from === null || from === i) return;
+      const [moved] = _columns.splice(from, 1);
+      _columns.splice(i, 0, moved);
+      buildColPanel();
+      renderTable();
+    });
+
+    list.appendChild(div);
+  });
+}
+
+function toggleColPanel() { document.getElementById('colPanel').classList.toggle('hidden'); }
+
+/* ════════════════════════════════════════════════════════════════════════
+   EXPORT
+   ════════════════════════════════════════════════════════════════════════
+   Both exporters take the rows the user is actually looking at (chip focus +
+   sort + grouping order) and the visible columns, with the Status column
+   resolved to what the screen shows — a staged change exports as the staged
+   value, flagged in its own column so nobody mistakes an export for the
+   current state of the database. */
+function exportRows() {
+  const rows = _viewMode !== 'flat'
+    ? sortedGroups().flatMap(g => sortedRows(g.items))
+    : sortedRows(focusedRows());
+  return rows.map(r => {
+    const out = Object.assign({}, r);
+    const eff = effectiveStatus(r);
+    out.status = STATUS_MAP[eff] ? STATUS_MAP[eff].label : String(eff);
+    out.__pending = _pending.has(r.customerid)
+      ? 'UNSAVED (was ' + (STATUS_MAP[r.statusid] ? STATUS_MAP[r.statusid].label : r.statusid) + ')'
+      : '';
+    return out;
+  });
+}
+
+function exportCols() {
+  const cols = visibleColumns().map(c => ({
+    key: c.key,
+    label: c.label,
+    type: c.money ? 'money' : c.date ? 'date' : c.qty ? 'qty' : 'text'
+  }));
+  if (_pending.size) cols.push({ key: '__pending', label: 'Unsaved Change', type: 'text' });
+  return cols;
+}
+
+function exportCSV() {
+  FBLib.Export.csv({
+    cols: exportCols(),
+    rows: exportRows(),
+    filename: 'CustomerStatus_' + FBLib.Export.stamp()
+  });
+}
+
+async function exportXLSX() {
+  try {
+    const rows = exportRows();
+    await FBLib.Export.xlsx({
+      filename: 'CustomerStatus_' + FBLib.Export.stamp(),
+      sheet: {
+        name: 'Customer Status',
+        title: 'Customer Status',
+        subtitle: [
+          rows.length.toLocaleString() + ' customer(s) — ' + new Date().toLocaleString(),
+          _focusStatus == null ? 'All statuses' : 'Focus: ' + STATUS_MAP[_focusStatus].label
+        ],
+        cols: exportCols(),
+        rows: rows,
+        totals: true
+      }
+    });
+  } catch (e) {
+    showToast('Excel export failed: ' + errText(e), 'error', 6000);
+  }
+}
+
+/* ── PRINT ──
+   window.print() on the report itself is unreliable in the Fishbowl client's
+   embedded browser, so the printable view is built as its own document, opened
+   in a new window, and THAT is printed. */
+function printTable() {
+  const vis = visibleColumns();
+  const rows = exportRows();
+  const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const hdrHtml = vis.map(c => `<th>${esc(c.label)}</th>`).join('');
+
+  const bodyHtml = rows.map(row => {
+    const cells = vis.map(col => {
+      const raw = row[col.key];
+      let val;
+      if (col.date) val = raw ? formatDate(String(raw)) : '';
+      else if (col.money) val = raw != null ? formatMoney(parseFloat(raw)) : '';
+      else if (col.qty) val = raw != null ? formatQty(parseFloat(raw)) : '';
+      else val = raw ?? '';
+      const align = (col.money || col.qty) ? ' class="nr"' : '';
+      const mark = (col.edit === 'status' && row.__pending) ? ' class="pend"' : align;
+      return `<td${mark}>${esc(val)}</td>`;
+    }).join('');
+    return `<tr>${cells}</tr>`;
+  }).join('');
+
+  const html = `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"/>
+<title>Customer Status</title>
+<style>
+  body { font-family: Arial, sans-serif; font-size: 8pt; margin: 0.4in; color: #111; }
+  h2   { font-size: 11pt; margin: 0 0 4px 0; color: #0B3140; }
+  .sub { font-size: 7.5pt; color: #64748b; margin: 0 0 10px 0; }
+  table { border-collapse: collapse; width: 100%; }
+  th { background: #0B3140; color: #fff; font-size: 7pt; padding: 4px 5px; text-align: left;
+       -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  td { font-size: 7.5pt; padding: 3px 5px; border-bottom: 1px solid #e5e7eb; }
+  tr:nth-child(even) td { background: #f9fafb; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .nr { text-align: right; }
+  .pend { font-weight: bold; color: #8A4E10; }
+  @page { size: A4 landscape; margin: 0.4in; }
+</style></head>
+<body>
+<h2>Customer Status</h2>
+<p class="sub">${rows.length.toLocaleString()} customers &mdash; printed ${new Date().toLocaleDateString()}${
+  _pending.size ? ' &mdash; ' + _pending.size + ' unsaved change(s) shown in bold' : ''}</p>
+<table><thead><tr>${hdrHtml}</tr></thead><tbody>${bodyHtml}</tbody></table>
+</body></html>`;
+
+  const w = window.open('', '_blank');
+  w.document.write(html);
+  w.document.close();
+  w.focus();
+  w.print();
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   STATUS WRITE-BACK
+   ════════════════════════════════════════════════════════════════════════
+   Fishbowl has no REST verb that edits a customer: POST /api/customers
+   answers 405 and there is no PUT. The supported path is the Customer CSV
+   IMPORT, posted through /api/import/:name — the same mechanism the
+   Import_Builder report generates files for, driven here directly.
+
+   Contract (verified against a live site, and against the server's own
+   /apidocs.json "Import data via CSV" / "Import data via JSON" entries):
+
+     • PATH — /api/import/Customers, PLURAL. The singular and the hyphenated
+       Customer-Default both answer "Import not found". The resolved path is
+       cached for the session; probing is cheap because Fishbowl says so
+       verbatim.
+
+     • ENCODING — JSON first (an array of row arrays, header row first), CSV
+       as the fallback for older servers. JSON is strictly better: it removes
+       quoting and row-splitting entirely, and it is the ONLY form that can
+       carry a value containing a NEWLINE. A two-line street address in CSV
+       tears the row in half and the import dies with a messageless 500 — a
+       real site lost every save on exactly one customer that way.
+
+     • ONLY the columns present are updated. Everything else on the customer —
+       other addresses, contacts, other custom fields, every other default —
+       is untouched because it is not in the payload.
+
+     • THE ADDRESS TRAP — Fishbowl rejects the row unless it sees a complete
+       address, even when the only column changing is Status. So the
+       customer's own default address is read back out and returned verbatim.
+       AddressType MUST be the NUMERIC addresstype.id: Fishbowl parses that
+       column as an int and throws "For input string: 'Main Office'" on the
+       name. The ids are NOT the same on every install (Main Office is 50 in
+       the reference database, not 10), which is why the id is read from the
+       address row rather than assumed.
+
+     • IsDefault is sent as the address's ACTUAL flag, not a hard-coded
+       'true'. Sending 'true' for an address that is not default would quietly
+       promote it — a data change the user did not ask for. */
+
+const CSV_CONTENT_TYPE = 'text/plain; charset=utf-8';
+
+/* Order = most-likely-first. */
+const _customerImportPathCandidates = [
+  '/api/import/Customers',
+  '/api/import/Customer',
+  '/api/import/Customer-Default',
+  '/api/import/customer',
+];
+let _resolvedCustomerImportPath = null;
+/* 'json' | 'csv' | null (not yet determined). */
+let _importEncoding = null;
+
+/* Can this host reach the import at all? runRestApiAsync is the REST bridge;
+   runApiRequest is the legacy socket bridge. Without either, the editor is
+   read-only and says why rather than failing at save time. */
+const _IMPORT_AVAILABLE = (typeof runRestApiAsync === 'function') || (typeof runApiRequest === 'function');
+const _IMPORT_UNAVAILABLE_MSG =
+  'This Fishbowl client exposes neither runRestApiAsync nor runApiRequest, so the report cannot '
+  + 'reach the Customer import. Status is read-only here — change it in the Customer module.';
+
+/* CSV fields must not contain a raw newline: Fishbowl's importer splits the
+   body into rows BEFORE it honours quoting, so one row tears into two and the
+   import dies with an unhandled, messageless 500. Collapsing to a space
+   FLATTENS the value, and on this import that is a real data change (the
+   address columns are rewritten on every save) — which is exactly why the JSON
+   encoding is tried first. Flattening is the price of the CSV fallback only. */
+function csvSafe(v) { return String(v ?? '').replace(/\s*[\r\n]+\s*/g, ' '); }
+function csvField(v) { return v == null ? '""' : '"' + csvSafe(v).replace(/"/g, '""') + '"'; }
+
+/* Should the path prober try the NEXT candidate, or stop and report?
+   Only on an explicit not-found. A 500 means the endpoint TOOK the request and
+   the request failed — inferring "wrong path" from a messageless 500 turns a
+   real failure into four pointless retries against paths that do not exist,
+   and then reports the last one. */
+function looksLikeUnresolvedImport(err) {
+  if (Number(err && (err.status || err.statusCode)) === 404) return true;
+  // runRestApiAsync rejects with the PARSED response body, so there is often no
+  // .message at all and String(err) is "[object Object]".
+  let hay = String((err && err.message) || '');
+  if (err && typeof err === 'object') {
+    try { hay += ' ' + JSON.stringify(err); } catch (_) { /* cyclic */ }
+  }
+  if (!hay.trim()) hay = String(err || '');
+  return /import not found|no such import|unknown import|\bhttp 404\b/i.test(hay);
+}
+
+/* Fishbowl buries the real complaint in a nested statusMessage. */
+function extractImportError(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  for (const k of Object.keys(obj)) {
+    if (/statusmessage/i.test(k) && obj[k]) return String(obj[k]);
+    if (typeof obj[k] === 'object') {
+      const nested = extractImportError(obj[k]);
+      if (nested) return nested;
+    }
+  }
+  return null;
+}
+
+/* Readable text out of anything thrown or rejected — a rejection carrying
+   {status, detail} has no .message, so the naive forms print "[object Object]"
+   and "[500] undefined" at exactly the moment the message is needed. */
+function errText(err) {
+  if (err == null) return 'unknown error';
+  if (typeof err === 'string') return err;
+  const parts = [];
+  if (err.status) parts.push('[' + err.status + ']');
+  const body = err.message || err.detail || err.error
+    || (err.response && (err.response.message || err.response.detail))
+    || extractImportError(err);
+  if (body) parts.push(String(body));
+  if (!parts.length) { try { parts.push(JSON.stringify(err)); } catch (_) { parts.push(String(err)); } }
+  return parts.join(' ');
+}
+
+/* One attempt at posting import ROWS to a specific path. `rows` is an array of
+   row arrays, header row first:
+     [['Name','Status'], ['Pierres Pastry','Hold All']]
+   Returns on success, throws on any failure. The caller distinguishes
+   "wrong path" from "real error" via looksLikeUnresolvedImport. */
+async function _postCustomerImport(path, rows) {
+  const asCsv = () => rows.map(r => r.map(csvField).join(',')).join('\n');
+
+  // Legacy bridge (a Fishbowl host without runRestApiAsync). ImportRq is
+  // line-oriented, so it is CSV-only — but the rows arrive already split, so
+  // nothing can tear on a value's newline.
+  if (typeof runRestApiAsync !== 'function' && typeof runApiRequest === 'function') {
+    const typeName = 'Import' + path.replace(/^.*\/api\/import\//, '').replace(/-/g, '');
+    const payload = { ImportRq: { Type: typeName, Rows: { Row: rows.map(r => r.map(csvField).join(',')) } } };
+    const raw = runApiRequest('ImportRq', JSON.stringify(payload));
+    const resp = typeof raw === 'string' ? safeParse(raw) : raw;
+    const flat = JSON.stringify(resp || {}).toLowerCase();
+    const ok = /statuscode"\s*:\s*"?1000/.test(flat) || /"success"\s*:\s*true/.test(flat);
+    if (!ok) throw new Error(extractImportError(resp) || 'ImportRq did not return a success status');
+    return resp;
+  }
+
+  const send = async (encoding) => {
+    const body = encoding === 'json' ? JSON.stringify(rows) : asCsv();
+    const type = encoding === 'json' ? 'application/json' : CSV_CONTENT_TYPE;
+    return await runRestApiAsync({ method: 'POST', path, body, contentType: type });
+  };
+
+  const order = _importEncoding ? [_importEncoding] : ['json', 'csv'];
+  let lastErr = null;
+  for (const encoding of order) {
+    try {
+      const resp = await send(encoding);
+      // A 200 can still carry a row-level rejection in the body.
+      const msg = extractImportError(resp);
+      if (msg && !/success/i.test(msg)) throw new Error(msg);
+      if (_importEncoding !== encoding) {
+        _importEncoding = encoding;
+        FBLib.Common.debugLog('Import encoding resolved → ' + encoding
+          + (encoding === 'csv' ? ' (this server does not take the JSON form; values containing newlines will be flattened)' : ''),
+          'info');
+      }
+      return resp;
+    } catch (e) {
+      lastErr = e;
+      FBLib.Common.debugLog('import via ' + encoding + ' failed: ' + errText(e), 'warn');
+      // A row-level rejection is not an encoding problem — don't re-send the
+      // same bad row in the other wire format.
+      if (!looksLikeUnresolvedImport(e) && !/unsupported media|content.type|415/i.test(errText(e))) break;
+    }
+  }
+  if (_importEncoding && order.length === 1) _importEncoding = null;   // re-probe next call
+  throw lastErr;
+}
+
+/* Build the one-row import payload for a single customer's status change. */
+function buildStatusImportRows(row, newStatusId) {
+  const status = STATUS_MAP[newStatusId];
+  if (!status) throw new Error('Unknown status id ' + newStatusId);
+
+  // Columns:
+  //   Name              — the identity key
+  //   Address*          — the address Fishbowl insists on seeing
+  //   Status            — the actual change
+  // Everything else on the customer stays as-is because it is not sent.
+  const cols = ['Name', 'AddressName', 'AddressContact', 'AddressType', 'IsDefault',
+                'Address', 'City', 'State', 'Zip', 'Country', 'Residential', 'Status'];
+  const vals = [
+    row.customer,
+    row.addrname || row.addrcontact || 'Main Office',
+    row.addrcontact || row.addrname || row.customer,
+    row.addrtypeid,                                  // NUMERIC addresstype.id — never the name
+    String(row.addrdefault) === '1' ? 'true' : 'false',
+    row.street || '',
+    row.city || '',
+    row.state || '',
+    row.zip || '',
+    row.country || '',
+    row.residential === 'true' ? 'true' : 'false',
+    status.label,                                    // Normal / Preferred / Hold Sales / …
+  ];
+  return [cols, vals];
+}
+
+/* Post one customer's change, retrying an optimistic-lock collision.
+   "Row was updated or deleted by another transaction" is Hibernate's stale-
+   version error on the customer row — transient, and the import re-reads the
+   row on retry, so backing off and resending the identical payload is safe. */
+async function writeCustomerStatus(row, newStatusId) {
+  const rows = buildStatusImportRows(row, newStatusId);
+  FBLib.Common.debugLog('status write → ' + row.customer + ' = ' + STATUS_MAP[newStatusId].label, 'info');
+  rows.forEach(r => FBLib.Common.debugLog('  ' + JSON.stringify(r)));
+
+  const pathsToTry = _resolvedCustomerImportPath
+    ? [_resolvedCustomerImportPath]
+    : _customerImportPathCandidates.slice();
+
+  const postWithRetry = async (path) => {
+    for (let attempt = 0; ; attempt++) {
+      try { return await _postCustomerImport(path, rows); }
+      catch (e) {
+        const stale = /updated or deleted by another transaction/i.test(errText(e));
+        if (!stale || attempt >= 2) throw e;
+        FBLib.Common.debugLog('stale-row collision — retry ' + (attempt + 1) + '/2', 'warn');
+        await new Promise(r => setTimeout(r, 800 * (attempt + 1)));
+      }
+    }
+  };
+
+  let lastErr = null;
+  for (const path of pathsToTry) {
+    try {
+      const resp = await postWithRetry(path);
+      if (_resolvedCustomerImportPath !== path) {
+        _resolvedCustomerImportPath = path;
+        FBLib.Common.debugLog('Customer import path resolved → ' + path, 'success');
+      }
+      return resp;
+    } catch (e) {
+      lastErr = e;
+      const pathWrong = looksLikeUnresolvedImport(e);
+      FBLib.Common.debugLog('import ' + path + (pathWrong ? ' returned not-found' : ' failed: ' + errText(e)), 'warn');
+      // Anything that is not "wrong path" is a real failure of THIS path — stop
+      // probing so the user sees the actual reason, not a generic "no path
+      // worked".
+      if (!pathWrong) break;
+    }
+  }
+  // A cached path that stopped working gets re-probed on the next call.
+  if (_resolvedCustomerImportPath && pathsToTry.length === 1) _resolvedCustomerImportPath = null;
+  throw lastErr || new Error('No customer import endpoint accepted the request. Tried: ' + pathsToTry.join(', '));
+}
+
+/* ── SAVE ── */
+async function savePending() {
+  if (_saving) return;
+  if (!_pending.size) { showToast('Nothing to save.', 'info'); return; }
+  if (!_IMPORT_AVAILABLE) { showToast(_IMPORT_UNAVAILABLE_MSG, 'error', 8000); return; }
+
+  const items = [..._pending.entries()]
+    .map(([id, st]) => ({ id, st, row: _rowById.get(id) }))
+    .filter(x => x.row && !writeBlocker(x.row));
+
+  if (!items.length) { showToast('None of the pending changes can be written.', 'error', 6000); return; }
+
+  if (typeof confirm === 'function' && !confirm(
+      'Write ' + items.length + ' customer status change' + (items.length === 1 ? '' : 's') +
+      ' to Fishbowl?\n\nEach one is written as a Customer import keyed on the customer name. ' +
+      'Only the Status column and the customer’s own default address are sent; nothing else ' +
+      'on the record is changed.')) return;
+
+  _saving = true;
+  _saveResults.clear();
+  const btn = document.getElementById('rvSaveBtn');
+  btn.disabled = true;
+  document.getElementById('rvProgress').classList.add('open');
+  renderTable();
+
+  let ok = 0, failed = 0;
+  for (let i = 0; i < items.length; i++) {
+    const { id, st, row } = items[i];
+    document.getElementById('rvProgressBar').style.width = Math.round((i / items.length) * 100) + '%';
+    setStatus(`Saving ${i + 1} of ${items.length} — ${row.customer}…`);
+    try {
+      await writeCustomerStatus(row, st);
+      ok++;
+      _saveResults.set(id, { ok: true, msg: 'Saved' });
+      // Land the change locally so the row reflects the database without a
+      // full refetch (which would also throw away every other pending edit).
+      row.statusid = st;
+      row.status = STATUS_MAP[st].label;
+      _pending.delete(id);
+    } catch (e) {
+      failed++;
+      _saveResults.set(id, { ok: false, msg: errText(e) });
+      FBLib.Common.debugLog('SAVE FAILED ' + row.customer + ': ' + errText(e), 'error');
+    }
+    renderReviewDrawer();
+  }
+  document.getElementById('rvProgressBar').style.width = '100%';
+
+  _saving = false;
+  btn.disabled = false;
+  syncDirtyUi();
+  renderTable();
+  renderReviewDrawer();
+  setStatus(_statusSuffix);
+
+  if (failed) {
+    showToast(`${ok} saved, ${failed} failed. The failed rows keep their pending change — open Review & Save for the reason.`,
+              'error', 9000);
+  } else {
+    showToast(`${ok} customer status change(s) saved to Fishbowl.`, 'success', 5000);
+  }
+}
+
+/* ── REVIEW DRAWER ── */
+function renderReviewDrawer() {
+  const warn = document.getElementById('rvNoWrite');
+  if (!_CAN_EDIT) {
+    warn.style.display = '';
+    warn.textContent = 'You do not hold the Customer-Edit access right, so status is read-only in this report.';
+  } else if (!_IMPORT_AVAILABLE) {
+    warn.style.display = '';
+    warn.textContent = _IMPORT_UNAVAILABLE_MSG;
+  } else {
+    warn.style.display = 'none';
+  }
+
+  document.getElementById('rvCount').textContent =
+    _pending.size ? '— ' + _pending.size + ' change(s)' : '— nothing staged';
+  document.getElementById('rvSaveBtn').disabled = _saving || !_pending.size;
+  document.getElementById('rvSaveBtn').textContent = 'Save to Fishbowl';
+
+  const list = document.getElementById('rvList');
+  list.innerHTML = '';
+  if (!_pending.size) {
+    const empty = document.createElement('div');
+    empty.className = 'rv-hint';
+    empty.textContent = 'Change a Status drop-down in the table, or tick rows and use the bulk bar. '
+      + 'Changes collect here until you save them.';
+    list.appendChild(empty);
+    return;
+  }
+
+  [..._pending.entries()].forEach(([id, st]) => {
+    const row = _rowById.get(id);
+    if (!row) return;
+    const res = _saveResults.get(id);
+    const blocker = writeBlocker(row);
+
+    const div = document.createElement('div');
+    div.className = 'rv-row' + (blocker || (res && !res.ok) ? ' bad' : (res && res.ok ? ' done' : ''));
+
+    const nm = document.createElement('span');
+    nm.className = 'rv-name';
+    nm.textContent = row.customer + (row.acctnum ? '  (' + row.acctnum + ')' : '');
+    div.appendChild(nm);
+
+    const from = document.createElement('span');
+    from.className = 'badge ' + (STATUS_MAP[row.statusid] ? STATUS_MAP[row.statusid].cls : '');
+    from.textContent = STATUS_MAP[row.statusid] ? STATUS_MAP[row.statusid].label : row.statusid;
+    div.appendChild(from);
+
+    const arrow = document.createElement('span');
+    arrow.className = 'rv-arrow';
+    arrow.textContent = '→';
+    div.appendChild(arrow);
+
+    const to = document.createElement('span');
+    to.className = 'badge ' + (STATUS_MAP[st] ? STATUS_MAP[st].cls : '');
+    to.textContent = STATUS_MAP[st] ? STATUS_MAP[st].label : st;
+    div.appendChild(to);
+
+    const x = document.createElement('button');
+    x.className = 'rv-x';
+    x.title = 'Discard this change';
+    x.innerHTML = '&times;';
+    x.addEventListener('click', () => discardOne(id));
+    div.appendChild(x);
+
+    const msg = blocker || (res && !res.ok ? res.msg : '');
+    if (msg) {
+      const m = document.createElement('div');
+      m.className = 'rv-msg';
+      m.textContent = msg;
+      div.appendChild(m);
+    }
+    list.appendChild(div);
+  });
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   HELPERS
+   ════════════════════════════════════════════════════════════════════════ */
+function showSpinner() { document.getElementById('loadingOverlay').style.display = 'flex'; }
+function hideSpinner() { document.getElementById('loadingOverlay').style.display = 'none'; }
+
+async function qp(sql) {
+  try { return normalise(await runQueryAsync(sql)); }
+  catch (e) { return normalise(runQuery(sql)); }
+}
+function normalise(r) {
+  if (r == null) return [];
+  if (typeof r === 'string') { try { const p = JSON.parse(r); return Array.isArray(p) ? p : []; } catch (_) { return []; } }
+  return Array.isArray(r) ? r : [];
+}
+function safeParse(s) { try { return JSON.parse(s); } catch (_) { return null; } }
+function mkOpt(val, text) { const o = document.createElement('option'); o.value = val; o.textContent = text; return o; }
+function setStatus(msg) { document.getElementById('statusLine').textContent = msg; }
+function escSQL(s) { return String(s).replace(/'/g, "''"); }
+function safeDate(s) { return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ''; }
+function escHtml(s) { return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+function showToast(message, type, duration) {
+  const host = document.getElementById('toastContainer');
+  const el = document.createElement('div');
+  el.className = 'toast ' + (type || 'info');
+  const ico = { success: '✓', error: '✕', warn: '⚠', info: 'ℹ' }[type || 'info'];
+  const icon = document.createElement('span'); icon.className = 'toast-icon'; icon.textContent = ico;
+  const msg = document.createElement('span'); msg.className = 'toast-msg'; msg.textContent = message;
+  const x = document.createElement('button'); x.className = 'toast-x'; x.innerHTML = '&times;';
+  x.addEventListener('click', () => el.remove());
+  el.appendChild(icon); el.appendChild(msg); el.appendChild(x);
+  host.appendChild(el);
+  setTimeout(() => {
+    el.style.opacity = '0';
+    setTimeout(() => el.remove(), 260);
+  }, duration || 3500);
+}
+
+init();
+</script>
+</body>
+</html>

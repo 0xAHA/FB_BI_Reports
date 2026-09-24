@@ -1,0 +1,1606 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  REPORT: PO Approval
+  PATH:   PurchaseOrder/PO_Approval.htm
+  --------------------------------------------------------------------------------
+  An approval queue for the purchase orders still waiting on a decision —
+  BID REQUEST (po.statusId = 10) and PENDING APPROVAL (15). One row per PO:
+  PO #, Status, Created By, Date Created, Date First Ship, Vendor, the
+  requested amount, and an Approve button.
+
+  The Status multi-select in the filter bar picks either status or both. The
+  query always loads BOTH, so switching is a client-side repaint rather than a
+  round trip, and the two counts in the filter bar always add up to what is on
+  screen.
+
+  WHAT "APPROVE" DOES
+    POST /api/purchase-orders/:id/issue   (REST, via runRestApiAsync)
+
+    That is Fishbowl's own issue path, so the SERVER decides the outcome, not
+    this report:
+      • enough approval authority  -> the order becomes ISSUED (20)
+      • not enough / over a limit  -> the order becomes PENDING APPROVAL (15)
+    The toast reports the status the server actually returned rather than
+    assuming. Because Pending Approval is itself part of this queue, an order
+    that lands there STAYS in the table with its badge repainted; a row only
+    drops off once it reaches a status the queue does not cover (Issued).
+
+    Approving a row that is ALREADY Pending Approval is the same call — in
+    the client a higher approver clears a status-15 order with that same Issue
+    action. That specific path has not been exercised against a live client;
+    see STATUS at the bottom of this block.
+
+    The button is enabled only when the logged-in user holds
+    "Purchase Order-Approve Orders" (verified verbatim against useraccess —
+    that exact string is what the Fishbowl client stores). Without it the
+    button is disabled and explains why on hover. This is a CONVENIENCE gate:
+    the server enforces the right independently, so a user who somehow gets
+    past the UI still cannot issue an order they have no authority for.
+
+  SAFETY
+    Approve sends for real. The only guard is the confirmation dialog
+    (Settings -> Safety, on by default), which names the order, its status and
+    its amount before anything is sent.
+
+    There is deliberately no "dry run" toggle: end users read a report that
+    silently simulates its own buttons as broken, and the one person it helps
+    (whoever is testing the write path) can point a dev client at a test
+    server instead.
+
+  AMOUNT
+    Request Amount = SUM(poitem.totalCost) over non-void lines, plus
+    po.totalTax when the order does not already include tax in its line
+    totals. The plain (non-mc*) cost fields are in the HOME currency, so the
+    figure is formatted with the home currency symbol. The order's own
+    currency code rides along in a hidden column when it differs.
+
+  CREATED BY
+    po.username — the user stamped on the PO record. Fishbowl exposes this as
+    the record's user (REST calls it lastModified.username), so on an order
+    that somebody else has since edited it reads as that editor, not the
+    original author. The Buyer field is available as a separate (hidden by
+    default) column when that distinction matters; true first-revision
+    authorship only exists in po_aud and is not queried here.
+
+  FILTERS  (always-visible bar under the header, no drawer)
+    Status is a fixed two-item multi-select (Bid Request / Pending Approval),
+    fixed rather than data-derived so an empty status is still visibly on
+    offer. Vendor and Created By are populated from the loaded rows, so they
+    only ever offer values that actually have orders. All three filter
+    client-side and repaint instantly. The date range (Date Created or Date
+    First Ship, preset or custom) is applied in SQL and re-queries. PO # is a
+    client-side contains match.
+
+  TABLE
+    FBLib.Table — click to sort, drag a header to reorder, drag a header edge
+    to resize, lazy chunked body. Layout (order / widths / hidden / sort) is
+    saved against the Fishbowl user account. The Columns panel toggles
+    visibility, including the extra columns hidden by default.
+
+  DEPLOY ORDER (re-save on the server, in this order, or the report breaks):
+    1. fb-styles  (Style  named exactly "fb-styles", source scripts/fb-styles.css)
+    2. fb-lib     (Script named exactly "fb-lib",    source scripts/fb-lib.js)
+    3. THIS report (the directives only re-run on save)
+
+  STATUS: desk-built and verified against demodb through the live-SQL harness,
+  with all five outcomes of the issue call exercised against a stubbed REST
+  layer. The WRITE path itself has NOT been exercised against a live client.
+  Issuing from Pending Approval is the least-proven part of it: apidocs
+  documents the endpoint only as "Issue a purchase order", with no
+  accepted-status list, so the result handling reads the status that comes
+  back instead of predicting it.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>- Purchasing - PO Approval - Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+
+    <!-- Moment.js — date formatting parity with the rest of the suite
+         (FBLib.Common.formatDate prefers it when present). -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script>
+
+    <!-- Shared Fishbowl BI lib — inlined by Fishbowl from the saved "fb-lib"
+         Script. Source of truth: scripts/fb-lib.js. Provides FBLib.Common
+         (formatting, drawers, multi-select, debug drawer), FBLib.Settings and
+         FBLib.Table. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Shared Fishbowl BI stylesheet — inlined from the saved "fb-styles"
+         Style (scripts/fb-styles.css). MUST come BEFORE the inline block so
+         per-report rules win the cascade on identical selectors. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <style>
+        /* =====================================================
+           BASE + LAYOUT — tokens live in fb-styles; style new work off
+           var(--…), never a hardcoded hex.
+           ===================================================== */
+        * { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; height: 100%; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            font-size: 13px; color: var(--c-primary); background: var(--bg-1);
+            display: flex; flex-direction: column; min-height: 100vh;
+            padding-bottom: var(--debug-drawer-h, 0px);
+            transition: padding-bottom 0.12s ease;
+        }
+        header h1 { font-size: 16px; font-weight: 700; color: var(--c-primary); margin: 0; line-height: 1.15; }
+        #statusLine { font-size: 12px; color: var(--c-tertiary); line-height: 1.15; margin: 2px 0 0; }
+        .hdr-actions { display: flex; align-items: center; gap: 8px; }
+
+        /* =====================================================
+           FILTER BAR — always visible, never a drawer. One wrapping row
+           directly under the header so the filters the user was asked for
+           (Vendor / Created By / dates) are never more than a glance away.
+           ===================================================== */
+        #filterBar {
+            display: flex; align-items: flex-end; flex-wrap: wrap; gap: 10px 14px;
+            background: #fff; border-bottom: 1px solid var(--border);
+            padding: 9px 20px; flex-shrink: 0;
+            /* An open .ms-dropdown must escape the bar rather than be clipped. */
+            position: relative; z-index: 30;
+        }
+        .fbar-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+        .fbar-field > label {
+            font-size: 10px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.05em; color: var(--c-secondary);
+        }
+        .fbar-field select,
+        .fbar-field input[type=text],
+        .fbar-field input[type=date] {
+            padding: 4px 8px; font-size: 12px; border: 1px solid var(--border-strong);
+            border-radius: 6px; background: #fff; font-family: inherit; color: #415157;
+            height: 28px;
+        }
+        .fbar-field select:focus, .fbar-field input:focus {
+            outline: none; border-color: var(--color-primary);
+            box-shadow: 0 0 0 2px rgba(45,156,219,0.18);
+        }
+        /* The multi-select trigger is a flex box that grows with its tags —
+           pin a width so the bar does not reflow every time a vendor is
+           ticked. */
+        .fbar-ms { width: 210px; }
+        /* Two short, fixed labels - it never needs the vendor list's width. */
+        .fbar-ms-narrow { width: 168px; }
+        .fbar-ms .ms-trigger { min-height: 28px; }
+        .fbar-dates { display: flex; align-items: center; gap: 5px; }
+        .fbar-dates span { color: var(--c-tertiary); font-size: 12px; }
+        .fbar-dates input[type=date] { width: 132px; }
+        #poSearch { width: 130px; }
+        .fbar-btn {
+            height: 28px; padding: 0 11px; font-size: 12px; font-weight: 600;
+            border: 1px solid var(--border-strong); border-radius: 6px;
+            background: #fff; color: #415157; cursor: pointer; font-family: inherit;
+        }
+        .fbar-btn:hover { background: var(--bg-2); }
+        /* Live tally of what the filters currently select. It sits in the
+           HEADER, not the filter bar: the numbers are the answer, so they
+           belong next to the title rather than at the end of the controls.
+           `margin-left:auto` packs it against the buttons -- header is
+           justify-content:space-between, which would otherwise strand it in
+           the middle of the bar. */
+        .hdr-summary {
+            display: flex; align-items: center; gap: 16px;
+            margin-left: auto; margin-right: 12px; white-space: nowrap;
+        }
+        .hdr-div { width: 1px; height: 26px; background: var(--border); flex: none; }
+        .hdr-stat { display: flex; flex-direction: column; align-items: flex-end; line-height: 1.15; }
+        .hdr-stat .k { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--c-tertiary); }
+        .hdr-stat .v { font-size: 15px; font-weight: 700; color: var(--c-primary); font-variant-numeric: tabular-nums; }
+
+        /* =====================================================
+           COLUMNS PANEL — a plain dropdown off the header button. Ordering
+           and resizing happen on the header itself (FBLib.Table); this panel
+           only owns show/hide.
+           ===================================================== */
+        .col-wrap { position: relative; }
+        #colPanel {
+            position: absolute; right: 0; top: calc(100% + 4px); z-index: 600;
+            width: 232px; max-height: 340px; overflow-y: auto;
+            background: #fff; border: 1px solid var(--border-strong);
+            border-radius: 8px; box-shadow: var(--shadow-md, 0 8px 22px rgba(0,0,0,0.14));
+        }
+        #colPanel.hidden { display: none; }
+        #colPanel .col-head {
+            padding: 7px 11px; font-size: 10px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.05em; color: var(--c-tertiary);
+            border-bottom: 1px solid var(--bg-2); position: sticky; top: 0; background: #fff;
+        }
+        #colPanel label {
+            display: flex; align-items: center; gap: 8px; padding: 5px 11px;
+            font-size: 12px; cursor: pointer; color: #415157;
+        }
+        #colPanel label:hover { background: var(--tint-blue); }
+        #colPanel .col-foot { padding: 6px 10px; border-top: 1px solid var(--bg-2); position: sticky; bottom: 0; background: #fff; }
+
+        /* =====================================================
+           APP SHELL + TABLE — the classes FBLib.Table.init expects.
+           ===================================================== */
+        .app-shell { width: 100%; margin: 0; padding: 0; flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+
+        .fb-table-container { flex: 1 1 auto; min-height: 0; overflow: auto; background: #fff; }
+        table.fb-table { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
+        table.fb-table th {
+            background: var(--menu-bg); color: #fff; font-weight: 500;
+            padding: 0 10px; height: 32px; text-align: left; white-space: nowrap;
+            cursor: grab; user-select: none; position: sticky; top: 0; z-index: 10;
+            overflow: hidden; text-overflow: ellipsis;
+        }
+        table.fb-table th:active { cursor: grabbing; }
+        table.fb-table th:hover { background: #164A5F; }
+        table.fb-table th.sort-asc::after  { content: ' \2191'; opacity: 0.8; }
+        table.fb-table th.sort-desc::after { content: ' \2193'; opacity: 0.8; }
+        table.fb-table th.col-drag-over { background: #164A5F; border-left: 3px solid #CBE5FB; }
+        /* Filtering lives in the always-visible bar; hide the empty per-column
+           filter row FBLib.Table renders so the body sits directly under the
+           single sticky title row with no gap. */
+        table.fb-table tr.filter-row { display: none; }
+        table.fb-table td {
+            padding: 3px 10px; border-bottom: 1px solid var(--border); white-space: nowrap;
+            vertical-align: middle; overflow: hidden; text-overflow: ellipsis;
+        }
+        table.fb-table tr:nth-child(even) td { background: var(--bg-1); }
+        table.fb-table tr:hover td { background: var(--tint-blue) !important; }
+        table.fb-table .num-cell { text-align: right; font-variant-numeric: tabular-nums; }
+        .fb-row-link { color: var(--fb-blue); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--fb-blue-accent); }
+        .fb-col-resize { position: absolute; right: 0; top: 0; width: 6px; height: 100%; cursor: col-resize; user-select: none; }
+        .fb-col-resize:hover { background: rgba(255,255,255,0.3); }
+
+        .money-cell { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+        .muted-cell { color: var(--c-tertiary); }
+
+        /* Status badge. fb-styles ships .b10/.b20/... but has no .b15, so
+           Pending Approval is defined here rather than in the shared sheet:
+           this report must not need a newer fb-styles to read correctly.
+           Grey = nobody has touched it yet, amber = it is on somebody's desk. */
+        .b15 { background: var(--acc-yellow-bg, #FAEFD5); color: var(--acc-yellow-con, #7A5510); }
+        table.fb-table td .badge { white-space: nowrap; }
+
+        /* Approve button. Deliberately the only primary-coloured thing in the
+           row — it is the single action this report exists for. */
+        .appr-btn {
+            display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+            height: 22px; padding: 0 11px; font-size: 11px; font-weight: 700;
+            font-family: inherit; border-radius: 5px; cursor: pointer;
+            border: 1px solid var(--fb-success, #1B7A46); background: var(--fb-success, #1B7A46); color: #fff;
+            white-space: nowrap;
+        }
+        .appr-btn:hover:not(:disabled) { background: #156038; border-color: #156038; }
+        .appr-btn:disabled { background: var(--bg-2); border-color: var(--border-strong); color: var(--c-tertiary); cursor: not-allowed; }
+        .appr-btn.busy { cursor: progress; opacity: 0.7; }
+        .appr-btn svg { width: 12px; height: 12px; }
+
+        .ds-btn { padding: 7px 13px; font-size: 12px; border-radius: 7px; border: 1px solid var(--border-strong); background: #fff; cursor: pointer; font-family: inherit; font-weight: 600; color: #415157; }
+        .ds-btn:hover { background: var(--bg-2); }
+        .ds-btn-primary { background: var(--color-primary); color: #fff; border-color: var(--color-primary); }
+        .ds-btn-primary:hover { background: var(--color-primary-dark); }
+        .ds-btn-admin { background: var(--acc-orange-bg); border-color: var(--acc-orange); color: var(--acc-orange-con); margin-right: 6px; }
+        .ds-lock-badge { background: var(--acc-orange-bg); color: var(--acc-orange-con); border: 1px solid var(--acc-orange); padding: 7px 10px; border-radius: 7px; font-size: 12px; margin-bottom: 14px; }
+
+        /* Drawer grid (settings / help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 220px; min-width: 220px; }
+        .fb-grid-cols { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); align-items: start; }
+        .fb-grid-cols .fb-group { flex: none; min-width: 0; }
+        .fb-group-title {
+            font-size: 12px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.04em; color: var(--c-secondary); border-bottom: 1px solid var(--border);
+            padding-bottom: 4px; margin-bottom: 8px;
+        }
+        .fb-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+        .fb-field label { font-size: 11px; font-weight: 600; color: var(--c-secondary); }
+        .fb-field select { padding: 4px 8px; font-size: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-1); font-family: inherit; color: #415157; }
+        .help-p { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .help-l { font-size: 12px; color: #415157; padding-left: 18px; margin: 4px 0; line-height: 1.55; }
+        /* The drawer backdrop scrim is injected + managed by fb-lib
+           (registerDrawer -> #fbDrawerScrim). Never add a local scrim, and
+           never override `.fb-drawer.open { z-index }` — the drawer must keep
+           the fb-styles z-index (10001) that sits above fb-lib's scrim. */
+
+        .fb-drawer-body::-webkit-scrollbar, .fb-table-container::-webkit-scrollbar, #colPanel::-webkit-scrollbar { width: 8px; height: 8px; }
+        .fb-drawer-body::-webkit-scrollbar-track, .fb-table-container::-webkit-scrollbar-track, #colPanel::-webkit-scrollbar-track { background: var(--bg-2); border-radius: 4px; }
+        .fb-drawer-body::-webkit-scrollbar-thumb, .fb-table-container::-webkit-scrollbar-thumb, #colPanel::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+
+        @media print {
+            html, body { overflow: visible; }
+            @page { size: A4 landscape; margin: 0.5in; }
+            header, #filterBar, .hdr-btn, .fb-drawer, .fblib-debug-drawer, #colPanel { display: none !important; }
+            .fb-table-container { overflow: visible !important; }
+            table.fb-table th { position: static !important; background: #ddd !important; color: #000 !important; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<!-- ==================== HEADER ==================== -->
+<header>
+    <div>
+        <h1>PO Approval</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-summary">
+        <div class="hdr-stat"><span class="k">Bid request</span><span class="v" id="statBid">—</span></div>
+        <div class="hdr-stat"><span class="k">Pending approval</span><span class="v" id="statPending">—</span></div>
+        <div class="hdr-stat"><span class="k">Requested value</span><span class="v" id="statValue">—</span></div>
+        <span class="hdr-div"></span>
+    </div>
+
+    <div class="hdr-actions">
+        <div class="col-wrap" id="colWrap">
+            <button id="colBtn" class="hdr-btn" type="button" onclick="toggleColPanel()" title="Show / hide columns (drag a header to reorder, drag its edge to resize)">
+                <svg fill="currentColor" viewBox="0 0 24 24"><circle cx="8" cy="6" r="1.5"/><circle cx="8" cy="12" r="1.5"/><circle cx="8" cy="18" r="1.5"/><circle cx="16" cy="6" r="1.5"/><circle cx="16" cy="12" r="1.5"/><circle cx="16" cy="18" r="1.5"/></svg>
+                Columns
+            </button>
+            <div id="colPanel" class="hidden">
+                <div class="col-head">Show / hide</div>
+                <div id="colList"></div>
+                <div class="col-foot">
+                    <button type="button" class="fbar-btn" style="width:100%;" onclick="resetColLayout()" title="Reset column order, widths and visibility">Reset layout</button>
+                </div>
+            </div>
+        </div>
+
+        <button id="refreshBtn" class="hdr-btn" type="button" onclick="loadData()" title="Re-query Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <button id="exportBtn" class="hdr-btn" type="button" onclick="exportCsv()" title="Download the visible rows and columns as CSV">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            CSV
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" onclick="printReport()" title="Print">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span style="width:1px; height:18px; background:var(--border); margin:0 4px;"></span>
+        <button id="helpBtn" class="hdr-btn" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How to use this report">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            Help
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ==================== FILTER BAR (always visible) ==================== -->
+<div id="filterBar">
+
+    <!-- Status is a FIXED list, not data-derived: an empty status must still
+         be pickable so "no pending approvals" reads as an answer rather than a
+         missing option. Nothing ticked means both, as everywhere else. -->
+    <div class="fbar-field">
+        <label for="statusMs-trigger">Status</label>
+        <div class="ms-container fbar-ms fbar-ms-narrow" id="statusMs">
+            <div class="ms-trigger" id="statusMs-trigger">
+                <span class="ms-placeholder" id="statusMs-placeholder">All statuses</span>
+            </div>
+            <div class="ms-dropdown hidden" id="statusMs-dropdown">
+                <div class="ms-actions"><span id="statusMs-all">Select All</span><span id="statusMs-clear">Clear All</span></div>
+                <div class="ms-list" id="statusMs-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Vendor + Created By are client-side multi-selects over the loaded
+         rows, so they repaint live (onChange) rather than re-querying. -->
+    <div class="fbar-field">
+        <label for="vendorMs-trigger">Vendor</label>
+        <div class="ms-container fbar-ms" id="vendorMs">
+            <div class="ms-trigger" id="vendorMs-trigger">
+                <span class="ms-placeholder" id="vendorMs-placeholder">All vendors</span>
+            </div>
+            <div class="ms-dropdown hidden" id="vendorMs-dropdown">
+                <div class="ms-search"><input type="text" id="vendorMs-search" placeholder="Search vendors…" /></div>
+                <div class="ms-actions"><span id="vendorMs-all">Select All</span><span id="vendorMs-clear">Clear All</span></div>
+                <div class="ms-list" id="vendorMs-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="fbar-field">
+        <label for="userMs-trigger">Created By</label>
+        <div class="ms-container fbar-ms" id="userMs">
+            <div class="ms-trigger" id="userMs-trigger">
+                <span class="ms-placeholder" id="userMs-placeholder">All users</span>
+            </div>
+            <div class="ms-dropdown hidden" id="userMs-dropdown">
+                <div class="ms-search"><input type="text" id="userMs-search" placeholder="Search users…" /></div>
+                <div class="ms-actions"><span id="userMs-all">Select All</span><span id="userMs-clear">Clear All</span></div>
+                <div class="ms-list" id="userMs-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Date range is applied in SQL, so changing it re-queries. -->
+    <div class="fbar-field">
+        <label for="dateField">Date field</label>
+        <select id="dateField" onchange="onDateControlChange()">
+            <option value="datecreated">Date Created</option>
+            <option value="datefirstship">Date First Ship</option>
+        </select>
+    </div>
+
+    <div class="fbar-field">
+        <label for="datePreset">Range</label>
+        <select id="datePreset" onchange="onPresetChange()">
+            <option value="all">All dates</option>
+            <option value="7">Last 7 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="mtd">This month</option>
+            <option value="lastmonth">Last month</option>
+            <option value="ytd">This year</option>
+            <option value="custom">Custom…</option>
+        </select>
+    </div>
+
+    <div class="fbar-field">
+        <label>From / To</label>
+        <div class="fbar-dates">
+            <input type="date" id="dateFrom" onchange="onCustomDateChange()" />
+            <span>&rarr;</span>
+            <input type="date" id="dateTo" onchange="onCustomDateChange()" />
+        </div>
+    </div>
+
+    <div class="fbar-field">
+        <label for="poSearch">PO #</label>
+        <input type="text" id="poSearch" placeholder="contains…" />
+    </div>
+
+    <div class="fbar-field">
+        <label>&nbsp;</label>
+        <button type="button" class="fbar-btn" onclick="clearFilters()" title="Clear every filter">Clear</button>
+    </div>
+</div>
+
+<!-- ==================== TABLE ==================== -->
+<div class="app-shell">
+    <div class="fb-table-container">
+        <table id="reportTable" class="fb-table"></table>
+    </div>
+</div>
+
+<!-- ==================== SETTINGS DRAWER ==================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div id="dsLockBadge" class="ds-lock-badge" style="display:none;">Locked by admin — your changes won't be saved.</div>
+        <div class="fb-grid fb-grid-cols">
+
+            <div class="fb-group">
+                <div class="fb-group-title">Safety</div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setConfirm" onchange="onSettingsChange()" style="margin-top:2px;" />
+                        <span>Ask for confirmation before each approval</span>
+                    </label>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Defaults</div>
+                <div class="fb-field">
+                    <label>Default date range</label>
+                    <select id="setDefaultPreset" onchange="onSettingsChange()">
+                        <option value="all">All dates</option>
+                        <option value="7">Last 7 days</option>
+                        <option value="30">Last 30 days</option>
+                        <option value="90">Last 90 days</option>
+                        <option value="mtd">This month</option>
+                        <option value="ytd">This year</option>
+                    </select>
+                </div>
+                <div class="fb-field">
+                    <label>Default date field</label>
+                    <select id="setDefaultDateField" onchange="onSettingsChange()">
+                        <option value="datecreated">Date Created</option>
+                        <option value="datefirstship">Date First Ship</option>
+                    </select>
+                </div>
+                <div class="fb-field">
+                    <label>Default status</label>
+                    <select id="setDefaultStatuses" onchange="onSettingsChange()">
+                        <option value="both">Bid Request + Pending Approval</option>
+                        <option value="10">Bid Request only</option>
+                        <option value="15">Pending Approval only</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setShowDebug" onchange="onSettingsChange()" />
+                        <span>Show debug console</span>
+                    </label>
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setRememberFilters" onchange="onSettingsChange()" />
+                        <span>Remember filter selections</span>
+                    </label>
+                </div>
+            </div>
+
+        </div>
+
+        <div id="dsAdminSection" style="display:none; margin-top:14px; padding-top:14px; border-top: 1px dashed var(--border-strong);">
+            <div class="fb-group-title">Admin</div>
+            <button type="button" class="ds-btn ds-btn-admin" onclick="publishDefaults()">Publish as default for everyone</button>
+            <button type="button" class="ds-btn ds-btn-admin" id="dsLockBtn" onclick="toggleUserEditing()">Lock user editing</button>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn" onclick="resetSettings()">Reset to defaults</button>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ==================== HELP DRAWER ==================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How to Use This Report</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group" style="flex:1 1 320px;">
+                <div class="fb-group-title">What it shows</div>
+                <p class="help-p">Every purchase order still waiting on somebody's decision, for the location groups you have access to. That is two statuses, and the <strong>Status</strong> column says which each order is in:</p>
+                <ul class="help-l">
+                    <li><span class="badge b10">Bid Request</span> — nobody has acted on it yet.</li>
+                    <li><span class="badge b15">Pending Approval</span> — somebody tried to issue it, it was over their limit, and it is now waiting on a higher approver.</li>
+                </ul>
+                <p class="help-p"><strong>Request Amount</strong> is the sum of the order's non-void line totals plus tax, in your home currency.</p>
+                <p class="help-p"><strong>Created By</strong> is the user stamped on the PO record. If somebody else has edited the order since, it shows that editor — turn on the <em>Buyer</em> column when you need the buyer instead.</p>
+            </div>
+            <div class="fb-group" style="flex:1 1 320px;">
+                <div class="fb-group-title">Approving</div>
+                <p class="help-p">Click <strong>Approve</strong> to issue the order through Fishbowl's own issue path. The server decides the outcome:</p>
+                <ul class="help-l">
+                    <li>With enough authority the order becomes <strong>Issued</strong>.</li>
+                    <li>Over your approval limit it becomes <strong>Pending Approval</strong> for someone above you.</li>
+                </ul>
+                <p class="help-p">The toast tells you which happened. An order that lands in <strong>Pending Approval</strong> stays on this list with its badge repainted — it is still waiting on somebody. Only an order that reaches <strong>Issued</strong> drops off.</p>
+                <p class="help-p">Approving a row that is already <strong>Pending Approval</strong> sends the same call. It clears the order only if your own approval limit covers it; if it does not, Fishbowl leaves the order where it is and the toast says so.</p>
+                <p class="help-p">The button is greyed out unless you hold the <strong>Purchase Order → Approve Orders</strong> access right.</p>
+                <p class="help-p">Approving sends immediately. Leave <strong>Ask for confirmation before each approval</strong> on (Settings → Safety) and every click shows you the order, its status and its amount first.</p>
+            </div>
+            <div class="fb-group" style="flex:1 1 320px;">
+                <div class="fb-group-title">Filters &amp; columns</div>
+                <ul class="help-l">
+                    <li><strong>Status</strong> picks Bid Request, Pending Approval or both. Leave it empty for both. Both are always loaded, so switching is instant.</li>
+                    <li><strong>Vendor</strong> and <strong>Created By</strong> are multi-selects — tick as many as you like; they filter instantly.</li>
+                    <li>The <strong>date range</strong> re-queries Fishbowl. Pick which date it applies to, then a preset or your own From / To.</li>
+                    <li>Click a column heading to sort, <strong>drag</strong> a heading to reorder, drag its right edge to resize.</li>
+                    <li><strong>Columns</strong> shows or hides columns, including Status, Buyer, Location Group, Lines, Subtotal, Tax, Currency and Note.</li>
+                    <li>Your layout and filters are saved against your Fishbowl user account.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('helpOverlay')">Close</button>
+    </div>
+</div>
+
+<script>
+// ============================================================================
+//  RUNTIME GUARD
+//  The report is useless outside the Fishbowl client (no runQueryAsync, no
+//  openModule) and equally useless without the shared lib, so say which is
+//  missing rather than dying on an undefined reference 300 lines later.
+// ============================================================================
+(function () {
+    var missing = [];
+    if (typeof runQueryAsync !== 'function' && typeof runQuery !== 'function') missing.push('runQuery / runQueryAsync');
+    if (!window.FBLib)                     missing.push('FBLib');
+    else {
+        if (!FBLib.Common)                 missing.push('FBLib.Common');
+        if (!FBLib.Settings)               missing.push('FBLib.Settings');
+        if (!FBLib.Table)                  missing.push('FBLib.Table');
+        if (FBLib.Common && !FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+    }
+    if (!missing.length) return;
+    document.body.innerHTML =
+        '<div style="padding:40px;font-family:sans-serif;color:#415157;max-width:640px;">' +
+        '<h2 style="color:#0B3140;">This report cannot start</h2>' +
+        '<p>Missing: <strong>' + missing.join(', ') + '</strong></p>' +
+        '<p>It must run inside the Fishbowl client, and the shared <em>fb-lib</em> Script and ' +
+        '<em>fb-styles</em> Style must be saved on this server (save them first, then re-save ' +
+        'this report so its includes re-run).</p></div>';
+    throw new Error('PO Approval: prerequisites missing — ' + missing.join(', '));
+})();
+
+// ============================================================================
+//  SETTINGS
+//  Layered resolver: this user's saved value -> the admin-published master ->
+//  a Fishbowl system property -> the defaults below.
+// ============================================================================
+FBLib.Settings.init({
+    masterStorage: 'userProperties',   // shared admin defaults via userproperties, not report data (which needs a SAVED report — see FBLib.SharedData)
+    userKey:   'cdx.bi.poApproval.user.v1',
+    masterKey: 'cdx.bi.poApproval.master.v1',
+    defaults: {
+        v: 1,
+        // The confirmation dialog is the only guard on the write path, so it
+        // ships ON. There is no dry-run toggle -- see SAFETY in the header.
+        confirmEach: true,
+        defaultPreset: 'all',
+        defaultDateField: 'datecreated',
+        // 'both' | '10' | '15' -- which statuses the bar starts on.
+        defaultStatuses: 'both',
+        showDebug: false,
+        rememberFilters: true,
+        // Saved filter selections (only honoured when rememberFilters is on).
+        filters: null,
+        // FBLib.Table's own layout blob (order / widths / hidden / sort).
+        tablePrefs: null
+    },
+    propFallback: {
+        showDebug: { name: 'BI_SHOW_DEBUG', dflt: 'false', parse: function (v) { return v === 'true' || v === true; } }
+    }
+});
+
+function _resolve(key, dflt) {
+    try {
+        var v = FBLib.Settings.resolve(key);
+        return (v === undefined || v === null) ? dflt : v;
+    } catch (_) { return dflt; }
+}
+function _setUserKey(key, value) {
+    try { FBLib.Settings.setUserKey(key, value); FBLib.Settings.saveUser(); } catch (_) {}
+}
+function debugLog(msg, type) { try { FBLib.Common.debugLog(msg, type || 'info'); } catch (_) {} }
+
+// ============================================================================
+//  CONSTANTS + STATE
+// ============================================================================
+
+// The two po.statusId values this queue covers. Both are always queried; the
+// Status filter narrows client-side.
+var STATUS_BID_REQUEST  = 10;
+var STATUS_PENDING_APPR = 15;
+var QUEUE_STATUSES = [STATUS_BID_REQUEST, STATUS_PENDING_APPR];
+var STATUS_LABEL = {};
+STATUS_LABEL[STATUS_BID_REQUEST]  = 'Bid Request';
+STATUS_LABEL[STATUS_PENDING_APPR] = 'Pending Approval';
+
+// The issue endpoint answers with the order's status as a LABEL, not an id, so
+// the reply has to be mapped back. Every po.statusId is listed, not just the
+// two in this queue -- the whole point of reading the reply is that the call
+// can land anywhere.
+var STATUS_ID_BY_LABEL = {
+    'bid request': 10, 'pending approval': 15, 'issued': 20, 'picking': 30,
+    'partial': 40, 'picked': 50, 'shipped': 55, 'fulfilled': 60,
+    'closed short': 70, 'void': 80, 'voided': 80
+};
+function statusIdFromLabel(label) {
+    var id = STATUS_ID_BY_LABEL[String(label || '').trim().toLowerCase()];
+    return id == null ? null : id;
+}
+function statusLabelOf(row) { return STATUS_LABEL[row.statusid] || String(row.statusid); }
+
+// Verified verbatim against the useraccess table — this is the exact string
+// the Fishbowl client stores for the PO module's "Approve Orders" right.
+var RIGHT_APPROVE = 'Purchase Order-Approve Orders';
+var RIGHT_VIEW    = 'Purchase Order-View';
+
+var _dataset    = [];    // every queued PO returned by the current query
+var _table      = null;
+var _statusMs   = null;
+var _vendorMs   = null;
+var _userMs     = null;
+var _canApprove = false;
+var _inFlight   = {};    // poid -> true while its approval is being sent
+var _debugApi   = null;
+
+var fmtMoney = function (v) { return FBLib.Common.formatMoney(v); };
+var fmtDate  = function (v) { return FBLib.Common.formatDate(v); };
+
+// ============================================================================
+//  COLUMNS
+//  `vis:false` columns are shipped but hidden — the Columns panel turns them
+//  on. Order here is the first-run order; the user's drag order wins after
+//  that (FBLib.Table restores it from settings).
+// ============================================================================
+var _columns = [
+    {
+        key: 'ponum', label: 'PO #', width: 110, sortable: true,
+        // openModule('Purchase Order', <num>) jumps straight to the order.
+        link: 'Purchase Order'
+    },
+    {
+        // Sorted and exported on the label (statuslabel), coloured off the id.
+        // Anyone opening this report with a saved layout from before the
+        // Pending Approval change gets this column appended at the right-hand
+        // end -- FBLib.Table keeps their order and adds unknown keys last.
+        key: 'statuslabel', label: 'Status', width: 132,
+        format: function (v, row) {
+            return '<span class="badge b' + (row.statusid || STATUS_BID_REQUEST) + '">' +
+                   escHtml(v || '') + '</span>';
+        }
+    },
+    { key: 'createdby',     label: 'Created By',      width: 130 },
+    { key: 'datecreated',   label: 'Date Created',    width: 115, format: function (v) { return fmtDate(v); } },
+    { key: 'datefirstship', label: 'Date First Ship', width: 125, format: function (v) { return fmtDate(v); } },
+    { key: 'vendorname',    label: 'Vendor',          width: 200, link: 'Vendor' },
+    {
+        key: 'total', label: 'Request Amount', width: 140, align: 'right', money: true,
+        format: function (v) { return '<span class="money-cell">' + escHtml(fmtMoney(v)) + '</span>'; }
+    },
+    {
+        key: '_approve', label: 'Approve', width: 116, align: 'center',
+        sortable: false, filter: false,
+        format: function (_v, row) { return buildApproveButton(row); }
+    },
+
+    /* ── hidden by default ── */
+    { key: 'buyer',         label: 'Buyer',          width: 130, vis: false },
+    { key: 'locationgroup', label: 'Location Group', width: 140, vis: false },
+    { key: 'linecount',     label: 'Lines',          width: 70,  vis: false, align: 'right', money: false, type: 'number' },
+    { key: 'subtotal',      label: 'Subtotal',       width: 120, vis: false, align: 'right', money: true, format: function (v) { return escHtml(fmtMoney(v)); } },
+    { key: 'totaltax',      label: 'Tax',            width: 110, vis: false, align: 'right', money: true, format: function (v) { return escHtml(fmtMoney(v)); } },
+    { key: 'currencycode',  label: 'Currency',       width: 90,  vis: false },
+    { key: 'note',          label: 'Note',           width: 280, vis: false, format: function (v) { return '<span class="muted-cell">' + escHtml(oneLine(v)) + '</span>'; } }
+];
+
+// ============================================================================
+//  QUERY
+//  One PO-grain row. The line subtotal is aggregated in a derived table so a
+//  PO with many lines still produces exactly one row (a plain join + GROUP BY
+//  would work too, but this keeps the header columns out of the grouping).
+// ============================================================================
+function buildSQL() {
+    // Both statuses always. The Status filter is client-side, so ticking it
+    // repaints instead of re-querying and the bar's two counts stay comparable.
+    var where = ['po.statusId IN (' + QUEUE_STATUSES.join(',') + ')'];
+
+    // Restrict to the location groups this user can actually see. An empty or
+    // unavailable list means "don't restrict" — the Fishbowl query layer still
+    // applies the user's own access.
+    var lgIds = [];
+    try { if (typeof getLocationGroupList === 'function') lgIds = getLocationGroupList() || []; } catch (_) {}
+    if (Array.isArray(lgIds) && lgIds.length) {
+        var clean = lgIds.map(function (n) { return parseInt(n, 10); }).filter(function (n) { return !isNaN(n); });
+        if (clean.length) where.push('po.locationGroupId IN (' + clean.join(',') + ')');
+    }
+
+    // Date range — applied in SQL against whichever date column is selected.
+    // `< toDate + 1 day` rather than `<= toDate` so a datetime stamped at
+    // 14:32 on the To date is still inside the range.
+    var field = document.getElementById('dateField').value === 'datefirstship' ? 'po.dateFirstShip' : 'po.dateCreated';
+    var from = safeDate(document.getElementById('dateFrom').value);
+    var to   = safeDate(document.getElementById('dateTo').value);
+    if (from) where.push(field + " >= '" + from + " 00:00:00'");
+    if (to)   where.push(field + " < DATE_ADD('" + to + " 00:00:00', INTERVAL 1 DAY)");
+
+    return [
+        'SELECT',
+        '  po.id                       AS poid,',
+        '  po.num                      AS ponum,',
+        '  po.statusId                 AS statusid,',
+        '  po.username                 AS createdby,',
+        '  po.buyer                    AS buyer,',
+        '  po.dateCreated              AS datecreated,',
+        '  po.dateFirstShip            AS datefirstship,',
+        '  v.name                      AS vendorname,',
+        '  lg.name                     AS locationgroup,',
+        '  po.note                     AS note,',
+        '  COALESCE(po.totalTax, 0)    AS totaltax,',
+        // bit(1) arrives in JS as a raw byte (String.fromCharCode(1)) and the
+        // Fishbowl client strips control characters out of inline script, so
+        // never compare it in JS — force it to a number here instead.
+        '  (po.totalIncludesTax + 0)   AS totalincludestax,',
+        '  COALESCE(li.subtotal, 0)    AS subtotal,',
+        '  COALESCE(li.linecount, 0)   AS linecount,',
+        '  cur.code                    AS currencycode',
+        'FROM po',
+        'JOIN vendor v              ON v.id  = po.vendorId',
+        'LEFT JOIN locationgroup lg ON lg.id = po.locationGroupId',
+        'LEFT JOIN currency cur     ON cur.id = po.currencyId',
+        'LEFT JOIN (',
+        // statusId 70 is a voided line — it is not part of what is being
+        // requested, so it must not be part of the amount.
+        '  SELECT pi.poId, SUM(pi.totalCost) AS subtotal, COUNT(*) AS linecount',
+        '  FROM poitem pi WHERE pi.statusId <> 70 GROUP BY pi.poId',
+        ') li ON li.poId = po.id',
+        'WHERE ' + where.join('\n  AND '),
+        'ORDER BY po.dateCreated DESC',
+        'LIMIT 2000'
+    ].join('\n');
+}
+
+async function loadData() {
+    var btn = document.getElementById('refreshBtn');
+    if (btn) btn.disabled = true;
+    setStatus('Loading orders awaiting approval…');
+    try {
+        var sql = buildSQL();
+        debugLog('PO Approval query:\n' + sql, 'query');
+        var rows = await qp(sql);
+
+        _dataset = (rows || []).map(function (r) {
+            var subtotal = parseFloat(r.subtotal) || 0;
+            var tax      = parseFloat(r.totaltax) || 0;
+            // When the order's line totals already include tax, adding
+            // po.totalTax on top would double-count it.
+            var inclusive = String(r.totalincludestax) === '1';
+            var statusId = parseInt(r.statusid, 10);
+            if (QUEUE_STATUSES.indexOf(statusId) === -1) statusId = STATUS_BID_REQUEST;
+            return {
+                poid:             parseInt(r.poid, 10),
+                ponum:            r.ponum || '',
+                statusid:         statusId,
+                statuslabel:      STATUS_LABEL[statusId],
+                createdby:        r.createdby || '',
+                buyer:            r.buyer || '',
+                datecreated:      r.datecreated || '',
+                datefirstship:    r.datefirstship || '',
+                vendorname:       r.vendorname || '',
+                locationgroup:    r.locationgroup || '',
+                note:             r.note || '',
+                subtotal:         subtotal,
+                totaltax:         tax,
+                linecount:        parseInt(r.linecount, 10) || 0,
+                currencycode:     r.currencycode || '',
+                total:            inclusive ? subtotal : subtotal + tax
+            };
+        });
+
+        debugLog('Loaded ' + _dataset.length + ' PO(s) awaiting approval — ' +
+                 countStatus(_dataset, STATUS_BID_REQUEST) + ' bid request, ' +
+                 countStatus(_dataset, STATUS_PENDING_APPR) + ' pending approval', 'success');
+        populateFilterOptions();
+        refreshTable();
+    } catch (e) {
+        console.error('[PO Approval] load failed:', e);
+        _dataset = [];
+        refreshTable();
+        setStatus('Load failed — ' + errText(e));
+        debugLog('Load failed: ' + errText(e), 'error');
+        showToast('Could not load purchase orders: ' + errText(e), 'error', 8000);
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+// runQueryAsync resolves to an already-parsed array; runQuery returns a JSON
+// string. Prefer the async one and fall back so the report still works on an
+// older client.
+async function qp(sql) {
+    if (typeof runQueryAsync === 'function') {
+        var out = await runQueryAsync(sql);
+        return normalise(out);
+    }
+    return normalise(safeParse(runQuery(sql, 'true')));
+}
+function normalise(r) {
+    if (!r) return [];
+    if (Array.isArray(r)) return r;
+    return [r];
+}
+
+// ============================================================================
+//  FILTERING  (client-side, over _dataset)
+// ============================================================================
+function selectedSet(ms) {
+    if (!ms) return null;
+    var vals = ms.getSelected ? ms.getSelected() : [];
+    if (!vals || !vals.length) return null;       // nothing ticked == no filter
+    var s = new Set();
+    vals.forEach(function (v) { s.add(String(v)); });
+    return s;
+}
+
+function filteredRows() {
+    var stat = selectedSet(_statusMs);
+    var vend = selectedSet(_vendorMs);
+    var user = selectedSet(_userMs);
+    var q = (document.getElementById('poSearch').value || '').trim().toLowerCase();
+
+    return _dataset.filter(function (r) {
+        if (stat && !stat.has(String(r.statusid))) return false;
+        if (vend && !vend.has(r.vendorname)) return false;
+        if (user && !user.has(r.createdby)) return false;
+        if (q && String(r.ponum).toLowerCase().indexOf(q) === -1) return false;
+        return true;
+    });
+}
+
+// Rebuild the two multi-select lists from the rows currently loaded, keeping
+// any selection that is still valid. Values the query no longer returns are
+// dropped rather than left ticked-but-invisible.
+function populateFilterOptions() {
+    function distinct(key) {
+        var seen = Object.create(null);
+        _dataset.forEach(function (r) { if (r[key]) seen[r[key]] = true; });
+        return Object.keys(seen).sort(function (a, b) { return a.localeCompare(b); })
+            .map(function (v) { return { value: v, label: v }; });
+    }
+    _setMsItems(_vendorMs, distinct('vendorname'));
+    _setMsItems(_userMs,   distinct('createdby'));
+    // Status is deliberately NOT rebuilt from the data -- it is a fixed list
+    // set once at init, so "Pending Approval (0)" stays selectable.
+}
+
+function countStatus(rows, statusId) {
+    return rows.reduce(function (n, r) { return n + (r.statusid === statusId ? 1 : 0); }, 0);
+}
+
+function _setMsItems(ms, items) {
+    if (!ms) return;
+    var keep = new Set(items.map(function (i) { return String(i.value); }));
+    var stillValid = (ms.getSelected() || []).filter(function (v) { return keep.has(String(v)); });
+    ms.setItems(items);
+    ms.setSelected(stillValid);
+}
+
+function refreshTable() {
+    if (_table) _table.render();
+    updateSummary();
+}
+
+function updateSummary() {
+    var rows = filteredRows();
+    var total = rows.reduce(function (a, r) { return a + (r.total || 0); }, 0);
+    var nBid  = countStatus(rows, STATUS_BID_REQUEST);
+    var nPend = countStatus(rows, STATUS_PENDING_APPR);
+
+    document.getElementById('statBid').textContent     = nBid.toLocaleString();
+    document.getElementById('statPending').textContent = nPend.toLocaleString();
+    document.getElementById('statValue').textContent   = fmtMoney(total);
+
+    // The per-status breakdown lives in the header stats now, so the
+    // subtitle carries only what they cannot: the total, what the filters are
+    // hiding, and the access warning.
+    var hidden = _dataset.length - rows.length;
+    setStatus(
+        rows.length.toLocaleString() + ' order' + (rows.length === 1 ? '' : 's') + ' awaiting approval' +
+        (hidden > 0 ? ' (' + hidden.toLocaleString() + ' filtered out)' : '') +
+        (_canApprove ? '' : ' — you do not hold "' + RIGHT_APPROVE + '", so approving is disabled')
+    );
+    persistFilters();
+}
+
+function clearFilters() {
+    if (_statusMs) _statusMs.setSelected(defaultStatusSelection());
+    if (_vendorMs) _vendorMs.setSelected([]);
+    if (_userMs)   _userMs.setSelected([]);
+    document.getElementById('poSearch').value = '';
+    document.getElementById('datePreset').value = _resolve('defaultPreset', 'all');
+    document.getElementById('dateField').value = _resolve('defaultDateField', 'datecreated');
+    applyPresetToInputs();
+    loadData();
+}
+
+// ── DATE RANGE ──────────────────────────────────────────────────────────────
+// A preset writes concrete dates into the From / To inputs, so the SQL only
+// ever reads those two values and "custom" needs no special case.
+function applyPresetToInputs() {
+    var preset = document.getElementById('datePreset').value;
+    var fromEl = document.getElementById('dateFrom');
+    var toEl   = document.getElementById('dateTo');
+    if (preset === 'custom') return;                 // leave whatever is typed
+
+    var today = new Date();
+    var from = null, to = null;
+    if (preset === 'all') {
+        from = null; to = null;
+    } else if (preset === 'mtd') {
+        from = new Date(today.getFullYear(), today.getMonth(), 1); to = today;
+    } else if (preset === 'lastmonth') {
+        from = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+        to   = new Date(today.getFullYear(), today.getMonth(), 0);
+    } else if (preset === 'ytd') {
+        from = new Date(today.getFullYear(), 0, 1); to = today;
+    } else {
+        var days = parseInt(preset, 10);
+        if (!isNaN(days)) { from = new Date(today.getTime()); from.setDate(from.getDate() - days); to = today; }
+    }
+    fromEl.value = from ? isoDate(from) : '';
+    toEl.value   = to   ? isoDate(to)   : '';
+}
+
+function onPresetChange() { applyPresetToInputs(); onDateControlChange(); }
+
+// Typing a date by hand means the user is no longer on a preset.
+function onCustomDateChange() {
+    document.getElementById('datePreset').value = 'custom';
+    onDateControlChange();
+}
+
+// Both the date field and the range live in the SQL, so either one re-queries.
+function onDateControlChange() { persistFilters(); loadData(); }
+
+function persistFilters() {
+    if (!_resolve('rememberFilters', true)) return;
+    _setUserKey('filters', {
+        statuses:  _statusMs ? _statusMs.getSelected() : [],
+        vendors:   _vendorMs ? _vendorMs.getSelected() : [],
+        users:     _userMs ? _userMs.getSelected() : [],
+        poSearch:  document.getElementById('poSearch').value || '',
+        dateField: document.getElementById('dateField').value,
+        preset:    document.getElementById('datePreset').value,
+        dateFrom:  document.getElementById('dateFrom').value,
+        dateTo:    document.getElementById('dateTo').value
+    });
+}
+
+// The Status setting as a multi-select selection. 'both' is expressed as
+// nothing ticked, which is this bar's convention for "no filter".
+function defaultStatusSelection() {
+    var d = String(_resolve('defaultStatuses', 'both'));
+    return (d === '10' || d === '15') ? [d] : [];
+}
+
+// Restores the saved bar state. The vendor / user selections are applied after
+// the first query (populateFilterOptions clears anything the data no longer
+// has). Status is a fixed list, so it can be set here and now.
+function hydrateFilters() {
+    document.getElementById('dateField').value  = _resolve('defaultDateField', 'datecreated');
+    document.getElementById('datePreset').value = _resolve('defaultPreset', 'all');
+
+    var f = _resolve('rememberFilters', true) ? _resolve('filters', null) : null;
+    if (_statusMs) {
+        _statusMs.setSelected(
+            (f && Array.isArray(f.statuses)) ? f.statuses : defaultStatusSelection()
+        );
+    }
+    if (f && typeof f === 'object') {
+        if (f.dateField) document.getElementById('dateField').value = f.dateField;
+        if (f.preset)    document.getElementById('datePreset').value = f.preset;
+        document.getElementById('poSearch').value = f.poSearch || '';
+    }
+    applyPresetToInputs();
+    if (f && f.preset === 'custom') {
+        document.getElementById('dateFrom').value = f.dateFrom || '';
+        document.getElementById('dateTo').value   = f.dateTo || '';
+    }
+    return f;
+}
+
+// ============================================================================
+//  APPROVE
+// ============================================================================
+
+// One button per row. Built as a DOM node (FBLib.Table appends a Node when
+// format() returns one) so the click handler binds directly to the row rather
+// than going through a global id lookup.
+function buildApproveButton(row) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'appr-btn';
+    btn.innerHTML =
+        '<svg fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24">' +
+        '<path d="M5 13l4 4L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+        '<span>Approve</span>';
+
+    if (_inFlight[row.poid]) {
+        btn.disabled = true;
+        btn.classList.add('busy');
+        btn.querySelector('span').textContent = 'Sending…';
+        return btn;
+    }
+    if (!_canApprove) {
+        btn.disabled = true;
+        btn.title = 'You do not hold the "' + RIGHT_APPROVE + '" access right.';
+        return btn;
+    }
+    btn.title = 'Issue PO ' + row.ponum + ' — ' + statusLabelOf(row) + ', ' +
+                fmtMoney(row.total) + ', ' + row.vendorname +
+                (row.statusid === STATUS_PENDING_APPR
+                    ? '. It is already waiting on a higher approver, so this only clears it if your own limit covers it.'
+                    : '');
+    btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        approvePo(row, btn);
+    });
+    return btn;
+}
+
+async function approvePo(row, btn) {
+    if (_inFlight[row.poid]) return;
+
+    if (_resolve('confirmEach', true)) {
+        var msg = 'Approve PO ' + row.ponum + '?\n\n' +
+            'Status: ' + statusLabelOf(row) + '\n' +
+            'Vendor: ' + row.vendorname + '\n' +
+            'Amount: ' + fmtMoney(row.total) + '\n\n' +
+            (row.statusid === STATUS_PENDING_APPR
+                ? 'This order is already over somebody\'s approval limit and is waiting on a ' +
+                  'higher approver. Issuing it here only succeeds if your own limit covers it — ' +
+                  'otherwise Fishbowl leaves it exactly where it is.'
+                : 'This issues the order in Fishbowl. If it is over your approval limit ' +
+                  'Fishbowl will place it in Pending Approval instead, and it stays in this queue.');
+        if (!confirm(msg)) return;
+    }
+
+    var path = '/api/purchase-orders/' + row.poid + '/issue';
+
+    _inFlight[row.poid] = true;
+    if (btn) { btn.disabled = true; btn.classList.add('busy'); var lbl = btn.querySelector('span'); if (lbl) lbl.textContent = 'Sending…'; }
+
+    if (typeof runRestApiAsync !== 'function') {
+        delete _inFlight[row.poid];
+        refreshTable();
+        showToast('The Fishbowl REST connection is not available, so orders cannot be approved from ' +
+                  'this report. Open it from a client connected to a server with REST enabled.', 'error', 9000);
+        debugLog('runRestApiAsync unavailable — approval aborted', 'error');
+        return;
+    }
+
+    try {
+        debugLog('POST ' + path + ' (PO ' + row.ponum + ')', 'click');
+        var res = await runRestApiAsync({ method: 'POST', path: path });
+        debugLog('Issue response: ' + JSON.stringify(res), 'info');
+
+        // The endpoint answers with the whole order, so the resulting status
+        // is authoritative — report what actually happened rather than
+        // assuming "Issued". Three outcomes, and the row's fate differs:
+        //   same status   -> nothing moved, keep the row so it can be retried
+        //   still queued  -> Bid Request became Pending Approval: REPAINT it
+        //   anything else -> it left the queue, drop it
+        var newStatus = (res && res.status) ? String(res.status) : '';
+        var newId = statusIdFromLabel(newStatus);
+
+        if (newId != null && newId === row.statusid) {
+            delete _inFlight[row.poid];
+            refreshTable();
+            showToast('PO ' + row.ponum + ' is still in ' + statusLabelOf(row) + ' — Fishbowl accepted ' +
+                      'the call but did not change the status.', 'warn', 8000);
+            debugLog('Issue returned the unchanged status "' + newStatus + '" for PO ' + row.ponum, 'warn');
+            return;
+        }
+
+        if (newId != null && QUEUE_STATUSES.indexOf(newId) !== -1) {
+            // Pending Approval is part of this queue, so the order has not
+            // finished its journey — keep it visible under its new badge.
+            setRowStatus(row, newId);
+            showToast('PO ' + row.ponum + ' → ' + STATUS_LABEL[newId] +
+                      ' — it is over your approval limit and now needs a higher approver. ' +
+                      'It stays in this queue.', 'success', 8000);
+            debugLog('PO ' + row.ponum + ' moved to ' + STATUS_LABEL[newId] + ' — row kept', 'success');
+            return;
+        }
+
+        showToast('PO ' + row.ponum + ' → ' + (newStatus || 'issued') +
+                  (newStatus ? '' : ' (Fishbowl did not report a status)'),
+                  'success', 6000);
+        debugLog('PO ' + row.ponum + ' issued — status now ' + (newStatus || '(not returned)'), 'success');
+        removeRow(row.poid);
+    } catch (e) {
+        // runRestApiAsync rejects with { message, status } on an HTTP error;
+        // anything else arrives as an ordinary Error.
+        delete _inFlight[row.poid];
+        refreshTable();
+        var txt = errText(e);
+        console.error('[PO Approval] issue failed:', e);
+        debugLog('Issue failed for PO ' + row.ponum + ': ' + txt, 'error');
+        showToast('Could not approve PO ' + row.ponum + ': ' + txt, 'error', 10000);
+    }
+}
+
+// Repaint a row that moved between the two queued statuses. The row object is
+// the one _dataset holds, so mutating it is enough — filteredRows() reads it
+// again on the next render and will hide the row if the Status filter no
+// longer admits it.
+function setRowStatus(row, statusId) {
+    delete _inFlight[row.poid];
+    row.statusid = statusId;
+    row.statuslabel = STATUS_LABEL[statusId] || String(statusId);
+    refreshTable();
+}
+
+// Drop an approved PO out of the queue. Fades the row first so the click has
+// visible consequences, then removes it from the dataset and repaints.
+function removeRow(poid) {
+    delete _inFlight[poid];
+    var idx = _dataset.findIndex(function (r) { return r.poid === poid; });
+    if (idx === -1) { refreshTable(); return; }
+    _dataset.splice(idx, 1);
+    populateFilterOptions();
+    refreshTable();
+}
+
+// ============================================================================
+//  COLUMNS PANEL
+//  FBLib.Table owns order / width / sort (and persists them itself on drag).
+//  Visibility has no public setter, so toggling writes the same settings blob
+//  the Table reads — keeping every other field it holds — and then repaints.
+// ============================================================================
+function buildColPanel() {
+    var host = document.getElementById('colList');
+    host.innerHTML = '';
+    _table.getColumns().forEach(function (col) {
+        var label = document.createElement('label');
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = col.vis !== false;
+        // The action column is the point of the report — never let it be hidden.
+        if (col.key === '_approve') { cb.disabled = true; label.title = 'The Approve column is always shown'; }
+        cb.addEventListener('change', function () { setColumnVisible(col.key, cb.checked); });
+        var span = document.createElement('span');
+        span.textContent = col.label;
+        label.appendChild(cb);
+        label.appendChild(span);
+        host.appendChild(label);
+    });
+}
+
+function setColumnVisible(key, visible) {
+    var cols = _table.getColumns();       // same column objects the Table holds
+    var col = cols.find(function (c) { return c.key === key; });
+    if (!col) return;
+    col.vis = !!visible;
+
+    var saved = _resolve('tablePrefs', null);
+    if (!saved || typeof saved !== 'object') saved = {};
+    saved.order = cols.map(function (c) { return c.key; });
+    saved.hidden = cols.filter(function (c) { return c.vis === false; }).map(function (c) { return c.key; });
+    _setUserKey('tablePrefs', saved);
+
+    _table.render();
+}
+
+function toggleColPanel() { document.getElementById('colPanel').classList.toggle('hidden'); }
+
+function resetColLayout() {
+    if (!confirm('Reset column order, widths and visibility to the defaults?')) return;
+    _setUserKey('tablePrefs', null);
+    // Rebuild from the pristine definitions — setColumns re-reads settings,
+    // which are now empty, so nothing is re-hidden.
+    _table.setColumns(_columns.map(function (c) { return Object.assign({}, c); }));
+    buildColPanel();
+    _table.render();
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+function visibleExportCols() {
+    return _table.getColumns().filter(function (c) { return c.vis !== false && c.key !== '_approve'; });
+}
+
+// Plain text for a cell — the on-screen formatter may emit HTML or a Node, so
+// format the underlying value here instead of scraping the DOM.
+function cellText(col, row) {
+    var raw = row[col.key];
+    if (raw == null) return '';
+    if (col.money) return fmtMoney(raw);
+    if (col.key === 'datecreated' || col.key === 'datefirstship') return fmtDate(raw);
+    return oneLine(String(raw));
+}
+
+function exportCsv() {
+    var rows = filteredRows();
+    if (!rows.length) { showToast('Nothing to export — no rows match the current filters.', 'warn'); return; }
+    var cols = visibleExportCols();
+    var name = 'PO_Approval_' + isoDate(new Date());
+
+    // Every cell is pre-formatted to text here, so the exported columns carry
+    // no money/date type — FBLib.Export must not re-format what is already
+    // formatted.
+    var flatCols = cols.map(function (c) { return { key: c.key, label: c.label }; });
+    var flatRows = rows.map(function (r) {
+        var o = {};
+        cols.forEach(function (c) { o[c.key] = cellText(c, r); });
+        return o;
+    });
+
+    // Prefer the shared exporter (it owns the one download dance that survives
+    // JxBrowser's Save-As dialog); fall back to a local blob if fb-lib is older.
+    if (FBLib.Export && typeof FBLib.Export.csv === 'function') {
+        FBLib.Export.csv({ cols: flatCols, rows: flatRows, filename: name });
+    } else {
+        var header = flatCols.map(function (c) { return csvField(c.label); }).join(',');
+        var body = flatRows.map(function (r) {
+            return flatCols.map(function (c) { return csvField(r[c.key]); }).join(',');
+        }).join('\r\n');
+        var blob = new Blob(['﻿' + header + '\r\n' + body], { type: 'text/csv;charset=utf-8;' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url; a.download = name + '.csv'; a.rel = 'noopener'; a.style.display = 'none';
+        document.body.appendChild(a); a.click();
+        // JxBrowser opens its Save-As dialog behind the window and reads the
+        // blob late — revoking immediately truncates the file.
+        setTimeout(function () {
+            try { document.body.removeChild(a); } catch (_) {}
+            try { URL.revokeObjectURL(url); } catch (_) {}
+        }, 4000);
+    }
+    debugLog('Exported ' + rows.length + ' row(s) to CSV', 'success');
+}
+
+// window.print() is unreliable in JxBrowser — build the document, open a new
+// window and print THAT.
+function printReport() {
+    var rows = filteredRows();
+    var cols = visibleExportCols();
+    var hdr = cols.map(function (c) { return '<th' + (c.align === 'right' ? ' class="nr"' : '') + '>' + escHtml(c.label) + '</th>'; }).join('');
+    var body = rows.map(function (r) {
+        return '<tr>' + cols.map(function (c) {
+            return '<td' + (c.align === 'right' ? ' class="nr"' : '') + '>' + escHtml(cellText(c, r)) + '</td>';
+        }).join('') + '</tr>';
+    }).join('');
+    var total = rows.reduce(function (a, r) { return a + (r.total || 0); }, 0);
+
+    // Name the statuses actually on the page rather than the ones the report
+    // covers — a printout filtered to one status must not claim both.
+    var printed = QUEUE_STATUSES
+        .filter(function (id) { return countStatus(rows, id) > 0; })
+        .map(function (id) { return STATUS_LABEL[id]; });
+
+    var html = '<!DOCTYPE html><html><head><meta charset="UTF-8"/><title>PO Approval</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:.4in;color:#111}' +
+        'h2{font-size:11pt;margin:0 0 4px;color:#0B3140}.sub{font-size:7.5pt;color:#506872;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}' +
+        'th{background:#0B3140;color:#fff;font-size:7pt;padding:4px 5px;text-align:left;-webkit-print-color-adjust:exact;print-color-adjust:exact}' +
+        'td{font-size:7.5pt;padding:3px 5px;border-bottom:1px solid #E3E3E3}' +
+        'tr:nth-child(even) td{background:#F7F7F7;-webkit-print-color-adjust:exact;print-color-adjust:exact}' +
+        '.nr{text-align:right}@page{size:A4 landscape;margin:.4in}' +
+        '</style></head><body><h2>Purchase Orders awaiting approval' +
+        (printed.length ? ' (' + escHtml(printed.join(' + ')) + ')' : '') + '</h2>' +
+        '<p class="sub">' + rows.length.toLocaleString() + ' order' + (rows.length === 1 ? '' : 's') +
+        ' &mdash; ' + escHtml(fmtMoney(total)) + ' requested &mdash; printed ' + new Date().toLocaleDateString() + '</p>' +
+        '<table><thead><tr>' + hdr + '</tr></thead><tbody>' + body + '</tbody></table></body></html>';
+
+    var w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+    debugLog('Printed ' + rows.length + ' row(s)', 'success');
+}
+
+// ============================================================================
+//  SETTINGS PANEL
+// ============================================================================
+function hydrateSettings() {
+    document.getElementById('setConfirm').checked = !!_resolve('confirmEach', true);
+    document.getElementById('setDefaultPreset').value = _resolve('defaultPreset', 'all');
+    document.getElementById('setDefaultDateField').value = _resolve('defaultDateField', 'datecreated');
+    document.getElementById('setDefaultStatuses').value = String(_resolve('defaultStatuses', 'both'));
+    document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+    document.getElementById('setRememberFilters').checked = !!_resolve('rememberFilters', true);
+}
+
+function onSettingsChange() {
+    _setUserKey('confirmEach', document.getElementById('setConfirm').checked);
+    _setUserKey('defaultPreset', document.getElementById('setDefaultPreset').value);
+    _setUserKey('defaultDateField', document.getElementById('setDefaultDateField').value);
+    _setUserKey('defaultStatuses', document.getElementById('setDefaultStatuses').value);
+    _setUserKey('rememberFilters', document.getElementById('setRememberFilters').checked);
+    var showDebug = document.getElementById('setShowDebug').checked;
+    _setUserKey('showDebug', showDebug);
+    applyDebugDrawer(showDebug);
+}
+
+function resetSettings() {
+    if (!confirm('Reset your personal settings to defaults?')) return;
+    try { FBLib.Settings.clearUser(); } catch (_) {}
+    hydrateSettings();
+    applyDebugDrawer(!!_resolve('showDebug', false));
+    hydrateFilters();
+    loadData();
+}
+
+function publishDefaults() {
+    if (!FBLib.Settings.isAdmin()) return;
+    if (!confirm('Publish the current Settings values as the default for all users?')) return;
+    try {
+        // publishMaster REPLACES the whole master object, so send every field
+        // the org default is meant to carry — not just the one that changed.
+        FBLib.Settings.publishMaster({
+            confirmEach: document.getElementById('setConfirm').checked,
+            defaultPreset: document.getElementById('setDefaultPreset').value,
+            defaultDateField: document.getElementById('setDefaultDateField').value,
+            defaultStatuses: document.getElementById('setDefaultStatuses').value,
+            rememberFilters: document.getElementById('setRememberFilters').checked
+        });
+        showToast('Published as the default for everyone.', 'success');
+        debugLog('Defaults published', 'success');
+    } catch (e) { debugLog('publishDefaults: ' + errText(e), 'error'); }
+}
+
+function toggleUserEditing() {
+    if (!FBLib.Settings.isAdmin()) return;
+    try { FBLib.Settings.setLock(FBLib.Settings.userEditingAllowed()); refreshAdminUi(); }
+    catch (e) { debugLog('toggleUserEditing: ' + errText(e), 'error'); }
+}
+
+function refreshAdminUi() {
+    var isAdmin = FBLib.Settings.isAdmin();
+    document.getElementById('dsAdminSection').style.display = isAdmin ? 'block' : 'none';
+    var allowed = FBLib.Settings.userEditingAllowed();
+    document.getElementById('dsLockBadge').style.display = (!allowed && !isAdmin) ? 'block' : 'none';
+    var lockBtn = document.getElementById('dsLockBtn');
+    if (lockBtn) lockBtn.textContent = allowed ? 'Lock user editing' : 'Unlock user editing';
+}
+
+// ============================================================================
+//  DEBUG DRAWER
+// ============================================================================
+function applyDebugDrawer(showIt) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (showIt) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    if (_debugApi.element) observeDebugDrawer(_debugApi.element);
+}
+function observeDebugDrawer(el) {
+    if (!el || el._observed) return;
+    el._observed = true;
+    var apply = function () {
+        var visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        var h = (visible && open) ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    if (typeof ResizeObserver === 'function') { try { new ResizeObserver(apply).observe(el); } catch (_) {} }
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+
+// ============================================================================
+//  SMALL HELPERS
+// ============================================================================
+function setStatus(msg) { document.getElementById('statusLine').textContent = msg; }
+function safeParse(s) { try { return JSON.parse(s); } catch (_) { return null; } }
+function safeDate(s) { return /^\d{4}-\d{2}-\d{2}$/.test(s || '') ? s : ''; }
+function isoDate(d) {
+    // Local date parts, not toISOString — that shifts to UTC and can land a
+    // day early for anyone east of Greenwich.
+    var m = String(d.getMonth() + 1).padStart(2, '0');
+    var day = String(d.getDate()).padStart(2, '0');
+    return d.getFullYear() + '-' + m + '-' + day;
+}
+function escHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function oneLine(s) { return String(s == null ? '' : s).replace(/\s*[\r\n]+\s*/g, ' ').trim(); }
+function csvField(v) { return '"' + oneLine(v).replace(/"/g, '""') + '"'; }
+function errText(e) {
+    if (!e) return 'unknown error';
+    if (typeof e === 'string') return e;
+    if (e.message) return e.message + (e.status != null ? ' (HTTP ' + e.status + ')' : '');
+    if (e.status != null) return 'HTTP ' + e.status;
+    try { return JSON.stringify(e); } catch (_) { return String(e); }
+}
+
+function showToast(message, type, duration) {
+    var host = document.getElementById('toastContainer');
+    var el = document.createElement('div');
+    el.className = 'toast ' + (type || 'info');
+    var ico = { success: '✓', error: '✕', warn: '⚠', info: 'ℹ' }[type || 'info'];
+    var icon = document.createElement('span'); icon.className = 'toast-icon'; icon.textContent = ico;
+    var msg = document.createElement('span'); msg.className = 'toast-msg'; msg.textContent = message;
+    var x = document.createElement('button'); x.className = 'toast-x'; x.innerHTML = '&times;';
+    x.addEventListener('click', function () { el.remove(); });
+    el.appendChild(icon); el.appendChild(msg); el.appendChild(x);
+    host.appendChild(el);
+    setTimeout(function () {
+        el.style.opacity = '0';
+        setTimeout(function () { el.remove(); }, 260);
+    }, duration || 4000);
+}
+
+function hasRight(name) {
+    // Outside the client there is no rights layer — fail CLOSED for the
+    // approve right so a harness can never look like it can issue orders.
+    try { return typeof hasUserAccess === 'function' && !!hasUserAccess(name); } catch (_) { return false; }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async function () {
+    try {
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn'  });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+
+        _canApprove = hasRight(RIGHT_APPROVE);
+        debugLog('Access — ' + RIGHT_VIEW + ': ' + hasRight(RIGHT_VIEW) + ', ' +
+                 RIGHT_APPROVE + ': ' + _canApprove, 'info');
+
+        hydrateSettings();
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        refreshAdminUi();
+
+        // Status is fixed and set up before hydrateFilters() runs, so the
+        // saved (or default) selection can be applied there like the rest of
+        // the bar. Values are strings because selectedSet() compares strings.
+        _statusMs = FBLib.Common.MultiSelect.create({
+            containerId: 'statusMs', placeholder: 'All statuses',
+            items: QUEUE_STATUSES.map(function (id) {
+                return { value: String(id), label: STATUS_LABEL[id] };
+            }),
+            onChange: function () { refreshTable(); }
+        });
+
+        // Vendor / Created By filter client-side over the loaded rows, so they
+        // repaint on every tick (onChange) rather than re-querying.
+        _vendorMs = FBLib.Common.MultiSelect.create({
+            containerId: 'vendorMs', items: [], placeholder: 'All vendors',
+            onChange: function () { refreshTable(); }
+        });
+        _userMs = FBLib.Common.MultiSelect.create({
+            containerId: 'userMs', items: [], placeholder: 'All users',
+            onChange: function () { refreshTable(); }
+        });
+
+        document.getElementById('poSearch').addEventListener('input', debounce(function () { refreshTable(); }, 180));
+
+        // Close the Columns panel on any outside click.
+        document.addEventListener('click', function (e) {
+            var wrap = document.getElementById('colWrap');
+            if (wrap && !wrap.contains(e.target)) document.getElementById('colPanel').classList.add('hidden');
+        });
+
+        // FBLib.Table: sort / drag-reorder / drag-resize / lazy render, with
+        // the layout persisted against the Fishbowl user account.
+        _table = FBLib.Table.init({
+            tableEl: document.getElementById('reportTable'),
+            columns: _columns,
+            getRows: filteredRows,
+            chunkSize: 200,
+            settingsKey: 'tablePrefs'
+        });
+        buildColPanel();
+
+        var savedFilters = hydrateFilters();
+
+        if (!hasRight(RIGHT_VIEW) && typeof hasUserAccess === 'function') {
+            // View is the gate on the data itself — say so rather than showing
+            // an empty table that looks like "no bid requests".
+            setStatus('You do not hold "' + RIGHT_VIEW + '", so no purchase orders can be shown.');
+            _table.render();
+            return;
+        }
+
+        await loadData();
+
+        // Re-apply saved multi-select picks now the lists exist (anything the
+        // current query no longer returns is silently dropped).
+        if (savedFilters) {
+            if (_vendorMs && savedFilters.vendors) _vendorMs.setSelected(savedFilters.vendors);
+            if (_userMs && savedFilters.users)     _userMs.setSelected(savedFilters.users);
+            refreshTable();
+        }
+
+        debugLog('Report initialised', 'success');
+    } catch (e) {
+        console.error('[PO Approval init] failed:', e);
+        setStatus('Init failed — ' + errText(e));
+        debugLog('Init failed: ' + (e && e.stack ? e.stack : errText(e)), 'error');
+    }
+});
+
+function debounce(fn, ms) {
+    var t = null;
+    return function () {
+        var args = arguments, self = this;
+        clearTimeout(t);
+        t = setTimeout(function () { fn.apply(self, args); }, ms);
+    };
+}
+</script>
+</body>
+</html>

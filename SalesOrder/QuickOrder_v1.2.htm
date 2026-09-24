@@ -4106,7 +4106,7 @@ let _favouriteWholePart = false;
 // Manufacturing/WO_Capacity_Planning_Gantt_v4.htm and
 // Dashboards/Dashboard_Combined.htm:
 //   1. Per-user via loadSettings/saveSettings — wins when present
-//   2. Admin master via loadReportData/saveReportData — shared blob,
+//   2. Admin master via the shared userproperties store — one blob,
 //      writable in practice only by the admin (anyone CAN write it; the
 //      auto-publish path is gated on _isAdmin so non-admins don't
 //      stomp the master). Picks up where per-user is missing a key.
@@ -4114,7 +4114,7 @@ let _favouriteWholePart = false;
 // Admin detection: sysuser.id matches getProperty('BI_ADMIN_USER_ID','1')
 // OR userName matches getProperty('BI_ADMIN_USER','').
 let _isAdmin = false;
-let _adminDefaults = {};   // { groupPreferredUOM, ... } — last read from loadReportData
+let _adminDefaults = {};   // { groupPreferredUOM, ... } — last read from the shared store
 
 let _partGroups = new Map();
 let _groupPrimary = new Map();
@@ -4463,10 +4463,98 @@ function _writeSettings(key, value) {
 
 // ── Admin-master settings overlay ──────────────────────────────────
 // Mirrors WO_Capacity_Planning_Gantt_v4.htm and Dashboard_Combined.htm.
-// Master payload lives in saveReportData (single blob per saved report,
+// Master payload lives in the shared userproperties store (one blob,
 // visible to every user). We currently only persist `groupPreferredUOM`
 // here, but the shape supports any number of keys — extend `keys` in
 // _saveAdminDefaults / consume more fields in _loadAdminDefaults.
+
+/* ── SHARED (ORG-WIDE) STORE ──────────────────────────────────────
+   An admin publishes one payload; every user reads it back.
+
+   This used to be loadReportData/saveReportData. Those only work on a SAVED
+   report: the BI Script Editor previews with report id -1, so the first read
+   raised the client's own "Loading data is only available on reports" modal
+   (its dialog title reads "Save Report Error") and the write was a silent
+   no-op — an admin published, saw no error, and nothing persisted.
+
+   Instead: saveSettings() writes the CURRENT user's userproperties row under
+   propertycategory 'Dashboard', and every user can SELECT that table. So the
+   admin writing a well-known key produces a row the company can read. Both
+   work in preview. Report-scoped becomes key-scoped, hence the explicit key.
+
+   TRUST. The SQL trusts the same accounts _qo_detectAdmin() does — the
+   BI_ADMIN_USER_ID / BI_ADMIN_USER this install designates, plus the built-in
+   `admin`. Widen one without the other and either the admin's publish goes
+   unread, or a row they did not write gets believed.
+
+   A write REPLACES the whole value — read, merge, write. */
+const _qoSHARED_KEY = 'cdx.bi.quickorderV12.shared.v1';
+let _qosharedCache = null, _qosharedRead = false;
+
+function _qotrustedPublishers() {
+    const prop = (n, d) => { try { return (typeof getProperty === 'function') ? getProperty(n, d) : d; } catch (_) { return d; } };
+    return {
+        id:    String(prop('BI_ADMIN_USER_ID', '1') || '1'),
+        name:  String(prop('BI_ADMIN_USER', '') || '')
+    };
+}
+
+// Pass fresh=true to bypass the per-load cache (a read-back after a write).
+function _qosharedLoad(fresh) {
+    if (_qosharedRead && !fresh) return _qosharedCache;
+    _qosharedRead = true;
+    _qosharedCache = null;
+    if (typeof runQuery !== 'function') return null;
+    try {
+        const esc = v => String(v == null ? '' : v).replace(/'/g, "''");
+        const t = _qotrustedPublishers();
+        const names = ["'admin'"].concat(t.name ? ["'" + esc(t.name.toLowerCase()) + "'"] : []);
+        const rows = JSON.parse(runQuery(
+            "SELECT up.id AS rowid, up.userValue AS shareddata " +
+            "FROM userproperties up " +
+            "INNER JOIN propertycategory pc ON pc.id = up.categoryId " +
+            "INNER JOIN sysuser su ON su.id = up.userId " +
+            "WHERE pc.name = 'Dashboard' " +
+            "AND up.userKey = '" + esc(_qoSHARED_KEY) + "' " +
+            "AND (LOWER(su.userName) IN (" + names.join(', ') + ") " +
+            "OR su.id = " + (parseInt(t.id, 10) || 0) + ") " +
+            "ORDER BY up.id DESC"
+        ) || '[]');
+        let bestValue = null, bestStamp = '', bestId = -1;
+        (Array.isArray(rows) ? rows : []).forEach(row => {
+            // runQuery lower-cases every result key.
+            const value = String((row.shareddata != null ? row.shareddata : row.uservalue) || '');
+            let stamp = '';
+            try { stamp = String((JSON.parse(value) || {})._sharedAt || ''); } catch (_) {}
+            const rowId = parseInt(row.rowid, 10) || 0;
+            if (bestValue === null ||
+                (stamp && (!bestStamp || stamp > bestStamp)) ||
+                (!stamp && !bestStamp && rowId > bestId)) {
+                bestValue = value; bestStamp = stamp; bestId = rowId;
+            }
+        });
+        if (!bestValue) return null;
+        const parsed = JSON.parse(bestValue);
+        _qosharedCache = (parsed && typeof parsed === 'object') ? parsed : null;
+    } catch (e) {
+        try { console.warn('shared defaults unavailable:', e); } catch (_) {}
+        _qosharedCache = null;
+    }
+    return _qosharedCache;
+}
+
+// True only when the payload verifiably round-tripped. An in-memory success
+// proves nothing — that was exactly the trap the report-data write set.
+function _qosharedSave(payload) {
+    if (typeof saveSettings !== 'function') return false;
+    const next = Object.assign({}, payload || {});
+    next._sharedAt = new Date().toISOString();
+    try { next._sharedBy = (JSON.parse(getUser() || '{}') || {}).userName || ''; } catch (_) {}
+    try { saveSettings(_qoSHARED_KEY, JSON.stringify(next)); }
+    catch (e) { try { console.warn('shared defaults save failed:', e); } catch (_) {} return false; }
+    const back = _qosharedLoad(true);
+    return !!(back && back._sharedAt === next._sharedAt);
+}
 
 function _detectAdmin() {
     try {
@@ -4483,16 +4571,11 @@ function _detectAdmin() {
 }
 
 function _loadAdminDefaults() {
-    if (typeof loadReportData !== 'function') return;
-    try {
-        const raw = loadReportData();
-        if (!raw) return;
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object') _adminDefaults = parsed;
-    } catch (_) { /* no master yet */ }
+    const shared = _qosharedLoad();
+    if (shared) _adminDefaults = shared;
 }
 
-// Persist current admin-publishable values to the report-level blob.
+// Persist current admin-publishable values to the shared blob.
 // Gated on _isAdmin — non-admins calling this is a silent no-op so a
 // rogue script can't corrupt the shared default. The function ALWAYS
 // preserves keys it doesn't know about, so a future report version
@@ -4524,7 +4607,7 @@ const ADMIN_KEYS = [
 ];
 
 function _saveAdminDefaults() {
-    if (!_isAdmin || typeof saveReportData !== 'function') return false;
+    if (!_isAdmin || typeof saveSettings !== 'function') return false;
     const payload = { ...(_adminDefaults || {}) };
     payload.groupPreferredUOM   = _groupPreferredUOM || 'ea';
     payload.groupByPart         = !!_groupByPart;
@@ -4542,8 +4625,11 @@ function _saveAdminDefaults() {
     payload.savedBy = (() => {
         try { return (JSON.parse(getUser() || '{}')).userName || ''; } catch (_) { return ''; }
     })();
-    try { saveReportData(JSON.stringify(payload)); _adminDefaults = payload; return true; }
-    catch (e) { console.warn('saveReportData failed:', e); return false; }
+    // Returns the VERIFIED result — a publish that did not persist must not
+    // report success to the admin.
+    const stuck = _qosharedSave(payload);
+    if (stuck) _adminDefaults = payload;
+    return stuck;
 }
 
 // Overlay admin defaults onto the live state. Called from loadSavedState
@@ -4573,20 +4659,21 @@ function _applyAdminDefaultsToState() {
 // Compare our build against the newest one any session has reported into the
 // shared report blob, and publish ours if it is newer.
 //
-// Self-organising by design — there is no admin step, because the failure this
-// guards against is exactly someone forgetting a manual step after a deploy.
-// The first rep to open the report on a new build records the number; every
-// session still running an older one then finds out.
+// Near-self-organising: no separate publish step, but only a trusted publisher
+// RECORDS the number, because a normal user writes their own userproperties row
+// and the shared read does not trust it. The first admin to open a new build
+// records it; every session still running an older one then finds out. Whoever
+// deploys is an admin, so in practice the stamp lands as soon as the build does.
 //
-// The write MERGES onto the existing payload. saveReportData REPLACES the whole
-// blob, so writing a bare {build} would delete the admin defaults — the same
-// trap as publishMaster. The blob is re-read immediately beforehand to keep the
+// The write MERGES onto the existing payload. A write REPLACES the whole blob,
+// so writing a bare {build} would delete the admin defaults — the same trap as
+// publishMaster. The blob is re-read immediately beforehand to keep the
 // window for losing a concurrent admin publish as small as possible.
 //
 // Writes are rare: once a session sees its own build already recorded it
 // returns without writing, so only an actual build change causes a write.
 function checkBuildFreshness() {
-    if (typeof loadReportData !== 'function') return;   // unsaved report / editor preview
+    if (typeof runQuery !== 'function') return;   // no shared store to read
     // Format-checked before it is trusted. A malformed or foreign value would
     // otherwise win the string comparison and nag every rep on every load,
     // and a warning that cries wolf is worse than no warning at all.
@@ -4609,11 +4696,14 @@ function checkBuildFreshness() {
                 + QO_BUILD + '.', 'error', 20000);
         return;
     }
-    if (seen === QO_BUILD || typeof saveReportData !== 'function') return;
+    // Only a trusted publisher records the stamp: a normal user writes their own
+    // userproperties row, which the shared read does not trust, so it would never
+    // be seen again. In practice whoever deploys a new build is an admin.
+    if (seen === QO_BUILD || !_isAdmin || typeof saveSettings !== 'function') return;
 
     try {
         let current = {};
-        try { current = JSON.parse(loadReportData() || '{}') || {}; } catch (_) { current = {}; }
+        try { current = _qosharedLoad(true) || {}; } catch (_) { current = {}; }
         // Our snapshot is the BASE and the fresh read overlays it — that
         // order matters. The other way round, an admin default published by
         // someone else since we loaded would be overwritten with the value we
@@ -4621,7 +4711,7 @@ function checkBuildFreshness() {
         const next = Object.assign({}, _adminDefaults || {}, current);
         next.build = QO_BUILD;
         next.buildSeenAt = new Date().toISOString();
-        saveReportData(JSON.stringify(next));
+        _qosharedSave(next);
         _adminDefaults = next;
         if (DEBUG) qoDebug('Recorded build ' + QO_BUILD + ' in the shared report blob'
             + (seen ? ' (was ' + seen + ')' : ' (first record)') + '.');
@@ -4679,8 +4769,8 @@ function publishAdminDefaults() {
         showToast('Only admins can publish defaults', 'error', 4000);
         return;
     }
-    if (typeof saveReportData !== 'function') {
-        showToast('saveReportData bridge unavailable — admin defaults need the Fishbowl host', 'error', 5000);
+    if (typeof saveSettings !== 'function' || typeof runQuery !== 'function') {
+        showToast('Shared settings store unavailable — admin defaults need the Fishbowl host', 'error', 5000);
         return;
     }
     const ok = _saveAdminDefaults();

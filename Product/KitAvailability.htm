@@ -1,0 +1,2174 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  REPORT: Kit Availability
+  PATH:   Product/KitAvailability.htm
+  --------------------------------------------------------------------------------
+  Interactive HTML rebuild of the custom JasperReports report
+  C:\Program Files\Fishbowl\server\reports\Custom\Kit Availability.jrxml,
+  on the shared fb-lib / fb-styles stack. Skeleton and conventions follow
+  Manufacturing/AvailableToBuild.htm, which answers the same question for BOMs.
+
+  WHAT IT ANSWERS
+    For each kit product (product.kitFlag = 1) in the selected location
+    group(s): how many complete kits could be assembled and sold right now
+    from current inventory. The scarcest kit line is the bottleneck.
+
+  CORE MATH
+    Per kit x location group, over the kit lines that can constrain it:
+        qtyPerKit_base   = kititem.defaultQty * uomconversion.multiply / factor
+                           (kititem.uomId -> part.uomId)
+        perLineKits      = FLOOR( availableForSale_base / qtyPerKit_base )
+        Kits Available   = MIN(perLineKits)   (floored at 0)
+
+  AVAILABILITY BASIS = "Available for Sale" (matches the .jrxml):
+        OnHand - Allocated - NotAvailable + DropShip   (floored at 0)
+    Aggregated from the qtyInventoryTotals view per part+LG, the same source
+    InventoryAvailability.htm and AvailableToBuild.htm use.
+
+  FOUR DEFECTS IN THE .jrxml THAT THIS REPORT FIXES
+    1. UOM CONVERSION WAS NEVER APPLIED. The .jrxml LEFT JOINs UOMCONVERSION
+       but never references it, then divides available stock (held in the
+       PART base UOM) by kititem.defaultQty (authored in the KIT LINE's UOM).
+       demodb: "50ml Jar of Eye Cream" consumes 1.2 kg of Bulk Cream, whose
+       part UOM is "20kg" -> the true figure is 0.06 base units per kit, so
+       the .jrxml understates that line's capacity 20x. Same defect class as
+       BillOfMaterials.jrxml / AvailableToBuild.jrxml.
+    2. DISCOUNT AND TAX-RATE LINES WERE TREATED AS COMPONENTS. kititem
+       .kitItemTypeId is ignored entirely, so a Discount (50) or Tax Rate (60)
+       line — which has no product at all — is counted like a Standard one.
+       Filtered to 10/20/30/40 here.
+       The genuinely optional types ARE counted in the headline (see THE THREE
+       FIGURES below), because the kit is configured with them; they are just
+       broken out so the effect of dropping them is visible.
+    3. "ALTERNATE PRODUCT" ROWS WERE TREATED AS COMPONENTS. kititem.kitTypeId
+       20 = Alternate Product, not a kit line; the .jrxml counts them, and its
+       COALESCE(NULLIF(defaultQty,0),1) turns their qty of 0 into 1, inventing
+       a one-per-kit requirement. Filtered to kitTypeId = 10 here.
+    4. OPTION GROUPS WERE SILENTLY DROPPED. A kit line whose productId is NULL
+       (an option group, e.g. "Colour") is removed by the .jrxml's inner JOIN.
+       Here the line resolves to its default kitoption choice, and the drill
+       lists every alternative with its own availability.
+
+  LOCATION-GROUP SCOPE — WHY THE FIGURES DIFFER FROM THE .jrxml
+    The .jrxml has no LG scope at all: it sums every group's raw on-hand /
+    allocated / not-available / drop-ship FIRST and floors the result ONCE.
+    This report defaults to one row per kit x LG and floors each group.
+    Those disagree whenever a group is OVER-ALLOCATED, because a negative group
+    is netted against real stock elsewhere. demodb part 11857:
+
+        Adelaide  9 on hand, 9 not available          ->   0
+        Brisbane 18 on hand, 28 allocated             ->  -9   <-- over-allocated
+        Melbourne 23 on hand                          -> +23
+        company-wide sum                              ->  14
+
+    So the Bearing Kit (2 x 11857) reads 7 company-wide but 11 in Melbourne.
+    You cannot assemble a kit in Melbourne out of Brisbane's shortfall, so the
+    per-LG figure is the actionable one — but the old report's is not wrong for
+    the question it asks, and 60 part x LG rows in demodb are negative (38
+    parts), so this is routine, not an edge case. The same netting is why the
+    .jrxml shows Test Kit = 1: F201 is +40 in one group and -39 across four
+    others.
+
+    Filters > Scope switches to "Consolidated", which reproduces the .jrxml's
+    arithmetic exactly for cross-checking (raw summed, floored once). Verified
+    on demodb: Consolidated Kits Available matches the .jrxml on all 8 kits
+    (14 / 7 / 0 / 0 / 1 / 1503 / 14 / 14). One residual gap — the .jrxml
+    sums EVERY location group including inactive ones, while this report sums
+    the groups the user selected (accessible + active).
+
+  THE THREE FIGURES — two independent axes, made explicit
+    A kit line can be optional, and a line can offer a CHOICE of products, so
+    "how many can we do" has more than one honest answer. The report shows
+    three, and the headline is deliberately the LEAST permissive:
+
+      Kits Available   every line, DEFAULT option choice — the kit as it is
+                       configured. The conservative number, and the one the
+                       .jrxml computes.
+      Excl. Optional   Optional + Variable-Optional lines left off the order.
+                       Higher than the headline means an OPTIONAL line is the
+                       thing holding the kit back.
+      Best Variation   every line, BEST-STOCKED option choice. Higher than the
+                       headline means the kit only needs a different option
+                       picked.
+
+    demodb "Test Kit", company-wide, is the case that makes this necessary:
+
+      Frame (Optional)  F201 default -> 1 kit      F202 alternative -> 474
+      H100  (Variable)  required                                   -> 123
+      Colour (Var-Opt)  qty 0                                  unbounded
+
+      Kits Available 1     as configured: the default frame allows one kit
+      Excl. Optional 123   ship no frame at all; H100 then binds
+      Best Variation 123   ship a frame, but F202; H100 still binds
+
+    An earlier revision made the required-only figure the headline, which put
+    123 in the Kits Available column while the kit as set up could supply one.
+    That reads as though 123 are sellable. The headline is now the
+    as-configured figure and the permissive ones have to earn attention.
+
+  FEATURES
+    - Kit summary table (FBLib.Table: sort / drag-reorder / drag-resize / lazy
+      render / saved column layout). Filtering lives in the Filters drawer via
+      FBLib.Common.MultiSelect (Location Group / Kit / Constraint Part) plus a
+      kit-number search and availability chips.
+    - Click ANY kit row to expand its per-line breakdown inline: qty per kit in
+      the part's stocking UOM, on hand, available, kits supported, the limiting
+      line(s) highlighted, optional lines marked, and every selectable
+      alternative for an option line. An Expand all / Collapse all switcher in
+      the header opens every row at once. Several kits can be open together, so
+      two kits sharing a short component can be compared side by side.
+    - "Excl. Optional" column shows what the kit would do with its optional
+      lines left off, highlighted when that beats the headline.
+    - "Best Variation" column — an optional / option-group line offers a CHOICE
+      of products, so the kit has variations. This is the count with the
+      best-stocked choice on every option line; when it beats Kits Available the
+      kit is not blocked, it just needs a different option picked, and the panel
+      names the swap. Computed by maximising each line independently (valid
+      because MIN is monotone per line), so the combinations are never
+      enumerated; a part reachable from two lines is flagged as contended
+      because those lines would compete for the same stock. Per-variation
+      figures are ALTERNATIVES, NOT ADDITIONS — variants share components.
+    - The breakdown splits availability into On Hand / Committed / Not Available
+      / Allocated / Available, because a line reading zero has three different
+      possible causes and they call for different action:
+        Not Available — in a QC-hold style location (countedAsAvailable = 0).
+                        Physically present, unusable. demodb: Adelaide 11857.
+        Committed     — reserved against a committed pick. demodb: Brisbane's
+                        18, all of it.
+        Allocated     — open order demand. NOT a physical state; the stock may
+                        be sitting there pickable, just spoken for. Exceeding
+                        On Hand means over-promised, which is what drives
+                        Available negative. demodb: Brisbane 28 vs 18 on hand.
+      Committed is display-only — the report's basis is Available for Sale,
+      which nets out ALLOCATED, not committed. It comes from tag x location
+      (qtyInventoryTotals has no committed column); the QTYCOMMITTED view is
+      avoided because the qty views are TEMPTABLE and a WHERE does not push
+      down. Not Available and Allocated are highlighted when they explain a zero.
+    - "After Incoming" projects the count once open POs/MOs/TOs arrive.
+    - CSV and real .xlsx export via FBLib.Export; print via the new-window
+      workaround (window.print() is unreliable inside JxBrowser).
+
+  DEPLOY ORDER (re-save on the server, in this order, or the report breaks):
+    1. fb-styles  (Style  named exactly "fb-styles", source scripts/fb-styles.css)
+    2. fb-lib     (Script named exactly "fb-lib",    source scripts/fb-lib.js)
+    3. THIS report (the {% ... %} directives only re-run on save)
+
+  STATUS: desk-built; the kit maths is validated against demodb. NOT yet
+  client-tested - run it in the BI Script Editor before handing it over.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- The page title IS the Fishbowl record name that tools/deploy derives
+         (minus the " - Fishbowl BI" suffix), so it carries the section prefix
+         the live picker sorts by. Plain hyphens, not em dashes — and do not
+         write the tag name in this comment, the generator matches on it. -->
+    <title>- Inventory - Kit Availability - Fishbowl BI</title>
+
+    <!-- Inter font (matches the rest of the suite). -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib — inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Shared Fishbowl BI stylesheet — inlined from the saved "fb-styles"
+         Style (scripts/fb-styles.css). MUST come BEFORE the inline block so
+         per-report rules win the cascade on identical selectors. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <style>
+        /* =====================================================
+           BASE + LAYOUT  (from Core_Dashboard_Template — tokens live in
+           fb-styles; style new work off var(--…), never hardcoded hexes)
+           ===================================================== */
+        * { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; height: 100%; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            font-size: 13px; color: var(--c-primary); background: var(--bg-1);
+            display: flex; flex-direction: column; min-height: 100vh;
+            padding-bottom: var(--debug-drawer-h, 0px);
+            transition: padding-bottom 0.12s ease;
+        }
+        header h1 { font-size: 16px; font-weight: 700; color: var(--c-primary); margin: 0; line-height: 1.15; }
+        #statusLine { font-size: 12px; color: var(--c-tertiary); line-height: 1.15; margin: 2px 0 0; }
+        .hdr-actions { display: flex; align-items: center; gap: 8px; }
+
+        /* Drawer grid (from Core). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 220px; min-width: 220px; }
+        .fb-grid-cols { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); align-items: start; }
+        .fb-grid-cols .fb-group { flex: none; min-width: 0; }
+        .fb-grid-cols .fb-field select,
+        .fb-grid-cols .fb-field input[type=text] { width: 100%; }
+        @media (max-width: 520px) { .fb-grid-cols { grid-template-columns: 1fr; } }
+        /* The Filters drawer hosts fb-lib multi-selects. The drawer body scrolls
+           (overflow-y:auto), which CLIPS an open .ms-dropdown. The filter content
+           is short and never needs to scroll, so let this drawer's body overflow
+           visibly — the dropdown caps itself at 280px with its own scroll. */
+        #filtersOverlay .fb-drawer-body { overflow: visible; }
+        /* The drawer backdrop scrim is injected + managed by fb-lib
+           (registerDrawer → #fbDrawerScrim). Never add a local scrim or a
+           `.fb-drawer.open { z-index }` override: the drawer must keep the
+           fb-styles z-index (10001) that sits above fb-lib's scrim (10000). */
+        .fb-group-title {
+            font-size: 12px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.04em; color: var(--c-secondary); border-bottom: 1px solid var(--border);
+            padding-bottom: 4px; margin-bottom: 8px;
+        }
+        .fb-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+        .fb-field label { font-size: 11px; font-weight: 600; color: var(--c-secondary); }
+        .fb-field select, .fb-field input[type=text] {
+            padding: 4px 8px; font-size: 12px; border: 1px solid var(--border);
+            border-radius: 6px; background: var(--bg-1); font-family: inherit; color: #415157;
+        }
+        .fb-hint { font-size: 11px; color: var(--c-tertiary); margin: -2px 0 8px; line-height: 1.35; }
+
+        /* Radio chips inside the filter drawer (availability + optional mode). */
+        .fb-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+        .fb-chips label {
+            display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+            padding: 4px 10px; border: 1px solid var(--border-strong); border-radius: var(--r-pill);
+            font-size: 12px; font-weight: 600; color: var(--c-secondary); background: #fff;
+        }
+        .fb-chips input { display: none; }
+        .fb-chips label.on { background: var(--tint-blue); border-color: var(--fb-blue); color: var(--fb-blue-accent); }
+
+        .ds-btn { padding: 7px 13px; font-size: 12px; border-radius: 7px; border: 1px solid var(--border-strong); background: #fff; cursor: pointer; font-family: inherit; font-weight: 600; color: #415157; }
+        .ds-btn:hover { background: var(--bg-2); }
+        .ds-btn-primary { background: var(--color-primary); color: #fff; border-color: var(--color-primary); }
+        .ds-btn-primary:hover { background: var(--color-primary-dark); }
+        .ds-btn-admin { background: var(--acc-orange-bg); border-color: var(--acc-orange); color: var(--acc-orange-con); margin-right: 6px; }
+        .ds-lock-badge { background: var(--acc-orange-bg); color: var(--acc-orange-con); border: 1px solid var(--acc-orange); padding: 7px 10px; border-radius: 7px; font-size: 12px; margin-bottom: 14px; }
+
+        /* App shell (from Core — no KPI strip). */
+        .app-shell { width: 100%; margin: 0; padding: 0; flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+
+        /* Data table (from Core — the styles FBLib.Table.init expects). Single
+           sticky title row (32px); the per-column filter row is hidden, so the
+           body scrolls directly under one sticky header with no gap. */
+        .fb-table-container { flex: 1 1 auto; min-height: 0; overflow: auto; background: #fff; }
+        table.fb-table { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
+        table.fb-table th {
+            background: var(--menu-bg); color: #fff; font-weight: 500;
+            padding: 0 10px; height: 32px; text-align: left; white-space: nowrap;
+            cursor: grab; user-select: none; position: sticky; top: 0; z-index: 10;
+            overflow: hidden; text-overflow: ellipsis;
+        }
+        table.fb-table th:active { cursor: grabbing; }
+        table.fb-table th:hover { background: #164A5F; }
+        table.fb-table th.sort-asc::after  { content: ' \2191'; opacity: 0.8; }
+        table.fb-table th.sort-desc::after { content: ' \2193'; opacity: 0.8; }
+        table.fb-table th.col-drag-over { background: #164A5F; border-left: 3px solid #CBE5FB; }
+        table.fb-table tr.filter-row { display: none; }
+        /* Clip data to its own column — never bleed into the neighbour. */
+        table.fb-table td {
+            padding: 4px 10px; border-bottom: 1px solid var(--border); white-space: nowrap;
+            vertical-align: middle; overflow: hidden; text-overflow: ellipsis;
+        }
+        /* Zebra striping is applied as a CLASS, not :nth-child — expanding a kit
+           interleaves detail rows into the same tbody, which makes positional
+           striping look random. _syncDetails() stamps .row-alt on every second
+           SUMMARY row so the banding still counts kits, not DOM rows. */
+        table.fb-table tr.row-alt > td { background: var(--bg-1); }
+        table.fb-table tr.kit-row { cursor: pointer; }
+        table.fb-table tr.kit-row:hover > td { background: var(--tint-blue) !important; }
+        table.fb-table tr.kit-row.is-open > td { background: var(--tint-blue); box-shadow: inset 0 -1px 0 var(--fb-blue); }
+        table.fb-table .num-cell { text-align: right; font-variant-numeric: tabular-nums; }
+        .fb-row-link { color: var(--fb-blue); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--fb-blue-accent); }
+        .fb-col-resize { position: absolute; right: 0; top: 0; width: 6px; height: 100%; cursor: col-resize; user-select: none; }
+        .fb-col-resize:hover { background: rgba(255,255,255,0.3); }
+
+        /* Expander affordance in the Components / Constraint columns. These are
+           NOT links any more — the whole kit row toggles — so they carry no
+           click handler of their own and simply fall through to the row. */
+        .drill-link { color: var(--fb-blue); cursor: pointer; font-weight: 600; text-decoration: none; }
+        table.fb-table tr.kit-row:hover .drill-link { text-decoration: underline; color: var(--fb-blue-accent); }
+        .kit-chev { display: inline-block; width: 9px; margin-right: 3px; transition: transform 0.12s; }
+        table.fb-table tr.is-open .kit-chev { transform: rotate(90deg); }
+
+        /* Inline kit-line detail row. One full-width cell per expanded kit
+           holding the breakdown table; the panel is inset so it reads as a
+           child of the row above rather than as another grid row. */
+        tr.kit-detail > td { padding: 0 !important; background: var(--bg-2) !important; border-bottom: 1px solid var(--border-strong); }
+        .kit-detail-wrap { padding: 10px 14px 12px 26px; }
+
+        /* ONE table, table-layout:fixed + a colgroup, so the numeric columns
+           line up straight down the whole list including alternative rows. */
+        /* max-width, not width:100% — on a wide panel the auto first column
+           otherwise swallows every spare pixel and strands the numbers at the
+           far right, yards from the part they belong to. */
+        table.drill-tbl { width: 100%; max-width: 1140px; border-collapse: collapse; font-size: 12px; table-layout: fixed; background: #fff; border: 1px solid var(--border); }
+        /* Names the kit the panel belongs to — several can be open at once, and
+           a panel scrolled away from its row is otherwise unattributable. */
+        .kit-detail-title { font-size: 12px; font-weight: 700; color: var(--c-primary); margin: 0 0 5px; }
+        .kit-detail-title .lg { font-weight: 500; color: var(--c-secondary); }
+        .kit-detail-title .qty { font-weight: 500; color: var(--c-secondary); }
+        /* "This kit is not blocked, it just needs a different option picked." */
+        .kit-best {
+            font-size: 11.5px; color: var(--fb-success); background: var(--acc-sage);
+            border: 1px solid #BBD6C6; border-radius: 6px;
+            padding: 5px 9px; margin: 0 0 7px; display: inline-block;
+        }
+        .kit-best .muted { color: var(--c-secondary); font-weight: 400; }
+        /* Best Variation grid cell, when a variation beats the kit as configured. */
+        .best-up { color: var(--fb-success); font-weight: 700; cursor: help; }
+        /* Excl. Optional, when dropping the optional lines would unblock the kit. */
+        .excl-up { color: var(--acc-orange-con); font-weight: 700; cursor: help; }
+        /* A component figure that EXPLAINS a zero — stock in a QC-hold location,
+           or open demand exceeding what is on hand. */
+        table.drill-tbl .avl-flag { color: var(--acc-orange-con); font-weight: 700; cursor: help; }
+        /* A narrowed Location Group selection is remembered between sessions and
+           is otherwise invisible — it silently changes every figure, and makes
+           Consolidated disagree with the Jasper report. Call it out. */
+        #statusLine .scope-warn { color: var(--acc-orange-con); cursor: help; }
+        /* Per-option kit total + the winning pick, inside the breakdown. */
+        table.drill-tbl .kit-if { color: var(--c-tertiary); font-weight: 400; font-size: 10.5px; cursor: help; }
+        table.drill-tbl .best-pick {
+            color: var(--fb-success); background: var(--acc-sage); border-radius: var(--r-pill);
+            font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+            padding: 1px 5px; margin-left: 4px; cursor: help;
+        }
+        /* NOT sticky: these tables now sit inline inside the scrolling grid, so a
+           sticky header would float over the rows above it. */
+        /* SPECIFICITY: the grid's own `table.fb-table th/td` rules reach these
+           nested cells too and outrank a bare `.drill-tbl th`, which rendered
+           the breakdown header in the grid's dark sticky chrome and clipped
+           every cell to one ellipsised line. Every selector below is therefore
+           qualified `table.drill-tbl …` to match that weight and, coming later
+           in the sheet, win. The sticky/grab/height chrome is reset explicitly. */
+        table.drill-tbl th {
+            background: var(--bg-2); color: var(--c-secondary); text-align: left;
+            font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.03em; padding: 6px 8px; border-bottom: 1px solid var(--border);
+            position: static; height: auto; cursor: default; white-space: normal;
+            overflow: visible; text-overflow: clip;
+        }
+        table.drill-tbl th.num { text-align: right; }
+        /* These cells must beat the grid's own `table.fb-table td` rules, which
+           would otherwise apply through the nesting and clip every line to one
+           ellipsised row. */
+        table.drill-tbl td {
+            padding: 6px 8px; border-bottom: 1px solid var(--bg-2); vertical-align: top;
+            white-space: normal; overflow: visible; text-overflow: clip;
+        }
+        table.drill-tbl td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+        table.drill-tbl tr.constraint td { background: var(--acc-yellow-bg); }
+        table.drill-tbl tr:hover > td { background: var(--tint-blue) !important; }
+        table.drill-tbl tr.opt-row td { background: repeating-linear-gradient(135deg, transparent, transparent 7px, rgba(0,0,0,0.018) 7px, rgba(0,0,0,0.018) 14px); }
+        table.drill-tbl tr.alt-row td { background: var(--bg-1); }
+        table.drill-tbl td.comp-part { font-weight: 600; }
+        table.drill-tbl td.comp-part > div { min-width: 0; }
+        table.drill-tbl .comp-desc { color: var(--c-secondary); font-size: 11px; font-weight: 400; }
+        table.drill-tbl .noninv { color: var(--c-tertiary); font-style: italic; }
+        table.drill-tbl .line-type { color: var(--c-tertiary); font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
+        /* Qty/Kit is shown in the PART's stocking UOM (see _drillRows); when the
+           kit line was authored in a different unit the original rides along
+           muted so the conversion is auditable rather than invisible. */
+        table.drill-tbl .uom-orig { color: var(--c-tertiary); font-size: 10.5px; font-weight: 400; white-space: nowrap; cursor: help; }
+        table.drill-tbl .uom-bad { color: var(--fb-negative); font-weight: 700; cursor: help; }
+        .alt-toggle { display: inline-flex; align-items: center; cursor: pointer; color: var(--fb-blue); vertical-align: middle; margin-right: 2px; }
+        .alt-toggle svg { width: 13px; height: 13px; transition: transform 0.12s; }
+        .alt-toggle.open svg { transform: rotate(90deg); }
+        .drill-hint { font-size: 11.5px; color: var(--c-tertiary); margin: 0 0 7px; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+        .drill-hint span.k { display: inline-flex; align-items: center; gap: 6px; }
+        .drill-hint .sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; background: var(--acc-yellow-bg); border: 1px solid var(--acc-yellow); }
+        .drill-hint .sw-opt { display: inline-block; width: 12px; height: 12px; border-radius: 3px; border: 1px solid var(--border-strong); background: repeating-linear-gradient(135deg, transparent, transparent 3px, rgba(0,0,0,0.10) 3px, rgba(0,0,0,0.10) 6px); }
+
+        /* Custom scrollbar (from Core). */
+        .fb-drawer-body::-webkit-scrollbar, .fb-table-container::-webkit-scrollbar, .modal-body::-webkit-scrollbar { width: 8px; height: 8px; }
+        .fb-drawer-body::-webkit-scrollbar-track, .fb-table-container::-webkit-scrollbar-track, .modal-body::-webkit-scrollbar-track { background: var(--bg-2); border-radius: 4px; }
+        .fb-drawer-body::-webkit-scrollbar-thumb, .fb-table-container::-webkit-scrollbar-thumb, .modal-body::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+
+        @media print {
+            html, body { overflow: visible; }
+            @page { size: A4 landscape; margin: 0.5in; }
+            header, .hdr-btn, .fb-drawer, .fblib-debug-drawer { display: none !important; }
+            /* Printing goes through printReport()'s own window, but if the
+               browser prints this page directly, expanded panels should not be
+               sliced across a page break. */
+            tr.kit-detail { break-inside: avoid; }
+            .fb-table-container { overflow: visible !important; }
+            table.fb-table th { position: static !important; background: #ddd !important; color: #000 !important; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- Drawer backdrop scrim is injected + managed by fb-lib (registerDrawer). -->
+
+<!-- ==================== HEADER ==================== -->
+<header>
+    <div>
+        <h1>Kit Availability</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.toggleDrawer('filtersOverlay')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <!-- Expand / collapse every kit's line breakdown. The label and icon
+             flip to whichever action the current state offers. -->
+        <button id="expandBtn" class="hdr-btn" type="button" onclick="toggleExpandAll()" title="Expand every kit's component lines">
+            <svg id="expandIcon" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M19 9l-7 7-7-7"/></svg>
+            <span id="expandLabel">Expand all</span>
+        </button>
+        <button id="refreshBtn" class="hdr-btn" type="button" onclick="loadDashboard()" title="Refresh data">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <button id="exportBtn" class="hdr-btn" type="button" onclick="exportCsv()" title="Export visible rows to CSV">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            CSV
+        </button>
+        <button id="xlsxBtn" class="hdr-btn" type="button" onclick="exportXlsx()" title="Export visible rows to Excel">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 17V7m6 10V7M4 5a2 2 0 012-2h12a2 2 0 012 2v14a2 2 0 01-2 2H6a2 2 0 01-2-2V5z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" onclick="printReport()" title="Print">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span style="width:1px; height:18px; background:var(--border); margin:0 4px;"></span>
+        <button id="helpBtn" class="hdr-btn" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How to use this report">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            Help
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ==================== FILTERS DRAWER ==================== -->
+<div id="filtersOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>🔍 Filters</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('filtersOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+
+            <!-- Location Group — drives every availability query. The .jrxml has
+                 no LG scope at all; this defaults to the user's accessible LGs. -->
+            <div class="fb-group">
+                <div class="fb-group-title">Location Group</div>
+                <div class="fb-field">
+                    <label>Location group(s)</label>
+                    <div class="ms-container" id="lgMs">
+                        <div class="ms-trigger" id="lgMs-trigger">
+                            <span class="ms-placeholder" id="lgMs-placeholder">All my location groups</span>
+                        </div>
+                        <div class="ms-dropdown hidden" id="lgMs-dropdown">
+                            <div class="ms-actions"><span id="lgMs-all">Select All</span><span id="lgMs-clear">Clear All</span></div>
+                            <div class="ms-list" id="lgMs-list"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Per-LG vs the .jrxml's company-wide roll-up. These legitimately
+                 DISAGREE where a group is over-allocated — see the hint. -->
+            <div class="fb-group">
+                <div class="fb-group-title">Scope</div>
+                <div class="fb-field">
+                    <label>Rows</label>
+                    <div class="fb-chips" id="scopeChips">
+                        <label data-v="perlg" class="on"><input type="radio" name="sc" value="perlg" checked>Per location group</label>
+                        <label data-v="consolidated"><input type="radio" name="sc" value="consolidated">Consolidated</label>
+                    </div>
+                </div>
+                <p class="fb-hint">Consolidated sums the selected groups the way the original Jasper report does: raw figures added together, then floored once. A group holding <em>less than it has allocated</em> therefore eats into another group's real stock, so the consolidated figure can be lower than any single group's — that is the report's own behaviour, reproduced for cross-checking.</p>
+            </div>
+
+            <!-- Kit number search + active toggle. -->
+            <div class="fb-group">
+                <div class="fb-group-title">Kit</div>
+                <div class="fb-field">
+                    <label>Kit number</label>
+                    <input type="text" id="filterKit" placeholder="contains…" />
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="filterActiveOnly" checked />
+                        <span>Active kits only</span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Kit multi-select — client-side over the loaded rows. -->
+            <div class="fb-group">
+                <div class="fb-group-title">Kit Product</div>
+                <div class="fb-field">
+                    <label>Kit product(s)</label>
+                    <div class="ms-container" id="kitMs">
+                        <div class="ms-trigger" id="kitMs-trigger">
+                            <span class="ms-placeholder" id="kitMs-placeholder">All kits</span>
+                        </div>
+                        <div class="ms-dropdown hidden" id="kitMs-dropdown">
+                            <div class="ms-search"><input type="text" id="kitMs-search" placeholder="Search…" /></div>
+                            <div class="ms-actions"><span id="kitMs-all">Select All</span><span id="kitMs-clear">Clear All</span></div>
+                            <div class="ms-list" id="kitMs-list"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Constraint (bottleneck) part — "show me kits blocked by part X". -->
+            <div class="fb-group">
+                <div class="fb-group-title">Constraint Part</div>
+                <div class="fb-field">
+                    <label>Limiting component(s)</label>
+                    <div class="ms-container" id="constraintMs">
+                        <div class="ms-trigger" id="constraintMs-trigger">
+                            <span class="ms-placeholder" id="constraintMs-placeholder">All constraint parts</span>
+                        </div>
+                        <div class="ms-dropdown hidden" id="constraintMs-dropdown">
+                            <div class="ms-search"><input type="text" id="constraintMs-search" placeholder="Search…" /></div>
+                            <div class="ms-actions"><span id="constraintMs-all">Select All</span><span id="constraintMs-clear">Clear All</span></div>
+                            <div class="ms-list" id="constraintMs-list"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Availability quick filter (applied in JS after the compute). -->
+            <div class="fb-group">
+                <div class="fb-group-title">Availability</div>
+                <div class="fb-field">
+                    <label>Show</label>
+                    <div class="fb-chips" id="availChips">
+                        <label data-v="now" class="on"><input type="radio" name="af" value="now" checked>Available now</label>
+                        <label data-v="all"><input type="radio" name="af" value="all">All kits</label>
+                        <label data-v="zero"><input type="radio" name="af" value="zero">Zero-available</label>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn" onclick="clearFilters()">Clear all</button>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="loadDashboard()">Apply</button>
+    </div>
+</div>
+
+<!-- ==================== SETTINGS DRAWER ==================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div id="dsLockBadge" class="ds-lock-badge" style="display:none;">Locked by admin — your changes won't be saved.</div>
+        <div class="fb-grid fb-grid-cols">
+
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setShowDebug" onchange="onSettingsChange()" />
+                        <span>Show debug console</span>
+                    </label>
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setRememberFilters" onchange="onSettingsChange()" />
+                        <span>Remember filter selections</span>
+                    </label>
+                </div>
+            </div>
+
+        </div>
+
+        <div id="dsAdminSection" style="display:none; margin-top:14px; padding-top:14px; border-top: 1px dashed var(--border-strong);">
+            <div class="fb-group-title">Admin</div>
+            <button type="button" class="ds-btn ds-btn-admin" onclick="publishDefaults()">Publish as default for everyone</button>
+            <button type="button" class="ds-btn ds-btn-admin" id="dsLockBtn" onclick="toggleUserEditing()">Lock user editing</button>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn" onclick="resetSettings()">Reset to defaults</button>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ==================== HELP DRAWER ==================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How to Use This Report</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group" style="flex:1 1 320px;">
+                <div class="fb-group-title">What it shows</div>
+                <p style="font-size:12px; color:#415157;">One row per <strong>kit product × location group</strong>. <strong>Kits Available</strong> is how many complete kits you could assemble and sell right now from stock in that location group, <em>as the kit is configured</em> — capped by the scarcest kit line (the <strong>constraint part</strong>).</p>
+                <p style="font-size:12px; color:#415157;">"Available" means <strong>Available for Sale</strong> = On Hand − Allocated − Not Available + Drop Ship, the same basis as Fishbowl's Inventory Availability and Available to Build reports.</p>
+            </div>
+            <div class="fb-group" style="flex:1 1 320px;">
+                <div class="fb-group-title">The three figures</div>
+                <p style="font-size:12px; color:#415157;"><strong>Kits Available</strong> is the kit <em>exactly as it is configured</em> — every line, each at its default option choice. It is the conservative figure and the one that matches Fishbowl's own Kit Availability report.</p>
+                <p style="font-size:12px; color:#415157;">The other two are the ways of beating it. <strong>Excl. Optional</strong> drops the Optional and Variable-Optional lines, which an order does not include unless the salesperson picks them — when it is higher, an optional line is what is holding the kit back. <strong>Best Variation</strong> keeps every line but takes the best-stocked choice on each.</p>
+                <p style="font-size:12px; color:#415157;">Discount and Tax Rate lines are never components and are always ignored.</p>
+            </div>
+            <div class="fb-group" style="flex:1 1 320px;">
+                <div class="fb-group-title">Variations</div>
+                <p style="font-size:12px; color:#415157;">An optional or option-group line lets the salesperson pick from several products, so the kit has <strong>variations</strong>. <strong>Best Variation</strong> is how many you could make with the best-stocked choice on every option line — when it beats <strong>Kits Available</strong>, the kit isn't really blocked, it just needs a different option picked, and the expanded panel names which one.</p>
+                <p style="font-size:12px; color:#415157;">Inside the panel each option shows its own stock <em>and</em> the kit total it would produce. These totals are <strong>alternatives, not additions</strong> — two variations of the same kit draw on the same shared components, so you cannot make the best of both.</p>
+            </div>
+            <div class="fb-group" style="flex:1 1 320px;">
+                <div class="fb-group-title">Drill &amp; columns</div>
+                <ul style="font-size:12px; color:#415157; padding-left:18px; margin:4px 0;">
+                    <li><strong>Click any row</strong> to expand its kit lines underneath: each line's available stock and how many kits it supports, with the limiting line(s) highlighted. Click again to collapse. <strong>Expand all</strong> in the header opens every row at once.</li>
+                    <li><strong>Qty / Kit</strong> is shown in the part's stocking UOM; where the kit line was authored in another unit, the original is in brackets.</li>
+                    <li>An <strong>option line</strong> expands (▸) to list every selectable alternative with its own availability — useful when the default choice is the bottleneck.</li>
+                    <li><strong>After Incoming</strong> projects the count once open POs/MOs/TOs land.</li>
+                    <li><strong>Sort</strong> by clicking a header; <strong>reorder</strong> by dragging headers; <strong>resize</strong> by dragging a header edge. Your layout is saved.</li>
+                </ul>
+            </div>
+            <div class="fb-group" style="flex:1 1 320px;">
+                <div class="fb-group-title">Filters &amp; export</div>
+                <p style="font-size:12px; color:#415157;">By default only kits you can <strong>build now</strong> are listed — switch to <strong>All kits</strong> or <strong>Zero-available</strong> in the filter drawer, where you can also multi-select <strong>Location Group</strong>, <strong>Kit Product</strong> and <strong>Constraint Part</strong>, and search a kit number. <strong>CSV</strong> and <strong>Excel</strong> export exactly the rows on screen; <strong>Print</strong> opens a print-formatted window.</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ==================== MAIN CONTENT ==================== -->
+<div class="app-shell">
+    <div class="fb-table-container">
+        <table class="fb-table" id="reportTable">
+            <thead></thead>
+            <tbody></tbody>
+        </table>
+    </div>
+</div>
+
+<!-- The kit-line breakdown expands INLINE beneath its kit row (see
+     _syncDetails); there is no drill modal. -->
+
+<script>
+// ============================================================================
+//  BAIL EARLY — needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report requires the Fishbowl embedded browser environment. ' +
+        'Open it from the Fishbowl client\'s BI module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+// ============================================================================
+//  FB-LIB FEATURE CHECK
+// ============================================================================
+(function () {
+    var missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    if (window.FBLib && !FBLib.Common) missing.push('FBLib.Common');
+    if (window.FBLib && FBLib.Common && typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common.toggleDrawer');
+    if (window.FBLib && FBLib.Common && !FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+    if (window.FBLib && !FBLib.Table) missing.push('FBLib.Table');
+    if (window.FBLib && !FBLib.Export) missing.push('FBLib.Export');
+    if (!missing.length) return;
+    function showBanner() {
+        var banner = document.createElement('div');
+        banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 -apple-system,Segoe UI,sans-serif;';
+        banner.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: <code style="background:#fff;padding:1px 5px;border-radius:3px;">' +
+            missing.join('</code>, <code style="background:#fff;padding:1px 5px;border-radius:3px;">') +
+            '</code>. Open BI Script Editor, confirm a script named exactly <code>fb-lib</code> exists with the current contents of <code>scripts/fb-lib.js</code>, then re-save THIS report.';
+        document.body.appendChild(banner);
+        try { console.error('[KitAvailability] fb-lib feature check failed:', missing); } catch (_) {}
+    }
+    if (document.body) showBanner(); else document.addEventListener('DOMContentLoaded', showBanner);
+})();
+
+// ============================================================================
+//  FBLIB SETTINGS INIT
+// ============================================================================
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',   // shared admin defaults via userproperties, not report data (which needs a SAVED report — see FBLib.SharedData)
+        userKey:   'cdx.bi.kitavailability.user.v1',
+        masterKey: 'cdx.bi.kitavailability.master.v1',
+        defaults: {
+            v: 1,
+            rememberFilters: true,
+            showDebug: false,
+            lgSel: [],               // remembered LG selection (empty = all accessible)
+            availFilter: 'now',      // 'all' | 'now' | 'zero'
+            scopeMode: 'perlg',      // 'perlg' | 'consolidated' (the .jrxml's company-wide roll-up)
+            tablePrefs: null         // FBLib.Table column order/widths/sort
+        },
+        propFallback: {
+            showDebug: { name: 'BI_SHOW_DEBUG', dflt: 'false', parse: function (v) { return v === 'true'; } }
+        }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+var _resolve = function (key, dflt) {
+    try { var v = FBLib.Settings.resolve(key); return (v === undefined || v === null) ? dflt : v; }
+    catch (_) { return dflt; }
+};
+var _setUserKey = function (key, value) {
+    try { FBLib.Settings.setUserKey(key, value); FBLib.Settings.saveUser(); } catch (_) {}
+};
+var debugLog = function (msg, kind) { FBLib.Common.debugLog(msg, kind); };
+
+// ============================================================================
+//  KIT LINE TYPES  (kititem.kitItemTypeId — verified against kititemtype)
+// ============================================================================
+//   10 Standard           — always on the order. Constrains.
+//   20 Optional           — only if the salesperson adds it. Optional.
+//   30 Variable           — always on the order, qty may be changed. Constrains.
+//   40 Variable-Optional  — optional AND variable-qty. Optional.
+//   50 Discount           — a discount line, no product. Never a component.
+//   60 Tax Rate           — a tax line, no product. Never a component.
+// kititem.kitTypeId is a DIFFERENT lookup: 10 = Kit Item, 20 = Alternate
+// Product. Only kitTypeId 10 rows are kit lines; type 20 rows are alternates
+// hanging off a product and must not be treated as requirements.
+var LINE_REQUIRED = [10, 30];
+var LINE_OPTIONAL = [20, 40];
+var LINE_COMPONENT = LINE_REQUIRED.concat(LINE_OPTIONAL);   // 50/60 excluded entirely
+
+// ============================================================================
+//  STATE
+// ============================================================================
+var _allRows = [];            // every summary row (kit x LG) in the current scope
+var _dataset = [];            // _allRows after the client filters (fed to the table)
+var _linesByKit = {};         // kitproductid -> [kit line objects]
+var _optionsByLine = {};      // kititemid -> [alternative option objects]
+var _kitMetaById = {};        // kitproductid -> { kitnum, kitdesc }
+var _availMap = {};           // "partid|lgid" -> { available, onhand, onorder }
+var _constraintByKey = {};    // "kitproductid|lgid" -> Set(partid) of limiting lines
+var _bestByKey = {};          // "kitproductid|lgid" -> computeKitBest() result
+var _table = null;
+var _lgMs = null;             // Location Group multi-select (drives the queries)
+var _kitMs = null;            // Kit multi-select (client-side filter)
+var _constraintMs = null;     // Constraint Part multi-select (client-side filter)
+var _lgAccessible = [];       // [{id,name}] the user can access
+var _loadToken = 0;
+var _availFilter = 'now';
+var _scopeMode = 'perlg';     // 'perlg' | 'consolidated'
+
+// Pseudo location group for Consolidated scope. Availability is summed across
+// the selected groups as RAW (unfloored) figures and floored ONCE at the end —
+// see the consolidation pass in loadDashboard for why that matters.
+var LG_ALL = 'ALL';
+
+var CAP_KITS = 3000;          // safety cap on the kit-header query
+
+// ============================================================================
+//  RUNQUERY NORMALISER
+// ============================================================================
+async function runQueryP(sql) {
+    if (typeof runQueryAsync === 'function') {
+        var r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    var raw = runQuery(sql);
+    if (!raw) return [];
+    try { var p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+function escSQL(s) { return FBLib.Common.escSQL(s); }
+function num(v) { var n = parseFloat(v); return isNaN(n) ? 0 : n; }
+function intList(arr) {
+    return (arr || []).map(function (x) { return parseInt(x, 10); })
+        .filter(function (n) { return !isNaN(n); });
+}
+function fmtQty(v) { return FBLib.Common.formatQty(v); }
+function fmtMoney(v) { return FBLib.Common.formatMoney(v); }
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' })[c]; }); }
+// MySQL bit(1) comes back as a raw byte, so `flag + 0` is selected in SQL and
+// this only has to cope with 1 / '1' / true.
+function truthy(v) { return v === true || v === 1 || v === '1'; }
+
+// The location groups currently in scope: the user's selection, else every
+// accessible LG. Availability is computed per LG within this set.
+function selectedLgIds() {
+    var sel = _lgMs ? intList(_lgMs.getSelected()) : [];
+    if (sel.length) return sel;
+    return _lgAccessible.map(function (l) { return parseInt(l.id, 10); }).filter(function (n) { return !isNaN(n); });
+}
+function lgNameById(id) {
+    if (String(id) === LG_ALL) {
+        var n = selectedLgIds().length;
+        return 'All selected (' + n + ' LG' + (n === 1 ? '' : 's') + ')';
+    }
+    var m = _lgAccessible.find(function (l) { return String(l.id) === String(id); });
+    return m ? m.name : ('LG ' + id);
+}
+// The groups the consolidated figure actually rolls up, for tooltips + exports.
+function selectedLgNames() { return selectedLgIds().map(lgNameById).join(', '); }
+
+// ============================================================================
+//  COLUMN DEFINITIONS  (FBLib.Table)
+// ============================================================================
+function _qtyCell(v) { return (v == null || v === '') ? '<span style="color:var(--c-tertiary)">—</span>' : fmtQty(num(v)); }
+// Plain figures in the grid — no pills. Zero reads as muted, available as bold.
+function _availCell(v) {
+    if (v == null || v === '') return '<span style="color:var(--c-tertiary)">—</span>';
+    var n = num(v);
+    return n <= 0
+        ? '<span style="color:var(--c-tertiary)">0</span>'
+        : '<strong>' + fmtQty(n) + '</strong>';
+}
+// "Excl. Optional" — the kit with its Optional / Variable-Optional lines left
+// off the order entirely. Higher than the headline means an OPTIONAL line is
+// what is holding the kit back, and simply not shipping it unblocks you; that
+// is worth calling out, so it is the only case that gets colour.
+function _exclOptCell(v, row) {
+    if (v == null || v === '') return '<span style="color:var(--c-tertiary)">—</span>';
+    var n = num(v), base = num(row.qtyavailable);
+    if (n <= base) {
+        return '<span style="color:var(--c-tertiary)" title="' +
+            esc('No optional line is limiting this kit — dropping the optional lines would not help.') +
+            '">' + fmtQty(n) + '</span>';
+    }
+    var names = (row._optCapping || []).join(', ');
+    return '<span class="excl-up" title="' +
+        esc('Optional line(s) ' + (names || '—') + ' cap this kit at ' + fmtQty(base) + '. Leave them off ' +
+            'the order and you could supply ' + fmtQty(n) + '. An Optional line is not added unless the ' +
+            'salesperson picks it, so this is often the realistic figure.') +
+        '">' + fmtQty(n) + '</span>';
+}
+// "Best Variation" — the same every-line basis as the headline, but with the
+// best-stocked choice on each option line, so the two are directly comparable.
+// Called out in green only when it beats the kit as configured, because that is
+// the actionable case: the kit is not really blocked, it just needs a different
+// option picked.
+function _bestCell(v, row) {
+    if (v == null || v === '') return '<span style="color:var(--c-tertiary)">—</span>';
+    var n = num(v), def = num(row.qtyavailable);
+    var caveat = row._bestContended
+        ? ' Note: two lines on this kit can select the same part, so they would compete for the same stock — treat this as an upper bound.'
+        : '';
+    if (n > def) {
+        var swaps = (row._bestSwaps || []);
+        var tip = (swaps.length ? 'Choose ' + swaps.join('; ') + ' — that lifts this kit from ' + fmtQty(def) + ' to ' + fmtQty(n) + '.'
+                                : 'A different option choice lifts this kit from ' + fmtQty(def) + ' to ' + fmtQty(n) + '.') +
+                  ' Click the row for the full breakdown.';
+        return '<span class="best-up" title="' + esc(tip + caveat) + '">' + fmtQty(n) + '</span>';
+    }
+    return '<span style="color:var(--c-tertiary)" title="' +
+        esc('No alternative option improves on the kit as configured.' + caveat) + '">' + fmtQty(n) + '</span>';
+}
+// Location Group cell. Consolidated scope shows one pseudo group, so name the
+// groups it actually rolled up rather than leaving "All selected (8)" opaque.
+function _lgCell(v, row) {
+    if (String(row.lgid) !== LG_ALL) return esc(v == null ? '' : v);
+    return '<span title="' + esc('Rolled up across: ' + selectedLgNames() +
+        '. Raw availability is summed across these groups and floored once, ' +
+        'matching the original Jasper report — so an over-allocated group reduces the total.') +
+        '">' + esc(v == null ? '' : v) + '</span>';
+}
+// Constraint cell — the first limiting part plus "+N" when there are more, and
+// the full list in the tooltip. No click handler: the whole kit row toggles the
+// inline breakdown, so this just has to LOOK like it participates.
+function _constraintCell(v, row) {
+    var parts = (row && row._constraintParts) || [];
+    if (!parts.length) return '<span style="color:var(--c-tertiary)">—</span>';
+    var more = parts.length - 1;
+    var label = esc(parts[0]) + (more > 0 ? ' <span style="color:var(--c-tertiary)">+' + more + '</span>' : '');
+    return '<span class="drill-link" title="' + esc(parts.join(', ')) +
+        ' — click the row for the full breakdown">' + label + '</span>';
+}
+// Components cell — the row's expander affordance. The chevron is rotated by
+// CSS off the row's .is-open class, so this markup is state-independent and
+// survives FBLib.Table re-rendering the cell on sort/filter.
+function _drillCell(v, row) {
+    var n = num(v);
+    return '<span class="drill-link" title="Show this kit\'s component lines">' +
+        '<span class="kit-chev">&#9656;</span>' + n + ' line' + (n === 1 ? '' : 's') + '</span>';
+}
+function _moneyCell(v) { return (v == null || v === '') ? '' : fmtMoney(num(v)); }
+// Text cell that keeps the full value in a hover tooltip (so a value clipped by
+// its column width is still readable).
+function _titleCell(v) { var s = (v == null ? '' : String(v)); return '<span title="' + esc(s) + '">' + esc(s) + '</span>'; }
+
+// Filtering is done in the Filters drawer, so the table columns carry no
+// per-column filter row (filter:false). Columns still sort, reorder, resize and
+// persist. Kit Description has NO fixed width, so under table-layout:fixed it
+// absorbs the slack and the table fills the page width.
+// EVERY column carries a width, Kit Description included. Leaving one column
+// width-less to "absorb the slack" works only while the fixed widths fit: under
+// table-layout:fixed the auto column is handed whatever is left, which is ZERO
+// on a narrow panel, and Kit Description silently disappeared. (A CSS min-width
+// does not rescue it — the fixed algorithm ignores it.) With every width set,
+// the table still fills a wide panel, because `width:100%` distributes the
+// surplus proportionally, and a narrow one scrolls horizontally instead.
+var _columns = [
+    { key: 'locationgroup',   label: 'Location Group',  width: 118, filter: false, format: _lgCell },
+    { key: 'kitnum',          label: 'Kit #',           width: 135, link: 'Product', filter: false },
+    { key: 'kitdesc',         label: 'Kit Description', width: 200, filter: false, format: _titleCell },
+    // The three figures, left to right: the kit as configured, then the two
+    // ways of doing better than that. The headline is deliberately the LEAST
+    // permissive of the three — it is the one someone can act on without
+    // changing the order.
+    { key: 'qtyavailable',    label: 'Kits Available',  width: 108, align: 'right', qty: true, filter: false, format: _availCell },
+    { key: 'qtyexcloptional', label: 'Excl. Optional',  width: 106, align: 'right', qty: true, filter: false, format: _exclOptCell },
+    { key: 'qtybestvariation',label: 'Best Variation',  width: 112, align: 'right', qty: true, filter: false, format: _bestCell },
+    { key: 'constraint',      label: 'Constraint',      width: 126, filter: false, format: _constraintCell },
+    { key: 'qtyafterincoming',label: 'After Incoming',  width: 110, align: 'right', qty: true, filter: false, format: _availCell },
+    { key: 'linecount',       label: 'Components',      width: 96,  align: 'center', qty: true, sortable: true, filter: false, format: _drillCell },
+    { key: 'kitprice',        label: 'Kit Price',       width: 90,  align: 'right', money: true, filter: false, format: _moneyCell },
+    { key: 'availablevalue',  label: 'Available Value', width: 112, align: 'right', money: true, filter: false, format: _moneyCell }
+];
+
+// ============================================================================
+//  FILTERS
+// ============================================================================
+function clearFilters() {
+    document.getElementById('filterKit').value = '';
+    document.getElementById('filterActiveOnly').checked = true;
+    _setAvailFilter('now');
+    _setUserKey('availFilter', 'now');
+    _setScopeMode('perlg');
+    _setUserKey('scopeMode', 'perlg');
+    if (_lgMs) _lgMs.setSelected([]);
+    if (_kitMs) _kitMs.setSelected([]);
+    if (_constraintMs) _constraintMs.setSelected([]);
+    loadDashboard();
+}
+
+async function loadFilters() {
+    // Location groups the current user can access (getLocationGroupList), active only.
+    try {
+        var ids = (typeof getLocationGroupList === 'function' ? getLocationGroupList() : []) || [];
+        var where = ids.length ? (' AND id IN (' + intList(ids).join(',') + ')') : '';
+        var lgs = await runQueryP('SELECT id, name FROM locationgroup WHERE activeflag = 1' + where + ' ORDER BY name');
+        _lgAccessible = lgs.map(function (r) { return { id: parseInt(r.id, 10), name: r.name || ('LG ' + r.id) }; });
+        _lgMs.setItems(_lgAccessible.map(function (l) { return { value: l.id, label: l.name }; }));
+        // Restore the remembered LG selection only when "Remember filter
+        // selections" is on; otherwise every session starts on all-accessible.
+        var savedLg = _resolve('lgSel', []);
+        if (_resolve('rememberFilters', true) && Array.isArray(savedLg) && savedLg.length) _lgMs.setSelected(savedLg);
+    } catch (e) { debugLog('loadFilters: locationgroup failed: ' + e.message, 'warn'); }
+}
+
+// ============================================================================
+//  CLIENT-SIDE FILTERS  (availability chip + Kit / Constraint multi-selects).
+//  Applied over _allRows -> _dataset with no re-query, so toggling them
+//  repaints instantly.
+// ============================================================================
+function _setAvailFilter(v) {
+    _availFilter = (v === 'now' || v === 'zero') ? v : 'all';
+    document.querySelectorAll('#availChips label').forEach(function (el) {
+        el.classList.toggle('on', el.getAttribute('data-v') === _availFilter);
+        var input = el.querySelector('input'); if (input) input.checked = (el.getAttribute('data-v') === _availFilter);
+    });
+}
+function onAvailFilterChange(v) {
+    _setAvailFilter(v);
+    _setUserKey('availFilter', _availFilter);
+    _refreshTable();
+}
+function _setScopeMode(v) {
+    _scopeMode = (v === 'consolidated') ? 'consolidated' : 'perlg';
+    document.querySelectorAll('#scopeChips label').forEach(function (el) {
+        el.classList.toggle('on', el.getAttribute('data-v') === _scopeMode);
+        var input = el.querySelector('input'); if (input) input.checked = (el.getAttribute('data-v') === _scopeMode);
+    });
+}
+// Scope only changes which LG key the rows are built on, and both the per-group
+// and the consolidated availability are already in _availMap — so this is a
+// recompute, not a re-query. Expansion keys embed the LG, so they are dropped.
+function onScopeModeChange(v) {
+    _setScopeMode(v);
+    _setUserKey('scopeMode', _scopeMode);
+    _expanded.clear();
+    _rebuildRows();
+    _populateValueFilters();
+    _refreshTable();
+}
+function _applyClientFilters() {
+    var kitSel = _kitMs ? new Set(_kitMs.getSelected().map(String)) : new Set();
+    var conSel = _constraintMs ? new Set(_constraintMs.getSelected().map(String)) : new Set();
+    _dataset = _allRows.filter(function (r) {
+        if (_availFilter === 'now'  && !(num(r.qtyavailable) >= 1)) return false;
+        if (_availFilter === 'zero' && !(r.qtyavailable != null && num(r.qtyavailable) === 0)) return false;
+        if (kitSel.size && !kitSel.has(String(r.kitnum))) return false;
+        if (conSel.size && !(r._constraintParts || []).some(function (p) { return conSel.has(String(p)); })) return false;
+        return true;
+    });
+}
+// Re-apply the client filters + repaint (no re-query). Rows that drop out of
+// the filter keep their expanded state in _expanded, so they come back open if
+// the filter is widened again — the reconciler only paints what is on screen.
+function _refreshTable() {
+    _applyClientFilters();
+    if (_table) _table.render();
+    _syncDetails();
+    document.getElementById('statusLine').innerHTML = _statusText();
+}
+// Populate the Kit + Constraint multi-selects from the loaded rows, preserving
+// any still-valid current selection.
+function _populateValueFilters() {
+    var kits = {}, cons = {};
+    _allRows.forEach(function (r) {
+        if (r.kitnum) kits[r.kitnum] = true;
+        (r._constraintParts || []).forEach(function (p) { if (p) cons[p] = true; });
+    });
+    if (_kitMs) {
+        var keepKit = _kitMs.getSelected().filter(function (v) { return kits[v]; });
+        _kitMs.setItems(Object.keys(kits).sort().map(function (v) { return { value: v, label: v }; }));
+        _kitMs.setSelected(keepKit);
+    }
+    if (_constraintMs) {
+        var keepCon = _constraintMs.getSelected().filter(function (v) { return cons[v]; });
+        _constraintMs.setItems(Object.keys(cons).sort().map(function (v) { return { value: v, label: v }; }));
+        _constraintMs.setSelected(keepCon);
+    }
+}
+// The status line has to answer two questions people actually hit:
+//   "why am I only seeing one location group?"  -> rows hidden by the
+//      availability chip, which defaults to Available-now and silently drops
+//      every zero row (a kit stocked in one group shows exactly one row).
+//   "why doesn't Consolidated match the Jasper report?" -> because it rolls up
+//      only the groups IN SCOPE, and the LG selection is remembered between
+//      sessions. Consolidating one group just returns that group.
+// Both are reported, and a narrowed LG scope is called out, because neither is
+// visible anywhere else on screen. Returns HTML.
+function _statusText() {
+    var cons = (_scopeMode === 'consolidated');
+    var inScope = selectedLgIds().length, accessible = _lgAccessible.length;
+    var bits = [
+        _dataset.length.toLocaleString() + ' of ' + _allRows.length.toLocaleString() +
+            (cons ? ' kit' : ' kit×LG') + ' row' + (_allRows.length === 1 ? '' : 's')
+    ];
+    var hidden = _allRows.length - _dataset.length;
+    if (hidden > 0) {
+        var why = (_availFilter === 'now') ? 'Available now'
+                : (_availFilter === 'zero') ? 'Zero-available' : 'the filters';
+        bits.push(hidden.toLocaleString() + ' hidden by ' + why);
+    }
+    // Always state the roll-up width in Consolidated — it defines the figure.
+    // In per-LG only mention it when narrowed, so the common case stays quiet.
+    if (cons || inScope < accessible) {
+        var lgTxt = (cons ? 'consolidated across ' : '') + inScope + ' of ' + accessible +
+                    ' location group' + (accessible === 1 ? '' : 's');
+        bits.push(inScope < accessible
+            ? '<strong class="scope-warn" title="' + esc('Only ' + inScope + ' of your ' + accessible +
+                ' location groups are selected, so every figure covers just those. Clear the Location ' +
+                'Group filter to include them all.') + '">&#9888; ' + esc(lgTxt) + '</strong>'
+            : esc(lgTxt));
+    }
+    return bits.join(' &middot; ');
+}
+
+// ============================================================================
+//  SQL BUILDERS
+// ============================================================================
+// Kit products (product.kitFlag = 1). Kit products carry no partId of their own
+// — a kit is assembled at pick time, never stocked — so there is no finished-
+// good availability column here, unlike AvailableToBuild.
+function buildKitHeaderSQL() {
+    var where = ['p.kitFlag = 1'];
+    if (document.getElementById('filterActiveOnly').checked) where.push('p.activeFlag = 1');
+    var kit = document.getElementById('filterKit').value.trim();
+    if (kit) where.push("p.num LIKE '%" + escSQL(kit) + "%'");
+    return [
+        'SELECT p.id AS kitproductid, p.num AS kitnum, p.description AS kitdesc,',
+        '       COALESCE(p.price, 0) AS kitprice, u.code AS kituom',
+        'FROM product p',
+        'LEFT JOIN uom u ON u.id = p.uomId',
+        'WHERE ' + where.join(' AND '),
+        'ORDER BY p.num',
+        'LIMIT ' + (CAP_KITS + 1)
+    ].join('\n');
+}
+
+// Kit lines for a set of kit products.
+//   - kitTypeId = 10 keeps genuine kit lines and drops "Alternate Product"
+//     rows (kitTypeId 20), which are not requirements.
+//   - kitItemTypeId IN (10,20,30,40) drops Discount (50) and Tax Rate (60).
+//   - A line with no productId is an OPTION GROUP; it resolves to the default
+//     kitoption choice so the group still contributes its default component
+//     (the .jrxml's inner JOIN dropped these lines entirely).
+//   - The uomconversion factors ride along so qty-per-kit normalises to the
+//     part base UOM in JS. `convok` records whether a conversion actually
+//     exists, so a silent 1:1 fallback can be flagged rather than trusted.
+function buildKitLineSQL(kitIds) {
+    return [
+        'SELECT ki.kitProductId AS kitproductid, ki.id AS kititemid, ki.sortOrder AS sortorder,',
+        '       ki.kitItemTypeId AS linetypeid, kitype.name AS linetype,',
+        '       COALESCE(ki.defaultQty, 0) AS kitqty,',
+        '       COALESCE(ki.description, \'\') AS linedesc,',
+        '       (ki.productId IS NULL) AS isoptiongroup,',
+        '       cp.id AS productid, cp.num AS productnum,',
+        '       part.id AS partid, part.num AS partnum, part.description AS partdesc,',
+        '       part.typeId AS parttype, partuom.code AS partuom, kiuom.code AS kituom,',
+        '       (ki.uomId = part.uomId OR uc.multiply IS NOT NULL) AS convok,',
+        '       COALESCE(uc.multiply, 1) AS multiply, COALESCE(uc.factor, 1) AS factor',
+        'FROM kititem ki',
+        'JOIN kititemtype kitype ON kitype.id = ki.kitItemTypeId',
+        // Default choice for an option group. defaultFlag is bit(1); comparing
+        // to 1 works server-side (only the SELECTed value needs a +0).
+        'LEFT JOIN kitoption kodef ON kodef.kitItemId = ki.id AND kodef.defaultFlag = 1',
+        'LEFT JOIN product cp ON cp.id = COALESCE(ki.productId, kodef.productId)',
+        'LEFT JOIN part ON part.id = cp.partId',
+        'LEFT JOIN uom partuom ON partuom.id = part.uomId',
+        'LEFT JOIN uom kiuom ON kiuom.id = ki.uomId',
+        'LEFT JOIN uomconversion uc ON uc.fromUomId = ki.uomId AND uc.toUomId = part.uomId',
+        'WHERE ki.kitTypeId = 10',
+        '  AND ki.kitItemTypeId IN (' + LINE_COMPONENT.join(',') + ')',
+        '  AND ki.kitProductId IN (' + kitIds.join(',') + ')',
+        'ORDER BY ki.kitProductId, ki.sortOrder, ki.id'
+    ].join('\n');
+}
+
+// Selectable alternatives for the given kit lines (the drill's expand rows).
+function buildKitOptionSQL(lineIds) {
+    return [
+        'SELECT ko.kitItemId AS kititemid, (ko.defaultFlag + 0) AS isdefault,',
+        '       p.id AS productid, p.num AS productnum,',
+        '       part.id AS partid, part.num AS partnum, part.description AS partdesc,',
+        '       part.typeId AS parttype, partuom.code AS partuom',
+        'FROM kitoption ko',
+        'JOIN product p ON p.id = ko.productId',
+        'LEFT JOIN part ON part.id = p.partId',
+        'LEFT JOIN uom partuom ON partuom.id = part.uomId',
+        'WHERE ko.kitItemId IN (' + lineIds.join(',') + ')',
+        'ORDER BY ko.kitItemId, ko.defaultFlag DESC, p.num'
+    ].join('\n');
+}
+
+// Committed per part+LG. NOT in qtyInventoryTotals — that view has no committed
+// column — so it comes from tag x location, which is also the definition the
+// QTYCOMMITTED view uses (no tag-type and no location-type filter). Queried
+// inline rather than through the view because the qty views are TEMPTABLE: a
+// WHERE does not push down, so filtering the view would still materialise every
+// part. `tag.partId` is indexed, so this form is the cheap one.
+//
+// Committed is shown in the breakdown ONLY. It is deliberately NOT part of the
+// headline figure: this report's basis is Available for Sale, which nets out
+// ALLOCATED (open demand). Committed is the different, physical measure — stock
+// actually reserved on a committed pick — and it is in the panel so that a line
+// reading zero says WHICH of the three reasons applies.
+function buildCommittedSQL(partIds, lgIds) {
+    return [
+        'SELECT t.partId AS partid, l.locationGroupId AS lgid,',
+        '       COALESCE(SUM(t.qtyCommitted), 0) AS committed',
+        'FROM tag t',
+        'JOIN location l ON l.id = t.locationId',
+        'WHERE t.partId IN (' + partIds.join(',') + ')',
+        '  AND l.locationGroupId IN (' + lgIds.join(',') + ')',
+        'GROUP BY t.partId, l.locationGroupId'
+    ].join('\n');
+}
+
+// Available-for-Sale per part+LG, from qtyInventoryTotals (same source as
+// InventoryAvailability.htm / AvailableToBuild.htm). Scoped by LG + part set.
+function buildAvailabilitySQL(partIds, lgIds) {
+    return [
+        'SELECT partId AS partid, locationGroupId AS lgid,',
+        '       SUM(qtyOnHand)       AS onhand,',
+        '       SUM(qtyNotAvailable) AS notavail,',
+        '       SUM(qtyDropship)     AS dropship,',
+        '       SUM(qtyAllocated)    AS allocated,',
+        '       SUM(qtyOnOrder)      AS onorder',
+        'FROM qtyInventoryTotals',
+        'WHERE locationGroupId IN (' + lgIds.join(',') + ') AND partId IN (' + partIds.join(',') + ')',
+        'GROUP BY partId, locationGroupId'
+    ].join('\n');
+}
+
+// ============================================================================
+//  COMPUTE HELPERS
+// ============================================================================
+// A line only constrains a kit when all of these hold:
+//   * it resolved to an INVENTORY part (typeId 10). Service / Labour / Overhead
+//     / Non-Inventory lines have no stock to run out of.
+//   * it consumes a positive quantity. A zero-qty line takes nothing, so it can
+//     never be the bottleneck. (The .jrxml coerced qty 0 to 1, inventing a
+//     requirement that does not exist.)
+//   * its line type is in scope for the current optional basis.
+function _lineIsInventory(l) { return l.parttype === 10 && l.partid > 0; }
+function _lineQtyPerKit(l) { return l.kitqty * (l.multiply / l.factor); }
+function _lineConstrains(l, includeOptional) {
+    if (!_lineIsInventory(l)) return false;
+    if (!(_lineQtyPerKit(l) > 0)) return false;
+    if (includeOptional) return LINE_COMPONENT.indexOf(l.linetypeid) !== -1;
+    return LINE_REQUIRED.indexOf(l.linetypeid) !== -1;
+}
+function availGet(pid, lg, projected) {
+    var a = _availMap[pid + '|' + lg];
+    if (!a) return 0;
+    return projected ? (a.available + a.onorder) : a.available;
+}
+// Kits supported by one kit x LG, over the lines in scope.
+//   { qty, constraint: [{partid, partnum, kits}] }
+// qty is null when no line can constrain the kit at all (nothing to divide) —
+// rendered as an em dash, never as zero, because "no inventory line" and "no
+// stock" are different answers.
+function computeKit(kitId, lg, includeOptional, projected) {
+    var lines = _linesByKit[kitId] || [];
+    var scoped = lines.filter(function (l) { return _lineConstrains(l, includeOptional); });
+    if (!scoped.length) return { qty: null, constraint: [] };
+    var minKits = Infinity, per = [];
+    scoped.forEach(function (l) {
+        var qpk = _lineQtyPerKit(l);
+        var avail = availGet(l.partid, lg, projected);
+        var kits = Math.floor(avail / qpk);
+        per.push({ partid: l.partid, partnum: l.partnum, kits: kits });
+        if (kits < minKits) minKits = kits;
+    });
+    if (!isFinite(minKits)) return { qty: null, constraint: [] };
+    return {
+        qty: Math.max(0, minKits),
+        constraint: per.filter(function (p) { return p.kits === minKits; })
+    };
+}
+
+// ----------------------------------------------------------------------------
+//  VARIATIONS — a kit line can offer a CHOICE of products
+// ----------------------------------------------------------------------------
+// An Optional or option-group line resolves to one default product but the
+// salesperson may pick any of its `kitoption` alternatives instead, so the kit
+// has variations. demodb "Test Kit" in Adelaide is the case that matters: the
+// default Frame F201 has 0 available, which drags the whole configured kit to
+// 0, while the alternative F202 has 323 — pick that and the kit runs to 69
+// (capped by the required H100). The headline figure alone hides that entirely.
+//
+// Every product a line could resolve to: its own default first, then each
+// selectable kitoption not already listed.
+function _lineChoices(l) {
+    var out = [], seen = {};
+    if (l.partid) {
+        out.push({ partid: l.partid, partnum: l.partnum, partdesc: l.partdesc,
+                   parttype: l.parttype, partuom: l.partuom, isdefault: true });
+        seen[l.partid] = true;
+    }
+    (_optionsByLine[l.kititemid] || []).forEach(function (o) {
+        if (!o.partid || seen[o.partid]) return;
+        seen[o.partid] = true;
+        out.push({ partid: o.partid, partnum: o.partnum, partdesc: o.partdesc,
+                   parttype: o.parttype, partuom: o.partuom, isdefault: !l.partid && o.isdefault });
+    });
+    return out;
+}
+// Kits one CHOICE supports. Infinity means "cannot constrain" — a non-inventory
+// part, or a line that consumes nothing — so it drops out of the MIN.
+function _choiceKits(choice, qpk, lg, projected) {
+    if (!(qpk > 0)) return Infinity;
+    if (!choice || !choice.partid || choice.parttype !== 10) return Infinity;
+    return Math.floor(availGet(choice.partid, lg, projected) / qpk);
+}
+// The best a single line can do, and which choice gets there.
+function _lineBest(l, lg, projected) {
+    var qpk = _lineQtyPerKit(l);
+    var scored = _lineChoices(l).map(function (c) {
+        return { choice: c, kits: _choiceKits(c, qpk, lg, projected) };
+    });
+    if (!scored.length) return { kits: Infinity, choice: null, scored: [] };
+    var top = scored.reduce(function (a, b) { return b.kits > a.kits ? b : a; });
+    return { kits: top.kits, choice: top.choice, scored: scored };
+}
+// The ceiling for a kit you actually configure and sell: EVERY line counted
+// (optional included, because a variation is a kit someone orders), each set to
+// its best-stocked choice.
+//
+// Maximising each line INDEPENDENTLY is valid rather than a shortcut: MIN is
+// monotone in each line, so max-over-configurations of the min equals the min
+// of each line's max. No need to enumerate the combinations (Test Kit alone has
+// 2 x 3 = 6, and that product grows with every option).
+//
+// It holds only while no part is reachable from two different lines. When one
+// is, those lines would compete for the same stock and the independent maximum
+// overstates — `contended` records that so the cell can say so rather than
+// quietly report a number nobody can hit.
+function computeKitBest(kitId, lg, projected) {
+    var lines = (_linesByKit[kitId] || []).filter(function (l) {
+        return LINE_COMPONENT.indexOf(l.linetypeid) !== -1;
+    });
+    if (!lines.length) return { qty: null, picks: [], swaps: [], contended: false };
+    var minKits = Infinity, picks = [], swaps = [], seenPart = {}, contended = false;
+    lines.forEach(function (l) {
+        var b = _lineBest(l, lg, projected);
+        _lineChoices(l).forEach(function (c) {
+            if (seenPart[c.partid]) contended = true;
+            seenPart[c.partid] = true;
+        });
+        picks.push({ line: l, best: b });
+        // A swap worth naming: this line has a choice, and the winner is not
+        // the product the kit defaults to.
+        if (b.choice && !b.choice.isdefault && _lineChoices(l).length > 1) {
+            swaps.push((l.linedesc || l.partnum || 'line') + ' = ' + b.choice.partnum);
+        }
+        if (b.kits < minKits) minKits = b.kits;
+    });
+    if (!isFinite(minKits)) return { qty: null, picks: picks, swaps: swaps, contended: contended };
+    return { qty: Math.max(0, minKits), picks: picks, swaps: swaps, contended: contended };
+}
+// What the kit totals if this line is committed to this choice and every other
+// line takes its own best. Used in the panel so each alternative shows not just
+// what the PART supports but what the KIT would come to.
+function _kitTotalIfChosen(kitId, lgId, line, choice) {
+    var mine = _choiceKits(choice, _lineQtyPerKit(line), lgId, false);
+    var others = Infinity;
+    (_linesByKit[kitId] || []).forEach(function (o) {
+        if (o.kititemid === line.kititemid) return;
+        if (LINE_COMPONENT.indexOf(o.linetypeid) === -1) return;
+        var k = _lineBest(o, lgId, false).kits;
+        if (k < others) others = k;
+    });
+    var v = Math.min(mine, others);
+    return isFinite(v) ? Math.max(0, v) : null;
+}
+
+// Rebuild _allRows from the already-loaded lines + availability. Split out of
+// loadDashboard so the optional-basis toggle repaints without re-querying.
+function _rebuildRows() {
+    // Consolidated scope collapses to ONE pseudo group whose availability was
+    // rolled up (raw, floored once) in loadDashboard — so everything downstream,
+    // including the drill, works through the same _availMap lookups.
+    var lgIds = (_scopeMode === 'consolidated') ? [LG_ALL] : selectedLgIds();
+    _allRows = [];
+    _constraintByKey = {};
+    _bestByKey = {};
+    Object.keys(_linesByKit).forEach(function (k) {
+        var kitId = parseInt(k, 10);
+        var meta = _kitMetaById[kitId];
+        if (!meta) return;
+        lgIds.forEach(function (lg) {
+            // THREE fixed figures, one per cell of the (lines x choice) grid
+            // that actually matters. There is no mode to switch, because the
+            // headline used to be the permissive one and read as though the kit
+            // could ship in quantities it cannot:
+            //   res     all lines, DEFAULT choices  — the kit as configured.
+            //           The honest headline, and the .jrxml's number.
+            //   exclOpt required lines only         — what you get if the
+            //           optional lines are simply left off the order.
+            //   best    all lines, BEST choices     — ship the optional lines,
+            //           but pick the best-stocked product on each.
+            var res     = computeKit(kitId, lg, true,  false);
+            var proj    = computeKit(kitId, lg, true,  true);
+            var exclOpt = computeKit(kitId, lg, false, false);
+            var best    = computeKitBest(kitId, lg, false);
+            _constraintByKey[kitId + '|' + lg] = new Set(res.constraint.map(function (c) { return c.partid; }));
+            _bestByKey[kitId + '|' + lg] = best;
+            var consNames = res.constraint.map(function (c) { return c.partnum; });
+            var exclNames = exclOpt.constraint.map(function (c) { return c.partnum; });
+            _allRows.push({
+                kitproductid: kitId, lgid: lg,
+                locationgroup: lgNameById(lg),
+                kitnum: meta.kitnum, kitdesc: meta.kitdesc,
+                qtyavailable: res.qty,
+                qtyexcloptional: exclOpt.qty,
+                qtybestvariation: best.qty,
+                _bestSwaps: best.swaps,
+                _bestContended: best.contended,
+                qtyafterincoming: proj.qty,
+                constraint: consNames.join(', '),     // filter / CSV / export value
+                _constraintParts: consNames,          // for the compact constraint cell
+                _exclConstraintParts: exclNames,      // tooltip on the Excl. Optional cell
+                // Which optional line(s) are capping the kit, if any — that is
+                // the whole reason Excl. Optional can exceed the headline.
+                _optCapping: res.constraint.filter(function (c) {
+                    var l = (_linesByKit[kitId] || []).find(function (x) { return x.partid === c.partid; });
+                    return l && LINE_OPTIONAL.indexOf(l.linetypeid) !== -1;
+                }).map(function (c) { return c.partnum; }),
+                linecount: (_linesByKit[kitId] || []).length,
+                kitprice: meta.kitprice,
+                availablevalue: (res.qty != null ? res.qty * (meta.kitprice || 0) : null)
+            });
+        });
+    });
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+async function loadDashboard() {
+    var tok = ++_loadToken;
+    debugLog('loadDashboard [' + tok + ']: start', 'info');
+    document.getElementById('statusLine').textContent = 'Loading…';
+    if (_lgMs) _setUserKey('lgSel', _lgMs.getSelected());
+
+    function _empty(msg) {
+        _allRows = []; _dataset = []; _linesByKit = {}; _optionsByLine = {};
+        _kitMetaById = {}; _availMap = {}; _constraintByKey = {}; _bestByKey = {};
+        _expanded.clear();
+        if (_table) _table.render();
+        _syncDetails();
+        document.getElementById('statusLine').textContent = msg;
+    }
+
+    try {
+        var lgIds = selectedLgIds();
+        if (!lgIds.length) { _empty('No accessible location group'); return; }
+
+        // 1) Kit products.
+        var hdr = await runQueryP(buildKitHeaderSQL());
+        if (tok !== _loadToken) return;
+        var kitIds = [];
+        _kitMetaById = {};
+        hdr.slice(0, CAP_KITS).forEach(function (r) {
+            var kid = parseInt(r.kitproductid, 10);
+            if (!kid || _kitMetaById[kid]) return;
+            _kitMetaById[kid] = { kitnum: r.kitnum || '', kitdesc: r.kitdesc || '', kitprice: num(r.kitprice) };
+            kitIds.push(kid);
+        });
+        var limitHit = hdr.length > CAP_KITS;
+        if (!kitIds.length) { _empty('No kits match the current filters'); return; }
+
+        // 2) Kit lines. A LEFT JOIN on kitoption could in principle duplicate a
+        //    line if two options were both flagged default, so dedupe by
+        //    kititemid and keep the first (kitoption is ordered default-first).
+        var lineRows = await runQueryP(buildKitLineSQL(kitIds));
+        if (tok !== _loadToken) return;
+        _linesByKit = {};
+        var seenLine = {};
+        var lineIds = [];
+        kitIds.forEach(function (k) { _linesByKit[k] = []; });
+        lineRows.forEach(function (r) {
+            var liid = parseInt(r.kititemid, 10);
+            if (seenLine[liid]) return;
+            seenLine[liid] = true;
+            lineIds.push(liid);
+            var kid = parseInt(r.kitproductid, 10);
+            var l = {
+                kitproductid: kid, kititemid: liid,
+                sortorder: (r.sortorder == null ? 0 : parseInt(r.sortorder, 10) || 0),
+                linetypeid: parseInt(r.linetypeid, 10), linetype: r.linetype || '',
+                linedesc: r.linedesc || '',
+                isoptiongroup: truthy(r.isoptiongroup),
+                productid: parseInt(r.productid, 10) || 0, productnum: r.productnum || '',
+                partid: parseInt(r.partid, 10) || 0, partnum: r.partnum || '',
+                partdesc: r.partdesc || '', parttype: parseInt(r.parttype, 10) || 0,
+                partuom: r.partuom || '', kituom: r.kituom || '',
+                kitqty: num(r.kitqty),
+                convok: truthy(r.convok),
+                multiply: num(r.multiply) || 1, factor: num(r.factor) || 1
+            };
+            (_linesByKit[kid] = _linesByKit[kid] || []).push(l);
+        });
+
+        // 3) Selectable alternatives for those lines (drill only).
+        _optionsByLine = {};
+        if (lineIds.length) {
+            try {
+                var opts = await runQueryP(buildKitOptionSQL(lineIds));
+                if (tok !== _loadToken) return;
+                opts.forEach(function (r) {
+                    var liid = parseInt(r.kititemid, 10);
+                    (_optionsByLine[liid] = _optionsByLine[liid] || []).push({
+                        kititemid: liid,
+                        isdefault: truthy(r.isdefault),
+                        productid: parseInt(r.productid, 10) || 0, productnum: r.productnum || '',
+                        partid: parseInt(r.partid, 10) || 0, partnum: r.partnum || '',
+                        partdesc: r.partdesc || '', parttype: parseInt(r.parttype, 10) || 0,
+                        partuom: r.partuom || ''
+                    });
+                });
+            } catch (e) { debugLog('kitoption query failed: ' + e.message, 'warn'); }
+        }
+
+        // 4) Availability per part+LG for every part reachable from a kit line —
+        //    including the alternatives, so the drill can price a swap.
+        var partIdSet = {};
+        Object.keys(_linesByKit).forEach(function (k) {
+            _linesByKit[k].forEach(function (l) { if (l.partid) partIdSet[l.partid] = true; });
+        });
+        Object.keys(_optionsByLine).forEach(function (k) {
+            _optionsByLine[k].forEach(function (o) { if (o.partid) partIdSet[o.partid] = true; });
+        });
+        var partIds = Object.keys(partIdSet).map(function (x) { return parseInt(x, 10); });
+        _availMap = {};
+        if (partIds.length) {
+            var av = await runQueryP(buildAvailabilitySQL(partIds, lgIds));
+            if (tok !== _loadToken) return;
+            av.forEach(function (r) {
+                var onhand = num(r.onhand), allocated = num(r.allocated),
+                    notavail = num(r.notavail), dropship = num(r.dropship);
+                var raw = onhand - allocated - notavail + dropship;
+                _availMap[r.partid + '|' + r.lgid] = {
+                    // Available for Sale, floored at 0 per location group.
+                    available: Math.max(0, raw),
+                    // The UNFLOORED figure is kept because Consolidated scope
+                    // must sum raw and floor once — a group can be NEGATIVE
+                    // (more allocated than on hand) and the .jrxml lets that
+                    // shortfall eat into other groups' real stock.
+                    rawavail: raw,
+                    onhand: onhand,
+                    // The components are kept so the breakdown can say WHICH of
+                    // them zeroed a line — "in QA Hold" and "all committed to
+                    // picks" and "over-promised on open orders" are three very
+                    // different answers that all render as Available 0.
+                    allocated: allocated,
+                    notavail: notavail,
+                    dropship: dropship,
+                    committed: 0,           // filled by the committed query below
+                    onorder: num(r.onorder)
+                };
+            });
+
+            // Committed, from tag x location (see buildCommittedSQL).
+            try {
+                var cm = await runQueryP(buildCommittedSQL(partIds, lgIds));
+                if (tok !== _loadToken) return;
+                cm.forEach(function (r) {
+                    var e = _availMap[r.partid + '|' + r.lgid];
+                    if (e) e.committed = num(r.committed);
+                });
+            } catch (e) { debugLog('committed query failed: ' + e.message, 'warn'); }
+
+            // Consolidated pseudo-LG. Summing RAW and flooring ONCE reproduces
+            // the .jrxml exactly, including the netting: demodb part 11857 is
+            // +23 in Melbourne and -9 in Brisbane, so consolidated availability
+            // is 14, not the 23 Melbourne can actually supply. That is why the
+            // Bearing Kit reads 7 consolidated and 11 in Melbourne.
+            partIds.forEach(function (pid) {
+                var raw = 0, oh = 0, oo = 0, al = 0, na = 0, ds = 0, cm = 0, seen = false;
+                lgIds.forEach(function (lg) {
+                    var a = _availMap[pid + '|' + lg];
+                    if (!a) return;
+                    seen = true;
+                    raw += a.rawavail; oh += a.onhand; oo += a.onorder;
+                    al += a.allocated; na += a.notavail; ds += a.dropship; cm += a.committed;
+                });
+                if (!seen) return;
+                _availMap[pid + '|' + LG_ALL] = {
+                    available: Math.max(0, raw), rawavail: raw, onhand: oh, onorder: oo,
+                    allocated: al, notavail: na, dropship: ds, committed: cm
+                };
+            });
+        }
+
+        // 5) Build the summary rows. Whatever was expanded stays expanded: the
+        //    reconciler rebuilds each breakdown from the freshly loaded lines
+        //    and availability, so a refresh updates open panels in place rather
+        //    than collapsing the user's place in the report.
+        _rebuildRows();
+        _populateValueFilters();
+        _applyClientFilters();
+        if (_table) _table.render();
+        _syncDetails();
+        document.getElementById('statusLine').innerHTML =
+            _statusText() + (limitHit ? ' &middot; capped at ' + CAP_KITS + ' kits' : '');
+        debugLog('Computed ' + _allRows.length + ' rows across ' + kitIds.length + ' kit(s) x ' + lgIds.length + ' LG(s)', 'success');
+    } catch (e) {
+        debugLog('loadDashboard error: ' + (e && e.message), 'error');
+        document.getElementById('statusLine').textContent = 'Error — see debug console';
+    }
+}
+
+// ============================================================================
+//  INLINE KIT-LINE EXPANSION
+// ----------------------------------------------------------------------------
+//  FBLib.Table owns the tbody: it re-renders it wholesale on sort/filter and
+//  appends further chunks on scroll (lazy render), and it offers no detail-row
+//  hook. So expansion is kept OUTSIDE the table as a set of row keys, and a
+//  reconciler re-derives the DOM after any change the table makes:
+//
+//    _expanded        the source of truth — Set of "kitproductid|lgid"
+//    _syncDetails()   strip every detail row, then re-insert one after each
+//                     expanded summary row, and re-stamp keys + zebra striping
+//    MutationObserver calls it whenever the table touches the tbody
+//
+//  Rebuilding the detail HTML each pass is cheap (a handful of lines per kit)
+//  and removes a whole class of stale-DOM bugs; the lazy renderer bounds how
+//  many summary rows are ever in the DOM, so "expand all" stays bounded too.
+// ============================================================================
+var _expanded = new Set();   // "kitproductid|lgid" of every expanded kit row
+var _rowObserver = null;
+
+function _rowKey(r) { return r.kitproductid + '|' + r.lgid; }
+function _tbodyEl() { return document.querySelector('#reportTable tbody'); }
+function _visibleColCount() {
+    return _table ? _table.getColumns().filter(function (c) { return c.vis !== false; }).length : 1;
+}
+
+// Reconcile detail rows + row classes against _expanded. The observer is
+// disconnected across the mutation (and its queue dropped) so our own DOM
+// writes cannot re-trigger it.
+function _syncDetails() {
+    var tb = _tbodyEl();
+    if (!tb) return;
+    if (_rowObserver) _rowObserver.disconnect();
+    try {
+        Array.prototype.slice.call(tb.querySelectorAll('tr.kit-detail'))
+            .forEach(function (tr) { tr.parentNode.removeChild(tr); });
+
+        var rows = _table ? _table.getVisibleRows() : [];
+        var colspan = _visibleColCount();
+        var i = 0;
+        Array.prototype.slice.call(tb.children).forEach(function (tr) {
+            var row = rows[i];
+            // The empty-state placeholder has no backing row — leave it alone.
+            if (!row) return;
+            i++;
+            var key = _rowKey(row);
+            tr.classList.add('kit-row');
+            tr.classList.toggle('row-alt', (i % 2) === 0);
+            tr.dataset.rowKey = key;
+            if (!_expanded.has(key)) { tr.classList.remove('is-open'); return; }
+            tr.classList.add('is-open');
+            var det = document.createElement('tr');
+            det.className = 'kit-detail';
+            det.dataset.rowKey = key;
+            var td = document.createElement('td');
+            td.colSpan = colspan;
+            td.innerHTML = '<div class="kit-detail-wrap">' + _detailHtml(row) + '</div>';
+            det.appendChild(td);
+            if (tr.nextSibling) tb.insertBefore(det, tr.nextSibling); else tb.appendChild(det);
+        });
+    } finally {
+        if (_rowObserver) { _rowObserver.takeRecords(); _rowObserver.observe(tb, { childList: true }); }
+        _refreshExpandBtn();
+    }
+}
+
+function _detailHtml(row) {
+    return '<p class="kit-detail-title">' + esc(row.kitnum) +
+             ' <span class="lg">· ' + esc(row.locationgroup) + '</span>' +
+             ' <span class="qty">— Kits Available: ' +
+               (row.qtyavailable == null ? '—' : fmtQty(row.qtyavailable)) + '</span></p>' +
+           _bestBanner(row) +
+           '<p class="drill-hint">' +
+             '<span class="k"><span class="sw"></span> constraint — the line(s) capping this kit</span>' +
+             '<span class="k"><span class="sw-opt"></span> optional line — counted here, but ' +
+               'left off the order it would not limit the kit</span>' +
+             '<span class="k">▸ expands an option line\'s selectable alternatives</span>' +
+           '</p>' +
+           '<table class="drill-tbl"><colgroup>' +
+             '<col><col style="width:88px"><col style="width:86px"><col style="width:44px">' +
+             '<col style="width:62px"><col style="width:84px"><col style="width:64px">' +
+             '<col style="width:84px"><col style="width:84px"><col style="width:148px">' +
+           '</colgroup><thead><tr>' +
+             '<th>Kit line</th><th>Type</th>' +
+             '<th class="num" title="Quantity consumed per kit, expressed in the part&apos;s stocking UOM ' +
+               'so it is directly comparable with On Hand and Available. Where the kit line was authored ' +
+               'in another unit, that original is shown in brackets.">Qty / Kit</th><th>UOM</th>' +
+             // The four components of the availability figure, so a line reading
+             // zero says WHICH reason applies rather than just "none".
+             '<th class="num" title="Physical stock on hand in this location group.">On Hand</th>' +
+             '<th class="num" title="Physically here but reserved against a committed pick. Not part of ' +
+               'this report&apos;s Available figure — shown so a zero line can be attributed.">Committed</th>' +
+             '<th class="num" title="In a location flagged not-counted-as-available (QC hold, quarantine ' +
+               'and the like). This is the literal &quot;cannot use this&quot; status.">Not Avail</th>' +
+             '<th class="num" title="Open order demand (SO / PO / MO / TO). NOT a physical state — the stock ' +
+               'may be sitting there pickable, just spoken for. Exceeding On Hand means over-promised.">Allocated</th>' +
+             '<th class="num" title="Available for Sale = On Hand − Allocated − Not Available + Drop Ship, ' +
+               'floored at zero. The basis for every figure in this report.">Available</th>' +
+             '<th class="num">Kits</th>' +
+           '</tr></thead><tbody>' + _drillRows(row.kitproductid, row.lgid) + '</tbody></table>';
+}
+
+// The actionable headline of an expanded panel: this kit is not blocked, it
+// just needs a different option picked. Shown only when a variation actually
+// beats the default configuration.
+function _bestBanner(row) {
+    var best = num(row.qtybestvariation), def = num(row.qtyavailable);
+    if (row.qtybestvariation == null || !(best > def)) return '';
+    var swaps = (row._bestSwaps || []);
+    return '<p class="kit-best">' +
+             '<strong>Best variation: ' + fmtQty(best) + ' kit' + (best === 1 ? '' : 's') + '</strong>' +
+             (swaps.length ? ' — choose <strong>' + esc(swaps.join('</strong>, <strong>')) + '</strong>' : '') +
+             ' <span class="muted">(as configured: ' + fmtQty(def) + ')</span>' +
+             (row._bestContended
+               ? ' <span class="muted">· two lines can select the same part, so this is an upper bound</span>'
+               : '') +
+           '</p>';
+}
+
+function toggleRow(key) {
+    if (_expanded.has(key)) _expanded.delete(key); else _expanded.add(key);
+    _syncDetails();
+}
+
+// Expand / collapse EVERY row currently passing the filters (not just the ones
+// the lazy renderer has painted), so scrolling on reveals them already open.
+function toggleExpandAll() {
+    if (_allExpanded()) _expanded.clear();
+    else (_table ? _table.getVisibleRows() : []).forEach(function (r) { _expanded.add(_rowKey(r)); });
+    _syncDetails();
+}
+function _allExpanded() {
+    var rows = _table ? _table.getVisibleRows() : [];
+    if (!rows.length) return false;
+    return rows.every(function (r) { return _expanded.has(_rowKey(r)); });
+}
+function _refreshExpandBtn() {
+    var lbl = document.getElementById('expandLabel');
+    var btn = document.getElementById('expandBtn');
+    var icon = document.getElementById('expandIcon');
+    if (!lbl || !btn || !icon) return;
+    var open = _allExpanded();
+    lbl.textContent = open ? 'Collapse all' : 'Expand all';
+    btn.title = open ? 'Collapse every kit\'s component lines' : 'Expand every kit\'s component lines';
+    // Chevron down = "expand", chevron up = "collapse".
+    icon.innerHTML = open ? '<path d="M5 15l7-7 7 7"/>' : '<path d="M19 9l-7 7-7-7"/>';
+    btn.disabled = !(_table ? _table.getVisibleRows().length : 0);
+}
+
+// Row click toggles the breakdown. Anything with its own behaviour is excluded:
+// `a.fb-row-link` is the Kit # / part link that opens a Fishbowl module, and
+// `.alt-toggle` is the alternatives chevron INSIDE a detail row. The Components
+// and Constraint cells are deliberately NOT anchors, so they fall through here.
+function _onTbodyClick(e) {
+    if (e.target.closest('a.fb-row-link, .alt-toggle, button, input, select, textarea, label')) return;
+    var tr = e.target.closest('tr');
+    if (!tr || !tr.classList.contains('kit-row') || tr.classList.contains('kit-detail')) return;
+    if (e.target.closest('tr.kit-detail')) return;
+    var key = tr.dataset.rowKey;
+    if (key) toggleRow(key);
+}
+
+// The On Hand / Committed / Not Avail / Allocated / Available block, rendered
+// identically for a kit line and for each of its alternatives. A non-inventory
+// part has no stock at all, so it gets one spanning note rather than five dashes
+// pretending to be measurements.
+//
+// Two figures are called out because they explain an otherwise mute zero:
+//   * Not Available > 0  — the stock exists but is in a QC-hold style location.
+//   * Allocated > On Hand — over-promised. This is what drives Available
+//     negative, and (when consolidated) what lets one group's shortfall eat
+//     into another group's real stock.
+function _availCells(a, isInv) {
+    if (!isInv) {
+        return '<td class="num">—</td><td class="num">—</td><td class="num">—</td>' +
+               '<td class="num">—</td><td class="num"><span class="noninv">Non-Inv</span></td>';
+    }
+    var oh = a ? a.onhand : 0, cm = a ? a.committed : 0,
+        na = a ? a.notavail : 0, al = a ? a.allocated : 0, av = a ? a.available : 0;
+    var naCell = na > 0
+        ? '<span class="avl-flag" title="' + esc(fmtQty(na) + ' sits in a location that is not counted as ' +
+            'available (QC hold, quarantine and the like) — physically present but unusable.') + '">' +
+            fmtQty(na) + '</span>'
+        : fmtQty(na);
+    var alCell = (al > oh)
+        ? '<span class="avl-flag" title="' + esc('Over-allocated: ' + fmtQty(al) + ' of open order demand ' +
+            'against only ' + fmtQty(oh) + ' on hand, a shortfall of ' + fmtQty(al - oh) + '. Available for ' +
+            'Sale is negative here and is floored to zero; consolidating groups lets this shortfall reduce ' +
+            'the real stock held in another group.') + '">' + fmtQty(al) + '</span>'
+        : fmtQty(al);
+    return '<td class="num">' + fmtQty(oh) + '</td>' +
+           '<td class="num">' + fmtQty(cm) + '</td>' +
+           '<td class="num">' + naCell + '</td>' +
+           '<td class="num">' + alCell + '</td>' +
+           '<td class="num">' + fmtQty(av) + '</td>';
+}
+
+// One row per kit line, plus (collapsed under a ▸) one row per selectable
+// alternative. Alternatives are priced at the SAME qty/kit as the line they
+// replace — Fishbowl swaps the product, not the quantity.
+function _drillRows(kitId, lgId) {
+    var lines = (_linesByKit[kitId] || []).slice().sort(function (a, b) {
+        return (a.sortorder - b.sortorder) || (a.kititemid - b.kititemid);
+    });
+    var constraintSet = _constraintByKey[kitId + '|' + lgId] || new Set();
+    if (!lines.length) {
+        return '<tr><td colspan="10" style="color:var(--c-tertiary); padding:14px; text-align:center;">' +
+               'This kit has no component lines.</td></tr>';
+    }
+    var out = '';
+    lines.forEach(function (l) {
+        var isOptional = LINE_OPTIONAL.indexOf(l.linetypeid) !== -1;
+        var inv = _lineIsInventory(l);
+        var qpk = _lineQtyPerKit(l);
+        var a = _availMap[l.partid + '|' + lgId] || null;
+        var counts = _lineConstrains(l, true);   // the headline counts every line
+        var kitsCell;
+        if (!inv) kitsCell = '—';
+        else if (!(qpk > 0)) kitsCell = '∞';
+        else kitsCell = fmtQty(Math.floor((a ? a.available : 0) / qpk));
+
+        // Qty / Kit renders in the PART's stocking UOM, because On Hand,
+        // Available and Kits all come from inventory, which is held in the part
+        // base UOM. Showing the authored figure here would silently mix two unit
+        // systems in adjacent columns — exactly the .jrxml's bug made visible.
+        var rowUom = (l.partuom || l.kituom || '');
+        var mixedUom = l.kituom && l.partuom && l.kituom !== l.partuom;
+        var qpkCell = inv || l.partid
+            ? fmtQty(qpk) +
+              (mixedUom
+                ? ' <span class="uom-orig" title="' + esc('Kit line is authored as ' + fmtQty(l.kitqty) + ' ' +
+                    l.kituom + '; converted to ' + l.partuom + ' (x' + fmtQty(l.multiply) + ' / ' +
+                    fmtQty(l.factor) + ') because inventory is held in ' + l.partuom + '.') + '">(' +
+                    fmtQty(l.kitqty) + ' ' + esc(l.kituom) + ')</span>'
+                : '') +
+              (!l.convok
+                ? ' <span class="uom-bad" title="' + esc('No UOM conversion exists from ' + (l.kituom || '?') +
+                    ' to ' + (l.partuom || '?') + ', so 1:1 was assumed. This quantity — and the Kits figure ' +
+                    'derived from it — is unreliable until the conversion is set up in Fishbowl.') + '">*</span>'
+                : '')
+            : fmtQty(l.kitqty);
+
+        var isConstraint = counts && constraintSet.has(l.partid);
+        var alts = (_optionsByLine[l.kititemid] || []).filter(function (o) {
+            return o.partid && o.partid !== l.partid;
+        });
+        var canExpand = alts.length > 0;
+        // Start a choice OPEN when the default is not the best pick: that is
+        // precisely the case the alternatives exist to reveal, and leaving it
+        // folded hides the answer behind a chevron nobody knows to click.
+        var startOpen = canExpand && qpk > 0 &&
+            ((_lineBest(l, lgId, false).choice || {}).partid !== l.partid);
+        // Where the line offers a choice, every option carries the KIT total it
+        // would produce alongside its own capacity — the part supporting 323 is
+        // not the same claim as the kit reaching 69.
+        var bestPart = canExpand ? (_lineBest(l, lgId, false).choice || {}).partid : null;
+        // `choice` must be the real object — _choiceKits reads parttype, and an
+        // alternative can be non-inventory just as a line can.
+        function _ifCell(choice, ownKits) {
+            // A line consuming nothing is unbounded whichever option is picked,
+            // so "best" and a kit total would be decoration with no information.
+            if (!canExpand || !(qpk > 0)) return ownKits;
+            var tot = _kitTotalIfChosen(kitId, lgId, l, choice);
+            var win = (choice.partid === bestPart)
+                ? ' <span class="best-pick" title="Best-stocked choice on this line.">best</span>' : '';
+            return ownKits + '<span class="kit-if" title="What this kit totals if this option is the one selected.">' +
+                   ' → kit ' + (tot == null ? '—' : fmtQty(tot)) + '</span>' + win;
+        }
+        var toggle = canExpand
+            ? '<span class="alt-toggle' + (startOpen ? ' open' : '') + '" onclick="_toggleAlts(this,' + l.kititemid + ')" title="Show the selectable alternatives for this line"><svg fill="none" stroke="currentColor" stroke-width="2.4" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></span>'
+            : '';
+
+        // Name cell. An option group with no product of its own falls back to
+        // its line description ("Colour"); when a default option resolved it,
+        // that part is named and marked as the default.
+        var nameCell;
+        if (l.partid) {
+            nameCell = '<a class="fb-row-link" onclick="openModule(\'Part\',\'' +
+                esc(String(l.partnum).replace(/'/g, "\\'")) + '\')">' + esc(l.partnum) + '</a>' +
+                (l.isoptiongroup ? ' <span class="line-type" title="This line is an option group; the default choice is shown.">default</span>' : '');
+        } else {
+            nameCell = '<span style="color:var(--c-tertiary)">' + esc(l.linedesc || '(no product)') + '</span>' +
+                ' <span class="line-type" title="This option group has no default choice, so nothing is consumed by default and the line cannot limit the kit.">option group</span>';
+        }
+        var descCell = l.partid
+            ? esc(l.partdesc) + (inv ? '' : ' · <span class="noninv">non-inventory</span>')
+            : '<span class="noninv">no product selected by default</span>';
+
+        out += '<tr class="' + (isConstraint ? 'constraint ' : '') + (isOptional ? 'opt-row' : '') + '">' +
+            '<td class="comp-part"><div>' + toggle + nameCell +
+              '<div class="comp-desc">' + descCell + '</div></div></td>' +
+            '<td><span class="line-type">' + esc(l.linetype) + '</span>' +
+              (isOptional
+                ? '<div class="comp-desc" title="Optional lines count toward Kits Available because the kit is configured with them. Leave them off the order and the Excl. Optional figure applies instead.">optional</div>'
+                : '') + '</td>' +
+            '<td class="num">' + qpkCell + '</td>' +
+            '<td>' + esc(rowUom) + '</td>' +
+            _availCells(a, inv) +
+            '<td class="num">' + _ifCell({ partid: l.partid, parttype: l.parttype }, kitsCell) + '</td>' +
+            '</tr>';
+
+        alts.forEach(function (o) {
+            var oa = _availMap[o.partid + '|' + lgId] || null;
+            var oinv = (o.parttype === 10);
+            var okits = (oinv && qpk > 0) ? fmtQty(Math.floor((oa ? oa.available : 0) / qpk)) : '—';
+            out += '<tr class="alt-row alt-' + l.kititemid + '"' + (startOpen ? '' : ' style="display:none"') + '>' +
+                '<td class="comp-part"><div style="padding-left:24px;font-weight:400">' +
+                  '<span style="color:var(--c-tertiary)">↳ </span>' +
+                  '<a class="fb-row-link" onclick="openModule(\'Part\',\'' +
+                    esc(String(o.partnum).replace(/'/g, "\\'")) + '\')">' + esc(o.partnum) + '</a>' +
+                  (o.isdefault ? ' <span class="line-type">default</span>' : '') +
+                  '<div class="comp-desc">' + esc(o.partdesc) + '</div></div></td>' +
+                '<td><span class="line-type">alternative</span></td>' +
+                '<td class="num">' + (qpk > 0 ? fmtQty(qpk) : '—') + '</td>' +
+                '<td>' + esc(o.partuom || '') + '</td>' +
+                _availCells(oa, oinv) +
+                '<td class="num">' + _ifCell(o, okits) + '</td>' +
+                '</tr>';
+        });
+    });
+    return out;
+}
+// Fold / unfold one line's alternatives. Scoped to the detail table the chevron
+// lives in — several kits can be expanded at once, so there is no single
+// breakdown tbody to look up by id any more.
+function _toggleAlts(el, lineId) {
+    var open = !el.classList.contains('open');
+    el.classList.toggle('open', open);
+    var tbl = el.closest('table.drill-tbl');
+    if (!tbl) return;
+    Array.prototype.forEach.call(tbl.querySelectorAll('tr.alt-' + lineId), function (tr) {
+        tr.style.display = open ? '' : 'none';
+    });
+}
+
+// ============================================================================
+//  EXPORT  (CSV + real .xlsx, both via FBLib.Export — see its block comment for
+//  the JxBrowser download gotchas it centralises)
+// ============================================================================
+// The on-screen column set, in the user's current order, mapped to the shape
+// FBLib.Export wants. Formatter-only columns export their raw value.
+function _exportCols() {
+    return _table.getColumns()
+        .filter(function (c) { return c.vis !== false; })
+        .map(function (c) {
+            var t = c.money ? 'money' : (c.qty ? 'qty' : 'text');
+            return { key: c.key, label: c.label, w: c.width, type: t,
+                     // Kits Available et al are counts, not amounts to sum across
+                     // unrelated kits — but a total is still meaningful per filter,
+                     // so only the price (a RATE) is kept out.
+                     noTotal: (c.key === 'kitprice') };
+        });
+}
+function _fileStem() { return 'kit_availability_' + new Date().toISOString().split('T')[0]; }
+
+function exportCsv() {
+    if (!_table || !_dataset.length) { debugLog('exportCsv: no data', 'warn'); return; }
+    var rows = _table.getVisibleRows();
+    FBLib.Export.csv({ filename: _fileStem(), cols: _exportCols(), rows: rows });
+    debugLog('Exported ' + rows.length + ' rows to CSV', 'success');
+}
+
+async function exportXlsx() {
+    if (!_table || !_dataset.length) { debugLog('exportXlsx: no data', 'warn'); return; }
+    var rows = _table.getVisibleRows();
+    var lgNames = selectedLgIds().map(lgNameById).join(', ');
+    try {
+        await FBLib.Export.xlsx({
+            filename: _fileStem(),
+            sheet: {
+                name: 'Kit Availability',
+                title: 'Kit Availability',
+                subtitle: [
+                    'Scope: ' + (_scopeMode === 'consolidated'
+                        ? 'consolidated across the selected groups (raw summed, floored once — matches the Jasper report)'
+                        : 'one row per location group'),
+                    'Location group(s): ' + (lgNames || 'all accessible'),
+                    'Basis: Available for Sale (on hand − allocated − not available + drop ship). ' +
+                        'Kits Available counts every kit line at its default option choice (the kit as ' +
+                        'configured); Excl. Optional drops the optional lines; Best Variation picks the ' +
+                        'best-stocked option on each line.',
+                    'Generated ' + new Date().toLocaleString()
+                ],
+                cols: _exportCols(),
+                rows: rows,
+                totals: true
+            }
+        });
+        debugLog('Exported ' + rows.length + ' rows to Excel', 'success');
+    } catch (e) {
+        debugLog('exportXlsx failed: ' + (e && e.message), 'error');
+    }
+}
+
+// ============================================================================
+//  PRINT  (new-window workaround — window.print() is unreliable in JxBrowser)
+// ============================================================================
+function printReport() {
+    if (!_table) return;
+    var cols = _table.getColumns().filter(function (c) { return c.vis !== false; });
+    var rows = _table.getVisibleRows();
+    if (!rows.length) { debugLog('printReport: no rows', 'warn'); return; }
+    function escHtml(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' })[c]; }); }
+    function cellText(col, row) {
+        var raw = row[col.key];
+        var out = (typeof col.format === 'function') ? col.format(raw, row) : raw;
+        if (out == null) return '';
+        var s = String(out).replace(/<[^>]+>/g, '');
+        return s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+    }
+    var title = 'Kit Availability';
+    var basis = 'Kits Available = the kit as configured (every line, default option choice)';
+    var hdr = cols.map(function (c) { return '<th>' + escHtml(c.label) + '</th>'; }).join('');
+    var body = rows.map(function (r) {
+        return '<tr>' + cols.map(function (c) {
+            var t = escHtml(cellText(c, r));
+            var cls = (c.align === 'right') ? ' class="nr"' : (c.align === 'center' ? ' class="nc"' : '');
+            return '<td' + cls + '>' + t + '</td>';
+        }).join('') + '</tr>';
+    }).join('');
+    var html = '<!DOCTYPE html><html><head><meta charset="UTF-8"/><title>' + escHtml(title) + '</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:.4in;color:#111}' +
+        'h2{font-size:11pt;margin:0 0 4px;color:#0B3140}.sub{font-size:7.5pt;color:#506872;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}' +
+        'th{background:#0B3140;color:#fff;font-size:7pt;padding:4px 5px;text-align:left;-webkit-print-color-adjust:exact;print-color-adjust:exact}' +
+        'td{font-size:7.5pt;padding:3px 5px;border-bottom:1px solid #E3E3E3}' +
+        'tr:nth-child(even) td{background:#F7F7F7;-webkit-print-color-adjust:exact;print-color-adjust:exact}' +
+        '.nr{text-align:right}.nc{text-align:center}@page{size:A4 landscape;margin:.4in}' +
+        '</style></head><body><h2>' + escHtml(title) + '</h2>' +
+        '<p class="sub">' + rows.length.toLocaleString() + ' row' + (rows.length === 1 ? '' : 's') +
+        ' — available for sale basis, ' + escHtml(basis) +
+        ' — printed ' + new Date().toLocaleDateString() + '</p>' +
+        '<table><thead><tr>' + hdr + '</tr></thead><tbody>' + body + '</tbody></table></body></html>';
+    var w = window.open('', '_blank');
+    if (!w) { debugLog('printReport: popup blocked', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+    debugLog('Printed ' + rows.length + ' rows', 'success');
+}
+
+// ============================================================================
+//  SETTINGS
+// ============================================================================
+function _hydrateSettings() {
+    document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+    document.getElementById('setRememberFilters').checked = !!_resolve('rememberFilters', true);
+    _setAvailFilter(_resolve('availFilter', 'now'));
+    _setScopeMode(_resolve('scopeMode', 'perlg'));
+}
+function onSettingsChange() {
+    var showDebug = document.getElementById('setShowDebug').checked;
+    _setUserKey('showDebug', showDebug);
+    _setUserKey('rememberFilters', document.getElementById('setRememberFilters').checked);
+    _applyDebugDrawer(showDebug);
+}
+function resetSettings() {
+    if (!confirm('Reset your personal settings to defaults?')) return;
+    try { FBLib.Settings.clearUser(); } catch (_) {}
+    _hydrateSettings();
+    _applyDebugDrawer(!!_resolve('showDebug', false));
+    loadDashboard();
+}
+function publishDefaults() {
+    if (!FBLib.Settings.isAdmin()) return;
+    if (!confirm('Publish current settings as the default for all users?')) return;
+    try {
+        FBLib.Settings.publishMaster({
+            rememberFilters: document.getElementById('setRememberFilters').checked,
+            availFilter: _availFilter,
+            scopeMode: _scopeMode
+        });
+        debugLog('Defaults published', 'success');
+    } catch (e) { debugLog('publishDefaults: ' + e.message, 'error'); }
+}
+function toggleUserEditing() {
+    if (!FBLib.Settings.isAdmin()) return;
+    try { FBLib.Settings.setLock(FBLib.Settings.userEditingAllowed()); _refreshAdminUi(); }
+    catch (e) { debugLog('toggleUserEditing: ' + e.message, 'error'); }
+}
+function _refreshAdminUi() {
+    var isAdmin = FBLib.Settings.isAdmin();
+    document.getElementById('dsAdminSection').style.display = isAdmin ? 'block' : 'none';
+    var allowed = FBLib.Settings.userEditingAllowed();
+    document.getElementById('dsLockBadge').style.display = (!allowed && !isAdmin) ? 'block' : 'none';
+    var lockBtn = document.getElementById('dsLockBtn');
+    if (lockBtn) lockBtn.textContent = allowed ? 'Lock user editing' : 'Unlock user editing';
+}
+
+// ============================================================================
+//  DEBUG DRAWER
+// ============================================================================
+var _debugApi = null;
+function _applyDebugDrawer(showIt) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (showIt) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    if (_debugApi.element) _observeDebugDrawer(_debugApi.element);
+}
+function _observeDebugDrawer(el) {
+    if (!el || el._observed) return;
+    el._observed = true;
+    var apply = function () {
+        var visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        var h = (visible && open) ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    if (typeof ResizeObserver === 'function') { try { new ResizeObserver(apply).observe(el); } catch (_) {} }
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async function () {
+  try {
+    // Register the drawers with fb-lib — mutual-exclusion, ESC-to-close,
+    // trigger .active state, and the shared backdrop scrim are all handled by
+    // fb-lib (no local scrim wiring; see the CSS note above).
+    FBLib.Common.registerDrawer({ id: 'filtersOverlay', triggerId: 'filtersBtn' });
+    FBLib.Common.registerDrawer({ id: 'setOverlay',     triggerId: 'setBtn'     });
+    FBLib.Common.registerDrawer({ id: 'helpOverlay',    triggerId: 'helpBtn'    });
+
+    // Chips.
+    document.querySelectorAll('#availChips input').forEach(function (inp) {
+        inp.addEventListener('change', function () { onAvailFilterChange(inp.value); });
+    });
+    document.querySelectorAll('#scopeChips input').forEach(function (inp) {
+        inp.addEventListener('change', function () { onScopeModeChange(inp.value); });
+    });
+
+    // Location Group drives the SQL, so re-run the query once per dropdown
+    // session (onClose). Kit + Constraint are client-side filters over the
+    // loaded rows, so they repaint live on each change (onChange).
+    _lgMs = FBLib.Common.MultiSelect.create({
+        containerId: 'lgMs',
+        items: [],
+        placeholder: 'All my location groups',
+        onClose: function () { loadDashboard(); }
+    });
+    _kitMs = FBLib.Common.MultiSelect.create({
+        containerId: 'kitMs',
+        items: [],
+        placeholder: 'All kits',
+        onChange: function () { _refreshTable(); }
+    });
+    _constraintMs = FBLib.Common.MultiSelect.create({
+        containerId: 'constraintMs',
+        items: [],
+        placeholder: 'All constraint parts',
+        onChange: function () { _refreshTable(); }
+    });
+
+    // FBLib.Table: sort / drag-reorder / drag-resize / lazy render + persisted
+    // layout (settingsKey). getRows returns the client-filtered set.
+    _table = FBLib.Table.init({
+        tableEl: document.getElementById('reportTable'),
+        columns: _columns,
+        getRows: function () { return _dataset; },
+        chunkSize: 200,
+        settingsKey: 'tablePrefs'
+    });
+
+    // Inline expansion. One delegated click handler covers every row (including
+    // rows the lazy renderer has not painted yet), and the observer re-applies
+    // the open panels after the table sorts, filters or appends a chunk.
+    var tb = document.querySelector('#reportTable tbody');
+    tb.addEventListener('click', _onTbodyClick);
+    if (typeof MutationObserver === 'function') {
+        _rowObserver = new MutationObserver(function () { _syncDetails(); });
+        _rowObserver.observe(tb, { childList: true });
+    }
+
+    _hydrateSettings();
+    _applyDebugDrawer(!!_resolve('showDebug', false));
+    _refreshAdminUi();
+
+    document.getElementById('filterKit').addEventListener('keydown', function (e) { if (e.key === 'Enter') loadDashboard(); });
+    document.getElementById('filterActiveOnly').addEventListener('change', loadDashboard);
+
+    await loadFilters();
+    await loadDashboard();
+    debugLog('Report initialised', 'success');
+  } catch (e) {
+    console.error('[KitAvailability init] failed:', e);
+    var sl = document.getElementById('statusLine');
+    if (sl) sl.textContent = 'Init failed — ' + (e && e.message ? e.message : 'see browser console');
+    try { FBLib.Common.debugLog('Init failed: ' + (e && e.stack ? e.stack : e), 'error'); } catch (_) {}
+  }
+});
+
+// Inline-handler exports.
+window.loadDashboard     = loadDashboard;
+window.clearFilters      = clearFilters;
+window.exportCsv         = exportCsv;
+window.exportXlsx        = exportXlsx;
+window.printReport       = printReport;
+window.onSettingsChange  = onSettingsChange;
+window.resetSettings     = resetSettings;
+window.publishDefaults   = publishDefaults;
+window.toggleUserEditing = toggleUserEditing;
+window.toggleExpandAll   = toggleExpandAll;
+window.onScopeModeChange = onScopeModeChange;
+window._toggleAlts       = _toggleAlts;
+</script>
+
+</body>
+</html>
