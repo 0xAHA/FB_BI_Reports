@@ -23,6 +23,26 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting, saved view and shared payload
+        //          this report stores in Fishbowl. Copying this report in
+        //          Fishbowl to make a SEPARATE report? Give the copy its own
+        //          key (e.g. add '2') so it keeps its own settings - left
+        //          as-is, the copy shares the original's. 31 chars max.
+        //   name   This report's Fishbowl record name ('- Folder - Report').
+        //          Publishing finds its copy in the SharePoint BI Reports
+        //          folder by this name; null = not published.
+        //   build  Stamped automatically from this file's content by
+        //          tools/stamp/stamp.js - never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.invreorder',
+            name:  '- Inventory - Inventory Reorder Monitor',
+            build: '2026.09.28-0d352c4'     // @fb-build
+        };
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Inventory Reorder Watchlist - Fishbowl Advanced</title>
 
@@ -244,6 +264,8 @@
                             <p><strong>Reorder Point:</strong> Threshold triggering a reorder alert</p>
                             <p><strong>Order Up To:</strong> Target maximum inventory level</p>
                         </div>
+                        <h3 class="text-sm font-bold text-slate-700 mt-4 mb-2">Hide Manufactured Parts</h3>
+                        <p class="text-sm text-slate-600">Tick it in the filters bar to leave out any part that is the finished good on an active bill of materials — parts you make rather than buy. The setting is remembered.</p>
                         <h3 class="text-sm font-bold text-slate-700 mt-4 mb-2">Columns</h3>
                         <p class="text-sm text-slate-600">Use the <strong>Columns</strong> button to show/hide columns and drag to reorder them. Your layout is saved automatically to your Fishbowl account.</p>
                         <h3 class="text-sm font-bold text-slate-700 mt-4 mb-2">Export &amp; Print</h3>
@@ -323,6 +345,12 @@
                         </div>
                     </div>
                     <div>
+                        <label class="flex items-center gap-2 text-sm text-slate-700 cursor-pointer" style="height:30px;"
+                               title="Hide parts that are the finished good on an active bill of materials — you make those, so you don't buy them">
+                            <input type="checkbox" id="hideManufactured" onchange="onHideManufacturedChange()"> Hide Manufactured Parts
+                        </label>
+                    </div>
+                    <div>
                         <button onclick="clearColumnFilters()" class="px-3 text-sm bg-slate-100 hover:bg-slate-200 text-slate-700 rounded border border-slate-300" style="height:30px;">Clear</button>
                     </div>
                 </div>
@@ -380,12 +408,13 @@
        FBLib.Settings under cdx.bi.invreorder.*. */
     const SETTINGS = {
         masterStorage: 'none',   // personal prefs only — no shared layer, so nothing calls loadReportData (which needs a SAVED report)
-        userKey:   'cdx.bi.invreorder.user.v1',
-        masterKey: 'cdx.bi.invreorder.master.v1',
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
         defaults: {
             v: 2,
             statuses: ['fb40', 'fb30'],   // Status filter selection (supersedes the old hide-flags)
             consumptionRange: '90', consumptionStart: '', consumptionEnd: '',
+            hideManufactured: false,      // leave out finished goods of active BOMs
             cols: []
         }
     };
@@ -418,6 +447,9 @@
             _selStatus = new Set(savedStatuses.map(String));
             if (_statusMs) _statusMs.setSelected(Array.from(_selStatus));
         }
+
+        var hm = document.getElementById('hideManufactured');
+        if (hm) hm.checked = !!FBLib.Settings.resolve('hideManufactured');
 
         // Consumption period.
         var cr = FBLib.Settings.resolve('consumptionRange');
@@ -455,9 +487,11 @@
             FBLib.Settings.setUserKey('consumptionRange', document.getElementById('consumptionRangeSel').value);
             FBLib.Settings.setUserKey('consumptionStart', document.getElementById('consumptionStart').value || '');
             FBLib.Settings.setUserKey('consumptionEnd', document.getElementById('consumptionEnd').value || '');
+            FBLib.Settings.setUserKey('hideManufactured', !!document.getElementById('hideManufactured').checked);
             FBLib.Settings.saveUser();
         } catch (e) { debugLog('persistPrefs failed: ' + e, 'warn'); }
     }
+    function onHideManufacturedChange() { persistPrefs(); refreshTable(); }
 
     /* ── FORMAT HELPERS ── */
     function fmtQty(v) {
@@ -600,6 +634,12 @@
         if (fVendors.length) conds.push("vendorname IN ("  + fVendors.map(function(s){ return "'" + escSql(s) + "'"; }).join(",") + ")");
         if (fLocs.length)    conds.push("locationgroup IN (" + fLocs.map(function(s){ return "'" + escSql(s) + "'"; }).join(",") + ")");
         if (fStates.length)  conds.push("state IN ("       + fStates.map(function(s){ return "'" + escSql(s) + "'"; }).join(",") + ")");
+        // Manufactured = the Finished Good (bomitem.typeId 10) of an ACTIVE BOM.
+        // Applied before LIMIT so hidden parts never use up the row cap.
+        if (document.getElementById('hideManufactured').checked) {
+            conds.push("partid NOT IN (SELECT bi.partid FROM bomitem bi JOIN bom b ON b.id = bi.bomid " +
+                       "WHERE bi.typeid = 10 AND b.activeflag = 1 AND bi.partid IS NOT NULL)");
+        }
         const outerWhere = conds.length ? "WHERE " + conds.join(" AND ") : "";
 
         let innerSql = `SELECT
@@ -1414,7 +1454,11 @@
     function printTable() {
         // JxBrowser: build clean HTML in a NEW window and print THAT window.
         var vis = _columns.filter(function(c){ return c.vis; });
-        var head = '<tr>' + vis.map(function(c){ return '<th>' + c.label + '</th>'; }).join('') + '</tr>';
+        // Part # and Description wrap (breaking inside long unspaced part numbers
+        // if needed) instead of forcing the table past the page edge.
+        var WRAP = { partnum: 'pn', partdescription: 'pd' };
+        function wrapCls(col) { return WRAP[col.key] ? ' class="' + WRAP[col.key] + '"' : ''; }
+        var head = '<tr>' + vis.map(function(c){ return '<th' + wrapCls(c) + '>' + c.label + '</th>'; }).join('') + '</tr>';
         var rows = '';
         var currentVendor = null;
         currentViewRows().forEach(function(entry){
@@ -1426,7 +1470,7 @@
             }
             rows += '<tr' + (entry.detail ? ' class="dr"' : '') + '>' + vis.map(function(col){
                 var align = (col.align === 'right') ? ' style="text-align:right"' : (col.align === 'left' ? ' style="text-align:left"' : '');
-                return '<td' + align + '>' + escHtml(viewCellText(col, entry)) + '</td>';
+                return '<td' + wrapCls(col) + align + '>' + escHtml(viewCellText(col, entry)) + '</td>';
             }).join('') + '</tr>';
         });
         var win = window.open('', '_blank');
@@ -1437,6 +1481,8 @@
             'table{width:100%;border-collapse:collapse;font-size:7pt;}th{background:#f1f5f9;border:1px solid #ccc;padding:3px 2px;text-align:center;}' +
             'td{border:1px solid #ccc;padding:2px 3px;text-align:center;}tr.vh td{background:#e2e8f0;font-weight:bold;text-align:left;}' +
             'tr.dr td{background:#f8fafc;font-size:6.5pt;color:#334155;}' +
+            'th.pn,td.pn,th.pd,td.pd{white-space:normal;overflow-wrap:anywhere;word-break:break-word;text-align:left;}' +
+            'th.pn{width:11%;}th.pd{width:18%;}tr{page-break-inside:avoid;}' +
             '</style></head><body><h1>Inventory Reorder Watchlist</h1><table><thead>' + head + '</thead><tbody>' + rows + '</tbody></table></body></html>'
         );
         win.document.close();
@@ -1503,6 +1549,7 @@
     window.exportToCSV = exportToCSV;
     window.printTable = printTable;
     window.toggleFilters = toggleFilters;
+    window.onHideManufacturedChange = onHideManufacturedChange;
     window.toggleInstructions = toggleInstructions;
     window.openPart = openPart;
     window.openVendor = openVendor;
