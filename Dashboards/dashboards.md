@@ -144,6 +144,8 @@ rescales old layouts to the 40px row height.
 **Filters:**
 
 - Customer Group
+- Customer: searchable; selected customers are listed first, and up to 200
+  matches are drawn at a time
 - Product Category
 - Sales Person
 - Margin: Good (> 30%), Medium (15–30%), Low (< 15%)

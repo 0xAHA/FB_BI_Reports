@@ -19,7 +19,7 @@
       window.FB_REPORT = {
           key:   'cdx.bi.salesdash',
           name:  '- Dashboard - Sales v1.2',
-          build: '2026.10.01-5a24cb0'     // @fb-build
+          build: '2026.10.01-a1ce0f6'     // @fb-build
       };
   </script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -398,7 +398,7 @@
       <div style="flex:1 1 280px; min-width:260px;">
         <b>Filters &amp; data</b>
         <ul style="padding-left:18px; margin:6px 0; line-height:1.6;">
-          <li>The filter strip applies to every widget — date range plus customer group, category, salesperson and margin tier (the margin tier keeps order lines whose own margin is in that tier)</li>
+          <li>The filter strip applies to every widget — date range plus customer group, customer, category, salesperson and margin tier (the margin tier keeps order lines whose own margin is in that tier)</li>
           <li>Margins follow the Fishbowl Margins report: (revenue − cost) ÷ revenue over all lines in the group, credits included; shipping, tax, subtotal and note lines are left out</li>
           <li>Click a <b>Top Customers</b> bar or an order number to drill into the underlying orders</li>
           <li>Categories show their full Product Tree path — set the roll-up depth in <b>Settings ▸ Product categories ▸ Category level</b>; admins publish it as the org default with <b>Publish</b></li>
@@ -712,7 +712,7 @@ function dashUserEditingAllowed() {
 const F = {
   datePreset: 'current_fy',
   customStart: '', customEnd: '',
-  customerGroup: [], productCategory: [], salesperson: [], margin: []
+  customerGroup: [], customer: [], productCategory: [], salesperson: [], margin: []
 };
 const SD_RANGES = [
   ['today','Today'], ['this_week','This Week'], ['this_month','This Month'], ['last_month','Last Month'],
@@ -722,7 +722,8 @@ const SD_RANGES = [
   ['current_cy','Current Calendar Year'], ['last_cy','Last Calendar Year'], ['custom','Custom Range']
 ];
 let _openDrop = null;    // which .fdrop panel is open ('date' | dim key | null)
-let _filterOpts = { customerGroups: [], categories: [], salespeople: [] };
+let _filterOpts = { customerGroups: [], customers: [], categories: [], salespeople: [] };
+const _dimSearch = {};  // typed text per searchable dropdown, kept across strip rebuilds
 
 function sdRangeLabel() {
   if (F.datePreset === 'custom' && F.customStart && F.customEnd)
@@ -933,6 +934,7 @@ function buildFilterConditions(dateCondOverride) {
   let w = `WHERE ${dateCondOverride || getDateCondition()} AND SoItem.typeId NOT IN (${EXCLUDED_LINE_TYPES})`;
   w += cgMemberCond(F.customerGroup);   // §5c — membership, NOT the arbitrary "first" group
   w += catFilterCond();
+  w += sdInNum('So.CustomerId', F.customer);
   w += sdInNum('So.salesmanId', F.salesperson);
   w += marginTierCond(F.margin);
   return w;
@@ -2225,6 +2227,7 @@ function gatherFilterState() {
     customStart:     F.customStart,
     customEnd:       F.customEnd,
     customerGroup:   [...F.customerGroup],
+    customer:        [...F.customer],
     productCategory: [...F.productCategory],
     salesperson:     [...F.salesperson],
     margin:          [...F.margin]
@@ -2941,6 +2944,13 @@ async function loadFilters() {
     const sps = await runQueryP(spSql);
     debugLog(`Salespeople filter: ${sps.length} options loaded`, sps.length ? 'success' : 'warning');
     _filterOpts.salespeople = sps.filter(r => r.id && r.name).map(r => ({ id: String(r.id), name: r.name }));
+
+    // Every customer with an order. The list can run to thousands, so its
+    // dropdown searches (SD_DIMS.customer.search) and caps what it draws.
+    const cuSql = `SELECT DISTINCT Customer.Id as id, Customer.Name as name FROM So JOIN Customer ON Customer.Id = So.CustomerId ORDER BY name`;
+    const cus = await runQueryP(cuSql);
+    debugLog(`Customers filter: ${cus.length} options loaded`, cus.length ? 'success' : 'warning');
+    _filterOpts.customers = cus.filter(r => r.id && r.name).map(r => ({ id: String(r.id), name: r.name }));
   } catch(e) {
     debugLog(`loadFilters ERROR: ${e.message}`, 'error');
     console.error('loadFilters error:', e);
@@ -2953,6 +2963,8 @@ async function loadFilters() {
 // are safe; every change funnels into onFilterChange().
 const SD_DIMS = {
   customerGroup:   { label: 'Customer Group',   allLabel: 'All Groups',       opts: () => _filterOpts.customerGroups.map(n => ({ value:n, name:n })) },
+  customer:        { label: 'Customer',         allLabel: 'All Customers',    search: true,
+                     opts: () => _filterOpts.customers.map(c => ({ value:c.id, name:c.name })) },
   productCategory: { label: 'Product Category', allLabel: 'All Categories',   opts: () => _filterOpts.categories.map(n => ({ value:n, name:n })) },
   salesperson:     { label: 'Sales Person',     allLabel: 'All Sales People', opts: () => _filterOpts.salespeople.map(s => ({ value:s.id, name:s.name })) },
   margin:          { label: 'Margin',           allLabel: 'All Margins',      opts: () => ([
@@ -3060,10 +3072,46 @@ function _sdDimDrop(which) {
   }
   panel.appendChild(head);
   const list = _sdEl('div', 'fdrop-list');
-  opts.forEach(o => list.appendChild(_sdMultiItem(o.name, sel.includes(String(o.value)), () => sdToggleDim(which, o.value))));
+  if (d.search) {
+    // Searchable dimension: the typed text lives in _dimSearch so it survives
+    // the full strip rebuild every tick triggers; typing redraws only the list.
+    const inp = document.createElement('input');
+    inp.type = 'search';
+    inp.placeholder = 'Search ' + d.label.toLowerCase() + 's…';
+    inp.value = _dimSearch[which] || '';
+    inp.style.cssText = 'width:100%;height:28px;margin:0 0 6px;border:1px solid var(--border-strong);border-radius:var(--r-btn);padding:0 8px;font-size:12px;font-family:inherit;color:var(--c-primary);box-sizing:border-box;';
+    inp.addEventListener('click', e => e.stopPropagation());
+    inp.addEventListener('input', () => { _dimSearch[which] = inp.value; _sdFillList(list, which, opts, sel); });
+    panel.appendChild(inp);
+    if (_openDrop === which) requestAnimationFrame(() => { inp.focus(); });
+  }
+  _sdFillList(list, which, opts, sel);
   panel.appendChild(list);
   wrap.appendChild(panel);
   return wrap;
+}
+
+// Draws a dimension's options. Searchable dimensions show selected items
+// first, then matches for the typed text, capped so a list of thousands of
+// customers stays responsive.
+const SD_LIST_CAP = 200;
+function _sdFillList(list, which, opts, sel) {
+  list.innerHTML = '';
+  const item = o => _sdMultiItem(o.name, sel.includes(String(o.value)), () => sdToggleDim(which, o.value));
+  if (!SD_DIMS[which].search) { opts.forEach(o => list.appendChild(item(o))); return; }
+  const q = (_dimSearch[which] || '').trim().toLowerCase();
+  const picked = opts.filter(o => sel.includes(String(o.value)));
+  const rest = opts.filter(o => !sel.includes(String(o.value)) && (!q || String(o.name).toLowerCase().includes(q)));
+  picked.concat(rest.slice(0, SD_LIST_CAP)).forEach(o => list.appendChild(item(o)));
+  if (rest.length > SD_LIST_CAP) {
+    const more = _sdEl('div', 'fdrop-item', `${rest.length - SD_LIST_CAP} more — type to narrow the list`);
+    more.style.cssText = 'color:var(--c-tertiary);font-style:italic;cursor:default;';
+    list.appendChild(more);
+  } else if (!picked.length && !rest.length) {
+    const none = _sdEl('div', 'fdrop-item', 'No matches');
+    none.style.cssText = 'color:var(--c-tertiary);font-style:italic;cursor:default;';
+    list.appendChild(none);
+  }
 }
 
 function renderFilterbar() {
@@ -3100,6 +3148,7 @@ function applyFilterState(state) {
   F.customStart = state.customStart || '';
   F.customEnd   = state.customEnd || '';
   F.customerGroup   = toArr(state.customerGroup);
+  F.customer        = toArr(state.customer);
   F.productCategory = toArr(state.productCategory);
   F.salesperson     = toArr(state.salesperson);
   F.margin          = toArr(state.margin);
@@ -3120,6 +3169,7 @@ function onFilterChange() {
 
 function clearAllFilters() {
   F.customerGroup   = [];
+  F.customer        = [];
   F.productCategory = [];
   F.salesperson     = [];
   F.margin          = [];
