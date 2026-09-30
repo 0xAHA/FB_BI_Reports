@@ -34,7 +34,9 @@ const OUT = path.join(REPO, 'Deployed');
    re-derived at runtime: the reference exports are not part of this repo, so
    the mapping has to survive without them. */
 const DEPLOYED_NAMES = {
-  'Audit/Audit_Trail.htm':                                 ['Audit Trail', 'Audit Trail'],
+  // Published as '- Audit Trail'. Older databases may still hold a record
+  // named plain 'Audit Trail'; importing this creates a second one there.
+  'Audit/Audit_Trail.htm':                                 ['- Audit Trail', '- Audit Trail'],
   // Client-specific pair: the entry screen captures the pricing rule into an
   // soitem custom field, the report reads it back. New records on first import.
   'Custom/Babor/Babor_SO_Entry.htm':                       ['- Sales - Babor SO Entry', '- Sales - Babor SO Entry'],
