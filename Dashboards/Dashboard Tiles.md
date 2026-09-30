@@ -1,268 +1,185 @@
-# Dashboard Tiles - Fishbowl BI Reports
+# Dashboard Tiles
 
 ## Overview
 
-This collection of BI reports provides real-time visibility into Fishbowl operations through interactive HTML dashboards. Each report runs in JxBrowser and queries the Fishbowl database directly to display current status of orders, work orders, and inventory movements.
+These are eight single-tile BI reports, one per order or inventory queue.
+Each is sized to sit on a Fishbowl dashboard as its own gadget. Every tile
+queries the Fishbowl database directly and has these features:
+
+- sortable, filterable columns;
+- click-through to the Fishbowl record;
+- a settings gear with a location-group filter, column visibility and
+  custom-field columns;
+- named saved views.
+
+The same eight tiles are available together in one grid as
+[Dashboard - Company](Dashboard%20Combined%20-%20Import%20Instructions.md).
+
+Source files: `Dashboards/Individual Pages/*.htm`.
 
 ## Installation
 
-### Prerequisites
+### 1. Import the shared library first
 
-Before installing the dashboard reports, create the following properties in **Setup > Property** and set their values to `false`:
+Every tile loads **fb-lib** (the shared BI script library) by name. Import it
+before the tiles, and re-import it whenever it is updated:
 
-| Property Name | Default Value | Purpose |
-|---------------|---------------|---------|
-| `BI_SHOW_DEBUG` | `false` | Enable/disable debug console for troubleshooting |
-| `BI_SO_SHOW_ESTIMATE` | `false` | Show/hide estimate-related sales order data |
-| `BI_PO_SHOW_BID_REQUEST` | `false` | Show/hide bid request purchase orders |
+| File | Where | Record |
+|---|---|---|
+| `fb-lib-Script.json` | BI Reports ▸ `Standard` | Script `fb-lib` |
 
-### Installation Steps
+Without fb-lib the tiles don't load. With an fb-lib older than the tiles, the
+saved-views button doesn't appear.
 
-1. **Save Report Files**
-   - Save all `.json` report files to a local folder on your computer
+### 2. Import the tiles
 
-2. **Import Reports**
-   - Open Fishbowl and navigate to **BI Editor**
-   - Click the **Import** button
-   - Select **ALL** `.json` files at once:
-     - `Open Work Orders-Page.json`
-     - `Open Transfer Orders-Page.json`
-     - `Open Sales Orders-Page.json`
-     - `Open RMA Orders-Page.json`
-     - `Open Purchase Orders-Page.json`
-     - `Items to be Shipped-Page.json`
-     - `Items to be Received-Page.json`
-     - `Items to be Picked-Page.json`
+All eight are in BI Reports ▸ `Company Dashboad and Tiles`:
 
-3. **Publish Reports**
-   - Ensure the **Publish** checkbox is ticked
-   - Select appropriate access rights for your user groups (View, Edit Settings)
-   - Click **OK** to complete the import
+| Tile | File | Source |
+|---|---|---|
+| Open Sales Orders | `- Open Sales Orders-Page.json` | `Open_Sales_Orders.htm` |
+| Open Purchase Orders | `- Open Purchase Orders-Page.json` | `Open_Purchase_Orders.htm` |
+| Open Work Orders | `- Open Work Orders-Page.json` | `Open_Work_Orders.htm` |
+| Open RMA Orders | `- Open RMA Orders-Page.json` | `Open_RMA_Orders.htm` |
+| Open Transfer Orders | `- Open Transfer Orders-Page.json` | `Open_Transfer_Orders.htm` |
+| Items to be Picked | `Dashboard - Tiles - Items to be Picked-Page.json` | `Items_To_Be_Picked.htm` |
+| Items to be Received | `Dashboard - Tiles - Items to be Received-Page.json` | `Items_To_Be_Received.htm` |
+| Items to be Shipped | `Dashboard - Tiles - Items to be Shipped-Page.json` | `Items_To_Be_Shipped.htm` |
 
-4. **Enable Dashboard Gadgets**
-   - Open each imported report in the BI Report window
-   - Go to the **Details** tab
-   - Check the **Dashboard Gadget** option
-   - Click **Save**
+1. In Fishbowl, open **BI Editor** and click **Import**.
+2. Select the `.json` files you want (you can select several at once).
+3. Tick **Publish** and choose the access rights for each user group.
+4. Click **OK**.
 
-5. **Access Reports**
-   - All reports will now be available as Dashboard Gadgets in the BI Report list
-   - Add them to your Fishbowl dashboard for quick access
+The record name inside each file keys the import:
 
-## Available Reports
+- A file whose name matches an existing record updates that record.
+- A file with a new name creates a new record.
 
-### Order Management
-- **Open Sales Orders** - Active customer orders awaiting fulfillment
-- **Open Purchase Orders** - Active vendor orders awaiting receipt
-- **Open Work Orders** - Manufacturing orders in progress
-- **Open RMA Orders** - Return merchandise authorizations with issue tracking
-- **Open Transfer Orders** - Inter-location inventory transfers
+Users' saved settings and views survive a re-import.
 
-### Inventory Operations
-- **Items To Be Picked** - Pick tickets requiring action with availability status
-- **Items To Be Received** - Receipts scheduled for incoming inventory
-- **Items To Be Shipped** - Shipments ready for processing
+### 3. Enable them as dashboard gadgets
 
-## Common Functionality
+For each tile:
 
-### Schedule Status Indicators
+1. Open it in the BI Report window.
+2. On the **Details** tab, tick **Dashboard Gadget** and click **Save**.
+3. Add it to a Fishbowl dashboard.
 
-All reports display schedule status using color-coded clock icons:
+No system properties are required.
 
-- <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> **Red Clock** - Past due (scheduled date has passed)
-- <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> **Orange Clock** - Due today (scheduled for current date)
-- <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#2d9cdb" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> **Blue Clock** - Due this week (scheduled within current calendar week)
-- **No indicator** - Future date beyond current week
+## The tiles
 
-### Availability Status Indicators
+| Tile | Shows | Click-through |
+|---|---|---|
+| Open Sales Orders | Active SOs: status, dates, customer, customer PO; salesperson optional | Sales Order |
+| Open Purchase Orders | Active POs: status, dates, vendor, customer SO; buyer optional | Purchase Order |
+| Open Work Orders | Active WOs with MO #, BOM #, qty, start and scheduled dates | Work Order |
+| Open RMA Orders | Open RMAs by type and issue (DOA / Warranty / `-`), product, qty, customer, dates | RMA |
+| Open Transfer Orders | Active TOs with type, dates, from and to location groups | Transfer Order |
+| Items to be Picked | Open picks with availability, priority and order info | Picking; Order # opens the source order |
+| Items to be Received | Receipts expected against POs, SOs (returns) and TOs, with vendor | Receiving (by source order) |
+| Items to be Shipped | Shipments with ship-to, carrier and service | Shipping; Order # opens the source order |
 
-Reports with inventory items (Picks, RMAs) show availability:
+Every tile can also show a **Location Group** column.
 
-- <svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="#10b981" stroke="#059669" stroke-width="2"/></svg> **Green Circle** - All items fully available
-- <svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="#fff3cd" stroke="#b8860b" stroke-width="2"/></svg> **Orange Circle** - Partial availability (mixed stock levels)
-- <svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="#ef4444" stroke="#dc2626" stroke-width="2"/></svg> **Red Circle** - No items available
-- <svg width="16" height="16" viewBox="0 0 16 16" fill="#f59e0b"><path fill-rule="evenodd" d="M5 6.5V4.5a3 3 0 1 1 6 0V6.5h1.5V4.5a4.5 4.5 0 0 0-9 0V6.5H5zM2.5 8A1.5 1.5 0 0 1 4 6.5h8A1.5 1.5 0 0 1 13.5 8v5.5a1.5 1.5 0 0 1-1.5 1.5H4a1.5 1.5 0 0 1-1.5-1.5V8zm10 0a.5.5 0 0 0-.5-.5H4a.5.5 0 0 0-.5.5v5.5a.5.5 0 0 0 .5.5h8a.5.5 0 0 0 .5-.5V8z"/></svg> **Padlock** - All items committed
-- <svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="#9ca3af" stroke="#6b7280" stroke-width="2"/></svg> **Gray Circle** - No pending items
+### Indicators
 
-Hover over indicators to see detailed counts of full/partial/none items.
+The **schedule** clock shows how the scheduled date compares with today:
 
-### Column Management
+| Clock | Meaning |
+|---|---|
+| Red | Past due |
+| Orange | Due today |
+| Blue | Due this week |
+| None | Later |
 
-#### Sorting
-- Click any column header to sort ascending
-- Click again to sort descending
-- Sort icon (⇅) indicates sortable columns
-- Current sort column is visually highlighted
+The **availability** circle (Items to be Picked) summarises the pick's items:
 
-#### Filtering
-- Type in filter boxes below column headers to filter data
-- Filters are case-insensitive and search for partial matches
-- Multiple filters work together (AND logic)
-- Filter count displays when active: "Showing X of Y records"
-- Click **Clear Filters** button to reset all filters
+| Indicator | Meaning |
+|---|---|
+| Green | All items available |
+| Orange | Partly available |
+| Red | Nothing available |
+| Padlock | All items committed |
+| Grey | No pending items |
 
-#### Reordering
-- Drag column headers to reorder columns
-- **Note**: Column order cannot be saved in Fishbowl and will revert to default layout when the report is reloaded
+Hover over it for the full / partial / none counts.
 
-#### Responsive Widths
-- Tables use dynamic column sizing to prevent horizontal scrollbars
-- Core columns (numbers, dates, status) have fixed widths
-- Text columns (customer/vendor names) truncate with ellipsis (...)
-- Hover over truncated text to see full value in tooltip
+## Using a tile
 
-### Interactive Elements
+- **Sort:** click a column header; click again to reverse.
+- **Filter:** type in the boxes under the headers. Matching is partial and
+  case-insensitive, and the filters combine. The header shows "Showing X
+  of Y". **Clear Filters** resets them.
+- **Reorder columns:** drag a column header. This lasts until the tile is
+  reloaded. To keep an order, set it in Settings ▸ Column Visibility.
+- **Refresh:** reloads the data and keeps the filters and sort.
+- **Open a record:** click an order, pick or shipment number.
 
-#### Clickable Records
-- Order/pick numbers are clickable links (blue, underlined on hover)
-- Clicking opens the record in Fishbowl's native module
-- Order references (SO-XXX, PO-XXX, etc.) also open their source orders
+### Saved views
 
-#### Refresh
-- Click **Refresh** button to reload data from database
-- All filters and column order are preserved during refresh
+The saved-views button in the header saves the current filters, header
+toggles and sort as a named view. It opens a list in two groups:
 
-### Debug Mode
+- **My views** are your own; other users don't see them.
+- **Company views** are published by an admin and visible to everyone. You
+  can save a copy to change one, but only an admin can change or delete the
+  original.
 
-Enable debug console by setting Fishbowl custom field:
-```
-BI_SHOW_DEBUG = true
-```
+Star a view to open it by default. An admin can also set a company view as
+everyone's default; a user's own star overrides it. The popover also lists
+every filter currently narrowing the table, including filters on hidden
+columns.
 
-Debug console shows:
-- SQL query execution
-- Record counts and parsing
-- Availability calculations
-- Error messages
+### Settings
 
-## Report-Specific Features
+Click the **gear icon** to open the tile's settings. Changes apply when you
+click **Save (just me)**.
 
-### Open Sales Orders
-- Shows customer name and order status
-- Schedule indicator for fulfillment dates
-- Click-through to customer orders
+| Setting | What it does |
+|---|---|
+| Location Groups | Show only these location groups. Empty = every location group you can access |
+| Hide Estimates / Hide Bid Requests | Open Sales Orders / Open Purchase Orders only |
+| Remember table filters between sessions | Reopen the tile with the filters you left it with; otherwise your starred view opens |
+| Show debug console | Show the SQL/event log at the bottom of the page |
+| Column Visibility | Show or hide standard columns, add custom-field columns, set column order. Order numbers and indicators can't be hidden |
 
-### Open Purchase Orders
-- Shows vendor name and order status
-- Schedule indicator for expected receipt dates
-- Click-through to vendor orders
+**Reset to defaults** clears your own saved settings.
 
-### Open Work Orders
-- Displays MO #, WO #, and BOM # for manufacturing tracking
-- Shows scheduled start dates
-- Status badges for work order progress
+**Admin controls.** An admin is the user named `admin` or any user with the
+`Admin` access right. Admins also get:
 
-### Open RMA Orders
-- **Issue Column** displays reason for return:
-  - **DOA** - Dead on arrival (Issue ID = 2)
-  - **Warranty** - Warranty claim (Issue ID = 3)
-  - **-** - No issue specified (NULL)
-- Groups items by product within each RMA
-- Customer information and RMA type displayed
+- **Publish as default for everyone** makes their settings the default for
+  users who haven't saved their own.
+- **Lock user editing** makes everyone use the published default.
 
-### Items To Be Picked
-- Availability status for each pick ticket
-- Links to source orders (SO/PO/WO/TO)
-- Priority and scheduled date sorting
-- Order info shows customer/vendor/location
+## Location-group access
 
-### Items To Be Received
-- Receipt type (PO/TO/RMA/WO)
-- Vendor name for purchase receipts
-- Schedule status for expected dates
+A tile only shows records in location groups assigned to the user (Setup ▸
+User ▸ Location Groups). The Location Groups setting narrows this further. A
+user with no location groups assigned sees no data.
 
-### Items To Be Shipped
-- Shipment details including carrier and service
-- Ship-to information
-- Order references with prefixes (SO-XXX, etc.)
+## Legacy system properties
 
-### Open Transfer Orders
-- From/To location groups
-- Transfer type and status
-- Scheduled and issued dates
+These **Setup ▸ Property** values are still read as fallbacks when no user or
+admin setting exists:
 
-## Usage Tips
+| Property | Effect |
+|---|---|
+| `BI_SO_SHOW_ESTIMATE` | `false` hides estimates on Open Sales Orders |
+| `BI_PO_SHOW_BID_REQUEST` | `false` hides bid requests on Open Purchase Orders |
+| `BI_SHOW_DEBUG` | `true` shows the debug console |
 
-### Optimizing for Lower Resolution Screens
-Reports are designed to fit within available window space without horizontal scrolling. Column headings use abbreviated formats (e.g., "RMA #" instead of "RMA Number") to maximize space efficiency.
+Dates use Fishbowl's `DateFormatShort` format.
 
-### Finding Overdue Items
-1. Sort by schedule indicator column to group past due items at top
-2. Look for red clock icons
-3. Filter by status to focus on specific order states
+## Troubleshooting
 
-### Tracking Availability
-1. On pick reports, look for red/orange availability circles
-2. Hover for detailed breakdown of full/partial/none items
-3. Padlock icons indicate all items are committed but may not be picked yet
+| Symptom | Check |
+|---|---|
+| Blank tile or script error | fb-lib is imported and up to date |
+| No saved-views button | fb-lib predates saved views; import it again from `Standard` |
+| No rows | The user has location groups assigned, and the Location Groups setting isn't excluding them |
+| Settings don't stick | The admin has locked user editing (the panel says "Locked by admin") |
 
-### Multi-Location Filtering
-Reports automatically filter to show only records for location groups assigned to the current user (via UserToLG table).
-
-### Custom Date Formats
-Reports respect Fishbowl's DateFormatShort setting from custom fields. Default is dd/MM/yyyy if not specified.
-
-## Known Limitations
-
-### Column Order Persistence
-- Column reordering via drag-and-drop is functional during a session
-- However, column order cannot be saved in Fishbowl's JxBrowser environment (localStorage not supported)
-- Columns will reset to their default order when the report is refreshed or reopened
-
-### Clickable Links
-- **Pick and Receive links do not work** - This is a Fishbowl limitation/bug
-- The following clickable links work correctly:
-  - Sales Order numbers → Opens Sales Order module
-  - Purchase Order numbers → Opens Purchase Order module
-  - Work Order numbers → Opens Work Order module
-  - Transfer Order numbers → Opens Transfer Order module
-  - RMA numbers → Opens RMA module
-
-### Multi-Location Access
-- Reports only display records for location groups assigned to the current user
-- Users without location group assignments may see no data
-- This is enforced via the UserToLG table relationship
-
-## Technical Details
-
-### Data Source
-- Reports query Fishbowl database directly using `runQuery()` function
-- Real-time data (no caching)
-- User permissions enforced via UserToLG relationships
-
-### Browser Compatibility
-- Designed for JxBrowser within Fishbowl
-- Uses modern CSS (flexbox, grid) and JavaScript (ES6)
-- Note: Browser localStorage is not available in Fishbowl's JxBrowser implementation
-
-### Performance
-- Complex SQL queries with joins and subqueries
-- Availability calculations for picks computed per-item
-- Schedule status calculated client-side in JavaScript
-
-### Customization
-
-#### Custom Fishbowl Properties
-Reports reference the following custom properties from **Setup > Property**:
-
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `DateFormatShort` | String | `dd/MM/yyyy` | Date display format used throughout reports |
-| `BI_SHOW_DEBUG` | Boolean | `false` | Enable debug console showing SQL queries, counts, and errors |
-| `BI_SO_SHOW_ESTIMATE` | Boolean | `false` | Show/hide estimate-related data in Sales Orders report |
-| `BI_PO_SHOW_BID_REQUEST` | Boolean | `false` | Show/hide bid request orders in Purchase Orders report |
-
-#### Report File Format
-- Reports are distributed as `.json` files for import into Fishbowl BI Editor
-- Each JSON file contains the HTML/CSS/JavaScript code for the dashboard
-- Files are generated from source `.htm` files via an external conversion process
-
-## Support
-
-For issues or enhancement requests, contact your Fishbowl administrator or BI report developer.
-
----
-
-**Last Updated**: 2026-01-14
-**Version**: 1.0
-**Reports**: 8 dashboards covering orders, manufacturing, and inventory operations
+Turn on **Show debug console** to see the SQL, record counts and errors.

@@ -12,10 +12,12 @@
   breaks single-pass directive substitution when this file is inlined).
   Exposes the
   window.FBLib namespace: Common (date/money/qty formatters, debug logger,
-  drawer + multi-select primitives), Settings (layered user/master/property
-  preference resolver), CfCatalog / CfCols (custom-field discovery + column
-  rendering), Columns (per-tile column manifest), Picker (drag/drop column
-  picker), and Table (sort/filter/drag scaffolding).
+  drawer + multi-select primitives), SharedData (admin-published org-wide
+  payloads), Settings (layered user/master/property preference resolver),
+  CfCatalog / CfCols (custom-field discovery + column rendering), Columns
+  (per-tile column manifest), Picker (drag/drop column picker), Table
+  (sort/filter/drag scaffolding), Export (.xlsx writer) and FilterViews
+  (saved views).
 ================================================================================
 */
 
@@ -38,12 +40,15 @@
 //
 // PUBLIC API SURFACE
 // ------------------
-// Every public helper hangs off `window.FBLib`. The five sub-modules
-// listed here cover roughly 95% of what a typical report needs:
+// Every public helper hangs off `window.FBLib`:
 //
+//   FBLib.BUILD          — this file's build stamp.
 //   FBLib.Common         — date / money / qty formatting, debug logger,
 //                          status indicators, debug drawer, drop-down
 //                          drawer helpers, multi-select widget.
+//   FBLib.SharedData     — one org-wide payload per key, written by an
+//                          admin and read by everyone (userproperties,
+//                          admin-owned rows only).
 //   FBLib.Settings       — layered preference resolver (user → master →
 //                          getProperty → defaults), with admin-publish +
 //                          editing-lock support.
@@ -59,6 +64,8 @@
 //   FBLib.Table          — Sort / per-column filter / drag-reorder /
 //                          drag-resize scaffolding for a <table> in a
 //                          scroll container. Plug in via FBLib.Table.init.
+//   FBLib.Export         — Formatted .xlsx download (real dates/numbers,
+//                          SUBTOTAL totals row); no CDN dependency.
 //   FBLib.FilterViews    — Saved views (per-user + admin-published company
 //                          views) behind one compact header button. Works
 //                          on filter-row tables out of the box, or on any
@@ -162,7 +169,7 @@ window.FBLib = (function () {
     // Build stamp of this fb-lib, maintained by tools/stamp/stamp.js — never
     // edit by hand. Exposed as FBLib.BUILD so a report can tell which fb-lib
     // the Fishbowl server actually served it.
-    const BUILD = '2026.09.25-a4fb81b';   // @fb-build
+    const BUILD = '2026.09.30-4ca940a';   // @fb-build
 
     // The report's identity block (window.FB_REPORT, top of every report's
     // <head>): { key: storage-key prefix, build: report build stamp }.
