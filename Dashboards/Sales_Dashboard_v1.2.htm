@@ -19,7 +19,7 @@
       window.FB_REPORT = {
           key:   'cdx.bi.salesdash',
           name:  '- Dashboard - Sales v1.2',
-          build: '2026.09.25-ba72b41'     // @fb-build
+          build: '2026.10.01-1a4147b'     // @fb-build
       };
   </script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -398,7 +398,8 @@
       <div style="flex:1 1 280px; min-width:260px;">
         <b>Filters &amp; data</b>
         <ul style="padding-left:18px; margin:6px 0; line-height:1.6;">
-          <li>The filter strip applies to every widget — date range plus customer group, category, salesperson and margin tier</li>
+          <li>The filter strip applies to every widget — date range plus customer group, category, salesperson and margin tier (the margin tier keeps order lines whose own margin is in that tier)</li>
+          <li>Margins follow the Fishbowl Margins report: (revenue − cost) ÷ revenue over all lines in the group, credits included; shipping, tax, subtotal and note lines are left out</li>
           <li>Click a <b>Top Customers</b> bar or an order number to drill into the underlying orders</li>
           <li>Categories show their full Product Tree path — set the roll-up depth in <b>Settings ▸ Product categories ▸ Category level</b>; admins publish it as the org default with <b>Publish</b></li>
           <li>Admins (Fishbowl Admin access) can <b>Publish</b> the current layout/filters as the org-wide default and lock user editing</li>
@@ -834,6 +835,16 @@ function sdClearDim(which) {
 // ============================================================
 const REV_EXPR    = `COALESCE(((PostSoItem.TotalPrice/PostSoItem.Qty)-((PostSoItem.TotalPrice/PostSoItem.Qty)*PSI.AdjustPercent)), PostSoItem.TotalPrice/PostSoItem.Qty) * PostSoItem.Qty`;
 const MARGIN_EXPR = `((${REV_EXPR}) - PostSoItem.PostedTotalCost) / NULLIF(${REV_EXPR}, 0)`;
+// Margin of any GROUP of lines, as Fishbowl's Margins report
+// (SalesOrder/marginsreport.jrxml) computes every total:
+// (Σrevenue − Σcost) / Σrevenue, and 0 when Σrevenue ≤ 0. Never
+// AVG(MARGIN_EXPR) — a per-line average lets credit lines and near-zero
+// revenue lines (kit/discount remnants) skew the figure.
+const MARGIN_AGG  = `(CASE WHEN SUM(${REV_EXPR}) > 0 THEN (SUM(${REV_EXPR}) - SUM(PostSoItem.PostedTotalCost)) / SUM(${REV_EXPR}) ELSE 0 END)`;
+// Line types left out of every figure, matching the Margins report's default
+// line set: 30 Discount % (already folded into line revenue via
+// PSI.AdjustPercent), 40 Subtotal, 60 Shipping, 70 Tax, 90 Note.
+const EXCLUDED_LINE_TYPES = '30,40,60,70,90';
 const BASE_JOIN   = `
   FROM PostSo
   JOIN PostSoItem ON PostSoItem.PostSoId = PostSo.Id
@@ -918,7 +929,7 @@ function marginTierCond(arr){
 }
 
 function buildFilterConditions(dateCondOverride) {
-  let w = `WHERE ${dateCondOverride || getDateCondition()} AND SoItem.typeId NOT IN (30,40)`;
+  let w = `WHERE ${dateCondOverride || getDateCondition()} AND SoItem.typeId NOT IN (${EXCLUDED_LINE_TYPES})`;
   w += cgMemberCond(F.customerGroup);   // §5c — membership, NOT the arbitrary "first" group
   w += catFilterCond();
   w += sdInNum('So.salesmanId', F.salesperson);
@@ -1191,17 +1202,17 @@ function qclear() { _qcache = {}; }
 // Query functions (each uses cache keyed on filter state)
 const Q = {
   kpis: () => qget('kpis', () => {
-    const sql = `SELECT SUM(${REV_EXPR}) as total_revenue, SUM(PostSoItem.PostedTotalCost) as total_cogs, COUNT(DISTINCT So.Num) as order_count, AVG(${MARGIN_EXPR}) as avg_margin ${BASE_JOIN} ${buildFilterConditions()}`;
+    const sql = `SELECT SUM(${REV_EXPR}) as total_revenue, SUM(PostSoItem.PostedTotalCost) as total_cogs, COUNT(DISTINCT So.Num) as order_count, ${MARGIN_AGG} as avg_margin ${BASE_JOIN} ${buildFilterConditions()}`;
     return runQueryLogged('KPIs', sql);
   }),
 
   monthly: () => qget('monthly', () => {
-    const sql = `SELECT DATE_FORMAT(PostSo.DateCreated,'%Y-%m-01') as month, SUM(${REV_EXPR}) as revenue, SUM(PostSoItem.PostedTotalCost) as cogs, AVG(${MARGIN_EXPR}) as avg_margin ${BASE_JOIN} ${buildFilterConditions()} GROUP BY month ORDER BY month ASC`;
+    const sql = `SELECT DATE_FORMAT(PostSo.DateCreated,'%Y-%m-01') as month, SUM(${REV_EXPR}) as revenue, SUM(PostSoItem.PostedTotalCost) as cogs, ${MARGIN_AGG} as avg_margin ${BASE_JOIN} ${buildFilterConditions()} GROUP BY month ORDER BY month ASC`;
     return runQueryLogged('Monthly Revenue', sql);
   }),
 
   topCustomers: () => qget('topCustomers', () => {
-    const sql = `SELECT Customer.Name as name, SUM(${REV_EXPR}) as revenue, SUM(PostSoItem.PostedTotalCost) as cogs, COUNT(DISTINCT So.Num) as orders, (SUM(${REV_EXPR}) - SUM(PostSoItem.PostedTotalCost)) / NULLIF(SUM(${REV_EXPR}), 0) as avg_margin ${BASE_JOIN} ${buildFilterConditions()} GROUP BY Customer.Name ORDER BY revenue DESC LIMIT 10`;
+    const sql = `SELECT Customer.Name as name, SUM(${REV_EXPR}) as revenue, SUM(PostSoItem.PostedTotalCost) as cogs, COUNT(DISTINCT So.Num) as orders, ${MARGIN_AGG} as avg_margin ${BASE_JOIN} ${buildFilterConditions()} GROUP BY Customer.Name ORDER BY revenue DESC LIMIT 10`;
     return runQueryLogged('Top Customers', sql);
   }),
 
@@ -1252,17 +1263,17 @@ const Q = {
   }),
 
   topSalespeople: () => qget('topSalespeople', () => {
-    const sql = `SELECT So.salesmanId as salesmanid, COALESCE(NULLIF(TRIM(CONCAT(SalesUser.FirstName,' ',SalesUser.LastName)),''),SalesUser.userName) as name, SUM(${REV_EXPR}) as revenue, COUNT(DISTINCT So.Num) as orders, AVG(${MARGIN_EXPR}) as avg_margin FROM PostSo JOIN PostSoItem ON PostSoItem.PostSoId = PostSo.Id JOIN SoItem ON SoItem.Id = PostSoItem.SoItemId JOIN So ON So.Id = SoItem.SoId JOIN SysUser AS SalesUser ON SalesUser.Id = So.salesmanId LEFT JOIN PostSoItem PSI ON PSI.SoItemId = COALESCE((SELECT K.Id FROM SoItem K WHERE K.SoLineItem = SoItem.SoLineItem+1 AND K.TypeId = 30 AND SoItem.typeId != 30 AND K.SoId = SoItem.SoId ORDER BY K.SoLineItem ASC LIMIT 1),(SELECT K.Id FROM SoItem K WHERE K.SoLineItem > SoItem.SoLineItem AND EXISTS (SELECT 1 FROM SoItem J WHERE J.TypeId = 40 AND J.SoId = K.SoId AND J.SoLineItem >= K.SoLineItem-1 ORDER BY J.SoLineItem ASC) AND K.TypeId = 30 AND SoItem.typeId != 30 AND K.SoId = SoItem.SoId ORDER BY K.SoLineItem ASC LIMIT 1)) AND PSI.PostSoId = PostSo.Id LEFT JOIN Product ON Product.Id = SoItem.ProductId LEFT JOIN ProductTree ON ProductTree.Id = (SELECT ProductToTree.ProductTreeId FROM ProductToTree WHERE ProductToTree.ProductId = Product.Id ORDER BY ProductToTree.Id ASC LIMIT 1) LEFT JOIN Customer ON Customer.Id = So.CustomerId ${buildFilterConditions()} GROUP BY So.salesmanId, SalesUser.FirstName, SalesUser.LastName ORDER BY revenue DESC LIMIT 8`;
+    const sql = `SELECT So.salesmanId as salesmanid, COALESCE(NULLIF(TRIM(CONCAT(SalesUser.FirstName,' ',SalesUser.LastName)),''),SalesUser.userName) as name, SUM(${REV_EXPR}) as revenue, COUNT(DISTINCT So.Num) as orders, ${MARGIN_AGG} as avg_margin FROM PostSo JOIN PostSoItem ON PostSoItem.PostSoId = PostSo.Id JOIN SoItem ON SoItem.Id = PostSoItem.SoItemId JOIN So ON So.Id = SoItem.SoId JOIN SysUser AS SalesUser ON SalesUser.Id = So.salesmanId LEFT JOIN PostSoItem PSI ON PSI.SoItemId = COALESCE((SELECT K.Id FROM SoItem K WHERE K.SoLineItem = SoItem.SoLineItem+1 AND K.TypeId = 30 AND SoItem.typeId != 30 AND K.SoId = SoItem.SoId ORDER BY K.SoLineItem ASC LIMIT 1),(SELECT K.Id FROM SoItem K WHERE K.SoLineItem > SoItem.SoLineItem AND EXISTS (SELECT 1 FROM SoItem J WHERE J.TypeId = 40 AND J.SoId = K.SoId AND J.SoLineItem >= K.SoLineItem-1 ORDER BY J.SoLineItem ASC) AND K.TypeId = 30 AND SoItem.typeId != 30 AND K.SoId = SoItem.SoId ORDER BY K.SoLineItem ASC LIMIT 1)) AND PSI.PostSoId = PostSo.Id LEFT JOIN Product ON Product.Id = SoItem.ProductId LEFT JOIN ProductTree ON ProductTree.Id = (SELECT ProductToTree.ProductTreeId FROM ProductToTree WHERE ProductToTree.ProductId = Product.Id ORDER BY ProductToTree.Id ASC LIMIT 1) LEFT JOIN Customer ON Customer.Id = So.CustomerId ${buildFilterConditions()} GROUP BY So.salesmanId, SalesUser.FirstName, SalesUser.LastName ORDER BY revenue DESC LIMIT 8`;
     return runQueryLogged('Top Salespeople', sql);
   }),
 
   lowMargin: () => qget('lowMargin', () => {
-    const sql = `SELECT Customer.Name as name, SUM(${REV_EXPR}) as revenue, AVG(${MARGIN_EXPR}) as avg_margin, COUNT(DISTINCT So.Num) as orders ${BASE_JOIN} ${buildFilterConditions()} GROUP BY Customer.Name HAVING avg_margin < 0.15 AND avg_margin > -1 ORDER BY avg_margin ASC LIMIT 10`;
+    const sql = `SELECT Customer.Name as name, SUM(${REV_EXPR}) as revenue, ${MARGIN_AGG} as avg_margin, COUNT(DISTINCT So.Num) as orders ${BASE_JOIN} ${buildFilterConditions()} GROUP BY Customer.Name HAVING avg_margin < 0.15 AND avg_margin > -1 ORDER BY avg_margin ASC LIMIT 10`;
     return runQueryLogged('Low Margin Customers', sql);
   }),
 
   highValue: () => qget('highValue', () => {
-    const sql = `SELECT So.Num as name, Customer.Name as customer, SUM(${REV_EXPR}) as revenue, AVG(${MARGIN_EXPR}) as avg_margin ${BASE_JOIN} ${buildFilterConditions()} GROUP BY So.Num, Customer.Name HAVING revenue > 10000 ORDER BY revenue DESC LIMIT 15`;
+    const sql = `SELECT So.Num as name, Customer.Name as customer, SUM(${REV_EXPR}) as revenue, ${MARGIN_AGG} as avg_margin ${BASE_JOIN} ${buildFilterConditions()} GROUP BY So.Num, Customer.Name HAVING revenue > 10000 ORDER BY revenue DESC LIMIT 15`;
     return runQueryLogged('High Value Orders', sql);
   }),
 
@@ -1275,7 +1286,7 @@ const Q = {
     const prior = getPriorDateRange();
     if (!prior) return Promise.resolve([]);
     const dateCond = `PostSo.DateCreated >= '${prior.start}' AND PostSo.DateCreated <= '${prior.end} 23:59:59'`;
-    const sql = `SELECT SUM(${REV_EXPR}) as total_revenue, SUM(PostSoItem.PostedTotalCost) as total_cogs, COUNT(DISTINCT So.Num) as order_count, AVG(${MARGIN_EXPR}) as avg_margin ${BASE_JOIN} ${buildFilterConditions(dateCond)}`;
+    const sql = `SELECT SUM(${REV_EXPR}) as total_revenue, SUM(PostSoItem.PostedTotalCost) as total_cogs, COUNT(DISTINCT So.Num) as order_count, ${MARGIN_AGG} as avg_margin ${BASE_JOIN} ${buildFilterConditions(dateCond)}`;
     return runQueryLogged('KPIs (prior)', sql);
   }),
 
@@ -1285,12 +1296,12 @@ const Q = {
   }),
 
   negMarginOrders: () => qget('negMarginOrders', () => {
-    const sql = `SELECT So.Num as name, Customer.Name as customer, SUM(${REV_EXPR}) as revenue, AVG(${MARGIN_EXPR}) as avg_margin ${BASE_JOIN} ${buildFilterConditions()} GROUP BY So.Num, Customer.Name HAVING avg_margin < 0 ORDER BY avg_margin ASC LIMIT 50`;
+    const sql = `SELECT So.Num as name, Customer.Name as customer, SUM(${REV_EXPR}) as revenue, ${MARGIN_AGG} as avg_margin ${BASE_JOIN} ${buildFilterConditions()} GROUP BY So.Num, Customer.Name HAVING avg_margin < 0 ORDER BY avg_margin ASC LIMIT 50`;
     return runQueryLogged('Negative Margin Orders', sql);
   }),
 
   topCustomersByMargin: () => qget('topCustomersByMargin', () => {
-    const sql = `SELECT Customer.Name as name, SUM(${REV_EXPR}) as revenue, AVG(${MARGIN_EXPR}) as avg_margin, COUNT(DISTINCT So.Num) as orders ${BASE_JOIN} ${buildFilterConditions()} GROUP BY Customer.Name HAVING SUM(${REV_EXPR}) > 1000 ORDER BY avg_margin DESC LIMIT 10`;
+    const sql = `SELECT Customer.Name as name, SUM(${REV_EXPR}) as revenue, ${MARGIN_AGG} as avg_margin, COUNT(DISTINCT So.Num) as orders ${BASE_JOIN} ${buildFilterConditions()} GROUP BY Customer.Name HAVING SUM(${REV_EXPR}) > 1000 ORDER BY avg_margin DESC LIMIT 10`;
     return runQueryLogged('Top Customers by Margin', sql);
   }),
 
@@ -1313,7 +1324,7 @@ const Q = {
   }),
 
   marginMix: () => qget('marginMix', () => {
-    const sql = `SELECT mix_tier as name, SUM(order_rev) as revenue FROM (SELECT So.Num as o, SUM(${REV_EXPR}) as order_rev, AVG(${MARGIN_EXPR}) as avg_m, CASE WHEN AVG(${MARGIN_EXPR}) >= 0.30 THEN 'Good (>=30%)' WHEN AVG(${MARGIN_EXPR}) >= 0.15 THEN 'Medium (15-30%)' ELSE 'Low (<15%)' END as mix_tier ${BASE_JOIN} ${buildFilterConditions()} GROUP BY So.Num) AS order_summary GROUP BY mix_tier ORDER BY FIELD(mix_tier, 'Good (>=30%)', 'Medium (15-30%)', 'Low (<15%)')`;
+    const sql = `SELECT mix_tier as name, SUM(order_rev) as revenue FROM (SELECT So.Num as o, SUM(${REV_EXPR}) as order_rev, ${MARGIN_AGG} as avg_m, CASE WHEN ${MARGIN_AGG} >= 0.30 THEN 'Good (>=30%)' WHEN ${MARGIN_AGG} >= 0.15 THEN 'Medium (15-30%)' ELSE 'Low (<15%)' END as mix_tier ${BASE_JOIN} ${buildFilterConditions()} GROUP BY So.Num) AS order_summary GROUP BY mix_tier ORDER BY FIELD(mix_tier, 'Good (>=30%)', 'Medium (15-30%)', 'Low (<15%)')`;
     return runQueryLogged('Margin Mix', sql);
   })
 };
@@ -1358,7 +1369,7 @@ function _kpiCompute(kpiKey, k) {
     case 'grossprofit':raw = rev-cogs; val = fmt$(rev-cogs, true, 3);  label = 'Gross Profit';     color = DS.success;  tone = 'tone-success'; break;
     case 'orders':     raw = orders;   val = fmtNum(orders);        label = 'Total Orders';     color = DS.magenta;  tone = 'tone-purple'; break;
     case 'avgorder':   raw = avgord;   val = fmt$(avgord, true, 3);    label = 'Avg Order Value';  color = DS.warning;  tone = 'tone-warning'; break;
-    case 'avgmargin':  raw = margin;   val = fmtPct(margin);        label = 'Avg Gross Margin';
+    case 'avgmargin':  raw = margin;   val = fmtPct(margin);        label = 'Gross Margin';
       color = margin >= 0.30 ? DS.success : margin >= 0.15 ? DS.warning : DS.negative;
       tone  = margin >= 0.30 ? 'tone-success' : margin >= 0.15 ? 'tone-warning' : 'tone-negative'; break;
     default:           raw = 0;       val = '—';                    label = kpiKey;             color = '#506872';   tone = 'tone-neutral';
@@ -1755,7 +1766,7 @@ const WIDGET_REGISTRY = {
     render: (el,cfg) => renderKPI(el,'avgorder')
   },
   'kpi-margin': {
-    title:'Avg Gross Margin', description:'Average gross margin percentage.', category:'kpi',
+    title:'Gross Margin', description:'Gross margin % for the period: (revenue − cost) / revenue, as in the Fishbowl Margins report.', category:'kpi',
     icon:'<path d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>',
     defaultW:2, defaultH:2, hasChartToggle:false,
     render: (el,cfg) => renderKPI(el,'avgmargin')
@@ -1815,7 +1826,7 @@ const WIDGET_REGISTRY = {
     render: (el,cfg) => renderHorizBar(el, Q.topSalespeople, { fmt:'currency', colorMode:'margin', clickable: (d) => drilldownSalesperson(d.meta.salesmanid) })
   },
   'low-margin': {
-    title:'Low Margin Customers', description:'Customers with average margin below 15% — requires review.', category:'chart',
+    title:'Low Margin Customers', description:'Customers whose gross margin for the period is below 15% — requires review.', category:'chart',
     icon:'<path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>',
     defaultW:4, defaultH:10, hasChartToggle:false,
     render: (el,cfg) => renderHorizBar(el, Q.lowMargin, { fmt:'currency', colorMode:'margin', clickable: (d) => drilldownCustomer(d.name) })
@@ -2604,7 +2615,7 @@ async function toggleOrderLineItems(rowIndex, orderNum) {
       PostSoItem.PostedTotalCost as cost,
       ${MARGIN_EXPR} as margin_percent
     ${BASE_JOIN}
-    WHERE So.Num = '${escSQL(orderNum)}' AND SoItem.typeId NOT IN (30,40)${extraCond}
+    WHERE So.Num = '${escSQL(orderNum)}' AND SoItem.typeId NOT IN (${EXCLUDED_LINE_TYPES})${extraCond}
     ORDER BY SoItem.Id ASC`;
   debugLog(`Expanding line items for ${orderNum}`, 'click');
   const items = await runQueryP(sql);
@@ -2660,7 +2671,7 @@ async function drilldownCustomer(customerName) {
     const sql = `SELECT So.Num as order_num, PostSo.DateCreated as order_date,
         COUNT(DISTINCT SoItem.Id) as item_count,
         SUM(${REV_EXPR}) as total_revenue,
-        (SUM(${REV_EXPR}) - SUM(PostSoItem.PostedTotalCost)) / NULLIF(SUM(${REV_EXPR}), 0) as margin_percent
+        ${MARGIN_AGG} as margin_percent
       ${BASE_JOIN} ${buildFilterConditions()} AND Customer.Name = '${escSQL(customerName)}'
       GROUP BY So.Num, PostSo.DateCreated ORDER BY PostSo.DateCreated DESC LIMIT 200`;
     const data = await runQueryP(sql);
@@ -2679,7 +2690,7 @@ async function drilldownMonth(month) {
   try {
     debugLog(`Drilldown: month ${month}`, 'click');
     const sql = `SELECT Customer.Name as customer_name, COUNT(DISTINCT So.Num) as order_count,
-        SUM(${REV_EXPR}) as total_revenue, AVG(${MARGIN_EXPR}) as avg_margin
+        SUM(${REV_EXPR}) as total_revenue, ${MARGIN_AGG} as avg_margin
       ${BASE_JOIN} ${buildFilterConditions()} AND DATE_FORMAT(PostSo.DateCreated, '%Y-%m-01') = '${escSQL(month)}'
       GROUP BY Customer.Name ORDER BY total_revenue DESC LIMIT 50`;
     const data = await runQueryP(sql);
@@ -2688,7 +2699,7 @@ async function drilldownMonth(month) {
       { key: 'customer_name', label: 'Customer',     type: 'string' },
       { key: 'order_count',   label: 'Orders',       type: 'number' },
       { key: 'total_revenue', label: 'Revenue',      type: 'currency' },
-      { key: 'avg_margin',    label: 'Avg Margin %', type: 'percent' }
+      { key: 'avg_margin',    label: 'Margin %', type: 'percent' }
     ]);
   } catch (e) { _ddFail('drilldownMonth', e); }
 }
@@ -2723,7 +2734,7 @@ async function drilldownCategory(categoryName, memberLabels) {
     const sql = `SELECT Product.Num as product_num, Product.Description as product_name,
         ProductTree.Id as tree_id,
         SUM(IF(SoItem.typeId IN (20,21), PostSoItem.Qty*-1, PostSoItem.Qty)) as units_sold,
-        SUM(${REV_EXPR}) as total_revenue, AVG(${MARGIN_EXPR}) as avg_margin
+        SUM(${REV_EXPR}) as total_revenue, ${MARGIN_AGG} as avg_margin
       ${BASE_JOIN} ${buildFilterConditions()} ${catCond}
       GROUP BY Product.Num, Product.Description, ProductTree.Id ORDER BY total_revenue DESC LIMIT ${rowCap}`;
     const rows = await runQueryP(sql);
@@ -2736,7 +2747,7 @@ async function drilldownCategory(categoryName, memberLabels) {
       { key: 'category_path', label: 'Category',     type: 'string' },
       { key: 'units_sold',    label: 'Units Sold',   type: 'number' },
       { key: 'total_revenue', label: 'Revenue',      type: 'currency' },
-      { key: 'avg_margin',    label: 'Avg Margin %', type: 'percent' }
+      { key: 'avg_margin',    label: 'Margin %', type: 'percent' }
     ]);
   } catch (e) { _ddFail('drilldownCategory', e); }
 }
@@ -2757,7 +2768,7 @@ async function drilldownCustomerGroup(groupName, memberNames) {
         ${CG_ALL_EXPR} as group_name,
         COUNT(DISTINCT SoItem.Id) as item_count,
         SUM(${REV_EXPR}) as total_revenue,
-        (SUM(${REV_EXPR}) - SUM(PostSoItem.PostedTotalCost)) / NULLIF(SUM(${REV_EXPR}), 0) as margin_percent
+        ${MARGIN_AGG} as margin_percent
       ${BASE_JOIN} ${buildFilterConditions()} ${grpCond}
       GROUP BY So.Num, PostSo.DateCreated, Customer.Name, group_name ORDER BY PostSo.DateCreated DESC LIMIT ${rowCap}`;
     const data = await runQueryP(sql);
@@ -2784,7 +2795,7 @@ async function drilldownSalesperson(salesmanId) {
     const sql = `SELECT So.Num as order_num, PostSo.DateCreated as order_date, Customer.Name as customer_name,
         COUNT(DISTINCT SoItem.Id) as item_count,
         SUM(${REV_EXPR}) as total_revenue,
-        (SUM(${REV_EXPR}) - SUM(PostSoItem.PostedTotalCost)) / NULLIF(SUM(${REV_EXPR}), 0) as margin_percent
+        ${MARGIN_AGG} as margin_percent
       ${BASE_JOIN} ${buildFilterConditions()} AND So.salesmanId = ${parseInt(salesmanId)}
       GROUP BY So.Num, PostSo.DateCreated, Customer.Name ORDER BY PostSo.DateCreated DESC LIMIT 200`;
     const data = await runQueryP(sql);
@@ -2807,7 +2818,7 @@ async function drilldownProduct(productNum, productDesc) {
     debugLog(`Drilldown: product "${productNum}"`, 'click');
     const sql = `SELECT So.Num as order_num, PostSo.DateCreated as order_date, Customer.Name as customer_name,
         SUM(IF(SoItem.typeId IN (20,21), PostSoItem.Qty*-1, PostSoItem.Qty)) as qty,
-        SUM(${REV_EXPR}) as line_total, AVG(${MARGIN_EXPR}) as margin_percent
+        SUM(${REV_EXPR}) as line_total, ${MARGIN_AGG} as margin_percent
       ${BASE_JOIN} ${buildFilterConditions()} AND Product.Num = '${escSQL(productNum)}'
       GROUP BY So.Num, PostSo.DateCreated, Customer.Name ORDER BY PostSo.DateCreated DESC LIMIT 200`;
     const data = await runQueryP(sql);

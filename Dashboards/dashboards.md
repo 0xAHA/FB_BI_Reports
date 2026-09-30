@@ -156,7 +156,7 @@ the Product Tree.
 
 | Type | Tiles |
 |---|---|
-| KPI | Total Revenue, Order Count, Avg Order Value, Avg Gross Margin, Gross Profit, Cost of Goods, Revenue vs Prior |
+| KPI | Total Revenue, Order Count, Avg Order Value, Gross Margin, Gross Profit, Cost of Goods, Revenue vs Prior |
 | Chart | Monthly Revenue & Margin (bar/line), Top Customers by Revenue, Top Customers by Margin, Top Products by Qty, Top Products by Revenue, Sales by Category, Customer Groups, Top Salespeople, Orders per Salesperson, Low Margin Customers, High Value Orders, New vs Repeat Customers, Margin Mix |
 | Table | Monthly Revenue Table, Customer Revenue Table, Negative Margin Orders |
 
@@ -170,8 +170,19 @@ Notes on specific tiles:
 **Drill-downs:** Customer, Month, Category, Customer Group, Salesperson,
 Product, and New/Repeat.
 
-Margin at any aggregate level is `(SUM(revenue) − SUM(cogs)) / SUM(revenue)`,
-never an average of per-line margins.
+**How margin is calculated.** Margins follow Fishbowl's Margins report
+(`SalesOrder/marginsreport.jrxml`):
+
+- **Formula.** Any group or total uses
+  `(SUM(revenue) − SUM(cost)) / SUM(revenue)` (`MARGIN_AGG`). It is 0 when
+  revenue is ≤ 0, and is never an average of per-line margins.
+- **Lines counted.** Sales, misc sales, drop ships, credit returns, misc
+  credits, discount amounts, associated prices and kits (`soitem.typeId` 10,
+  11, 12, 20, 21, 31, 50, 80). Discount % (30) is folded into each line's
+  revenue.
+- **Lines left out.** Subtotal, shipping, tax and note lines
+  (`EXCLUDED_LINE_TYPES`).
+- **Margin filter.** Good / Medium / Low still tests each line's own margin.
 
 ---
 
