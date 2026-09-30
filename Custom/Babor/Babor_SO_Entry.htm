@@ -39,6 +39,26 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting, saved view and shared payload
+        //          this report stores in Fishbowl. Copying this report in
+        //          Fishbowl to make a SEPARATE report? Give the copy its own
+        //          key (e.g. add '2') so it keeps its own settings - left
+        //          as-is, the copy shares the original's. 31 chars max.
+        //   name   This report's Fishbowl record name ('- Folder - Report').
+        //          Publishing finds its copy in the SharePoint BI Reports
+        //          folder by this name; null = not published.
+        //   build  Stamped automatically from this file's content by
+        //          tools/stamp/stamp.js - never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.baborSoEntry',
+            name:  '- Sales - Babor SO Entry',
+            build: '2026.09.27-7e01768'     // @fb-build
+        };
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Sales Order Entry — Fishbowl BI</title>
 
@@ -48,6 +68,14 @@
          Source of truth: scripts/fb-lib.js. Included exactly ONCE. -->
     <script>
         {% Script fb-lib %}
+    </script>
+
+    <!-- Fishbowl's own pricing engine as one SQL query — source of truth:
+         scripts/fb-pricing.js. Its OWN script tag, on purpose: on a server
+         without that saved Script only this block fails, and the screen prices
+         the old way (best-price plus its own rules engine). Included ONCE. -->
+    <script>
+        {% Script fb-pricing %}
     </script>
 
     <!-- Shared stylesheet — source of truth: scripts/fb-styles.css. Must come
@@ -630,6 +658,10 @@
                         <option value="low">Lowest price wins</option>
                         <option value="high">Highest price wins</option>
                     </select>
+                    <div style="font-size:11.5px;color:var(--c-secondary);line-height:1.5;margin-top:4px;">
+                        Only used when the fb-pricing Script isn't on this server.
+                        Otherwise Fishbowl's own Tier 2 / Tier 3 settings decide, as they do in the client.
+                    </div>
                 </div>
             </div>
 
@@ -853,8 +885,8 @@ const DEFAULTS = {
 try {
     FBLib.Settings.init({
         masterStorage: 'userProperties',   // shared admin defaults via userproperties, not report data (which needs a SAVED report — see FBLib.SharedData)
-        userKey:   'cdx.bi.baborSoEntry.user.v1',
-        masterKey: 'cdx.bi.baborSoEntry.master.v1',
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
         defaults:  DEFAULTS,
         propFallback: { debug: { name: 'BI_SHOW_DEBUG', dflt: 'false', parse: v => (v === 'true' || v === true) } },
     });
@@ -998,6 +1030,10 @@ let _moduleOpt = pref('moduleOpt') || 'low';
 // _allRulesById is every active rule, which is what the off-list section of
 // the picker offers and what labels a server-returned rule id.
 let _activeRules = [], _allRulesById = new Map();
+// Fishbowl-exact automatic prices for the chosen customer (FBPricing). null
+// when there is no customer, the Script isn't on this server, or it failed —
+// every reader falls back to the older path then.
+let _priceBook = null;
 let _partCosts = new Map(), _partCostsLoaded = false;
 let _customerLastPrice = new Map();
 
@@ -1310,6 +1346,50 @@ async function loadCustomerLastPrices(customer) {
         });
     } catch (e) { dbg('customerparts lookup failed: ' + e.message, 'warn'); }
 }
+
+// The customer's price book: Fishbowl's own pricing engine (scripts/fb-pricing.js,
+// a port of Custom/Babor/GetPrices.sql) loaded once per customer, so every line
+// after it prices without a round trip. It gives the automatic price, the list
+// price a Tier 3 rule works from, and WHICH rule won — what gets recorded.
+async function loadPriceBook(customer) {
+    _priceBook = null;
+    if (!customer) return;
+    if (!window.FBPricing) {
+        dbg('fb-pricing is not on this server — automatic prices come from best-price and this screen\'s own rules', 'warn');
+        return;
+    }
+    const cid = customer.id;
+    try {
+        const book = await FBPricing.loadBook({ customerId: cid, log: m => dbg(m) });
+        if (!_customer || _customer.id !== cid) return;   // customer changed while it loaded
+        if (!book || book.status !== 'OK') {
+            dbg('price book came back ' + (book ? book.status : 'empty') + ' — using the older pricing path', 'warn');
+            return;
+        }
+        _priceBook = book;
+    } catch (e) {
+        console.warn('Price book failed:', e);
+        dbg('price book failed: ' + (e && e.message || e) + ' — using the older pricing path', 'warn');
+    }
+}
+
+// What Fishbowl would do BY ITSELF for this product at this quantity, or null
+// to use the older path. A winning rule this screen can't name is treated as
+// unknown: recording a rule id without its name would be worse than asking.
+function bookPriceFor(product, qty) {
+    if (!_priceBook || !product) return null;
+    const bp = _priceBook.priceAt(product.id, qty > 0 ? qty : 1);
+    if (!bp) return null;
+    if (bp.ruleId != null && !_allRulesById.has(bp.ruleId)) {
+        dbg('price book names rule ' + bp.ruleId + ', which is not among the active rules — using the older path', 'warn');
+        return null;
+    }
+    return bp;
+}
+function ruleNameOf(id) { const r = _allRulesById.get(id); return r ? String(r.name || '') : ''; }
+
+// A candidate's price source, as a line records it.
+function lineSourceOf(c) { return c.source === 'server' || c.source === 'book' ? 'rule' : 'rule-local'; }
 
 async function loadAddresses(customer) {
     _addresses = [];
@@ -1697,18 +1777,42 @@ function resolveLocal(product, qty) {
 function localCandidates(product, qty) {
     const q = qty > 0 ? qty : 1;
     const applicable = _activeRules.filter(r => productMatchesRule(product, r) && qtyMatchesRule(q, r));
-    const auto = resolveLocal(product, q);
-    const winners = new Set([auto.t2 && intOf(auto.t2.id), auto.t3 && intOf(auto.t3.id)].filter(v => v != null));
-    const t2 = competeAtTier(applicable.filter(ruleIsTier2), product, product.price, null);
-    const listPrice = t2.winnerPrice != null ? t2.winnerPrice : product.price;
+    // With a price book, Fishbowl's own answer marks the winners, prices them
+    // exactly, and supplies the list price a hand-applied Tier 3 rule works
+    // from. The local ladder only stands in without one: it counts rules
+    // Fishbowl never applies by itself, so its list price can be far off.
+    const bp = bookPriceFor(product, q);
+    let winners, listPrice;
+    if (bp) {
+        winners = new Set([bp.tier2RuleId, bp.tier3RuleId].filter(v => v != null));
+        listPrice = bp.listPrice;
+    } else {
+        const auto = resolveLocal(product, q);
+        winners = new Set([auto.t2 && intOf(auto.t2.id), auto.t3 && intOf(auto.t3.id)].filter(v => v != null));
+        const t2 = competeAtTier(applicable.filter(ruleIsTier2), product, product.price, null);
+        listPrice = t2.winnerPrice != null ? t2.winnerPrice : product.price;
+    }
+    const exactFor = id => !bp ? null : id === bp.tier3RuleId ? bp.unitPrice : id === bp.tier2RuleId ? bp.listPrice : null;
     const out = [];
     for (const r of applicable) {
-        const p = applyRuleAdjustment(r, product, product.price, ruleIsTier2(r) ? null : listPrice);
+        const id = intOf(r.id);
+        const exact = exactFor(id);
+        const p = exact != null ? exact : applyRuleAdjustment(r, product, product.price, ruleIsTier2(r) ? null : listPrice);
         if (p == null || !isFinite(p) || p < 0) continue;
         out.push({
-            id: intOf(r.id), name: String(r.name || ''), description: r.description || '',
-            unitPrice: roundCents(p), valid: winners.has(intOf(r.id)), source: 'local',
+            id, name: String(r.name || ''), description: r.description || '',
+            unitPrice: exact != null ? exact : roundCents(p), valid: winners.has(id),
+            source: exact != null ? 'book' : 'local',
         });
+    }
+    // Fishbowl can apply a rule this screen's matcher misses (a rule on a
+    // parent category, a quantity bracket it reads differently). It still
+    // belongs in the list, priced as Fishbowl priced it.
+    for (const id of winners) {
+        if (out.some(c => c.id === id) || !_allRulesById.has(id)) continue;
+        const r = _allRulesById.get(id);
+        out.push({ id, name: String(r.name || ''), description: r.description || '',
+                   unitPrice: exactFor(id), valid: true, source: 'book' });
     }
     return out;
 }
@@ -1739,7 +1843,8 @@ function autoApplyWinner(product, qty) {
 // rather than silently vanishing.
 function offListCandidates(product, qty, excludeIds) {
     const q = qty > 0 ? qty : 1;
-    const listPrice = resolveLocal(product, q).listPrice;
+    const bp = bookPriceFor(product, q);
+    const listPrice = bp ? bp.listPrice : resolveLocal(product, q).listPrice;
     const out = [];
     for (const r of _allRulesById.values()) {
         const id = intOf(r.id);
@@ -2109,7 +2214,7 @@ function makeSaleLine(product, qty) {
         taxable: product.taxableFlag !== false,
         listPrice: product.price, unitPrice: product.price,
         priceSource: 'product',
-        ruleId: null, ruleName: '', ruleAuto: false, ruleLocked: false,
+        ruleId: null, ruleName: '', ruleAuto: false, ruleLocked: false, ruleFromBook: false,
         // Set when the operator picks "None" outright. Distinct from "no rule
         // chosen yet": a cleared line must STAY at list price through a qty
         // change instead of quietly picking a rule back up.
@@ -2206,6 +2311,15 @@ function settleLinePrice(line, applyDefault) {
     line.ruleNotApplicable = null;
     line.autoWould = null;
 
+    // A rule the price book attributed was Fishbowl's automatic choice for the
+    // line as it WAS. A new quantity can cross a break into another rule, and a
+    // new customer has different rules altogether, so it is asked again rather
+    // than kept at a new price. Nobody chose it, so nothing is overridden.
+    if (line.ruleFromBook && !line.ruleLocked) {
+        line.ruleId = null; line.ruleName = ''; line.ruleAuto = false;
+    }
+    line.ruleFromBook = false;
+
     // A rule already chosen keeps its identity; only its price is refreshed
     // (the qty may have crossed a break).
     if (line.ruleId != null) {
@@ -2231,7 +2345,7 @@ function settleLinePrice(line, applyDefault) {
             if (!c || c.unitPrice == null) continue;
             line.ruleId = c.id; line.ruleName = c.name; line.unitPrice = c.unitPrice;
             line.ruleAuto = true;
-            line.priceSource = c.source === 'server' ? 'rule' : 'rule-local';
+            line.priceSource = lineSourceOf(c);
             return;
         }
         // None of them covers this product. Say so on the row rather than
@@ -2240,8 +2354,23 @@ function settleLinePrice(line, applyDefault) {
     }
 
     // Nothing came from the customer's note, so fall to Fishbowl's own
-    // auto-apply rules. The price is read back out of the candidate list so it
-    // is the SERVER's figure wherever the server answered.
+    // auto-apply rules. The price book is Fishbowl's engine itself, so its
+    // winner is recorded and its price used as-is — no rounding to cents.
+    const bp = bookPriceFor(line.product, line.qty);
+    if (bp) {
+        line.unitPrice = bp.unitPrice;
+        if (bp.ruleId != null) {
+            line.ruleId = bp.ruleId; line.ruleName = ruleNameOf(bp.ruleId);
+            line.ruleAuto = true; line.ruleFromBook = true;
+            line.priceSource = 'rule';
+        } else {
+            line.priceSource = 'product';
+        }
+        return;
+    }
+
+    // No price book: the older path. The price is read back out of the
+    // candidate list so it is the SERVER's figure wherever the server answered.
     if (applyDefault) {
         const w = autoApplyWinner(line.product, line.qty);
         if (w) {
@@ -2249,7 +2378,7 @@ function settleLinePrice(line, applyDefault) {
             if (c && c.unitPrice != null) {
                 line.ruleId = c.id; line.ruleName = c.name; line.unitPrice = c.unitPrice;
                 line.ruleAuto = true;
-                line.priceSource = c.source === 'server' ? 'rule' : 'rule-local';
+                line.priceSource = lineSourceOf(c);
                 return;
             }
         }
@@ -2259,7 +2388,7 @@ function settleLinePrice(line, applyDefault) {
     const auto = (line.choices ? line.choices.inScope : []).find(c => c.valid);
     if (auto && auto.unitPrice != null) {
         line.unitPrice = auto.unitPrice;
-        line.priceSource = auto.source === 'server' ? 'rule' : 'rule-local';
+        line.priceSource = lineSourceOf(auto);
         line.ruleId = null; line.ruleName = '';
         line.autoWould = auto.name;
     } else {
@@ -2289,6 +2418,7 @@ function setLineManualPrice(line, price) {
     line.priceSource = 'manual';
     line.ruleLocked = true;
     line.ruleCleared = false;
+    line.ruleFromBook = false;
     // A hand-typed price is not the outcome of a rule. Recording the rule
     // anyway would attribute a number to a reason that didn't produce it.
     const sentinel = String(pref('manualOverrideCfValue') || '');
@@ -3328,6 +3458,7 @@ function pickRule(ruleId) {
     // default from ever overwriting this line again.
     l.ruleLocked = true;
     l.ruleAuto = false;
+    l.ruleFromBook = false;
     l.ruleNotApplicable = null;
     if (ruleId == null) {
         l.ruleCleared = true;
@@ -3340,7 +3471,7 @@ function pickRule(ruleId) {
         l.ruleCleared = false;
         l.ruleId = c.id; l.ruleName = c.name;
         l.unitPrice = c.unitPrice;
-        l.priceSource = c.source === 'server' ? 'rule' : 'rule-local';
+        l.priceSource = lineSourceOf(c);
     }
     refreshLineCells(l); refreshTotals();
 }
@@ -3384,6 +3515,7 @@ async function onCustomerChange() {
 
     if (!_customer) {
         _activeRules = []; _defaultRules = []; _defaultRuleMisses = []; _defaultRuleText = '';
+        _priceBook = null;
         renderRuleBanner(); renderGrid(); refreshTotals();
         setStatusLine(statusText());
         return;
@@ -3406,6 +3538,7 @@ async function onCustomerChange() {
         loadRulesForCustomer(_customer),
         loadCustomerLastPrices(_customer),
         loadAddresses(_customer),
+        loadPriceBook(_customer),
     ]);
     resolveDefaultRules(_customer);
     renderRuleBanner();
@@ -3413,6 +3546,16 @@ async function onCustomerChange() {
     // Only now — a chosen customer is the first real sign of an order, and the
     // number is consumed the moment it is asked for.
     fetchNextSoNumber(false);
+    // A rule the screen chose by itself — from the previous customer's note, or
+    // Fishbowl's automatic rules for them — belonged to that customer. Left in
+    // place it would be kept (only re-priced) and recorded against this one.
+    // Clear it so this customer's note and rules decide again. A rule someone
+    // picked, cleared or overrode by hand (ruleLocked) is theirs, and stays.
+    _lines.forEach(l => {
+        if (l.kind === 'sale' && l.ruleAuto && !l.ruleLocked) {
+            l.ruleId = null; l.ruleName = ''; l.ruleAuto = false; l.ruleFromBook = false;
+        }
+    });
     await repriceAllLines();
     refreshTotals();
     setStatusLine(statusText());
