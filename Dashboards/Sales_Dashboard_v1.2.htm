@@ -19,7 +19,7 @@
       window.FB_REPORT = {
           key:   'cdx.bi.salesdash',
           name:  '- Dashboard - Sales v1.2',
-          build: '2026.10.01-1a4147b'     // @fb-build
+          build: '2026.10.01-5a24cb0'     // @fb-build
       };
   </script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -527,6 +527,7 @@ function fmtPct(v) { return (parseFloat(v||0)*100).toFixed(1)+'%'; }
 function fmtNum(v) { return parseInt(v||0).toLocaleString(); }
 function fmtDate(s) { if (!s) return '—'; return moment(s).format('D MMM YY'); }
 function escSQL(v) { if (v==null) return ''; return String(v).replace(/'/g,"''"); }
+function escHtml(v) { return v == null ? '' : String(v).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[c]); }
 
 const KPI_ICONS = {
   revenue:     '<path d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>',
@@ -1709,11 +1710,16 @@ async function renderSortableTable(el, dataFn, columns) {
       columns.forEach(col => {
         const td = document.createElement('td');
         const v  = row[col.key];
-        if      (col.fmt === 'currency') td.textContent = fmt$(v);
+        if      (col.fmt === 'currency') { td.textContent = fmt$(v); if (parseFloat(v||0) < 0) td.style.color = DS.negative; }
         else if (col.fmt === 'percent')  {
-          const pct = parseFloat(v||0)*100;
-          td.textContent = pct.toFixed(1)+'%';
-          if (col.colorCode) { td.style.fontWeight='600'; td.style.color = pct>=30?DS.success:pct>=15?DS.warning:DS.negative; }
+          // No margin on a row with revenue <= 0 (credits), as in the Fishbowl Margins report.
+          if (col.key.includes('margin') && row.revenue != null && parseFloat(row.revenue||0) <= 0) {
+            td.textContent = '—'; td.style.color = 'var(--c-secondary)';
+          } else {
+            const pct = parseFloat(v||0)*100;
+            td.textContent = pct.toFixed(1)+'%';
+            if (col.colorCode) { td.style.fontWeight='600'; td.style.color = pct>=30?DS.success:pct>=15?DS.warning:DS.negative; }
+          }
         }
         else if (col.fmt === 'count')    td.textContent = fmtNum(v);
         else if (col.fmt === 'date')     td.textContent = fmtDate(v);
@@ -2519,8 +2525,11 @@ function renderDdTable(data) {
   tbody.innerHTML = '';
   data.forEach((row, rowIndex) => {
     const isOrderRow = Object.prototype.hasOwnProperty.call(row, 'order_num');
-    // Credits/returns: negative revenue rows shown in red
-    const isCredit = ['total_revenue', 'line_total', 'total'].some(k => parseFloat(row[k] || 0) < 0);
+    // A row whose revenue is <= 0 (a credit/return order, or a zero-price
+    // group) has no margin, as in the Fishbowl Margins report: its margin
+    // cell reads '—'. Negative amounts are red, never bold.
+    const revKey = ['total_revenue', 'line_total'].find(k => row[k] != null);
+    const noMargin = revKey != null && parseFloat(row[revKey] || 0) <= 0;
 
     const trEl = document.createElement('tr');
     trEl.dataset.rowIndex = rowIndex;
@@ -2535,10 +2544,14 @@ function renderDdTable(data) {
       if (col.type === 'currency')      { text = fmt$(num); if (num < 0) td.style.color = DS.negative; }
       else if (col.type === 'number')   text = fmtNum(rawVal);
       else if (col.type === 'percent')  {
-        const disp = (isCredit && col.key.includes('margin')) ? -Math.abs(num) : num;
-        text = (disp * 100).toFixed(1) + '%';
-        td.style.fontWeight = '600';
-        td.style.color = (isCredit || disp < 0) ? DS.negative : _ddMarginColor(num);
+        if (noMargin && col.key.includes('margin')) {
+          text = '—';
+          td.style.color = 'var(--c-secondary)';
+        } else {
+          text = (num * 100).toFixed(1) + '%';
+          td.style.fontWeight = '600';
+          td.style.color = num < 0 ? DS.negative : _ddMarginColor(num);
+        }
       }
       else if (col.type === 'date')     text = fmtDate(rawVal);
       else if (col.format)              text = col.format(rawVal);
@@ -2609,6 +2622,7 @@ async function toggleOrderLineItems(rowIndex, orderNum) {
   extraCond += marginTierCond(F.margin);
 
   const sql = `SELECT Product.Num as product_num, Product.Description as product_desc,
+      SoItem.typeId as typeid, SoItem.Description as item_desc,
       PostSoItem.Qty as qty,
       (${REV_EXPR}) / NULLIF(PostSoItem.Qty, 0) as unit_price,
       ${REV_EXPR} as line_total,
@@ -2622,21 +2636,26 @@ async function toggleOrderLineItems(rowIndex, orderNum) {
   if (!items.length) { showToast('No line items found for this order', 'info'); return; }
 
   const cell = (val, color, align) => `<td style="padding:4px 8px;${align ? 'text-align:right;' : ''}${color ? 'color:' + color + ';' : ''}">${val}</td>`;
+  // Shown the way a Fishbowl sales order and the Margins report show them:
+  // qty as stored (positive), credit price / total / cost negative in red
+  // (not bold), and no margin on credit lines (20 Credit Return, 21 Misc.
+  // Credit) or any line priced at or below zero.
   const bodyRows = items.map(it => {
-    const lineTotal = parseFloat(it.line_total || 0);
+    const typeId = parseInt(it.typeid, 10);
+    const noMargin = typeId === 20 || typeId === 21 || parseFloat(it.unit_price || 0) <= 0;
     const mg = parseFloat(it.margin_percent || 0);
-    const credit = lineTotal < 0;
-    const mgDisp = credit ? -Math.abs(mg) : mg;
-    const mgColor = credit || mgDisp < 0 ? DS.negative : _ddMarginColor(mg);
     const negC = v => parseFloat(v || 0) < 0 ? DS.negative : '';
+    const mgCell = noMargin
+      ? `<td style="padding:4px 8px;text-align:right;color:var(--c-secondary);">—</td>`
+      : `<td style="padding:4px 8px;text-align:right;font-weight:600;color:${mg < 0 ? DS.negative : _ddMarginColor(mg)};">${(mg * 100).toFixed(1)}%</td>`;
     return '<tr style="border-top:1px solid var(--bg-2);">' +
-      cell(it.product_num || '', '', false) +
-      cell(it.product_desc || '', '', false) +
+      cell(escHtml(it.product_num || (typeId === 21 ? 'Misc. Credit' : typeId === 11 ? 'Misc. Sale' : '')), '', false) +
+      cell(escHtml(it.product_desc || it.item_desc || ''), '', false) +
       cell(fmtNum(it.qty), '', true) +
       cell(fmt$(it.unit_price), negC(it.unit_price), true) +
       cell(fmt$(it.line_total), negC(it.line_total), true) +
-      cell(fmt$(it.cost), '', true) +
-      `<td style="padding:4px 8px;text-align:right;font-weight:600;color:${mgColor};">${(mgDisp * 100).toFixed(1)}%</td>` +
+      cell(fmt$(it.cost), negC(it.cost), true) +
+      mgCell +
     '</tr>';
   }).join('');
 
