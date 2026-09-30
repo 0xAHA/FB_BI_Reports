@@ -30,6 +30,73 @@ node tools/deploy/build-deployed.js
 
 ---
 
+## Report identity & build stamps
+
+Every production report starts its `<head>` (right after `<meta charset>`) with
+an identity block:
+
+```html
+<script>
+    window.FB_REPORT = {
+        key:   'cdx.bi.openSalesOrders',   // storage-key prefix
+        name:  '- Open Sales Orders',      // Fishbowl record name (null = unpublished)
+        build: '2026.09.24-2a6c74c'        // @fb-build
+    };
+</script>
+```
+
+- **`key`** is the prefix of every key the report stores (settings, saved
+  views, shared payloads). Build them as `FB_REPORT.key + '.user.v1'` etc.,
+  never as a literal. `FBLib.Settings.init` defaults `userKey`/`masterKey` from
+  it. A user who copies a report in Fishbowl changes this one line so the copy
+  gets its own storage. Max 31 characters, because userproperties.userKey is
+  varchar(41) and the longest suffix is `.master.v1`. Keys shared on purpose
+  across reports (`cdx.bi.fbconn.v1`) or legacy migration sources stay literal.
+  `key: null` means the report stores nothing.
+- **`build`** is `<date content last changed>-<content hash>`, written by
+  `tools/stamp/stamp.js`. **Never edit it by hand.** The first line containing
+  `@fb-build` holds the stamp. fb-lib (`FBLib.BUILD`), fb-mfg (`FBMfg.BUILD`)
+  and fb-styles (`--fb-styles-build`) carry their own stamps, and fb-lib logs
+  both builds at init.
+- **Stamping runs automatically** from a Claude Code PostToolUse hook
+  (`.claude/settings.json`) and a git pre-commit hook (`tools/githooks`). To
+  enable the git hook once per clone, run
+  `git config core.hooksPath tools/githooks`. Manual commands:
+  `node tools/stamp/stamp.js` (all files), `--check` (verify only), `--list`.
+- **`name`** is the report's Fishbowl record name, `'- <Folder> - <Report>'`.
+  Publishing (below) finds the report's shared copy by it. `null` means the
+  report isn't published. Don't "tidy" an existing name: the name identifies the
+  record, so renaming creates a duplicate on the next import.
+- **New reports** start from `Template/Core_Dashboard_Template.htm`, which
+  already has the block. **Ask the user what the report should be named**
+  before creating it. Set `name` to that, and name the file after it. Give the
+  report a unique key and leave `build` as `'UNSTAMPED'`; the next write stamps
+  it.
+
+## Publishing to the shared BI Reports folder
+
+Published reports live as Fishbowl JSON exports in the SharePoint
+"BI Reports" library (synced locally; the path is in the gitignored
+`tools/deploy/publish.local.json`). The owner arranges its folders.
+`tools/deploy/publish.js` **never picks a folder and never creates a file
+there**:
+
+- it searches the folder **recursively** for a `<name>-<Type>.json` whose
+  record name equals the report's `FB_REPORT.name` (shared scripts use their
+  fixed names: `fb-lib`, `fb-mfg`, `fb-styles`);
+- a match is overwritten **in place** with the freshly wrapped source, and
+  keeps its published description; no match means not published, so nothing
+  happens. A report is published when the owner drops its first copy there.
+- It runs **after every edit**, straight after the build stamp
+  (`tools/hooks/after-edit.js`, wired in `.claude/settings.json`), and reports
+  each publish in a one-line message. Edits made outside Claude Code publish
+  with `node tools/deploy/publish.js <file>` (`--all`, `--list`, `--dry`).
+- Publishing an edit means consultants can import it from that folder
+  straight away, so shared-asset order still matters: publish fb-styles, then
+  fb-lib, then the reports that depend on them.
+
+---
+
 ## What Is a BI Report?
 
 A BI report is an **HTML file** that runs inside an embedded browser in the Fishbowl Advanced desktop client. You write standard HTML, CSS, and JavaScript — the report is stored in Fishbowl and opened in a panel inside the client window.

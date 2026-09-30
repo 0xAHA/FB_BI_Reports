@@ -161,7 +161,10 @@ const written = [], unchanged = [];
 files.forEach(f => {
   const type = typeFor(f.rel);
   const text = fs.readFileSync(f.abs, 'utf8');
-  const known = DEPLOYED_NAMES[f.rel];
+  // A report's own identity block (FB_REPORT.name) is the record name when it
+  // sets one — the same name publish.js matches on — ahead of the table below.
+  const own = require('./publish.js').identityOf(f.abs);
+  const known = own && own.type === 'Page' ? [own.name, (DEPLOYED_NAMES[f.rel] || [])[1] || own.name] : DEPLOYED_NAMES[f.rel];
   const name = known ? known[0] : deriveName(f.rel, text);
   const desc = known ? known[1] : name;
 
