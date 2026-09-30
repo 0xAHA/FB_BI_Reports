@@ -35,6 +35,26 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting, saved view and shared payload
+        //          this report stores in Fishbowl. Copying this report in
+        //          Fishbowl to make a SEPARATE report? Give the copy its own
+        //          key (e.g. add '2') so it keeps its own settings - left
+        //          as-is, the copy shares the original's. 31 chars max.
+        //   name   This report's Fishbowl record name ('- Folder - Report').
+        //          Publishing finds its copy in the SharePoint BI Reports
+        //          folder by this name; null = not published.
+        //   build  Stamped automatically from this file's content by
+        //          tools/stamp/stamp.js - never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.productionsched',
+            name:  '- Manufacturing - Production Scheduling w AI',
+            build: '2026.09.30-d79d0c5'     // @fb-build
+        };
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Production Schedule (v1.2)</title>
 
@@ -5006,20 +5026,28 @@ function psProcureData(){
                 // `remaining` (p.shortfall) so already-scheduled production reduces the
                 // number immediately (not only once a WO is finished into on-hand).
                 // Fall back to need−available-now for older availability shapes.
-                const short = (p.shortfall != null)
-                    ? Math.max(0, Number(p.shortfall) || 0)
-                    : Math.max(0, (Number(p.need)||0) - (Number(p.availQty)||0));
+                // Summed in the part's STOCKING uom (shortfallBase): each WO line
+                // has its own uom, so line-uom shortfalls can't be added together.
+                const inBase = p.shortfallBase != null;
+                const short = inBase
+                    ? Math.max(0, Number(p.shortfallBase) || 0)
+                    : (p.shortfall != null)
+                        ? Math.max(0, Number(p.shortfall) || 0)
+                        : Math.max(0, (Number(p.need)||0) - (Number(p.availQty)||0));
                 if(short <= 1e-6) return;
                 const key = p.partNum || ('#'+p.partId);
                 let e = agg.get(key);
                 if(!e){
                     const vd = psPartVendor.get(String(p.partId)), bm = psMakeBom.get(String(p.partId));
-                    e = { partNum:p.partNum||'', partId:p.partId, partDesc:p.partDesc||'', uom:p.uom||'',
+                    e = { partNum:p.partNum||'', partId:p.partId, partDesc:p.partDesc||'', uom:(inBase ? (p.baseUom||p.uom||'') : (p.uom||'')),
                           short:0, onhand:(p.onhand!=null?p.onhand:null), wos:[], woList:[], earliest:null,
                           lgId:'', lgName:'', lgIds:new Set(),
                           vendorId: vd?vd.id:null, vendorName: vd?(vd.name||''):'',
                           lastCost: (vd&&vd.lastCost!=null)?vd.lastCost:null, vendorPartNum: vd?(vd.vendorPartNum||''):'',
                           qtyMin: (vd&&vd.qtyMin!=null)?vd.qtyMin:null,
+                          vendorUomId: vd?vd.uomId:null, vendorUom: vd?(vd.uom||''):'',
+                          vendorUomIntegral: vd?vd.uomIntegral:null,
+                          vendorUomSame: vd?vd.sameUom:true, baseToVendor: vd?vd.baseToVendor:null,
                           bomNum: bm?(bm.bomNum||''):'' };
                     agg.set(key, e);
                 }
@@ -5036,7 +5064,7 @@ function psProcureData(){
                 if(!e.lgId && woLgId){ e.lgId = woLgId; e.lgName = woLgName; }
                 if(wo.wo_num && e.wos.indexOf(wo.wo_num) < 0){
                     e.wos.push(wo.wo_num);
-                    e.woList.push({ woNum: wo.wo_num, woId: wo.wo_id, fg: wo.part_num || '', fgDesc: wo.description || '', qty: (Number(p.need) || 0), start: wo.date_scheduled_start || '' });
+                    e.woList.push({ woNum: wo.wo_num, woId: wo.wo_id, fg: wo.part_num || '', fgDesc: wo.description || '', qty: (Number(inBase && p.needBase != null ? p.needBase : p.need) || 0), start: wo.date_scheduled_start || '' });
                 }
                 const st = wo.date_scheduled_start ? moment(wo.date_scheduled_start) : null;
                 if(st && st.isValid() && (!e.earliest || st.isBefore(e.earliest))){ e.earliest = st; if(woLgId){ e.lgId = woLgId; e.lgName = woLgName; } }
@@ -5059,7 +5087,77 @@ function psProcureData(){
     const isMake = r => psMakePartIds && psMakePartIds.has(String(r.partId));
     // Sort most-urgent first (earliest need date), then part number.
     const bySort = (a,b)=>{ const av=a.earliest?a.earliest.valueOf():Infinity, bv=b.earliest?b.earliest.valueOf():Infinity; return (av-bv) || String(a.partNum).localeCompare(String(b.partNum)); };
-    return { buy: all.filter(r=>!isMake(r)).sort(bySort), make: all.filter(isMake).sort(bySort) };
+    const buy = all.filter(r=>!isMake(r)).sort(bySort);
+    buy.forEach(r=>{ r.isBuy = true; });   // only purchased rows can show vendor-UOM qtys
+    return { buy, make: all.filter(isMake).sort(bySort) };
+}
+
+// ── Vendor-part UOM ──────────────────────────────────────────
+// Shortages are held in the part's stocking UOM, which is what the WOs/MOs
+// are short of. A vendor can sell in a different unit (vendorparts.uomId,
+// e.g. pk of 20 for a part stocked in ea), and lastCost + qtyMin are per
+// that unit. A PO line must be raised in it: Fishbowl matches the line to
+// its vendor part by part + vendor + UOM, and any other UOM makes it create
+// a second vendor part (the old Auto PO bug).
+// Stocking-UOM qty -> vendor-UOM qty. null when no uomconversion links the two.
+function psToVendorQty(r, q){
+    if(q==null) return q;
+    if(!r || r.vendorUomSame!==false) return q;
+    if(r.baseToVendor==null) return null;
+    return Math.round(q * r.baseToVendor * 1e6) / 1e6;   // 28 x 0.05 is 1.4000000000000001 raw
+}
+function psToStockQty(r, qv){
+    if(qv==null) return qv;
+    if(!r || r.vendorUomSame!==false) return qv;
+    if(r.baseToVendor==null) return null;
+    return Math.round(qv / r.baseToVendor * 1e6) / 1e6;
+}
+// To Purchase table unit: 'stock' (what the WOs are short of) or 'vendor'
+// (what the PO will say). Per user; read lazily so no init wiring is needed.
+let psProcQtyUom = null;
+function psProcUomMode(){
+    if(psProcQtyUom==null){ let v=null; try { v=FBLib.Settings.resolve('procQtyUom'); } catch(_){} psProcQtyUom=(v==='vendor')?'vendor':'stock'; }
+    return psProcQtyUom;
+}
+function psSetProcQtyUom(m){
+    psProcQtyUom = (m==='vendor') ? 'vendor' : 'stock';
+    try { FBLib.Settings.setUserKey('procQtyUom', psProcQtyUom); FBLib.Settings.saveUser(); } catch(_){}
+    renderProcure();
+}
+// {q,u} for a procurement row in the chosen unit. Make rows, and buy rows with no
+// conversion to their vendor UOM, stay in the stocking UOM.
+function psProcQty(r, q){
+    if(r && r.isBuy && psProcUomMode()==='vendor' && r.vendorUomSame===false){
+        const v=psToVendorQty(r,q); if(v!=null) return { q:v, u:r.vendorUom };
+    }
+    return { q:q, u:(r&&r.uom)||'' };
+}
+
+// ── PO tax rate ──────────────────────────────────────────────
+// The vendor's rate wins; otherwise each line takes its part's rate. The
+// purchase code lives on part.taxId (product.taxId is the SALES one), and a
+// rate is sent by id, never by name: taxrate.code is not unique.
+// {id,name} when the rate may appear on a PO, else null (orderTypeId 20 = sales only).
+function psPurchaseTaxRate(id, name, orderTypeId){
+    const tid=parseInt(id,10); if(!tid) return null;
+    const ot=(orderTypeId==null || orderTypeId==='') ? null : parseInt(orderTypeId,10);
+    if(ot!==null && ot!==10) return null;
+    return { id:tid, name:name ? String(name) : ('#'+tid) };
+}
+function psPoTaxRates(vendorId, partIds){
+    const out={ vendor:null, byPart:new Map() };
+    try {
+        const v=JSON.parse(runQuery('SELECT tr.id, tr.name, tr.ordertypeid FROM vendor v JOIN taxrate tr ON tr.id = v.taxrateid WHERE v.id = '+parseInt(vendorId,10)))||[];
+        if(v.length) out.vendor=psPurchaseTaxRate(v[0].id, v[0].name, v[0].ordertypeid);
+    } catch(e){ debugLog('warn','Vendor tax rate lookup failed: '+(e&&e.message)); }
+    const ids=(partIds||[]).map(x=>parseInt(x,10)).filter(Boolean);
+    if(ids.length){
+        try {
+            (JSON.parse(runQuery('SELECT p.id AS part_id, tr.id, tr.name, tr.ordertypeid FROM part p JOIN taxrate tr ON tr.id = p.taxid WHERE p.id IN ('+ids.join(',')+')'))||[])
+              .forEach(r=>{ const t=psPurchaseTaxRate(r.id, r.name, r.ordertypeid); if(t) out.byPart.set(String(r.part_id), t); });
+        } catch(e){ debugLog('warn','Part tax rate lookup failed: '+(e&&e.message)); }
+    }
+    return out;
 }
 
 // ── Materials tab — at-risk work orders (read-only) ──────────
@@ -5158,8 +5256,22 @@ function renderProcure(){
     const partLink = r => r.partNum
         ? '<a href="#" onclick="event.preventDefault();event.stopPropagation();openModule(\'Part\',\''+String(r.partNum).replace(/'/g,"\\'")+'\')" style="color:var(--link);text-decoration:none;font-weight:700">'+psEsc(r.partNum)+'</a>'
         : '—';
-    const shortCell = r => '<td class="num" style="color:var(--fb-negative);font-weight:700">'+psEsc(psFmtQty(r.short))+(r.uom?' '+psEsc(r.uom):'')+'</td>';
-    const ohCell    = r => '<td class="num">'+(r.onhand!=null?psEsc(psFmtQty(r.onhand)):'—')+'</td>';
+    // Short by, in the chosen unit. When the vendor sells in a different UOM the
+    // other unit sits muted underneath, so both "short for the WOs" and "what
+    // the PO will say" are visible whichever way the toggle is set.
+    const shortCell = r => {
+        const a = psProcQty(r, r.short);
+        let alt = '';
+        if(r.isBuy && r.vendorUomSame===false){
+            const inStock = (a.u === r.uom);
+            const oq = inStock ? psToVendorQty(r, r.short) : r.short;
+            const ou = inStock ? r.vendorUom : r.uom;
+            alt = '<div style="font-size:10.5px;font-weight:400;color:'+(oq!=null?'var(--c-tertiary)':'var(--fb-warning)')+'" title="'+(oq!=null?'The vendor sells this part in '+psEsc(r.vendorUom)+' — the PO is raised in '+psEsc(r.vendorUom):'No UOM conversion links '+psEsc(r.uom)+' and '+psEsc(r.vendorUom)+' — check the PO quantity')+'">'+
+                  (oq!=null ? '= '+psEsc(psFmtQty(oq))+' '+psEsc(ou) : 'vendor UOM '+psEsc(r.vendorUom)+', no conversion')+'</div>';
+        }
+        return '<td class="num" style="color:var(--fb-negative);font-weight:700">'+psEsc(psFmtQty(a.q))+(a.u?' '+psEsc(a.u):'')+alt+'</td>';
+    };
+    const ohCell    = r => '<td class="num">'+(r.onhand!=null?psEsc(psFmtQty(psProcQty(r, r.onhand).q)):'—')+'</td>';
     const needCell  = r => '<td>'+(r.earliest?psFmtDate(r.earliest):'—')+'</td>';
     // "On order" — Bid Request / Pending Approval POs covering this part (not yet
     // confirmed supply). Each links to the PO; an amber chip = Bid Request.
@@ -5169,8 +5281,10 @@ function renderProcure(){
         const links = pend.map(p => {
             const numJs = String(p.ponum).replace(/'/g, "\\'");
             const tone = p.statusId === 10 ? 'caution' : 'active';
-            const lbl = 'PO ' + p.ponum + ' · ' + p.statusName + (p.outstanding ? (' ×' + psFmtQty(p.outstanding)) : '');
-            return '<a href="#" onclick="event.preventDefault();event.stopPropagation();openModule(\'Purchase Order\',\'' + numJs + '\')" style="text-decoration:none;display:inline-block;margin:1px 0" title="' + psEsc(p.statusName) + ' — ' + psEsc(psFmtQty(p.outstanding)) + ' on order (not yet confirmed supply)">' + psSpill(tone, lbl) + '</a>';
+            const oa = psProcQty(r, p.outstanding);
+            const oTxt = psFmtQty(oa.q) + (oa.u ? ' ' + oa.u : '');
+            const lbl = 'PO ' + p.ponum + ' · ' + p.statusName + (p.outstanding ? (' ×' + oTxt) : '');
+            return '<a href="#" onclick="event.preventDefault();event.stopPropagation();openModule(\'Purchase Order\',\'' + numJs + '\')" style="text-decoration:none;display:inline-block;margin:1px 0" title="' + psEsc(p.statusName) + ' — ' + psEsc(oTxt) + ' on order (not yet confirmed supply)">' + psSpill(tone, lbl) + '</a>';
         }).join(' ');
         return '<td>' + links + '</td>';
     };
@@ -5198,17 +5312,17 @@ function renderProcure(){
         });
         if(!items.length) return '<td><span style="color:var(--c-tertiary)">—</span></td>';
         const CAP = 5;
-        const uom = r.uom ? ' '+psEsc(r.uom) : '';
         // Column order: scheduled start · WO# · finished good · qty.
         const cells = items.map(it => {
             const act = it.woId != null
                 ? 'openDetail('+it.woId+')'
                 : ('openModule(\'Work Order\',\''+String(it.woNum).replace(/'/g,"\\'")+'\')');
             const ttl = it.fgDesc ? ' title="'+psEsc(it.fgDesc)+'"' : '';
+            const a = psProcQty(r, it.qty);
             return '<span class="bdate">'+psEsc(it.start?psFmtDate(it.start):'—')+'</span>'+
                    '<a href="#" class="bwo" onclick="event.preventDefault();event.stopPropagation();'+act+'">'+psEsc(it.woNum)+'</a>'+
                    '<span class="bfg"'+ttl+'>'+psEsc(it.fg||'—')+'</span>'+
-                   '<span class="bqty">'+psEsc(psFmtQty(it.qty))+uom+'</span>';
+                   '<span class="bqty">'+psEsc(psFmtQty(a.q))+(a.u?' '+psEsc(a.u):'')+'</span>';
         }).join('');
         const over = items.length > CAP;
         const grid = '<div class="proc-blk'+(over?' blk-cap':'')+'">'+cells+'</div>';
@@ -5245,7 +5359,18 @@ function renderProcure(){
             buyBody += '<div class="proc-vgrp"><div class="proc-vhead">'+psEsc(vlabel)+'<span class="proc-vcount">'+rows.length+'</span>'+createBtn+'</div>'+
                 '<div class="tbl-wrap proc-tbl"><table style="table-layout:fixed">'+PROC_BUY_COLS+'<thead><tr><th>Part</th><th>Description</th><th style="text-align:right">Short by</th><th style="text-align:right">On hand</th><th>Needed by</th><th>On order</th><th>Blocked work orders</th></tr></thead><tbody>'+body+'</tbody></table></div></div>';
         });
-        buyHtml = '<div class="proc-subtitle">Raw goods short of stock and open POs — grouped by default vendor.</div>'+buyBody;
+        // Unit toggle — only worth showing when some vendor sells in a different UOM.
+        const uomMode = psProcUomMode();
+        const uomToggle = buy.some(r=>r.vendorUomSame===false)
+            ? '<span style="font-size:11.5px;color:var(--c-secondary)">Quantities in</span>'+
+              '<div class="grpseg" title="Stock UOM = what the work orders are short of. Vendor UOM = the unit the vendor sells in, which the PO is raised in.">'+
+                '<button class="'+(uomMode==='stock'?'active':'')+'" onclick="psSetProcQtyUom(\'stock\')">Stock UOM</button>'+
+                '<button class="'+(uomMode==='vendor'?'active':'')+'" onclick="psSetProcQtyUom(\'vendor\')">Vendor UOM</button></div>'
+            : '';
+        buyHtml = '<div class="proc-subhead">'+
+              '<span class="proc-subtitle" style="margin:0">Raw goods short of stock and open POs — grouped by default vendor.</span>'+
+              '<span style="flex:1"></span>'+uomToggle+
+            '</div>'+buyBody;
     }
 
     // ── To Manufacture — tick parts, then Create MO (one MO, a config per part). ──
@@ -5394,11 +5519,55 @@ function psInitialLg(lgList){
 }
 
 // Open the Create-MO drawer for the ticked To-Manufacture parts.
+// An MO configuration's quantity is a number of BOM BUILDS, not finished units:
+// each build makes the finished-good bomitem's quantity, in THAT line's UOM
+// (demodb MO 108: 5 builds of a 12-ea BOM = 60 ea). Returns
+// "bomId|partId" -> { fgQty, fgUom, stockToFg } for the FG line that makes the
+// part (direct or product-wrapped). stockToFg is null when no uomconversion
+// links the part's stocking UOM to the line's.
+function psMoYields(pairs){
+    const out=new Map();
+    const bomIds=[...new Set(pairs.map(p=>parseInt(p.bomId,10)).filter(Boolean))];
+    const partIds=[...new Set(pairs.map(p=>parseInt(p.partId,10)).filter(Boolean))];
+    if(!bomIds.length || !partIds.length) return out;
+    try {
+        (JSON.parse(runQuery(`
+            SELECT bi.bomid AS bom_id, p.id AS part_id, bi.quantity AS fg_qty, bu.code AS fg_uom,
+                   CASE WHEN bi.uomid = p.uomid THEN 1 ELSE COALESCE(
+                     (SELECT uc.multiply / uc.factor FROM uomconversion uc WHERE uc.fromuomid = p.uomid AND uc.touomid = bi.uomid LIMIT 1),
+                     (SELECT uc.factor / uc.multiply FROM uomconversion uc WHERE uc.fromuomid = bi.uomid AND uc.touomid = p.uomid LIMIT 1)
+                   ) END AS stock_to_fg
+            FROM bomitem bi
+            LEFT JOIN product pr ON pr.id = bi.productid
+            JOIN part p ON (p.id = bi.partid OR p.id = pr.partid) AND p.id IN (${partIds.join(',')})
+            LEFT JOIN uom bu ON bu.id = bi.uomid
+            WHERE bi.typeid = 10 AND bi.bomid IN (${bomIds.join(',')})
+        `))||[]).forEach(r=>{
+            const q=parseFloat(r.fg_qty), c=parseFloat(r.stock_to_fg);
+            out.set(r.bom_id+'|'+r.part_id, { fgQty:(isFinite(q)&&q>0)?q:null, fgUom:r.fg_uom||'', stockToFg:(isFinite(c)&&c>0)?c:null });
+        });
+    } catch(e){ debugLog('warn','BOM output lookup failed (MO qty defaults to the shortfall): '+(e&&e.message)); }
+    return out;
+}
 function psOpenCreateMo(){
     const { make } = psProcureData();
     const sel = make.filter(r=>psProcureSel.has(String(r.partId)));
     if(!sel.length){ showToast('Tick at least one part to manufacture','info'); return; }
-    const built = sel.map(r=>{ const bm=psMakeBom.get(String(r.partId))||{}; return { partId:String(r.partId), partNum:r.partNum, bomId:bm.bomId||null, bomNum:bm.bomNum||'', qty:Math.max(1, Math.ceil(Number(r.short)||0)), needBy:(r.earliest?r.earliest.clone():null) }; });
+    const yields = psMoYields(sel.map(r=>({ bomId:(psMakeBom.get(String(r.partId))||{}).bomId, partId:r.partId })));
+    const built = sel.map(r=>{
+        const bm=psMakeBom.get(String(r.partId))||{};
+        const shortStock=Number(r.short)||0;
+        // Builds = shortfall converted into the FG line's UOM ÷ what one build makes,
+        // rounded up to whole builds.
+        const y=yields.get(bm.bomId+'|'+r.partId)||null;
+        const perBuild=(y&&y.fgQty)||null;
+        const noConv=!!(perBuild && y.stockToFg==null);
+        const fgShort=perBuild ? (noConv ? shortStock : Math.round(shortStock*y.stockToFg*1e6)/1e6) : null;
+        const builds=perBuild ? Math.max(1, Math.ceil(fgShort/perBuild - 1e-9)) : Math.max(1, Math.ceil(shortStock));
+        return { partId:String(r.partId), partNum:r.partNum, bomId:bm.bomId||null, bomNum:bm.bomNum||'', qty:builds,
+                 perBuild, fgUom:(y&&y.fgUom)||'', noConv, shortStock, stockUom:r.uom||'',
+                 needBy:(r.earliest?r.earliest.clone():null) };
+    });
     const usable = built.filter(p=>p.bomId), noBom = built.filter(p=>!p.bomId).map(p=>p.partNum);
     if(!usable.length){ showToast('Selected part(s) have no resolvable BOM — cannot create an MO','error',5000); return; }
     let lgList=[];
@@ -5435,7 +5604,7 @@ function psOpenCreateMo(){
 }
 function psCloseMoDrawer(){ const p=document.getElementById('moPanel'), s=document.getElementById('moScrim'); if(p) p.classList.remove('on'); if(s) s.classList.remove('on'); psMoDraft=null; }
 function psMoField(f,v){ if(psMoDraft) psMoDraft[f]=v; }
-function psMoQty(pid,v){ if(!psMoDraft) return; const p=psMoDraft.parts.find(x=>String(x.partId)===String(pid)); if(p) p.qty=v; }
+function psMoQty(pid,v){ if(!psMoDraft) return; const p=psMoDraft.parts.find(x=>String(x.partId)===String(pid)); if(p){ p.qty=v; psRenderMoDrawer(); } }
 function psMoCf(name,v){ if(psMoDraft){ psMoDraft.cf=psMoDraft.cf||{}; psMoDraft.cf[name]=v; } }
 
 function psRenderMoDrawer(){
@@ -5457,9 +5626,17 @@ function psRenderMoDrawer(){
         return;
     }
     const submitting = d.status==='submitting';
-    const partRows=d.parts.map(p=>'<tr><td><span class="pf-partn">'+psEsc(p.partNum)+'</span></td>'+
-        '<td class="mono" style="font-size:12px">'+psEsc(p.bomNum||('#'+p.bomId))+'</td>'+
-        '<td class="num"><input type="number" min="0" step="1" value="'+psEsc(String(p.qty))+'" onchange="psMoQty(\''+p.partId+'\',this.value)"></td></tr>').join('');
+    // Qty is BUILDS of the BOM. Underneath: what that makes (FG line UOM) next to
+    // what the work orders are short of (stocking UOM).
+    const partRows=d.parts.map(p=>{
+        const b=parseFloat(p.qty)||0;
+        let note;
+        if(!p.perBuild) note='<div style="font-size:10px;margin-top:2px;color:var(--fb-warning)" title="The BOM\'s finished-good quantity could not be read, so the default assumes one unit per build">Output per build unknown · short '+psEsc(psFmtQty(p.shortStock))+' '+psEsc(p.stockUom)+'</div>';
+        else note='<div style="font-size:10px;margin-top:2px;color:'+(p.noConv?'var(--fb-warning)':'var(--c-tertiary)')+'" title="1 build = '+psEsc(psFmtQty(p.perBuild))+' '+psEsc(p.fgUom)+(p.noConv?' · no UOM conversion links '+psEsc(p.stockUom)+' and '+psEsc(p.fgUom)+' — check the builds':'')+'">makes '+psEsc(psFmtQty(Math.round(b*p.perBuild*1e6)/1e6))+' '+psEsc(p.fgUom)+' · short '+psEsc(psFmtQty(p.shortStock))+' '+psEsc(p.stockUom)+'</div>';
+        return '<tr><td><span class="pf-partn">'+psEsc(p.partNum)+'</span></td>'+
+            '<td class="mono" style="font-size:12px">'+psEsc(p.bomNum||('#'+p.bomId))+'</td>'+
+            '<td class="num"><input type="number" min="0" step="1" value="'+psEsc(String(p.qty))+'" onchange="psMoQty(\''+p.partId+'\',this.value)">'+note+'</td></tr>';
+    }).join('');
     const lgOpts=(d.lgList||[]).map(l=>'<option value="'+l.id+'"'+(String(l.id)===String(d.lgId)?' selected':'')+'>'+psEsc(l.name)+'</option>').join('') || '<option value="">(no accessible location groups)</option>';
     const cfs=psLoadMoCustomFields();
     const cfHtml=cfs.map(c=>{
@@ -5477,7 +5654,7 @@ function psRenderMoDrawer(){
     panel.innerHTML=head+'<div class="detail-body">'+
         (d.error?'<div class="pf-banner late"><span class="pf-summary">'+psSpill('critical', d.error)+'</span></div>':'')+
         (d.noBom&&d.noBom.length?'<div class="alert-box" style="background:'+psHexA('#F7C23A',.16)+';color:var(--acc-yellow-con)"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M12 9v2m0 4h.01"/></svg>Skipped (no BOM): '+psEsc(d.noBom.join(', '))+'</div>':'')+
-        '<div class="dsec"><h4>Finished goods</h4><div class="pf-tablewrap"><table class="pf-table"><thead><tr><th>Part</th><th>BOM</th><th class="num">Qty</th></tr></thead><tbody>'+partRows+'</tbody></table></div></div>'+
+        '<div class="dsec"><h4>Finished goods</h4><div class="pf-tablewrap"><table class="pf-table"><thead><tr><th>Part</th><th>BOM</th><th class="num" title="Number of times to build the BOM">Builds</th></tr></thead><tbody>'+partRows+'</tbody></table></div></div>'+
         '<div class="dsec"><h4>Order details</h4><div class="mo-form">'+
           '<label><span>Location group</span><select onchange="psMoField(\'lgId\',this.value)">'+lgOpts+'</select></label>'+
           '<label><span>Order status</span><select onchange="psMoField(\'moStatus\',this.value)">'+['Issued','Entered'].map(s=>'<option'+(s===(d.moStatus||'Issued')?' selected':'')+'>'+s+'</option>').join('')+'</select><span class="ds-toggle-help" style="margin-top:2px">Issued = live on the floor · Entered = suggestion (won\'t drive production until issued)</span></label>'+
@@ -5543,7 +5720,10 @@ function psPoField(f,v){ if(psPoDraft) psPoDraft[f]=v; }
 // grand totals doesn't steal focus mid-typing.
 // A part is ordered in whole units when its UOM is Each (code "ea"/"each"); qty is
 // then constrained to integers. Other UOMs (kg, m, L, …) allow fractional qty.
-function psPoIsEach(p){ return /^(ea|each)$/i.test(String(p && p.uom || '').trim()); }
+function psPoIsEach(p){
+    if(p && p.uomIntegral!=null) return p.uomIntegral;   // uom.integral of the line's (vendor) UOM
+    return /^(ea|each)$/i.test(String(p && p.uom || '').trim());
+}
 function psPoQty(pid,v){ if(!psPoDraft) return; const p=psPoDraft.parts.find(x=>String(x.partId)===String(pid)); if(p){ if(psPoIsEach(p)){ let n=Math.round(parseFloat(v)||0); p.qty=String(Math.max(0,n)); } else p.qty=v; } psRenderPoDrawer(); }
 // Unit cost is currency — normalise to 2 decimal places on entry.
 function psPoCost(pid,v){ if(!psPoDraft) return; const p=psPoDraft.parts.find(x=>String(x.partId)===String(pid)); if(p){ const n=parseFloat(v); p.unitCost=(isFinite(n)&&n>=0)?n.toFixed(2):'0.00'; } psRenderPoDrawer(); }
@@ -5555,18 +5735,29 @@ function psOpenCreatePo(vendorKey){
     if(!groupRows.length){ showToast('No parts to purchase for this vendor','info'); return; }
     const vRow = groupRows.find(r=>r.vendorId!=null);
     if(!vRow){ showToast('These parts have no vendor — cannot create a PO','error',5000); return; }
-    // Default order qty = the shortfall (rounded up), BUT bumped to the vendor's
-    // minimum order qty (vendorparts.qtyMin) when the MOQ is larger. moqApplied
-    // flags the rows where the MOQ raised the qty so the drawer can say so.
+    // Lines are raised in the vendor part's UOM (see psToVendorQty), so the
+    // shortfall is converted into it first. Default order qty = that shortfall
+    // rounded up to a whole vendor unit, BUT bumped to the vendor's minimum order
+    // qty (vendorparts.qtyMin, also in the vendor UOM) when the MOQ is larger.
+    // moqApplied flags the rows where the MOQ raised the qty so the drawer can say so.
+    const tax = psPoTaxRates(vRow.vendorId, groupRows.map(r=>r.partId));
     const parts = groupRows.map(r=>{
-        const shortCeil = Math.max(1, Math.ceil(Number(r.short)||0));
+        const shortStock = Number(r.short)||0;
+        const vShort = psToVendorQty(r, shortStock);
+        const noConv = r.vendorUomSame===false && vShort==null;
+        const shortCeil = Math.max(1, Math.ceil((vShort!=null ? vShort : shortStock) - 1e-9));
         const moq = (r.qtyMin!=null && r.qtyMin>0) ? r.qtyMin : 0;
         const moqApplied = moq > shortCeil;
+        const partTax = tax.byPart.get(String(r.partId)) || null;
         return {
-            partId:String(r.partId), partNum:r.partNum, partDesc:r.partDesc||'', uom:r.uom||'',
+            partId:String(r.partId), partNum:r.partNum, partDesc:r.partDesc||'',
+            uom:(r.vendorUom||r.uom||''), uomId:r.vendorUomId, uomIntegral:r.vendorUomIntegral,
+            stockUom:r.uom||'', shortStock:shortStock, uomDiffers:r.vendorUomSame===false, noConv:noConv,
+            baseToVendor:r.baseToVendor, vendorUomSame:r.vendorUomSame,
             vendorPartNum:r.vendorPartNum||'', qtyMin:moq, shortCeil:shortCeil, moqApplied:moqApplied,
             qty:(moqApplied ? moq : shortCeil),
             unitCost:(r.lastCost!=null ? r.lastCost : 0),
+            taxRate:(tax.vendor || partTax), taxFrom:(tax.vendor ? 'vendor' : (partTax ? 'part' : '')),
             needBy:(r.earliest?r.earliest.clone():null)
         };
     });
@@ -5595,6 +5786,7 @@ function psOpenCreatePo(vendorKey){
     psPoDraft = {
         vendorId: vRow.vendorId, vendorName: (vendorKey==='__NOVENDOR__'?'':vendorKey),
         parts, lgList, lgId:poLg,
+        vendorTax: tax.vendor,  // vendor's own purchase rate (null = lines use the part's)
         poStatus:poStatus0,   // 'Bid Request' | 'Issued' — default from the Procurement setting
         dateScheduled:poSched.format('YYYY-MM-DD'),
         note:'',
@@ -5639,12 +5831,25 @@ function psRenderPoDrawer(){
         // the (larger-than-shortfall) minimum, else a muted "MOQ N" reference.
         const atMoq = p.qtyMin>0 && p.qtyMin>(p.shortCeil||0) && q===p.qtyMin;
         const moqNote = (p.qtyMin>0)
-            ? '<div style="font-size:10px;margin-top:2px;color:'+(atMoq?'var(--fb-warning)':'var(--c-tertiary)')+'" title="Vendor minimum order quantity">MOQ '+psEsc(psFmtQty(p.qtyMin))+(atMoq?' · set to MOQ':'')+'</div>'
+            ? '<div style="font-size:10px;margin-top:2px;color:'+(atMoq?'var(--fb-warning)':'var(--c-tertiary)')+'" title="Vendor minimum order quantity">MOQ '+psEsc(psFmtQty(p.qtyMin))+(p.uom?' '+psEsc(p.uom):'')+(atMoq?' · set to MOQ':'')+'</div>'
             : '';
-        return '<tr><td><span class="pf-partn">'+psEsc(p.partNum)+'</span>'+(p.partDesc?'<div class="pf-desc">'+psEsc(p.partDesc)+'</div>':'')+'</td>'+
+        // Qty is in the vendor's UOM. When that differs from the stocking UOM, show
+        // what the qty comes to in stock units next to what the WOs are short of.
+        let uomNote = '';
+        if(p.noConv){
+            uomNote = '<div style="font-size:10px;margin-top:2px;color:var(--fb-warning)" title="No UOM conversion links '+psEsc(p.stockUom)+' and '+psEsc(p.uom)+'. Enter the quantity in '+psEsc(p.uom)+'.">No '+psEsc(p.stockUom)+' → '+psEsc(p.uom)+' conversion · short '+psEsc(psFmtQty(p.shortStock))+' '+psEsc(p.stockUom)+'</div>';
+        } else if(p.uomDiffers){
+            const eq = psToStockQty(p, q);
+            uomNote = '<div style="font-size:10px;margin-top:2px;color:var(--c-tertiary)" title="The vendor sells this part in '+psEsc(p.uom)+'; the work orders are short '+psEsc(psFmtQty(p.shortStock))+' '+psEsc(p.stockUom)+'">= '+psEsc(psFmtQty(eq))+' '+psEsc(p.stockUom)+' · short '+psEsc(psFmtQty(p.shortStock))+'</div>';
+        }
+        // Tax: the vendor's rate when it has one, else the part's.
+        const taxLine = '<div class="pf-desc">'+(p.taxRate
+            ? 'Tax: '+psEsc(p.taxRate.name)+' <span style="color:var(--c-tertiary)">· from '+(p.taxFrom==='vendor'?'vendor':'part')+'</span>'
+            : '<span style="color:var(--c-tertiary)">No tax code on vendor or part</span>')+'</div>';
+        return '<tr><td><span class="pf-partn">'+psEsc(p.partNum)+'</span>'+(p.partDesc?'<div class="pf-desc">'+psEsc(p.partDesc)+'</div>':'')+taxLine+'</td>'+
             '<td class="mono" style="font-size:12px">'+psEsc(p.vendorPartNum||'—')+'</td>'+
-            '<td class="num"><input type="number" min="0" step="'+(isEach?'1':'0.001')+'" value="'+psEsc(String(p.qty))+'" onchange="psPoQty(\''+p.partId+'\',this.value)">'+moqNote+'</td>'+
-            '<td class="num"><span style="display:inline-flex;align-items:center;gap:3px;justify-content:flex-end"><span style="color:var(--c-tertiary)">'+psEsc(poSym)+'</span><input type="number" min="0" step="0.01" value="'+psEsc(Number(c).toFixed(2))+'" onchange="psPoCost(\''+p.partId+'\',this.value)"></span></td>'+
+            '<td class="num" style="white-space:nowrap"><input type="number" min="0" step="'+(isEach?'1':'0.001')+'" value="'+psEsc(String(p.qty))+'" onchange="psPoQty(\''+p.partId+'\',this.value)"> <span style="color:var(--c-secondary)">'+psEsc(p.uom||'')+'</span>'+uomNote+moqNote+'</td>'+
+            '<td class="num"><span style="display:inline-flex;align-items:center;gap:3px;justify-content:flex-end" title="'+(p.uom?'Per '+psEsc(p.uom):'')+'"><span style="color:var(--c-tertiary)">'+psEsc(poSym)+'</span><input type="number" min="0" step="0.01" value="'+psEsc(Number(c).toFixed(2))+'" onchange="psPoCost(\''+p.partId+'\',this.value)"></span></td>'+
             '<td class="num">'+psEsc(psPoMoney(line))+'</td></tr>';
     }).join('');
     const lgOpts=(d.lgList||[]).map(l=>'<option value="'+l.id+'"'+(String(l.id)===String(d.lgId)?' selected':'')+'>'+psEsc(l.name)+'</option>').join('') || '<option value="">(no accessible location groups)</option>';
@@ -5679,10 +5884,18 @@ async function psSubmitPo(){
     // The order-level scheduled date (chosen in the drawer) applies to every line;
     // fall back to the line's own need-by only if it is somehow blank/invalid.
     const orderSched=(d.dateScheduled && /^\d{4}-\d{2}-\d{2}$/.test(d.dateScheduled)) ? d.dateScheduled : null;
+    // part.description is nominally optional, but Fishbowl does NOT backfill it from
+    // the part record: omit it and poitem.description lands blank on the order.
+    // uom is the vendor part's, so Fishbowl matches the line to the existing vendor
+    // part instead of creating a new one. taxRate: vendor's rate, else the part's.
     const items=d.parts.filter(p=>(parseFloat(p.qty)||0)>0).map(p=>{
         const qty=parseFloat(p.qty)||0, unit=parseFloat(p.unitCost)||0;
-        const it={ part:{ id:parseInt(p.partId,10), name:p.partNum }, type:{ id:10 },
+        const partRef={ id:parseInt(p.partId,10), name:p.partNum };
+        if(p.partDesc) partRef.description=p.partDesc;
+        const it={ part:partRef, type:{ id:10 },
                    quantity:qty, totalCost:Number((qty*unit).toFixed(4)) };
+        if(p.uomId) it.uom={ id:parseInt(p.uomId,10) };
+        if(p.taxRate) it.taxRate={ id:p.taxRate.id };
         if(p.vendorPartNum) it.vendorPartNumber=p.vendorPartNum;
         const sched = orderSched || (p.needBy ? p.needBy.format('YYYY-MM-DD') : null);
         if(sched) it.dateScheduled=sched+'T00:00:00';
@@ -5693,7 +5906,9 @@ async function psSubmitPo(){
     // Remember the chosen status as the user's Create-PO default for next time.
     try { FBLib.Settings.setUserKey('poCreateStatus', d.poStatus === 'Bid Request' ? 'Bid Request' : 'Issued'); FBLib.Settings.saveUser(); } catch(_){}
     const payload={ vendor:{ id:d.vendorId }, status:d.poStatus, locationGroup:{ id:d.lgId }, poItems:items };
+    if(d.vendorTax) payload.taxRate={ id:d.vendorTax.id };
     if(d.note && d.note.trim()) payload.note=d.note.trim();
+    debugLog('info','POST /api/purchase-orders '+JSON.stringify(payload));
     d.state='submitting'; d.error=null; psRenderPoDrawer();
     try {
         const res=await runRestApiAsync({ method:'POST', path:'/api/purchase-orders', body:JSON.stringify(payload) });
@@ -8864,22 +9079,40 @@ async function psLoadAvailability() {
             //    vendorparts (partid → vendorid); defaultFlag marks the preferred
             //    vendor. There is NO part.defaultVendorId column. Take the default-
             //    flagged row per part, else the lowest-id vendorparts row.
+            //    The row's UOM (vendorparts.uomId) is the unit the vendor sells in;
+            //    lastCost and qtyMin are per THAT unit, and a PO line must use it or
+            //    Fishbowl creates a second vendor part. base_to_vendor converts a
+            //    stocking-UOM qty into it (NULL = no uomconversion links the two).
             try {
                 (await runQueryAsync(`
                     SELECT vp.partid AS part_id, vp.vendorid AS vendor_id, v.name AS vendor_name,
                            vp.lastcost AS last_cost, vp.vendorpartnumber AS vendor_part_num,
-                           vp.qtymin AS qty_min
+                           vp.qtymin AS qty_min,
+                           vp.uomid AS vendor_uom_id, vu.code AS vendor_uom_code,
+                           (vu.integral + 0) AS vendor_uom_integral, (vp.uomid = p.uomid) AS same_uom,
+                           CASE WHEN vp.uomid = p.uomid THEN 1 ELSE COALESCE(
+                             (SELECT uc.multiply / uc.factor FROM uomconversion uc WHERE uc.fromuomid = p.uomid AND uc.touomid = vp.uomid LIMIT 1),
+                             (SELECT uc.factor / uc.multiply FROM uomconversion uc WHERE uc.fromuomid = vp.uomid AND uc.touomid = p.uomid LIMIT 1)
+                           ) END AS base_to_vendor
                     FROM vendorparts vp
                     JOIN vendor v ON v.id = vp.vendorid
+                    JOIN part p ON p.id = vp.partid
+                    LEFT JOIN uom vu ON vu.id = vp.uomid
                     WHERE vp.partid IN (${partIdArr.join(',')})
                     ORDER BY vp.partid, vp.defaultflag DESC, vp.id
                 `)).forEach(r => {
                     const pid = String(r.part_id);
+                    const b2v = parseFloat(r.base_to_vendor);
                     if (!psPartVendor.has(pid)) psPartVendor.set(pid, {
                         id: parseInt(r.vendor_id, 10), name: (r.vendor_name || '').trim(),
                         lastCost: (r.last_cost != null ? parseFloat(r.last_cost) : null),
                         vendorPartNum: (r.vendor_part_num || ''),
-                        qtyMin: (r.qty_min != null ? parseFloat(r.qty_min) : null)
+                        qtyMin: (r.qty_min != null ? parseFloat(r.qty_min) : null),
+                        uomId: (r.vendor_uom_id != null ? parseInt(r.vendor_uom_id, 10) : null),
+                        uom: (r.vendor_uom_code || ''),
+                        uomIntegral: (r.vendor_uom_integral != null ? parseInt(r.vendor_uom_integral, 10) === 1 : null),
+                        sameUom: parseInt(r.same_uom, 10) === 1,
+                        baseToVendor: (isFinite(b2v) && b2v > 0) ? b2v : null
                     });
                 });
                 debugLog('success', `Default vendor resolved for ${psPartVendor.size} part(s)`);
@@ -9258,7 +9491,8 @@ async function psLoadAvailability() {
                 // means "was due earlier and hasn't arrived" — surface it as Overdue.
                 const etaOverdue = !unmet && !contended && sawOverdue && by === today && availNow < need - 1e-6;
                 if (etaOverdue) rawOverdue = true;
-                parts.push({ partId: pid, partNum: req.part_num, partDesc: req.part_desc, need: needLine, uom: req.uom_code || '', baseUom, onhand: oh, availableBy: by, unmet, staged: false, nonInv: false, committed: committedFull, committedQty: toLine(committedQ), committedStatus, availQty: toLine(availNow), shortfall: toLine(remaining), moPoEta: etaFromMoPo, woEta: etaFromWo, etaOverdue, contended, contendedBy: priorClaims });
+                parts.push({ partId: pid, partNum: req.part_num, partDesc: req.part_desc, need: needLine, uom: req.uom_code || '', baseUom, onhand: oh, availableBy: by, unmet, staged: false, nonInv: false, committed: committedFull, committedQty: toLine(committedQ), committedStatus, availQty: toLine(availNow), shortfall: toLine(remaining), moPoEta: etaFromMoPo, woEta: etaFromWo, etaOverdue, contended, contendedBy: priorClaims,
+                             needBase: need, shortfallBase: remaining });   // stocking UOM — Procurement sums these across WOs
                 if (by && by > rawBy) rawBy = by;
             });
             wo._av = { parts, rawBy: rawUnmet ? null : rawBy, rawUnmet, rawContended, rawNowOk, rawOverdue };
@@ -12582,7 +12816,7 @@ function psRosterSave() {
         let persistWarn = '';
         try {
             const disk = (window.FBLib && FBLib.SharedData)
-                ? FBLib.SharedData.readJson('cdx.bi.productionsched.master.v1', null, { adminOnly: true, fresh: true })
+                ? FBLib.SharedData.readJson(FB_REPORT.key + '.master.v1', null, { adminOnly: true, fresh: true })
                 : null;
             const dh = (disk && disk.rosterConfig && Array.isArray(disk.rosterConfig.holidays)) ? disk.rosterConfig.holidays.length : null;
             if (dh === null || dh !== holCount) {
@@ -14597,8 +14831,8 @@ function initShell(){
 function initSettings() {
     FBLib.Settings.init({
         masterStorage: 'userProperties',   // shared admin defaults via userproperties, not report data (which needs a SAVED report — see FBLib.SharedData)
-        userKey:   'cdx.bi.productionsched.user.v1',
-        masterKey: 'cdx.bi.productionsched.master.v1',
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
         defaults: {
             v: 1,
             allowSameDayStarts: false,
@@ -14634,6 +14868,7 @@ function initSettings() {
             },
             moCreateStatus:     'Issued',      // Create-MO default order status: Issued (live) | Entered (suggestion)
             poCreateStatus:     'Issued',      // Create-PO default order status: Issued | Bid Request
+            procQtyUom:         'stock',       // Procurement ▸ To Purchase quantities: stock | vendor (UOM)
             cfGroupOrder:       ['bom','mo','wo','part'], // CF filters drawer: object-group display order (drag-reorder, persisted)
             tabOrder:           PS_VIEWS.map(function (v) { return v.id; }), // Settings ▸ Display: tab strip order (drag-reorder, persisted)
             tabHidden:          [],            // Settings ▸ Display: user-hidden tab ids (only among psTabEnabled tabs)
