@@ -1,186 +1,35 @@
-# TODO List
+# TODO
 
-## Completed Tasks
+Open items only. Completed work lives in the git history.
 
-### Price Formatting - Use System Property
-- [x] Use Fishbowl system property `REPORT_DECIMAL_PRICE` (format: `$ #,##0.00`) for price formatting
-- [x] Apply to Sales_Dashboard.htm - global `formatCurrency()` function using PRICE_FORMAT, CURRENCY_SYMBOL, DECIMAL_PLACES
-- [x] Apply to Purchasing_Dashboard.htm - same implementation
-- [ ] Apply to other dashboards: Inventory, Combined (if applicable)
+## Waiting on others
 
-### Terminology Update
-- [x] Change all references from 'Salesman' to 'Sales Person' in Sales Dashboard
-- [x] Update column headings in drilldown tables
-- [x] Update filter labels
-- [x] Update tooltips and any other UI text
-- Note: Purchasing Dashboard doesn't use 'Salesman' terminology
+### #4922 — Fishbowl's built-in print / download buttons
+- [ ] The client's own print and download buttons are separate from the
+      buttons a report draws, and a report can't hook into or style them.
+      This needs a change in the Fishbowl application layer, so it is out of
+      scope for the reports.
 
----
+## Dashboards
 
-## Pending Tasks
+### v1.2 dashboards ignore the user's location groups
+- [ ] On Sales, Inventory and Purchasing v1.2, the Location Group filter
+      lists every active location group, and no tile limits itself to the
+      groups assigned to the user (`getLocationGroupList()`). The order tiles
+      and Dashboard - Company do apply them. See the Known gaps section of
+      `Dashboards/dashboards.md`.
 
-### Sales Credit Note Display Review
-- [ ] Review credit note (negative qty line item) display - currently too much red after recent changes
-- [x] Change styling: keep red text for negatives but remove bold font weight (completed)
-- [ ] Consider following standard Fishbowl sales order info: Qty, negative price, negative total (no margin shown)
-- [ ] Test with various credit/return scenarios
+### Sales v1.2 margin axis
+- [ ] Monthly Revenue & Margin draws margin on a fixed 0–65% axis (`yMarg`), so a
+      negative or very high margin runs off the chart. Size the axis from
+      the data, or clamp and label the value.
 
-**Notes:**
-- Current implementation shows margin for credits which may be misleading
-- Fishbowl standard doesn't show margin on credit lines
-
----
-
-### Add Missing Filters
-- [ ] Add Customer filter dropdown to Sales Dashboard
-- [ ] Add Vendor filter dropdown to Purchasing Dashboard (if not already present)
-
----
-
-### Currency Localization (Complete for applicable files)
-- [x] Created global `formatCurrency()` function using REPORT_DECIMAL_PRICE property
-- [x] Currency symbol mapped from home currency code in database (CURRENCY_SYMBOLS lookup)
-- [x] Decimal places extracted from price format pattern
-- [x] Applied to Sales Dashboard
-- [x] Applied to Purchasing Dashboard (added CURRENCY_SYMBOLS and getHomeCurrencySymbol)
-- [x] Applied to Inventory Dashboard
-- [x] Dashboard_Combined and individual tile reports do NOT display currency/value amounts - no changes needed
-- [ ] Still using 'en-US' locale for number formatting (thousands separator, decimal point)
-- [ ] May need additional property for full locale support if non-US formatting needed (1.234,56 format)
-
-**Notes:**
-- Currency symbol now determined by querying home currency code from `currency` table and mapping via CURRENCY_SYMBOLS
-- Supports 30+ currencies (AUD, USD, EUR, GBP, JPY, etc.)
-- Falls back to REPORT_DECIMAL_PRICE parsing if DB query fails
-- Full locale support would require additional property for number formatting style
-
----
-
-### Inventory Dashboard - Implementation
-
-#### Completed:
-- [x] Updated date range selector to match Sales/Purchasing dashboards (dropdown with presets)
-- [x] Changed default date range to Current Financial Year
-- [x] Removed Part Type filter (now fixed to typeid=10 for Inventory parts)
-- [x] Removed Tracking Method filter
-- [x] Added Product Category filter (using producttree)
-- [x] Added Vendor filter (using vendorparts with defaultflag=1)
-- [x] Implemented new inventory availability query (based on Fishbowl Inventory Availability by Location Group report)
-- [x] Updated Top Parts by Value to show availability data (On Hand, Available, Committed, On Order)
-- [x] Applied currency symbol mapping and formatCurrency function
-- [x] Updated date handling functions (getQuarterDates, getFYDates, getCalendarYearDates, getDateCondition)
-- [x] Added updateDateRangeDisplay for header date range display
-- [x] Added clearAllFilters button
-- [x] Added Short Parts Alert tile with click-to-expand modal drilldown (shows part, orders affected, sales value at risk)
-- [x] Implemented Stock Movement chart using part activity report query (summarized by category: Receiving, Shipping, Adjustments, Transfers, Production)
-- [x] Added Cycle Count Adjustments KPI tile with modal drilldown (shows parts adjusted, qty change, value impact)
-- [x] Added Scrapped Items KPI tile with modal drilldown (shows parts scrapped, qty, value lost)
-- [x] Added Debug Console (collapsible, auto-scrolling, same as Sales/Purchasing)
-- [x] Added Drilldown Modal with export to CSV functionality
-
-#### Additional Updates:
-- [x] Fixed inventorylogtype IDs: 67=Scrap (adj:scp), 68=Cycle Count (adj:cyc), 64=Adjust Inc, 65=Adjust Dec
-- [x] Changed from part.stdCost to partcost.avgCost for accurate current valuation
-- [x] Added 4-column KPI tiles row: Total Value, Unavailable Stock, Below Reorder, Short Parts
-- [x] Added Unavailable Stock KPI tile with modal drilldown (uses qtynotavailable view)
-- [x] Added Below Reorder KPI tile with modal drilldown (uses partreorder table)
-- [x] Updated Stock Movement chart with correct inventorylogtype IDs (10=Recv, 20=Ship, 30=Transfer, 40/50=Production)
-- [x] All KPI tiles are clickable with modal drilldowns and export to CSV
-
-#### Fulfillment Pipeline (Added):
-- [x] Added Fulfillment Pipeline metrics to Inventory Dashboard (moved from Sales)
-- [x] Short Pick tile with detailed counts and drilldown
-- [x] Items Ready to Ship tile with counts and drilldown
-- [x] Fixed ShipItem.QtyShipped column reference
-- [x] Fixed Short Parts value calculation using SoItem.UnitPrice
-
-#### Layout & UI Improvements:
-- [x] Redesigned Inventory Dashboard layout with improved KPI tiles
-- [x] Stacked Fulfillment Pipeline metrics vertically with smaller font
-- [x] Dynamic color for Cycle Count adjustments (green=positive, red=negative)
-- [x] Stock Levels by Location Group with dynamic coloring
-- [x] Reduced Stock Loss dollar value font size
-- [x] Format all drilldown quantities to 2 decimal places
-- [x] Use consistent MOMENT_DATE_FORMAT for all drilldown dates
-- [x] Remove non-functional Export buttons from Sales, Purchasing, and Inventory dashboards
-
-#### SQL Query Fixes:
-- [x] Fix tag table queries to use correct location relationship
-- [x] Remove producttree references from tag-based stock queries
-- [x] Use partcost.avgCost instead of product.avgCost (SQL error fix)
-- [x] Exclude zero-quantity cycle count adjustments from drilldown
-- [x] Use POST.DATECREATED instead of DATEPOSTED for adjustments
-
-#### Pending:
-- [x] Review and test all queries with real data (validated against standard Fishbowl reports)
-
-#### Completed (Cost Attribution):
-- [x] Correct cost attribution for Scrap/Adjustments implemented
-  - Now using POST table with POST.AMOUNT for historical cost at time of adjustment
-  - Uses POST.DATEPOSTED for date filtering
-  - POST.REFITEMID = 2 for Scrap, 3 for Cycle Count
-  - Joins to INVENTORYLOG via RECORDID for location group filtering and notes
-  - **Verified against standard Fishbowl Adjustments report for Last Calendar Year - numbers match**
-
----
-
-### Inv_Reorder_Watchlist.htm - Issues
-
-#### Completed:
-- [x] Fix "Include No ROP/OUL" feature - not showing parts without reorder points
-  - Changed INNER JOIN to LEFT OUTER JOIN for partreorder in company-wide query
-  - Added condition to include parts with NO partreorder entry when checkbox is checked
-  - Parts with NULL/0 reorderpoint/orderuptolevel now show with state='norop'
-  - Added part.typeid = 10 filter to both queries to only include Inventory parts
-- [x] Fix multi-location aggregated row display for parts with Location Group ROPs
-  - Show "-" for ROP and OUL columns instead of misleading summed totals
-  - Remove colored status bar for aggregated rows (not meaningful for mixed states)
-  - Preserve normal behavior for single location group filter and Company Wide settings
-
----
-
-### #4922 - Printing/Downloading from Built-in Fishbowl Buttons
-- [ ] Built-in Fishbowl print/download buttons are separate to rendered buttons in the page
-  - Need to investigate how to hook into or style these buttons
-  - **Requires external assistance / coordination with Fishbowl application layer**
-
----
-
-### #4921 - Date Format Standardization (Completed)
-- [x] Use `DateFormatShort` property for date display in dashboard header date ranges
-- [x] Ensure default format is US format `MM/dd/yyyy` across all files
-- [x] Apply to: Sales_Dashboard.htm, Purchasing_Dashboard.htm, Inventory_Dashboard.htm
-- [x] Apply to: Dashboard_Combined.htm (added moment.js and MOMENT_DATE_FORMAT conversion)
-- [x] Apply to: Individual pages (Open_Sales_Orders_Table_Simple, Open_Purchase_Orders_Table_Simple, etc.)
-- [x] Date filters now compare against formatted dates (matching displayed format)
-
----
-
-### WO_Capacity_Planning_Gantt_v3.htm - Quality of Life Updates
-
-#### Gantt Tooltip - BOM vs Finished Good
-- [ ] In the stylised Gantt tooltip, the part number currently shows the Finished Good
-- [ ] Change to show two separate lines:
-  - `BOM: <bom part number>`
-  - `Finished Good: <finished good part number> x <qty>`
-- [ ] This correctly distinguishes the BOM being built from the output part
-
-#### Multi-Select Work Orders in Capacity Calendar
-- [ ] Add Ctrl+Click to toggle selection of individual WO blocks in the month calendar view
-- [ ] When one or more WOs are selected, clicking and dragging any selected WO should move all selected WOs to the same drop date
-- [ ] Consider visual indicator for selected state (e.g. highlighted border or overlay)
-- [ ] Deselect all on plain click of an unselected WO or on click of empty calendar cell
-
-#### Weekend Config Option
-- [ ] Add a config/toggle option to hide weekends from the Gantt and calendar views
-- [ ] When enabled, weekend columns are collapsed or hidden entirely (no scheduling allowed on Sat/Sun)
-- [ ] Consider whether existing WOs scheduled on weekends should be flagged or auto-moved
-
----
-
-### Dashboard KPI & Tile Help/Explanations
-- [ ] Sales, Purchasing, and Inventory dashboards need explanations for what each KPI tile and chart means
-- [ ] **Option A:** Add tooltip (title attribute or hover popover) to each KPI tile explaining what it measures and how it is calculated
-- [ ] **Option B:** Add a Help button (top-right, next to Refresh) that opens a modal listing all KPIs and tiles with plain-text descriptions
-- [ ] Option B is preferred if explanations are too long for tooltips (e.g. chart tiles)
-- [ ] Applies to: Sales_Dashboard.htm, Purchasing_Dashboard.htm, Inventory_Dashboard.htm
+## Needs testing in the Fishbowl client
+These have been checked against demodb only:
+- [ ] Sales v1.2:
+  - weighted margins and the Fishbowl line set (19bd33f);
+  - credit-line display (0e0945c);
+  - the Customer filter (b6250a3).
+- [ ] Production Scheduling v1.2 Timeline tooltip at several app zoom
+      levels (4a2a23d).
+- [ ] Saved views (FBLib.FilterViews) on the individual dashboard tiles.
