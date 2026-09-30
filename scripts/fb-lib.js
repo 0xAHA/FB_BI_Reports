@@ -59,6 +59,10 @@
 //   FBLib.Table          — Sort / per-column filter / drag-reorder /
 //                          drag-resize scaffolding for a <table> in a
 //                          scroll container. Plug in via FBLib.Table.init.
+//   FBLib.FilterViews    — Saved views (per-user + admin-published company
+//                          views) behind one compact header button. Works
+//                          on filter-row tables out of the box, or on any
+//                          report that supplies capture/restore.
 //
 // QUICK START — common building blocks
 // ------------------------------------
@@ -125,6 +129,11 @@
 //    retired them. See the "DROP-DOWN DRAWER" comment block in Common
 //    below for the canonical markup + behaviour.
 //
+//  • Saved filter views are the one exception: use FBLib.FilterViews
+//    (a compact header button + popover holding My views, Company views
+//    and the admin publish / delete-for-all actions). Don't build a
+//    report-local views picker or drawer.
+//
 //  • Lowercase result keys: every column returned by `runQuery` /
 //    `runQueryAsync` is lowercased regardless of the SQL aliasing. Use
 //    `row.totalprice`, not `row.totalPrice`.
@@ -149,6 +158,21 @@
 // ============================================================================
 window.FBLib = (function () {
     'use strict';
+
+    // Build stamp of this fb-lib, maintained by tools/stamp/stamp.js — never
+    // edit by hand. Exposed as FBLib.BUILD so a report can tell which fb-lib
+    // the Fishbowl server actually served it.
+    const BUILD = '2026.09.25-a4fb81b';   // @fb-build
+
+    // The report's identity block (window.FB_REPORT, top of every report's
+    // <head>): { key: storage-key prefix, build: report build stamp }.
+    function report() {
+        const r = (typeof window !== 'undefined' && window.FB_REPORT) || {};
+        return { key: r.key || null, build: r.build || null };
+    }
+    // userproperties.userKey is varchar(41): a longer key is truncated (or
+    // rejected) by MySQL, so two keys can silently collide.
+    const USERKEY_MAX = 41;
 
     // ====================================================================
     // FBLib.Common — date / money formatting, debug logger + drawer,
@@ -1406,8 +1430,23 @@ window.FBLib = (function () {
 
         function init(config) {
             config = config || {};
-            _userKey   = config.userKey   || 'cdx.bi.report.user.v1';
-            _masterKey = config.masterKey || 'cdx.bi.report.master.v1';
+            // Keys default from the report's identity block, so a report copied
+            // in Fishbowl only needs FB_REPORT.key changed to get its own store.
+            const id = report();
+            _userKey   = config.userKey   || (id.key ? id.key + '.user.v1'   : 'cdx.bi.report.user.v1');
+            _masterKey = config.masterKey || (id.key ? id.key + '.master.v1' : 'cdx.bi.report.master.v1');
+            [_userKey, _masterKey].forEach(function (k) {
+                if (String(k).length > USERKEY_MAX) {
+                    const msg = 'Settings key "' + k + '" is ' + String(k).length + ' characters; Fishbowl stores at most ' +
+                        USERKEY_MAX + '. Shorten FB_REPORT.key or settings may not save.';
+                    try { console.warn('[FBLib.Settings] ' + msg); } catch (_) {}
+                    try { if (Common && Common.debugLog) Common.debugLog(msg, 'error'); } catch (_) {}
+                }
+            });
+            try {
+                console.info('[FBLib] report ' + (id.key || '(no key)') + ' build ' + (id.build || '?') +
+                             ' · fb-lib build ' + BUILD);
+            } catch (_) {}
             _defaults  = config.defaults  || {};
             _propFallback = config.propFallback || {};
             _defaultTileOrder = (config.defaultTileOrder || []).slice();
@@ -3369,7 +3408,814 @@ window.FBLib = (function () {
         };
     })();
 
+    // ====================================================================
+    // FBLib.FilterViews — saved views behind one compact header button.
+    //
+    // Two kinds of view, shown as two groups in one popover:
+    //   My views       per Fishbowl user; each user's own list.
+    //   Company views  published by an admin, read LIVE by everyone from
+    //                  FBLib.SharedData. Not copied into anyone's list, so
+    //                  "delete for all" removes a view for everyone on their
+    //                  next load and never touches a personal view. Users can
+    //                  "save a copy" to edit one; they can't change the
+    //                  original.
+    // Either kind can be starred as "open by default" (per user). An admin
+    // can also flag one company view as the default for everyone; a user's
+    // own star wins over it.
+    //
+    // TWO WAYS TO PLUG IN
+    //
+    //  1. Filter-row tables (Dashboards / Individual Pages) — zero config:
+    //       const views = FBLib.FilterViews.attach({
+    //           tile: 'SO', mount: 'fvMount', toggles: ['hideEstimates'],
+    //           getSort: () => ({ col: sortColumn, dir: sortDirection }),
+    //           setSort: s => { sortColumn = s.col; sortDirection = s.dir; },
+    //           apply:   () => applyFilters()
+    //       });
+    //       views.beforeLoad()   top of every build (loadData)
+    //       views.changed()      after every filter / sort change
+    //       views.detach()       from Clear Filters
+    //     State = every `.filter-row [data-filter]` value + the toggle
+    //     checkboxes + the sort. Also owns the page's `persistFilters`
+    //     ("remember table filters") session memory.
+    //
+    //  2. Anything else (the Summary reports) — the page supplies the state:
+    //       attach({ tile, mount,
+    //                capture: () => stateObject,          // JSON-able
+    //                restore: state => { ... },           // may return a Promise
+    //                canon:   state => 'comparable string',   // optional
+    //                matches: (viewState, liveState) => bool, // optional, wins over canon
+    //                describe: state => 'one-line summary',  // optional
+    //                storage: { load: () => ({views, defaultId}),
+    //                           save: obj => bool } })       // optional
+    //     then calls views.changed() whenever the on-screen state may have
+    //     moved. For the starred default either call views.adoptDefault()
+    //     before the first query (returns the state to apply, or null) or
+    //     views.openDefault() once the page is ready (restores it).
+    //
+    // STORAGE
+    //   My views      default: this page's FBLib.Settings user payload,
+    //                 `views.<TILE>` + `defaultView.<TILE>`.
+    //   Company views FBLib.SharedData key `<FB_REPORT.key>.shared.v1`
+    //                 (override: opts.sharedKey), field `filterViews.<TILE>`:
+    //                 { views, defaultId, at, by }. Writes merge onto the
+    //                 rest of that payload — a SharedData write replaces the
+    //                 whole value. opts.legacyCompany(blob) may map an older
+    //                 shape; opts.legacyCleanup(nextBlob) drops old fields on
+    //                 the first publish.
+    //   A view is { id, name, state, updated }.
+    //
+    // CSS is injected here (not fb-styles) because the Individual Pages don't
+    // load fb-styles yet; it reads the fb-styles tokens with literal fallbacks,
+    // so it follows the brand palette wherever fb-styles is present.
+    // ====================================================================
+    const FilterViews = (function () {
+        const CSS_ID = 'fbLibFilterViewsStyle';
+        const T = function (name, fallback) { return 'var(' + name + ',' + fallback + ')'; };
+        const CSS =
+            '.fbfv-wrap{position:relative;display:inline-block}' +
+            '.fbfv-btn{position:relative;display:inline-flex;align-items:center;justify-content:center;' +
+                'width:28px;height:28px;padding:0;border:1px solid ' + T('--border', '#E3E3E3') + ';background:#fff;' +
+                'border-radius:8px;color:' + T('--c-secondary', '#506872') + ';cursor:pointer;transition:all .15s}' +
+            '.fbfv-btn:hover{background:' + T('--bg-1', '#F7F7F7') + ';border-color:' + T('--border-strong', '#C6D0D4') + '}' +
+            '.fbfv-btn svg{width:15px;height:15px}' +
+            '.fbfv-btn.fbfv-on{background:' + T('--tint-blue', '#DEEAF4') + ';border-color:' + T('--tint-blue-2', '#CBE5FB') + ';' +
+                'color:' + T('--color-primary-dark', '#1e7bb4') + '}' +
+            '.fbfv-btn.fbfv-dirty::after{content:"";position:absolute;top:-3px;right:-3px;width:8px;height:8px;border-radius:50%;' +
+                'background:' + T('--acc-orange', '#F69133') + ';border:1px solid #fff}' +
+            '.fbfv-pop{position:absolute;top:calc(100% + 4px);right:0;z-index:10002;width:320px;max-height:72vh;' +
+                'display:flex;flex-direction:column;background:#fff;border:1px solid ' + T('--border', '#E3E3E3') + ';' +
+                'border-radius:8px;box-shadow:0 10px 25px -5px rgba(0,0,0,.18);overflow:hidden;' +
+                'font-family:' + T('--font', "'Inter',sans-serif") + ';font-size:12px;color:' + T('--c-primary', '#101010') + ';' +
+                'text-align:left;white-space:normal;line-height:1.4}' +
+            '.fbfv-pop[hidden]{display:none}' +
+            '.fbfv-head{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;flex-shrink:0;' +
+                'background:' + T('--menu-bg', '#0B3140') + ';color:#fff;font-weight:700;font-size:13px}' +
+            '.fbfv-x{border:none;background:none;cursor:pointer;color:#fff;opacity:.85;font-size:18px;line-height:1;padding:0 2px}' +
+            '.fbfv-x:hover{opacity:1}' +
+            '.fbfv-body{overflow-y:auto;flex:1 1 auto;min-height:0}' +
+            '.fbfv-sec{padding:9px 12px;border-bottom:1px solid ' + T('--bg-2', '#EBEEED') + '}' +
+            '.fbfv-sec:last-child{border-bottom:none}' +
+            '.fbfv-lbl{display:flex;align-items:center;justify-content:space-between;font-size:10px;font-weight:700;' +
+                'text-transform:uppercase;letter-spacing:.04em;color:' + T('--c-secondary', '#506872') + ';margin-bottom:6px}' +
+            '.fbfv-lbl span{font-weight:500;text-transform:none;letter-spacing:0;color:' + T('--c-tertiary', '#8FA1A7') + '}' +
+            '.fbfv-cur{margin-bottom:6px;font-weight:600;color:' + T('--menu-bg', '#0B3140') + '}' +
+            '.fbfv-mod{display:inline-block;margin-left:5px;padding:0 5px;border-radius:3px;font-size:9px;font-weight:700;' +
+                'text-transform:uppercase;letter-spacing:.04em;vertical-align:1px;' +
+                'background:' + T('--acc-orange-bg', '#F5E7DD') + ';color:' + T('--acc-orange-con', '#8A4E10') + '}' +
+            '.fbfv-tag{display:inline-block;margin-left:5px;padding:0 5px;border-radius:3px;font-size:9px;font-weight:700;' +
+                'text-transform:uppercase;letter-spacing:.04em;vertical-align:1px;' +
+                'background:' + T('--tint-blue', '#DEEAF4') + ';color:' + T('--menu-bg', '#0B3140') + '}' +
+            '.fbfv-chips{display:flex;flex-wrap:wrap;gap:4px}' +
+            '.fbfv-chip{display:inline-flex;align-items:center;gap:3px;max-width:100%;padding:2px 7px;border-radius:999px;' +
+                'font-size:11px;background:' + T('--tint-blue', '#DEEAF4') + ';color:' + T('--menu-bg', '#0B3140') + '}' +
+            '.fbfv-chip.fbfv-hid{background:' + T('--acc-yellow-bg', '#FBEDC4') + ';color:' + T('--acc-yellow-con', '#7A5A08') + '}' +
+            '.fbfv-chip.fbfv-sort{background:' + T('--bg-2', '#EBEEED') + ';color:' + T('--c-secondary', '#506872') + '}' +
+            '.fbfv-chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
+            '.fbfv-chip button{border:none;background:none;cursor:pointer;color:inherit;font-weight:700;padding:0;line-height:1}' +
+            '.fbfv-sum{font-size:11px;color:' + T('--c-secondary', '#506872') + '}' +
+            '.fbfv-none{color:' + T('--c-tertiary', '#8FA1A7') + ';font-style:italic;font-size:11px}' +
+            '.fbfv-acts{display:flex;gap:6px;margin-top:8px;align-items:center}' +
+            '.fbfv-b{display:inline-flex;align-items:center;padding:4px 9px;font-size:11px;font-weight:600;font-family:inherit;' +
+                'border:1px solid ' + T('--border-strong', '#C6D0D4') + ';background:#fff;color:#415157;border-radius:6px;cursor:pointer}' +
+            '.fbfv-b:hover:not([disabled]){background:' + T('--bg-2', '#EBEEED') + '}' +
+            '.fbfv-b.fbfv-pri{background:' + T('--color-primary', '#2d9cdb') + ';border-color:' + T('--color-primary', '#2d9cdb') + ';color:#fff}' +
+            '.fbfv-b.fbfv-pri:hover:not([disabled]){background:' + T('--color-primary-dark', '#1e7bb4') + '}' +
+            '.fbfv-b[disabled]{opacity:.45;cursor:default}' +
+            '.fbfv-in{flex:1;min-width:0;padding:4px 8px;font-size:12px;font-family:inherit;' +
+                'border:1px solid ' + T('--border', '#E3E3E3') + ';border-radius:6px;background:' + T('--bg-1', '#F7F7F7') + '}' +
+            '.fbfv-in:focus{outline:none;border-color:' + T('--color-primary', '#2d9cdb') + ';background:#fff}' +
+            '.fbfv-row{display:flex;align-items:center;gap:2px;padding:3px 4px;border-radius:6px;border:1px solid transparent}' +
+            '.fbfv-row:hover{background:' + T('--bg-1', '#F7F7F7') + '}' +
+            '.fbfv-row.fbfv-act{background:#F4FAFE;border-color:' + T('--tint-blue-2', '#CBE5FB') + '}' +
+            '.fbfv-main{flex:1;min-width:0;cursor:pointer;padding:1px 3px}' +
+            '.fbfv-name{font-weight:600;color:' + T('--menu-bg', '#0B3140') + ';overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
+            '.fbfv-meta{font-size:10px;color:' + T('--c-tertiary', '#8FA1A7') + ';overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
+            '.fbfv-ic{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border:none;background:none;' +
+                'cursor:pointer;color:' + T('--c-tertiary', '#8FA1A7') + ';padding:0;border-radius:4px;font-size:13px;line-height:1;flex-shrink:0}' +
+            '.fbfv-ic svg{width:13px;height:13px}' +
+            '.fbfv-ic:hover{color:' + T('--link', '#2d9cdb') + ';background:#eff6ff}' +
+            '.fbfv-ic.fbfv-del:hover{color:' + T('--fb-negative', '#C43046') + ';background:' + T('--acc-maroon-bg', '#F0D7DD') + '}' +
+            '.fbfv-ic.fbfv-on{color:' + T('--acc-orange', '#F69133') + '}' +
+            '.fbfv-ic.fbfv-all.fbfv-on{color:' + T('--color-primary', '#2d9cdb') + '}' +
+            '.fbfv-msg{padding:7px 12px;font-size:11px;line-height:1.45;background:' + T('--acc-maroon-bg', '#F0D7DD') + ';' +
+                'color:' + T('--acc-maroon-con', '#5E1D30') + '}' +
+            '.fbfv-msg.fbfv-ok{background:' + T('--acc-sage', '#DBE8E1') + ';color:' + T('--acc-sage-con', '#1B7A46') + '}' +
+            '.fbfv-foot{padding:6px 12px;font-size:10px;color:' + T('--c-tertiary', '#8FA1A7') + ';border-top:1px solid ' +
+                T('--bg-2', '#EBEEED') + ';flex-shrink:0}';
+
+        const ICON_BTN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" ' +
+            'stroke-linejoin="round" aria-hidden="true"><path d="M19 21l-7-5-7 5V5a2 2 0 012-2h10a2 2 0 012 2z"/></svg>';
+        const SVG = {
+            save:    '<path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/>',
+            publish: '<path d="M12 19V5"/><path d="M5 12l7-7 7 7"/><path d="M5 21h14"/>',
+            copy:    '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 012-2h10"/>',
+            rename:  '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z"/>',
+            everyone:'<circle cx="9" cy="8" r="3"/><path d="M3 20a6 6 0 0112 0"/><circle cx="17" cy="9" r="2.5"/><path d="M15.5 14.5A5 5 0 0121 19"/>'
+        };
+
+        function injectCss() {
+            if (document.getElementById(CSS_ID)) return;
+            const style = document.createElement('style');
+            style.id = CSS_ID;
+            style.textContent = CSS;
+            document.head.appendChild(style);
+        }
+
+        // Tiny DOM builder — user-entered text only ever goes in as text
+        // nodes, so view names never need escaping.
+        function h(tag, attrs, kids) {
+            const el = document.createElement(tag);
+            Object.keys(attrs || {}).forEach(function (k) {
+                const v = attrs[k];
+                if (v == null || v === false) return;
+                if (k === 'on') Object.keys(v).forEach(function (ev) { el.addEventListener(ev, v[ev]); });
+                else if (k === 'text') el.textContent = v;
+                else if (k === 'className') el.className = v;
+                else if (k === 'svg') el.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+                    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + v + '</svg>';
+                else el.setAttribute(k, v === true ? '' : v);
+            });
+            [].concat(kids || []).forEach(function (c) {
+                if (c == null || c === false) return;
+                el.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+            });
+            return el;
+        }
+        function icon(name, title, onClick, extraCls) {
+            return h('button', { type: 'button', className: 'fbfv-ic' + (extraCls ? ' ' + extraCls : ''), title: title,
+                'aria-label': title, svg: SVG[name], on: { click: onClick } });
+        }
+        function glyph(text, title, onClick, extraCls) {
+            return h('button', { type: 'button', className: 'fbfv-ic' + (extraCls ? ' ' + extraCls : ''), title: title,
+                'aria-label': title, text: text, on: { click: onClick } });
+        }
+        function newId(prefix) { return (prefix || 'v') + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+        function clone(o) { return o == null ? o : JSON.parse(JSON.stringify(o)); }
+        function stable(o) {
+            if (Array.isArray(o)) return '[' + o.map(stable).join(',') + ']';
+            if (o && typeof o === 'object') {
+                return '{' + Object.keys(o).sort().map(function (k) { return JSON.stringify(k) + ':' + stable(o[k]); }).join(',') + '}';
+            }
+            return JSON.stringify(o === undefined ? null : o);
+        }
+        function fmtWhen(iso) {
+            if (!iso) return '';
+            try { return new Date(iso).toLocaleDateString(); } catch (_) { return String(iso).slice(0, 10); }
+        }
+
+        function attach(opts) {
+            opts = opts || {};
+            const TILE = String(opts.tile || '').toUpperCase();
+            const CUSTOM = typeof opts.capture === 'function' && typeof opts.restore === 'function';
+            const FILTER_SEL = opts.filterSelector ||
+                '.filter-row input[data-filter], .filter-row select[data-filter]';
+            const TOGGLES = (opts.toggles || []).slice();
+            const getSort = typeof opts.getSort === 'function' ? opts.getSort : function () { return null; };
+            const setSort = typeof opts.setSort === 'function' ? opts.setSort : function () {};
+            const apply = typeof opts.apply === 'function' ? opts.apply : function () {};
+            const SAVE_DEBOUNCE = 400;
+
+            let _state = null;          // DOM mode: live { filters, toggles, sort }
+            let _activeId = null;
+            let _booted = false;
+            let _timer = null, _lastWritten = null;
+            let _btn = null, _pop = null;
+            let _mode = null;           // null | 'saveas' | { rename: id }
+            let _draft = '';
+            let _msg = '', _msgOk = false;
+
+            // ---- my views: storage adapter ----
+            function settingsMap(key) {
+                let u = {};
+                try { u = Settings.getUser() || {}; } catch (_) {}
+                const m = u[key];
+                return (m && typeof m === 'object' && !Array.isArray(m)) ? m : {};
+            }
+            function setSettingsTile(key, value) {
+                const next = Object.assign({}, settingsMap(key));
+                if (value === undefined || value === null) delete next[TILE]; else next[TILE] = value;
+                Settings.setUserKey(key, next);
+            }
+            const store = opts.storage || {
+                load: function () {
+                    return { views: settingsMap('views')[TILE], defaultId: settingsMap('defaultView')[TILE] || null };
+                },
+                save: function (o) {
+                    setSettingsTile('views', o.views);
+                    setSettingsTile('defaultView', o.defaultId || null);
+                    try { return Settings.saveUser() !== false; } catch (_) { return false; }
+                }
+            };
+            // Older views carried filters/toggles/sort at the top level.
+            function norm(v) {
+                if (!v || !v.id) return null;
+                const state = v.state || { filters: v.filters || {}, toggles: v.toggles || {}, sort: v.sort || null };
+                return { id: String(v.id), name: String(v.name || 'Untitled'), state: state, updated: v.updated || '' };
+            }
+            function mine() {
+                let o = {};
+                try { o = store.load() || {}; } catch (_) {}
+                return { views: (Array.isArray(o.views) ? o.views : []).map(norm).filter(Boolean), defaultId: o.defaultId || null };
+            }
+            function saveMine(views, defaultId) {
+                let ok = false;
+                try { ok = store.save({ views: views, defaultId: defaultId || null }) !== false; } catch (_) { ok = false; }
+                if (!ok) setMsg('Couldn\'t save — your settings may be locked by an admin.');
+                return ok;
+            }
+
+            // ---- company views: FBLib.SharedData ----
+            function sharedKey() {
+                if (opts.sharedKey) return opts.sharedKey;
+                const id = report();
+                return id.key ? id.key + '.shared.v1' : null;
+            }
+            const SHARE_OK = opts.company !== false && !!sharedKey() && !!SharedData;
+            function isAdmin() { try { return !!SharedData.isAdmin(opts.alsoTrust); } catch (_) { return false; } }
+            function company() {
+                if (!SHARE_OK) return { views: [], defaultId: null };
+                let blob = {};
+                try { blob = SharedData.readJson(sharedKey(), {}, { alsoTrust: opts.alsoTrust }) || {}; } catch (_) {}
+                let e = blob.filterViews && blob.filterViews[TILE];
+                if (!e && typeof opts.legacyCompany === 'function') { try { e = opts.legacyCompany(blob); } catch (_) {} }
+                e = e || {};
+                return {
+                    views: (Array.isArray(e.views) ? e.views : []).map(norm).filter(Boolean),
+                    defaultId: e.defaultId || null, at: e.at || '', by: e.by || ''
+                };
+            }
+            function saveCompany(views, defaultId) {
+                if (!SHARE_OK || !isAdmin()) { setMsg('Only an administrator can change company views.'); return false; }
+                let ok = false;
+                try {
+                    const next = Object.assign({}, SharedData.readJson(sharedKey(), {}, { fresh: true, alsoTrust: opts.alsoTrust }) || {});
+                    next.filterViews = Object.assign({}, next.filterViews);
+                    next.filterViews[TILE] = {
+                        views: views, defaultId: defaultId || null,
+                        at: new Date().toISOString(), by: SharedData.currentUserName()
+                    };
+                    if (typeof opts.legacyCleanup === 'function') { try { opts.legacyCleanup(next); } catch (_) {} }
+                    ok = SharedData.writeJson(sharedKey(), next, { adminOnly: true, alsoTrust: opts.alsoTrust });
+                } catch (_) { ok = false; }
+                if (!ok) setMsg('Couldn\'t publish — the shared store didn\'t save. Check that fb-lib is current and runQuery is available.');
+                return ok;
+            }
+
+            function allViews() {
+                const m = mine().views.map(function (v) { v.company = false; return v; });
+                const c = company().views.map(function (v) { v.company = true; return v; });
+                return c.concat(m);
+            }
+            function findView(id) {
+                if (!id) return null;
+                return allViews().filter(function (v) { return v.id === id; })[0] || null;
+            }
+            function defaultView() {
+                return findView(mine().defaultId) || findView(company().defaultId) || null;
+            }
+            function setMsg(text, ok) { _msg = text || ''; _msgOk = !!ok; }
+
+            // ---- live state ----
+            function filterEls() { return Array.prototype.slice.call(document.querySelectorAll(FILTER_SEL)); }
+            function catalogPending() { return !(CfCatalog && CfCatalog.loaded); }
+            function readDom() {
+                const filters = {}, present = {};
+                filterEls().forEach(function (el) {
+                    const k = el.getAttribute('data-filter');
+                    present[k] = true;
+                    if (el.value) filters[k] = el.value;
+                });
+                // Custom-field filter inputs only appear once the CF catalog
+                // returns; carry their values across until then.
+                if (_state && _state.filters && catalogPending()) {
+                    Object.keys(_state.filters).forEach(function (k) {
+                        if (!present[k] && k.indexOf('cf_') === 0) filters[k] = _state.filters[k];
+                    });
+                }
+                const toggles = {};
+                TOGGLES.forEach(function (id) { const el = document.getElementById(id); if (el) toggles[id] = !!el.checked; });
+                let sort = null;
+                try {
+                    const s = getSort();
+                    if (s && s.col) sort = { col: String(s.col), dir: s.dir === 'desc' ? 'desc' : 'asc' };
+                } catch (_) {}
+                return { filters: filters, toggles: toggles, sort: sort };
+            }
+            function writeDom(state, withExtras) {
+                const f = (state && state.filters) || {};
+                filterEls().forEach(function (el) {
+                    const k = el.getAttribute('data-filter');
+                    el.value = (f[k] != null) ? f[k] : '';
+                });
+                if (!withExtras) return;
+                TOGGLES.forEach(function (id) {
+                    const el = document.getElementById(id);
+                    if (el && state.toggles && typeof state.toggles[id] === 'boolean') el.checked = state.toggles[id];
+                });
+                if (state.sort && state.sort.col) { try { setSort(state.sort); } catch (_) {} }
+            }
+            function live() {
+                if (CUSTOM) { try { return opts.capture(); } catch (_) { return {}; } }
+                return _state || {};
+            }
+            function canon(s) {
+                if (typeof opts.canon === 'function') { try { return String(opts.canon(s || {})); } catch (_) { return ''; } }
+                if (CUSTOM) return stable(s || {});
+                s = s || {};
+                const f = s.filters || {}, t = s.toggles || {};
+                return JSON.stringify({
+                    f: Object.keys(f).filter(function (k) { return f[k] !== '' && f[k] != null; }).sort()
+                        .map(function (k) { return [k, String(f[k])]; }),
+                    t: TOGGLES.map(function (id) { return !!t[id]; }),
+                    s: s.sort && s.sort.col ? [s.sort.col, s.sort.dir] : null
+                });
+            }
+            function isDirty() {
+                const v = findView(_activeId);
+                if (!v) return false;
+                if (typeof opts.matches === 'function') {
+                    try { return !opts.matches(v.state, live()); } catch (_) { return false; }
+                }
+                return canon(v.state) !== canon(live());
+            }
+
+            // ---- DOM mode: session memory (`persistFilters`) ----
+            function persistEnabled() {
+                if (CUSTOM) return false;
+                try { return !!Settings.resolve('persistFilters'); } catch (_) { return false; }
+            }
+            function persistShape() { return JSON.stringify([_state && _state.filters, _activeId, _state && _state.toggles, _state && _state.sort]); }
+            function schedulePersist() {
+                if (!persistEnabled()) return;
+                if (_timer) clearTimeout(_timer);
+                _timer = setTimeout(function () {
+                    _timer = null;
+                    const shape = persistShape();
+                    if (shape === _lastWritten) return;
+                    _lastWritten = shape;
+                    try {
+                        setSettingsTile('savedFilters', Object.assign({}, _state.filters));
+                        setSettingsTile('lastView', { id: _activeId, toggles: _state.toggles, sort: _state.sort });
+                        Settings.saveUser();
+                    } catch (_) {}
+                }, SAVE_DEBOUNCE);
+            }
+            function initialState() {
+                if (persistEnabled()) {
+                    const f = settingsMap('savedFilters')[TILE];
+                    const lv = settingsMap('lastView')[TILE] || {};
+                    const hasF = f && typeof f === 'object' && Object.keys(f).length > 0;
+                    if (hasF || lv.id || lv.sort || lv.toggles) {
+                        if (findView(lv.id)) _activeId = lv.id;
+                        return { filters: hasF ? f : {}, toggles: lv.toggles || null, sort: lv.sort || null };
+                    }
+                }
+                const dv = defaultView();
+                if (dv) { _activeId = dv.id; return clone(dv.state); }
+                return null;
+            }
+
+            // ---- lifecycle hooks ----
+            function beforeLoad() {
+                if (CUSTOM) return;
+                if (!_booted) {
+                    _booted = true;
+                    const init = initialState();
+                    if (init) {
+                        _state = { filters: Object.assign({}, init.filters || {}), toggles: init.toggles || {}, sort: init.sort || null };
+                        writeDom(init, true);
+                    }
+                    _state = readDom();
+                    _lastWritten = persistShape();
+                    render();
+                    return;
+                }
+                if (_state) writeDom(_state, false);
+            }
+            function changed() {
+                if (!CUSTOM) {
+                    if (!_booted) return;
+                    _state = readDom();
+                    schedulePersist();
+                }
+                render();
+            }
+            function detach() {
+                _activeId = null;
+                _mode = null;
+                if (!CUSTOM) _state = { filters: {}, toggles: (_state && _state.toggles) || {}, sort: _state && _state.sort };
+                render();
+            }
+            // CUSTOM mode: apply the starred default once the page is ready.
+            // Resolves true when a view was applied.
+            // CUSTOM mode, before the page's first query: mark the default view
+            // active and hand back its state for the page to apply itself —
+            // saves the second load that openDefault() would cost.
+            function adoptDefault() {
+                const dv = defaultView();
+                if (!dv) return null;
+                _activeId = dv.id;
+                render();
+                return clone(dv.state);
+            }
+            function openDefault() {
+                const dv = defaultView();
+                if (!dv) return Promise.resolve(false);
+                return loadView(dv.id).then(function () { return true; });
+            }
+
+            // ---- view operations ----
+            function loadView(id) {
+                const v = findView(id);
+                if (!v) return Promise.resolve();
+                _activeId = v.id;
+                _mode = null; setMsg('');
+                close();
+                if (CUSTOM) {
+                    let r;
+                    try { r = opts.restore(clone(v.state)); } catch (e) { try { console.warn('[FBLib.FilterViews] restore failed', e); } catch (_) {} }
+                    return Promise.resolve(r).then(function () { render(); });
+                }
+                _state = clone(v.state);
+                writeDom(_state, true);
+                apply();                                   // → changed(): persist + render
+                return Promise.resolve();
+            }
+            function stamp() { return new Date().toISOString(); }
+            function saveActive() {
+                const v = findView(_activeId);
+                if (!v) return;
+                const s = clone(live());
+                if (v.company) {
+                    if (!isAdmin()) return;
+                    if (!confirm('Update the company view "' + v.name + '" for everyone?')) return;
+                    const c = company();
+                    const list = c.views.map(function (x) { return x.id === v.id ? Object.assign({}, x, { state: s, updated: stamp() }) : x; });
+                    if (saveCompany(strip(list), c.defaultId)) setMsg('Updated for everyone.', true);
+                } else {
+                    const m = mine();
+                    const list = m.views.map(function (x) { return x.id === v.id ? Object.assign({}, x, { state: s, updated: stamp() }) : x; });
+                    saveMine(list, m.defaultId);
+                }
+                render();
+            }
+            function strip(list) {
+                return list.map(function (v) { return { id: v.id, name: v.name, state: v.state, updated: v.updated }; });
+            }
+            function saveAs(name) {
+                name = String(name || '').trim().slice(0, 60);
+                if (!name) { setMsg('Give the view a name.'); render(); return; }
+                const m = mine();
+                const lower = name.toLowerCase();
+                const same = m.views.filter(function (v) { return v.name.toLowerCase() === lower; })[0];
+                const s = clone(live());
+                let list = m.views.slice();
+                if (same) {
+                    if (!confirm('You already have a view named "' + same.name + '". Replace it?')) return;
+                    list = list.map(function (v) { return v.id === same.id ? Object.assign({}, v, { state: s, updated: stamp() }) : v; });
+                    _activeId = same.id;
+                } else {
+                    const nv = { id: newId('v'), name: name, state: s, updated: stamp() };
+                    list.push(nv);
+                    _activeId = nv.id;
+                }
+                _mode = null; _draft = '';
+                if (saveMine(strip(list), m.defaultId)) setMsg('');
+                schedulePersist();
+                render();
+            }
+            function renameView(v, name) {
+                name = String(name || '').trim().slice(0, 60);
+                _mode = null; _draft = '';
+                if (!name || name === v.name) { render(); return; }
+                if (v.company) {
+                    const c = company();
+                    saveCompany(strip(c.views.map(function (x) { return x.id === v.id ? Object.assign({}, x, { name: name }) : x; })), c.defaultId);
+                } else {
+                    const m = mine();
+                    saveMine(strip(m.views.map(function (x) { return x.id === v.id ? Object.assign({}, x, { name: name }) : x; })), m.defaultId);
+                }
+                render();
+            }
+            function deleteView(v) {
+                if (v.company) {
+                    if (!confirm('Delete "' + v.name + '" for EVERYONE?\n\nIt disappears from every user\'s list the next time ' +
+                                 'they open this report. Their own views are not touched.')) return;
+                    const c = company();
+                    if (saveCompany(strip(c.views.filter(function (x) { return x.id !== v.id; })),
+                                    c.defaultId === v.id ? null : c.defaultId)) setMsg('Deleted for everyone.', true);
+                } else {
+                    if (!confirm('Delete your view "' + v.name + '"?')) return;
+                    const m = mine();
+                    saveMine(strip(m.views.filter(function (x) { return x.id !== v.id; })), m.defaultId === v.id ? null : m.defaultId);
+                }
+                if (_activeId === v.id) _activeId = null;
+                schedulePersist();
+                render();
+            }
+            function toggleMyDefault(v) {
+                const m = mine();
+                saveMine(strip(m.views), m.defaultId === v.id ? null : v.id);
+                render();
+            }
+            function toggleCompanyDefault(v) {
+                const c = company();
+                if (saveCompany(strip(c.views), c.defaultId === v.id ? null : v.id)) {
+                    setMsg(c.defaultId === v.id ? 'No company default now.' : '"' + v.name + '" now opens by default for everyone ' +
+                        '(unless they\'ve starred their own).', true);
+                }
+                render();
+            }
+            function publish(v) {
+                const c = company();
+                const same = c.views.filter(function (x) { return x.name.toLowerCase() === v.name.toLowerCase(); })[0];
+                let list = c.views.slice();
+                if (same) {
+                    if (!confirm('A company view named "' + same.name + '" already exists. Replace it for everyone?')) return;
+                    list = list.map(function (x) { return x.id === same.id ? Object.assign({}, x, { state: clone(v.state), updated: stamp() }) : x; });
+                } else {
+                    if (!confirm('Publish "' + v.name + '" to everyone?\n\nIt appears under Company views for every user the ' +
+                                 'next time they open this report.')) return;
+                    list.push({ id: newId('c'), name: v.name, state: clone(v.state), updated: stamp() });
+                }
+                if (saveCompany(strip(list), c.defaultId)) setMsg('Published "' + v.name + '" for everyone.', true);
+                render();
+            }
+            function saveCopy(v) {
+                const m = mine();
+                let name = v.name;
+                const taken = function (n) { return m.views.some(function (x) { return x.name.toLowerCase() === n.toLowerCase(); }); };
+                if (taken(name)) { let i = 2; while (taken(name + ' (' + i + ')')) i++; name = name + ' (' + i + ')'; }
+                const nv = { id: newId('v'), name: name, state: clone(v.state), updated: stamp() };
+                if (saveMine(strip(m.views.concat([nv])), m.defaultId)) setMsg('Saved a copy as "' + name + '" in My views.', true);
+                render();
+            }
+
+            // ---- UI ----
+            function headerLabel(key) {
+                const th = document.querySelector('th[data-column="' + String(key).replace(/"/g, '\\"') + '"]');
+                if (!th) return key;
+                const t = (th.textContent || '').replace(/⇅|▲|▼|↑|↓/g, '').trim();
+                return t || th.getAttribute('title') || key;
+            }
+            function chip(text, cls, onRemove, title) {
+                return h('span', { className: 'fbfv-chip' + (cls ? ' ' + cls : ''), title: title || text }, [
+                    h('span', { text: text }),
+                    onRemove ? h('button', { type: 'button', title: 'Remove', text: '×', on: { click: onRemove } }) : null
+                ]);
+            }
+            function nowChips() {
+                if (typeof opts.chips === 'function') {
+                    let list = [];
+                    try { list = opts.chips() || []; } catch (_) {}
+                    return list.map(function (c) {
+                        return chip(c.text, c.hidden ? 'fbfv-hid' : '', c.remove ? function () { c.remove(); changed(); } : null, c.title);
+                    });
+                }
+                if (CUSTOM) {
+                    const d = describe(live());
+                    return d ? [h('div', { className: 'fbfv-sum', text: d })] : [];
+                }
+                const out = [];
+                filterEls().forEach(function (el) {
+                    if (!el.value) return;
+                    const key = el.getAttribute('data-filter');
+                    let shown = el.value;
+                    if (el.tagName === 'SELECT' && el.selectedIndex >= 0) shown = el.options[el.selectedIndex].text || el.value;
+                    const td = el.closest('td');
+                    const hidden = (td && td.style.display === 'none') || el.offsetParent === null;
+                    out.push(chip(headerLabel(key) + ': ' + shown + (hidden ? ' (hidden column)' : ''), hidden ? 'fbfv-hid' : '',
+                        function () { el.value = ''; apply(); },
+                        hidden ? 'This column is hidden but its filter still applies' : null));
+                });
+                TOGGLES.forEach(function (id) {
+                    const el = document.getElementById(id);
+                    if (!el || !el.checked) return;
+                    const lab = el.closest('label');
+                    out.push(chip((lab && lab.textContent.trim()) || id, '', function () { el.checked = false; apply(); }));
+                });
+                const s = _state && _state.sort;
+                if (s && s.col) out.push(chip('Sort: ' + headerLabel(s.col) + (s.dir === 'desc' ? ' ↓' : ' ↑'), 'fbfv-sort', null));
+                return out;
+            }
+            function describe(state) {
+                if (typeof opts.describe !== 'function') return '';
+                try { return String(opts.describe(state) || ''); } catch (_) { return ''; }
+            }
+            function nameInput(initial, onOk) {
+                const inp = h('input', {
+                    className: 'fbfv-in', type: 'text', maxlength: '60', placeholder: 'View name',
+                    on: {
+                        input: function (e) { _draft = e.target.value; },
+                        keydown: function (e) {
+                            if (e.key === 'Enter') { e.preventDefault(); onOk(inp.value); }
+                            else if (e.key === 'Escape') { e.stopPropagation(); _mode = null; _draft = ''; render(); }
+                        }
+                    }
+                });
+                inp.value = initial || '';
+                setTimeout(function () { try { inp.focus(); inp.select(); } catch (_) {} }, 0);
+                return inp;
+            }
+            function viewRow(v, ctx) {
+                if (_mode && _mode.rename === v.id) {
+                    const inp = nameInput(_draft || v.name, function (val) { renameView(v, val); });
+                    return h('div', { className: 'fbfv-row' }, [inp,
+                        glyph('✓', 'Save name', function () { renameView(v, inp.value); })]);
+                }
+                const isMyDef = ctx.myDef === v.id;
+                const kids = [
+                    glyph(isMyDef ? '★' : '☆', isMyDef ? 'Opens by default for you — click to unset' : 'Open this view by default (just me)',
+                        function () { toggleMyDefault(v); }, isMyDef ? 'fbfv-on' : ''),
+                    h('div', { className: 'fbfv-main', title: 'Switch to "' + v.name + '"', on: { click: function () { loadView(v.id); } } }, [
+                        h('div', { className: 'fbfv-name' }, [v.name,
+                            (v.company && ctx.coDef === v.id) ? h('span', { className: 'fbfv-tag', text: 'default' }) : null]),
+                        describe(v.state) ? h('div', { className: 'fbfv-meta', text: describe(v.state) }) : null
+                    ])
+                ];
+                if (v.company) {
+                    if (ctx.admin) {
+                        const isCoDef = ctx.coDef === v.id;
+                        kids.push(icon('everyone', isCoDef ? 'Default for everyone — click to unset' : 'Open by default for everyone',
+                            function () { toggleCompanyDefault(v); }, 'fbfv-all' + (isCoDef ? ' fbfv-on' : '')));
+                        kids.push(icon('rename', 'Rename for everyone', function () { _mode = { rename: v.id }; _draft = v.name; render(); }));
+                        kids.push(glyph('×', 'Delete for everyone', function () { deleteView(v); }, 'fbfv-del'));
+                    } else {
+                        kids.push(icon('copy', 'Save a copy to My views (to edit it)', function () { saveCopy(v); }));
+                    }
+                } else {
+                    if (ctx.admin && SHARE_OK) kids.push(icon('publish', 'Publish for everyone', function () { publish(v); }));
+                    kids.push(icon('rename', 'Rename', function () { _mode = { rename: v.id }; _draft = v.name; render(); }));
+                    kids.push(glyph('×', 'Delete', function () { deleteView(v); }, 'fbfv-del'));
+                }
+                return h('div', { className: 'fbfv-row' + (v.id === _activeId ? ' fbfv-act' : '') }, kids);
+            }
+            function renderPop() {
+                if (!_pop) return;
+                const m = mine(), c = company(), admin = isAdmin();
+                const active = findView(_activeId);
+                const dirty = isDirty();
+                const ctx = { admin: admin, myDef: m.defaultId, coDef: c.defaultId };
+                _pop.innerHTML = '';
+
+                _pop.appendChild(h('div', { className: 'fbfv-head' }, [
+                    h('span', { text: 'Saved views' }),
+                    h('button', { type: 'button', className: 'fbfv-x', title: 'Close', 'aria-label': 'Close', text: '×', on: { click: close } })
+                ]));
+                const body = h('div', { className: 'fbfv-body' });
+                _pop.appendChild(body);
+
+                // What's on screen now.
+                const chips = nowChips();
+                const canSave = !!active && dirty && (!active.company || admin);
+                body.appendChild(h('div', { className: 'fbfv-sec' }, [
+                    h('div', { className: 'fbfv-lbl' }, [document.createTextNode('Showing now')]),
+                    h('div', { className: 'fbfv-cur' }, active
+                        ? [active.name, active.company ? h('span', { className: 'fbfv-tag', text: 'company' }) : null,
+                           dirty ? h('span', { className: 'fbfv-mod', text: 'modified' }) : null]
+                        : [h('span', { className: 'fbfv-none', text: 'No saved view' })]),
+                    h('div', { className: 'fbfv-chips' }, chips.length ? chips : [h('span', { className: 'fbfv-none', text: 'No filters' })]),
+                    _mode === 'saveas'
+                        ? h('div', { className: 'fbfv-acts' }, (function () {
+                            const inp = nameInput(_draft, saveAs);
+                            return [inp,
+                                h('button', { type: 'button', className: 'fbfv-b fbfv-pri', text: 'Save', on: { click: function () { saveAs(inp.value); } } }),
+                                h('button', { type: 'button', className: 'fbfv-b', text: 'Cancel', on: { click: function () { _mode = null; _draft = ''; render(); } } })];
+                        })())
+                        : h('div', { className: 'fbfv-acts' }, [
+                            active ? h('button', {
+                                type: 'button', className: 'fbfv-b fbfv-pri', disabled: !canSave,
+                                title: !dirty ? 'No changes to save'
+                                    : (active.company && !admin) ? 'Company views can\'t be changed — use Save as new'
+                                    : (active.company ? 'Update "' + active.name + '" for everyone' : 'Overwrite "' + active.name + '"'),
+                                text: active.company && admin ? 'Save for everyone' : 'Save', on: { click: saveActive }
+                            }) : null,
+                            h('button', { type: 'button', className: 'fbfv-b' + (active ? '' : ' fbfv-pri'), text: 'Save as new…',
+                                on: { click: function () { _mode = 'saveas'; _draft = ''; setMsg(''); render(); } } })
+                        ])
+                ]));
+
+                // Company views — shown when there are any, or to an admin.
+                if (SHARE_OK && (c.views.length || admin)) {
+                    const who = c.at ? 'by ' + (c.by || '?') + ', ' + fmtWhen(c.at) : '';
+                    body.appendChild(h('div', { className: 'fbfv-sec' }, [
+                        h('div', { className: 'fbfv-lbl' }, [document.createTextNode('Company views'), admin && who ? h('span', { text: who }) : null])
+                    ].concat(c.views.length ? c.views.map(function (v) { v.company = true; return viewRow(v, ctx); })
+                        : [h('div', { className: 'fbfv-none', text: 'None yet — publish one of your views with the ↑ button.' })])));
+                }
+
+                body.appendChild(h('div', { className: 'fbfv-sec' }, [
+                    h('div', { className: 'fbfv-lbl' }, [document.createTextNode('My views')])
+                ].concat(m.views.length ? m.views.map(function (v) { v.company = false; return viewRow(v, ctx); })
+                    : [h('div', { className: 'fbfv-none', text: 'None yet — set your filters, then Save as new.' })])));
+
+                if (_msg) _pop.appendChild(h('div', { className: 'fbfv-msg' + (_msgOk ? ' fbfv-ok' : ''), text: _msg }));
+                _pop.appendChild(h('div', { className: 'fbfv-foot',
+                    text: admin ? '☆ opens by default for you · ↑ publishes for everyone.' : '☆ opens by default. Views are saved to your Fishbowl user.' }));
+            }
+            function render() {
+                if (!_btn) return;
+                const v = findView(_activeId);
+                const dirty = isDirty();
+                _btn.classList.toggle('fbfv-on', !!v);
+                _btn.classList.toggle('fbfv-dirty', dirty);
+                _btn.title = v ? ('View: ' + v.name + (dirty ? ' (modified)' : '')) : 'Saved views';
+                if (_pop && !_pop.hidden) renderPop();
+            }
+            function open() {
+                if (!_pop) return;
+                setMsg('');
+                if (SHARE_OK) { try { SharedData.invalidate(sharedKey()); } catch (_) {} }
+                _pop.hidden = false;
+                renderPop();
+            }
+            function close() { if (!_pop) return; _pop.hidden = true; _mode = null; _draft = ''; }
+
+            function mount() {
+                const host = typeof opts.mount === 'string' ? document.getElementById(opts.mount) : opts.mount;
+                if (!host) return;
+                injectCss();
+                _btn = h('button', { type: 'button', className: 'fbfv-btn', title: 'Saved views', 'aria-haspopup': 'true' });
+                _btn.innerHTML = ICON_BTN;
+                _pop = h('div', { className: 'fbfv-pop', hidden: true });
+                const wrap = h('span', { className: 'fbfv-wrap' }, [_btn, _pop]);
+                host.innerHTML = '';
+                host.appendChild(wrap);
+                _btn.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                    if (_pop.hidden) open(); else close();
+                });
+                // Outside click / Escape close it. confirm() dialogs fire no
+                // mousedown on the page, so they don't close it mid-action.
+                document.addEventListener('mousedown', function (e) {
+                    if (!_pop.hidden && !wrap.contains(e.target)) close();
+                });
+                document.addEventListener('keydown', function (e) {
+                    if (e.key === 'Escape' && !_pop.hidden) close();
+                });
+            }
+
+            mount();
+            render();
+            return {
+                beforeLoad: beforeLoad,
+                changed: changed,
+                detach: detach,
+                openDefault: openDefault,
+                adoptDefault: adoptDefault,
+                open: open,
+                close: close,
+                get activeView() { return findView(_activeId); }
+            };
+        }
+
+        return { attach: attach };
+    })();
+
     return {
+        BUILD: BUILD,
+        report: report,
         Common: Common,
         SharedData: SharedData,
         Export: Export,
@@ -3378,6 +4224,7 @@ window.FBLib = (function () {
         CfCols: CfCols,
         Columns: Columns,
         Picker: Picker,
-        Table: Table
+        Table: Table,
+        FilterViews: FilterViews
     };
 })();

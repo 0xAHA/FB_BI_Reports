@@ -1619,6 +1619,8 @@ function psOrderMoRowsByChain(items, deps) {
   };
 
   global.FBMfg = {
+    // Build stamp, maintained by tools/stamp/stamp.js - never edit by hand.
+    BUILD: '2026.09.24-46e47b9',   // @fb-build
     Finisher: Finisher,
     Scrap: Scrap,
     Staging: Staging,
