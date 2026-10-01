@@ -30,11 +30,13 @@ and `saveSettings`. [CLAUDE.md](CLAUDE.md) documents the full API.
 
 These folders are not production:
 
-- `archived/`
-- `Manufacturing/Archived/`
+- `archived/`: superseded versions kept for comparison and bug checks (see its README)
+- `Manufacturing/Archived/`: earlier Production Scheduling and Gantt versions
 - `Manufacturing/Temp/`
 - `mockups/`
-- `Other_NOT_FOR_PRODUCTION/`
+- `Other_NOT_FOR_PRODUCTION/`: helper tools, prototypes, probes and sample data (see its README)
+
+Project skills for Claude Code live in `.claude/skills/`.
 
 ## Shared assets
 

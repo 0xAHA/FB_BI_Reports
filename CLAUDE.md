@@ -149,6 +149,8 @@ Every report should start from this skeleton:
 - SQL queries are **read-only** — only `SELECT` is allowed
 - All built-in functions (listed below) are synchronous except `runQueryAsync`, which returns a `Promise`
 - The report runs in the context of the logged-in user — `getUser()`, `hasUserAccess()`, and `getLocationGroupList()` all reflect that user's account
+- **Async loads can overlap.** If a filter changes while a query is in flight, the older result can arrive last and paint over the newer one. Capture a token before each `await` and drop the result when a newer load has started (`ctx.stale()` in `Dashboards/Sales_Dashboard_v1.2.htm`'s `doRender` is the pattern).
+- **There are no browser dev tools in the client.** Debug through an in-page console (`FBLib.Common.mountDebugDrawer` / `debugLog`); a local run checks syntax and logic, not runtime behaviour.
 
 ---
 
@@ -518,6 +520,22 @@ The full REST API documentation (available endpoints, request/response shapes, f
 
 > **Note for AI assistants:** These docs are rendered by a JavaScript SPA and cannot be read by most AI tools. Fetching the URL only returns an empty HTML shell — the actual content never loads. To get AI help writing `runRestApiAsync` calls, **copy and paste the relevant endpoint documentation from that page directly into your prompt**. The AI can then use the exact paths, parameter names, and response shapes you provide.
 
+### Legacy API requests (writes REST doesn't cover)
+
+Some writes only exist as legacy API requests (`SaveWorkOrderRq`, `SavePickRq`,
+`ImportRq`, …). Reports reach them in two ways, both in production use:
+
+- **`runApiRequest(name, jsonString)`** — synchronous bridge over the client's
+  own session. Pass the un-enveloped request, e.g. `{"GetWorkOrderRq":{…}}`;
+  the result is a JSON string parsing to `{"GetWorkOrderRs":{"statusCode":1000,…}}`.
+  It **blocks the UI thread**.
+- **`runRestApiAsync({ method: 'POST', path: '/api/legacy/external/' + name, body: JSON.stringify({ [name]: payload }) })`**
+  — async. The response wraps the result in `FbiJson.FbiMsgsRs`.
+
+Either way, success is `statusCode === 1000` on the `…Rs` object. Check for
+an `ErrorRs` first, and surface its `statusMessage` / `Message` rather than a
+generic failure.
+
 ---
 
 ### Persistent Storage
@@ -525,7 +543,7 @@ The full REST API documentation (available endpoints, request/response shapes, f
 These two pairs let your report save and load data between sessions.
 
 #### `saveReportData(data)` / `loadReportData()`
-Saves/loads arbitrary data tied to this specific report. Only works on saved reports (not the editor preview).
+Saves/loads arbitrary data tied to this specific report. Only works on saved reports (not the editor preview). Called in preview they raise a native dialog, "Save Report Error — Loading data is only available on reports", that `try/catch` cannot suppress. The project skill `.claude/skills/fishbowl-bi-save-error` walks through the fix (usually `FBLib.Settings` with `masterStorage: 'userProperties'` or `'none'`).
 
 ```js
 saveReportData(JSON.stringify({ lastFilter: "active" }));
@@ -568,6 +586,7 @@ const lg = loadSettings("myReport_locationGroup");
 | `getAutoMo` | Auto MO wizard data |
 | `runPickStatusHelper` | Recalculate pick status |
 | `runRestApiAsync` | Make async REST API calls to the Fishbowl server |
+| `runApiRequest` | Synchronous legacy API request (`SaveWorkOrderRq`, `ImportRq`, …) |
 | `saveReportData` / `loadReportData` | Persist data per report |
 | `saveSettings` / `loadSettings` | Persist settings per user |
 
@@ -623,6 +642,10 @@ Simple join views (no aggregation) use the MERGE algorithm and are safe to filte
 - **Transfer Orders use the table `xo`** — not `to`, which is a reserved SQL word.
 - **FK naming convention** — a field named `fooId` is almost always a FK to `foo.id`. e.g. `customerId` → `customer.id`, `locationGroupId` → `locationgroup.id`. Exceptions and the full pattern are documented in `schema-index.md`.
 - **Result column keys are always lowercase** — `row.statusid`, not `row.statusId`; `row.totalprice`, not `row.totalPrice`. This applies regardless of how you write column names or aliases in the SQL.
+- **Start every query with `SELECT`.** A bare top-level `WITH` is rejected; wrap it as `SELECT * FROM (WITH … SELECT …) AS t`. Prefer derived tables to CTEs anyway — CTEs can re-plan badly, and a recursive CTE roll-up has hung the Fishbowl client.
+- **Correlated `EXISTS (…)` over big tables can be slow** — a `JOIN (SELECT DISTINCT col FROM big …)` is often much faster.
+- **Scope `tag` scans to the parts you need** (`AND tag.partid IN (…)`): an unscoped tag aggregate took 1.7 s where the scoped one took 8 ms.
+- **`bit(1)` columns** (`activeFlag`, `defaultFlag`, `countedAsAvailable`, `trackingFlag`, …) come back from `runQuery` as the raw byte rendered as a one-character string, so neither `=== 1` nor truthiness works. Cast in SQL — `SELECT activeflag+0 AS activeflag` — or compare `v.charCodeAt(0) === 1`. Never compare against a literal control character: Fishbowl strips 0x00–0x1F from inline scripts when the report is saved.
 
 ---
 

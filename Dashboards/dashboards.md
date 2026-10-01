@@ -14,9 +14,10 @@ wiki pages.
 | Inventory | `Inventory_Dashboard_v1.2.htm` | `- Dashboards - Inventory v1.2` | `cdx.bi.invdash` |
 | Purchasing | `Purchasing_Dashboard_v1.2.htm` | `- Dashboard - Purchasing v1.2` | `cdx.bi.purchdash` |
 
-`Sales_Dashboard.htm`, `Inventory_Dashboard.htm` and `Purchasing_Dashboard.htm`
-are the older fixed-layout versions. `Sales_Dashboard_DragDrop.htm` and
-`Sales_Dashboard_Grid_POC.htm` are prototypes of the Sales v1.2 dashboard.
+The older fixed-layout versions (`Sales_Dashboard.htm`,
+`Inventory_Dashboard.htm`, `Purchasing_Dashboard.htm`) and the Sales v1.2
+prototypes (`Sales_Dashboard_DragDrop.htm`, `Sales_Dashboard_Grid_POC.htm`)
+are kept in `archived/Dashboards/` for comparison.
 
 ---
 
