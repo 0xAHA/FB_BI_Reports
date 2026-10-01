@@ -169,8 +169,46 @@ Notes on specific tiles:
   revenue.
 - **High Value Orders** lists orders over $10k.
 
-**Drill-downs:** Customer, Month, Category, Customer Group, Salesperson,
-Product, and New/Repeat.
+**Drill-downs:** Customer, period (a trend week or month), Category,
+Customer Group, Salesperson, Product, and New/Repeat.
+
+**Revenue & Margin Trend.**
+- **Buckets.** A range of 6 months or less is drawn in weeks, a longer one in
+  calendar months.
+- **Axes.** Both are sized from the data:
+  - Revenue always includes zero.
+  - Margin is held to −100%…100%; a value beyond that sits on the edge as ▲ or
+    ▼, and the tooltip shows the real figure.
+  - A period with no revenue has no margin and leaves a gap in the line.
+- **Legend.** Click an entry to hide that series.
+
+**Compare.** The **Compare** chip in the filter strip (also the Off / Prev / LY
+buttons on the trend tile) is one dashboard-wide setting:
+
+- **Off** is the default.
+- **Previous period** is the equal-length range just before.
+- **Same period last year** is the same dates one year earlier.
+
+While Compare is on:
+
+- **KPI tiles and badges** show the change (▲/▼ %, or points for margin).
+- **The trend chart** draws the comparison bars beside each bar, with a faint
+  comparison margin line and a summary line on top.
+- **Monthly Revenue Table and Customer Revenue Table** add comparison revenue,
+  revenue change and margin change.
+- **Top Customers by Revenue, Top Salespeople and Top Products by Revenue**
+  label each bar with its change ("new" when there was none).
+
+Saved and published with the rest of the filter state.
+
+**Loading.** Comparison data never delays the first paint. Every tile draws
+its own figures first; the comparison pass (`runComparePass`) runs only once
+no primary render is queued or running. It then re-draws the
+comparison-aware tiles from cached data plus the comparison queries.
+
+- **Compare off:** nothing extra is queried, except the previous-period query
+  behind **Revenue vs Prior** (tile and badge), which also waits for that
+  pass.
 
 **How margin is calculated.** Margins follow Fishbowl's Margins report
 (`SalesOrder/marginsreport.jrxml`):

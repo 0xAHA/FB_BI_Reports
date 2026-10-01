@@ -19,7 +19,7 @@
       window.FB_REPORT = {
           key:   'cdx.bi.salesdash',
           name:  '- Dashboard - Sales v1.2',
-          build: '2026.10.01-a0ca27b'     // @fb-build
+          build: '2026.10.01-d516723'     // @fb-build
       };
   </script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -163,6 +163,11 @@
     .ts-sw.line, .ts-sw.dash, .ts-sw.dots { height: 0; border-radius: 0; background: none; border-top: 2px solid var(--c); }
     .ts-sw.dash { border-top-style: dashed; }
     .ts-sw.dots { border-top-style: dotted; }
+    .ts-sum { flex-basis: 100%; font-size: 11px; color: var(--c-secondary); }
+    .ts-sum b { color: var(--c-primary); font-weight: 700; }
+    /* Comparison deltas (tables, trend summary, badges) */
+    .dlt { font-size: 10.5px; font-weight: 700; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .kpi-badge-dlt { font-size: 9.5px; font-weight: 700; white-space: nowrap; }
 
     .info-icon-btn { width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; border: none; border-radius: 4px; background: transparent; color: var(--c-tertiary); cursor: help; flex-shrink: 0; transition: color .15s, background .15s; padding: 0; }
     .info-icon-btn:hover { color: var(--fb-blue); background: var(--bg-1); }
@@ -408,6 +413,7 @@
         <b>Filters &amp; data</b>
         <ul style="padding-left:18px; margin:6px 0; line-height:1.6;">
           <li>The filter strip applies to every widget — date range plus customer group, customer, category, salesperson and margin tier (the margin tier keeps order lines whose own margin is in that tier)</li>
+          <li><b>Compare</b> (filter strip, or Off / Prev / LY on the trend tile) adds the previous period or the same period last year to the KPIs and badges, the trend chart (comparison bars sit beside each bar), the revenue tables, and the Top Customers / Sales People / Products bars. It is off by default and always loads after everything else</li>
           <li>Margins follow the Fishbowl Margins report: (revenue − cost) ÷ revenue over all lines in the group, credits included; shipping, tax, subtotal and note lines are left out</li>
           <li>Click a <b>Top Customers</b> bar or an order number to drill into the underlying orders</li>
           <li>Categories show their full Product Tree path — set the roll-up depth in <b>Settings ▸ Product categories ▸ Category level</b>; admins publish it as the org default with <b>Publish</b></li>
@@ -721,7 +727,8 @@ function dashUserEditingAllowed() {
 const F = {
   datePreset: 'current_fy',
   customStart: '', customEnd: '',
-  customerGroup: [], customer: [], productCategory: [], salesperson: [], margin: []
+  customerGroup: [], customer: [], productCategory: [], salesperson: [], margin: [],
+  compare: 'off'   // 'off' | 'prior' | 'yoy' — see COMPARE_MODES
 };
 const SD_RANGES = [
   ['today','Today'], ['this_week','This Week'], ['this_month','This Month'], ['last_month','Last Month'],
@@ -789,6 +796,45 @@ function getPriorDateRange() {
     start: s.clone().subtract(days, 'days').format('YYYY-MM-DD'),
     end:   s.clone().subtract(1, 'days').format('YYYY-MM-DD')
   };
+}
+
+// ── Compare (dashboard-wide) ─────────────────────────────────
+// One setting, F.compare, drives every comparison on the dashboard: the KPI
+// tiles and badges, the Revenue & Margin Trend, the revenue tables, the Top
+// Customers / Sales People / Products bars, the Profit Bridge and Growth vs
+// Margin tiles. It is Off by default, so a first load runs no comparison
+// queries, and when it is on the comparison is always drawn in a second
+// pass, after every tile has its own figures (runComparePass).
+const COMPARE_MODES = [
+  { v: 'off',   label: 'Off',                   chip: 'Compare',            short: '' },
+  { v: 'prior', label: 'Previous period',       chip: 'vs Previous period', short: 'Previous period' },
+  { v: 'yoy',   label: 'Same period last year', chip: 'vs Last year',       short: 'Last year' }
+];
+
+function getCompareRange(mode = F.compare) {
+  if (!mode || mode === 'off') return null;
+  const cur = getDateRange();
+  if (!cur.start || !cur.end) return null;
+  if (mode === 'prior') return getPriorDateRange();
+  return { start: moment(cur.start).subtract(1, 'year').format('YYYY-MM-DD'),
+           end:   moment(cur.end).subtract(1, 'year').format('YYYY-MM-DD') };
+}
+function compareOn() { return !!getCompareRange(); }
+function compareShort() { return (COMPARE_MODES.find(m => m.v === F.compare) || {}).short || 'Comparison'; }
+function rangeText(r) { return r ? moment(r.start).format('D MMM YY') + ' – ' + moment(r.end).format('D MMM YY') : ''; }
+
+// Change in % of the base (null when there is no base to compare against).
+function deltaPct(cur, base) {
+  cur = parseFloat(cur || 0); base = parseFloat(base || 0);
+  return base ? ((cur - base) / Math.abs(base)) * 100 : null;
+}
+// ▲12.4% / ▼3.2 pts, green when it moved the good way (invert: down is good,
+// e.g. cost); a grey dash when there is no base.
+function deltaHtml(v, unit = '%', invert = false, title = '') {
+  const t = title ? ` title="${escHtml(title)}"` : '';
+  if (v == null || !isFinite(v)) return `<span class="dlt"${t} style="color:#8FA1A7;">—</span>`;
+  const good = invert ? v <= 0 : v >= 0;
+  return `<span class="dlt"${t} style="color:${good ? DS.success : DS.negative};">${v >= 0 ? '▲' : '▼'}${Math.abs(v).toFixed(1)}${unit === 'pts' ? ' pts' : '%'}</span>`;
 }
 
 function updateDateDisplay() {
@@ -1279,15 +1325,29 @@ const Q = {
     return runQueryLogged('KPIs', sql);
   }),
 
-  monthly: () => qget('monthly', () => {
-    const sql = `SELECT DATE_FORMAT(PostSo.DateCreated,'%Y-%m-01') as month, SUM(${REV_EXPR}) as revenue, SUM(PostSoItem.PostedTotalCost) as cogs, ${MARGIN_AGG} as avg_margin ${BASE_JOIN} ${buildFilterConditions()} GROUP BY month ORDER BY month ASC`;
-    return runQueryLogged('Monthly Revenue', sql);
-  }),
 
   // Weekly or monthly buckets for the trend chart (see trendGrain).
   trend: () => qget('trend', () => {
     const r = trendRange();
     return bucketTotals('Revenue & Margin Trend', r, trendGrain(r));
+  }),
+  // The comparison range in the CURRENT range's grain, so bucket i matches.
+  trendCompare: () => qget('trendCmp:' + F.compare, () => {
+    const r = getCompareRange();
+    return r ? bucketTotals('Revenue & Margin Trend (comparison)', r, trendGrain(trendRange())) : Promise.resolve(null);
+  }),
+  monthBuckets: () => qget('monthBuckets', () => bucketTotals('Monthly Revenue Table', trendRange(), 'month')),
+  monthBucketsCompare: () => qget('monthBucketsCmp:' + F.compare, () => {
+    const r = getCompareRange();
+    return r ? bucketTotals('Monthly Revenue Table (comparison)', r, 'month') : Promise.resolve(null);
+  }),
+
+  // Comparison-range KPIs. "Previous period" is exactly kpisPrior, so reuse it.
+  kpisCompare: () => F.compare === 'prior' ? Q.kpisPrior() : qget('kpisCmp:' + F.compare, () => {
+    const r = getCompareRange();
+    if (!r) return Promise.resolve([]);
+    const sql = `SELECT SUM(${REV_EXPR}) as total_revenue, SUM(PostSoItem.PostedTotalCost) as total_cogs, COUNT(DISTINCT So.Num) as order_count, ${MARGIN_AGG} as avg_margin ${BASE_JOIN} ${buildFilterConditions(rangeCond(r))}`;
+    return runQueryLogged('KPIs (comparison)', sql);
   }),
 
   topCustomers: () => qget('topCustomers', () => {
@@ -1408,6 +1468,21 @@ const Q = {
   })
 };
 
+// Comparison-range revenue and cost for the keys a tile is already showing
+// (customers, sales people, products) → Map(String(key) → {revenue, cogs}).
+// cacheKey names the tile's list; the keys come from its cached current data.
+function cmpByKey(cacheKey, keyExpr, keys, quoted) {
+  return qget(`cmp:${cacheKey}:${F.compare}`, async () => {
+    const r = getCompareRange();
+    const vals = [...new Set((keys || []).filter(k => k != null && k !== ''))];
+    if (!r || !vals.length) return new Map();
+    const list = vals.map(k => quoted ? `'${escSQL(k)}'` : (parseInt(k, 10) || 0)).join(',');
+    const sql = `SELECT ${keyExpr} as k, SUM(${REV_EXPR}) as revenue, SUM(PostSoItem.PostedTotalCost) as cogs ${BASE_JOIN} ${buildFilterConditions(rangeCond(r))} AND ${keyExpr} IN (${list}) GROUP BY ${keyExpr}`;
+    const rows = await runQueryLogged(`Comparison (${cacheKey})`, sql);
+    return new Map(rows.map(x => [String(x.k), { revenue: parseFloat(x.revenue || 0), cogs: parseFloat(x.cogs || 0) }]));
+  });
+}
+
 // ============================================================
 // 7.  TOOLTIP
 // ============================================================
@@ -1459,29 +1534,37 @@ function _kpiCompute(kpiKey, k) {
   return { raw, val, label, color, tone, full };
 }
 
-async function renderKPI(el, kpiKey, cfg = {}) {
-  debugLog(`Rendering KPI: ${kpiKey}${cfg.withPriorDelta?' (with prior delta)':''}`, 'info');
-  renderSkeleton(el);
-  const [curRows, priorRows] = await Promise.all([
+// Change of one KPI against its comparison row, as a .kpi-delta span: % for
+// amounts and counts (cost going up is the bad direction), points for margin.
+function kpiDeltaHtml(kpiKey, curRow, baseRow, cls, rangeR) {
+  const cur = _kpiCompute(kpiKey, curRow || {}), base = _kpiCompute(kpiKey, baseRow || {});
+  const title = rangeR ? 'vs ' + rangeText(rangeR) + ': ' + base.full : '';
+  const html = kpiKey === 'avgmargin'
+    ? deltaHtml(parseFloat((baseRow || {}).total_revenue || 0) > 0 ? (cur.raw - base.raw) * 100 : null, 'pts', false, title)
+    : deltaHtml(deltaPct(cur.raw, base.raw), '%', kpiKey === 'cogs', title);
+  return html.replace('class="dlt"', `class="${cls}"`);
+}
+
+async function renderKPI(el, kpiKey, cfg = {}, ctx = {}) {
+  // Revenue vs Prior always compares with the previous period; every other KPI
+  // compares only while Compare is on. Either way the delta arrives in the
+  // comparison pass (ctx.compare) — the primary render is the figure alone.
+  const wantPrior = !!cfg.withPriorDelta;
+  const wantCmp   = !wantPrior && compareOn();
+  const withDelta = !!ctx.compare && (wantPrior || wantCmp);
+  debugLog(`Rendering KPI: ${kpiKey}${withDelta ? ' (with comparison)' : ''}`, 'info');
+  if (!ctx.compare) renderSkeleton(el);
+  const [curRows, baseRows] = await Promise.all([
     Q.kpis(),
-    cfg.withPriorDelta ? Q.kpisPrior() : Promise.resolve([])
+    withDelta ? (wantPrior ? Q.kpisPrior() : Q.kpisCompare()) : Promise.resolve([])
   ]);
+  if (ctx.stale && ctx.stale()) return null;
   const cur = _kpiCompute(kpiKey, curRows[0] || {});
 
   // Delta sits inline next to the value, so all KPI tiles share the same vertical footprint.
   let deltaInline = '';
-  if (cfg.withPriorDelta) {
-    const prior = _kpiCompute(kpiKey, priorRows[0] || {});
-    if (prior.raw !== 0 && !isNaN(prior.raw)) {
-      const pct   = ((cur.raw - prior.raw) / Math.abs(prior.raw)) * 100;
-      const up    = pct >= 0;
-      const arrow = up ? '▲' : '▼';
-      const dCol  = up ? DS.success : DS.negative;
-      deltaInline = `<span class="kpi-delta" style="color:${dCol};">${arrow}${Math.abs(pct).toFixed(1)}%</span>`;
-    } else {
-      deltaInline = `<span class="kpi-delta" style="color:#8FA1A7;">—</span>`;
-    }
-  }
+  if (withDelta) deltaInline = kpiDeltaHtml(kpiKey, curRows[0], baseRows[0], 'kpi-delta', wantPrior ? getPriorDateRange() : getCompareRange());
+  else if (wantPrior) deltaInline = `<span class="kpi-delta" style="color:#8FA1A7;">…</span>`;
 
   debugLog(`KPI ${kpiKey}: ${cur.val}`, 'success');
   // Shared icon-chip anatomy (fb-styles §28): chip carries the tone,
@@ -1510,7 +1593,8 @@ const TS_COLORS = { 'rev-cur': DS.blue, 'rev-cmp': '#9FCBEA', 'mg-cur': DS.warni
 // read −1,000% and would flatten every other point, so a value past the
 // floor is drawn on the edge as ▼ and the tooltip gives the real figure.
 // When either axis goes negative both zero lines are put at the same height
-// (one shared baseline), unless one axis is mostly below zero.
+// (one shared baseline) — but only while the negative part is under a third
+// of either axis; past that, sharing would squash the bars into half the height.
 function trendAxes(series, ih) {
   const revs = series.flatMap(s => s.data.map(b => b.revenue));
   const mgs  = series.flatMap(s => s.data.map(b => b.margin)).filter(v => v != null);
@@ -1527,7 +1611,7 @@ function trendAxes(series, ih) {
   const fr = rLo < 0 ? -rLo / (rHi - rLo) : 0;
   const fm = mLo < 0 ? -mLo / (mHi - mLo) : 0;
   const f  = Math.max(fr, fm);
-  if (f > 0 && f <= 0.5 && rHi > 0) {
+  if (f > 0 && f <= 1 / 3 && rHi > 0) {
     rLo = -f / (1 - f) * rHi;
     mLo = -f / (1 - f) * mHi;
   }
@@ -1550,8 +1634,14 @@ async function renderTimeSeries(el, cfg, ctx = {}) {
   const mode = (cfg && cfg.chartType) || 'bar';
   debugLog(`Rendering Revenue & Margin Trend (mode: ${mode})`, 'info');
   if (!ctx.compare) renderSkeleton(el);
-  const cur = await Q.trend();
-  const cmp = null;
+  // The comparison layer is only drawn in the comparison pass.
+  const withCmp = !!ctx.compare && compareOn();
+  const [cur, cmp, kCur, kCmp] = await Promise.all([
+    Q.trend(),
+    withCmp ? Q.trendCompare() : null,
+    withCmp ? Q.kpis() : null,
+    withCmp ? Q.kpisCompare() : null
+  ]);
   if (ctx.stale && ctx.stale()) return;
   if (!cur.length || !cur.some(b => b.revenue || b.cogs)) {
     debugLog('Revenue & Margin Trend: no data for period', 'warning');
@@ -1563,10 +1653,11 @@ async function renderTimeSeries(el, cfg, ctx = {}) {
 
   const series = [{ key: 'cur', data: cur }];
   if (cmp) series.push({ key: 'cmp', data: cmp.filter(b => b.i < cur.length) });
+  const cmpName = compareShort().toLowerCase();
   const legend = [{ id: 'rev-cur', kind: mode === 'bar' ? 'bar' : 'line', label: 'Revenue' }];
-  if (cmp) legend.push({ id: 'rev-cmp', kind: mode === 'bar' ? 'bar' : 'line', label: 'Revenue (comparison)' });
+  if (cmp) legend.push({ id: 'rev-cmp', kind: mode === 'bar' ? 'bar' : 'line', label: `Revenue (${cmpName})` });
   legend.push({ id: 'mg-cur', kind: 'dash', label: 'Margin %' });
-  if (cmp) legend.push({ id: 'mg-cmp', kind: 'dots', label: 'Margin % (comparison)' });
+  if (cmp) legend.push({ id: 'mg-cmp', kind: 'dots', label: `Margin % (${cmpName})` });
 
   el.innerHTML = '';
   // Hidden series survive re-renders (filter changes, the comparison pass).
@@ -1591,6 +1682,19 @@ async function renderTimeSeries(el, cfg, ctx = {}) {
     });
     head.appendChild(btn);
   });
+  // Period totals vs the comparison, one line above the legend.
+  if (cmp) {
+    const kc = (kCur && kCur[0]) || {}, kp = (kCmp && kCmp[0]) || {};
+    const rc = parseFloat(kc.total_revenue || 0), rp = parseFloat(kp.total_revenue || 0);
+    const mc = rc > 0 ? (rc - parseFloat(kc.total_cogs || 0)) / rc : null;
+    const mp = rp > 0 ? (rp - parseFloat(kp.total_cogs || 0)) / rp : null;
+    const sum = document.createElement('div');
+    sum.className = 'ts-sum';
+    sum.innerHTML = `Revenue <b>${fmt$(rc, true)}</b> ${deltaHtml(deltaPct(rc, rp), '%', false, compareShort() + ': ' + fmt$(rp))}` +
+      ` · Margin <b>${mc == null ? '—' : fmtPct(mc)}</b> ${deltaHtml(mc != null && mp != null ? (mc - mp) * 100 : null, 'pts', false, compareShort() + ': ' + (mp == null ? '—' : fmtPct(mp)))}` +
+      ` · vs ${rangeText(getCompareRange())}`;
+    head.prepend(sum);
+  }
   el.appendChild(head);
 
   const W = el.clientWidth, H = el.clientHeight - head.offsetHeight;
@@ -1708,10 +1812,16 @@ async function renderTimeSeries(el, cfg, ctx = {}) {
 }
 
 // ── Horizontal Bar ───────────────────────────────────────────
-async function renderHorizBar(el, dataFn, opts={}) {
+// opts.cmp = { cacheKey, keyExpr, keyOf(row), quoted } makes a revenue bar
+// chart comparison-aware: in the comparison pass each value label gains its
+// change against the comparison range (▲12% / ▼8% / "new").
+async function renderHorizBar(el, dataFn, opts={}, ctx={}) {
   debugLog(`Rendering horizontal bar chart`, 'info');
-  renderSkeleton(el);
+  if (!ctx.compare) renderSkeleton(el);
+  const withCmp = !!(ctx.compare && opts.cmp && compareOn());
   const raw = await dataFn();
+  const cmpMap = withCmp ? await cmpByKey(opts.cmp.cacheKey, opts.cmp.keyExpr, raw.map(opts.cmp.keyOf), opts.cmp.quoted) : null;
+  if (ctx.stale && ctx.stale()) return;
   if (!raw.length) { debugLog('Horizontal bar: no data for period', 'warning'); el.innerHTML = '<div class="tile-skel"><span class="tile-skel-lbl">No data for period</span></div>'; return; }
   debugLog(`Horizontal bar: rendering ${raw.length} rows`, 'success');
 
@@ -1720,7 +1830,8 @@ async function renderHorizBar(el, dataFn, opts={}) {
   if (W < 80 || H < 50) return;
 
   const data = raw.map(d => ({ name: d.name, value: parseFloat(d.revenue || d.orders || d.qty || 0), meta: d }));
-  const m  = { top:6, right:84, bottom:18, left: Math.min(120, W*0.32) };
+  const cmpOf = d => cmpMap ? (cmpMap.get(String(opts.cmp.keyOf(d.meta))) || { revenue: 0, cogs: 0 }) : null;
+  const m  = { top:6, right: cmpMap ? 118 : 84, bottom:18, left: Math.min(120, W*0.32) };
   const iw = W - m.left - m.right;
   const ih = H - m.top  - m.bottom;
   if (iw < 20 || ih < 20) return;
@@ -1748,27 +1859,42 @@ async function renderHorizBar(el, dataFn, opts={}) {
       const fmtV = opts.fmt === 'count' ? fmtNum(d.value) : fmt$(d.value);
       const mgStr = d.meta.avg_margin != null ? `<br>Margin: ${fmtPct(d.meta.avg_margin)}` : '';
       const ordStr = d.meta.orders != null ? `<br>Orders: ${fmtNum(d.meta.orders)}` : '';
-      showTip(ev, `<strong>${d.name}</strong><br>${fmtV}${ordStr}${mgStr}`);
+      const p = cmpOf(d);
+      const cmpStr = p ? `<br>${compareShort()}: ${fmt$(p.revenue)} ${deltaHtml(deltaPct(d.value, p.revenue))}` : '';
+      showTip(ev, `<strong>${escHtml(d.name)}</strong><br>${fmtV}${ordStr}${mgStr}${cmpStr}`);
     })
     .on('mousemove',moveTip).on('mouseout',hideTip)
     .on('click', opts.clickable ? ((ev,d) => opts.clickable(d)) : null);
 
-  // Value labels
+  // Value labels (+ the change against the comparison, in the comparison pass)
   svg.selectAll('.val-lbl').data(data).join('text').attr('class','val-lbl')
     .attr('x',d=>x(d.value)+4).attr('y',d=>y(d.name)+y.bandwidth()/2)
     .attr('dy','0.35em').style('fill','#8FA1A7').style('font-size','9px')
-    .text(d => opts.fmt === 'count' ? fmtNum(d.value) : fmt$(d.value, true));
+    .text(d => opts.fmt === 'count' ? fmtNum(d.value) : fmt$(d.value, true))
+    .each(function (d) {
+      const p = cmpOf(d);
+      if (!p) return;
+      const dv = deltaPct(d.value, p.revenue);
+      d3.select(this).append('tspan').attr('dx', 4).style('font-weight', 700)
+        .style('fill', dv == null ? '#8FA1A7' : (dv >= 0 ? DS.success : DS.negative))
+        .text(dv == null ? 'new' : (dv >= 0 ? '▲' : '▼') + Math.abs(dv).toFixed(0) + '%');
+    });
 
   svg.append('g').attr('class','axis').attr('transform',`translate(0,${ih})`).call(d3.axisBottom(x).ticks(4).tickFormat(d=>opts.fmt==='count' ? d3.format('.2s')(d) : '$'+d3.format('.2s')(d)));
   svg.append('g').attr('class','axis').call(d3.axisLeft(y).tickFormat(d=>d.length>15?d.slice(0,14)+'…':d)).selectAll('text').style('font-size','10px');
 
   // CSV export payload — name + value (§2).
+  const columns = [
+    { key:'name',  label:'Name' },
+    { key:'value', label: opts.valueLabel || (opts.fmt === 'count' ? 'Qty' : 'Value') }
+  ];
+  if (cmpMap) columns.push({ key:'cmp_value', label: compareShort() });
   return {
-    columns: [
-      { key:'name',  label:'Name' },
-      { key:'value', label: opts.valueLabel || (opts.fmt === 'count' ? 'Qty' : 'Value') }
-    ],
-    rows: data.map(d => ({ name: d.name, value: d.value }))
+    columns,
+    rows: data.map(d => {
+      const p = cmpOf(d);
+      return p ? { name: d.name, value: d.value, cmp_value: p.revenue } : { name: d.name, value: d.value };
+    })
   };
 }
 
@@ -1856,10 +1982,11 @@ async function renderDonut(el, dataFn, opts = {}) {
 }
 
 // ── Sortable table ───────────────────────────────────────────
-async function renderSortableTable(el, dataFn, columns) {
+async function renderSortableTable(el, dataFn, columns, ctx = {}) {
   debugLog(`Rendering sortable table (${columns.length} columns)`, 'info');
-  renderSkeleton(el);
+  if (!ctx.compare) renderSkeleton(el);
   const raw = await dataFn();
+  if (ctx.stale && ctx.stale()) return;
   debugLog(`Sortable table: ${raw.length} rows`, raw.length ? 'success' : 'warning');
   el.innerHTML = '';
 
@@ -1923,6 +2050,8 @@ async function renderSortableTable(el, dataFn, columns) {
             if (col.colorCode) { td.style.fontWeight='600'; td.style.color = pct>=30?DS.success:pct>=15?DS.warning:DS.negative; }
           }
         }
+        else if (col.fmt === 'deltapct') { td.innerHTML = deltaHtml(v, '%'); td.style.textAlign = 'right'; }
+        else if (col.fmt === 'deltapts') { td.innerHTML = deltaHtml(v, 'pts'); td.style.textAlign = 'right'; }
         else if (col.fmt === 'count')    td.textContent = fmtNum(v);
         else if (col.fmt === 'date')     td.textContent = fmtDate(v);
         else if (col.fmt === 'monthyear') td.textContent = v ? moment(v).format('MMM YYYY') : '—';
@@ -1954,60 +2083,70 @@ async function renderSortableTable(el, dataFn, columns) {
 // ============================================================
 // 9.  WIDGET REGISTRY
 // ============================================================
+// compare: true     — draws a comparison layer while Compare is on (comparison pass)
+// compare: 'always' — always compares (Revenue vs Prior), also in that pass
+// compareToggle     — header Off / Prev / LY buttons bound to F.compare
+const CMP_TABLE_COLS = () => [
+  {key:'cmp_revenue',   label: compareShort() + ' Revenue', fmt:'currency'},
+  {key:'rev_change',    label:'Revenue Δ',                  fmt:'deltapct'},
+  {key:'margin_change', label:'Margin Δ',                   fmt:'deltapts'}
+];
 const WIDGET_REGISTRY = {
   'kpi-revenue': {
     title:'Total Revenue', description:'Total invoiced revenue for the period.', category:'kpi',
     icon:'<path d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>',
-    defaultW:2, defaultH:2, hasChartToggle:false,
-    render: (el,cfg) => renderKPI(el,'revenue')
+    defaultW:2, defaultH:2, hasChartToggle:false, compare:true,
+    render: (el,cfg,ctx) => renderKPI(el,'revenue',{},ctx)
   },
   'kpi-orders': {
     title:'Order Count', description:'Number of sales orders in the period.', category:'kpi',
     icon:'<path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>',
-    defaultW:2, defaultH:2, hasChartToggle:false,
-    render: (el,cfg) => renderKPI(el,'orders')
+    defaultW:2, defaultH:2, hasChartToggle:false, compare:true,
+    render: (el,cfg,ctx) => renderKPI(el,'orders',{},ctx)
   },
   'kpi-avg-order': {
     title:'Avg Order Value', description:'Average revenue per sales order.', category:'kpi',
     icon:'<path d="M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z"/>',
-    defaultW:2, defaultH:2, hasChartToggle:false,
-    render: (el,cfg) => renderKPI(el,'avgorder')
+    defaultW:2, defaultH:2, hasChartToggle:false, compare:true,
+    render: (el,cfg,ctx) => renderKPI(el,'avgorder',{},ctx)
   },
   'kpi-margin': {
     title:'Gross Margin', description:'Gross margin % for the period: (revenue − cost) / revenue, as in the Fishbowl Margins report.', category:'kpi',
     icon:'<path d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>',
-    defaultW:2, defaultH:2, hasChartToggle:false,
-    render: (el,cfg) => renderKPI(el,'avgmargin')
+    defaultW:2, defaultH:2, hasChartToggle:false, compare:true,
+    render: (el,cfg,ctx) => renderKPI(el,'avgmargin',{},ctx)
   },
   'kpi-gross-profit': {
     title:'Gross Profit', description:'Revenue minus cost of goods sold.', category:'kpi',
     icon:'<path d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"/>',
-    defaultW:2, defaultH:2, hasChartToggle:false,
-    render: (el,cfg) => renderKPI(el,'grossprofit')
+    defaultW:2, defaultH:2, hasChartToggle:false, compare:true,
+    render: (el,cfg,ctx) => renderKPI(el,'grossprofit',{},ctx)
   },
   'kpi-cogs': {
     title:'Cost of Goods', description:'Total cost of goods sold for the period.', category:'kpi',
     icon:'<path d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/>',
-    defaultW:2, defaultH:2, hasChartToggle:false,
-    render: (el,cfg) => renderKPI(el,'cogs')
+    defaultW:2, defaultH:2, hasChartToggle:false, compare:true,
+    render: (el,cfg,ctx) => renderKPI(el,'cogs',{},ctx)
   },
   'kpi-revenue-vs-prior': {
     title:'Revenue vs Prior', description:'Total revenue with % change vs the prior period of equal length.', category:'kpi',
     icon:'<path d="M3 17l6-6 4 4 8-8m0 0v6m0-6h-6"/>',
-    defaultW:2, defaultH:2, hasChartToggle:false,
-    render: (el,cfg) => renderKPI(el,'revenue',{ withPriorDelta:true })
+    defaultW:2, defaultH:2, hasChartToggle:false, compare:'always',
+    render: (el,cfg,ctx) => renderKPI(el,'revenue',{ withPriorDelta:true },ctx)
   },
   'monthly-revenue': {
     title:'Revenue & Margin Trend', description:'Revenue with gross margin % — weekly for a range of 6 months or less, monthly beyond. Click a bar for that period\'s customers; click a legend entry to hide a series. Toggle between bar and line.', category:'chart',
     icon:'<path stroke-linecap="round" stroke-linejoin="round" d="M7 12l3-3 3 3 4-4"/>',
-    defaultW:8, defaultH:10, hasChartToggle:true, toggleModes:['bar','line'],
-    render: (el,cfg) => renderTimeSeries(el,cfg)
+    defaultW:8, defaultH:10, hasChartToggle:true, toggleModes:['bar','line'], compare:true, compareToggle:true,
+    render: (el,cfg,ctx) => renderTimeSeries(el,cfg,ctx)
   },
   'top-customers': {
     title:'Top Customers by Revenue', description:'Top 10 customers ranked by revenue. Colour-coded by margin.', category:'chart',
     icon:'<path d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/>',
     defaultW:6, defaultH:10, hasChartToggle:false,
-    render: (el,cfg) => renderHorizBar(el, Q.topCustomers, { fmt:'currency', colorMode:'margin', clickable: (d) => drilldownCustomer(d.name) })
+    compare:true,
+    render: (el,cfg,ctx) => renderHorizBar(el, Q.topCustomers, { fmt:'currency', colorMode:'margin', clickable: (d) => drilldownCustomer(d.name),
+      cmp: { cacheKey:'topCustomers', keyExpr:'Customer.Name', keyOf: r => r.name, quoted:true } }, ctx)
   },
   'top-products': {
     title:'Top Products by Qty', description:'Top 10 products ranked by units sold.', category:'chart',
@@ -2031,7 +2170,9 @@ const WIDGET_REGISTRY = {
     title:'Top Salespeople', description:'Revenue per salesperson.', category:'chart',
     icon:'<path d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"/>',
     defaultW:4, defaultH:10, hasChartToggle:false,
-    render: (el,cfg) => renderHorizBar(el, Q.topSalespeople, { fmt:'currency', colorMode:'margin', clickable: (d) => drilldownSalesperson(d.meta.salesmanid) })
+    compare:true,
+    render: (el,cfg,ctx) => renderHorizBar(el, Q.topSalespeople, { fmt:'currency', colorMode:'margin', clickable: (d) => drilldownSalesperson(d.meta.salesmanid),
+      cmp: { cacheKey:'topSalespeople', keyExpr:'So.salesmanId', keyOf: r => r.salesmanid, quoted:false } }, ctx)
   },
   'low-margin': {
     title:'Low Margin Customers', description:'Customers whose gross margin for the period is below 15% — requires review.', category:'chart',
@@ -2059,34 +2200,65 @@ const WIDGET_REGISTRY = {
   'revenue-table': {
     title:'Monthly Revenue Table', description:'Monthly revenue and margin in sortable table format.', category:'table',
     icon:'<path d="M3 10h18M3 14h18M10 3v18"/>',
-    defaultW:6, defaultH:10, hasChartToggle:false,
-    render: (el,cfg) => renderSortableTable(el, Q.monthly, [
-      {key:'month',      label:'Month',   fmt:'monthyear'},
-      {key:'revenue',    label:'Revenue', fmt:'currency'},
-      {key:'cogs',       label:'COGS',    fmt:'currency'},
-      {key:'avg_margin', label:'Margin',  fmt:'percent', colorCode:true}
-    ])
+    defaultW:6, defaultH:10, hasChartToggle:false, compare:true,
+    // Calendar months of the range (bucketTotals); with Compare on, month n is
+    // set against month n of the comparison range.
+    render: (el,cfg,ctx={}) => {
+      const withCmp = !!ctx.compare && compareOn();
+      return renderSortableTable(el, async () => {
+        const [cur, cmp] = await Promise.all([Q.monthBuckets(), withCmp ? Q.monthBucketsCompare() : null]);
+        return cur.filter(b => b.revenue || b.cogs || (cmp && cmp[b.i] && (cmp[b.i].revenue || cmp[b.i].cogs))).map(b => {
+          const row = { month: b.start, revenue: b.revenue, cogs: b.cogs, avg_margin: b.margin };
+          if (cmp) {
+            const p = cmp[b.i] || { revenue: 0, margin: null };
+            Object.assign(row, { cmp_revenue: p.revenue, rev_change: deltaPct(b.revenue, p.revenue),
+                                 margin_change: (b.margin != null && p.margin != null) ? (b.margin - p.margin) * 100 : null });
+          }
+          return row;
+        });
+      }, [
+        {key:'month',      label:'Month',   fmt:'monthyear'},
+        {key:'revenue',    label:'Revenue', fmt:'currency'},
+        {key:'cogs',       label:'COGS',    fmt:'currency'},
+        {key:'avg_margin', label:'Margin',  fmt:'percent', colorCode:true},
+        ...(withCmp ? CMP_TABLE_COLS() : [])
+      ], ctx);
+    }
   },
   'customer-table': {
     title:'Customer Revenue Table', description:'Top customers with orders, revenue, gross profit and margin, sortable.', category:'table',
     icon:'<path d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/>',
-    defaultW:6, defaultH:10, hasChartToggle:false,
-    render: (el,cfg) => renderSortableTable(el, async () => {
-      const rows = await Q.topCustomers();
-      return rows.map(r => ({ ...r, gross_profit: parseFloat(r.revenue||0) - parseFloat(r.cogs||0) }));
-    }, [
-      {key:'name',         label:'Customer',     fmt:'custlink'},
-      {key:'orders',       label:'Orders',       fmt:'count'},
-      {key:'revenue',      label:'Revenue',      fmt:'currency'},
-      {key:'gross_profit', label:'Gross Profit', fmt:'currency'},
-      {key:'avg_margin',   label:'Margin',       fmt:'percent', colorCode:true}
-    ])
+    defaultW:6, defaultH:10, hasChartToggle:false, compare:true,
+    render: (el,cfg,ctx={}) => {
+      const withCmp = !!ctx.compare && compareOn();
+      return renderSortableTable(el, async () => {
+        const rows = (await Q.topCustomers()).map(r => ({ ...r, gross_profit: parseFloat(r.revenue||0) - parseFloat(r.cogs||0) }));
+        if (!withCmp) return rows;
+        const cmp = await cmpByKey('topCustomers', 'Customer.Name', rows.map(r => r.name), true);
+        return rows.map(r => {
+          const p  = cmp.get(String(r.name)) || { revenue: 0, cogs: 0 };
+          const rv = parseFloat(r.revenue || 0);
+          const mc = rv > 0 ? r.gross_profit / rv : null, mp = p.revenue > 0 ? (p.revenue - p.cogs) / p.revenue : null;
+          return { ...r, cmp_revenue: p.revenue, rev_change: deltaPct(rv, p.revenue),
+                   margin_change: (mc != null && mp != null) ? (mc - mp) * 100 : null };
+        });
+      }, [
+        {key:'name',         label:'Customer',     fmt:'custlink'},
+        {key:'orders',       label:'Orders',       fmt:'count'},
+        {key:'revenue',      label:'Revenue',      fmt:'currency'},
+        {key:'gross_profit', label:'Gross Profit', fmt:'currency'},
+        {key:'avg_margin',   label:'Margin',       fmt:'percent', colorCode:true},
+        ...(withCmp ? CMP_TABLE_COLS() : [])
+      ], ctx);
+    }
   },
   'top-products-revenue': {
     title:'Top Products by Revenue', description:'Top 10 products ranked by revenue.', category:'chart',
     icon:'<path d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/>',
     defaultW:6, defaultH:10, hasChartToggle:false,
-    render: (el,cfg) => renderHorizBar(el, Q.topProductsByRev, { fmt:'currency', clickable: (d) => drilldownProduct(d.name, d.meta.desc_text) })
+    compare:true,
+    render: (el,cfg,ctx) => renderHorizBar(el, Q.topProductsByRev, { fmt:'currency', clickable: (d) => drilldownProduct(d.name, d.meta.desc_text),
+      cmp: { cacheKey:'topProductsByRev', keyExpr:'Product.Num', keyOf: r => r.name, quoted:true } }, ctx)
   },
   'top-customers-margin': {
     title:'Top Customers by Margin', description:'Top 10 customers ranked by gross margin % (min $1k revenue). Colour-coded by margin tier.', category:'chart',
@@ -2138,6 +2310,13 @@ function buildWidgetContent(type, cfg) {
       </button>
     </div>` : '';
 
+  // Compare buttons — the same dashboard-wide setting as the filter strip's
+  // Compare chip (setCompareMode), surfaced on the tile it matters most to.
+  const cmpToggleHTML = reg.compareToggle ? `<div style="display:flex;gap:2px;margin-right:4px;">` +
+    [['off','Off','No comparison'], ['prior','Prev','Compare with the previous period'], ['yoy','LY','Compare with the same period last year']].map(([v, l, t]) =>
+      `<button class="chart-toggle-btn opt-toggle-btn cmp-toggle-btn ${F.compare === v ? 'active' : ''}" data-cmp="${v}" title="${t}">${l}</button>`
+    ).join('') + `</div>` : '';
+
   // Generic secondary toggle groups (§4) — additive to the chart-type toggle.
   // Reads the per-widget cfg value; first mode is the default when unset.
   const optToggleHTML = (reg.optToggles || []).map(group => {
@@ -2185,6 +2364,7 @@ function buildWidgetContent(type, cfg) {
       <span class="widget-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${reg.icon || ''}</svg></span>
       <span class="widget-title">${reg.title}</span>
       ${infoBtnHTML}
+      ${cmpToggleHTML}
       ${toggleHTML}
       ${optToggleHTML}
       ${exportBtnHTML}
@@ -2220,7 +2400,9 @@ function addWidget(type, cfg={}, pos={}) {
 
   const el     = grid.addWidget(opts);
   const bodyEl = el.querySelector('.widget-body');
-  const state  = { type, config:{...cfg}, bodyEl, reg };
+  // pendingPrimary holds the comparison pass back until this tile's first
+  // render (queued for two animation frames below) has run.
+  const state  = { type, config:{...cfg}, bodyEl, reg, pendingPrimary: true };
   widgetStore.set(el, state);
   el.dataset.widgetType   = type;
   el.dataset.widgetConfig = JSON.stringify(cfg);
@@ -2254,7 +2436,12 @@ function addWidget(type, cfg={}, pos={}) {
 
   // Generic secondary option toggles (§4) — per-widget cfg[key], mirrored to
   // el.dataset.widgetConfig, active class toggled within the same group.
-  el.querySelectorAll('.opt-toggle-btn').forEach(btn => {
+  el.querySelectorAll('.cmp-toggle-btn').forEach(btn => {
+    btn.addEventListener('click', () => setCompareMode(btn.dataset.cmp));
+    btn.addEventListener('mousedown', ev => ev.stopPropagation());
+  });
+
+  el.querySelectorAll('.opt-toggle-btn:not(.cmp-toggle-btn)').forEach(btn => {
     btn.addEventListener('click', () => {
       const key = btn.dataset.optKey, val = btn.dataset.optVal;
       state.config[key] = val;
@@ -2276,23 +2463,98 @@ function addWidget(type, cfg={}, pos={}) {
   return el;
 }
 
-async function doRender(el) {
+// opts.compare = the comparison pass: draw over the tile's current content
+// (no skeleton) once its data — cached primary + comparison — is in. Every
+// render gets ctx.stale(), true once a newer render of the same tile has
+// started, so a slow, superseded render never paints over a fresh one.
+async function doRender(el, opts = {}) {
   const state = widgetStore.get(el);
   if (!state) return;
-  debugLog(`Re-rendering: ${state.type}`, 'info');
-  state.bodyEl.innerHTML = '';
+  const compare = !!opts.compare;
+  const token = state.renderToken = (state.renderToken || 0) + 1;
+  const ctx = { compare, stale: () => state.renderToken !== token || !widgetStore.has(el) };
+  debugLog(`${compare ? 'Comparison pass' : 'Re-rendering'}: ${state.type}`, 'info');
   const exportBtn = el.querySelector('.widget-export');
-  if (exportBtn) exportBtn.disabled = true;
-  try {
-    // Render fns return a { columns, rows } payload for CSV export (§2),
-    // or null/undefined (KPI tiles, no-data early returns).
-    const exp = await state.reg.render(state.bodyEl, state.config);
-    state.exportData = (exp && exp.rows) ? exp : null;
-    if (exportBtn) exportBtn.disabled = !(state.exportData && state.exportData.rows.length);
-  } catch(e) {
-    debugLog(`Render error (${state.type}): ${e.message}`, 'error');
-    console.error('doRender error:', e);
+  if (!compare) {
+    state.pendingPrimary = false;
+    state.cmpEpoch = null;        // a fresh primary render is due its comparison pass again
+    state.bodyEl.innerHTML = '';
+    if (exportBtn) exportBtn.disabled = true;
   }
+  const run = (async () => {
+    try {
+      // Render fns return a { columns, rows } payload for CSV export (§2),
+      // or null/undefined (KPI tiles, no-data early returns).
+      const exp = await state.reg.render(state.bodyEl, state.config, ctx);
+      if (ctx.stale()) return;
+      state.exportData = (exp && exp.rows) ? exp : null;
+      if (exportBtn) exportBtn.disabled = !(state.exportData && state.exportData.rows.length);
+    } catch(e) {
+      debugLog(`Render error (${state.type}): ${e.message}`, 'error');
+      console.error('doRender error:', e);
+    }
+  })();
+  if (!compare) trackPrimary(run);
+  return run;
+}
+
+// ── Comparison pass ──────────────────────────────────────────
+// Comparison data never sits on the first-paint path. Every tile first draws
+// its own figures (a primary render). Only when no primary render is queued
+// or running does runComparePass re-draw the comparison-aware tiles, and the
+// KPI badges, with their comparison layer. With Compare off that is just the
+// two things whose whole point is a comparison: the Revenue vs Prior tile and
+// badge. Anything that changes what a comparison shows (filters, dates, the
+// Compare mode, a refresh) starts a new epoch, so each tile is due again.
+const _primaryInflight = new Set();
+let _cmpEpoch = 0, _cmpTimer = null, _badgesCmpEpoch = -1;
+
+function trackPrimary(p) {
+  _primaryInflight.add(p);
+  Promise.resolve(p).finally(() => { _primaryInflight.delete(p); scheduleComparePass(); });
+  return p;
+}
+function newCompareEpoch() { _cmpEpoch++; }
+function tileWantsCompare(st) { return st.reg.compare === 'always' || (st.reg.compare === true && compareOn()); }
+function badgesWantCompare() { return _badgeConfig.includes('revenuevsprior') || compareOn(); }
+
+function scheduleComparePass() {
+  clearTimeout(_cmpTimer);
+  _cmpTimer = setTimeout(runComparePass, 30);
+}
+
+async function runComparePass() {
+  // The last primary render to finish schedules the pass again.
+  if (_primaryInflight.size || [...widgetStore.values()].some(st => st.pendingPrimary)) return;
+  const epoch = _cmpEpoch, jobs = [];
+  widgetStore.forEach((st, el) => {
+    if (st.cmpEpoch === epoch || !tileWantsCompare(st)) return;
+    st.cmpEpoch = epoch;
+    jobs.push(doRender(el, { compare: true }));
+  });
+  if (_badgesCmpEpoch !== epoch && badgesWantCompare()) {
+    _badgesCmpEpoch = epoch;
+    jobs.push(updateKPIBadges(true));
+  }
+  if (!jobs.length) return;
+  debugLog(`Comparison pass: ${jobs.length} item(s)`, 'info');
+  await Promise.allSettled(jobs);
+}
+
+// One setting for the whole dashboard (F.compare). Turning it off gives the
+// comparison-aware tiles a clean primary render; turning it on, or switching
+// mode, only needs the comparison pass.
+function setCompareMode(mode) {
+  _openDrop = null;
+  if (!COMPARE_MODES.some(m => m.v === mode) || F.compare === mode) { renderFilterbar(); return; }
+  F.compare = mode;
+  debugLog(`Compare: ${mode}`, 'info');
+  renderFilterbar();
+  document.querySelectorAll('.cmp-toggle-btn').forEach(b => b.classList.toggle('active', b.dataset.cmp === mode));
+  newCompareEpoch();
+  if (mode === 'off') widgetStore.forEach((st, el) => { if (st.reg.compare === true) doRender(el); });
+  trackPrimary(updateKPIBadges());
+  scheduleComparePass();
 }
 
 // Per-widget CSV export (§2). Reads state.exportData captured by doRender.
@@ -2330,8 +2592,12 @@ function setWidgetOption(innerEl, key, val) {
   doRender(item);
 }
 
+// Primary renders of every tile plus the badges; the comparison pass follows
+// on its own once they have all finished.
 function rerenderAll() {
+  newCompareEpoch();
   widgetStore.forEach((_, el) => doRender(el));
+  trackPrimary(updateKPIBadges());
 }
 
 function updateWidthClasses() {
@@ -2430,7 +2696,8 @@ function gatherFilterState() {
     customer:        [...F.customer],
     productCategory: [...F.productCategory],
     salesperson:     [...F.salesperson],
-    margin:          [...F.margin]
+    margin:          [...F.margin],
+    compare:         F.compare
   };
 }
 
@@ -2495,17 +2762,29 @@ function showToast(message, type = 'info', duration = 3000) {
 // 13. KPI HEADER BADGES (draggable, add/removable)
 // ============================================================
 let _lastKpiData      = {};
-let _lastKpiDataPrior = {};
+let _lastKpiDataPrior = null;   // previous period — only the Rev vs Prior badge
+let _lastKpiDataCmp   = null;   // the Compare range — a delta on every badge
 let _dragBadgeKey = null;
 
-async function updateKPIBadges() {
-  const [rows, priorRows] = await Promise.all([Q.kpis(), Q.kpisPrior()]);
-  _lastKpiData      = (rows && rows[0])      || {};
-  _lastKpiDataPrior = (priorRows && priorRows[0]) || {};
-  renderBadges(_lastKpiData, _lastKpiDataPrior);
+// withCompare = the comparison pass. The primary call queries nothing but the
+// period's own KPIs (cached, shared with the KPI tiles).
+async function updateKPIBadges(withCompare = false) {
+  const needPrior = withCompare && _badgeConfig.includes('revenuevsprior');
+  const needCmp   = withCompare && compareOn();
+  const [rows, priorRows, cmpRows] = await Promise.all([
+    Q.kpis(),
+    needPrior ? Q.kpisPrior() : null,
+    needCmp ? Q.kpisCompare() : null
+  ]);
+  _lastKpiData      = (rows && rows[0]) || {};
+  _lastKpiDataPrior = priorRows ? (priorRows[0] || {}) : null;
+  _lastKpiDataCmp   = cmpRows ? (cmpRows[0] || {}) : null;
+  renderBadges(_lastKpiData, _lastKpiDataPrior, _lastKpiDataCmp);
 }
 
-function renderBadges(k, kPrior) {
+const BADGE_KPI_KEY = { revenue:'revenue', cogs:'cogs', grossprofit:'grossprofit', orders:'orders', avgorder:'avgorder', avgmargin:'avgmargin' };
+
+function renderBadges(k, kPrior, kCmp = _lastKpiDataCmp) {
   const el = document.getElementById('kpiBadges');
   if (!el) return;
   el.style.display = 'flex';
@@ -2521,11 +2800,12 @@ function renderBadges(k, kPrior) {
     div.className = 'kpi-badge k-' + key;
     div.dataset.badgeKey = key;
     div.draggable = true;
-    div.innerHTML = `<span class="kpi-badge-icon" style="color:${color};"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${meta.icon || ''}</svg></span><span class="kpi-badge-text"><span class="kpi-badge-val" style="color:${color};">${val}</span><span class="kpi-badge-lbl">${meta.label}</span></span><button class="badge-remove" title="Remove badge">✕</button>`;
+    const dlt   = (kCmp && BADGE_KPI_KEY[key] && Object.keys(k || {}).length) ? ' ' + kpiDeltaHtml(BADGE_KPI_KEY[key], k, kCmp, 'kpi-badge-dlt', getCompareRange()) : '';
+    div.innerHTML = `<span class="kpi-badge-icon" style="color:${color};"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${meta.icon || ''}</svg></span><span class="kpi-badge-text"><span class="kpi-badge-val" style="color:${color};">${val}${dlt}</span><span class="kpi-badge-lbl">${meta.label}</span></span><button class="badge-remove" title="Remove badge">✕</button>`;
 
     div.querySelector('.badge-remove').addEventListener('click', () => {
       _badgeConfig = _badgeConfig.filter(k2 => k2 !== key);
-      renderBadges(k, kPrior);
+      renderBadges(_lastKpiData, _lastKpiDataPrior, _lastKpiDataCmp);
     });
 
     div.addEventListener('dragstart', e => {
@@ -2555,7 +2835,7 @@ function renderBadges(k, kPrior) {
       _badgeConfig.splice(fi, 1);
       _badgeConfig.splice(ti, 0, _dragBadgeKey);
       _dragBadgeKey = null;
-      renderBadges(k, kPrior);
+      renderBadges(_lastKpiData, _lastKpiDataPrior, _lastKpiDataCmp);
     });
 
     el.appendChild(div);
@@ -2590,7 +2870,7 @@ function openBadgePicker(anchor, k, kPrior) {
     btn.appendChild(document.createTextNode(meta.label));
     btn.onmouseover = () => btn.style.background = '#EBEEED';
     btn.onmouseout  = () => btn.style.background = 'none';
-    btn.addEventListener('click', () => { _badgeConfig.push(key); pop.remove(); renderBadges(k, kPrior); });
+    btn.addEventListener('click', () => { _badgeConfig.push(key); pop.remove(); renderBadges(_lastKpiData, _lastKpiDataPrior, _lastKpiDataCmp); _badgesCmpEpoch = -1; scheduleComparePass(); });
     pop.appendChild(btn);
   });
 
@@ -3316,11 +3596,35 @@ function _sdFillList(list, which, opts, sel) {
   }
 }
 
+// Compare chip — single choice; each option shows the dates it would compare with.
+const SD_CMP = '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4"/></svg>';
+function _sdCompareDrop() {
+  const wrap = _sdEl('div', 'fdrop');
+  const cur  = COMPARE_MODES.find(m => m.v === F.compare) || COMPARE_MODES[0];
+  wrap.appendChild(_sdChip(SD_CMP + '<span></span>', F.compare !== 'off', _openDrop === 'compare', () => sdToggleDropdown('compare')));
+  wrap.querySelector('.fchip span').textContent = cur.chip;
+  const panel = _sdEl('div', 'fdrop-panel');
+  if (_openDrop === 'compare') panel.style.display = 'block';
+  const head = _sdEl('div', 'fdrop-head');
+  head.appendChild(_sdEl('span', null, 'Compare with'));
+  panel.appendChild(head);
+  const list = _sdEl('div', 'fdrop-list');
+  COMPARE_MODES.forEach(m => {
+    const r = m.v === 'off' ? null : getCompareRange(m.v);
+    if (m.v !== 'off' && !r) return;   // open-ended custom range: nothing to compare
+    list.appendChild(_sdItem(m.label + (r ? ' · ' + rangeText(r) : ''), F.compare === m.v, () => setCompareMode(m.v)));
+  });
+  panel.appendChild(list);
+  wrap.appendChild(panel);
+  return wrap;
+}
+
 function renderFilterbar() {
   const bar = document.getElementById('filterBar');
   if (!bar) return;
   bar.innerHTML = '';
   bar.appendChild(_sdDateDrop());
+  bar.appendChild(_sdCompareDrop());
   bar.appendChild(_sdEl('span', 'filter-sep'));
   Object.keys(SD_DIMS).forEach(k => bar.appendChild(_sdDimDrop(k)));
   bar.appendChild(_sdEl('span', 'filter-sep'));
@@ -3354,6 +3658,7 @@ function applyFilterState(state) {
   F.productCategory = toArr(state.productCategory);
   F.salesperson     = toArr(state.salesperson);
   F.margin          = toArr(state.margin);
+  F.compare         = COMPARE_MODES.some(m => m.v === state.compare) ? state.compare : 'off';
   // A saved selection was written at whatever category level was active
   // then — pull it onto the current level rather than silently dropping it.
   remapCatSelection();
@@ -3365,7 +3670,6 @@ function onFilterChange() {
   debugLog('Filter changed — clearing cache and re-rendering', 'info');
   qclear();
   rerenderAll();
-  updateKPIBadges();
   updateDateDisplay();
 }
 
@@ -3397,7 +3701,6 @@ async function refreshDashboard() {
   }
   qclear();
   rerenderAll();
-  updateKPIBadges();
 }
 
 // ============================================================
@@ -3648,7 +3951,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   updateDateDisplay();
   loadLayout(layout);
   applyLockState();
-  updateKPIBadges();
+  trackPrimary(updateKPIBadges());
 });
 </script>
 </body>
