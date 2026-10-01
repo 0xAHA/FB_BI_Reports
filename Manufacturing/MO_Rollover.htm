@@ -1,0 +1,1893 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  REPORT: MO Rollover
+  PATH:   Manufacturing/MO_Rollover.htm
+--------------------------------------------------------------------------------
+  Rolls the unstarted part of a Manufacture Order onto a new MO, then closes
+  the original short so it finishes with what was actually built.
+
+    1. Pick a Partial MO. close-short refuses anything else ("Can only close
+       short a manufacture order with a status of partial"), so an Issued MO
+       - nothing built yet - is listed but can't roll over.
+    2. Every WO on it is sorted into one of three:
+         MOVES   - Entered, nothing picked, nothing used, no WIP
+         STAYS   - Fulfilled
+         BLOCKS  - anything else. A started WO is finished in Fishbowl first.
+                   An Entered WO whose pick has Started / Committed /
+                   Finished lines (e.g. a finished sub-stage's output
+                   committed to the next stage) needs that pick VOIDED in
+                   the Picking module first: Fishbowl refuses close-short
+                   with "outstanding Pick items that are in already progress".
+    3. A new MO is built from the moving WOs' CURRENT lines (woitem), not the
+       MO configuration - split WOs and WO-level edits make those differ.
+    4. Create (Entered) -> verify the moitem tree -> close short the original
+       -> issue the new MO -> copy WO-level fields across. An Entered MO left
+       by an earlier run that stopped is picked up again (after the same
+       verify) instead of a new one; one that has since been issued means
+       only the close-short is left, so that is all the run does.
+
+  Writes:
+    POST /api/manufacture-orders                 create the new MO (Entered)
+    POST /api/manufacture-orders/:id/close-short close the ORIGINAL
+    POST /api/manufacture-orders/:id/issue       issue the new MO
+    POST /api/work-orders/:id                    WO-level carry-over
+    POST /api/manufacture-orders/:id/unissue     \ duplicate cleanup only,
+    DELETE /api/manufacture-orders/:id           / after a confirm (below)
+  The original MO is never POSTed back: that endpoint is a full replace that
+  rebuilds its WOs. If a step fails the run stops where it is and says what
+  was left behind.
+
+  The only delete: an Issued original with nothing built whose open WOs
+  already went to an earlier rollover MO (MO 89 -> 89-1). close-short refuses
+  an Issued MO, and its WOs are duplicates, so after a confirm it is
+  unissued (Fishbowl removes its WOs and picks) and then deleted.
+
+  Picks are voided by hand because no API can: REST has no void, SavePickRq
+  refuses to move a line backwards (5106 "The pick is not up to date"), and
+  close-short refuses while a pick is in progress (all client-tested on
+  MO 95 / 122 / 123). close-short does delete an Entered WO with an UNPICKED
+  pick (MO 119).
+================================================================================
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <script>
+      // ================================================================
+      // REPORT IDENTITY
+      //   key    Prefix of every setting, saved view and shared payload
+      //          this report stores in Fishbowl. Copying this report in
+      //          Fishbowl to make a SEPARATE report? Give the copy its own
+      //          key (e.g. add '2') so it keeps its own settings - left
+      //          as-is, the copy shares the original's. 31 chars max.
+      //   name   This report's Fishbowl record name ('- Folder - Report').
+      //          Publishing finds its copy in the SharePoint BI Reports
+      //          folder by this name; null = not published.
+      //   build  Stamped automatically from this file's content by
+      //          tools/stamp/stamp.js - never edit it by hand.
+      // ================================================================
+      window.FB_REPORT = {
+          key:   'cdx.bi.moRollover',
+          name:  '- Manufacturing - MO Rollover',
+          build: '2026.10.01-1f97901'     // @fb-build
+      };
+  </script>
+  <title>MO Rollover - Fishbowl BI</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+
+  <!-- Moment.js - loads BEFORE fb-lib so its Common.formatDate sees moment. -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script>
+
+  <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+       script (source: scripts/fb-lib.js). -->
+  <script>
+    {% Script fb-lib %}
+  </script>
+
+  <!-- Shared chrome (source: scripts/fb-styles.css). -->
+  <style>
+    {% Style fb-styles %}
+  </style>
+
+  <style>
+    html, body { height: 100%; margin: 0; padding: 0;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    body { padding-bottom: var(--debug-drawer-h, 0px); transition: padding-bottom 0.12s ease; }
+    .wrap { display: flex; flex-direction: column; height: 100vh; }
+    .muted { color: var(--c-tertiary); }
+
+    /* fb-drawer body grid */
+    .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+    .fb-group { flex: 1 1 240px; min-width: 240px; }
+    .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.04em; color: #475569; border-bottom: 1px solid #e2e8f0;
+      padding-bottom: 4px; margin-bottom: 8px; }
+    .fb-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+    .fb-field label { font-size: 12px; font-weight: 600; color: #475569; }
+    .fb-field select { height: 32px; border: 1px solid var(--border-strong); border-radius: 6px;
+      padding: 0 8px; font-size: 12px; font-family: inherit; color: var(--c-primary); background: #fff; }
+    .fb-drawer-body p, .fb-drawer-body li { font-size: 12px; color: #334155; line-height: 1.5; }
+    .fb-drawer-body ul { margin: 4px 0; padding-left: 18px; }
+    .fb-drawer-body code { background: var(--bg-2); padding: 1px 4px; border-radius: 3px;
+      font-family: var(--mono); font-size: 11px; }
+    .ds-btn { padding: 7px 13px; font-size: 12px; border-radius: 7px; border: 1px solid #cbd5e1;
+      background: #fff; cursor: pointer; font-family: inherit; font-weight: 600; color: #334155; }
+    .ds-btn:hover { background: #f1f5f9; }
+    .ds-btn-primary { background: var(--color-primary); color: #fff; border-color: var(--color-primary); }
+    .ds-btn-admin { background: #fef3c7; border-color: #f59e0b; color: #7c2d12; margin-right: 6px; }
+    .ds-lock-badge { background: #fef3c7; color: #92400e; border: 1px solid #f59e0b;
+      padding: 7px 10px; border-radius: 7px; font-size: 12px; margin-bottom: 14px; }
+
+    /* KPI bar */
+    #kpiBar { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 10px; padding: 10px 16px; background: #f1f5f9; border-bottom: 1px solid #e2e8f0; flex-shrink: 0; }
+
+    /* Filter strip */
+    #filtersBar { background: #fff; border-bottom: 1px solid #e2e8f0; padding: 8px 16px; flex-shrink: 0;
+      display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; }
+    .fl-label { font-size: 9px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+      color: #64748b; padding: 4px 8px; background: #f1f5f9; border-radius: 999px; white-space: nowrap; }
+    .fl-select { height: 30px; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0 8px;
+      font-size: 12px; font-family: inherit; background: #fff; min-width: 180px; cursor: pointer; }
+    .fl-divider { width: 1px; height: 22px; background: #e2e8f0; flex-shrink: 0; }
+    .fl-dates { display: inline-flex; align-items: center; gap: 6px; }
+    .fl-date { height: 30px; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0 6px;
+      font-size: 12px; font-family: inherit; background: #fff; color: var(--c-primary); }
+    .fl-arrow { color: #94a3b8; font-size: 12px; }
+
+    /* MO table */
+    #tableScroll { flex: 1; min-height: 0; overflow: auto; background: var(--bg-1); position: relative; }
+    table.mr { width: 100%; border-collapse: collapse; font-size: 12.5px; background: #fff; }
+    table.mr th { background: var(--menu-bg); color: #fff; font-weight: 600; font-size: 11px; text-align: left;
+      padding: 8px 10px; white-space: nowrap; position: sticky; top: 0; z-index: 5;
+      text-transform: uppercase; letter-spacing: 0.03em; }
+    table.mr th.nr, table.mr td.nr { text-align: right; font-variant-numeric: tabular-nums; }
+    table.mr td { padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    table.mr tbody tr { cursor: pointer; }
+    table.mr tbody tr:hover td { background: var(--bg-1); }
+    table.mr tbody tr.on td { background: var(--tint-blue); }
+    .empty { text-align: center; color: var(--c-tertiary); font-style: italic; padding: 26px 10px !important; cursor: default; }
+    .row-link { color: var(--link); font-weight: 700; text-decoration: none; cursor: pointer; }
+    .row-link:hover { text-decoration: underline; }
+    .zero { color: var(--c-tertiary); }
+
+    /* Loading overlay */
+    #loadOverlay { position: absolute; inset: 0; z-index: 30; display: none; flex-direction: column;
+      align-items: center; justify-content: center; gap: 10px; background: rgba(247,247,247,.82);
+      color: var(--c-secondary); font-size: 12px; }
+    #loadOverlay.show { display: flex; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spin { animation: spin 0.8s linear infinite; }
+
+    .ps-btn svg, .ps-btn.sm svg { width: 17px; height: 17px; }
+    .ps-btn.icon, .ps-btn.icon.sm { width: 32px; padding: 0; }
+
+    /* Toasts */
+    .toast-container { position: fixed; bottom: 16px; right: 16px; z-index: 10130;
+      display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
+    .toast { display: flex; align-items: center; gap: 9px; min-width: 260px; max-width: 420px;
+      background: #fff; border: 1px solid var(--border); border-left: 4px solid var(--fb-neutral);
+      border-radius: var(--r-card); box-shadow: var(--sh2); padding: 10px 13px;
+      font-size: 12.5px; color: var(--c-primary); transition: opacity .3s; }
+    .toast.success { border-left-color: var(--fb-success); }
+    .toast.error   { border-left-color: var(--fb-negative); }
+    .toast.info    { border-left-color: var(--fb-blue); }
+    .toast-icon { font-weight: 700; }
+
+    /* Detail drawer */
+    .scrim { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(16,16,16,.35);
+      opacity: 0; pointer-events: none; transition: .2s; z-index: 10001; }
+    .scrim.on { opacity: 1; pointer-events: auto; }
+    .detail { position: fixed; top: 0; right: 0; bottom: 0; height: 100vh; width: 920px; max-width: 96vw;
+      background: #fff; z-index: 10002; box-shadow: var(--sh3); transform: translateX(100%);
+      transition: transform .22s cubic-bezier(.2,0,0,1); display: flex; flex-direction: column; }
+    .detail.on { transform: translateX(0); }
+    .detail-head { padding: 16px 20px; border-bottom: 1px solid var(--border); }
+    .detail-head .top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .detail-head .crumb { font-family: var(--mono); font-weight: 700; font-size: 12px; color: var(--c-tertiary); }
+    .detail-head h2 { font-size: 19px; font-weight: 800; margin: 2px 0 0; color: var(--c-primary); }
+    .detail-head .sub { font-size: 12.5px; color: var(--c-secondary); margin-top: 4px; display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
+    .detail-body { padding: 16px 20px; overflow-y: auto; flex: 1 1 auto; min-height: 0; }
+    .dsec { margin-bottom: 18px; }
+    .dsec h4 { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+      color: var(--c-tertiary); margin: 0 0 8px; }
+    .close-x { width: 32px; height: 32px; }
+
+    .pf-banner { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 11px 13px;
+      border-radius: var(--r-card); border-left: 4px solid var(--fb-neutral); background: var(--bg-1); margin-bottom: 12px; }
+    .pf-banner.ok   { border-left-color: #A9CDBA; background: #F1F7F3; }
+    .pf-banner.warn { border-left-color: #EBC49B; background: #FBF4EC; }
+    .pf-banner.bad  { border-left-color: #D9A4B2; background: #F7ECEF; }
+    .pf-banner .pf-summary { flex: 1; font-size: 12.5px; color: var(--c-primary); line-height: 1.45; }
+    .pf-banner .ps-btn.primary:disabled { opacity: .5; cursor: not-allowed; }
+    .pf-list { margin: 2px 0 12px 18px; padding: 0; font-size: 12px; }
+    .pf-list li { margin: 3px 0; }
+    .pf-list.bad  { color: #8A1E30; }
+    .pf-list.warn { color: #8A4E10; }
+
+    .pf-tablewrap { border: 1px solid var(--border); border-radius: var(--r-card); overflow: auto; }
+    .pf-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .pf-table th { background: var(--bg-1); color: var(--c-secondary); text-align: left; font-size: 10px;
+      font-weight: 700; text-transform: uppercase; letter-spacing: .04em; padding: 6px 8px;
+      border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 1; white-space: nowrap; }
+    .pf-table td { padding: 6px 8px; border-bottom: 1px solid var(--bg-2); vertical-align: top; }
+    .pf-table tr:last-child td { border-bottom: none; }
+    .pf-table td.num, .pf-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .pf-table tr.cfg-row td { background: var(--tint-blue); font-weight: 600; }
+    .pf-table tr.fg-line td { background: #F1F7F3; }
+    .pf-table .why { font-size: 11px; color: var(--c-secondary); margin-top: 2px; }
+    .stage-ind { display: inline-block; color: var(--c-tertiary); font-family: var(--mono); margin-right: 4px; }
+    .mode-chip { display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: .03em;
+      text-transform: uppercase; border-radius: var(--r-pill); padding: 1px 8px; margin-left: 8px;
+      border: 1px solid var(--border); background: #fff; color: var(--c-secondary); }
+    .mode-chip.bom { border-color: #BBA5EE; color: var(--acc-purple-con); background: var(--acc-purple-bg); }
+    .rg-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .rg-head .rg-all { font-size: 11px; margin-bottom: 8px; }
+    .pf-table tr.rg-toggle td { cursor: pointer; color: var(--c-secondary); font-size: 11.5px; padding-top: 4px; padding-bottom: 4px; }
+    .pf-table tr.rg-toggle:hover td { background: var(--bg-1); }
+    .rg-caret { display: inline-block; width: 14px; color: var(--c-tertiary); }
+    .pf-table tr.rg-line td:nth-child(2) { padding-left: 22px; }
+
+    .steps { list-style: none; margin: 0; padding: 0; font-size: 12.5px; }
+    .steps li { display: flex; gap: 8px; padding: 4px 0; border-bottom: 1px dashed var(--bg-2); }
+    .steps li:last-child { border-bottom: none; }
+    .steps .ic { width: 16px; flex-shrink: 0; font-weight: 800; text-align: center; }
+    .steps li.ok   .ic { color: var(--fb-success); }
+    .steps li.fail .ic { color: var(--fb-negative); }
+    .steps li.warn .ic { color: var(--fb-warning); }
+    .steps li.run  .ic { color: var(--fb-blue); }
+    .steps .txt { flex: 1; white-space: pre-line; }
+  </style>
+</head>
+<body>
+
+  <div class="wrap">
+
+    <!-- TOPBAR (v1.2 Workspace chrome) -->
+    <div class="topbar">
+      <div class="topbar-row1">
+        <div class="title-wrap">
+          <span class="crumb">Manufacturing</span>
+          <h1>MO Rollover</h1>
+          <p id="statusLine" style="font-size:12px;color:var(--c-tertiary);margin:2px 0 0;line-height:1.15;">Initialising&hellip;</p>
+        </div>
+        <div class="top-actions">
+          <div class="search">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path stroke-linecap="round" d="M21 21l-4-4"/></svg>
+            <input type="text" id="searchInput" placeholder="Search MO / part / SO&hellip;" />
+          </div>
+          <button class="ps-btn icon sm" type="button" onclick="loadList()" title="Refresh data">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v6h6M20 20v-6h-6M20 8a8 8 0 00-14.9-2M4 16a8 8 0 0014.9 2"/></svg>
+          </button>
+          <button class="ps-btn primary sm" type="button" onclick="openModule('Manufacture Order')" title="Open the Manufacture Order module">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>MO Module
+          </button>
+          <button class="ps-btn icon sm" id="helpBtn" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093M12 17h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+          </button>
+          <button class="ps-btn icon sm" id="setBtn" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- SETTINGS -->
+    <div id="setOverlay" class="fb-drawer">
+      <div class="fb-drawer-head">
+        <h2>&#9881; Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+      </div>
+      <div class="fb-drawer-body">
+        <div class="fb-grid">
+          <div class="fb-group">
+            <div class="fb-group-title">Display</div>
+            <div class="fb-field">
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                <input type="checkbox" id="dsReadyOnly" onchange="onSettingsChange()" />
+                <span>Only show MOs that can roll over</span>
+              </label>
+            </div>
+          </div>
+          <div class="fb-group">
+            <div class="fb-group-title">Diagnostics</div>
+            <div class="fb-field">
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                <input type="checkbox" id="dsDebug" onchange="onSettingsChange()" />
+                <span>Show debug console</span>
+              </label>
+              <span class="muted" style="font-size:11px;">Every REST payload and response is logged here.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn" onclick="resetSettings()">Reset to defaults</button>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+      </div>
+    </div>
+
+    <!-- HELP -->
+    <div id="helpOverlay" class="fb-drawer">
+      <div class="fb-drawer-head">
+        <h2>&#128214; How MO Rollover works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+      </div>
+      <div class="fb-drawer-body">
+        <div class="fb-grid">
+          <div class="fb-group" style="flex:1 1 300px;">
+            <div class="fb-group-title">The list</div>
+            <p>Issued and Partial MOs in your location groups. <strong>Scheduled</strong> narrows it by the MO's
+               scheduled date: pick a preset, counted from today each time the report opens, or type your own
+               From / To, which switches the range to <em>Custom</em>.</p>
+            <div class="fb-group-title" style="margin-top:10px;">Which MOs can roll over</div>
+            <p>Only a <strong>Partial</strong> MO &mdash; at least one WO already fulfilled. Fishbowl won't close an
+               Issued MO short, and with nothing built there is nothing to close it short for; those show as
+               <em>Nothing built yet</em>.</p>
+            <p>One exception: an Issued MO whose open WOs already went to a new MO in an earlier rollover. Those WOs
+               are duplicates, so the report offers to <strong>unissue and delete</strong> it &mdash; always after
+               asking you first.</p>
+            <div class="fb-group-title" style="margin-top:10px;">What happens to each WO</div>
+            <ul>
+              <li><strong>Moves</strong> &mdash; Entered, nothing picked, used or scrapped, no WIP stock. It is rebuilt
+                  on the new MO, and closing the original short removes it together with its pick.</li>
+              <li><strong>Stays</strong> &mdash; Fulfilled. It stays on the original, which is closed short.</li>
+              <li><strong>Blocks</strong> &mdash; anything else. Fishbowl won't close an MO short while one of its WOs is
+                  started or its pick is in progress:
+                  <ul>
+                    <li>a <strong>picked</strong> WO (pick lines started, committed or finished &mdash; for example a
+                        finished sub-stage's output committed to the next stage): <strong>void its pick in the Picking
+                        module</strong>, then press <strong>Re-check</strong></li>
+                    <li>a <strong>started</strong> WO, stock in WIP or quantities already used: finish the WO in Fishbowl</li>
+                  </ul></li>
+            </ul>
+            <p>Every movable WO moves &mdash; there is no opt-out, because a WO left behind would be closed short with
+               the original.</p>
+          </div>
+          <div class="fb-group" style="flex:1 1 300px;">
+            <div class="fb-group-title">What the button does</div>
+            <ul>
+              <li>Creates the new MO as <strong>Entered</strong> and checks every line against what was asked for</li>
+              <li><strong>Closes the original short</strong> (<code>/close-short</code>)</li>
+              <li><strong>Issues</strong> the new MO, which generates its work orders</li>
+              <li>Copies each old WO's location, customer, calendar category, assigned users, note and dates to its new WO</li>
+            </ul>
+            <p>Nothing is deleted. If a step fails the run stops there and tells you exactly what was left behind.
+               An Entered MO left by a run that stopped is used again by the next run, as long as it still
+               matches what is left to build. If that MO has since been issued, the work is already there and
+               the run only closes the original short.</p>
+          </div>
+          <div class="fb-group" style="flex:1 1 300px;">
+            <div class="fb-group-title">How the new MO is built</div>
+            <ul>
+              <li>Numbered after the original: <code>117</code> &rarr; <code>117-1</code>, then <code>117-2</code> &hellip;</li>
+              <li>One build per moving WO, with that WO's <strong>current</strong> lines and quantities,
+                  dates, priority and class</li>
+              <li>A staged build whose WOs all move is rebuilt from its BOM so the stages are kept &mdash; but only
+                  when the BOM gives exactly the same lines as the WOs. Otherwise each WO becomes its own build and
+                  the sub-assembly link is not kept.</li>
+              <li>Not carried: the sales-order link, MO memos, WO custom fields and WO instruction edits</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- KPI BAR -->
+    <div id="kpiBar">
+      <div class="kpi-tile"><div class="kpi-chip tone-blue"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg></div><div class="kpi-text"><div class="kpi-lbl">Open MOs</div><div class="kpi-val"><span class="kpi-num" id="kpiOpen">&mdash;</span></div></div></div>
+      <div class="kpi-tile"><div class="kpi-chip tone-success"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg></div><div class="kpi-text"><div class="kpi-lbl">Ready to roll over</div><div class="kpi-val"><span class="kpi-num" id="kpiReady">&mdash;</span></div></div></div>
+      <div class="kpi-tile"><div class="kpi-chip tone-warning"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg></div><div class="kpi-text"><div class="kpi-lbl">Blocked</div><div class="kpi-val"><span class="kpi-num" id="kpiBlocked">&mdash;</span> <span class="kpi-sub">WO started / picked</span></div></div></div>
+      <div class="kpi-tile"><div class="kpi-chip tone-purple"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"/></svg></div><div class="kpi-text"><div class="kpi-lbl">WOs that would move</div><div class="kpi-val"><span class="kpi-num" id="kpiMoving">&mdash;</span></div></div></div>
+    </div>
+
+    <!-- FILTER STRIP -->
+    <div id="filtersBar">
+      <span class="fl-label">Location group</span>
+      <select id="lgSel" class="fl-select" onchange="onLgChange()"><option value="">All</option></select>
+      <span class="fl-divider"></span>
+      <!-- Scheduled-date range: applied in SQL, so changing it re-queries. -->
+      <span class="fl-label">Scheduled</span>
+      <select id="datePreset" class="fl-select" onchange="onPresetChange()" title="Filter by the MO's scheduled date"></select>
+      <span class="fl-dates">
+        <input type="date" id="dateFrom" class="fl-date" onchange="onCustomDateChange()" title="Scheduled on or after" />
+        <span class="fl-arrow">&rarr;</span>
+        <input type="date" id="dateTo" class="fl-date" onchange="onCustomDateChange()" title="Scheduled on or before" />
+      </span>
+      <span class="fl-divider"></span>
+      <label class="fl-label" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;" title="Hide MOs that are blocked or have nothing to move">
+        <input type="checkbox" id="readyOnly" onchange="onReadyOnlyChange()" style="cursor:pointer;" />
+        Ready only
+      </label>
+    </div>
+
+    <!-- TABLE -->
+    <div id="tableScroll">
+      <div id="loadOverlay">
+        <svg class="spin" width="36" height="36" viewBox="0 0 24 24" fill="none">
+          <circle cx="12" cy="12" r="10" stroke="#e2e8f0" stroke-width="3"/>
+          <path d="M12 2a10 10 0 0 1 10 10" stroke="#2d9cdb" stroke-width="3" stroke-linecap="round"/>
+        </svg>
+        <div id="loadMsg">Loading&hellip;</div>
+      </div>
+      <table class="mr">
+        <thead>
+          <tr>
+            <th>MO</th>
+            <th>Status</th>
+            <th>Location group</th>
+            <th>Builds</th>
+            <th>Scheduled</th>
+            <th class="nr">WOs</th>
+            <th class="nr">Fulfilled</th>
+            <th class="nr">Moving</th>
+            <th class="nr">Blocking</th>
+            <th>Rollover</th>
+          </tr>
+        </thead>
+        <tbody id="moBody">
+          <tr><td colspan="10" class="empty">Loading&hellip;</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="toast-container"></div>
+
+  <!-- DETAIL drawer -->
+  <div class="scrim" id="detailScrim" onclick="MR.close()"></div>
+  <aside class="detail" id="detailPanel"></aside>
+
+  <script>
+  (function () {
+    'use strict';
+
+    // ── Runtime guards ─────────────────────────────────────────────
+    if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+      document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#8A1E30">' +
+        '<h2>Not running inside Fishbowl</h2><p>This report needs the Fishbowl BI host.</p></div>';
+      return;
+    }
+    if (!window.FBLib || !FBLib.Common || !FBLib.Settings) {
+      document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#8A1E30">' +
+        '<h2>fb-lib not loaded</h2><p>Save <code>scripts/fb-lib.js</code> as a Fishbowl Script named ' +
+        '<code>fb-lib</code> and reload.</p></div>';
+      return;
+    }
+
+    // ── Settings ───────────────────────────────────────────────────
+    FBLib.Settings.init({
+      masterStorage: 'userProperties',
+      userKey:   FB_REPORT.key + '.user.v1',
+      masterKey: FB_REPORT.key + '.master.v1',
+      defaults: {
+        v: 1,
+        showDebug: false,
+        lgId: '',
+        readyOnly: false,
+        datePreset: 'all',
+        dateFrom: '',
+        dateTo: ''
+      },
+      propFallback: {
+        showDebug: { name: 'BI_SHOW_DEBUG', dflt: 'false', parse: function (v) { return v === 'true' || v === true; } }
+      }
+    });
+
+    var C = FBLib.Common;
+    var MARKER = '[MOROLL v1]';
+    var MO_STATUS = { 10: 'Entered', 20: 'Issued', 50: 'Partial', 60: 'Fulfilled', 70: 'Closed Short', 80: 'Void' };
+    var WO_STATUS = { 10: 'Entered', 30: 'Started', 40: 'Fulfilled' };
+    var MO_NUM_MAX = 25;   // mo.num is varchar(25)
+
+    // ── Small helpers ──────────────────────────────────────────────
+    function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+    function escSQL(s) { return String(s == null ? '' : s).replace(/'/g, "''"); }
+    // A LIKE pattern literal: quotes doubled, then \ % _ escaped with a
+    // backslash (written as two characters inside the SQL string literal).
+    function likeEsc(s) { return escSQL(s).replace(/[\\%_]/g, function (m) { return '\\\\' + m; }); }
+    function num(v) { var n = parseFloat(v); return isNaN(n) ? 0 : n; }
+    function int(v) { var n = parseInt(v, 10); return isNaN(n) ? 0 : n; }
+    function same(a, b) { return Math.abs(num(a) - num(b)) < 1e-6; }
+    function qtyStr(v) { return String(Math.round(num(v) * 1e9) / 1e9); }
+    function fmtQty(v) { try { return C.formatQty(v); } catch (_) { return qtyStr(v); } }
+    function fmtDate(v) { if (!v) return ''; try { return C.formatDate(v); } catch (_) { return String(v).slice(0, 10); } }
+    function restDate(v) { if (!v) return null; var m = moment(v); return m.isValid() ? m.format('YYYY-MM-DDTHH:mm:ss') : null; }
+    function setStatus(m) { var el = document.getElementById('statusLine'); if (el) el.textContent = m; }
+    function errText(e) {
+      if (e == null) return 'unknown error';
+      if (typeof e === 'string') return e;
+      return e.message || (e.status != null ? 'HTTP ' + e.status : String(e));
+    }
+
+    // Debug drawer lines are written as TEXT, so payload JSON (notes can hold
+    // '<') can never inject markup.
+    function log(msg, type) {
+      try {
+        if (!C.DEBUG_MODE) return;
+        var el = document.getElementById('debugLog');
+        if (!el) return;
+        var ph = el.querySelector('[style*="italic"]');
+        if (ph) el.innerHTML = '';
+        var colors = { info: '#60a5fa', success: '#34d399', warning: '#fbbf24', error: '#f87171', query: '#a78bfa' };
+        var div = document.createElement('div');
+        div.style.marginBottom = '4px';
+        div.style.whiteSpace = 'pre-wrap';
+        div.style.color = colors[type] || '#e2e8f0';
+        div.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
+        el.appendChild(div);
+        el.scrollTop = el.scrollHeight;
+      } catch (_) {}
+    }
+    function logJson(label, obj) { try { log(label + '\n' + JSON.stringify(obj, null, 2), 'query'); } catch (_) { log(label, 'query'); } }
+
+    function spill(tone, label, title) {
+      return '<span class="spill ' + tone + '"' + (title ? ' title="' + esc(title) + '"' : '') + '>' + esc(label) + '</span>';
+    }
+    function moStatusTone(id) { id = int(id); return id === 50 ? 'active' : id === 20 ? 'neutral' : id === 60 ? 'success' : id === 70 ? 'caution' : 'critical'; }
+    function woStatusTone(id) { id = int(id); return id === 40 ? 'success' : id === 30 ? 'active' : 'neutral'; }
+
+    function showToast(message, type, duration) {
+      type = type || 'info'; duration = duration || 3500;
+      var container = document.querySelector('.toast-container');
+      var toast = document.createElement('div');
+      toast.className = 'toast ' + type;
+      toast.innerHTML = '<span class="toast-icon">' + (type === 'success' ? '&#10003;' : type === 'error' ? '&#10005;' : '&#8505;') + '</span><span class="toast-msg"></span>';
+      toast.querySelector('.toast-msg').textContent = message;
+      container.appendChild(toast);
+      setTimeout(function () { toast.style.opacity = '0'; setTimeout(function () { toast.remove(); }, 300); }, duration);
+    }
+
+    function hexA(hex, a) {
+      var h = String(hex || '').replace('#', '');
+      var r = parseInt(h.substr(0, 2), 16), g = parseInt(h.substr(2, 2), 16), b = parseInt(h.substr(4, 2), 16);
+      return 'rgba(' + r + ',' + g + ',' + b + ',' + a + ')';
+    }
+    // Themed confirm(). Resolves true / false. tone: 'warn' | 'danger' | 'info'.
+    function psConfirm(opts) {
+      opts = opts || {};
+      var tone = opts.tone || 'warn';
+      return new Promise(function (resolve) {
+        var toneColor = tone === 'danger' ? 'var(--fb-negative)' : tone === 'info' ? 'var(--fb-blue)' : 'var(--fb-warning)';
+        var toneBg = tone === 'danger' ? hexA('#C43046', .12) : tone === 'info' ? hexA('#2d9cdb', .12) : hexA('#F69133', .14);
+        var scrim = document.createElement('div');
+        scrim.setAttribute('style', 'position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:10120;display:flex;align-items:center;justify-content:center;background:rgba(16,16,16,.45);padding:20px');
+        scrim.innerHTML =
+          '<div role="dialog" aria-modal="true" style="background:#fff;border-radius:var(--r-card);box-shadow:var(--sh3);max-width:560px;width:100%;overflow:hidden">' +
+            '<div style="display:flex;gap:14px;padding:20px 20px 4px">' +
+              '<div style="flex-shrink:0;width:40px;height:40px;border-radius:50%;background:' + toneBg + ';color:' + toneColor + ';display:flex;align-items:center;justify-content:center">' +
+                '<svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M10.29 3.86 1.82 18a1.5 1.5 0 0 0 1.29 2.25h17.78A1.5 1.5 0 0 0 22.18 18L13.71 3.86a1.5 1.5 0 0 0-2.42 0z"/><path stroke-linecap="round" d="M12 9v4m0 4h.01"/></svg></div>' +
+              '<div style="flex:1;min-width:0">' +
+                '<h3 style="margin:0 0 6px;font-size:16px;font-weight:800;color:var(--c-primary)">' + esc(opts.title || 'Please confirm') + '</h3>' +
+                '<div style="font-size:13px;line-height:1.5;color:var(--c-secondary);white-space:pre-line;max-height:55vh;overflow:auto">' + esc(opts.message || '') + '</div>' +
+              '</div>' +
+            '</div>' +
+            '<div style="display:flex;gap:8px;justify-content:flex-end;padding:16px 20px 18px">' +
+              '<button type="button" class="ps-btn ps-confirm-cancel">' + esc(opts.cancelLabel || 'Cancel') + '</button>' +
+              '<button type="button" class="ps-btn primary ps-confirm-ok">' + esc(opts.confirmLabel || 'Confirm') + '</button>' +
+            '</div>' +
+          '</div>';
+        document.body.appendChild(scrim);
+        var done = false;
+        function close(val) { if (done) return; done = true; document.removeEventListener('keydown', onKey, true); scrim.remove(); resolve(val); }
+        function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(false); } }
+        scrim.querySelector('.ps-confirm-ok').addEventListener('click', function () { close(true); });
+        scrim.querySelector('.ps-confirm-cancel').addEventListener('click', function () { close(false); });
+        document.addEventListener('keydown', onKey, true);
+        // Focus Cancel, not OK: Enter must never close an MO short by accident.
+        setTimeout(function () { try { scrim.querySelector('.ps-confirm-cancel').focus(); } catch (_) {} }, 30);
+      });
+    }
+
+    // ── Queries ────────────────────────────────────────────────────
+    function norm(r) {
+      if (r == null) return [];
+      if (typeof r === 'string') { try { var p = JSON.parse(r); return Array.isArray(p) ? p : []; } catch (_) { return []; } }
+      return Array.isArray(r) ? r : [];
+    }
+    function qp(sql, label) {
+      var t0 = Date.now();
+      var p = (typeof runQueryAsync === 'function')
+        ? Promise.resolve(runQueryAsync(sql)).then(norm)
+        : Promise.resolve().then(function () { return norm(runQuery(sql)); });
+      return p.then(function (rows) {
+        log((label || 'query') + ': ' + rows.length + ' row(s) in ' + (Date.now() - t0) + ' ms', 'info');
+        return rows;
+      }, function (e) {
+        log((label || 'query') + ' FAILED: ' + errText(e) + '\n' + sql, 'error');
+        throw e;
+      });
+    }
+    function rest(req, label) {
+      logJson('REST ' + (req.method || 'GET') + ' ' + req.path + (label ? ' (' + label + ')' : ''), req.body ? JSON.parse(req.body) : {});
+      return runRestApiAsync(req).then(function (res) {
+        logJson('REST response ' + req.path, res);
+        return res;
+      }, function (e) {
+        log('REST ' + req.path + ' FAILED: ' + errText(e), 'error');
+        throw e;
+      });
+    }
+
+    // Every query takes the same scope: one MO (detail + pre-flight) or all
+    // open MOs in the user's location groups (the list). So the list and the
+    // drawer classify WOs from identical facts.
+    var lgIds = [];
+    function scopeWhere(scope) {
+      if (scope.moId) return 'mo.id = ' + int(scope.moId);
+      var w = 'mo.statusid IN (20, 50)';
+      if (scope.lgId) w += ' AND mo.locationgroupid = ' + int(scope.lgId);
+      else if (lgIds.length) w += ' AND mo.locationgroupid IN (' + lgIds.join(',') + ')';
+      // datescheduled is a datetime, so the To day runs up to midnight after it.
+      if (isIsoDate(scope.from)) w += " AND mo.datescheduled >= '" + scope.from + "'";
+      if (isIsoDate(scope.to)) w += " AND mo.datescheduled < DATE_ADD('" + scope.to + "', INTERVAL 1 DAY)";
+      return w;
+    }
+    var WO_JOIN = 'FROM wo JOIN moitem mh ON mh.id = wo.moitemid JOIN mo ON mo.id = mh.moid';
+
+    function sqlMos(scope) {
+      return 'SELECT mo.id AS mo_id, mo.num AS mo_num, mo.statusid AS mo_status, mo.locationgroupid AS lg_id, ' +
+        'lg.name AS lg_name, mo.datescheduled AS mo_date, mo.qbclassid AS class_id, mo.url AS url, ' +
+        'mo.note AS note, mo.soid AS so_id, so.num AS so_num ' +
+        'FROM mo LEFT JOIN locationgroup lg ON lg.id = mo.locationgroupid LEFT JOIN so ON so.id = mo.soid ' +
+        'WHERE ' + scopeWhere(scope) + ' ORDER BY mo.datescheduled, mo.num';
+    }
+    // moitem tree: build headers (50), finished goods (10), components (20).
+    // A staged sub-assembly's header hangs off the component line it feeds.
+    function sqlTree(scope) {
+      return 'SELECT mi.moid AS mo_id, mi.id, mi.parentid AS parent_id, mi.typeid AS type_id, mi.partid AS part_id, ' +
+        'p.num AS part_num, mi.bomid AS bom_id, b.num AS bom_num, mi.uomid AS uom_id, u.code AS uom_code, ' +
+        'mi.qtytofulfill AS qty ' +
+        'FROM moitem mi JOIN mo ON mo.id = mi.moid LEFT JOIN part p ON p.id = mi.partid ' +
+        'LEFT JOIN bom b ON b.id = mi.bomid LEFT JOIN uom u ON u.id = mi.uomid ' +
+        'WHERE ' + scopeWhere(scope) + ' ORDER BY mi.moid, mi.id';
+    }
+    function sqlWos(scope) {
+      return 'SELECT mh.moid AS mo_id, wo.id AS wo_id, wo.num AS wo_num, wo.statusid AS wo_status, ' +
+        'wo.moitemid AS header_id, wo.qtytarget AS builds, wo.datescheduled AS ds, wo.datescheduledtostart AS dss, ' +
+        'wo.priorityid AS priority_id, pr.name AS priority_name, wo.qbclassid AS class_id, wo.locationid AS location_id, ' +
+        'wo.customerid AS customer_id, wo.calcategoryid AS category_id, wo.note AS note ' +
+        WO_JOIN + ' LEFT JOIN priority pr ON pr.id = wo.priorityid ' +
+        'WHERE ' + scopeWhere(scope) + ' ORDER BY wo.num';
+    }
+    // Per-WO activity. Picking is read per PICK LINE, through
+    // pickitem.woitemid: a pick header can read Entered while one of its lines
+    // is already Finished, and grouped picks don't follow the 'W'+wo.num name.
+    function sqlLineFacts(scope) {
+      return 'SELECT woi.woid AS wo_id, COUNT(*) AS line_count, ' +
+        'SUM(CASE WHEN woi.typeid NOT IN (10, 20) THEN 1 ELSE 0 END) AS other_lines, ' +
+        'SUM(COALESCE(woi.qtyused, 0)) AS used, SUM(COALESCE(woi.qtyscrapped, 0)) AS scrapped ' +
+        'FROM woitem woi JOIN wo ON wo.id = woi.woid JOIN moitem mh ON mh.id = wo.moitemid JOIN mo ON mo.id = mh.moid ' +
+        'WHERE ' + scopeWhere(scope) + ' GROUP BY woi.woid';
+    }
+    // Started (20), Committed (30) and Finished (40) lines block: close-short
+    // refuses "outstanding Pick items that are in already progress".
+    function sqlPickFacts(scope) {
+      return 'SELECT woi.woid AS wo_id, ' +
+        'SUM(CASE WHEN pi.statusid IN (20, 30, 40) THEN 1 ELSE 0 END) AS picked_lines, ' +
+        'COUNT(*) AS pick_lines, ' +
+        "GROUP_CONCAT(DISTINCT p.num ORDER BY p.num SEPARATOR ', ') AS picks " +
+        'FROM pickitem pi JOIN woitem woi ON woi.id = pi.woitemid JOIN pick p ON p.id = pi.pickid ' +
+        'JOIN wo ON wo.id = woi.woid JOIN moitem mh ON mh.id = wo.moitemid JOIN mo ON mo.id = mh.moid ' +
+        'WHERE ' + scopeWhere(scope) + ' GROUP BY woi.woid';
+    }
+    function sqlWipFacts(scope) {
+      return 'SELECT woi.woid AS wo_id, COUNT(*) AS wip_tags ' +
+        'FROM tag t JOIN woitem woi ON woi.id = t.woitemid ' +
+        'JOIN wo ON wo.id = woi.woid JOIN moitem mh ON mh.id = wo.moitemid JOIN mo ON mo.id = mh.moid ' +
+        'WHERE ' + scopeWhere(scope) + ' AND wo.statusid <> 40 AND t.qty > 0 GROUP BY woi.woid';
+    }
+    function sqlWoLines(scope) {
+      return 'SELECT woi.woid AS wo_id, woi.id, woi.typeid AS type_id, woi.partid AS part_id, p.num AS part_num, ' +
+        'p.description AS part_desc, woi.description AS descr, woi.uomid AS uom_id, u.code AS uom_code, ' +
+        'woi.qtytarget AS qty, woi.oneTimeItem+0 AS one_time ' +
+        'FROM woitem woi JOIN wo ON wo.id = woi.woid JOIN moitem mh ON mh.id = wo.moitemid JOIN mo ON mo.id = mh.moid ' +
+        'LEFT JOIN part p ON p.id = woi.partid LEFT JOIN uom u ON u.id = woi.uomid ' +
+        'WHERE ' + scopeWhere(scope) + ' ORDER BY woi.woid, woi.sortid, woi.id';
+    }
+    function sqlAssigned(scope) {
+      return 'SELECT au.woid AS wo_id, au.userid AS user_id FROM woassignedusers au ' +
+        'JOIN wo ON wo.id = au.woid JOIN moitem mh ON mh.id = wo.moitemid JOIN mo ON mo.id = mh.moid ' +
+        'WHERE ' + scopeWhere(scope);
+    }
+
+    function byKey(rows, key) { var m = {}; rows.forEach(function (r) { m[String(r[key])] = r; }); return m; }
+    function groupBy(rows, key) { var m = {}; rows.forEach(function (r) { (m[String(r[key])] = m[String(r[key])] || []).push(r); }); return m; }
+
+    // ── Classification ─────────────────────────────────────────────
+    // Fishbowl only closes an MO short when every WO is Entered or Fulfilled
+    // and no pick is in progress, so anything else blocks the whole run.
+    function classify(w, lf, pf, wf) {
+      var s = int(w.wo_status);
+      lf = lf || {}; pf = pf || {}; wf = wf || {};
+      if (s === 40) return { disp: 'stay', reason: 'Fulfilled — stays on the original' };
+      if (s !== 10) return { disp: 'block', reason: (WO_STATUS[s] || 'Status ' + s) + ' — finish it in Fishbowl first' };
+      var n = int(pf.picked_lines);
+      if (n > 0) return { disp: 'block', pick: true, picks: String(pf.picks || ''), reason: (pf.picks || 'Its pick') + ' has ' + n + ' line' + (n === 1 ? '' : 's') +
+        ' already picked — void ' + (String(pf.picks || '').indexOf(',') >= 0 ? 'those picks' : 'it') + ' in the Picking module, then Re-check' };
+      if (int(wf.wip_tags) > 0) return { disp: 'block', reason: 'Has stock staged in WIP — finish it in Fishbowl first' };
+      if (num(lf.used) > 0 || num(lf.scrapped) > 0) return { disp: 'block', reason: 'Has quantities used or scrapped — finish it in Fishbowl first' };
+      if (int(lf.other_lines) > 0) return { disp: 'block', reason: 'Has a line that is not a finished or raw good, which a new MO cannot carry' };
+      if (!(num(w.builds) > 0)) return { disp: 'block', reason: 'Has no build quantity' };
+      return { disp: 'move', reason: 'Entered, nothing picked' };
+    }
+
+    // Readiness of a whole MO from its classified WOs.
+    function readiness(wos, moStatus) {
+      var c = { total: wos.length, move: 0, stay: 0, block: 0, picks: 0 };
+      wos.forEach(function (w) { c[w._cls.disp]++; if (w._cls.pick) c.picks++; });
+      c.state = int(moStatus) !== 50 ? 'unbuilt' : c.block ? 'blocked' : c.move ? 'ready' : 'none';
+      return c;
+    }
+    function readinessPill(c) {
+      if (c.state === 'ready') return spill('success', 'Ready');
+      if (c.state === 'unbuilt') return spill('neutral', 'Nothing built yet', 'Fishbowl only closes short a Partial MO: at least one WO has to be fulfilled first');
+      if (c.state === 'blocked' && c.picks && c.picks === c.block) return spill('caution', 'Blocked · void pick', 'A WO has picked lines: void its pick in the Picking module');
+      if (c.state === 'blocked') return spill('critical', 'Blocked', 'A WO is started or picked — finish it in Fishbowl first');
+      return spill('neutral', 'Nothing to move');
+    }
+
+    // ── State ──────────────────────────────────────────────────────
+    var state = { lgs: [], mos: [], search: '', lgId: '', readyOnly: false,
+                  datePreset: 'all', dateFrom: '', dateTo: '', loadToken: 0 };
+
+    // ── List load ──────────────────────────────────────────────────
+    function loadList() {
+      var token = ++state.loadToken;
+      var scope = { lgId: state.lgId, from: state.dateFrom, to: state.dateTo };
+      showSpinner(true, 'Loading open MOs…');
+      setStatus('Loading open MOs…');
+      return Promise.all([
+        qp(sqlMos(scope), 'MOs'), qp(sqlTree(scope), 'MO tree'), qp(sqlWos(scope), 'WOs'),
+        qp(sqlLineFacts(scope), 'WO lines'), qp(sqlPickFacts(scope), 'Picks'), qp(sqlWipFacts(scope), 'WIP')
+      ]).then(function (r) {
+        if (token !== state.loadToken) return;   // a newer load started
+        var tree = groupBy(r[1], 'mo_id'), wos = groupBy(r[2], 'mo_id');
+        var lf = byKey(r[3], 'wo_id'), pf = byKey(r[4], 'wo_id'), wf = byKey(r[5], 'wo_id');
+        state.mos = r[0].map(function (mo) {
+          var items = tree[String(mo.mo_id)] || [];
+          var list = (wos[String(mo.mo_id)] || []).map(function (w) {
+            w._cls = classify(w, lf[String(w.wo_id)], pf[String(w.wo_id)], wf[String(w.wo_id)]);
+            return w;
+          });
+          // Builds = the finished goods hanging off each ROOT header.
+          var roots = {}; items.forEach(function (i) { if (int(i.type_id) === 50 && i.parent_id == null) roots[String(i.id)] = true; });
+          var fgs = items.filter(function (i) { return int(i.type_id) === 10 && roots[String(i.parent_id)]; })
+                         .map(function (i) { return i.part_num; });
+          mo._fg = fgs.filter(function (v, k) { return v && fgs.indexOf(v) === k; });
+          mo._wos = list;
+          mo._r = readiness(list, mo.mo_status);
+          return mo;
+        });
+        showSpinner(false);
+        render();
+        var range = rangeText();
+        setStatus(state.mos.length + ' open MO' + (state.mos.length === 1 ? '' : 's') + (range ? ' scheduled ' + range : '') + ' · ' +
+          moment().format('HH:mm'));
+      }).catch(function (e) {
+        if (token !== state.loadToken) return;
+        showSpinner(false);
+        setStatus('Load failed: ' + errText(e));
+        document.getElementById('moBody').innerHTML = '<tr><td colspan="10" class="empty">Could not load MOs — ' + esc(errText(e)) + '</td></tr>';
+      });
+    }
+
+    function visibleMos() {
+      var q = state.search.trim().toLowerCase();
+      return state.mos.filter(function (mo) {
+        if (state.readyOnly && mo._r.state !== 'ready') return false;
+        if (!q) return true;
+        return [mo.mo_num, mo.so_num, mo.lg_name].concat(mo._fg).some(function (v) { return String(v || '').toLowerCase().indexOf(q) >= 0; });
+      });
+    }
+
+    function render() {
+      var rows = visibleMos();
+      var k = { open: state.mos.length, ready: 0, blocked: 0, moving: 0 };
+      state.mos.forEach(function (mo) {
+        if (mo._r.state === 'ready') { k.ready++; k.moving += mo._r.move; }
+        if (mo._r.state === 'blocked') k.blocked++;
+      });
+      document.getElementById('kpiOpen').textContent = k.open;
+      document.getElementById('kpiReady').textContent = k.ready;
+      document.getElementById('kpiBlocked').textContent = k.blocked;
+      document.getElementById('kpiMoving').textContent = k.moving;
+
+      var body = document.getElementById('moBody');
+      if (!rows.length) {
+        var range = rangeText();
+        body.innerHTML = '<tr><td colspan="10" class="empty">' + (state.mos.length ? 'No MOs match the filters.' :
+          'No open (Issued or Partial) MOs' + (range ? ' scheduled ' + esc(range) : '') + '.') + '</td></tr>';
+        return;
+      }
+      var activeId = MR.activeId();
+      body.innerHTML = rows.map(function (mo) {
+        var r = mo._r;
+        var n = function (v) { return '<td class="nr' + (v ? '' : ' zero') + '">' + v + '</td>'; };
+        return '<tr data-mo="' + esc(mo.mo_id) + '"' + (String(activeId) === String(mo.mo_id) ? ' class="on"' : '') + '>' +
+          '<td><span class="row-link">' + esc(mo.mo_num) + '</span>' + (mo.so_num ? ' <span class="muted" style="font-size:11px;">SO ' + esc(mo.so_num) + '</span>' : '') + '</td>' +
+          '<td>' + spill(moStatusTone(mo.mo_status), MO_STATUS[int(mo.mo_status)] || mo.mo_status) + '</td>' +
+          '<td>' + esc(mo.lg_name || '') + '</td>' +
+          '<td>' + esc(mo._fg.join(', ')) + '</td>' +
+          '<td>' + esc(fmtDate(mo.mo_date)) + '</td>' +
+          n(r.total) + n(r.stay) + n(r.move) + n(r.block) +
+          '<td>' + readinessPill(r) + '</td>' +
+        '</tr>';
+      }).join('');
+    }
+
+    document.getElementById('moBody').addEventListener('click', function (e) {
+      var tr = e.target.closest('tr[data-mo]');
+      if (tr) MR.open(int(tr.getAttribute('data-mo')));
+    });
+
+    function showSpinner(on, msg) {
+      document.getElementById('loadOverlay').classList.toggle('show', !!on);
+      if (msg) document.getElementById('loadMsg').textContent = msg;
+    }
+
+    // ============================================================
+    // MR — the detail drawer: load one MO, plan the new MO, run it.
+    // ============================================================
+    var MR = (function () {
+      var active = null;      // { moId, model, plan, steps, running, done }
+      var inFlight = false;
+      var openToken = 0;
+
+      function activeId() { return active ? active.moId : null; }
+
+      // ── One MO, fresh from the database ──────────────────────────
+      function loadModel(moId) {
+        var scope = { moId: moId };
+        return Promise.all([
+          qp(sqlMos(scope), 'MO'), qp(sqlTree(scope), 'MO tree'), qp(sqlWos(scope), 'WOs'),
+          qp(sqlLineFacts(scope), 'WO line facts'), qp(sqlPickFacts(scope), 'Picks'), qp(sqlWipFacts(scope), 'WIP'),
+          qp(sqlWoLines(scope), 'WO lines'), qp(sqlAssigned(scope), 'Assigned users')
+        ]).then(function (r) {
+          var mo = r[0][0];
+          if (!mo) throw new Error('MO ' + moId + ' was not found.');
+          var lf = byKey(r[3], 'wo_id'), pf = byKey(r[4], 'wo_id'), wf = byKey(r[5], 'wo_id');
+          var lines = groupBy(r[6], 'wo_id'), assigned = groupBy(r[7], 'wo_id');
+          var wos = r[2].map(function (w) {
+            w._cls = classify(w, lf[String(w.wo_id)], pf[String(w.wo_id)], wf[String(w.wo_id)]);
+            w._picks = (pf[String(w.wo_id)] || {}).picks || '';
+            w._pickedLines = int((pf[String(w.wo_id)] || {}).picked_lines);
+            w._pickLines = int((pf[String(w.wo_id)] || {}).pick_lines);
+            w._lines = lines[String(w.wo_id)] || [];
+            w._users = (assigned[String(w.wo_id)] || []).map(function (a) { return int(a.user_id); });
+            return w;
+          });
+          return indexTree({ mo: mo, items: r[1], wos: wos });
+        });
+      }
+
+      // Tree helpers shared by the old MO and the new one.
+      //   path   a header's position inside its build: '' for the root, then
+      //          '/<component part id>#<n>' per stage (n disambiguates two
+      //          stages fed by the same part).
+      function indexTree(model) {
+        var byId = {}; model.items.forEach(function (i) { byId[String(i.id)] = i; });
+        var headers = model.items.filter(function (i) { return int(i.type_id) === 50; });
+        function parentHeader(h) {
+          if (h.parent_id == null) return null;
+          var comp = byId[String(h.parent_id)];
+          return comp && comp.parent_id != null ? byId[String(comp.parent_id)] || null : null;
+        }
+        var memo = {};
+        function info(h) {
+          var key = String(h.id);
+          if (memo[key]) return memo[key];
+          var ph = parentHeader(h);
+          if (!ph) { memo[key] = { root: h, path: '', depth: 0 }; return memo[key]; }
+          var pi = info(ph);
+          var comp = byId[String(h.parent_id)];
+          var siblings = headers.filter(function (o) {
+            var oc = byId[String(o.parent_id)];
+            return oc && String(oc.parent_id) === String(ph.id) && String(oc.part_id) === String(comp.part_id);
+          }).sort(function (a, b) { return int(a.id) - int(b.id); });
+          var n = siblings.indexOf(h);
+          memo[key] = { root: pi.root, path: pi.path + '/' + comp.part_id + '#' + n, depth: pi.depth + 1, comp: comp };
+          return memo[key];
+        }
+        model.byId = byId;
+        model.headers = headers;
+        model.info = info;
+        model.roots = headers.filter(function (h) { return h.parent_id == null; }).sort(function (a, b) { return int(a.id) - int(b.id); });
+        model.childrenOf = function (h) { return model.items.filter(function (i) { return String(i.parent_id) === String(h.id); }); };
+        (model.wos || []).forEach(function (w) {
+          var h = byId[String(w.header_id)];
+          w._info = h ? info(h) : { root: null, path: '', depth: 0 };
+        });
+        return model;
+      }
+
+      // ── BOM-default prediction for a staged build ────────────────
+      // Mirrors how Fishbowl expands a configuration sent with NO items[]:
+      // default lines only (groupDefault), quantities x builds except one-time
+      // items (a fixed quantity per build order: moitem 655 on MO 108 is 1 for 5
+      // builds), and a staged line opening a sub-build of
+      // (line qty / sub-BOM output qty). Anything
+      // this can't predict with certainty returns ok:false, and the build is
+      // flattened instead — the safe answer.
+      var bomCache = {};
+      function loadBoms(ids) {
+        var need = ids.filter(function (id) { return id && !bomCache[String(id)]; });
+        if (!need.length) return Promise.resolve();
+        return qp('SELECT bi.id, bi.bomid AS bom_id, bi.typeid AS type_id, bi.partid AS part_id, bi.uomid AS uom_id, ' +
+          'bi.quantity AS qty, bi.stage+0 AS stage, bi.stagebomid AS stage_bom_id, bi.groupdefault+0 AS gd, bi.onetimeitem+0 AS one_time ' +
+          'FROM bomitem bi WHERE bi.bomid IN (' + need.map(int).join(',') + ') ORDER BY bi.bomid, bi.sortidconfig, bi.id', 'BOM lines')
+          .then(function (rows) {
+            need.forEach(function (id) { bomCache[String(id)] = []; });
+            rows.forEach(function (r) { bomCache[String(r.bom_id)].push(r); });
+            var subs = [];
+            rows.forEach(function (r) { if (int(r.stage) === 1 && r.stage_bom_id) subs.push(int(r.stage_bom_id)); });
+            return loadBoms(subs);
+          });
+      }
+      function predictStages(bomId, builds, path, out, depth) {
+        if (depth > 10) return 'BOM nesting is deeper than 10 levels';
+        var lines = (bomCache[String(bomId)] || []).filter(function (b) { return int(b.gd) === 1; });
+        if (!lines.length) return 'BOM ' + bomId + ' has no default lines';
+        if (lines.some(function (b) { var t = int(b.type_id); return t === 30 || t === 31; })) return 'the BOM has a repair line';
+        var mats = lines.filter(function (b) { var t = int(b.type_id); return t === 10 || t === 20; });
+        var fg = mats.filter(function (b) { return int(b.type_id) === 10; });
+        if (fg.length !== 1) return 'the BOM has ' + fg.length + ' finished goods';
+        out.push({ path: path, bomId: int(bomId), builds: builds,
+                   lines: mats.map(function (b) { return { type: int(b.type_id), part: int(b.part_id), uom: int(b.uom_id), qty: int(b.one_time) === 1 ? num(b.qty) : num(b.qty) * builds }; }) });
+        var seen = {};
+        for (var i = 0; i < mats.length; i++) {
+          var b = mats[i];
+          if (int(b.type_id) !== 20 || int(b.stage) !== 1 || !b.stage_bom_id) continue;
+          var sub = (bomCache[String(b.stage_bom_id)] || []).filter(function (x) { return int(x.gd) === 1 && int(x.type_id) === 10; });
+          if (sub.length !== 1) return 'stage BOM ' + b.stage_bom_id + ' has ' + sub.length + ' finished goods';
+          if (int(sub[0].part_id) !== int(b.part_id) || int(sub[0].uom_id) !== int(b.uom_id) || !(num(sub[0].qty) > 0)) return 'a stage line and its BOM output differ in part or UOM';
+          var k = String(b.part_id); var n = seen[k] || 0; seen[k] = n + 1;
+          var err = predictStages(b.stage_bom_id, num(b.qty) * builds / num(sub[0].qty), path + '/' + b.part_id + '#' + n, out, depth + 1);
+          if (err) return err;
+        }
+        return null;
+      }
+
+      // Lines are compared as multisets of (type, part, uom, qty).
+      function lineKey(l) { return l.type + '|' + l.part + '|' + l.uom; }
+      function diffLines(want, got, where) {
+        var probs = [];
+        var w = {}, g = {};
+        want.forEach(function (l) { w[lineKey(l)] = (w[lineKey(l)] || 0) + l.qty; });
+        got.forEach(function (l) { g[lineKey(l)] = (g[lineKey(l)] || 0) + l.qty; });
+        Object.keys(w).forEach(function (k) {
+          var part = partLabel(k);
+          if (g[k] == null) probs.push(where + ': ' + part + ' is missing');
+          else if (!same(g[k], w[k])) probs.push(where + ': ' + part + ' is ' + fmtQty(g[k]) + ', expected ' + fmtQty(w[k]) +
+            (same(g[k], w[k] * 2) ? ' (exactly double — items[] merged with the BOM defaults)' : ''));
+        });
+        Object.keys(g).forEach(function (k) { if (w[k] == null) probs.push(where + ': unexpected ' + partLabel(k)); });
+        return probs;
+      }
+      var partNames = {};
+      function partLabel(k) { var p = k.split('|'); return (p[0] === '10' ? 'output ' : '') + (partNames[p[1]] || ('part ' + p[1])); }
+
+      function woLines(w) {
+        return w._lines.filter(function (l) { var t = int(l.type_id); return t === 10 || t === 20; })
+          .map(function (l) { partNames[String(l.part_id)] = l.part_num; return { type: int(l.type_id), part: int(l.part_id), uom: int(l.uom_id), qty: num(l.qty), src: l }; });
+      }
+
+      // ── Plan: what the new MO will contain ───────────────────────
+      // configs[] is in payload order. Each is { mode: 'flat'|'bom', wos[],
+      // stages[] (what the new MO's tree must hold), items[] (flat only) }.
+      function buildPlan(model) {
+        var blockers = [], warnings = [], configs = [];
+        var moving = model.wos.filter(function (w) { return w._cls.disp === 'move'; });
+        model.wos.forEach(function (w) { if (w._cls.disp === 'block') blockers.push('WO ' + w.wo_num + ': ' + w._cls.reason); });
+        var issued = int(model.mo.mo_status) === 20;
+        if (issued) blockers.unshift('MO ' + model.mo.mo_num + ' is Issued: nothing on it has been built yet, and Fishbowl only closes short a Partial MO (at least one WO fulfilled).');
+        else if (int(model.mo.mo_status) !== 50)
+          blockers.unshift('MO ' + model.mo.mo_num + ' is ' + (MO_STATUS[int(model.mo.mo_status)] || model.mo.mo_status) + ' — only a Partial MO can roll over.');
+        if (!moving.length && !blockers.length) blockers.push('Nothing to move — every WO is Fulfilled.');
+        if (model.mo.so_id) warnings.push('MO ' + model.mo.mo_num + ' is linked to SO ' + (model.mo.so_num || model.mo.so_id) +
+          '. The new MO cannot carry that link: it stays with the closed original.');
+
+        // Group the moving WOs by the build (root header) they belong to.
+        var byRoot = {};
+        moving.forEach(function (w) {
+          var root = w._info.root; var key = root ? String(root.id) : 'x' + w.wo_id;
+          (byRoot[key] = byRoot[key] || []).push(w);
+        });
+
+        var jobs = model.roots.map(function (root) {
+          var group = byRoot[String(root.id)];
+          if (!group) return null;
+          var treeWos = model.wos.filter(function (w) { return w._info.root && String(w._info.root.id) === String(root.id); });
+          var treeHeaders = model.headers.filter(function (h) { return String(model.info(h).root.id) === String(root.id); });
+          var staged = treeHeaders.length > 1;
+          var oneWoPerHeader = treeHeaders.every(function (h) { return treeWos.filter(function (w) { return String(w.header_id) === String(h.id); }).length === 1; });
+          var whole = staged && group.length === treeWos.length && oneWoPerHeader;
+          return { root: root, group: group, staged: staged, whole: whole };
+        }).filter(Boolean);
+
+        return Promise.all(jobs.map(function (j) {
+          if (!j.whole) return Promise.resolve(null);
+          var rootWo = j.group.filter(function (w) { return w._info.path === ''; })[0];
+          return loadBoms([int(j.root.bom_id)]).then(function () {
+            var pred = [];
+            var err = predictStages(int(j.root.bom_id), num(rootWo.builds), '', pred, 0);
+            if (err) return { ok: false, why: [err] };
+            var probs = [];
+            var oldByPath = {}; j.group.forEach(function (w) { oldByPath[w._info.path] = w; });
+            pred.forEach(function (st) {
+              var w = oldByPath[st.path];
+              if (!w) { probs.push('the BOM has a stage the MO does not'); return; }
+              if (int(model.byId[String(w.header_id)].bom_id) !== st.bomId) probs.push('WO ' + w.wo_num + ' builds a different BOM');
+              if (!same(w.builds, st.builds)) probs.push('WO ' + w.wo_num + ': ' + fmtQty(w.builds) + ' builds, the BOM gives ' + fmtQty(st.builds));
+              probs = probs.concat(diffLines(st.lines, woLines(w), 'WO ' + w.wo_num));
+            });
+            if (pred.length !== j.group.length) probs.push('the MO has ' + j.group.length + ' stages, the BOM ' + pred.length);
+            return { ok: !probs.length, why: probs, rootWo: rootWo };
+          });
+        })).then(function (preds) {
+          jobs.forEach(function (j, k) {
+            var p = preds[k];
+            if (p && p.ok) {
+              var sorted = j.group.slice().sort(function (a, b) { return a._info.depth - b._info.depth || int(a.wo_id) - int(b.wo_id); });
+              configs.push({ mode: 'bom', root: j.root, rootWo: p.rootWo, wos: sorted,
+                stages: sorted.map(function (w) { return { path: w._info.path, wo: w, bomId: int(model.byId[String(w.header_id)].bom_id), builds: num(w.builds), lines: woLines(w) }; }) });
+              return;
+            }
+            if (p && !p.ok) warnings.push('Staged build ' + (j.root.bom_num || j.root.bom_id) + ' is not rebuilt from its BOM (' +
+              p.why.slice(0, 3).join('; ') + (p.why.length > 3 ? '; …' : '') + '), so each WO becomes its own build and the sub-assembly link between them is not kept.');
+            else if (j.staged && j.group.length > 1) warnings.push('Only part of staged build ' + (j.root.bom_num || j.root.bom_id) +
+              ' moves, so each moving WO becomes its own build and the sub-assembly link between them is not kept.');
+            j.group.slice().sort(function (a, b) { return b._info.depth - a._info.depth || int(a.wo_id) - int(b.wo_id); }).forEach(function (w) {
+              var lines = woLines(w);
+              var zero = lines.filter(function (l) { return l.type === 20 && !(l.qty > 0); });
+              zero.forEach(function (l) { warnings.push('WO ' + w.wo_num + ': ' + (l.src.part_num || 'a line') + ' has quantity 0 and is not carried.'); });
+              lines = lines.filter(function (l) { return l.qty > 0; });
+              var fg = lines.filter(function (l) { return l.type === 10; });
+              if (!fg.length) blockers.push('WO ' + w.wo_num + ' has no finished good with a quantity.');
+              if (lines.some(function (l) { return !l.part || !l.uom; })) blockers.push('WO ' + w.wo_num + ' has a line with no part or UOM.');
+              configs.push({ mode: 'flat', root: model.byId[String(w.header_id)], rootWo: w, wos: [w],
+                stages: [{ path: '', wo: w, bomId: int((model.byId[String(w.header_id)] || {}).bom_id), builds: num(w.builds), lines: lines }] });
+            });
+          });
+          configs.forEach(function (c) { if (!c.stages[0].bomId) blockers.push('WO ' + c.rootWo.wo_num + ' has no BOM on its build.'); });
+          // Every moving WO must land in a build — one left out would be closed
+          // short with the original and its work lost.
+          var covered = {};
+          configs.forEach(function (c) { c.wos.forEach(function (w) { covered[String(w.wo_id)] = true; }); });
+          moving.forEach(function (w) { if (!covered[String(w.wo_id)]) blockers.push('WO ' + w.wo_num + ' could not be placed in a build on the new MO.'); });
+          return { configs: configs, blockers: blockers, warnings: warnings, moving: moving, issued: issued };
+        });
+      }
+
+      // ── Numbering + duplicate guard ──────────────────────────────
+      // The marker sits at the very START of the new MO's note, so an
+      // anchored LIKE can't be fooled by free text:
+      //   [MOROLL v1] from=117 base=117 wos=117:002,117:003 <original note>
+      var MARKER_RE = /^\[MOROLL v1\] from=(\S+) base=(\S+) wos=(\S*) ?/;
+      function stripMarkers(note) {
+        var s = String(note || ''), base = null, m;
+        while ((m = MARKER_RE.exec(s))) { if (!base) base = m[2]; s = s.slice(m[0].length); }
+        return { base: base, note: s };
+      }
+      function markerMos(origNum) {
+        return qp("SELECT id AS mo_id, num AS mo_num, statusid AS mo_status, note FROM mo WHERE statusid <> 80 AND note LIKE '" +
+          likeEsc(MARKER + ' from=' + origNum + ' ') + "%'", 'Earlier rollovers');
+      }
+      function nextNumber(mo) {
+        var base = stripMarkers(mo.note).base || String(mo.mo_num);
+        return qp("SELECT num AS mo_num FROM mo WHERE num LIKE '" + likeEsc(base + '-') + "%'", 'Suffix numbers').then(function (rows) {
+          var max = 0;
+          rows.forEach(function (r) {
+            var tail = String(r.mo_num).slice(base.length + 1);
+            if (/^\d+$/.test(tail)) max = Math.max(max, int(tail));
+          });
+          return { base: base, num: base + '-' + (max + 1) };
+        });
+      }
+
+      // ── Payload ──────────────────────────────────────────────────
+      function buildPayload(model, plan, restMo, newNum) {
+        var mo = model.mo;
+        var cfgNotes = {};
+        (restMo.configurations || []).forEach(function (c) { if (c && c.id != null) cfgNotes[String(c.id)] = c.note || ''; });
+        var wosList = plan.moving.map(function (w) { return w.wo_num; }).join(',');
+        var payload = {
+          number: newNum.num,
+          status: 'Entered',
+          locationGroup: { id: int(mo.lg_id) },
+          note: MARKER + ' from=' + mo.mo_num + ' base=' + newNum.base + ' wos=' + wosList + ' ' + stripMarkers(mo.note).note,
+          configurations: plan.configs.map(function (c) {
+            var w = c.rootWo;
+            var cfg = {
+              bom: { id: c.stages[0].bomId },
+              quantity: qtyStr(w.builds),
+              note: cfgNotes[String(w.header_id)] || ''
+            };
+            if (restDate(w.ds)) cfg.dateScheduled = restDate(w.ds);
+            if (restDate(w.dss)) cfg.dateScheduledToStart = restDate(w.dss);
+            if (w.priority_name) cfg.priority = w.priority_name;
+            if (w.class_id) cfg['class'] = { id: int(w.class_id) };
+            if (c.mode === 'flat') {
+              cfg.items = c.stages[0].lines.map(function (l) {
+                var s = l.src;
+                return { description: s.descr || s.part_desc || s.part_num || 'Item',
+                         type: l.type === 10 ? 'Finished Good' : 'Raw Good',
+                         part: { id: l.part }, uom: { id: l.uom },
+                         oneTimeItem: int(s.one_time) === 1, quantity: qtyStr(l.qty) };
+              });
+            }
+            return cfg;
+          })
+        };
+        if (restDate(mo.mo_date)) payload.dateScheduled = restDate(mo.mo_date);
+        if (mo.url) payload.url = mo.url;
+        if (mo.class_id) payload['class'] = { id: int(mo.class_id) };
+        var cf = (restMo.customFields || []).filter(function (f) { return f && f.id != null && f.value != null && String(f.value) !== ''; })
+          .map(function (f) { return { id: f.id, value: String(f.value) }; });
+        if (cf.length) payload.customFields = cf;
+        return payload;
+      }
+
+      // ── Verify the new MO against the plan ───────────────────────
+      function verifyNewMo(newId, plan) {
+        return qp(sqlTree({ moId: newId }), 'New MO tree').then(function (items) {
+          var probs = [];
+          if (!items.length) return { ok: false, problems: ['Could not read the new MO back from the database.'] };
+          var m = indexTree({ items: items, wos: [] });
+          if (m.roots.length !== plan.configs.length) probs.push('Expected ' + plan.configs.length + ' build(s), the new MO has ' + m.roots.length + '.');
+          plan.configs.forEach(function (c, i) {
+            var root = m.roots[i];
+            if (!root) return;
+            var hs = m.headers.filter(function (h) { return String(m.info(h).root.id) === String(root.id); });
+            var byPath = {}; hs.forEach(function (h) { byPath[m.info(h).path] = h; });
+            if (hs.length !== c.stages.length) probs.push('Build ' + (i + 1) + ': expected ' + c.stages.length + ' stage(s), found ' + hs.length + '.');
+            c.stages.forEach(function (st) {
+              var h = byPath[st.path];
+              var where = 'Build ' + (i + 1) + (st.path ? ' stage ' + st.path : '') + ' (WO ' + st.wo.wo_num + ')';
+              if (!h) { probs.push(where + ' is missing'); return; }
+              if (int(h.bom_id) !== st.bomId) probs.push(where + ' builds BOM ' + h.bom_id + ', expected ' + st.bomId);
+              if (!same(h.qty, st.builds)) probs.push(where + ' has ' + fmtQty(h.qty) + ' builds, expected ' + fmtQty(st.builds));
+              var got = m.childrenOf(h).filter(function (x) { var t = int(x.type_id); return t === 10 || t === 20; })
+                .map(function (x) { return { type: int(x.type_id), part: int(x.part_id), uom: int(x.uom_id), qty: num(x.qty) }; });
+              probs = probs.concat(diffLines(st.lines, got, where));
+            });
+          });
+          return { ok: !probs.length, problems: probs };
+        }).catch(function (e) { return { ok: false, problems: ['Read-back failed: ' + errText(e)] }; });
+      }
+
+      // ── An MO left by an earlier rollover of this original ───────
+      // Entered: used again when it covers exactly the WOs moving now and its
+      // tree still matches them line for line.
+      // Already Issued / Partial / Fulfilled / Closed Short: that run created
+      // and issued its MO but never closed the original (MO 89 -> 89-1). The
+      // work already lives there, so a new MO would double it: if it covers
+      // exactly the WOs still open here, the only step left is close-short.
+      // Anything else blocks.
+      function findResume(origNum, plan) {
+        return markerMos(origNum).then(function (rows) {
+          if (!rows.length) return {};
+          var label = rows.map(function (e) { return e.mo_num + ' (' + (MO_STATUS[int(e.mo_status)] || e.mo_status) + ')'; }).join(', ');
+          if (rows.length !== 1)
+            return { blocked: 'MO ' + label + ' were already rolled over from ' + origNum + '. Sort them out in the MO module first.' };
+          var r = rows[0];
+          var m = MARKER_RE.exec(String(r.note || ''));
+          var got = String((m && m[3]) || '').split(',').filter(Boolean).sort().join(', ');
+          var want = plan.moving.map(function (w) { return String(w.wo_num); }).sort().join(', ');
+          var st = int(r.mo_status);
+          if (st !== 10) {
+            if (got === want) return { closeOnly: { id: int(r.mo_id), num: String(r.mo_num), status: MO_STATUS[st] || String(st), wos: got } };
+            return { blocked: 'MO ' + label + ' was already rolled over from ' + origNum + ' for WO ' + got + ', but WO ' + want +
+              ' is open here now. Sort it out in the MO module first.' };
+          }
+          if (got !== want) return { blocked: 'MO ' + r.mo_num + ' (Entered) was created by an earlier rollover for WO ' + got +
+            ', but WO ' + want + ' would move now. Remove ' + r.mo_num + ' in the MO module first.' };
+          return verifyNewMo(int(r.mo_id), plan).then(function (v) {
+            if (!v.ok) return { blocked: 'MO ' + r.mo_num + ' (Entered) from an earlier rollover no longer matches what is left on ' + origNum + ': ' +
+              v.problems.slice(0, 3).join('; ') + '. Remove ' + r.mo_num + ' in the MO module first.' };
+            return { resume: { id: int(r.mo_id), num: String(r.mo_num) } };
+          });
+        });
+      }
+      function splitPicks(s) { return String(s || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean); }
+      function withBlocker(plan, msg) { return msg ? Object.assign({}, plan, { blockers: plan.blockers.concat([msg]) }) : plan; }
+
+      // ── Gate ─────────────────────────────────────────────────────
+      // Access rights only (the server enforces them too). Checked up front so
+      // a run can't stop half way on a refused step.
+      function gate(plan) {
+        try {
+          if (typeof hasUserAccess === 'function') {
+            var need = ['Manufacture Order-Edit', 'Manufacture Order-Issue'];
+            var miss = need.filter(function (r) { return !hasUserAccess(r); });
+            if (miss.length) return 'You need the ' + miss.join(', ') + ' right' + (miss.length > 1 ? 's' : '') + '.';
+          }
+        } catch (_) {}
+        if (typeof runRestApiAsync !== 'function') return 'This client has no REST connection.';
+        return null;
+      }
+
+      function gateCleanup() {
+        try {
+          if (typeof hasUserAccess === 'function') {
+            var miss = ['Manufacture Order-Issue', 'Manufacture Order-Delete'].filter(function (r) { return !hasUserAccess(r); });
+            if (miss.length) return 'You need the ' + miss.join(', ') + ' right' + (miss.length > 1 ? 's' : '') + '.';
+          }
+        } catch (_) {}
+        if (typeof runRestApiAsync !== 'function') return 'This client has no REST connection.';
+        return null;
+      }
+
+      // ── Open / render ────────────────────────────────────────────
+      function open(moId) {
+        var token = ++openToken;
+        active = { moId: moId, model: null, plan: null, newNum: null, loading: true, steps: [], done: false };
+        document.getElementById('detailScrim').classList.add('on');
+        document.getElementById('detailPanel').classList.add('on');
+        renderDrawer();
+        render();
+        loadModel(moId).then(function (model) {
+          return Promise.all([buildPlan(model), nextNumber(model.mo)]).then(function (r) {
+            // An Issued original is still checked for an earlier rollover: if
+            // its open WOs already went to another MO they are duplicates, and
+            // the way out is to unissue it, not to roll it over.
+            var onlyIssued = r[0].issued && r[0].blockers.length === 1;
+            return (r[0].blockers.length && !onlyIssued ? Promise.resolve({}) : findResume(model.mo.mo_num, r[0])).then(function (res) {
+              if (token !== openToken || !active) return;
+              var cleanup = null;
+              if (onlyIssued) {
+                if (res.closeOnly) { cleanup = res.closeOnly; r[0].blockers = []; }
+                res = {};
+              }
+              active.cleanup = cleanup;
+              active.model = model; active.plan = withBlocker(r[0], res.blocked); active.newNum = r[1];
+              active.resume = res.resume || null; active.closeOnly = res.closeOnly || null; active.loading = false;
+              renderDrawer();
+            });
+          });
+        }).catch(function (e) {
+          if (token !== openToken || !active) return;
+          active.loading = false; active.error = errText(e);
+          renderDrawer();
+        });
+      }
+      function close() {
+        if (inFlight) { showToast('A rollover is running — wait for it to finish', 'info'); return; }
+        openToken++;
+        active = null;
+        document.getElementById('detailScrim').classList.remove('on');
+        document.getElementById('detailPanel').classList.remove('on');
+        render();
+      }
+
+      function stepsHtml() {
+        if (!active.steps.length) return '';
+        var ic = { ok: '&#10003;', fail: '&#10005;', warn: '!', run: '&hellip;' };
+        return '<div class="dsec"><h4>Progress</h4><ul class="steps">' + active.steps.map(function (s) {
+          return '<li class="' + s.state + '"><span class="ic">' + ic[s.state] + '</span><span class="txt">' + esc(s.text) + '</span></li>';
+        }).join('') + '</ul></div>';
+      }
+
+      function renderDrawer() {
+        var panel = document.getElementById('detailPanel');
+        if (!active) { panel.innerHTML = ''; return; }
+        var closeBtn = '<button class="ps-btn icon close-x" type="button" onclick="MR.close()" title="Close"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></svg></button>';
+        if (active.loading || active.error) {
+          panel.innerHTML = '<div class="detail-head"><div class="top"><div><span class="crumb">MO</span><h2>Loading&hellip;</h2></div>' + closeBtn + '</div></div>' +
+            '<div class="detail-body">' + (active.error ? '<div class="pf-banner bad"><div class="pf-summary">Could not load this MO — ' + esc(active.error) + '</div></div>' : '<p class="muted">Reading the MO, its work orders and picks&hellip;</p>') + '</div>';
+          return;
+        }
+        var m = active.model, mo = m.mo, plan = active.plan, r = readiness(m.wos, mo.mo_status);
+        var blocked = plan.blockers.length > 0;
+        var cl = active.cleanup;
+        var gateMsg = cl ? gateCleanup() : gate(plan);
+        var canRun = !blocked && !gateMsg && !inFlight && !active.done;
+        var co = active.closeOnly;
+        var target = co ? co.num : active.resume ? active.resume.num : active.newNum.num;
+
+        var head = '<div class="detail-head"><div class="top"><div style="min-width:0;">' +
+          '<span class="crumb">Manufacture Order</span>' +
+          '<h2><span class="row-link" onclick="openModule(\'Manufacture Order\', ' + esc(JSON.stringify(String(mo.mo_num))) + ')">' + esc(mo.mo_num) + '</span></h2>' +
+          '<div class="sub">' + spill(moStatusTone(mo.mo_status), MO_STATUS[int(mo.mo_status)] || mo.mo_status) +
+            '<span>' + esc(mo.lg_name || '') + '</span>' +
+            (mo.mo_date ? '<span>Scheduled ' + esc(fmtDate(mo.mo_date)) + '</span>' : '') +
+            (mo.so_num ? '<span>SO ' + esc(mo.so_num) + '</span>' : '') +
+            '<span>' + r.total + ' WO' + (r.total === 1 ? '' : 's') + ': ' + r.move + ' moving, ' + r.stay + ' fulfilled, ' + r.block + ' blocking</span>' +
+          '</div></div>' + closeBtn + '</div></div>';
+
+        // Banner + action
+        var bannerCls = active.done ? (active.result === 'ok' ? 'ok' : 'warn') : blocked ? 'bad' : plan.warnings.length ? 'warn' : 'ok';
+        var summary;
+        if (active.done) summary = active.resultText || 'Finished.';
+        else if (cl) summary = 'WO <strong>' + esc(cl.wos) + '</strong> already went to MO <strong>' + esc(cl.num) + '</strong> (' + esc(cl.status) +
+          ') in an earlier rollover, so it is a duplicate here. <strong>' + esc(mo.mo_num) + '</strong> is Issued with nothing built, so Fishbowl won\'t ' +
+          'close it short: the way to clear it is to <strong>unissue</strong> it (Fishbowl removes its work orders and picks) and <strong>delete</strong> it. ' +
+          'You\'ll be asked to confirm.' + (gateMsg ? '<br><span class="muted">' + esc(gateMsg) + '</span>' : '');
+        else if (blocked && plan.issued) summary = '<strong>Can\'t roll over.</strong> Fishbowl only closes short a Partial MO, and nothing on ' + esc(mo.mo_num) + ' has been built yet.';
+        else if (blocked) summary = '<strong>Can\'t roll over yet.</strong> Fishbowl only closes an MO short when every WO is Entered or Fulfilled.';
+        else if (co) summary = 'WO <strong>' + esc(co.wos) + '</strong> already went to MO <strong>' + esc(co.num) + '</strong> (' + esc(co.status) +
+          ') in an earlier rollover that stopped before closing <strong>' + esc(mo.mo_num) + '</strong> short. The only step left is to close ' +
+          esc(mo.mo_num) + ' short &mdash; nothing new is created.' + (gateMsg ? '<br><span class="muted">' + esc(gateMsg) + '</span>' : '');
+        else summary = '<strong>' + plan.moving.length + ' WO' + (plan.moving.length === 1 ? '' : 's') + '</strong> move to ' +
+          (active.resume ? 'MO <strong>' + esc(target) + '</strong> (created by an earlier run that stopped, and still matching)'
+                         : 'the new MO <strong>' + esc(target) + '</strong>') +
+          ', then <strong>' + esc(mo.mo_num) + '</strong> is closed short.' +
+          (gateMsg ? '<br><span class="muted">' + esc(gateMsg) + '</span>' : '');
+        var btn = active.done ? '' :
+          '<button class="ps-btn primary" type="button" ' + (canRun ? '' : 'disabled ') + 'onclick="MR.run()">' +
+          (inFlight ? 'Working&hellip;' : blocked ? 'Roll over &amp; close short ' + esc(mo.mo_num) : cl ? 'Unissue &amp; delete ' + esc(mo.mo_num) : co ? 'Close ' + esc(mo.mo_num) + ' short'
+                    : (active.resume ? 'Continue with ' : 'Roll over to ') + esc(target) + ' &amp; close short ' + esc(mo.mo_num)) + '</button>';
+        var banner = '<div class="pf-banner ' + bannerCls + '"><div class="pf-summary">' + summary + '</div>' + btn + '</div>';
+        // Picks to void, as buttons that open them in the Picking module.
+        var toVoid = [];
+        m.wos.forEach(function (w) { if (w._cls.pick) splitPicks(w._cls.picks).forEach(function (p) { if (toVoid.indexOf(p) < 0) toVoid.push(p); }); });
+        var actions = blocked && !active.done ? '<div style="display:flex;flex-wrap:wrap;gap:6px;margin:-4px 0 12px;">' +
+          (plan.issued ? '<button class="ps-btn sm" type="button" onclick="openModule(\'Manufacture Order\', ' + esc(JSON.stringify(String(mo.mo_num))) + ')">Open MO ' + esc(mo.mo_num) + '</button>' : '') +
+          toVoid.map(function (p) { return '<button class="ps-btn sm" type="button" onclick="openModule(\'Picking\', ' + esc(JSON.stringify(p)) + ')">Open pick ' + esc(p) + '</button>'; }).join('') +
+          '<button class="ps-btn sm" type="button" onclick="MR.open(' + int(mo.mo_id) + ')" title="Read the MO again, e.g. after voiding a pick">Re-check</button></div>' : '';
+        var lists = (plan.blockers.length ? '<ul class="pf-list bad">' + plan.blockers.map(function (b) { return '<li>' + esc(b) + '</li>'; }).join('') + '</ul>' : '') + actions +
+          (plan.warnings.length && !active.done ? '<ul class="pf-list warn">' + plan.warnings.map(function (b) { return '<li>' + esc(b) + '</li>'; }).join('') + '</ul>' : '');
+
+        // WO table, in build order with stages indented
+        var woRows = m.wos.slice().sort(function (a, b) {
+          var ra = a._info.root ? int(a._info.root.id) : 0, rb = b._info.root ? int(b._info.root.id) : 0;
+          return ra - rb || a._info.path.localeCompare(b._info.path) || String(a.wo_num).localeCompare(String(b.wo_num));
+        }).map(function (w) {
+          var fg = w._lines.filter(function (l) { return int(l.type_id) === 10; });
+          var disp = w._cls.disp === 'move' ? spill('active', 'Moves') : w._cls.disp === 'stay' ? spill('success', 'Stays')
+                   : w._cls.pick ? spill('caution', 'Void pick first') : spill('critical', 'Blocks');
+          var pick = !w._pickLines ? '<span class="muted">—</span>' :
+            splitPicks(w._picks).map(function (p) { return '<span class="row-link" onclick="openModule(\'Picking\', ' + esc(JSON.stringify(p)) + ')">' + esc(p) + '</span>'; }).join(', ') +
+            '<div class="why">' + (w._pickedLines ? w._pickedLines + ' of ' + w._pickLines + ' lines picked' : 'not started') + '</div>';
+          return '<tr><td>' + (w._info.depth ? '<span class="stage-ind">' + new Array(w._info.depth + 1).join('&#8627; ') + '</span>' : '') +
+              '<span class="row-link" onclick="openModule(\'Work Order\', ' + esc(JSON.stringify(String(w.wo_num))) + ')">' + esc(w.wo_num) + '</span></td>' +
+            '<td>' + spill(woStatusTone(w.wo_status), WO_STATUS[int(w.wo_status)] || w.wo_status) + '</td>' +
+            '<td>' + pick + '</td>' +
+            '<td class="num">' + fmtQty(w.builds) + '</td>' +
+            '<td>' + esc(fg.map(function (l) { return l.part_num + ' ×' + fmtQty(l.qty); }).join(', ')) + '</td>' +
+            '<td>' + esc(fmtDate(w.dss)) + '</td><td>' + esc(fmtDate(w.ds)) + '</td>' +
+            '<td>' + disp + '<div class="why">' + esc(w._cls.reason) + '</div></td></tr>';
+        }).join('');
+        var woSec = '<div class="dsec"><h4>Work orders</h4><div class="pf-tablewrap"><table class="pf-table"><thead><tr>' +
+          '<th>WO</th><th>Status</th><th>Pick</th><th class="num">Builds</th><th>Makes</th><th>Start</th><th>Finish</th><th>Rollover</th>' +
+          '</tr></thead><tbody>' + (woRows || '<tr><td colspan="8" class="muted">This MO has no work orders.</td></tr>') + '</tbody></table></div></div>';
+
+        // New MO preview
+        var preview = '';
+        if (!blocked && !co && !cl && plan.configs.length) {
+          var linesOpen = active.linesOpen || (active.linesOpen = {});
+          var rows = plan.configs.map(function (c, i) {
+            var hdr = '<tr class="cfg-row"><td colspan="5">Build ' + (i + 1) + ' — from WO ' + esc(c.wos.map(function (w) { return w.wo_num; }).join(', ')) +
+              ' · ' + fmtQty(c.rootWo.builds) + ' × BOM ' + esc((c.root && c.root.bom_num) || c.stages[0].bomId) +
+              (c.mode === 'bom' ? '<span class="mode-chip bom" title="Sent as BOM defaults so Fishbowl recreates the stages; the BOM matches these WOs exactly">Rebuilt from BOM · ' + c.stages.length + ' stages</span>'
+                                : '<span class="mode-chip" title="Sent with this WO\'s exact lines">Exact lines</span>') + '</td></tr>';
+            // Each stage (one new WO) shows its finished good, with its raw
+            // goods folded under an "N raw goods" row until opened.
+            var body = c.stages.map(function (st, j) {
+              var key = i + '-' + j, open = !!linesOpen[key];
+              var fg = st.lines.filter(function (l) { return l.type === 10; }), raw = st.lines.filter(function (l) { return l.type !== 10; });
+              var line = function (l, k) {
+                var isRaw = l.type !== 10;
+                return '<tr' + (isRaw ? ' class="rg-line" data-rg="' + key + '"' + (open ? '' : ' style="display:none"') : ' class="fg-line"') + '>' +
+                  '<td>' + (!isRaw && !k && st.path ? '<span class="stage-ind">&#8627;</span>WO ' + esc(st.wo.wo_num) : '') + '</td>' +
+                  '<td>' + (isRaw ? 'Raw good' : 'Finished good') + '</td>' +
+                  '<td><strong>' + esc(l.src.part_num || '') + '</strong><div class="why">' + esc(l.src.descr || l.src.part_desc || '') + '</div></td>' +
+                  '<td class="num">' + fmtQty(l.qty) + '</td><td>' + esc(l.src.uom_code || '') + '</td></tr>';
+              };
+              return fg.map(line).join('') + (!raw.length ? '' :
+                '<tr class="rg-toggle" data-rgt="' + key + '" onclick="MR.toggleLines(\'' + key + '\')" title="Show or hide this WO\'s raw goods">' +
+                  '<td></td><td colspan="4"><span class="rg-caret">' + (open ? '&#9662;' : '&#9656;') + '</span>' +
+                  raw.length + ' raw good' + (raw.length === 1 ? '' : 's') + '</td></tr>' +
+                raw.map(line).join(''));
+            }).join('');
+            return hdr + body;
+          }).join('');
+          preview = '<div class="dsec"><div class="rg-head"><h4>' + (active.resume ? 'MO ' + esc(target) + ' (from the earlier run)' : 'New MO ' + esc(target)) + '</h4>' +
+            '<span class="row-link rg-all" onclick="MR.toggleLines()">' + (allLinesOpen() ? 'Hide raw goods' : 'Show raw goods') + '</span></div>' +
+            '<div class="pf-tablewrap"><table class="pf-table"><thead><tr><th>Stage</th><th>Type</th><th>Part</th><th class="num">Qty</th><th>UOM</th></tr></thead><tbody>' +
+            rows + '</tbody></table></div></div>';
+        }
+
+        panel.innerHTML = head + '<div class="detail-body">' + banner + lists + stepsHtml() + woSec + preview + '</div>';
+      }
+
+      // Raw-good folds in the preview. Toggled in place (a re-render would
+      // jump the drawer back to the top) and remembered in active.linesOpen
+      // so re-renders during a run keep them. No key = all of them.
+      function rgKeys() {
+        var keys = [];
+        if (!active || !active.plan) return keys;
+        active.plan.configs.forEach(function (c, i) {
+          c.stages.forEach(function (st, j) { if (st.lines.some(function (l) { return l.type !== 10; })) keys.push(i + '-' + j); });
+        });
+        return keys;
+      }
+      function allLinesOpen() {
+        var open = (active && active.linesOpen) || {}, keys = rgKeys();
+        return keys.length > 0 && keys.every(function (k) { return open[k]; });
+      }
+      function toggleLines(key) {
+        if (!active) return;
+        var open = active.linesOpen || (active.linesOpen = {});
+        var panel = document.getElementById('detailPanel');
+        var keys = key != null ? [String(key)] : rgKeys();
+        var to = key != null ? !open[key] : !allLinesOpen();
+        keys.forEach(function (k) {
+          open[k] = to;
+          [].forEach.call(panel.querySelectorAll('tr[data-rg="' + k + '"]'), function (tr) { tr.style.display = to ? '' : 'none'; });
+          var caret = panel.querySelector('tr[data-rgt="' + k + '"] .rg-caret');
+          if (caret) caret.innerHTML = to ? '&#9662;' : '&#9656;';
+        });
+        var all = panel.querySelector('.rg-all');
+        if (all) all.textContent = allLinesOpen() ? 'Hide raw goods' : 'Show raw goods';
+      }
+
+      // ── The run ──────────────────────────────────────────────────
+      function step(text, st) { var s = { text: text, state: st || 'run' }; active.steps.push(s); renderDrawer(); return s; }
+      function finish(s, st, text) { s.state = st; if (text) s.text = text; renderDrawer(); }
+
+      function run() {
+        var a = active;
+        if (!a || !a.model) return;
+        // Checked BEFORE the first await: a disabled button alone doesn't stop a queued click.
+        if (inFlight) { showToast('Already running — please wait', 'info'); return; }
+        if (a.cleanup) return runCleanup(a);
+        var g = gate(a.plan);
+        if (g) { showToast(g, 'error', 5000); return; }
+        inFlight = true;
+        a.steps = [];
+        var origId = int(a.model.mo.mo_id), origNum = String(a.model.mo.mo_num);
+        var seen = a.plan.moving.map(function (w) { return String(w.wo_id); }).sort().join(',');
+        var fresh, plan, newNum, restMo, payload, resume = null, closeOnly = null, newId = null, newNumber = null, ctx = {};
+        // An Entered MO left behind is picked up by the next run.
+        function leftover() { return closeOnly ? '' : '\nMO ' + newNumber + ' is Entered (no work orders). Run the rollover again to carry on with it, or remove it in the MO module.'; }
+
+        var s1 = step('Re-checking ' + origNum + ' against the database…');
+        loadModel(origId).then(function (model) {
+          fresh = model;
+          return Promise.all([buildPlan(model), nextNumber(model.mo), rest({ path: '/api/manufacture-orders/' + origId }, 'read original')]);
+        }).then(function (r) {
+          plan = r[0]; newNum = r[1]; restMo = r[2] || {};
+          // The drawer shows what was just read, whatever happens next.
+          a.model = fresh; a.plan = plan; a.newNum = newNum;
+          var now = plan.moving.map(function (w) { return String(w.wo_id); }).sort().join(',');
+          if (plan.blockers.length) throw stop(s1, 'Can\'t roll over: ' + plan.blockers[0]);
+          if (now !== seen) throw stop(s1, origNum + ' changed since you opened it. Review it again before rolling over.', true);
+          if (int(restMo.id) !== origId || String(restMo.number) !== origNum) throw stop(s1, 'The REST read of ' + origNum + ' returned a different MO (' + restMo.number + ').');
+          if (newNum.num.length > MO_NUM_MAX) throw stop(s1, 'The new number ' + newNum.num + ' is longer than ' + MO_NUM_MAX + ' characters.');
+          var g2 = gate(plan);
+          if (g2) throw stop(s1, g2);
+          return findResume(origNum, plan);
+        }).then(function (res) {
+          if (res.blocked) { a.plan = withBlocker(plan, res.blocked); throw stop(s1, res.blocked); }
+          resume = res.resume || null;
+          closeOnly = res.closeOnly || null;
+          a.resume = resume; a.closeOnly = closeOnly;
+          if (closeOnly) {
+            newNumber = closeOnly.num;
+            finish(s1, 'ok', 'Re-checked ' + origNum + ': WO ' + closeOnly.wos + ' already rolled over to MO ' + closeOnly.num + ' (' + closeOnly.status + ')');
+            return psConfirm({ title: 'Close MO ' + origNum + ' short', tone: 'warn', confirmLabel: 'Close short', cancelLabel: 'Cancel',
+              message: 'WO ' + closeOnly.wos + ' was already rolled over to MO ' + closeOnly.num + ' (' + closeOnly.status + ') by an earlier run, ' +
+                'which stopped before closing ' + origNum + ' short.\n\nClose ' + origNum + ' short now. Nothing new is created: the work already went to ' +
+                closeOnly.num + '.\n\nClosing short cannot be undone.' });
+          }
+          var target = resume ? resume.num : newNum.num;
+          finish(s1, 'ok', 'Re-checked ' + origNum + ': ' + plan.moving.length + ' WO' + (plan.moving.length === 1 ? '' : 's') + ' to move' +
+            (resume ? ' · carrying on with MO ' + target + ' from the earlier run (matches line for line)' : ''));
+
+          var stay = fresh.wos.filter(function (w) { return w._cls.disp === 'stay'; });
+          var msg = (resume ? 'Carry on with MO ' + target + ' (Entered, left by an earlier run and checked again just now):\n'
+                            : 'Create MO ' + target + ' with ' + plan.configs.length + ' build' + (plan.configs.length === 1 ? '' : 's') + ':\n') +
+            plan.configs.map(function (c) {
+              return '  • ' + c.wos.map(function (w) { return w.wo_num; }).join(' + ') + '  ' + fmtQty(c.rootWo.builds) + ' × ' +
+                ((c.root && c.root.bom_num) || 'BOM ' + c.stages[0].bomId) + (c.mode === 'bom' ? '  (rebuilt from BOM, stages kept)' : '');
+            }).join('\n') +
+            '\n\nThen CLOSE SHORT MO ' + origNum + (stay.length ? ', which keeps ' + stay.length + ' fulfilled WO' + (stay.length === 1 ? '' : 's') + ' (' + stay.map(function (w) { return w.wo_num; }).join(', ') + ')' : '') + '.' +
+            '\nThen issue ' + target + ' and copy WO details across.' +
+            '\n\nClosing short cannot be undone.' +
+            (plan.warnings.length ? '\n\nPlease note:\n' + plan.warnings.map(function (w) { return '  • ' + w; }).join('\n') : '');
+          return psConfirm({ title: 'Roll over MO ' + origNum, message: msg, tone: plan.warnings.length ? 'danger' : 'warn',
+            confirmLabel: 'Roll over & close short', cancelLabel: 'Cancel' });
+        }).then(function (ok) {
+          if (!ok) throw stop(null, 'Cancelled — nothing was changed.', true);
+          if (closeOnly) return;
+          if (resume) { newId = resume.id; newNumber = resume.num; step('Using MO ' + newNumber + ' from the earlier run', 'ok'); return; }
+
+          // Create, Entered. No WOs or picks exist until it is issued.
+          payload = buildPayload(fresh, plan, restMo, newNum);
+          var s2 = step('Creating MO ' + newNum.num + ' (Entered)…');
+          return rest({ method: 'POST', path: '/api/manufacture-orders', body: JSON.stringify(payload) }, 'create').then(function (res) {
+            newId = int(res && res.id); newNumber = (res && res.number) || newNum.num;
+            if (!newId) throw new Error('the create returned no MO id');
+            finish(s2, 'ok', 'Created MO ' + newNumber + ' (Entered)');
+          }, function (e) {
+            // A thrown POST may still have landed. Never retry; look for the marker.
+            return markerMos(origNum).then(function (rows) {
+              if (rows.length) throw stop(s2, 'The create request failed (' + errText(e) + '), but MO ' + rows[0].mo_num +
+                ' now exists. Nothing else was done: run the rollover again to check it and carry on.');
+              throw stop(s2, 'Could not create the new MO: ' + errText(e) + '. Nothing was changed.');
+            });
+          }).then(function () {
+            var s3 = step('Checking ' + newNumber + ' line by line…');
+            return verifyNewMo(newId, plan).then(function (v) {
+              if (!v.ok) throw stop(s3, 'MO ' + newNumber + ' does not match what was asked for, so the run stopped before touching ' + origNum + '.\n' +
+                v.problems.slice(0, 8).join('\n') + (v.problems.length > 8 ? '\n…' : '') +
+                '\nMO ' + newNumber + ' was left Entered (no work orders). Remove it in the MO module.');
+              finish(s3, 'ok', 'MO ' + newNumber + ' matches the moving WOs line for line');
+            });
+          });
+        }).then(function () {
+          var s4 = step('Closing ' + origNum + ' short…');
+          return rest({ method: 'POST', path: '/api/manufacture-orders/' + origId + '/close-short' }, 'close short').then(function (res) {
+            finish(s4, 'ok', 'Closed ' + origNum + ' short' + (res && res.status && res.status !== 'Closed Short' ? ' (server says: ' + res.status + ')' : ''));
+          }, function (e) {
+            throw stop(s4, 'Could not close ' + origNum + ' short: ' + errText(e) + '\n' + origNum + ' is unchanged.' + leftover());
+          });
+        }).then(function () {
+          // What did close-short leave behind on the original?
+          return Promise.all([qp('SELECT statusid AS mo_status FROM mo WHERE id = ' + origId, 'Original after'),
+                              qp(sqlWos({ moId: origId }), 'Original WOs after')]).then(function (r) {
+            var st = int((r[0][0] || {}).mo_status);
+            var open = r[1].filter(function (w) { return int(w.wo_status) !== 40 && plan.moving.some(function (m) { return String(m.wo_id) === String(w.wo_id); }); });
+            if (st !== 70) step(origNum + ' reads ' + (MO_STATUS[st] || st) + ' in the database, not Closed Short. Check it in the MO module.', 'warn');
+            if (open.length) step('Still open on ' + origNum + ': ' + open.map(function (w) { return 'WO ' + w.wo_num + ' (' + (WO_STATUS[int(w.wo_status)] || w.wo_status) + ')'; }).join(', ') +
+              '. Void them in the MO module so the work isn\'t doubled.', 'warn');
+          }).catch(function (e) { step('Could not re-read ' + origNum + ' after closing it: ' + errText(e), 'warn'); });
+        }).then(function () {
+          if (closeOnly) return;
+          var s5 = step('Issuing ' + newNumber + '…');
+          return rest({ method: 'POST', path: '/api/manufacture-orders/' + newId + '/issue' }, 'issue').then(function () {
+            finish(s5, 'ok', 'Issued ' + newNumber + ' — work orders generated');
+            ctx.issued = true;
+          }, function (e) {
+            finish(s5, 'fail', 'Could not issue ' + newNumber + ': ' + errText(e) + '. It is Entered with all its builds: issue it in the MO module.');
+          });
+        }).then(function () {
+          if (!ctx.issued) return;
+          return carryOver(plan, newId);
+        }).then(function () {
+          var bad = a.steps.some(function (s) { return s.state === 'fail' || s.state === 'warn'; });
+          a.done = true; a.result = bad ? 'partial' : 'ok';
+          a.resultText = '<strong>' + esc(origNum) + '</strong> is closed short. The unstarted work ' + (closeOnly ? 'already went to' : 'is on') + ' <span class="row-link" onclick="openModule(\'Manufacture Order\', ' +
+            esc(JSON.stringify(String(newNumber))) + ')">' + esc(newNumber) + '</span>' + (bad ? ' — see the notes below.' : '.');
+          inFlight = false;
+          renderDrawer();
+          showToast(origNum + ' rolled over to ' + newNumber, bad ? 'info' : 'success', 6000);
+          loadList();
+        }).catch(function (e) {
+          inFlight = false;
+          if (e && e._stop) {
+            if (e.soft) { if (e.step) finish(e.step, 'warn', e.message); else if (a.steps.length) step(e.message, 'warn'); }
+            else if (e.step) finish(e.step, 'fail', e.message); else step(e.message, 'fail');
+          } else {
+            step('Stopped: ' + errText(e) + (newNumber ? leftover() : ''), 'fail');
+          }
+          renderDrawer();
+          if (!newNumber) return;
+          // A new MO now exists: the button offers to carry on with it, or
+          // explains why it can't.
+          loadList();
+          findResume(origNum, plan).then(function (res) {
+            if (active !== a) return;
+            a.resume = res.resume || null; a.closeOnly = res.closeOnly || null;
+            if (res.blocked) a.plan = withBlocker(plan, res.blocked);
+            renderDrawer();
+          }).catch(function () {});
+        });
+      }
+      // ── Duplicate cleanup: unissue + delete the original ─────────
+      // Only for an Issued original (nothing built) whose open WOs all went to
+      // an earlier rollover MO. Re-checked against the database first, asked
+      // for explicitly, and each step read back before the next.
+      function runCleanup(a) {
+        var g = gateCleanup();
+        if (g) { showToast(g, 'error', 5000); return; }
+        inFlight = true;
+        a.steps = [];
+        var origId = int(a.model.mo.mo_id), origNum = String(a.model.mo.mo_num), dup = null;
+        var s1 = step('Re-checking ' + origNum + ' against the database…');
+        loadModel(origId).then(function (model) {
+          return buildPlan(model).then(function (plan) {
+            a.model = model;
+            if (!(plan.issued && plan.blockers.length === 1)) throw stop(s1, origNum + ' changed since you opened it (' +
+              (plan.issued ? plan.blockers.slice(1).join(' ') : 'it is no longer Issued') + '). Re-check it.', true);
+            return findResume(origNum, plan);
+          });
+        }).then(function (res) {
+          if (!res.closeOnly) throw stop(s1, 'The earlier rollover MO no longer covers the WOs open on ' + origNum + '. Re-check it.', true);
+          dup = res.closeOnly;
+          finish(s1, 'ok', 'Re-checked ' + origNum + ': Issued, nothing built; WO ' + dup.wos + ' already went to MO ' + dup.num + ' (' + dup.status + ')');
+          return psConfirm({ title: 'Unissue and delete MO ' + origNum + '?', tone: 'danger', confirmLabel: 'Unissue & delete', cancelLabel: 'Cancel',
+            message: 'WO ' + dup.wos + ' already went to MO ' + dup.num + ' (' + dup.status + ') in an earlier rollover, so it is a duplicate on ' + origNum + '.\n\n' +
+              origNum + ' is Issued with nothing built, so it can\'t be closed short. This will:\n' +
+              '  1. UNISSUE ' + origNum + ': Fishbowl removes WO ' + dup.wos + ' and its pick\n' +
+              '  2. DELETE MO ' + origNum + '\n\nDeleting cannot be undone.' });
+        }).then(function (ok) {
+          if (!ok) throw stop(null, 'Cancelled — nothing was changed.', true);
+          var s2 = step('Unissuing ' + origNum + '…');
+          return rest({ method: 'POST', path: '/api/manufacture-orders/' + origId + '/unissue' }, 'unissue').then(null, function (e) {
+            throw stop(s2, 'Could not unissue ' + origNum + ': ' + errText(e) + '\n' + origNum + ' is unchanged.');
+          }).then(function () {
+            return Promise.all([qp('SELECT statusid AS mo_status FROM mo WHERE id = ' + origId, 'Original after unissue'),
+                                qp(sqlWos({ moId: origId }), 'Original WOs after unissue')]);
+          }).then(function (r) {
+            var st = int((r[0][0] || {}).mo_status);
+            if (st !== 10 || r[1].length) throw stop(s2, origNum + ' reads ' + (MO_STATUS[st] || st) + ' with ' + r[1].length +
+              ' work order(s) after unissuing, so it was not deleted. Check it in the MO module.');
+            finish(s2, 'ok', 'Unissued ' + origNum + ' — its work orders and picks are gone');
+          });
+        }).then(function () {
+          var s3 = step('Deleting ' + origNum + '…');
+          return rest({ method: 'DELETE', path: '/api/manufacture-orders/' + origId }, 'delete').then(null, function (e) {
+            throw stop(s3, 'Could not delete ' + origNum + ': ' + errText(e) + '\n' + origNum + ' is Entered with no work orders (nothing to build or pick): ' +
+              'delete it in the MO module.');
+          }).then(function () {
+            return qp('SELECT id FROM mo WHERE id = ' + origId, 'Original after delete');
+          }).then(function (rows) {
+            if (rows.length) throw stop(s3, 'The delete was accepted but ' + origNum + ' is still there (Entered, no work orders). Delete it in the MO module.');
+            finish(s3, 'ok', 'Deleted ' + origNum);
+          });
+        }).then(function () {
+          inFlight = false;
+          a.done = true; a.result = 'ok';
+          a.resultText = '<strong>' + esc(origNum) + '</strong> is gone. Its work already went to <span class="row-link" onclick="openModule(\'Manufacture Order\', ' +
+            esc(JSON.stringify(String(dup.num))) + ')">' + esc(dup.num) + '</span>.';
+          renderDrawer();
+          showToast(origNum + ' unissued and deleted', 'success', 6000);
+          loadList();
+        }).catch(function (e) {
+          inFlight = false;
+          if (e && e._stop) {
+            if (e.soft) { if (e.step) finish(e.step, 'warn', e.message); else if (a.steps.length) step(e.message, 'warn'); }
+            else if (e.step) finish(e.step, 'fail', e.message); else step(e.message, 'fail');
+          } else step('Stopped: ' + errText(e), 'fail');
+          renderDrawer();
+          loadList();
+        });
+      }
+
+      // A controlled stop: its message is already the user-facing explanation.
+      function stop(stepObj, message, soft) { return { _stop: true, step: stepObj, message: message, soft: !!soft }; }
+
+      // ── Copy WO-level fields to the new WOs ──────────────────────
+      // Matched by build order (and stage position for a rebuilt staged
+      // build). POST /api/work-orders/:id keeps any field it isn't sent.
+      function carryOver(plan, newId) {
+        var s = step('Copying WO details to the new work orders…');
+        return Promise.all([qp(sqlTree({ moId: newId }), 'New MO tree'), qp(sqlWos({ moId: newId }), 'New WOs')]).then(function (r) {
+          var m = indexTree({ items: r[0], wos: r[1] });
+          var pairs = [], unmatched = [];
+          plan.configs.forEach(function (c, i) {
+            var root = m.roots[i];
+            c.stages.forEach(function (st) {
+              var nw = root && r[1].filter(function (w) { return w._info.root && String(w._info.root.id) === String(root.id) && w._info.path === st.path; });
+              if (nw && nw.length === 1) pairs.push({ from: st.wo, to: nw[0] });
+              else unmatched.push(st.wo.wo_num);
+            });
+          });
+          var warns = [], done = 0;
+          return pairs.reduce(function (p, pr) {
+            return p.then(function () {
+              var w = pr.from, body = {};
+              if (w.location_id) body.location = { id: int(w.location_id) };
+              if (w.customer_id) body.customer = { id: int(w.customer_id) };
+              if (w.category_id) body.category = { id: int(w.category_id) };
+              if (w.note) body.note = w.note;
+              if (w.priority_name) body.priority = w.priority_name;
+              if (restDate(w.dss)) body.dateScheduledToStart = restDate(w.dss);
+              if (restDate(w.ds)) body.dateScheduled = restDate(w.ds);
+              if (w._users.length) body.assignedUsers = w._users.map(function (id) { return { id: id }; });
+              if (!Object.keys(body).length) { done++; return; }
+              var path = '/api/work-orders/' + int(pr.to.wo_id);
+              return rest({ method: 'POST', path: path, body: JSON.stringify(body) }, w.wo_num + ' → ' + pr.to.wo_num).then(function () { done++; }, function (e) {
+                if (!body.assignedUsers) { warns.push(pr.to.wo_num + ': ' + errText(e)); return; }
+                // Assigning users needs its own right; try once more without them.
+                delete body.assignedUsers;
+                return rest({ method: 'POST', path: path, body: JSON.stringify(body) }, 'retry without users').then(function () {
+                  done++; warns.push(pr.to.wo_num + ': assigned users not copied (' + errText(e) + ')');
+                }, function (e2) { warns.push(pr.to.wo_num + ': ' + errText(e2)); });
+              });
+            });
+          }, Promise.resolve()).then(function () {
+            if (unmatched.length) warns.push('could not match a new WO for ' + unmatched.join(', '));
+            if (warns.length) finish(s, 'warn', 'WO details copied to ' + done + ' of ' + (pairs.length + unmatched.length) + ' work orders:\n' + warns.join('\n'));
+            else finish(s, 'ok', 'WO details copied to ' + done + ' work order' + (done === 1 ? '' : 's') + ' (' +
+              pairs.map(function (p) { return p.from.wo_num + ' → ' + p.to.wo_num; }).join(', ') + ')');
+          });
+        }).catch(function (e) { finish(s, 'warn', 'WO details were not copied: ' + errText(e)); });
+      }
+
+      return { open: open, close: close, run: run, toggleLines: toggleLines, activeId: activeId, isBusy: function () { return inFlight; } };
+    })();
+    window.MR = MR;
+    window.loadList = loadList;
+
+    // ============================================================
+    // SETTINGS + FILTERS
+    // ============================================================
+    // ── Scheduled-date range ───────────────────────────────────────
+    // A preset is saved by key and turned into dates each time it is applied,
+    // so "Next 30 days" always counts from today; only Custom keeps the dates
+    // typed. Weeks run Monday to Sunday.
+    var DATE_PRESETS = [
+      { key: 'all', label: 'All dates' },
+      { group: 'Behind', items: [
+        { key: 'overdue',   label: 'Overdue (before today)', range: function (t) { return [null, t.clone().subtract(1, 'day')]; } },
+        { key: 'last7',     label: 'Last 7 days',  range: function (t) { return [t.clone().subtract(6, 'days'), t]; } },
+        { key: 'last30',    label: 'Last 30 days', range: function (t) { return [t.clone().subtract(29, 'days'), t]; } },
+        { key: 'lastmonth', label: 'Last month',   range: function (t) { var m = t.clone().subtract(1, 'month'); return [m.clone().startOf('month'), m.clone().endOf('month')]; } }
+      ] },
+      { group: 'Current', items: [
+        { key: 'today',     label: 'Today',        range: function (t) { return [t, t]; } },
+        { key: 'thisweek',  label: 'This week',    range: function (t) { return [t.clone().startOf('isoWeek'), t.clone().endOf('isoWeek')]; } },
+        { key: 'thismonth', label: 'This month',   range: function (t) { return [t.clone().startOf('month'), t.clone().endOf('month')]; } }
+      ] },
+      { group: 'Ahead', items: [
+        { key: 'next7',     label: 'Next 7 days',  range: function (t) { return [t, t.clone().add(6, 'days')]; } },
+        { key: 'next30',    label: 'Next 30 days', range: function (t) { return [t, t.clone().add(29, 'days')]; } },
+        { key: 'nextweek',  label: 'Next week',    range: function (t) { var w = t.clone().add(1, 'week'); return [w.clone().startOf('isoWeek'), w.clone().endOf('isoWeek')]; } },
+        { key: 'nextmonth', label: 'Next month',   range: function (t) { var m = t.clone().add(1, 'month'); return [m.clone().startOf('month'), m.clone().endOf('month')]; } }
+      ] },
+      { key: 'custom', label: 'Custom…' }
+    ];
+    var presetByKey = {};
+    DATE_PRESETS.forEach(function (p) { (p.items || [p]).forEach(function (i) { presetByKey[i.key] = i; }); });
+
+    function isIsoDate(v) { return /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')); }
+    function rangeText() {
+      var f = state.dateFrom, t = state.dateTo;
+      if (!f && !t) return '';
+      if (!f) return 'up to ' + fmtDate(t);
+      if (!t) return 'from ' + fmtDate(f);
+      return f === t ? 'on ' + fmtDate(f) : fmtDate(f) + ' – ' + fmtDate(t);
+    }
+    // Writes a preset's dates into state and the From / To inputs. Custom
+    // keeps whatever is in state.
+    function applyDatePreset() {
+      var p = presetByKey[state.datePreset];
+      if (p && p.key !== 'custom') {
+        var r = p.range ? p.range(moment().startOf('day')) : [null, null];
+        state.dateFrom = r[0] ? r[0].format('YYYY-MM-DD') : '';
+        state.dateTo = r[1] ? r[1].format('YYYY-MM-DD') : '';
+      }
+      document.getElementById('datePreset').value = state.datePreset;
+      document.getElementById('dateFrom').value = state.dateFrom;
+      document.getElementById('dateTo').value = state.dateTo;
+    }
+    function renderDatePresets() {
+      document.getElementById('datePreset').innerHTML = DATE_PRESETS.map(function (p) {
+        var opt = function (i) { return '<option value="' + esc(i.key) + '">' + esc(i.label) + '</option>'; };
+        return p.items ? '<optgroup label="' + esc(p.group) + '">' + p.items.map(opt).join('') + '</optgroup>' : opt(p);
+      }).join('');
+    }
+    function saveDates() { saveUserKeys({ datePreset: state.datePreset, dateFrom: state.dateFrom, dateTo: state.dateTo }); }
+    window.onPresetChange = function () {
+      state.datePreset = document.getElementById('datePreset').value;
+      applyDatePreset();   // Custom starts from the dates already showing
+      saveDates();
+      loadList();
+    };
+    // Typing a date by hand means the range is no longer a preset.
+    window.onCustomDateChange = function () {
+      var f = document.getElementById('dateFrom').value, t = document.getElementById('dateTo').value;
+      if (f && t && f > t) { var x = f; f = t; t = x; }
+      state.datePreset = 'custom';
+      state.dateFrom = isIsoDate(f) ? f : '';
+      state.dateTo = isIsoDate(t) ? t : '';
+      applyDatePreset();
+      saveDates();
+      loadList();
+    };
+
+    function hydrateSettings() {
+      var g = function (k) { try { return FBLib.Settings.resolve(k); } catch (_) { return undefined; } };
+      state.readyOnly = !!g('readyOnly');
+      state.lgId = String(g('lgId') || '');
+      state.datePreset = presetByKey[String(g('datePreset'))] ? String(g('datePreset')) : 'all';
+      state.dateFrom = isIsoDate(g('dateFrom')) ? String(g('dateFrom')) : '';
+      state.dateTo = isIsoDate(g('dateTo')) ? String(g('dateTo')) : '';
+      applyDatePreset();
+      document.getElementById('dsReadyOnly').checked = state.readyOnly;
+      document.getElementById('readyOnly').checked = state.readyOnly;
+      document.getElementById('dsDebug').checked = !!g('showDebug');
+    }
+    function saveUserKeys(obj) {
+      try { Object.keys(obj).forEach(function (k) { FBLib.Settings.setUserKey(k, obj[k]); }); FBLib.Settings.saveUser(); } catch (_) {}
+    }
+    window.onSettingsChange = function () {
+      state.readyOnly = document.getElementById('dsReadyOnly').checked;
+      document.getElementById('readyOnly').checked = state.readyOnly;
+      saveUserKeys({ readyOnly: state.readyOnly, showDebug: document.getElementById('dsDebug').checked });
+      applyDebugDrawer(!!FBLib.Settings.resolve('showDebug'));
+      render();
+    };
+    window.onReadyOnlyChange = function () {
+      state.readyOnly = document.getElementById('readyOnly').checked;
+      document.getElementById('dsReadyOnly').checked = state.readyOnly;
+      saveUserKeys({ readyOnly: state.readyOnly });
+      render();
+    };
+    window.onLgChange = function () {
+      state.lgId = document.getElementById('lgSel').value || '';
+      saveUserKeys({ lgId: state.lgId });
+      loadList();
+    };
+    window.resetSettings = function () {
+      psConfirm({ title: 'Reset settings', tone: 'warn', confirmLabel: 'Reset',
+        message: 'Clear your personal settings for this report and go back to the published defaults?' }).then(function (ok) {
+        if (!ok) return;
+        try { FBLib.Settings.clearUser(); } catch (_) {}
+        hydrateSettings();
+        renderLgSelect();
+        applyDebugDrawer(!!FBLib.Settings.resolve('showDebug'));
+        loadList();
+      });
+    };
+
+    function loadLocationGroups() {
+      try { lgIds = (getLocationGroupList() || []).map(int).filter(Boolean); } catch (_) { lgIds = []; }
+      if (!lgIds.length) { log('getLocationGroupList() returned nothing — listing every location group', 'warning'); }
+      return qp('SELECT id, name FROM locationgroup' + (lgIds.length ? ' WHERE id IN (' + lgIds.join(',') + ')' : '') + ' ORDER BY name', 'Location groups')
+        .then(function (rows) { state.lgs = rows; renderLgSelect(); });
+    }
+    function renderLgSelect() {
+      var sel = document.getElementById('lgSel');
+      if (state.lgId && !state.lgs.some(function (l) { return String(l.id) === state.lgId; })) state.lgId = '';
+      sel.innerHTML = '<option value="">All</option>' + state.lgs.map(function (l) {
+        return '<option value="' + esc(l.id) + '"' + (String(l.id) === state.lgId ? ' selected' : '') + '>' + esc(l.name) + '</option>';
+      }).join('');
+    }
+
+    // ============================================================
+    // DEBUG DRAWER
+    // ============================================================
+    var _debugApi = null;
+    function applyDebugDrawer(on) {
+      try {
+        if (!_debugApi) {
+          _debugApi = FBLib.Common.mountDebugDrawer();
+          if (_debugApi && _debugApi.element) observeDebugDrawer(_debugApi.element);
+        }
+        if (!_debugApi) return;
+        if (on) { _debugApi.show(); _debugApi.expand(); } else { _debugApi.hide(); }
+      } catch (e) { try { console.warn('debug drawer:', e); } catch (_) {} }
+    }
+    function observeDebugDrawer(el) {
+      function sync() {
+        var h = el.classList.contains('is-visible') ? el.offsetHeight : 0;
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+      }
+      try { new ResizeObserver(sync).observe(el); } catch (_) {}
+      try { new MutationObserver(sync).observe(el, { attributes: true, attributeFilter: ['class', 'style'] }); } catch (_) {}
+      sync();
+    }
+
+    // ============================================================
+    // INIT
+    // ============================================================
+    var searchTimer = null;
+    document.getElementById('searchInput').addEventListener('input', function (e) {
+      clearTimeout(searchTimer);
+      var v = e.target.value || '';
+      searchTimer = setTimeout(function () { state.search = v; render(); }, 200);
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && MR.activeId() != null && !document.querySelector('[role="dialog"]')) MR.close();
+    });
+
+    FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn'  });
+    FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+
+    renderDatePresets();
+    hydrateSettings();
+    applyDebugDrawer(!!FBLib.Settings.resolve('showDebug'));
+    log('MO Rollover build ' + FB_REPORT.build, 'info');
+
+    loadLocationGroups().then(loadList).catch(function (e) {
+      setStatus('Initialisation failed: ' + errText(e));
+    });
+  })();
+  </script>
+</body>
+</html>
