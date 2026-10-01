@@ -23,8 +23,10 @@ are kept in `archived/Dashboards/` for comparison.
 
 ## Installation
 
-The dashboards load two shared assets by record name. Import them first, in
-this order, from BI Reports ▸ `Standard`:
+The v1.2 dashboards ship built into Fishbowl. They are not distributed
+through the shared BI Reports folder. To load one by hand (development or
+testing), note that it needs two shared assets, found by record name. Import
+them first, in this order, from BI Reports ▸ `Standard`:
 
 1. `fb-styles-Style.json`, the Style `fb-styles`
 2. `fb-lib-Script.json`, the Script `fb-lib`
@@ -304,12 +306,13 @@ Currency comes from `currencyLocale()`, falling back to `$` / en-US.
 
 ---
 
-## Known gaps
+## Scope and limits
 
-- **Location groups aren't restricted per user.** The Location Group filter
-  lists every active location group, and no tile applies the user's assigned
-  groups (`getLocationGroupList()`). The order tiles and Dashboard - Company
-  do apply them.
+- **Company-wide, by design.** These are company-wide analytics dashboards,
+  not operational pages, so they show every location group rather than
+  limiting a user to their assigned ones (`getLocationGroupList()`). Users
+  narrow a view with the Location Group filter. The operational order tiles
+  and Dashboard - Company do apply the user's location groups.
 - **No saved views or .xlsx export.** Export is CSV per tile and per
   drill-down.
 
