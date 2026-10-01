@@ -159,7 +159,7 @@ the Product Tree.
 | Type | Tiles |
 |---|---|
 | KPI | Total Revenue, Order Count, Avg Order Value, Gross Margin, Gross Profit, Cost of Goods, Revenue vs Prior |
-| Chart | Monthly Revenue & Margin (bar/line), Top Customers by Revenue, Top Customers by Margin, Top Products by Qty, Top Products by Revenue, Sales by Category, Customer Groups, Top Salespeople, Orders per Salesperson, Low Margin Customers, High Value Orders, New vs Repeat Customers, Margin Mix |
+| Chart | Revenue & Margin Trend (bar/line; weekly for ranges of 6 months or less), Top Customers by Revenue, Top Customers by Margin, Top Products by Qty, Top Products by Revenue, Sales by Category, Customer Groups, Top Salespeople, Orders per Salesperson, Low Margin Customers, High Value Orders, New vs Repeat Customers, Margin Mix |
 | Table | Monthly Revenue Table, Customer Revenue Table, Negative Margin Orders |
 
 Notes on specific tiles:

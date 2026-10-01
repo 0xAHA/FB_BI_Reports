@@ -19,7 +19,7 @@
       window.FB_REPORT = {
           key:   'cdx.bi.salesdash',
           name:  '- Dashboard - Sales v1.2',
-          build: '2026.10.01-a1ce0f6'     // @fb-build
+          build: '2026.10.01-a0ca27b'     // @fb-build
       };
   </script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -154,6 +154,15 @@
     /* Generic header option toggle (second toggle group beyond chart-type) —
        carries a short text label (#, $, …) so it sizes to content. */
     .opt-toggle-btn { width: auto; min-width: 22px; padding: 0 6px; font-size: 11px; font-weight: 700; font-family: inherit; }
+    /* Revenue & Margin Trend — clickable legend (+ comparison summary) above the plot */
+    .ts-head { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 10px; padding: 3px 10px 0 14px; font-size: 10px; color: var(--c-secondary); }
+    .ts-leg { display: inline-flex; align-items: center; gap: 5px; border: 0; background: none; padding: 1px 2px; font: inherit; color: inherit; cursor: pointer; border-radius: 3px; }
+    .ts-leg:hover { background: var(--bg-2); }
+    .ts-leg.off { opacity: .45; text-decoration: line-through; }
+    .ts-sw { display: inline-block; width: 12px; height: 7px; border-radius: 2px; background: var(--c); }
+    .ts-sw.line, .ts-sw.dash, .ts-sw.dots { height: 0; border-radius: 0; background: none; border-top: 2px solid var(--c); }
+    .ts-sw.dash { border-top-style: dashed; }
+    .ts-sw.dots { border-top-style: dotted; }
 
     .info-icon-btn { width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; border: none; border-radius: 4px; background: transparent; color: var(--c-tertiary); cursor: help; flex-shrink: 0; transition: color .15s, background .15s; padding: 0; }
     .info-icon-btn:hover { color: var(--fb-blue); background: var(--bg-1); }
@@ -940,6 +949,67 @@ function buildFilterConditions(dateCondOverride) {
   return w;
 }
 
+// ── Trend buckets (Revenue & Margin Trend, Monthly Revenue Table) ──
+// A range of 6 months or less is drawn in weeks, anything longer in calendar
+// months. Buckets are numbered from the START of the range (week n = days
+// 7n…7n+6, month n = the nth calendar month), so bucket i of the current
+// range lines up with bucket i of an equal-length comparison range, whatever
+// weekday or date either one starts on.
+function rangeCond(r) { return `PostSo.DateCreated >= '${r.start}' AND PostSo.DateCreated <= '${r.end} 23:59:59'`; }
+
+function trendRange() {
+  const r = getDateRange();
+  if (r.start && r.end) return r;
+  // An open-ended custom range falls back to the 365 days getDateCondition uses.
+  return { start: moment().subtract(365, 'days').format('YYYY-MM-DD'), end: moment().format('YYYY-MM-DD') };
+}
+
+function trendGrain(r) {
+  return moment(r.end).diff(moment(r.start), 'months', true) <= 6 ? 'week' : 'month';
+}
+
+function bucketExpr(grain, start) {
+  return grain === 'week'
+    ? `FLOOR(DATEDIFF(PostSo.DateCreated, '${start}') / 7)`
+    : `PERIOD_DIFF(DATE_FORMAT(PostSo.DateCreated, '%Y%m'), ${moment(start).format('YYYYMM')})`;
+}
+
+function bucketLabel(b, grain) {
+  return grain === 'week' ? moment(b.start).format('D MMM') : moment(b.start).format('MMM YY');
+}
+
+// Every bucket in the range, empty ones included, each with its own dates.
+function bucketList(range, grain) {
+  const s = moment(range.start).startOf('day'), e = moment(range.end).startOf('day');
+  const out = [];
+  if (grain === 'week') {
+    for (let i = 0, b = s.clone(); !b.isAfter(e); i++, b.add(7, 'days')) {
+      const be = moment.min(b.clone().add(6, 'days'), e);
+      out.push({ i, start: b.format('YYYY-MM-DD'), end: be.format('YYYY-MM-DD') });
+    }
+  } else {
+    for (let i = 0, mth = s.clone().startOf('month'); !mth.isAfter(e); i++, mth.add(1, 'month')) {
+      const ms = moment.max(mth.clone(), s), me = moment.min(mth.clone().endOf('month').startOf('day'), e);
+      out.push({ i, start: ms.format('YYYY-MM-DD'), end: me.format('YYYY-MM-DD') });
+    }
+  }
+  return out;
+}
+
+// Revenue and cost per bucket over `range` (every other filter applied),
+// zero-filled, with each bucket's margin — null when its revenue is <= 0,
+// which has no margin (as in the Fishbowl Margins report).
+async function bucketTotals(label, range, grain) {
+  const sql = `SELECT ${bucketExpr(grain, range.start)} as bucket, SUM(${REV_EXPR}) as revenue, SUM(PostSoItem.PostedTotalCost) as cogs ${BASE_JOIN} ${buildFilterConditions(rangeCond(range))} GROUP BY bucket ORDER BY bucket`;
+  const rows = await runQueryLogged(label, sql);
+  const byIdx = new Map(rows.map(r => [parseInt(r.bucket, 10), r]));
+  return bucketList(range, grain).map(b => {
+    const r = byIdx.get(b.i) || {};
+    const revenue = parseFloat(r.revenue || 0), cogs = parseFloat(r.cogs || 0);
+    return { ...b, grain, label: bucketLabel(b, grain), revenue, cogs, margin: revenue > 0 ? (revenue - cogs) / revenue : null };
+  });
+}
+
 // ============================================================
 // 5b. PRODUCT TREE CATEGORY ROLLUP
 // ------------------------------------------------------------
@@ -1214,6 +1284,12 @@ const Q = {
     return runQueryLogged('Monthly Revenue', sql);
   }),
 
+  // Weekly or monthly buckets for the trend chart (see trendGrain).
+  trend: () => qget('trend', () => {
+    const r = trendRange();
+    return bucketTotals('Revenue & Margin Trend', r, trendGrain(r));
+  }),
+
   topCustomers: () => qget('topCustomers', () => {
     const sql = `SELECT Customer.Name as name, SUM(${REV_EXPR}) as revenue, SUM(PostSoItem.PostedTotalCost) as cogs, COUNT(DISTINCT So.Num) as orders, ${MARGIN_AGG} as avg_margin ${BASE_JOIN} ${buildFilterConditions()} GROUP BY Customer.Name ORDER BY revenue DESC LIMIT 10`;
     return runQueryLogged('Top Customers', sql);
@@ -1422,88 +1498,212 @@ async function renderKPI(el, kpiKey, cfg = {}) {
   return null;   // KPI tiles have no CSV export (§2).
 }
 
-// ── Time-series (bar or line + margin overlay) ───────────────
-async function renderTimeSeries(el, cfg) {
-  debugLog(`Rendering Monthly Revenue (mode: ${(cfg&&cfg.chartType)||'bar'})`, 'info');
-  renderSkeleton(el);
-  const raw = await Q.monthly();
-  if (!raw.length) { debugLog('Monthly Revenue: no data for period', 'warning'); el.innerHTML = '<div class="tile-skel"><span class="tile-skel-lbl">No data for period</span></div>'; return; }
-  debugLog(`Monthly Revenue: rendering ${raw.length} months`, 'success');
+// ── Revenue & Margin Trend (bar or line + margin overlay) ────
+// Weekly buckets for a range of 6 months or less, monthly beyond it
+// (trendGrain). Both axes are sized from what is drawn (trendAxes). Each
+// series sits in its own <g class="ser-…"> so a legend click can hide it.
+const TS_COLORS = { 'rev-cur': DS.blue, 'rev-cmp': '#9FCBEA', 'mg-cur': DS.warning, 'mg-cmp': '#D9A66B' };
+
+// Axes that fit the data. Revenue always includes zero, so a period of net
+// credits drops below the baseline instead of vanishing. Margin follows the
+// data but is held to −100%…100%: a period with a sliver of revenue can
+// read −1,000% and would flatten every other point, so a value past the
+// floor is drawn on the edge as ▼ and the tooltip gives the real figure.
+// When either axis goes negative both zero lines are put at the same height
+// (one shared baseline), unless one axis is mostly below zero.
+function trendAxes(series, ih) {
+  const revs = series.flatMap(s => s.data.map(b => b.revenue));
+  const mgs  = series.flatMap(s => s.data.map(b => b.margin)).filter(v => v != null);
+  let rLo = Math.min(0, d3.min(revs)), rHi = Math.max(0, d3.max(revs));
+  if (rHi === rLo) rHi = rLo + 1;
+  const pad = (rHi - rLo) * 0.08;
+  if (rHi > 0) rHi += pad;
+  if (rLo < 0) rLo -= pad;
+  [rLo, rHi] = d3.scaleLinear().domain([rLo, rHi]).nice(5).domain();
+  let mHi = mgs.length ? Math.min(1, Math.ceil((d3.max(mgs) + 0.02) * 10) / 10) : 0.5;
+  let mLo = mgs.length ? Math.max(-1, Math.floor((Math.min(0, d3.min(mgs)) - 0.02) * 10) / 10) : 0;
+  if (mHi <= 0) mHi = 0.1;
+  if (mLo > 0) mLo = 0;
+  const fr = rLo < 0 ? -rLo / (rHi - rLo) : 0;
+  const fm = mLo < 0 ? -mLo / (mHi - mLo) : 0;
+  const f  = Math.max(fr, fm);
+  if (f > 0 && f <= 0.5 && rHi > 0) {
+    rLo = -f / (1 - f) * rHi;
+    mLo = -f / (1 - f) * mHi;
+  }
+  return {
+    yRev:  d3.scaleLinear().domain([rLo, rHi]).range([ih, 0]),
+    yMarg: d3.scaleLinear().domain([mLo, mHi]).range([ih, 0]),
+    mLo, mHi
+  };
+}
+
+// "March 2026", "3–9 Mar 2026", or the exact dates of a part-bucket.
+function tsPeriodTitle(b) {
+  const s = moment(b.start), e = moment(b.end);
+  if (b.grain === 'month' && s.date() === 1 && e.isSame(s.clone().endOf('month'), 'day')) return s.format('MMMM YYYY');
+  if (s.isSame(e, 'day')) return s.format('D MMM YYYY');
+  return (s.isSame(e, 'month') ? s.format('D') : s.format('D MMM')) + '–' + e.format('D MMM YYYY');
+}
+
+async function renderTimeSeries(el, cfg, ctx = {}) {
+  const mode = (cfg && cfg.chartType) || 'bar';
+  debugLog(`Rendering Revenue & Margin Trend (mode: ${mode})`, 'info');
+  if (!ctx.compare) renderSkeleton(el);
+  const cur = await Q.trend();
+  const cmp = null;
+  if (ctx.stale && ctx.stale()) return;
+  if (!cur.length || !cur.some(b => b.revenue || b.cogs)) {
+    debugLog('Revenue & Margin Trend: no data for period', 'warning');
+    el.innerHTML = '<div class="tile-skel"><span class="tile-skel-lbl">No data for period</span></div>';
+    return;
+  }
+  const grain = cur[0].grain;
+  debugLog(`Revenue & Margin Trend: ${cur.length} ${grain} buckets`, 'success');
+
+  const series = [{ key: 'cur', data: cur }];
+  if (cmp) series.push({ key: 'cmp', data: cmp.filter(b => b.i < cur.length) });
+  const legend = [{ id: 'rev-cur', kind: mode === 'bar' ? 'bar' : 'line', label: 'Revenue' }];
+  if (cmp) legend.push({ id: 'rev-cmp', kind: mode === 'bar' ? 'bar' : 'line', label: 'Revenue (comparison)' });
+  legend.push({ id: 'mg-cur', kind: 'dash', label: 'Margin %' });
+  if (cmp) legend.push({ id: 'mg-cmp', kind: 'dots', label: 'Margin % (comparison)' });
 
   el.innerHTML = '';
-  const W = el.clientWidth, H = el.clientHeight;
-  if (W < 80 || H < 50) return;
+  // Hidden series survive re-renders (filter changes, the comparison pass).
+  const hidden = el._tsHidden || (el._tsHidden = new Set());
+  const hideCss = id => hidden.has(id) ? 'none' : null;
+  let svg = null;
+  const head = document.createElement('div');
+  head.className = 'ts-head';
+  legend.forEach(l => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ts-leg' + (hidden.has(l.id) ? ' off' : '');
+    btn.title = 'Show / hide';
+    btn.innerHTML = `<span class="ts-sw ${l.kind}" style="--c:${TS_COLORS[l.id]}"></span>`;
+    btn.appendChild(document.createTextNode(l.label));
+    btn.addEventListener('mousedown', ev => ev.stopPropagation());   // not a tile drag
+    btn.addEventListener('click', ev => {
+      ev.stopPropagation();
+      if (hidden.has(l.id)) hidden.delete(l.id); else hidden.add(l.id);
+      btn.classList.toggle('off', hidden.has(l.id));
+      if (svg) svg.selectAll('.ser-' + l.id).style('display', hideCss(l.id));
+    });
+    head.appendChild(btn);
+  });
+  el.appendChild(head);
 
-  const mode = (cfg && cfg.chartType) || 'bar';
-  const m    = { top:12, right:56, bottom:42, left:70 };
-  const iw   = W - m.left - m.right;
-  const ih   = H - m.top  - m.bottom;
+  const W = el.clientWidth, H = el.clientHeight - head.offsetHeight;
+  if (W < 80 || H < 50) return;
+  const m  = { top: 8, right: 56, bottom: 42, left: 70 };
+  const iw = W - m.left - m.right;
+  const ih = H - m.top - m.bottom;
   if (iw < 20 || ih < 20) return;
 
-  const data = raw.map(d => ({ month: d.month, revenue: parseFloat(d.revenue||0), cogs: parseFloat(d.cogs||0), avg_margin: parseFloat(d.avg_margin||0) }));
+  svg = d3.select(el).append('svg').attr('width', W).attr('height', H).style('overflow', 'hidden').style('display', 'block')
+    .append('g').attr('transform', `translate(${m.left},${m.top})`);
 
-  const svg = d3.select(el).append('svg').attr('width',W).attr('height',H).style('overflow','hidden').append('g').attr('transform',`translate(${m.left},${m.top})`);
+  const xBand = d3.scaleBand().domain(cur.map(b => b.i)).range([0, iw]).padding(0.22);
+  const xSub  = d3.scaleBand().domain(series.map(s => s.key)).range([0, xBand.bandwidth()]).padding(series.length > 1 ? 0.1 : 0);
+  const cx    = (b, key) => xBand(b.i) + xSub(key) + xSub.bandwidth() / 2;
+  const ax    = trendAxes(series, ih);
+  const { yRev, yMarg } = ax;
+  const clampM = v => Math.max(ax.mLo, Math.min(ax.mHi, v));
+  const offAxis = v => v < ax.mLo || v > ax.mHi;
 
-  const xBand = d3.scaleBand().domain(data.map(d=>d.month)).range([0,iw]).padding(0.25);
-  const yRev  = d3.scaleLinear().domain([0, d3.max(data,d=>d.revenue)*1.18]).nice().range([ih,0]);
-  const yMarg = d3.scaleLinear().domain([0,0.65]).range([ih,0]);
+  const tip = i => {
+    const c = cur[i], p = cmp ? cmp[i] : null;
+    let h = `<strong>${tsPeriodTitle(c)}</strong><br>Revenue: ${fmt$(c.revenue)}<br>COGS: ${fmt$(c.cogs)}<br>Margin: ${c.margin == null ? '—' : fmtPct(c.margin)}`;
+    if (p) {
+      const dRev = p.revenue ? ((c.revenue - p.revenue) / Math.abs(p.revenue)) * 100 : null;
+      const dMg  = (c.margin != null && p.margin != null) ? (c.margin - p.margin) * 100 : null;
+      h += `<br><br><strong>${tsPeriodTitle(p)}</strong><br>Revenue: ${fmt$(p.revenue)}${dRev == null ? '' : ` (${dRev >= 0 ? '▲' : '▼'}${Math.abs(dRev).toFixed(1)}%)`}` +
+           `<br>Margin: ${p.margin == null ? '—' : fmtPct(p.margin)}${dMg == null ? '' : ` (${dMg >= 0 ? '▲' : '▼'}${Math.abs(dMg).toFixed(1)} pts)`}`;
+    }
+    return h + '<br><em>Click a bar for its customers</em>';
+  };
+  const drill = b => { hideTip(); drilldownPeriod(b.start, b.end, tsPeriodTitle(b)); };
 
-  // gridlines
-  svg.append('g').selectAll('line').data(yRev.ticks(5)).join('line').attr('class','grid-line').attr('x1',0).attr('x2',iw).attr('y1',d=>yRev(d)).attr('y2',d=>yRev(d));
+  // Gridlines, then a solid zero baseline when revenue dips below it.
+  svg.append('g').selectAll('line').data(yRev.ticks(5)).join('line').attr('class', 'grid-line')
+    .attr('x1', 0).attr('x2', iw).attr('y1', d => yRev(d)).attr('y2', d => yRev(d));
+  if (yRev.domain()[0] < 0) svg.append('line').attr('x1', 0).attr('x2', iw).attr('y1', yRev(0)).attr('y2', yRev(0)).attr('stroke', '#8FA1A7').attr('stroke-width', 1);
 
-  if (mode === 'bar') {
-    svg.selectAll('.rev-bar').data(data).join('rect').attr('class','rev-bar')
-      .attr('x',d=>xBand(d.month)).attr('y',d=>yRev(d.revenue))
-      .attr('width',xBand.bandwidth()).attr('height',d=>Math.max(0,ih-yRev(d.revenue)))
-      .attr('fill',DS.blue).attr('rx',3).attr('opacity',0.85)
-      .style('cursor','pointer')
-      .on('mouseover',(ev,d)=>showTip(ev,`<strong>${moment(d.month).format('MMM YYYY')}</strong><br>Revenue: ${fmt$(d.revenue)}<br>COGS: ${fmt$(d.cogs)}<br>Margin: ${fmtPct(d.avg_margin)}<br><em>Click for top customers</em>`))
-      .on('mousemove',moveTip).on('mouseout',hideTip)
-      .on('click',(ev,d)=>{ hideTip(); drilldownMonth(d.month); });
-  } else {
-    const linePath = d3.line().x(d=>xBand(d.month)+xBand.bandwidth()/2).y(d=>yRev(d.revenue)).curve(d3.curveMonotoneX);
-    svg.append('path').datum(data).attr('fill','none').attr('stroke',DS.blue).attr('stroke-width',2.5).attr('d',linePath);
-    svg.append('path').datum(data).attr('fill',DS.blue).attr('opacity',0.08)
-      .attr('d', d3.area().x(d=>xBand(d.month)+xBand.bandwidth()/2).y0(ih).y1(d=>yRev(d.revenue)).curve(d3.curveMonotoneX));
-    svg.selectAll('.rv-dot').data(data).join('circle').attr('class','rv-dot')
-      .attr('cx',d=>xBand(d.month)+xBand.bandwidth()/2).attr('cy',d=>yRev(d.revenue))
-      .attr('r',4).attr('fill','white').attr('stroke',DS.blue).attr('stroke-width',2)
-      .style('cursor','pointer')
-      .on('mouseover',(ev,d)=>showTip(ev,`<strong>${moment(d.month).format('MMM YYYY')}</strong><br>Revenue: ${fmt$(d.revenue)}<br>Margin: ${fmtPct(d.avg_margin)}<br><em>Click for top customers</em>`))
-      .on('mousemove',moveTip).on('mouseout',hideTip)
-      .on('click',(ev,d)=>{ hideTip(); drilldownMonth(d.month); });
-  }
+  // Hover band per bucket, under the marks, so the tooltip works between bars too.
+  svg.append('g').selectAll('rect').data(cur).join('rect')
+    .attr('x', b => xBand(b.i) - xBand.step() * xBand.paddingInner() / 2).attr('width', xBand.step()).attr('y', 0).attr('height', ih)
+    .attr('fill', 'transparent').style('cursor', 'pointer')
+    .on('mouseover', (ev, b) => showTip(ev, tip(b.i))).on('mousemove', moveTip).on('mouseout', hideTip)
+    .on('click', (ev, b) => drill(b));
 
-  // Margin % line overlay
-  const margLine = d3.line().x(d=>xBand(d.month)+xBand.bandwidth()/2).y(d=>yMarg(d.avg_margin)).curve(d3.curveMonotoneX);
-  svg.append('path').datum(data).attr('fill','none').attr('stroke',DS.warning).attr('stroke-width',2).attr('stroke-dasharray','5,4').attr('d',margLine);
-  svg.selectAll('.mg-dot').data(data).join('circle').attr('class','mg-dot')
-    .attr('cx',d=>xBand(d.month)+xBand.bandwidth()/2).attr('cy',d=>yMarg(d.avg_margin))
-    .attr('r',3).attr('fill','white').attr('stroke',DS.warning).attr('stroke-width',1.5);
-
-  // Axes
-  svg.append('g').attr('class','axis').attr('transform',`translate(0,${ih})`).call(d3.axisBottom(xBand).tickFormat(d=>moment(d).format('MMM YY'))).selectAll('text').attr('transform','rotate(-40)').style('text-anchor','end');
-  svg.append('g').attr('class','axis').call(d3.axisLeft(yRev).ticks(5).tickFormat(d=>'$'+d3.format('.2s')(d)));
-  svg.append('g').attr('class','axis').attr('transform',`translate(${iw},0)`).call(d3.axisRight(yMarg).ticks(4).tickFormat(d=>(d*100).toFixed(0)+'%'));
-
-  // Legend
-  const lgx = iw - 120, lgy = -2;
-  [{ c:DS.blue, lbl:'Revenue', dash:false },{ c:DS.warning, lbl:'Margin %', dash:true }].forEach((l,i)=>{
-    const g = svg.append('g').attr('transform',`translate(${lgx + i*64},${lgy})`);
-    if (l.dash) g.append('line').attr('x1',0).attr('x2',14).attr('y1',5).attr('y2',5).attr('stroke',l.c).attr('stroke-width',2).attr('stroke-dasharray','4,3');
-    else g.append('rect').attr('width',12).attr('height',7).attr('rx',2).attr('fill',l.c).attr('y',2);
-    g.append('text').attr('x',18).attr('y',9).style('fill','#506872').style('font-size','9px').text(l.lbl);
+  series.forEach(s => {
+    const id = 'rev-' + s.key, col = TS_COLORS[id];
+    const g = svg.append('g').attr('class', 'ser-' + id).style('display', hideCss(id));
+    if (mode === 'bar') {
+      g.selectAll('rect').data(s.data).join('rect')
+        .attr('x', b => xBand(b.i) + xSub(s.key)).attr('width', xSub.bandwidth())
+        .attr('y', b => yRev(Math.max(0, b.revenue))).attr('height', b => Math.abs(yRev(b.revenue) - yRev(0)))
+        .attr('rx', 2).attr('fill', b => b.revenue < 0 ? DS.negative : col).attr('opacity', 0.9)
+        .style('cursor', 'pointer')
+        .on('mouseover', (ev, b) => showTip(ev, tip(b.i))).on('mousemove', moveTip).on('mouseout', hideTip)
+        .on('click', (ev, b) => drill(b));
+    } else {
+      const line = d3.line().x(b => cx(b, s.key)).y(b => yRev(b.revenue)).curve(d3.curveMonotoneX);
+      if (s.key === 'cur') {
+        g.append('path').datum(s.data).attr('fill', col).attr('opacity', 0.08)
+          .attr('d', d3.area().x(b => cx(b, s.key)).y0(yRev(0)).y1(b => yRev(b.revenue)).curve(d3.curveMonotoneX));
+      }
+      g.append('path').datum(s.data).attr('fill', 'none').attr('stroke', col).attr('stroke-width', s.key === 'cur' ? 2.5 : 2)
+        .attr('stroke-dasharray', s.key === 'cur' ? null : '6,4').attr('d', line);
+      g.selectAll('circle').data(s.data).join('circle')
+        .attr('cx', b => cx(b, s.key)).attr('cy', b => yRev(b.revenue)).attr('r', s.key === 'cur' ? 4 : 3)
+        .attr('fill', 'white').attr('stroke', col).attr('stroke-width', 2).style('cursor', 'pointer')
+        .on('mouseover', (ev, b) => showTip(ev, tip(b.i))).on('mousemove', moveTip).on('mouseout', hideTip)
+        .on('click', (ev, b) => drill(b));
+    }
   });
 
+  // Margin % — a gap where a bucket has no margin; ▼ / ▲ where it is off the axis.
+  series.forEach(s => {
+    const id = 'mg-' + s.key, col = TS_COLORS[id];
+    const g = svg.append('g').attr('class', 'ser-' + id).style('display', hideCss(id));
+    g.append('path').datum(s.data).attr('fill', 'none').attr('stroke', col).attr('stroke-width', s.key === 'cur' ? 2 : 1.5)
+      .attr('stroke-dasharray', s.key === 'cur' ? '5,4' : '2,3')
+      .attr('d', d3.line().defined(b => b.margin != null).x(b => cx(b, s.key)).y(b => yMarg(clampM(b.margin))).curve(d3.curveMonotoneX));
+    g.selectAll('path.mg-pt').data(s.data.filter(b => b.margin != null)).join('path').attr('class', 'mg-pt')
+      .attr('transform', b => `translate(${cx(b, s.key)},${yMarg(clampM(b.margin))})` + (b.margin < ax.mLo ? ' rotate(180)' : ''))
+      .attr('d', b => offAxis(b.margin) ? d3.symbol(d3.symbolTriangle, 46)() : d3.symbol(d3.symbolCircle, 30)())
+      .attr('fill', b => offAxis(b.margin) ? col : 'white').attr('stroke', col).attr('stroke-width', 1.5)
+      .style('cursor', 'pointer')
+      .on('mouseover', (ev, b) => showTip(ev, tip(b.i))).on('mousemove', moveTip).on('mouseout', hideTip);
+  });
+
+  // Axes. Only as many period labels as fit (about one per 46px).
+  const every = Math.max(1, Math.ceil(cur.length / Math.max(1, Math.floor(iw / 46))));
+  svg.append('g').attr('class', 'axis').attr('transform', `translate(0,${ih})`)
+    .call(d3.axisBottom(xBand).tickValues(cur.filter((b, k) => k % every === 0).map(b => b.i)).tickFormat(i => cur[i].label))
+    .selectAll('text').attr('transform', 'rotate(-40)').style('text-anchor', 'end');
+  svg.append('g').attr('class', 'axis').call(d3.axisLeft(yRev).ticks(5).tickFormat(d => fmt$(d, true)));
+  svg.append('g').attr('class', 'axis').attr('transform', `translate(${iw},0)`)
+    .call(d3.axisRight(yMarg).ticks(5).tickFormat(d => Math.round(d * 100) + '%'));
+
   // CSV export payload — one row per period (§2).
+  const columns = [
+    { key: 'period',  label: 'Period' }, { key: 'from', label: 'From' }, { key: 'to', label: 'To' },
+    { key: 'revenue', label: 'Revenue' }, { key: 'cogs', label: 'COGS' }, { key: 'margin', label: 'Margin' }
+  ];
+  if (cmp) columns.push(
+    { key: 'cmp_period',  label: 'Comparison Period' }, { key: 'cmp_revenue', label: 'Comparison Revenue' },
+    { key: 'cmp_cogs',    label: 'Comparison COGS' },   { key: 'cmp_margin',  label: 'Comparison Margin' }
+  );
   return {
-    columns: [
-      { key:'month',      label:'Month' },
-      { key:'revenue',    label:'Revenue' },
-      { key:'cogs',       label:'COGS' },
-      { key:'avg_margin', label:'Margin' }
-    ],
-    rows: data
+    columns,
+    rows: cur.map(c => {
+      const row = { period: tsPeriodTitle(c), from: c.start, to: c.end, revenue: c.revenue, cogs: c.cogs, margin: c.margin == null ? '' : c.margin };
+      const p = cmp && cmp[c.i];
+      if (p) Object.assign(row, { cmp_period: tsPeriodTitle(p), cmp_revenue: p.revenue, cmp_cogs: p.cogs, cmp_margin: p.margin == null ? '' : p.margin });
+      return row;
+    })
   };
 }
 
@@ -1798,7 +1998,7 @@ const WIDGET_REGISTRY = {
     render: (el,cfg) => renderKPI(el,'revenue',{ withPriorDelta:true })
   },
   'monthly-revenue': {
-    title:'Monthly Revenue & Margin', description:'Revenue trend with gross margin % overlay. Toggle between bar and line.', category:'chart',
+    title:'Revenue & Margin Trend', description:'Revenue with gross margin % — weekly for a range of 6 months or less, monthly beyond. Click a bar for that period\'s customers; click a legend entry to hide a series. Toggle between bar and line.', category:'chart',
     icon:'<path stroke-linecap="round" stroke-linejoin="round" d="M7 12l3-3 3 3 4-4"/>',
     defaultW:8, defaultH:10, hasChartToggle:true, toggleModes:['bar','line'],
     render: (el,cfg) => renderTimeSeries(el,cfg)
@@ -2708,22 +2908,24 @@ async function drilldownCustomer(customerName) {
   } catch (e) { _ddFail('drilldownCustomer', e); }
 }
 
-async function drilldownMonth(month) {
+// One trend bucket (a week or a month, current or comparison range): its
+// customers, with every other filter still applied.
+async function drilldownPeriod(start, end, title) {
   try {
-    debugLog(`Drilldown: month ${month}`, 'click');
+    debugLog(`Drilldown: period ${start} – ${end}`, 'click');
     const sql = `SELECT Customer.Name as customer_name, COUNT(DISTINCT So.Num) as order_count,
         SUM(${REV_EXPR}) as total_revenue, ${MARGIN_AGG} as avg_margin
-      ${BASE_JOIN} ${buildFilterConditions()} AND DATE_FORMAT(PostSo.DateCreated, '%Y-%m-01') = '${escSQL(month)}'
+      ${BASE_JOIN} ${buildFilterConditions(rangeCond({ start, end }))}
       GROUP BY Customer.Name ORDER BY total_revenue DESC LIMIT 50`;
     const data = await runQueryP(sql);
-    if (!data.length) { showToast('No data for this month', 'info'); return; }
-    openDrilldown(`Top Customers for ${moment(month).format('MMMM YYYY')}`, `Monthly Revenue > ${moment(month).format('MMM YYYY')}`, data, [
+    if (!data.length) { showToast('No sales in this period', 'info'); return; }
+    openDrilldown(`Top Customers — ${title}`, `Revenue & Margin Trend > ${title}`, data, [
       { key: 'customer_name', label: 'Customer',     type: 'string' },
       { key: 'order_count',   label: 'Orders',       type: 'number' },
       { key: 'total_revenue', label: 'Revenue',      type: 'currency' },
       { key: 'avg_margin',    label: 'Margin %', type: 'percent' }
     ]);
-  } catch (e) { _ddFail('drilldownMonth', e); }
+  } catch (e) { _ddFail('drilldownPeriod', e); }
 }
 
 // categoryName is a rollup path label ("Bike Parts > Accessories"), so
