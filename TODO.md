@@ -10,6 +10,3 @@ These have been checked against demodb only:
   - the Customer filter (b6250a3);
   - Revenue & Margin Trend axes and weekly buckets (57016fd), Compare
     (b3cebfd), Profit Bridge and Growth vs Margin tiles.
-- [ ] Production Scheduling v1.2 Timeline tooltip at several app zoom
-      levels (4a2a23d).
-- [ ] Saved views (FBLib.FilterViews) on the individual dashboard tiles.
