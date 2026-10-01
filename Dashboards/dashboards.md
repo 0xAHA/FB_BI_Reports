@@ -159,7 +159,7 @@ the Product Tree.
 | Type | Tiles |
 |---|---|
 | KPI | Total Revenue, Order Count, Avg Order Value, Gross Margin, Gross Profit, Cost of Goods, Revenue vs Prior |
-| Chart | Revenue & Margin Trend (bar/line; weekly for ranges of 6 months or less), Top Customers by Revenue, Top Customers by Margin, Top Products by Qty, Top Products by Revenue, Sales by Category, Customer Groups, Top Salespeople, Orders per Salesperson, Low Margin Customers, High Value Orders, New vs Repeat Customers, Margin Mix |
+| Chart | Revenue & Margin Trend (bar/line; weekly for ranges of 6 months or less), Top Customers by Revenue, Top Customers by Margin, Top Products by Qty, Top Products by Revenue, Sales by Category, Customer Groups, Top Salespeople, Orders per Salesperson, Low Margin Customers, High Value Orders, New vs Repeat Customers, Margin Mix, Profit Bridge, Growth vs Margin |
 | Table | Monthly Revenue Table, Customer Revenue Table, Negative Margin Orders |
 
 Notes on specific tiles:
@@ -168,6 +168,17 @@ Notes on specific tiles:
 - **Top Customers by Margin** only includes customers with at least $1k of
   revenue.
 - **High Value Orders** lists orders over $10k.
+- **Profit Bridge** (needs Compare) splits the change in gross profit into a
+  **volume effect**, the revenue change at the comparison margin, and a
+  **margin effect**, the rest: this period's revenue × the margin change.
+  The two always add up to the change.
+- **Growth vs Margin** (needs Compare) plots the top 30 customers,
+  categories, sales people or products. Use the Cust / Cat / Rep / Prod
+  buttons to choose which.
+  - Across is revenue change; up is margin change in points; bubble size is
+    revenue.
+  - Anything with no comparison revenue is listed as new underneath.
+  - With Compare off, both tiles offer the two Compare modes.
 
 **Drill-downs:** Customer, period (a trend week or month), Category,
 Customer Group, Salesperson, Product, and New/Repeat.

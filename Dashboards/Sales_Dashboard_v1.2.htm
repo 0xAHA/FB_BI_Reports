@@ -19,7 +19,7 @@
       window.FB_REPORT = {
           key:   'cdx.bi.salesdash',
           name:  '- Dashboard - Sales v1.2',
-          build: '2026.10.01-d516723'     // @fb-build
+          build: '2026.10.01-7cf7834'     // @fb-build
       };
   </script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -168,6 +168,11 @@
     /* Comparison deltas (tables, trend summary, badges) */
     .dlt { font-size: 10.5px; font-weight: 700; white-space: nowrap; font-variant-numeric: tabular-nums; }
     .kpi-badge-dlt { font-size: 9.5px; font-weight: 700; white-space: nowrap; }
+    /* Profit Bridge / Growth vs Margin: footnote, and the "turn on Compare" prompt */
+    .pb-note { padding: 4px 12px 6px; font-size: 11px; line-height: 1.4; color: var(--c-secondary); }
+    .pb-note b { color: var(--c-primary); }
+    .cmp-prompt { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 16px; text-align: center; font-size: 12px; color: var(--c-secondary); }
+    .cmp-prompt-btns { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
 
     .info-icon-btn { width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; border: none; border-radius: 4px; background: transparent; color: var(--c-tertiary); cursor: help; flex-shrink: 0; transition: color .15s, background .15s; padding: 0; }
     .info-icon-btn:hover { color: var(--fb-blue); background: var(--bg-1); }
@@ -413,7 +418,7 @@
         <b>Filters &amp; data</b>
         <ul style="padding-left:18px; margin:6px 0; line-height:1.6;">
           <li>The filter strip applies to every widget — date range plus customer group, customer, category, salesperson and margin tier (the margin tier keeps order lines whose own margin is in that tier)</li>
-          <li><b>Compare</b> (filter strip, or Off / Prev / LY on the trend tile) adds the previous period or the same period last year to the KPIs and badges, the trend chart (comparison bars sit beside each bar), the revenue tables, and the Top Customers / Sales People / Products bars. It is off by default and always loads after everything else</li>
+          <li><b>Compare</b> (filter strip, or Off / Prev / LY on the trend tile) adds the previous period or the same period last year to the KPIs and badges, the trend chart (comparison bars sit beside each bar), the revenue tables, the Top Customers / Sales People / Products bars, and powers the <b>Profit Bridge</b> and <b>Growth vs Margin</b> tiles (Add Widget). It is off by default and always loads after everything else</li>
           <li>Margins follow the Fishbowl Margins report: (revenue − cost) ÷ revenue over all lines in the group, credits included; shipping, tax, subtotal and note lines are left out</li>
           <li>Click a <b>Top Customers</b> bar or an order number to drill into the underlying orders</li>
           <li>Categories show their full Product Tree path — set the roll-up depth in <b>Settings ▸ Product categories ▸ Category level</b>; admins publish it as the org default with <b>Publish</b></li>
@@ -1811,6 +1816,222 @@ async function renderTimeSeries(el, cfg, ctx = {}) {
   };
 }
 
+// ── Tiles that only make sense with Compare on ───────────────
+// With Compare off they offer the two modes; with it on, the primary render
+// is a placeholder and the comparison pass draws them (so even their
+// current-period queries wait until every other tile has rendered).
+function comparePrompt(el, what) {
+  el.innerHTML = `<div class="cmp-prompt"><div>${what}</div><div class="cmp-prompt-btns">` +
+    `<button type="button" class="fchip" data-cmp="prior">Previous period</button>` +
+    `<button type="button" class="fchip" data-cmp="yoy">Same period last year</button></div></div>`;
+  el.querySelectorAll('button[data-cmp]').forEach(b => {
+    b.addEventListener('mousedown', ev => ev.stopPropagation());
+    b.addEventListener('click', () => setCompareMode(b.dataset.cmp));
+  });
+}
+function compareWaiting(el) {
+  el.innerHTML = '<div class="tile-skel"><div class="tile-skel-spin"></div><span class="tile-skel-lbl">Loading comparison…</span></div>';
+}
+function fmtSigned$(v) { return (v >= 0 ? '+' : '−') + fmt$(Math.abs(v), true); }
+
+// ── Profit Bridge ────────────────────────────────────────────
+// Splits the change in gross profit between two causes, so the two bars
+// always add up to it:
+//   volume effect = (revenue − comparison revenue) × comparison margin
+//                   what selling more or less, at the old margin, did
+//   margin effect = (GP − comparison GP) − volume effect
+//                 = revenue × (margin − comparison margin) when both periods
+//                   have revenue: what earning more or less per $1 did
+async function renderProfitBridge(el, cfg, ctx = {}) {
+  if (!compareOn()) { comparePrompt(el, 'Turn on Compare to see what moved gross profit: selling more or less, or earning more or less on each dollar.'); return null; }
+  if (!ctx.compare) { compareWaiting(el); return null; }
+  const [kc, kp] = await Promise.all([Q.kpis(), Q.kpisCompare()]);
+  if (ctx.stale && ctx.stale()) return;
+  const c = kc[0] || {}, p = kp[0] || {};
+  const rc = parseFloat(c.total_revenue || 0), rp = parseFloat(p.total_revenue || 0);
+  const gc = rc - parseFloat(c.total_cogs || 0), gp = rp - parseFloat(p.total_cogs || 0);
+  const mc = rc > 0 ? gc / rc : null, mp = rp > 0 ? gp / rp : null;
+  const volume   = (rc - rp) * (mp || 0);
+  const marginFx = (gc - gp) - volume;
+  const cmpName  = compareShort();
+
+  const steps = [
+    { label: cmpName + ' GP', value: gp, from: 0, to: gp, kind: 'total',
+      tip: `<strong>${cmpName} gross profit</strong><br>${fmt$(gp)} on ${fmt$(rp)} revenue${mp == null ? '' : ` (${fmtPct(mp)} margin)`}<br>${rangeText(getCompareRange())}` },
+    { label: 'Volume effect', value: volume, from: gp, to: gp + volume, kind: 'delta',
+      tip: `<strong>Volume effect: ${fmtSigned$(volume)}</strong><br>Revenue ${rc >= rp ? 'up' : 'down'} ${fmt$(Math.abs(rc - rp))}` +
+           `${rp ? ` (${deltaPct(rc, rp) >= 0 ? '▲' : '▼'}${Math.abs(deltaPct(rc, rp)).toFixed(1)}%)` : ''}<br>at the ${cmpName.toLowerCase()}'s ${mp == null ? '—' : fmtPct(mp)} margin` },
+    { label: 'Margin effect', value: marginFx, from: gp + volume, to: gc, kind: 'delta',
+      tip: `<strong>Margin effect: ${fmtSigned$(marginFx)}</strong><br>Margin ${mc == null || mp == null ? 'change' : (mc >= mp ? 'up' : 'down') + ' ' + Math.abs((mc - mp) * 100).toFixed(1) + ' pts'}<br>on this period's ${fmt$(rc)} revenue` },
+    { label: 'Gross profit', value: gc, from: 0, to: gc, kind: 'total', current: true,
+      tip: `<strong>Gross profit</strong><br>${fmt$(gc)} on ${fmt$(rc)} revenue${mc == null ? '' : ` (${fmtPct(mc)} margin)`}<br>${rangeText(getDateRange())}` }
+  ];
+
+  el.innerHTML = '';
+  const note = document.createElement('div');
+  note.className = 'pb-note';
+  note.innerHTML = `Gross profit ${gc >= gp ? 'rose' : 'fell'} <b>${fmt$(Math.abs(gc - gp), true)}</b> vs ${rangeText(getCompareRange())}: ` +
+    `<b>${fmtSigned$(volume)}</b> from ${rc >= rp ? 'selling more' : 'selling less'}, <b>${fmtSigned$(marginFx)}</b> from ${marginFx >= 0 ? 'a better' : 'a thinner'} margin.`;
+  const W = el.clientWidth, H0 = el.clientHeight;
+  const svgHost = document.createElement('div');
+  el.appendChild(svgHost);
+  el.appendChild(note);
+  const H = H0 - note.offsetHeight;
+  if (W < 80 || H < 60) return null;
+  const m = { top: 18, right: 16, bottom: 30, left: 66 };
+  const iw = W - m.left - m.right, ih = H - m.top - m.bottom;
+  const svg = d3.select(svgHost).append('svg').attr('width', W).attr('height', H).style('display', 'block')
+    .append('g').attr('transform', `translate(${m.left},${m.top})`);
+  const x = d3.scaleBand().domain(steps.map(s => s.label)).range([0, iw]).padding(0.32);
+  const ext = steps.flatMap(s => [s.from, s.to]);
+  const y = d3.scaleLinear().domain([Math.min(0, d3.min(ext)), Math.max(0, d3.max(ext))]).nice(5).range([ih, 0]);
+
+  svg.append('g').selectAll('line').data(y.ticks(5)).join('line').attr('class', 'grid-line')
+    .attr('x1', 0).attr('x2', iw).attr('y1', d => y(d)).attr('y2', d => y(d));
+  svg.append('line').attr('x1', 0).attr('x2', iw).attr('y1', y(0)).attr('y2', y(0)).attr('stroke', '#8FA1A7');
+  // dashed connectors carry each running total across to the next bar
+  steps.slice(0, -1).forEach((s, k) => {
+    const yv = y(s.to), nx = steps[k + 1];
+    svg.append('line').attr('x1', x(s.label) + x.bandwidth()).attr('x2', x(nx.label)).attr('y1', yv).attr('y2', yv)
+      .attr('stroke', '#8FA1A7').attr('stroke-dasharray', '3,3');
+  });
+  const fill = s => s.kind === 'total' ? (s.current ? DS.blue : '#8FA1A7') : (s.value >= 0 ? DS.success : DS.negative);
+  svg.selectAll('rect.pb').data(steps).join('rect').attr('class', 'pb')
+    .attr('x', s => x(s.label)).attr('width', x.bandwidth())
+    .attr('y', s => y(Math.max(s.from, s.to))).attr('height', s => Math.max(1, Math.abs(y(s.from) - y(s.to))))
+    .attr('rx', 3).attr('fill', fill)
+    .on('mouseover', (ev, s) => showTip(ev, s.tip)).on('mousemove', moveTip).on('mouseout', hideTip);
+  svg.selectAll('text.pb-val').data(steps).join('text').attr('class', 'pb-val')
+    .attr('x', s => x(s.label) + x.bandwidth() / 2).attr('y', s => y(Math.max(s.from, s.to)) - 5)
+    .attr('text-anchor', 'middle').style('font-size', '10px').style('font-weight', 700).style('fill', s => fill(s))
+    .text(s => s.kind === 'total' ? fmt$(s.value, true) : fmtSigned$(s.value));
+  svg.append('g').attr('class', 'axis').attr('transform', `translate(0,${ih})`).call(d3.axisBottom(x)).selectAll('text').style('font-size', '10px');
+  svg.append('g').attr('class', 'axis').call(d3.axisLeft(y).ticks(5).tickFormat(d => fmt$(d, true)));
+
+  return {
+    columns: [{ key: 'step', label: 'Step' }, { key: 'amount', label: 'Amount' }],
+    rows: steps.map(s => ({ step: s.kind === 'total' ? s.label : s.label, amount: s.value }))
+  };
+}
+
+// ── Growth vs Margin ─────────────────────────────────────────
+// Each customer / category / sales person / product as a bubble: across =
+// revenue change against the comparison, up = margin change in points, size
+// = this period's revenue. The four quadrants are the four stories: growing
+// at a better margin, growing by giving margin away, shrinking but more
+// profitable, shrinking and less profitable. Something with no comparison
+// revenue has no change to plot and is counted as new instead.
+const GVM_TOP = 30;
+const GVM_DIMS = {
+  customer:    { label: 'Customers',    keyExpr: () => 'Customer.Id',   nameExpr: 'MAX(Customer.Name)', quoted: false,
+                 name: r => r.nm, drill: d => drilldownCustomer(d.name) },
+  category:    { label: 'Categories',   keyExpr: () => `COALESCE(${CAT_ID_EXPR}, 0)`, nameExpr: "''", quoted: false,
+                 name: r => catLabel(r.k), drill: d => drilldownCategory(d.name) },
+  salesperson: { label: 'Sales people', keyExpr: () => 'So.salesmanId', nameExpr: "''", quoted: false, notNull: true,
+                 name: r => ((_filterOpts.salespeople || []).find(s => String(s.id) === String(r.k)) || {}).name || ('User ' + r.k),
+                 drill: d => drilldownSalesperson(d.key) },
+  product:     { label: 'Products',     keyExpr: () => 'Product.Num',   nameExpr: 'MAX(Product.Description)', quoted: true, notNull: true,
+                 name: r => r.k, drill: d => drilldownProduct(d.name, d.desc) }
+};
+
+async function renderGrowthMargin(el, cfg, ctx = {}) {
+  const dimKey = (cfg && GVM_DIMS[cfg.dim]) ? cfg.dim : 'customer';
+  const dim = GVM_DIMS[dimKey];
+  if (!compareOn()) { comparePrompt(el, `Turn on Compare to plot each of your top ${dim.label.toLowerCase()} by revenue growth against margin change.`); return null; }
+  if (!ctx.compare) { compareWaiting(el); return null; }
+  const keyExpr = dim.keyExpr();
+  const cur = await qget('gvm:' + dimKey, () => runQueryLogged(`Growth vs Margin (${dim.label})`,
+    `SELECT ${keyExpr} as k, ${dim.nameExpr} as nm, SUM(${REV_EXPR}) as revenue, SUM(PostSoItem.PostedTotalCost) as cogs ${BASE_JOIN} ${buildFilterConditions()}` +
+    `${dim.notNull ? ` AND ${keyExpr} IS NOT NULL` : ''} GROUP BY ${keyExpr} HAVING revenue > 0 ORDER BY revenue DESC LIMIT ${GVM_TOP}`));
+  const cmp = await cmpByKey('gvm:' + dimKey, keyExpr, cur.map(r => r.k), dim.quoted);
+  if (ctx.stale && ctx.stale()) return;
+
+  const items = cur.map(r => {
+    const rc = parseFloat(r.revenue || 0), cc = parseFloat(r.cogs || 0);
+    const p  = cmp.get(String(r.k)) || { revenue: 0, cogs: 0 };
+    const mc = rc > 0 ? (rc - cc) / rc : null, mp = p.revenue > 0 ? (p.revenue - p.cogs) / p.revenue : null;
+    return { key: r.k, name: dim.name(r), desc: r.nm, rc, rp: p.revenue, mc, mp,
+             dx: p.revenue > 0 ? (rc - p.revenue) / p.revenue : null,
+             dy: (mc != null && mp != null) ? (mc - mp) * 100 : null };
+  });
+  const pts = items.filter(d => d.dx != null && d.dy != null);
+  const fresh = items.filter(d => d.dx == null);
+  if (!items.length) { el.innerHTML = '<div class="tile-skel"><span class="tile-skel-lbl">No data for period</span></div>'; return null; }
+
+  el.innerHTML = '';
+  const host = document.createElement('div');
+  const note = document.createElement('div');
+  note.className = 'pb-note';
+  note.textContent = `Top ${items.length} ${dim.label.toLowerCase()} by revenue vs ${rangeText(getCompareRange())}.` +
+    (fresh.length ? ` New (no ${compareShort().toLowerCase()} revenue): ${fresh.slice(0, 4).map(d => d.name).join(', ')}${fresh.length > 4 ? ` +${fresh.length - 4}` : ''}.` : '');
+  el.appendChild(host);
+  el.appendChild(note);
+  const W = el.clientWidth, H = el.clientHeight - note.offsetHeight;
+  if (W < 80 || H < 60) return null;
+  const m = { top: 14, right: 18, bottom: 34, left: 54 };
+  const iw = W - m.left - m.right, ih = H - m.top - m.bottom;
+  const svg = d3.select(host).append('svg').attr('width', W).attr('height', H).style('display', 'block')
+    .append('g').attr('transform', `translate(${m.left},${m.top})`);
+
+  // Revenue change runs −100%…+200% (beyond that sits on the edge as ▶);
+  // margin change is symmetric, 5–50 pts, so zero stays in the middle.
+  const X_MAX = 2, Y_CAP = 50;
+  const xHi = Math.min(X_MAX, Math.max(0.2, d3.max(pts, d => d.dx) || 0) * 1.1);
+  const xLo = Math.max(-1, Math.min(-0.2, d3.min(pts, d => d.dx) || 0) * 1.1);
+  const yM  = Math.min(Y_CAP, Math.max(5, d3.max(pts, d => Math.abs(d.dy)) || 0) * 1.15);
+  // Inset by the largest bubble so ones on the edge aren't clipped.
+  const R_MAX = 16, inset = R_MAX + 2;
+  const x = d3.scaleLinear().domain([xLo, xHi]).range([inset, iw - inset]);
+  const y = d3.scaleLinear().domain([-yM, yM]).range([ih - inset, inset]);
+  const r = d3.scaleSqrt().domain([0, d3.max(items, d => d.rc) || 1]).range([3, R_MAX]);
+  const cx = d => x(Math.max(xLo, Math.min(xHi, d.dx))), cy = d => y(Math.max(-yM, Math.min(yM, d.dy)));
+  const quadColor = d => d.dx >= 0 ? (d.dy >= 0 ? DS.success : DS.warning) : (d.dy >= 0 ? DS.blue : DS.negative);
+
+  svg.append('g').selectAll('line').data(y.ticks(5)).join('line').attr('class', 'grid-line')
+    .attr('x1', 0).attr('x2', iw).attr('y1', d => y(d)).attr('y2', d => y(d));
+  svg.append('line').attr('x1', x(0)).attr('x2', x(0)).attr('y1', 0).attr('y2', ih).attr('stroke', '#8FA1A7');
+  svg.append('line').attr('x1', 0).attr('x2', iw).attr('y1', y(0)).attr('y2', y(0)).attr('stroke', '#8FA1A7');
+  [['Growing, better margin', iw - 4, 10, 'end', DS.success], ['Growing, thinner margin', iw - 4, ih - 4, 'end', DS.warning],
+   ['Shrinking, better margin', 4, 10, 'start', DS.blue], ['Shrinking, thinner margin', 4, ih - 4, 'start', DS.negative]].forEach(([t, qx, qy, a, c]) =>
+    svg.append('text').attr('x', qx).attr('y', qy).attr('text-anchor', a).style('font-size', '9px').style('font-weight', 700).style('fill', c).style('opacity', 0.75).text(t));
+
+  const tip = d => `<strong>${escHtml(d.name)}</strong>${dimKey === 'product' && d.desc ? '<br>' + escHtml(d.desc) : ''}` +
+    `<br>Revenue: ${fmt$(d.rc)} vs ${fmt$(d.rp)} ${deltaHtml(d.dx * 100)}` +
+    `<br>Margin: ${fmtPct(d.mc)} vs ${fmtPct(d.mp)} ${deltaHtml(d.dy, 'pts')}<br><em>Click for detail</em>`;
+  const g = svg.append('g');
+  g.selectAll('circle').data(pts.slice().sort((a, b) => b.rc - a.rc)).join('circle')
+    .attr('cx', cx).attr('cy', cy).attr('r', d => r(d.rc))
+    .attr('fill', quadColor).attr('fill-opacity', 0.55).attr('stroke', quadColor).attr('stroke-width', 1.5)
+    .attr('stroke-dasharray', d => (d.dx > xHi || Math.abs(d.dy) > yM) ? '2,2' : null)
+    .style('cursor', 'pointer')
+    .on('mouseover', (ev, d) => showTip(ev, tip(d))).on('mousemove', moveTip).on('mouseout', hideTip)
+    .on('click', (ev, d) => { hideTip(); dim.drill(d); });
+  // names on the five biggest
+  // (a name near the right edge goes on the bubble's left instead)
+  const leftSide = d => cx(d) > iw - 90;
+  g.selectAll('text').data(pts.slice().sort((a, b) => b.rc - a.rc).slice(0, 5)).join('text')
+    .attr('x', d => leftSide(d) ? cx(d) - r(d.rc) - 3 : cx(d) + r(d.rc) + 3).attr('y', d => cy(d)).attr('dy', '0.35em')
+    .attr('text-anchor', d => leftSide(d) ? 'end' : 'start')
+    .style('font-size', '9px').style('fill', '#506872').style('pointer-events', 'none')
+    .text(d => d.name.length > 16 ? d.name.slice(0, 15) + '…' : d.name);
+
+  svg.append('g').attr('class', 'axis').attr('transform', `translate(0,${ih})`)
+    .call(d3.axisBottom(x).ticks(6).tickFormat(d => (d > 0 ? '+' : '') + Math.round(d * 100) + '%'));
+  svg.append('g').attr('class', 'axis').call(d3.axisLeft(y).ticks(5).tickFormat(d => (d > 0 ? '+' : '') + d + ' pts'));
+  svg.append('text').attr('x', iw).attr('y', ih + 30).attr('text-anchor', 'end').style('font-size', '9px').style('fill', '#8FA1A7').text('Revenue change →');
+  svg.append('text').attr('transform', 'rotate(-90)').attr('x', 0).attr('y', -44).attr('text-anchor', 'end').style('font-size', '9px').style('fill', '#8FA1A7').text('Margin change →');
+
+  return {
+    columns: [
+      { key: 'name', label: dim.label }, { key: 'revenue', label: 'Revenue' }, { key: 'cmp_revenue', label: compareShort() + ' Revenue' },
+      { key: 'rev_change', label: 'Revenue Change %' }, { key: 'margin', label: 'Margin' }, { key: 'cmp_margin', label: compareShort() + ' Margin' },
+      { key: 'margin_change', label: 'Margin Change (pts)' }
+    ],
+    rows: items.map(d => ({ name: d.name, revenue: d.rc, cmp_revenue: d.rp, rev_change: d.dx == null ? '' : (d.dx * 100).toFixed(1),
+                            margin: d.mc == null ? '' : d.mc, cmp_margin: d.mp == null ? '' : d.mp, margin_change: d.dy == null ? '' : d.dy.toFixed(1) }))
+  };
+}
+
 // ── Horizontal Bar ───────────────────────────────────────────
 // opts.cmp = { cacheKey, keyExpr, keyOf(row), quoted } makes a revenue bar
 // chart comparison-aware: in the comparison pass each value label gains its
@@ -2288,6 +2509,21 @@ const WIDGET_REGISTRY = {
     icon:'<path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/>',
     defaultW:4, defaultH:10, hasChartToggle:false,
     render: (el,cfg) => renderDonut(el, Q.marginMix, { colorMap:{ 'Good (>=30%)':DS.success, 'Medium (15-30%)':DS.warning, 'Low (<15%)':DS.negative }})
+  },
+  'profit-bridge': {
+    title:'Profit Bridge', description:'What moved gross profit against the Compare period: the volume effect (the change in revenue at the comparison margin) and the margin effect (the change in margin on this period\'s revenue). They always add up to the change. Needs Compare.', category:'chart',
+    icon:'<path d="M3 20h18M5 20v-9h3v9M10.5 11V6h3v5M16 20v-7h3v7"/>',
+    defaultW:6, defaultH:10, hasChartToggle:false, compare:true,
+    render: (el,cfg,ctx) => renderProfitBridge(el,cfg,ctx)
+  },
+  'growth-margin': {
+    title:'Growth vs Margin', description:'Your top customers, categories, sales people or products by revenue change (across) and margin change (up): growing at a better margin, growing by giving margin away, shrinking but more profitable, or shrinking and less profitable. Bubble size = revenue. Needs Compare.', category:'chart',
+    icon:'<path d="M3 3v18h18"/><circle cx="8" cy="14" r="2"/><circle cx="13" cy="8" r="3"/><circle cx="18" cy="15" r="1.5"/>',
+    defaultW:6, defaultH:10, hasChartToggle:false, compare:true,
+    optToggles: [{ key:'dim', modes:[
+      { v:'customer', label:'Cust', title:'Customers' }, { v:'category', label:'Cat', title:'Product categories' },
+      { v:'salesperson', label:'Rep', title:'Sales people' }, { v:'product', label:'Prod', title:'Products' } ] }],
+    render: (el,cfg,ctx) => renderGrowthMargin(el,cfg,ctx)
   }
 };
 
@@ -2322,7 +2558,7 @@ function buildWidgetContent(type, cfg) {
   const optToggleHTML = (reg.optToggles || []).map(group => {
     const cur = cfg[group.key] ?? group.modes[0].v;
     return `<div style="display:flex;gap:2px;margin-right:2px;">` + group.modes.map(m =>
-      `<button class="chart-toggle-btn opt-toggle-btn ${cur === m.v ? 'active' : ''}" data-opt-key="${group.key}" data-opt-val="${m.v}" title="${m.label}">${m.label}</button>`
+      `<button class="chart-toggle-btn opt-toggle-btn ${cur === m.v ? 'active' : ''}" data-opt-key="${group.key}" data-opt-val="${m.v}" title="${m.title || m.label}">${m.label}</button>`
     ).join('') + `</div>`;
   }).join('');
 
