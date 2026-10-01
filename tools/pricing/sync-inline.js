@@ -18,7 +18,7 @@ const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 const SOURCE = path.join(ROOT, 'scripts', 'fb-pricing.js');
-const TARGETS = ['SalesOrder/QuickOrder.htm', 'SalesOrder/QuickOrder_v1.2.htm'];
+const TARGETS = ['SalesOrder/QuickOrder_v1.2.htm'];   // v1.0 retired to archived/ 2026-10-01
 const BEGIN = '// ==== fb-pricing.js (INLINED COPY) BEGIN — regenerate with tools/pricing/sync-inline.js, never edit here ====';
 const END = '// ==== fb-pricing.js (INLINED COPY) END ====';
 

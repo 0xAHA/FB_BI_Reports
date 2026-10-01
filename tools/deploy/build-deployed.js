@@ -66,11 +66,9 @@ const DEPLOYED_NAMES = {
   'Part/PartActivity.htm':                                 ['- Part - Part Activity', '- Part - Part Activity'],
   'PurchaseOrder/PurchaseOrderSummary.htm':                ['- Purchasing - Purchase Order Summary', '- Purchasing - Purchase Order Summary'],
   'PurchaseOrder/receivingsummary.htm':                    ['- Purchasing - Receiving Summary', '- Purchasing - Receiving Summary'],
-  // AMBIGUOUS — the deployed "QuickOrder V2" matched QuickOrder.htm far more
-  // closely than QuickOrder_v1.2.htm (31% of sampled blocks vs 3%), but
-  // neither is a clean match because a deployed page has its {% Script %}
-  // directives expanded inline. Confirm before importing this one.
-  'SalesOrder/QuickOrder.htm':                             ['- Sales - QuickOrder V2', '- Sales - QuickOrder V2'],
+  // v1.2 is the released QuickOrder (confirmed 2026-10-01). The record was
+  // first recovered from a v1.0 export; v1.0 now lives in archived/.
+  'SalesOrder/QuickOrder_v1.2.htm':                        ['- Sales - QuickOrder V2', '- Sales - QuickOrder V2'],
   'SalesOrder/SalesOrderSummary.htm':                      ['- Sales - Sales Order Summary', '- Sales - Sales Order Summary'],
   'Template/Core_Dashboard_Template.htm':                  ['- System - BI Template', '- System - BI Template'],
   // Shared assets — names must match exactly or the {% Script %} /

@@ -8,8 +8,9 @@ REM  carried as a payload at the bottom and extracted to %TEMP% at run time.
 REM  Nothing else needs to sit beside it.
 REM
 REM  SELF-LOCATING. Drop it anywhere and double-click:
-REM    * Beside .htm reports -> serves THAT folder. Opens QuickOrder.htm if
-REM      present, else the only report there, else a pick-list.
+REM    * Beside .htm reports -> serves THAT folder. Opens QuickOrder_v1.2.htm
+REM      (or QuickOrder.htm) if present, else the only report there, else a
+REM      pick-list.
 REM    * Somewhere with no reports -> serves the folder anyway and lists it.
 REM
 REM  Usage:
@@ -112,7 +113,9 @@ if not defined REPORT (
         set /a COUNT+=1
         if not defined FIRST set "FIRST=%%~nxF"
     )
-    if exist "%HERE%\QuickOrder.htm" (
+    if exist "%HERE%\QuickOrder_v1.2.htm" (
+        set "REPORT=QuickOrder_v1.2.htm"
+    ) else if exist "%HERE%\QuickOrder.htm" (
         set "REPORT=QuickOrder.htm"
     ) else (
         if !COUNT! EQU 1 set "REPORT=!FIRST!"

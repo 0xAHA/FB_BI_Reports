@@ -70,11 +70,9 @@ which is which for every file:
 
 ## Known caveats
 
-- **`SalesOrder/QuickOrder.htm` → `- Sales - QuickOrder V2` is unconfirmed.**
-  It matched the deployed page far better than `QuickOrder_v1.2.htm` (31% of
-  sampled blocks vs 3%), but neither is clean, because a deployed page has its
-  `{% Script %}` directives expanded inline while the repo copy does not.
-  Check this one before importing it over the live page.
+- **`- Sales - QuickOrder V2` is `SalesOrder/QuickOrder_v1.2.htm`** (v1.2 is
+  the released version, confirmed 2026-10-01). The name was recovered from an
+  export of the older v1.0, which is now `archived/SalesOrder/QuickOrder.htm`.
 - **Payloads are faithful, including existing defects.** Three source files
   carry mojibake from an old Windows-1252 save (`Manufacturing/Temp/ProdSched_vA.htm`
   and `_vB.htm`, 18 occurrences each in visible text; `SalesOrder/QuickOrder_v1.2.htm`,

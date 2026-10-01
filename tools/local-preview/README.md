@@ -29,7 +29,7 @@ It serves **its own folder**, whatever that is:
 
 | Where you put it | What it serves | What it opens |
 |---|---|---|
-| Beside `QuickOrder.htm` | that folder | `QuickOrder.htm` |
+| Beside `QuickOrder_v1.2.htm` (or `QuickOrder.htm`) | that folder | that QuickOrder |
 | Beside exactly one `.htm` | that folder | that report |
 | Beside several `.htm` | that folder | a pick-list |
 | Anywhere else | that folder | a folder listing |

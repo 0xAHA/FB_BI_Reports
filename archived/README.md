@@ -18,4 +18,5 @@ versions live in `Manufacturing/Archived/`.
 | `Manufacturing/WO Finisher/` | `Manufacturing/WO_Finisher.htm` (prototype, 2026-06). The `.md` files are that project's old Claude notes; their useful parts are now in `CLAUDE.md` and `schema/schema-index.md` |
 | `_ps.js` | `Manufacturing/Production_Scheduling_v1.2.htm` (an extracted copy of its script) |
 | `bi-script-javascript-api-guide.md` | `CLAUDE.md` (an earlier copy of the API guide) |
+| `SalesOrder/QuickOrder.htm` | `SalesOrder/QuickOrder_v1.2.htm` (v1.0, retired 2026-10-01 when v1.2 took over the `- Sales - QuickOrder V2` record and the portal. This is v1.0 as last maintained; tag `quickorder-v1.0` marks where v1.2 forked) |
 | `File_Storage_Test_shelved.htm` | — (shelved experiment) |

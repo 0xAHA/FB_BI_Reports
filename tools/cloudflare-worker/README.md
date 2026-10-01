@@ -1,6 +1,6 @@
 # QuickOrder Portal — Cloudflare Worker + Pages Function
 
-This is the auth + proxy layer that lets `SalesOrder/QuickOrder.htm`
+This is the auth + proxy layer that lets `SalesOrder/QuickOrder_v1.2.htm`
 run from any browser instead of only inside the Fishbowl desktop
 client.
 
@@ -131,7 +131,7 @@ Each entry is a JSON object:
 
 `appName` + `appId` are the Integrated Application credentials
 registered in Fishbowl → Maintenance → Integrated Applications.
-QuickOrder.htm registers as `(Quick Order, 102)` by default — the
+QuickOrder registers as `(Quick Order, 102)` by default — the
 same IA approval covers both this portal and the desktop QuickOrder.
 
 ---
