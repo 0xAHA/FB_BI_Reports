@@ -1,0 +1,764 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  REPORT: Sales Order Report / Sales Invoice  (PROOF OF CONCEPT)
+  PATH:   Other_NOT_FOR_PRODUCTION/Paperwork_POC/SOReport.htm
+  --------------------------------------------------------------------------------
+  HTML replica of Fishbowl's standard SalesOrder/SOReport.jrxml and
+  SOInvoiceReport.jrxml, printed and saved as PDF from the BI Report module's own
+  Print / Save / Email buttons. The page IS the paper: fb-doc.js lays the order
+  out into fixed-size sheets (page header on every sheet, item-table column
+  header repeated, page footer "Page X of Y", totals pinned to the bottom of the
+  last sheet, kits and BOM rows kept with their line).
+
+  SOURCE vs BUILD
+    This file is the source. `node build.js` inlines fb-doc.js and
+    fb-doc-fonts.css into dist/SOReport.htm, and also writes
+    dist/SOInvoiceReport.htm: this page with the Invoice setting defaulting on,
+    its own settings key and the record name "Sales Invoice".
+    Paste the dist files into the BI Script Editor (fb-lib and fb-styles are the
+    deployed shared records).
+
+  SCREEN
+    The toolbar, record picker, Settings drawer, paper choice and launch handling
+    are FBDoc.app (fb-doc.js); this file supplies the document only.
+
+  FISHBOWL REPORT SETTINGS (Parameters button on the BI Report)
+    Sales_Order  the order to print (Fishbowl's own SO picker); adopted once,
+                 after that each user's in-page pick stands
+    Invoice      print as the Sales Invoice (SOInvoiceReport) instead
+    Page_setup   paper size / margins (default A4, Jasper margins)
+    The setting tokens are in the text/plain blocks at the top of <body>. They
+    are substituted by global text replacement: never repeat them anywhere else.
+
+  LAUNCH FROM THE SALES ORDER MODULE (LAUNCH_CONTEXT.md)
+    The fb-launch meta tag in <head> (content SO) lists this report under
+    Reports > Apps in the Sales Order module (report_btn plugin). Opened from
+    there, the host's window.FB_LAUNCH names the open order: it is printed
+    straight away and cannot be changed (the toolbar shows only Print and
+    Settings). Write that tag only once: the plugin reads the first one in the page.
+
+  OPTIONS
+    The stock report's saved options (reportparameter rows of SOReport.jasper /
+    SOInvoiceReport.jasper) are read as the starting point, so a customer's
+    existing setup carries over. An admin can override them in Settings and
+    save for everyone (FBLib.Settings master, userProperties storage).
+
+  DELIBERATE DEVIATIONS FROM THE JRXML
+    - LEFT joins throughout: a null ship terms no longer blanks the info strip.
+    - No literal "null" for a missing phone/email/fax/salesperson.
+    - One currency source: so.currencyId (customer's as fallback); the jrxml
+      mixes the customer's and the order's.
+    - Info strips refit to the page width instead of running off it past six
+      columns; item columns use the shared fb-doc catalogue widths.
+    - Payments ordered by date; Kit headers re-shown "(continued)" on the next
+      page when a kit runs over a page break.
+
+  STATUS: proof of concept. Desk-tested against demodb through the live-SQL
+  harness (tests/). Not client-tested.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <script>
+        window.FB_REPORT = {
+            key:   'cdx.bi.paperwork.so',
+            name:  'Sales Order Report',
+            build: 'UNSTAMPED'    // @fb-build (Other_NOT_FOR_PRODUCTION is not stamped)
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="fb-launch" content="SO">
+    <meta name="description" content="The sales order document, ready to print or save as PDF.">
+    <title>Sales Order Report</title>
+
+    <script>
+        {% Script fb-lib %}
+    </script>
+    <style>
+        {% Style fb-styles %}
+    </style>
+    <!-- @inline-style fb-doc-fonts.css -->
+    <!-- @inline-script fb-doc.js -->
+
+    <style>
+        /* ---------- the document (pt, black on white — paperwork, not dashboard) ---------- */
+        .so-doc { font-size: 9pt; color: #000; }
+        .so-abs { position: absolute; overflow: hidden; }
+        .so-hdrcell { background: #EAEAEA; font-weight: 700; font-size: 10pt; border: 0.5pt solid #000; }
+        .so-box { border: 0.5pt solid #000; font-size: 10pt; }
+        .so-title { font-size: 17pt; font-weight: 700; text-align: right; display: flex; align-items: flex-end; justify-content: flex-end; line-height: 1.1; }
+        .so-company { font-size: 14pt; font-weight: 700; line-height: 1.2; }
+        .so-addr { font-size: 10pt; white-space: pre-wrap; line-height: 1.25; }
+        .so-center { display: flex; align-items: center; justify-content: center; text-align: center; }
+        .so-logo { display: flex; overflow: hidden; }
+        .so-logo img { max-width: 100%; max-height: 100%; object-fit: contain; }
+        .pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+        .so-addresses { display: grid; column-gap: 0; padding-bottom: 5pt; min-height: 98pt; align-content: start; }
+        .so-addresses .h { padding: 0 3pt; height: 17pt; display: flex; align-items: flex-end; }
+        .so-addresses .b { padding: 3pt; min-height: 44pt; white-space: pre-wrap; }
+        .so-addresses .l { padding: 0 3pt; min-height: 11pt; margin-top: 5pt; white-space: pre-wrap; display: flex; align-items: center; }
+        .so-notes { display: flex; font-size: 10pt; padding-bottom: 5pt; }
+        .so-notes .lbl { font-weight: 700; flex: none; }
+        .so-notes .txt { padding-left: 3pt; white-space: pre-wrap; flex: 1 1 auto; }
+        .so-strip { padding-bottom: 10pt; }
+        .so-strip table { width: 100%; table-layout: fixed; border-collapse: collapse; }
+        .so-strip th { background: #EAEAEA; font-weight: 700; font-size: 10pt; border: 0.5pt solid #000; height: 14pt; padding: 0 2pt; text-align: center; vertical-align: middle; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+        .so-strip td { font-size: 10pt; border: 0.5pt solid #000; height: 14pt; padding: 0 3pt; text-align: center; vertical-align: middle; overflow-wrap: anywhere; }
+
+        .so-items th { background: #EAEAEA; font-weight: 700; font-size: 9pt; height: 28pt; vertical-align: bottom; padding: 0 3pt 1pt;
+                       border-bottom: 0.5pt solid #000; border-left: 1pt solid #fff; border-right: 1pt solid #fff; white-space: pre-line; line-height: 1.15; }
+        .so-items td { font-size: 9pt; padding: 1pt 3pt 0.5pt; line-height: 1.3; border-left: 1pt solid #fff; border-right: 1pt solid #fff; min-height: 14pt; }
+        .so-items .c { text-align: center; } .so-items .r { text-align: right; } .so-items .l { text-align: left; }
+        .so-items tbody.fbdoc-zebra td { background: #EAEAEA; }
+        .so-items .qty { display: flex; } .so-items .qty .q { flex: 0 0 56%; text-align: right; } .so-items .qty .u { flex: 1 1 auto; padding-left: 3pt; text-align: left; }
+        .so-items .cont { font-style: italic; color: #333; }
+        /* Too many columns for the paper: one font step down (FBDoc.Columns.fit 'compact'). */
+        .so-items.compact th, .so-items.compact td { font-size: 7pt; padding-left: 1.5pt; padding-right: 1.5pt; }
+        .so-items.compact .so-bom, .so-items.compact .so-bom .p9 { font-size: 6.5pt; }
+        .so-bom { font-size: 8pt; }
+        .so-bom .bh { display: flex; border-bottom: 0.5pt solid #000; padding: 2pt 0 0 2pt; }
+        .so-bom .br { display: flex; padding-left: 2pt; }
+        .so-bom .p { flex: 0 0 61%; } .so-bom .a { flex: 0 0 16%; text-align: right; } .so-bom .n { flex: 0 0 13%; text-align: right; } .so-bom .m { flex: 1 1 auto; padding-left: 2pt; }
+        .so-bom .p9 { font-size: 9pt; }
+
+        .so-sub th { background: #EAEAEA; font-weight: 700; font-size: 10pt; height: 16pt; vertical-align: bottom; text-align: center; border-bottom: 0.5pt solid #000; border-left: 1pt solid #fff; border-right: 1pt solid #fff; padding: 0 3pt; }
+        .so-sub td { font-size: 9pt; padding: 1pt 3pt; border-left: 1pt solid #fff; border-right: 1pt solid #fff; }
+        .so-sub tbody.fbdoc-zebra td { background: #EAEAEA; }
+        .so-memotitle { font-size: 10pt; font-weight: 700; height: 14pt; display: flex; align-items: flex-end; }
+        .so-memos td { font-size: 9pt; border-bottom: 0.25pt solid #CCCCCC; padding: 1pt 3pt; white-space: pre-wrap; }
+        .so-memos th { background: #EAEAEA; font-weight: 700; font-size: 10pt; text-align: left; padding: 0 3pt; border-bottom: 0.5pt solid #000; height: 14pt; vertical-align: bottom; }
+
+        .so-foot { display: flex; align-items: flex-end; height: 14pt; font-size: 9pt; white-space: nowrap; }
+        .so-foot .rev { font-size: 8pt; margin-left: 12pt; }
+        .so-foot .pg { margin-left: auto; }
+        .so-last { position: relative; height: 140pt; }
+        .so-last .msg { position: absolute; left: 0; top: 0; height: 121pt; font-size: 8pt; display: flex; flex-direction: column; justify-content: flex-end; white-space: pre-wrap; overflow: hidden; }
+        .so-last .tot { position: absolute; top: 10pt; }
+        .so-last .tot table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; }
+        .so-last .tot td, .so-last .tot th { font-size: 10pt; font-weight: 700; text-align: right; height: 14pt; padding: 0 3pt; border-left: 1pt solid #fff; border-right: 1pt solid #fff; white-space: nowrap; }
+        .so-last .tot th { background: #EAEAEA; border-bottom: 0.5pt solid #000; }
+        .so-last .tot tr.g td { background: #EAEAEA; }
+        .so-last .tot td.sp { background: transparent !important; }
+        .so-pay { position: absolute; height: 26pt; border-radius: 10pt; background: #137FFD; border: 1pt solid #0265D9; color: #fff !important; font-size: 16pt;
+                  display: flex; align-items: center; justify-content: center; text-decoration: none; }
+        .so-last .foot { position: absolute; left: 0; right: 0; top: 126pt; }
+    </style>
+</head>
+<body>
+
+<!-- Fishbowl report settings: each token exactly once, never elsewhere. -->
+<script type="text/plain" id="set-so">$SO{Sales_Order|0|Order}</script>
+<script type="text/plain" id="set-invoice">$CHECK{Invoice|false|Document}</script>
+<script type="text/plain" id="set-print">$PRINT{Page_setup|A4|Print}</script>
+
+<script>
+// ============================================================================
+//  BAIL EARLY — needs the Fishbowl embedded browser, fb-lib and fb-doc.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2><p>Open this report from the Fishbowl client\'s BI module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+if (!window.FBLib || !window.FBDoc) {
+    document.body.insertAdjacentHTML('afterbegin', '<div style="background:#F0D7DD;color:#8A1E30;padding:10px 16px;font:13px sans-serif">' +
+        'Missing ' + (!window.FBLib ? 'fb-lib' : 'fb-doc') + '. Paste the BUILT file from dist/, not the source.</div>');
+    throw new Error('fb-lib / fb-doc missing');
+}
+
+// Shell access (FBDoc.app, created at the end of this script).
+function opt(name) { return APP.opt(name); }
+function label(key, dflt) { return APP.label(key, dflt); }
+function debugLog(m, t) { APP.debug(m, t); }
+
+var esc = FBDoc.esc;
+function num(v) { var n = parseFloat(v); return isNaN(n) ? 0 : n; }
+function round2(x) { return Math.sign(x) * Math.round(Math.abs(x) * 100 + 1e-7) / 100; }
+function has(v) { return v != null && String(v) !== ''; }
+
+// ============================================================================
+//  OPTIONS — jrxml defaults (spec of SOReport.jrxml §2), stock presets, admin
+// ============================================================================
+var SO_REPORT_PATH = '../reports/SalesOrder/SOReport.jasper';
+var INV_REPORT_PATH = '../reports/SalesOrder/SOInvoiceReport.jasper';
+
+function jrxmlDefaults(env) {
+    var MC = env.multiCurrency;
+    return {
+        cbDisplaySeller: 'username', cbShowDate: 'issued', cbLogoAlignment: 'left',
+        ShowCompanyName: true, ShowCompanyAddress: true, ShowCountry: false,
+        ShowBillToPhoneNumber: false, ShowBillToEmail: false, ShowBillToFax: false, ShowCustomerNameInAddress: false,
+        ShowContact: true, ShowStatus: false, ShowRevision: false, ShowOrderNotes: true, ShowMemos: false,
+        ShowBarcode: true, ShowSOCustomFields: false,
+        ShowCfSO1: true, ShowCfSO2: true, ShowCfSO3: true, ShowCfSO4: true, ShowCfSO5: true, ShowCfSO6: true,
+        ShowCfItem1: false, ShowCfItem2: false, ShowCfItem3: false,
+        IncludeCustomerPartNumbers: true, ShowLineItemNotes: true, ShowZeroPriceItems: true,
+        ShowBOMOnWOItems: true, ShowDescriptionOnWOItems: false, ShowAdjustmentAmounts: false, OnlyShowBOMPriceAdjustments: false,
+        ShowTotals: !MC, ShowCurrencyTotals: MC, ShowHomeCurrencyTotals: false,
+        ShowPayments: false, ShowCreditCardNumber: false, ShowHomeCurrency: false, ShowTaxRateName: false,
+        AddTaxIntegrationEstimatedTaxToTotal: false, ShowPayOnlineButton: true,
+        'Column:SalesOrderSeller': true, 'Column:SalesOrderPaymentTerms': true, 'Column:SalesOrderFOBPoint': true,
+        'Column:SalesOrderShippingTerms': false, 'Column:SalesOrderCarrier': true, 'Column:SalesOrderShipService': true,
+        'Column:DateScheduled': true, 'Column:PONumber': false, 'Column:OrderCurrencyCode': false,
+        'Column:OrderCurrencyRate': false, 'Column:TaxIntegrationEstimatedTax': false,
+        'Column:CustomerName': true, 'Column:CustomFooterText': true,
+        'Column:ItemLineNumber': true, 'Column:ItemType': env.edition === 'US', 'Column:ItemNumberAndDescription': false,
+        'Column:ItemNumber': true, 'Column:ItemDescription': true, 'Column:ItemDateScheduled': false,
+        'Column:ItemUnitPrice': !MC, 'Column:ItemCurrencyUnitPrice': MC, 'Column:ItemQuantityOrdered': true,
+        'Column:ItemTotalPrice': !MC, 'Column:ItemCurrencyTotalPrice': MC,
+        'Column:ItemTaxCode': true, 'Column:ItemTaxAmount': false, 'Column:ItemCurrencyTax': false,
+        'CustomField:SO1': -1, 'CustomField:SO2': -1, 'CustomField:SO3': -1, 'CustomField:SO4': -1,
+        'CustomField:SO5': -1, 'CustomField:SO6': -1, 'CustomField:Item1': -1, 'CustomField:Item2': -1, 'CustomField:Item3': -1
+    };
+}
+
+// The options shown in the Settings drawer (labels are the stock report's).
+var OPTION_GROUPS = [
+    ['Header', [['cbLogoAlignment', 'Logo position', ['left', 'top']], ['ShowCompanyName', 'Company name'], ['ShowCompanyAddress', 'Company address'],
+        ['ShowCountry', 'Show country'], ['ShowStatus', 'Order status'], ['ShowBarcode', 'Barcode'], ['ShowRevision', 'Revision'],
+        ['cbShowDate', 'Date shown', ['issued', 'created', 'completed', 'firstship', 'lastmodified', 'revision', 'today']],
+        ['cbDisplaySeller', 'Sales rep shows', ['username', 'first', 'full']]]],
+    ['Addresses', [['ShowCustomerNameInAddress', 'Customer name in bill-to'], ['ShowBillToPhoneNumber', 'Bill-to phone'],
+        ['ShowBillToEmail', 'Bill-to email'], ['ShowBillToFax', 'Bill-to fax'], ['ShowContact', 'Contact'], ['Column:CustomerName', 'Customer line']]],
+    ['Sections', [['ShowOrderNotes', 'Order notes'], ['ShowMemos', 'Memos'], ['ShowSOCustomFields', 'SO custom fields'], ['ShowPayments', 'Payments']]],
+    ['Order info strip', [['Column:SalesOrderSeller', 'Sales rep'], ['Column:SalesOrderPaymentTerms', 'Payment terms'], ['Column:SalesOrderFOBPoint', 'FOB point'],
+        ['Column:SalesOrderShippingTerms', 'Shipping terms'], ['Column:SalesOrderCarrier', 'Carrier'], ['Column:SalesOrderShipService', 'Ship service'],
+        ['Column:DateScheduled', 'Date scheduled'], ['Column:PONumber', 'PO # (moves it out of the contact box)'], ['Column:OrderCurrencyCode', 'Currency code'],
+        ['Column:OrderCurrencyRate', 'Currency rate'], ['Column:TaxIntegrationEstimatedTax', 'Estimated tax']]],
+    ['Line item columns', [['Column:ItemLineNumber', 'Item #'], ['Column:ItemType', 'Type'], ['Column:ItemNumberAndDescription', 'Number / Description'],
+        ['Column:ItemNumber', 'Number'], ['Column:ItemDescription', 'Description'], ['Column:ItemTaxCode', 'Tax code (AU/CA)'],
+        ['Column:ItemTaxAmount', 'Tax amount (AU/CA)'], ['Column:ItemCurrencyTax', 'Order-currency tax (AU/CA)'], ['Column:ItemDateScheduled', 'Date scheduled'],
+        ['Column:ItemUnitPrice', 'Unit price (home)'], ['Column:ItemCurrencyUnitPrice', 'Unit price (order currency)'], ['Column:ItemQuantityOrdered', 'Qty ordered'],
+        ['Column:ItemTotalPrice', 'Total price (home)'], ['Column:ItemCurrencyTotalPrice', 'Total price (order currency)'],
+        ['ShowCfItem1', 'Item CF 1'], ['ShowCfItem2', 'Item CF 2'], ['ShowCfItem3', 'Item CF 3']]],
+    ['Line items', [['IncludeCustomerPartNumbers', 'Customer part numbers'], ['ShowLineItemNotes', 'Line notes'], ['ShowZeroPriceItems', 'Zero-price lines'],
+        ['ShowBOMOnWOItems', 'BOM under WO lines (Number / Description column)'], ['ShowDescriptionOnWOItems', 'BOM part descriptions'],
+        ['ShowAdjustmentAmounts', 'BOM adjustments'], ['OnlyShowBOMPriceAdjustments', 'Only priced BOM items']]],
+    ['Totals', [['ShowTotals', 'Totals (single currency)'], ['ShowCurrencyTotals', 'Totals (multi-currency)'], ['ShowHomeCurrencyTotals', 'Home-currency column'],
+        ['ShowTaxRateName', 'Tax rate name as label'], ['AddTaxIntegrationEstimatedTaxToTotal', 'Estimated tax in total (open orders)'],
+        ['ShowCreditCardNumber', 'Payment reference'], ['ShowHomeCurrency', 'Payments in home currency'], ['ShowPayOnlineButton', 'Pay Online button'],
+        ['Column:CustomFooterText', 'Footer message (SO Notice)']]]
+];
+
+// ============================================================================
+//  DATA
+// ============================================================================
+// Configured custom-field columns only, each with a leading comma. Never select
+// a bare NULL: the server's MariaDB driver types it as a binary string, Fishbowl
+// then fails Class.forName("byte[]") and the whole query returns "An unknown
+// error has occurred". An omitted column simply reads as undefined (blank).
+function cfSelect(prefix, alias, count, keyBase) {
+    var out = '', params = [];
+    for (var i = 1; i <= count; i++) {
+        var id = opt('CustomField:' + keyBase + i);
+        if (id > 0) { out += ', CustomFieldById(' + alias + '.customFields, ?) AS ' + prefix + i; params.push(id); }
+    }
+    return { sql: out, params: params };
+}
+
+async function fetchModel(soId) {
+    var cfS = cfSelect('socf', 'so', 6, 'SO');
+    var hdr = await FBDoc.q([
+        'SELECT so.id, so.num, so.statusId AS statusid, sostatus.name AS sostatus, so.note, so.revisionNum AS revisionnum,',
+        '  so.dateIssued AS dateissued, so.dateCompleted AS datecompleted, so.dateCreated AS datecreated,',
+        '  so.dateFirstShip AS datefirstship, so.dateRevision AS daterevision, so.dateLastModified AS datelastmodified,',
+        '  so.locationGroupId AS lgid, so.paymentLink AS paymentlink, COALESCE(so.customerContact, \'\') AS customercontact,',
+        '  so.customerPO AS customerpo, customer.name AS customername,',
+        '  so.totalTax AS totaltax, so.mcTotalTax AS mctotaltax, so.estimatedTax AS estimatedtax,',
+        '  so.shipToName AS shiptoname, so.shipToAddress AS shiptoaddress, so.shipToCity AS shiptocity, so.shipToZip AS shiptozip,',
+        '  ss.code AS shiptostate, sc.name AS shiptocountry,',
+        '  so.billToName AS billtoname, so.billToAddress AS billtoaddress, so.billToCity AS billtocity, so.billToZip AS billtozip,',
+        '  bs.code AS billtostate, bc.name AS billtocountry,',
+        '  COALESCE(NULLIF(so.currencyRate, 0), 1) AS currencyrate, cur.code AS currencycode, hc.code AS homecurrencycode,',
+        '  company.name AS company, company.abn AS abn, so.phone, so.email,',
+        '  (SELECT c.datus FROM contact c WHERE c.accountId = customer.accountId AND c.typeId = 40 AND c.defaultFlag = 1 ORDER BY c.id LIMIT 1) AS fax,',
+        '  so.salesman, su.firstName AS firstname, su.lastName AS lastname,',
+        '  pt.name AS paymentterms, fob.name AS fobpoint, st.name AS shippingterms, car.name AS carriername, cs.name AS shipservice,',
+        '  ot.name AS ordertaxname,',
+        '  (SELECT COALESCE(SUM(p.amount), 0) FROM postransaction p WHERE p.soId = so.id) AS paymentamount,',
+        '  (SELECT SUM(i.unitPrice * i.qtyToFulfill + COALESCE(i.adjustAmount, 0)) FROM soitem i WHERE i.soId = so.id AND i.typeId <> 40) AS sototal' + cfS.sql,
+        'FROM so',
+        'JOIN customer ON customer.id = so.customerId',
+        'LEFT JOIN company ON company.id = 1',
+        'LEFT JOIN sostatus ON sostatus.id = so.statusId',
+        'LEFT JOIN stateconst ss ON ss.id = so.shipToStateId',
+        'LEFT JOIN countryconst sc ON sc.id = so.shipToCountryId',
+        'LEFT JOIN stateconst bs ON bs.id = so.billToStateId',
+        'LEFT JOIN countryconst bc ON bc.id = so.billToCountryId',
+        'LEFT JOIN currency cur ON cur.id = COALESCE(so.currencyId, customer.currencyId)',
+        'LEFT JOIN currency hc ON hc.homeCurrency = 1',
+        'LEFT JOIN sysuser su ON su.userName = so.salesman',
+        'LEFT JOIN paymentterms pt ON pt.id = so.paymentTermsId',
+        'LEFT JOIN fobpoint fob ON fob.id = so.fobPointId',
+        'LEFT JOIN shipterms st ON st.id = so.shipTermsId',
+        'LEFT JOIN carrier car ON car.id = so.carrierId',
+        'LEFT JOIN carrierservice cs ON cs.id = so.carrierServiceId',
+        'LEFT JOIN taxrate ot ON ot.id = so.taxRateId',
+        'WHERE so.id = ?'
+    ].join('\n'), cfS.params.concat([soId]));
+    if (!hdr.length) throw new Error('Sales order ' + soId + ' not found');
+    var h = hdr[0];
+
+    var cfI = cfSelect('itemcf', 'si', 3, 'Item');
+    var lines = await FBDoc.q([
+        'SELECT si.id AS itemid, si.soLineItem AS lineno, sit.name AS itemtype, si.typeId AS typeid,',
+        '  si.customerPartNum AS cpn, si.productNum AS productnum, si.description, si.note,',
+        '  COALESCE(si.qtyToFulfill, 0) AS qty, uom.code AS uomcode, COALESCE(si.adjustAmount, 0) AS adjust,',
+        '  COALESCE(si.unitPrice, 0) AS unitprice, COALESCE(si.totalPrice, 0) AS totalprice,',
+        '  si.dateScheduledFulfillment AS datesched, COALESCE(si.taxRate, 0) AS taxrate, tr.code AS taxcode,',
+        '  oto.recordId2 AS kitparent,',
+        '  (SELECT COUNT(*) FROM moitem mi WHERE mi.soItemId = si.id) AS mocount,',
+        '  COALESCE(kit.kittotal, 0) AS kittotal' + cfI.sql,
+        'FROM soitem si',
+        'JOIN soitemtype sit ON sit.id = si.typeId',
+        'LEFT JOIN uom ON uom.id = si.uomId',
+        'LEFT JOIN taxrate tr ON tr.id = si.taxId',
+        'LEFT JOIN objecttoobject oto ON oto.recordId1 = si.id AND oto.typeId = 30',
+        'LEFT JOIN (SELECT o.recordId2 AS parentid, SUM(c.totalPrice) AS kittotal FROM soitem c',
+        '           JOIN objecttoobject o ON o.recordId1 = c.id AND o.typeId = 30',
+        '           WHERE c.soId = ? AND c.showItemFlag = 0 GROUP BY o.recordId2) kit',
+        '       ON kit.parentid = si.id AND si.typeId = 80 AND si.totalPrice = 0',
+        'WHERE si.soId = ? AND si.showItemFlag = 1',
+        'ORDER BY si.soLineItem, si.id'
+    ].join('\n'), cfI.params.concat([soId, soId]));
+
+    var woIds = lines.filter(function (l) { return num(l.mocount) > 0; }).map(function (l) { return parseInt(l.itemid, 10); });
+    var wo = [];
+    if (woIds.length && opt('ShowBOMOnWOItems')) {
+        wo = await FBDoc.q([
+            'SELECT mi.soItemId AS soitemid, part.num AS partnum, part.description AS partdescription, uom.code AS uomcode,',
+            '  bt.name AS bomtype, mi.priceAdjustment AS priceadj,',
+            '  (mi.qtyToFulfill * COALESCE(uc.multiply, 1)) / COALESCE(uc.factor, 1) AS qtyordered',
+            'FROM moitem mi JOIN part ON part.id = mi.partId JOIN bomitemtype bt ON bt.id = mi.typeId',
+            'JOIN uom ON uom.id = part.uomId',
+            'LEFT JOIN uomconversion uc ON uc.toUomId = part.uomId AND uc.fromUomId = mi.uomId',
+            'WHERE mi.soItemId IN (' + woIds.map(function () { return '?'; }).join(',') + ') AND mi.typeId IN (20, 30)',
+            'ORDER BY mi.soItemId, mi.typeId, mi.sortIdInstruct'
+        ].join('\n'), woIds);
+    }
+    var payments = opt('ShowPayments') ? await FBDoc.q(
+        'SELECT p.amount, pm.name AS paymentmethod, COALESCE(NULLIF(p.currencyRate, 0), 1) AS currencyrate, p.info AS reference, p.dateTime AS paymentdate ' +
+        'FROM postransaction p LEFT JOIN paymentmethod pm ON pm.id = p.paymentMethodId WHERE p.soId = ? ORDER BY p.dateTime, p.id', [soId]) : [];
+    var memos = opt('ShowMemos') ? await FBDoc.q(
+        'SELECT memo, userName AS username, dateCreated AS datecreated FROM memo WHERE tableId = 1012013120 AND recordId = ? ORDER BY id', [soId]) : [];
+    var companyAddress = '';
+    try { companyAddress = typeof getCompanyAddress === 'function' ? String(getCompanyAddress(parseInt(h.lgid, 10), !!opt('ShowCountry')) || '') : ''; }
+    catch (e) { debugLog('getCompanyAddress failed: ' + e.message, 'warn'); }
+
+    return { h: h, lines: lines, wo: wo, payments: payments, memos: memos, companyAddress: companyAddress };
+}
+
+// ============================================================================
+//  CALCULATIONS — the ItemInfo variables of the jrxml (§4, §9)
+// ============================================================================
+function compute(model, invoice) {
+    var h = model.h, E = APP.env, rate = num(h.currencyrate) || 1;
+    var lines = model.lines.filter(function (l) {
+        return opt('ShowZeroPriceItems') || (num(l.unitprice) + num(l.adjust)) !== 0;
+    });
+    var sub = 0, homeSub = 0;
+    lines.forEach(function (l) {
+        var t = parseInt(l.typeid, 10), up = num(l.unitprice), q = num(l.qty), adj = num(l.adjust), tp = num(l.totalprice);
+        var qd = q === 0 ? 1 : q, ext2 = round2(up * q);
+        l._t = t;
+        l.homeUnit = up + adj / qd;
+        l.homeExt = ext2 + adj;
+        l.homeExtNR = up * q + adj;
+        l.homeTax = E.isUS ? 0 : round2(num(l.taxrate) * tp);
+        l.curUnit = up / rate + (adj / qd) / rate;
+        l.curTotal = tp / rate;
+        if (E.isAU) {
+            l.curExt = invoice ? (ext2 + adj) / rate : round2((ext2 + adj) / rate);
+            l.curExtNR = (up * q + adj) / rate;
+        } else {
+            l.curExt = invoice ? ext2 / rate + adj / rate : round2(ext2 / rate + adj / rate);
+            l.curExtNR = up * q / rate + adj / rate;
+        }
+        l.curTax = E.isUS ? 0 : round2(num(l.taxrate) * tp / rate);
+        if (t !== 90 && t !== 40) { sub += l.curExt + num(l.kittotal); homeSub += l.homeExt + num(l.kittotal); }
+    });
+    var est = opt('AddTaxIntegrationEstimatedTaxToTotal') && parseInt(h.statusid, 10) < 60;
+    var mcTax = num(h.mctotaltax);
+    var tax = est ? num(h.estimatedtax) / rate : (mcTax !== 0 ? mcTax : num(h.totaltax) / rate);
+    var homeTax = est ? num(h.estimatedtax) : num(h.totaltax);
+    var paid = num(h.paymentamount) / rate, homePaid = num(h.paymentamount);
+    return {
+        lines: lines, rate: rate,
+        sub: sub, tax: tax, total: sub + tax, paid: paid, balance: sub + tax - paid,
+        homeSub: homeSub, homeTax: homeTax, homeTotal: homeSub + homeTax, homePaid: homePaid, homeBalance: homeSub + homeTax - homePaid
+    };
+}
+
+// ============================================================================
+//  DOCUMENT BUILD — bands + blocks for FBDoc.paginate
+// ============================================================================
+var NO_PRICE = { 90: 1, 30: 1, 31: 1, 40: 1, 50: 1 };
+
+function buildDoc(model, geom, invoice) {
+    var h = model.h, E = APP.env, c = compute(model, invoice);
+    var K = geom.CWpt / 552;                       // jrxml x-positions scale to this page's content width
+    var X = function (x) { return (x * K).toFixed(2) + 'pt'; };
+    var curSym = FBDoc.fmt.currencySymbol(h.currencycode || h.homecurrencycode, E.useCode);
+    var homeSym = FBDoc.fmt.currencySymbol(h.homecurrencycode, E.useCode);
+    var fmtCur = function (sym, v, pat) { return FBDoc.fmt.number(pat, v, { symbol: sym, rounding: 'halfUp' }); };
+    var fmtRaw = function (v, pat) { return FBDoc.fmt.number(pat, v); };
+    var fmtD = function (v) { return FBDoc.fmt.date(E.date, v); };
+    var isDateCf = function (v) { return /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/.test(String(v || '')); };
+    var cfVal = function (v, detect) { return v == null ? '' : (detect && isDateCf(v) ? fmtD(v) : String(v)); };
+    var orderNo = (E.barcodeDI ? 'S' : '') + h.num;
+    var status = parseInt(h.statusid, 10);
+
+    // ---- title (edition / status / invoice logic of the jrxml) ----
+    var titleOverride = label('ReportTitle', null);
+    var title = titleOverride || (invoice
+        ? (E.isAU ? 'Tax Invoice' : 'Invoice')
+        : E.isAU
+            ? (num(h.sototal) < 0 ? 'Credit Adj Note' : status === 10 ? (E.estimateTitle || 'Estimate') : status === 60 ? 'Tax Invoice' : 'Sales Order')
+            : (status === 10 ? (E.estimateTitle || 'Estimate') : 'Sales Order'));
+    APP.setTitle(title + ' ' + h.num);
+
+    var dateKey = String(opt('cbShowDate') || 'issued').toLowerCase();
+    var dateMap = { revision: h.daterevision, completed: h.datecompleted, created: h.datecreated, firstship: h.datefirstship, lastmodified: h.datelastmodified };
+    var docDate = dateKey === 'today' ? new Date() : (dateMap[dateKey] || h.dateissued || new Date());
+
+    // ---- page header (every sheet) ----
+    var companyAddr = (E.isAU ? '<b>ABN: </b>' + esc(h.abn || '') + '\n' : '') + esc(model.companyAddress);
+    var logo = E.logo ? '<img src="' + E.logo + '" alt="">' : '';
+    var top = opt('cbLogoAlignment') === 'top';
+    var left = top
+        ? '<div class="so-abs so-logo" style="left:0;top:0;width:' + X(356) + ';height:40pt;align-items:flex-end">' + logo + '</div>' +
+          (opt('ShowCompanyName') ? '<div class="so-abs so-company" style="left:0;top:40pt;width:' + X(358) + ';height:20pt;display:flex;align-items:center">' + esc(h.company) + '</div>' : '') +
+          (opt('ShowCompanyAddress') ? '<div class="so-abs so-addr" style="left:0;top:60pt;width:' + X(358) + ';height:74pt;padding-bottom:3pt">' + companyAddr + '</div>' : '')
+        : '<div class="so-abs so-logo" style="left:' + X(1) + ';top:0;width:' + X(75) + ';height:134pt;align-items:center;justify-content:center">' + logo + '</div>' +
+          (opt('ShowCompanyName') ? '<div class="so-abs so-company" style="left:' + X(76) + ';top:33pt;width:' + X(283) + ';height:20pt;padding-left:3pt">' + esc(h.company) + '</div>' : '') +
+          (opt('ShowCompanyAddress') ? '<div class="so-abs so-addr" style="left:' + X(76) + ';top:53pt;width:' + X(283) + ';height:81pt;padding-left:3pt">' + companyAddr + '</div>' : '');
+    var pageHeader =
+        '<div class="so-doc" style="position:relative;height:134pt">' + left +
+        '<div class="so-abs so-title" style="left:' + X(358) + ';top:0;width:' + X(194) + ';height:24pt">' + esc(title) + '</div>' +
+        (opt('ShowStatus') ? '<div class="so-abs so-center" style="left:' + X(452) + ';top:21pt;width:' + X(100) + ';height:12pt;font-size:8pt">' + esc(h.sostatus) + '</div>' : '') +
+        '<div class="so-abs so-hdrcell so-center" style="left:' + X(358) + ';top:33pt;width:' + X(125) + ';height:17pt">' + esc(label('Order#', 'Order #')) + '</div>' +
+        '<div class="so-abs so-hdrcell so-center" style="left:' + X(483) + ';top:33pt;width:' + X(69) + ';height:17pt;border-left:0">' + esc(label('Date', 'Date')) + '</div>' +
+        '<div class="so-abs so-box so-center" style="left:' + X(358) + ';top:50pt;width:' + X(125) + ';height:17pt;font-weight:700;border-top:0">' + esc(orderNo) + '</div>' +
+        '<div class="so-abs so-box so-center" style="left:' + X(483) + ';top:50pt;width:' + X(69) + ';height:17pt;border-top:0;border-left:0">' + esc(fmtD(docDate)) + '</div>' +
+        (opt('ShowBarcode') ? '<div class="so-abs so-center" style="left:' + X(359) + ';top:77pt;width:' + X(193) + ';height:47pt">' + FBDoc.code128.svg(orderNo, { module: 1, quiet: 0 }) + '</div>' : '') +
+        '</div>';
+
+    // ---- footers ----
+    var printed = FBDoc.fmt.printedAt();
+    var footLine = function (ctx) {
+        return '<div class="so-foot"><span>' + esc(printed) + '</span>' +
+            (opt('ShowRevision') ? '<span class="rev">Revision: ' + esc(h.revisionnum == null ? '' : h.revisionnum) + '</span>' : '') +
+            '<span class="pg">Page ' + ctx.pageNo + ' of ' + ctx.pageCount + '</span></div>';
+    };
+    var pageFooter = function (ctx) { return '<div class="so-doc">' + footLine(ctx) + '</div>'; };
+
+    var showTotals = E.multiCurrency ? opt('ShowCurrencyTotals') : opt('ShowTotals');
+    var dual = opt('ShowHomeCurrencyTotals') && E.multiCurrency && has(h.currencycode);
+    var taxLabel = E.isAU ? 'GST:' : (opt('ShowTaxRateName') && has(h.ordertaxname) ? h.ordertaxname + ':' : label('SalesTax', 'Sales Tax:'));
+    var totRows = [
+        [label('Subtotal', 'Subtotal:'), c.sub, c.homeSub, true],
+        [taxLabel, c.tax, c.homeTax, false],
+        [label('Total', 'Total:'), c.total, c.homeTotal, true]
+    ];
+    if (opt('ShowPayments')) {
+        totRows.push([label('Paid', 'Paid:'), round2(c.paid), round2(c.homePaid), false]);
+        totRows.push([label('BalanceDue', 'Balance Due:'), c.balance, c.homeBalance, true]);
+    }
+    var totalsHtml = '';
+    if (showTotals && c.lines.length) {
+        var tw = function (w) { return '<col style="width:' + (w * K).toFixed(2) + 'pt">'; };
+        totalsHtml = dual
+            ? '<table><colgroup>' + tw(69) + tw(95) + tw(95) + '</colgroup><thead><tr><td class="sp"></td><th>' + esc(h.currencycode) + '</th><th>' + esc(h.homecurrencycode) + '</th></tr></thead><tbody>' +
+              totRows.map(function (r) { return '<tr' + (r[3] ? ' class="g"' : '') + '><td>' + esc(r[0]) + '</td><td>' + esc(fmtCur(curSym, r[1], E.total)) + '</td><td>' + esc(fmtCur(homeSym, r[2], E.total)) + '</td></tr>'; }).join('') + '</tbody></table>'
+            : '<table><colgroup>' + tw(45) + tw(69) + tw(145) + '</colgroup><tbody>' +
+              totRows.map(function (r) { return '<tr' + (r[3] ? ' class="g"' : '') + '><td class="sp"></td><td>' + esc(r[0]) + '</td><td>' + esc(fmtCur(curSym, r[1], E.total)) + '</td></tr>'; }).join('') + '</tbody></table>';
+    }
+    var notice = opt('Column:CustomFooterText') ? esc(E.notice).replace(/&lt;(\/?)(b|i|u|br)\s*\/?&gt;/gi, '<$1$2>') : '';
+    var payBtn = (opt('ShowPayOnlineButton') && has(h.paymentlink))
+        ? '<a class="so-pay" href="' + esc(h.paymentlink) + '" target="_blank" style="left:' + X(440) + ';top:95pt;width:' + X(112) + '">' + esc(label('PayButton', 'Pay Online')) + '</a>' : '';
+    var lastPageFooter = function (ctx) {
+        return '<div class="so-doc so-last">' +
+            '<div class="msg" style="width:' + X(293) + '">' + notice + '</div>' +
+            '<div class="tot" style="left:' + X(293) + ';width:' + X(259) + '">' + totalsHtml + '</div>' + payBtn +
+            '<div class="foot">' + footLine(ctx) + '</div></div>';
+    };
+
+    var blocks = [], tables = {};
+
+    // ---- CustomerAddresses ----
+    var cw = X(271), gap = X(10);
+    var billTo = [opt('ShowCustomerNameInAddress') ? h.customername : h.billtoname]
+        .concat(has(h.billtoaddress) ? [h.billtoaddress] : [])
+        .concat([(h.billtocity || '') + (has(h.billtostate) ? ', ' + h.billtostate + '  ' : '  ') + (h.billtozip || '')])
+        .concat(opt('ShowCountry') && has(h.billtocountry) ? [h.billtocountry] : [])
+        .concat(opt('ShowBillToPhoneNumber') && has(h.phone) ? ['Phone: ' + h.phone] : [])
+        .concat(opt('ShowBillToEmail') && has(h.email) ? ['Email: ' + h.email] : [])
+        .concat(opt('ShowBillToFax') && has(h.fax) ? ['Fax: ' + h.fax] : []).join('\n');
+    var shipTo = has(h.shiptoname)
+        ? [h.shiptoname].concat(has(h.shiptoaddress) ? [h.shiptoaddress] : [])
+            .concat([(h.shiptocity || '') + (has(h.shiptostate) ? ', ' + h.shiptostate + '  ' : '  ') + (h.shiptozip || '')])
+            .concat(opt('ShowCountry') && has(h.shiptocountry) ? [h.shiptocountry] : []).join('\n')
+        : '';
+    var contactTxt = (opt('ShowContact') && has(h.customercontact)) ? label('Contact', 'Contact:').replace(/:?\s*$/, ':') + ' ' + h.customercontact : '';
+    var poTxt = (!opt('Column:PONumber') && has(h.customerpo)) ? label('PONumber', 'PO Number:').replace(/:?\s*$/, ':') + ' ' + h.customerpo : '';
+    var cpBox = [contactTxt, poTxt].filter(Boolean).join('\n');
+    blocks.push({ html:
+        '<div class="so-doc so-addresses" style="grid-template-columns:' + cw + ' ' + gap + ' ' + cw + '">' +
+        '<div class="h so-hdrcell">' + esc(label('BillTo', 'Bill To:')) + '</div><div></div><div class="h so-hdrcell">' + esc(label('ShipTo', 'Ship To:')) + '</div>' +
+        '<div class="b so-box" style="border-top:0">' + esc(billTo) + '</div><div></div><div class="b so-box" style="border-top:0">' + esc(shipTo) + '</div>' +
+        (opt('Column:CustomerName') ? '<div class="l so-box">' + esc(label('Customer', 'Customer:').replace(/:?\s*$/, ':') + ' ' + (h.customername || '')) + '</div>' : '<div></div>') +
+        '<div></div>' + (cpBox ? '<div class="l so-box">' + esc(cpBox) + '</div>' : '<div></div>') +
+        (E.isCaOrIntl ? '<div class="l so-box">' + esc(label('GST/HST', 'GST/HST:').replace(/:?\s*$/, ':') + ' ' + (h.abn || '')) + '</div>' : '') +
+        '</div>' });
+
+    // ---- Notes (splits across pages when long) ----
+    if (opt('ShowOrderNotes') && has(h.note)) {
+        blocks.push({ split: true, html:
+            '<div class="so-doc so-notes"><div class="lbl" style="width:' + X(34) + '">' + esc(label('Notes', 'Notes:')) + '</div>' +
+            '<div class="txt" data-fbdoc-split>' + esc(h.note) + '</div></div>' });
+    }
+
+    // ---- Memos ----
+    if (opt('ShowMemos') && model.memos.length) {
+        blocks.push({ kwn: true, html: '<div class="so-doc so-memotitle">Memos</div>' });
+        var mw = FBDoc.Columns.fit([{ key: 'd', basis: 55, min: 50, flex: 0 }, { key: 'u', basis: 55, min: 45, flex: 0 }, { key: 'm', basis: 300, min: 100, flex: 1 }], geom.CWpt);
+        tables.memo = { className: 'so-doc so-memos', colgroup: FBDoc.Columns.colgroup(mw.widths), thead: '<thead><tr><th>Date</th><th>User</th><th>Memo</th></tr></thead>' };
+        model.memos.forEach(function (mm) {
+            blocks.push({ table: 'memo', html: '<tr><td>' + esc(fmtD(mm.datecreated)) + '</td><td>' + esc(mm.username) + '</td><td>' + esc(mm.memo) + '</td></tr>' });
+        });
+    }
+
+    // ---- Order info strip (SOInfo group) ----
+    var sellerMode = opt('cbDisplaySeller');
+    var seller = sellerMode === 'first' ? (h.firstname || '') : sellerMode === 'full' ? [h.firstname, h.lastname].filter(Boolean).join(' ') : (h.salesman || '');
+    var strip = [
+        ['Column:SalesOrderSeller', label('SalesRep', 'Sales Rep'), seller],
+        ['Column:SalesOrderPaymentTerms', label('PaymentTerms', 'Payment Terms'), h.paymentterms],
+        ['Column:SalesOrderFOBPoint', label('FOBPoint', 'FOB Point'), h.fobpoint],
+        ['Column:SalesOrderShippingTerms', label('ShippingTerms', 'Shipping Terms'), h.shippingterms],
+        ['Column:SalesOrderCarrier', label('Carrier', 'Carrier'), h.carriername],
+        ['Column:SalesOrderShipService', label('ShipService', 'Ship Service'), h.shipservice],
+        ['Column:DateScheduled', label('DateScheduled', 'Date Scheduled'), fmtD(h.datefirstship)],
+        ['Column:PONumber', label('PO#', 'PO#'), h.customerpo],
+        ['Column:OrderCurrencyCode', label('CurrencyCode', 'Currency Code'), h.currencycode || h.homecurrencycode],
+        ['Column:OrderCurrencyRate', label('CurrencyRate', 'Currency Rate'), FBDoc.fmt.number(' #,##0.0#######', h.currencyrate)],
+        ['Column:TaxIntegrationEstimatedTax', label('EstimatedTax', 'Estimated Tax'), fmtRaw(h.estimatedtax, E.total)]
+    ].filter(function (s) { return opt(s[0]); });
+    if (strip.length) blocks.push({ html: stripHtml(strip, geom) });
+
+    // ---- SO custom fields strip ----
+    if (opt('ShowSOCustomFields')) {
+        var cfs = [];
+        for (var n = 1; n <= 6; n++) if (opt('ShowCfSO' + n)) cfs.push(['', label('SOcf' + n, 'Custom Field ' + n), cfVal(h['socf' + n], !invoice)]);
+        if (cfs.length) blocks.push({ html: stripHtml(cfs, geom) });
+    }
+
+    // ---- Line items ----
+    var cols = itemColumns(h, E);
+    var fit = FBDoc.Columns.fit(cols, geom.CWpt);
+    tables.items = {
+        className: 'so-doc so-items' + (fit.compact ? ' compact' : ''),
+        colgroup: FBDoc.Columns.colgroup(fit.widths),
+        thead: '<thead><tr>' + cols.map(function (col, i) {
+            var a = fit.items[i].align === 'right' ? 'r' : fit.items[i].align === 'center' ? 'c' : 'l';
+            return '<th class="' + a + '">' + esc(col.label) + '</th>';
+        }).join('') + '</tr></thead>'
+    };
+    var splitKey = cols.some(function (x) { return x.key === 'desc'; }) ? 'desc' : 'numdesc';
+    var woBySoItem = {};
+    model.wo.forEach(function (w) { (woBySoItem[w.soitemid] = woBySoItem[w.soitemid] || []).push(w); });
+    var kitIds = {};
+    c.lines.forEach(function (l) { if (l.kitparent != null) kitIds[l.kitparent] = true; });
+    var showNumDesc = cols.some(function (x) { return x.key === 'numdesc'; });
+
+    c.lines.forEach(function (l) {
+        var t = l._t, kitChild = l.kitparent != null;
+        var itemNum = (kitChild ? '     ' : '') + (has(l.productnum)
+            ? ((has(l.cpn) && opt('IncludeCustomerPartNumbers')) ? l.productnum + ' (' + l.cpn + ')' : l.productnum) : '');
+        var desc = l.description || '';
+        var note = opt('ShowLineItemNotes') && has(l.note) ? l.note : '';
+        var numDesc = itemNum + (itemNum.trim() && desc ? ' - ' : '') + desc + (note ? '\n  ' + (kitChild ? '     ' : '') + note : '');
+        var descTxt = desc + (note ? '\n  ' + note : '');
+        var cells = cols.map(function (col) {
+            var k = col.key, v = '';
+            switch (k) {
+                case 'line': v = esc(l.lineno); break;
+                case 'type': v = esc(String(l.itemtype || '').indexOf('Discount') === 0 ? 'Discount' : l.itemtype); break;
+                case 'cf1': case 'cf2': case 'cf3': v = esc(cfVal(l['itemcf' + k.charAt(2)], E.isUS && !invoice)); break;
+                case 'numdesc': v = '<div class="pre"' + (splitKey === 'numdesc' ? ' data-fbdoc-split' : '') + '>' + esc(numDesc) + '</div>'; break;
+                case 'num': v = '<div class="pre">' + esc(itemNum) + '</div>'; break;
+                case 'desc': v = '<div class="pre" data-fbdoc-split>' + esc(descTxt) + '</div>'; break;
+                case 'taxCode': v = t === 90 ? '' : esc(l.taxcode || ''); break;
+                case 'taxAmt': v = (t === 90 || (E.isCaOrIntl && t === 40)) ? '' : t === 40 ? esc(fmtRaw(0, E.price)) : esc(fmtCur(homeSym, l.homeTax, E.price)); break;
+                case 'curTax': v = (E.isAU ? NO_PRICE[t] : (t === 90 || t === 40)) ? '' : esc(fmtCur(curSym, l.curTax, E.price)); break;
+                case 'date': v = (E.isUS ? t === 90 : NO_PRICE[t]) ? '' : esc(fmtD(l.datesched)); break;
+                case 'unitPrice': v = NO_PRICE[t] ? '' : esc(fmtCur(homeSym, num(l.qty) > 0 ? l.homeUnit : 0, E.price)); break;
+                case 'curUnitPrice': v = NO_PRICE[t] ? '' : esc(fmtCur(curSym, l.curUnit, E.price)); break;
+                case 'qty': v = NO_PRICE[t] ? '' : '<div class="qty"><span class="q">' + esc(FBDoc.fmt.number(E.qty, l.qty)) + '</span><span class="u">' + esc(l.uomcode || '') + '</span></div>'; break;
+                case 'total':
+                    if (t === 90) break;
+                    var hv = t === 40 ? num(l.totalprice) : l.homeExtNR;
+                    v = esc(E.isCaOrIntl ? fmtCur(homeSym, hv, E.total) : fmtRaw(hv, E.total)); break;
+                case 'curTotal': v = t === 90 ? '' : esc(fmtCur(curSym, t === 40 ? l.curTotal : l.curExtNR, E.total)); break;
+            }
+            return '<td class="' + (col.align === 'right' ? 'r' : col.align === 'center' ? 'c' : 'l') + '">' + v + '</td>';
+        });
+        var block = { table: 'items', stripe: true, split: true, html: '<tr>' + cells.join('') + '</tr>' };
+        // Kit parent: keep with its first child; re-shown "(continued)" if the kit runs over a page.
+        if (t === 80 && kitIds[l.itemid]) {
+            block.kwn = true;
+            block.groupHeader = 'kit' + l.itemid;
+            block.repeatHtml = '<tr>' + cols.map(function (col) {
+                var txt = (col.key === 'num' || col.key === 'numdesc') ? esc(itemNum.trim() + ' (continued)')
+                        : (col.key === 'desc' && !showNumDesc && !cols.some(function (x) { return x.key === 'num'; })) ? esc(desc + ' (continued)') : '';
+                return '<td class="cont">' + txt + '</td>';
+            }).join('') + '</tr>';
+        }
+        if (kitChild) block.grp = ['kit' + l.kitparent];
+        blocks.push(block);
+
+        // BOM rows of a WO line (subWOItems) — only in the Number / Description column, like the jrxml.
+        var bom = woBySoItem[l.itemid];
+        if (bom && showNumDesc && opt('ShowBOMOnWOItems')) {
+            if (opt('OnlyShowBOMPriceAdjustments')) bom = bom.filter(function (w) { return num(w.priceadj) > 0; });
+            var ndIdx = cols.findIndex(function (x) { return x.key === 'numdesc'; });
+            var rowOf = function (inner) {
+                return '<tr>' + cols.map(function (col, i) { return i === ndIdx ? '<td class="l so-bom">' + inner + '</td>' : '<td></td>'; }).join('') + '</tr>';
+            };
+            var lastType = null;
+            bom.forEach(function (w, wi) {
+                var grp = kitChild ? ['kit' + l.kitparent] : [];
+                if (w.bomtype !== lastType) {
+                    lastType = w.bomtype;
+                    blocks.push({ table: 'items', stripe: 'attach', kwp: wi === 0, kwn: true, grp: grp,
+                        html: rowOf('<div class="bh"><span class="p">' + esc(w.bomtype) + '</span>' + (opt('ShowAdjustmentAmounts') ? '<span class="a">Adjustment</span>' : '') + '</div>') });
+                }
+                var part = w.partnum + (opt('ShowDescriptionOnWOItems') && has(w.partdescription) ? ' - ' + w.partdescription : '');
+                blocks.push({ table: 'items', stripe: 'attach', grp: grp,
+                    html: rowOf('<div class="br"><span class="p' + (opt('ShowAdjustmentAmounts') ? '' : ' p9') + '">' + esc(part) + '</span>' +
+                        (opt('ShowAdjustmentAmounts') ? '<span class="a">' + esc(fmtRaw(w.priceadj, E.price)) + '</span>' : '') +
+                        '<span class="n">' + esc(FBDoc.fmt.number(E.qty, w.qtyordered)) + '</span><span class="m">' + esc(w.uomcode) + '</span></div>') });
+            });
+        }
+    });
+
+    // ---- Payments ----
+    if (opt('ShowPayments') && model.payments.length) {
+        blocks.push({ kwn: true, html: '<div style="height:10pt"></div>' });
+        var pw = FBDoc.Columns.fit([{ key: 'payDate' }, { key: 'payMethod' }, { key: 'payAmount' }], geom.CWpt);
+        tables.pay = { className: 'so-doc so-sub', colgroup: FBDoc.Columns.colgroup(pw.widths),
+            thead: '<thead><tr><th>' + esc(label('PaymentDate', 'Date')) + '</th><th>' + esc(label('Payment', 'Payment')) + '</th><th>' + esc(label('Amount', 'Amount')) + '</th></tr></thead>' };
+        model.payments.forEach(function (p) {
+            var suffix = (!E.multiCurrency || opt('ShowHomeCurrency')) ? '' : ' : Currency Rate: ' + p.currencyrate;
+            var method = (p.paymentmethod || '') + (opt('ShowCreditCardNumber') && has(p.reference) ? ' ' + p.reference : '') + suffix;
+            var amt = !E.multiCurrency ? fmtRaw(p.amount, E.price)
+                : opt('ShowHomeCurrency') ? fmtCur(homeSym, p.amount, E.price)
+                : fmtCur(curSym, num(p.amount) / (num(p.currencyrate) || 1), E.price);
+            blocks.push({ table: 'pay', stripe: true, html: '<tr><td>' + esc(fmtD(p.paymentdate)) + '</td><td>' + esc(method) + '</td><td style="text-align:right">' + esc(amt) + '</td></tr>' });
+        });
+    }
+
+    return { id: 'so-' + h.num, pageHeader: pageHeader, pageFooter: pageFooter, lastPageFooter: lastPageFooter, tables: tables, blocks: blocks };
+}
+
+function stripHtml(cells, geom) {
+    var fit = FBDoc.Columns.fit(cells.map(function (c, i) { return { key: 's' + i, kind: 'strip' }; }), geom.CWpt);
+    return '<div class="so-doc so-strip"><table>' + FBDoc.Columns.colgroup(fit.widths) +
+        '<thead><tr>' + cells.map(function (c) { return '<th title="' + esc(c[1]) + '">' + esc(c[1]) + '</th>'; }).join('') + '</tr></thead>' +
+        '<tbody><tr>' + cells.map(function (c) { return '<td>' + esc(c[2] == null ? '' : c[2]) + '</td>'; }).join('') + '</tr></tbody></table></div>';
+}
+
+// Visible item columns, in the jrxml's order for the edition.
+function itemColumns(h, E) {
+    var cols = [];
+    var curHdr = function (txt) { return has(h.currencycode) ? h.currencycode + '\n' + txt : txt; };
+    var add = function (key, kind, on, lbl, align) { if (on) cols.push({ key: key, kind: kind, label: lbl, align: align }); };
+    add('line', 'line', opt('Column:ItemLineNumber'), label('Item#', 'Item #'), 'center');
+    add('type', 'type', opt('Column:ItemType'), label('Type', 'Type'), 'center');
+    add('cf1', 'cf', opt('ShowCfItem1'), label('Itemcf1', 'Item CF 1'), 'center');
+    add('numdesc', 'numdesc', opt('Column:ItemNumberAndDescription'), label('Number/Description', 'Number / Description'), 'left');
+    add('num', 'num', opt('Column:ItemNumber'), label('Number', 'Number'), 'left');
+    add('desc', 'desc', opt('Column:ItemDescription'), label('Description', 'Description'), 'left');
+    add('cf2', 'cf', opt('ShowCfItem2'), label('Itemcf2', 'Item CF 2'), 'center');
+    if (!E.isUS) {
+        add('taxCode', 'taxCode', opt('Column:ItemTaxCode'), label('TaxCode', 'Tax Code'), 'left');
+        add('taxAmt', 'taxAmt', opt('Column:ItemTaxAmount'), label('TaxAmount', 'Tax Amount'), 'right');
+        add('curTax', 'curTax', opt('Column:ItemCurrencyTax'), curHdr(label('TaxAmount', 'Tax Amount')), 'right');
+    }
+    add('date', 'date', opt('Column:ItemDateScheduled'), label('ItemDateScheduled', 'Date Scheduled'), 'center');
+    add('unitPrice', 'unitPrice', opt('Column:ItemUnitPrice'), label('UnitPrice', 'Unit Price'), 'right');
+    add('curUnitPrice', 'curUnitPrice', opt('Column:ItemCurrencyUnitPrice'), curHdr(label('UnitPrice', 'Unit Price')), 'right');
+    add('qty', 'qty', opt('Column:ItemQuantityOrdered'), label('QtyOrdered', 'Qty Ordered'), 'right');
+    add('total', 'total', opt('Column:ItemTotalPrice'), label('TotalPrice', 'Total Price'), 'right');
+    add('curTotal', 'curTotal', opt('Column:ItemCurrencyTotalPrice'), curHdr(label('TotalPrice', 'Total Price')), 'right');
+    add('cf3', 'cf', opt('ShowCfItem3'), label('Itemcf3', 'Item CF 3'), 'center');
+    return cols;
+}
+
+// ============================================================================
+//  ORDER PICKER — typeahead + browse with status / period filters (per user)
+// ============================================================================
+var PERIODS = [{ value: '30', label: '30 days' }, { value: '90', label: '90 days' }, { value: '365', label: '1 year' }, { value: 'all', label: 'All' }];
+function pickFilterSql(f) {
+    var where = [];
+    var st = ((f && f.status) || []).map(function (x) { return parseInt(x, 10); }).filter(function (n) { return !isNaN(n); });
+    if (st.length) where.push('so.statusId IN (' + st.join(',') + ')');
+    var days = parseInt(f && f.period, 10);
+    if (days > 0) where.push('so.dateCreated >= DATE_SUB(CURDATE(), INTERVAL ' + days + ' DAY)');
+    return where;
+}
+async function searchOrders(term, f) {
+    var where = pickFilterSql(f), params = [];
+    if (term) {
+        where.push('(so.num LIKE ? OR c.name LIKE ? OR so.customerPO LIKE ?)');
+        params.push(term + '%', '%' + term + '%', '%' + term + '%');
+    }
+    var rows = await FBDoc.q(
+        'SELECT so.id, so.num, c.name AS customer, st.name AS status, so.dateCreated AS datecreated, so.totalPrice AS totalprice, so.customerPO AS customerpo ' +
+        'FROM so JOIN customer c ON c.id = so.customerId LEFT JOIN sostatus st ON st.id = so.statusId ' +
+        (where.length ? 'WHERE ' + where.join(' AND ') + ' ' : '') +
+        'ORDER BY so.dateCreated DESC, so.id DESC LIMIT 60', params);
+    return rows.map(function (r) {
+        return { value: r.id, label: r.num, sub: r.customer + (has(r.customerpo) ? ' · PO ' + r.customerpo : ''),
+                 meta: [r.status || '', FBDoc.fmt.date(APP.env ? APP.env.date : 'dd/MM/yyyy', r.datecreated),
+                        FBDoc.fmt.number(APP.env ? APP.env.total : '$ #,##0.00', r.totalprice, { rounding: 'halfUp' })] };
+    });
+}
+// ============================================================================
+//  THE APP — FBDoc.app runs the screen; this report supplies its document.
+// ============================================================================
+var APP = FBDoc.app({
+    title: 'Sales Order',
+    record: { code: 'SO', table: 'so', numColumn: 'num', noun: 'order', setting: 'set-so' },
+    flags: [{ key: 'invoice', label: 'Invoice', title: 'Print as the Sales Invoice (SOInvoiceReport)', setting: 'set-invoice', reloadEnv: true }],
+    sys: ['SO Notice', 'Estimate Title'],
+    env: function (env, s) { env.notice = s['SO Notice'] || ''; env.estimateTitle = s['Estimate Title'] || ''; },
+    presets: function (flags) { return flags.invoice ? [SO_REPORT_PATH, INV_REPORT_PATH] : [SO_REPORT_PATH]; },
+    defaults: function (env) { return jrxmlDefaults(env); },
+    options: OPTION_GROUPS,
+    optionsIntro: 'the stock Sales Order report',
+    fetch: function (id) { return fetchModel(id); },
+    build: function (model, geom, app) { return buildDoc(model, geom, !!app.flags.invoice); },
+    picker: {
+        placeholder: 'SO #, customer or PO…',
+        alias: 'so',
+        where: pickFilterSql,
+        search: function (term, f) { return searchOrders(term, f); },
+        filters: async function (saved) {
+            var statuses = [];
+            try { statuses = await FBDoc.q('SELECT id, name FROM sostatus ORDER BY id'); } catch (e) { debugLog('sostatus: ' + FBDoc.errText(e), 'warn'); }
+            return [
+                { key: 'status', label: 'Status', multi: true, value: saved.status || [],
+                  options: statuses.map(function (r) { return { value: String(r.id), label: r.name }; }) },
+                { key: 'period', label: 'Created', value: saved.period || '365', options: PERIODS }
+            ];
+        }
+    }
+});
+</script>
+
+</body>
+</html>

@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Inventory Availability by Location Group (iReport port)
+  PATH:   iReport_Ports/Inventory/InventoryAvailabilityByLG.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard Inventory/InventoryAvailabilityByLG.jrxml.
+  Same source, same rules, same columns; only the presentation is
+  interactive.
+
+    Source     Every active inventory part (part.typeId 10, activeFlag 1,
+               id <> 0) crossed with every chosen location group, with the
+               quantity views joined on part + location group: qtyonhand,
+               qtyallocated, qtynotavailable, qtydropship, qtycommitted,
+               qtyonorder. All quantities are in the part's stocking UOM.
+    Columns    On Hand, Allocated, Not Available, Drop Ship, On Order and
+               Committed straight from the views, plus the original's two
+               calculated columns:
+                 Available = On Hand - Allocated - Not Available + Drop Ship
+                 Short     = Allocated - (On Hand - Not Available)
+               both shown as 0 when they would be negative.
+    Filters    Location groups (the original's locationGroupID; the picker
+               lists the user's own groups, getLocationGroupList, and none
+               picked means all of them), part number (the original's
+               partNum LIKE; % is a wildcard) and "Show parts with zero
+               quantity" (ShowPartsWithZeroQuantity: off drops rows whose
+               six quantities add up to 0 or less, the original's HAVING).
+    Grouping   One group per location group, ordered by location group id
+               then part number, as the original. The original has no
+               totals (parts are stocked in different units), so neither
+               does this: a group row carries the group's part count and
+               how many of them are short; the footer counts the lot.
+
+  Layout: the REPORT chrome (fb-styles §35). The jQuery/DataTables
+  prototype that used to live at this path is in
+  archived/iReport_Ports/Inventory/.
+  Table tools (fb-lib FBLib.RptCols / RowCap / Pivot): column headings sort
+  the parts within each location group (the groups keep the original's
+  order), drag to reorder and resize (remembered per user); a Table / Pivot
+  view selector (any quantity by any two of part, location group, UOM and
+  shortage, with drill-down: Part x Location Group is the cross-tab of a
+  part's stock in every group); the query fetches at most 10,000 rows, with
+  Load all.
+  Views: the header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+  report out as pages like the original: Letter landscape by default, the
+  company / title / filters band on every page (the original's page
+  header), the column headings repeated, a heading per location group
+  carried over a page break as "(continued)" (the original names the page's
+  location group in its page header instead), UOM centred, Short figures in
+  bold, no totals (the original has none), "Page X of Y". Columns fit the
+  page and the font steps down from the original's 9pt when they don't.
+  The paper size and orientation, and the view, are remembered per user.
+  Print prints those pages in either view.
+
+  Speed: the six views are TEMPTABLE (materialised in full before the
+  part / location group filter applies), but each is built once from the
+  open orders only (status indexes). Timed live: 0.2–0.5 s for every
+  active part x 7 location groups (2,814 rows), so they are kept as the
+  original has them. The SQL is the original's, minus the company
+  sub-select (read once instead) and plus the location group id.
+
+  Differences from the iReport version: the Count / Skip paging (LIMIT
+  1000) is dropped: the table paints in chunks as you scroll, and the query
+  stops at 10,000 rows with Load all (the views are still built in full on
+  the server; the cap bounds what is fetched and drawn); the part number
+  accepts * as well as % as a wildcard; ShowTimeStamp is always on (Print stamps the time).
+  Additions: collapsible location groups, a short count per group, Short
+  figures highlighted, Part links, Excel (one sheet with a Location Group
+  column). "Short lines only" (Filters, redraw only, remembered with the
+  filters): keeps the rows whose Short is above 0; a location group with
+  none drops out. The status line says how many rows are short and how
+  many are hidden; the table, its footer counts, Print / PDF, the Pivot and
+  Excel cover the rows shown. It works on the rows loaded (the first 10,000
+  until Load all).
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipInvAvailByLG',
+            name:  null,
+            build: '2026.10.12-060eb74'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inventory Availability by Location Group — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table th, .rpt-table td.ctr { text-align: center; }
+        .rpt-table th:not(.num-cell):not(.ctr) { text-align: left; }
+        .rpt-table th { cursor: default; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        .pp-neg { color: #8A1E30; }
+        .is-short { color: #8A1E30; font-weight: 700; }
+        .rpt-grp-meta .is-short { font-weight: 600; }
+        .rpt-table tfoot .is-short { color: inherit; }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>Inventory Availability by Location Group</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <div class="rpt-viewsel" id="viewSelWrap" title="Table: the report as the standard one lays it out. Pivot: total any quantity by any two fields (Part x Location Group by default)">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 5h18M3 10h10M3 15h18M3 20h10" stroke-linecap="round"/></svg>
+            <select id="viewSel">
+                <option value="table">Table</option>
+                <option value="pivot">Pivot</option>
+            </select>
+        </div>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="split-btn">
+            <button id="expandBtn" class="hdr-btn" type="button" title="Show every location group's parts">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+                Expand
+            </button>
+            <button id="collapseBtn" class="hdr-btn" type="button" title="Location group rows only">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 12h14" stroke-linecap="round"/></svg>
+                Collapse
+            </button>
+        </span>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook (one sheet, with a Location Group column)">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages: collapsed location groups print as their heading only">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Where</div>
+            <div>
+                <div class="rpt-flabel">Location groups</div>
+                <div class="ms-container" id="lgMs">
+                    <div class="ms-trigger" id="lgMs-trigger"><span class="ms-placeholder" id="lgMs-placeholder">All my location groups</span></div>
+                    <div class="ms-dropdown hidden" id="lgMs-dropdown">
+                        <div class="ms-search"><input type="text" id="lgMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="lgMs-all">Select All</span><span id="lgMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="lgMs-list"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="rpt-fnote">Lists the location groups your<br>Fishbowl user can see.</div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Parts</div>
+            <div>
+                <div class="rpt-flabel">Part number</div>
+                <input type="text" id="fPart" placeholder="Any (% is a wildcard)">
+            </div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fShowZero"> Show parts with zero quantity</label>
+            <label class="rpt-fcheck" title="Keep the rows whose Short is above 0; location groups without one drop out"><input type="checkbox" id="fShortOnly"> Short lines only</label>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own sort">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters the starting point for everyone who hasn't saved their own.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>How much of each active inventory part is on hand, promised and on its way, location group by location group. It is the BI version of the standard <strong>Inventory Availability by Location Group</strong> report and reads the same data the same way.</p>
+                <p>Every quantity is in the part's own stocking unit (the UOM column).</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">The columns</div>
+                <ul>
+                    <li><strong>Allocated</strong>: still to go out on open orders (sales, vendor credit returns, work orders using the part, transfers).</li>
+                    <li><strong>Not Available</strong>: stock in locations not counted as available.</li>
+                    <li><strong>On Order</strong>: still to come in (purchase orders, customer returns, work orders making the part, transfers).</li>
+                    <li><strong>Committed</strong>: stock already committed to picks.</li>
+                    <li><strong>Available</strong> = On Hand − Allocated − Not Available + Drop Ship, never below 0.</li>
+                    <li><strong>Short</strong> = Allocated − (On Hand − Not Available), never below 0.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>Filter changes apply straight away. With no location group picked you see all of yours.</li>
+                    <li><strong>Show parts with zero quantity</strong> off hides a part in a location group when its quantities add up to nothing.</li>
+                    <li><strong>Short lines only</strong> keeps just the rows with a <strong>Short</strong> above 0; a location group with no short part drops out. The header counts the rows shown and hidden. It doesn't reload anything, and Print, PDF, Excel and the Pivot follow it.</li>
+                    <li>Click a location group's row to show or hide its parts; <strong>Expand</strong> / <strong>Collapse</strong> do them all.</li>
+                    <li>Click a column heading to sort the parts within each location group (again to reverse, a third time for the standard order). Drag a heading onto another to move the column; drag a heading's right edge to resize it. Your layout is remembered; <strong>Settings → Reset column layout</strong> undoes it.</li>
+                    <li>The <strong>Table / Pivot</strong> selector switches to a pivot: total any quantity by any two of part, location group, UOM and shortage. It opens as each part across the location groups (with the part's total), so a part's stock everywhere is on one line. Click a figure to see the rows behind it. Print, PDF and Excel follow the view on screen.</li>
+                    <li>A very large result shows its first 10,000 rows with a <strong>Load all</strong> button; the counts then cover the rows shown.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable pages, laid out like the standard report. In PDF view pick the paper size and orientation in the bar above the pages; they are remembered. <strong>Print</strong> prints those pages.</li>
+                    <li>There are no quantity totals, as in the standard report: parts are stocked in different units.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-app" id="appView">
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+</div>
+<div class="pivot-host" id="pivotHost" style="display:none"></div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Common || !FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const DEFAULT_FILTERS = { lgs: [], part: '', showZero: true, shortOnly: false };   // the original's defaults
+// Filters that only change what is drawn (no new query).
+const REDRAW_ONLY = ['shortOnly'];
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const ints = a => (Array.isArray(a) ? a : []).map(Number).filter(n => Number.isInteger(n));
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const r6 = v => Math.round(v * 1e6) / 1e6;              // drops float noise from the views' sums
+const fmtQty = v => FBLib.Common.formatQty(v);
+const qty = v => '<span class="' + (v < 0 ? 'pp-neg' : '') + '">' + esc(fmtQty(v)) + '</span>';
+const openLink = (module, number, title) => number
+    ? `<a class="fb-row-link" data-open="${esc(module)}" data-num="${esc(number)}"${title ? ` title="${esc(title)}"` : ''}>${esc(number)}</a>` : '';
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const cut = s => `<span title="${esc(s)}">${esc(s)}</span>`;
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS — the panel applies as it changes (one short debounce).
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _lgMs = null;
+let _hydrating = false, _applyTimer = null;
+const S = { rows: [], company: '', myLgs: [], lgNames: new Map(), loadedAt: null, collapsed: new Set(),
+            view: 'table', noCap: false };
+
+function readFilters() {
+    return {
+        lgs: ints(_lgMs.getSelected()),
+        part: document.getElementById('fPart').value.trim(),
+        showZero: document.getElementById('fShowZero').checked,
+        shortOnly: document.getElementById('fShortOnly').checked
+    };
+}
+function writeFilters(f) {
+    _hydrating = true;
+    _lgMs.setSelected(ints(f.lgs));
+    document.getElementById('fPart').value = f.part || '';
+    document.getElementById('fShowZero').checked = f.showZero !== false;
+    document.getElementById('fShortOnly').checked = !!f.shortOnly;
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const requery = queryKey(next) !== queryKey(F);
+        F = next;
+        remember();
+        if (!requery) { render(false); return; }        // "Short lines only": a redraw
+        S.noCap = false;            // a new query: back to the first 10,000 rows
+        loadAll();
+    }, 250);
+}
+const queryKey = f => JSON.stringify(Object.assign({}, f, ...REDRAW_ONLY.map(k => ({ [k]: null }))));
+
+// The location groups a load covers: the picked ones, else all of the user's.
+const lgsFor = f => (f.lgs.length ? f.lgs : S.myLgs).filter(id => S.myLgs.indexOf(id) !== -1);
+// The part-number pattern as the original's LIKE takes it (* reads as %).
+const partPattern = f => f.part.replace(/\*/g, '%');
+
+function filterText(f) {
+    const lgs = lgsFor(f);
+    const lgText = !f.lgs.length ? 'All my location groups'
+        : lgs.length <= 3 ? lgs.map(id => S.lgNames.get(id) || ('#' + id)).join(', ') : plural(lgs.length, 'location group');
+    const out = ['Location Groups: ' + lgText];
+    if (f.part) out.push('Part: ' + partPattern(f));
+    if (!f.showZero) out.push('Zero quantities hidden');
+    if (f.shortOnly) out.push('Short lines only');
+    return out.join(' · ');
+}
+
+// ============================================================================
+//  SQL — the iReport query as it is, without its Count / Skip paging.
+// ============================================================================
+function buildSQL(f, lgIds) {
+    // Always the LIKE, '%' when no part is given, as the original sends it.
+    const w = [`part.num LIKE '${sqlStr(f.part ? partPattern(f) : '%')}'`, 'part.id != 0', 'part.typeid = 10', 'part.activeflag = 1'];
+    return `
+        SELECT part.num AS part, part.description, uom.code AS uomcode, part.id,
+               locationgroup.id AS lgid, locationgroup.name AS lg,
+               COALESCE(qtyonhand.qty, 0) AS qty,
+               COALESCE(qtynotavailable.qty, 0) AS unavailable,
+               COALESCE(qtydropship.qty, 0) AS dropship,
+               COALESCE(qtycommitted.qty, 0) AS qtycommitted,
+               COALESCE(qtyallocated.qty, 0) AS allocated,
+               COALESCE(qtyonorder.qty, 0) AS onorder
+        FROM part
+        LEFT JOIN locationgroup ON locationgroup.id IN (${lgIds.join(', ')})
+        LEFT JOIN uom ON part.uomid = uom.id
+        LEFT JOIN qtyonorder ON qtyonorder.partid = part.id AND qtyonorder.locationgroupid = locationgroup.id
+        LEFT JOIN qtyallocated ON qtyallocated.partid = part.id AND qtyallocated.locationgroupid = locationgroup.id
+        LEFT JOIN qtycommitted ON qtycommitted.partid = part.id AND qtycommitted.locationgroupid = locationgroup.id
+        LEFT JOIN qtynotavailable ON qtynotavailable.partid = part.id AND qtynotavailable.locationgroupid = locationgroup.id
+        LEFT JOIN qtydropship ON qtydropship.partid = part.id AND qtydropship.locationgroupid = locationgroup.id
+        LEFT JOIN qtyonhand ON qtyonhand.partid = part.id AND qtyonhand.locationgroupid = locationgroup.id
+        WHERE ${w.join('\n          AND ')}` +
+        (f.showZero ? '' : `
+        HAVING (qty + unavailable + dropship + qtycommitted + allocated + onorder) > 0`) + `
+        ORDER BY locationgroup.id, part.num`;
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+let _loadToken = 0;
+
+async function loadLookups() {
+    let myLgs = [];
+    try { myLgs = ints(typeof getLocationGroupList === 'function' ? getLocationGroupList() : []); } catch (_) {}
+    S.myLgs = myLgs;
+    const res = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('Location groups', `SELECT id, name, activeflag+0 AS active FROM locationgroup WHERE id IN (${myLgs.join(',') || '0'}) ORDER BY name`)
+    ]);
+    const ok = i => res[i].status === 'fulfilled' ? res[i].value : [];
+    S.company = (ok(0)[0] || {}).name || '';
+    S.lgNames = new Map(ok(1).map(r => [Number(r.id), String(r.name)]));
+    _lgMs.setItems(ok(1).map(r => ({ value: Number(r.id), label: r.name + (Number(r.active) === 1 ? '' : ' (inactive)') })));
+    const failed = res.filter(x => x.status === 'rejected').map(x => x.reason && x.reason.message);
+    if (failed.length) document.getElementById('banner').textContent = 'Some filter lists failed to load: ' + failed.join('; ');
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    const f = F;
+    document.getElementById('banner').textContent = '';
+    const lgs = lgsFor(f);
+    const appView = document.getElementById('appView');
+    if (!lgs.length) {
+        S.rows = []; S.loadedAt = new Date();
+        document.getElementById('banner').textContent = 'Your Fishbowl user has no location groups, so there is nothing to show.';
+        FBLib.RowCap.notice({ before: appView, capped: false });
+        render();
+        return;
+    }
+    document.getElementById('loading').classList.add('show');
+    setStatus('Loading…');
+    let rows;
+    const cap = S.noCap ? 0 : undefined;           // FBLib.RowCap: the first 10,000 rows unless Load all
+    try { rows = await q('Availability', FBLib.RowCap.sql(buildSQL(f, lgs), cap)); }
+    catch (e) {
+        if (tok !== _loadToken) return;
+        document.getElementById('loading').classList.remove('show');
+        document.getElementById('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        FBLib.RowCap.notice({ before: appView, capped: false });
+        S.rows = []; S.loadedAt = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    if (tok !== _loadToken) return;
+    document.getElementById('loading').classList.remove('show');
+    const capped = FBLib.RowCap.apply(rows, cap);
+    rows = capped.rows;
+    FBLib.RowCap.notice({ before: appView, capped: capped.capped, limit: capped.limit, what: 'rows',
+                          onLoadAll: () => { S.noCap = true; loadAll(); } });
+    S.rows = rows.map(r => {
+        const onHand = num(r.qty), unav = num(r.unavailable), drop = num(r.dropship), alloc = num(r.allocated);
+        return {
+            lgid: Number(r.lgid), lg: r.lg || '', part: r.part || '', desc: r.description || '', uom: r.uomcode || '',
+            onHand, alloc, unav, drop, onOrder: num(r.onorder), committed: num(r.qtycommitted),
+            // The original's two calculated columns, floored at 0 as it prints them.
+            available: Math.max(0, r6(onHand - alloc - unav + drop)),
+            short: Math.max(0, r6(alloc - (onHand - unav)))
+        };
+    });
+    S.collapsed = new Set();
+    S.loadedAt = new Date();
+    render();
+}
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+
+// ============================================================================
+//  MODEL + TABLE
+// ============================================================================
+// The iReport version's columns, in its order (the user may rearrange
+// them: cols()).
+const COL_DEFS = [
+    { key: 'part',      label: 'Part',          w: 130 },
+    { key: 'desc',      label: 'Description',   w: 300 },
+    { key: 'uom',       label: 'UOM',           w: 60, ctr: true },
+    { key: 'onHand',    label: 'On Hand',       w: 85, num: true },
+    { key: 'alloc',     label: 'Allocated',     w: 85, num: true },
+    { key: 'unav',      label: 'Not Available', w: 90, num: true },
+    { key: 'drop',      label: 'Drop Ship',     w: 80, num: true },
+    { key: 'available', label: 'Available',     w: 85, num: true },
+    { key: 'onOrder',   label: 'On Order',      w: 85, num: true },
+    { key: 'committed', label: 'Committed',     w: 85, num: true },
+    { key: 'short',     label: 'Short',         w: 75, num: true }
+];
+const cols = () => (COLS ? COLS.arrange(COL_DEFS) : COL_DEFS);    // the user's column order (FBLib.RptCols)
+const cellCls = c => (c.num ? 'num-cell' : c.ctr ? 'ctr' : '');
+
+// What is drawn, printed, pivoted and exported: "Short lines only" keeps the
+// rows whose Short is above 0 (the bold figures); a location group without
+// one drops out.
+const shownRows = () => (F.shortOnly ? S.rows.filter(r => r.short > 0) : S.rows);
+// The status line's counts while the option is on: "12 of 2,814 rows short, 2,802 hidden".
+function shortCounts() {
+    if (!F.shortOnly || !S.loadedAt) return '';
+    const shown = shownRows().length;
+    return shown.toLocaleString() + ' of ' + plural(S.rows.length, 'row') + ' short, ' + (S.rows.length - shown).toLocaleString() + ' hidden';
+}
+const emptyText = () => (S.rows.length ? 'No part is short with these filters.' : 'No parts match these filters.');
+const statusFilters = () => filterText(Object.assign({}, F, { shortOnly: false }));   // the counts say the option is on
+
+function groups() {
+    const out = [];
+    shownRows().forEach(r => {
+        const g = out.length && out[out.length - 1].lgid === r.lgid ? out[out.length - 1] : null;
+        if (g) { g.rows.push(r); if (r.short > 0) g.short++; }
+        else out.push({ lgid: r.lgid, name: r.lg, rows: [r], short: r.short > 0 ? 1 : 0 });
+    });
+    return out;
+}
+// Heading-click sort (FBLib.RptCols): parts sort within their location
+// group; the groups keep the original's order (location group id).
+const sortVal = (r, k) => r[k];
+const sortLines = list => (COLS && COLS.sort() ? list.slice().sort((a, b) => COLS.compare(a, b, sortVal)) : list);
+
+const shortText = n => n ? ` · <span class="is-short">${esc(n.toLocaleString())} short</span>` : '';
+// A group row: the identity (toggle + location group + part count) spans
+// every column, whatever order the user has put them in: the original has
+// no totals, so no figure needs its own column.
+function groupRow(cs, g, forPrint) {
+    const open = !S.collapsed.has(String(g.lgid));
+    return `<tr class="rpt-grp" data-grp="${esc(g.lgid)}"><td colspan="${cs.length}"><div class="rpt-grp-inner">` +
+        (forPrint ? '' : `<span class="rpt-toggle">${open ? '▼' : '▶'}</span>`) +
+        `<span>${esc(g.name || '(no location group)')}</span><span class="rpt-grp-meta">${esc(plural(g.rows.length, 'part'))}${shortText(g.short)}</span></div></td></tr>`;
+}
+function lineRow(cs, r) {
+    const cell = {
+        part: openLink('Part', r.part, r.desc), desc: cut(r.desc), uom: esc(r.uom),
+        short: r.short > 0 ? `<span class="is-short">${esc(fmtQty(r.short))}</span>` : esc(fmtQty(r.short))
+    };
+    return '<tr>' + cs.map(c => `<td class="${cellCls(c)}">${cell[c.key] ?? qty(r[c.key])}</td>`).join('') + '</tr>';
+}
+function bodyRows(cs, forPrint) {
+    const out = [];
+    groups().forEach(g => {
+        out.push(groupRow(cs, g, forPrint));
+        if (!S.collapsed.has(String(g.lgid))) sortLines(g.rows).forEach(r => out.push(lineRow(cs, r)));
+    });
+    return out;
+}
+function footRow(cs) {
+    const gs = groups();
+    const short = gs.reduce((s, g) => s + g.short, 0);
+    return `<tr><td colspan="${cs.length}">Total — ${esc(plural(gs.length, 'location group'))}, ${esc(plural(shownRows().length, 'part line'))}${shortText(short)}</td></tr>`;
+}
+const headRow = cs => '<tr>' + cs.map(c => `<th data-col="${c.key}" class="${cellCls(c)}" style="min-width:${c.w}px">${esc(c.label)}</th>`).join('') + '</tr>';
+
+// Long reports paint in chunks as the user scrolls.
+const CHUNK = 600;
+let _paint = { html: [], shown: 0 };
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+function render(keepScroll) {
+    if (S.view === 'pivot' && PIVOT) {
+        PIVOT.render();
+        setStatus([S.company, statusFilters(), 'pivot', shortCounts() || (S.loadedAt ? plural(S.rows.length, 'row') : '')].filter(Boolean).join(' · '));
+        if (PDF) PDF.refresh();
+        return;
+    }
+    const shown = shownRows().length;
+    const tbl = document.getElementById('rpt');
+    const wrap = document.getElementById('rptWrap');
+    const top = wrap.scrollTop;
+    const cs = cols();
+    tbl.querySelector('thead').innerHTML = headRow(cs);
+    _paint = { html: bodyRows(cs, false), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    while (keepScroll && _paint.shown < _paint.html.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+    tbl.querySelector('tfoot').innerHTML = shown ? footRow(cs) : '';
+    tbl.style.display = shown ? '' : 'none';
+    document.getElementById('rptEmpty').textContent = shown || !S.loadedAt ? '' : emptyText();
+    wrap.scrollTop = keepScroll ? top : 0;
+    const parts = [S.company, statusFilters()];
+    if (S.loadedAt) parts.push((shortCounts() || plural(S.rows.length, 'row')) + ' · loaded ' + S.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    setStatus(parts.filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the pages as the standard report prints them: Letter
+//  landscape, the company / title / filters on every page (the original's
+//  page header), 9pt rows under a heading per location group, UOM centred,
+//  Short in bold, no totals (the original has none).
+// ============================================================================
+let PDF = null;
+const PDF_CSS =
+    '.fbdoc-rpt-tbl th.ctr,.fbdoc-rpt-tbl td.ctr{text-align:center}' +
+    '.fbdoc-rpt-tbl .pp-neg{color:inherit}' +
+    '.fbdoc-rpt-tbl .is-short{color:inherit;font-weight:700}';
+function docSpec() {
+    if (!S.loadedAt) return null;
+    if (S.view === 'pivot' && PIVOT) {
+        const p = PIVOT.pdfSpec();
+        return { company: S.company, title: 'Inventory Availability by Location Group', subtitle: [filterText(F), pivotText()], titleEveryPage: true,
+                 head: p.head, rows: p.rows, foot: p.foot, empty: emptyText(), css: PDF_CSS, fontPt: 9 };
+    }
+    const cs = cols();
+    return {
+        company: S.company, title: 'Inventory Availability by Location Group', subtitle: filterText(F), titleEveryPage: true,
+        head: headRow(cs), rows: bodyRows(cs, true), foot: '',
+        empty: emptyText(), css: PDF_CSS, fontPt: 9
+    };
+}
+
+// ============================================================================
+//  PIVOT VIEW (FBLib.Pivot) — any quantity by any two of part, location
+//  group, UOM and shortage. It opens as Part x Location Group: each part's
+//  stock in every group on one line, with the part's total (one UOM per
+//  part, so a row total is a true company figure). The report's own layout
+//  stays in the Table view.
+// ============================================================================
+let PIVOT = null, COLS = null;
+const PIVOT_FIELDS = [
+    { key: 'part', label: 'Part' }, { key: 'desc', label: 'Description', dim: false }, { key: 'lg', label: 'Location Group' },
+    { key: 'uom', label: 'UOM' }, { key: 'shortage', label: 'Shortage' },
+    { key: 'onHand', label: 'On Hand', type: 'qty' }, { key: 'alloc', label: 'Allocated', type: 'qty' },
+    { key: 'unav', label: 'Not Available', type: 'qty' }, { key: 'drop', label: 'Drop Ship', type: 'qty' },
+    { key: 'available', label: 'Available', type: 'qty' }, { key: 'onOrder', label: 'On Order', type: 'qty' },
+    { key: 'committed', label: 'Committed', type: 'qty' }, { key: 'short', label: 'Short', type: 'qty' }
+];
+const pivotRows = () => shownRows().map(r => Object.assign({}, r, { shortage: r.short > 0 ? 'Short' : 'Not short' }));
+function pivotText() {
+    const c = PIVOT.config(), lbl = k => (PIVOT_FIELDS.find(x => x.key === k) || {}).label || '';
+    const m = c.measure === '__count__' ? 'Row count'
+        : ({ sum: 'Total', count: 'Count of', avg: 'Average', min: 'Lowest', max: 'Highest' }[c.agg] + ' ' + lbl(c.measure));
+    return 'Pivot: ' + m + ' by ' + [lbl(c.rowDim), lbl(c.rowDim2)].filter(Boolean).join(' + ') + (c.colDim ? ' × ' + lbl(c.colDim) : '');
+}
+function setView(v, persist) {
+    S.view = v === 'pivot' && PIVOT ? 'pivot' : 'table';
+    document.getElementById('viewSel').value = S.view;
+    document.getElementById('rptWrap').style.display = S.view === 'pivot' ? 'none' : '';
+    document.getElementById('pivotHost').style.display = S.view === 'pivot' ? '' : 'none';
+    document.getElementById('expandBtn').parentNode.style.display = S.view === 'pivot' ? 'none' : '';
+    if (persist) _saveUserKeys({ view: S.view });
+    render(false);
+}
+
+function setAllOpen(open) {
+    S.collapsed = new Set(open ? [] : groups().map(g => String(g.lgid)));
+    render(false);
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!shownRows().length) { showToast('Nothing to export.', 'warn'); return; }
+    // The columns in the user's order, the parts in the table's sort.
+    const xcols = [{ key: 'lg', label: 'Location Group', w: 160, type: 'text' }].concat(cols().map(c =>
+        ({ key: c.key, label: c.label, w: c.w, type: c.num ? 'qty' : 'text' })));
+    const sub = [S.company, filterText(F)].filter(Boolean);
+    const sheets = [{
+        name: 'Availability', title: 'Inventory Availability by Location Group', subtitle: sub,
+        cols: xcols, rows: [].concat(...groups().map(g => sortLines(g.rows))),
+        totals: false          // no totals: parts are stocked in different units
+    }];
+    if (S.view === 'pivot' && PIVOT) sheets.unshift(Object.assign(PIVOT.sheet('Pivot'), { title: 'Inventory Availability by Location Group – ' + pivotText(), subtitle: sub }));
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'Inventory_Availability_by_LG_' + ymd(new Date()), sheets });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's pages (fb-doc). Without fb-doc on the server, the
+// plain printout below: JxBrowser won't print the report page itself, so it
+// is built in a new window and printed there. Collapsed location groups
+// print as their heading only.
+function printReport() {
+    if (!shownRows().length) { showToast('Nothing to print.', 'warn'); return; }
+    if (PDF) { PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000)); return; }
+    printPlain();
+}
+function printPlain() {
+    if (!shownRows().length) { showToast('Nothing to print.', 'warn'); return; }
+    const cs = cols();
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Inventory Availability by Location Group</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:11pt;font-weight:700}h2{text-align:center;font-size:14pt;margin:2px 0}.sub{text-align:center;font-size:8.5pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{font-size:8pt;text-align:left;padding:3px 5px;border-bottom:1px solid #000;vertical-align:bottom}' +
+        'td{font-size:8pt;padding:2px 5px;vertical-align:top;border-bottom:.5px solid #ccc}.num-cell{text-align:right}th.num-cell{text-align:right}.ctr{text-align:center}' +
+        'tr.rpt-grp td{font-weight:700;padding-top:7px;border-bottom:1px solid #999}.rpt-grp-meta{font-weight:400;color:#555;margin-left:8px}' +
+        'tfoot td{font-weight:700;border-top:1px solid #000;border-bottom:0}a{color:#000;text-decoration:none}.pp-neg,.is-short{color:#000}.is-short{font-weight:700}' +
+        '@page{size:Letter landscape;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>Inventory Availability by Location Group</h2><p class="sub">' + esc(filterText(F)) + '</p>' +
+        '<table><thead>' + headRow(cs).replace(/ style="[^"]*"/g, '') + '</thead><tbody>' + bodyRows(cs, true).join('') +
+        '</tbody><tfoot>' + footRow(cs) + '</tfoot></table>' +
+        '<p style="font-size:7.5pt;margin-top:8px">Printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters the starting point for every user who hasn\'t saved their own?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        _lgMs = FBLib.Common.MultiSelect.create({ containerId: 'lgMs', items: [], placeholder: 'All my location groups', maxTags: 2, onClose: applySoon });
+
+        document.getElementById('fShowZero').addEventListener('change', applySoon);
+        document.getElementById('fShortOnly').addEventListener('change', applySoon);
+        const fPart = document.getElementById('fPart');
+        fPart.addEventListener('change', applySoon);
+        fPart.addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        document.getElementById('resetFiltersBtn').onclick = () => { writeFilters(DEFAULT_FILTERS); applySoon(); };
+
+        // Column resize / sort / reorder, and the Pivot view (fb-lib).
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({ table: document.getElementById('rpt'), onSort: () => render(true), onReorder: () => render(true) });
+        if (FBLib.Pivot) PIVOT = FBLib.Pivot.mount(document.getElementById('pivotHost'), {
+            fields: PIVOT_FIELDS, rows: pivotRows,
+            defaults: { rowDim: 'part', colDim: 'lg', measure: 'available', agg: 'sum' },
+            format: (fld, v) => (fld && fld.type === 'qty' ? fmtQty(r6(v)) : null)
+        });
+        else document.getElementById('viewSelWrap').style.display = 'none';
+        document.getElementById('viewSel').addEventListener('change', e => setView(e.target.value, true));
+        document.getElementById('resetColsBtn').onclick = () => { if (COLS) { COLS.reset(); render(false); } };
+        S.view = _resolve('view', 'table') === 'pivot' && PIVOT ? 'pivot' : 'table';
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: document.getElementById('appView'), toggleBefore: document.getElementById('exportBtn'),
+                page: { size: 'Letter', orientation: 'landscape' },
+                doc: docSpec, title: () => 'Inventory Availability by Location Group'
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        setView(S.view, false);
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('expandBtn').onclick = () => setAllOpen(true);
+        document.getElementById('collapseBtn').onclick = () => setAllOpen(false);
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        const wrap = document.getElementById('rptWrap');
+        wrap.addEventListener('scroll', () => { if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 400) appendChunk(); });
+        document.getElementById('rpt').addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (a) {
+                e.preventDefault();
+                try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+                catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+                return;
+            }
+            const g = e.target.closest('tr.rpt-grp');
+            if (!g) return;
+            const key = g.dataset.grp;
+            if (S.collapsed.has(key)) S.collapsed.delete(key); else S.collapsed.add(key);
+            render(true);
+        });
+
+        await loadLookups();
+        writeFilters(savedFilters());
+        F = readFilters();          // drops saved picks that no longer exist
+        await loadAll();
+    } catch (e) {
+        console.error('[Inventory Availability by LG] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

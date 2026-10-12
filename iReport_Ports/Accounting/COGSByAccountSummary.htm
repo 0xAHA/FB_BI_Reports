@@ -1,0 +1,993 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   COGS by Account Summary (iReport port)
+  PATH:   iReport_Ports/Accounting/COGSByAccountSummary.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard Accounting/COGSByAccountSummary.jrxml.
+  Same source, same rules, same columns and totals; only the presentation
+  is interactive.
+
+    Source     postsoitem.postedTotalCost (the cost of goods posted for a
+               sales order line) via postso, grouped by the COGS account
+               on the line's product's part (part.cogsAccountId). A part
+               with none is "(Default Account N/A) Account", as in the
+               original.
+    Lines      soitem types Sale, Misc. Sale, Drop Ship, Credit Return,
+               Misc. Credit, Assoc. Price, Shipping, Tax and Kit, with a
+               product; line status Partial / Fulfilled / Closed Short
+               (each a filter) plus Picked (always, as the original).
+    Dates      Date range is on postso.postDate (when the items were
+               fulfilled), inclusive of both end days.
+    Totals     Each account's total sits on its group row; the grand total
+               in the footer. Collapsing an account is the original's
+               "Show part details" switched off.
+
+  Layout: the REPORT chrome (fb-styles §35): 56px header, push-down filter
+  panel that applies as you change it, collapsible group rows, sticky
+  totals footer. The dashboard-style layout it replaced is in
+  archived/iReport_Ports/Accounting/.
+  Table tools (fb-lib FBLib.RptCols / RowCap / Pivot): column headings sort
+  the lines within each account, drag to reorder and resize (remembered per
+  user); a Table / Pivot view selector (COGS by any two of account, part,
+  sales order and date fulfilled, with drill-down); the lines query
+  fetches at most 10,000 lines, with Load all. When it is cut, a GROUP BY
+  query totals every account over all the lines, so the account rows and
+  the Grand Total stay whole; only the line detail (and the pivot built
+  from it) is capped.
+  Views: the header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+  report out as pages like the original: Letter portrait by default, the
+  company / title / date range on every page (the original's page header),
+  the column headings repeated, account rows carrying their totals and
+  carried over a page break as "(continued)" (a collapsed account prints as
+  that row: Show part details off), the Grand Total after the last line,
+  "Page X of Y"; in the Pivot view, the pivot grid. Columns follow the
+  user's order. Columns fit the page and the font steps down from the
+  original's 10pt when they don't. The paper and the view are remembered
+  per user. Print prints those pages in either view.
+
+  Additions over the iReport version: record links, an account picker in
+  place of the free-text LIKE, Excel (by-account + detail sheets).
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-launch" content="ACCOUNTING">
+    <meta name="description" content="Cost of goods sold posted from sales orders, totalled by COGS account.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipCogsByAccount',
+            name:  'COGS by Account Summary',
+            build: '2026.10.12-5da5076'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>COGS by Account Summary — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 460px; overflow: hidden; text-overflow: ellipsis; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table th { cursor: default; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        .pp-neg { color: #8A1E30; }
+        .rpt-table tr.rpt-grp .pp-neg { color: #8A1E30; }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>COGS by Account Summary</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <div class="rpt-viewsel" id="viewSelWrap" title="Table: the report as the standard one lays it out. Pivot: total COGS by any two fields">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 5h18M3 10h10M3 15h18M3 20h10" stroke-linecap="round"/></svg>
+            <select id="viewSel">
+                <option value="table">Table</option>
+                <option value="pivot">Pivot</option>
+            </select>
+        </div>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="split-btn">
+            <button id="expandBtn" class="hdr-btn" type="button" title="Show every account's lines (Show part details)">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+                Expand
+            </button>
+            <button id="collapseBtn" class="hdr-btn" type="button" title="Account totals only">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 12h14" stroke-linecap="round"/></svg>
+                Collapse
+            </button>
+        </span>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook (by-account and detail sheets)">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages: collapsed accounts print as their totals">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Date fulfilled</div>
+            <div>
+                <div class="rpt-flabel">Quick range</div>
+                <select id="fRange"></select>
+            </div>
+            <div class="rpt-dates">
+                <input type="date" id="fFrom" aria-label="From">
+                <span class="rpt-fnote">→</span>
+                <input type="date" id="fTo" aria-label="To">
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Accounts &amp; products</div>
+            <div>
+                <div class="rpt-flabel">COGS account</div>
+                <div class="ms-container" id="acctMs">
+                    <div class="ms-trigger" id="acctMs-trigger"><span class="ms-placeholder" id="acctMs-placeholder">All accounts</span></div>
+                    <div class="ms-dropdown hidden" id="acctMs-dropdown">
+                        <div class="ms-search"><input type="text" id="acctMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="acctMs-all">Select All</span><span id="acctMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="acctMs-list"></div>
+                    </div>
+                </div>
+            </div>
+            <div>
+                <div class="rpt-flabel">Product number</div>
+                <input type="text" id="fProduct" placeholder="Any (% is a wildcard)">
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Lines</div>
+            <div>
+                <div class="rpt-flabel">Line status</div>
+                <div class="ms-container" id="statusMs">
+                    <div class="ms-trigger" id="statusMs-trigger"><span class="ms-placeholder" id="statusMs-placeholder">Picked only</span></div>
+                    <div class="ms-dropdown hidden" id="statusMs-dropdown">
+                        <div class="ms-actions"><span id="statusMs-all">Select All</span><span id="statusMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="statusMs-list"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="rpt-fnote">Picked lines are always included,<br>as in the standard report.</div>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to this month, every account, every status">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own sort">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters the starting point for everyone who hasn't saved their own.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>The cost of goods sold that Fishbowl posted for each sales order line, totalled by the COGS account it goes to. It is the BI version of the standard <strong>COGS by Account Summary</strong> and reads the same data the same way.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Which account</div>
+                <p>The account is the COGS account on the part behind the line's product. A part with none set uses your accounting system's default, listed as <strong>(Default Account N/A) Account</strong>.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>Filter changes apply straight away.</li>
+                    <li>Click an account's row to show or hide its lines; <strong>Expand</strong> / <strong>Collapse</strong> do every account. Collapsed is the standard report with <em>Show part details</em> off.</li>
+                    <li>The date range is on when the line's items were fulfilled. A line fulfilled in two shipments appears once per shipment.</li>
+                    <li>Click a column heading to sort the lines within each account (again to reverse, a third time for the standard order). Drag a heading onto another to move the column; drag a heading's right edge to resize it. Your layout is remembered; <strong>Settings → Reset column layout</strong> undoes it.</li>
+                    <li>The <strong>Table / Pivot</strong> selector switches to a pivot: total COGS by any two of account, part, sales order and date fulfilled (by day, week, month, quarter or year). Click a figure to see the lines behind it. Print, PDF and Excel follow the view on screen.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable pages, laid out like the standard report. In PDF view pick the paper size and orientation in the bar above the pages; they are remembered. <strong>Print</strong> prints those pages.</li>
+                    <li>A very large result lists its first 10,000 lines with a <strong>Load all</strong> button. The account totals and the Grand Total still cover every line; the pivot and the Excel detail cover the lines listed.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-app" id="appView">
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+</div>
+<div class="pivot-host" id="pivotHost" style="display:none"></div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Common || !FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const DEFAULT_ACCOUNT = '(Default Account N/A) Account';   // the original's label for "none set"
+const LINE_TYPES = [10, 11, 12, 20, 21, 50, 60, 70, 80];   // soitem types the original counts
+const STATUS_PICKED = 40;                                   // always included
+const STATUS_OPTS = [{ value: 30, label: 'Partial' }, { value: 50, label: 'Fulfilled' }, { value: 60, label: 'Closed Short' }];
+const DEFAULT_FILTERS = { range: 'thisMonth', from: '', to: '', accounts: [], product: '', statuses: [30, 50, 60], details: true };
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false, view: 'table' }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const dstr = v => { const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v ?? '')); return m ? m[1] : ''; };
+const fmtMoney = v => FBLib.Common.formatMoney(v);
+const money = v => '<span class="' + (num(v) < 0 ? 'pp-neg' : '') + '">' + esc(fmtMoney(v)) + '</span>';
+const openLink = (module, number) => number
+    ? `<a class="fb-row-link" data-open="${esc(module)}" data-num="${esc(number)}">${esc(number)}</a>` : '';
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const cut = s => `<span title="${esc(s)}">${esc(s)}</span>`;
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// ---- Date ranges (Fishbowl's "This Month" etc.) ----
+const RANGES = [
+    ['custom', 'Custom…'], ['all', 'All dates'], ['today', 'Today'], ['yesterday', 'Yesterday'], ['last7', 'Last 7 days'],
+    ['thisMonth', 'This month'], ['lastMonth', 'Last month'], ['thisQuarter', 'This quarter'], ['lastQuarter', 'Last quarter'],
+    ['thisYear', 'This year'], ['lastYear', 'Last year']
+];
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const isYmd = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+
+// A quick range as [from, to] ISO dates, or null for "All dates".
+function presetDates(key) {
+    const t = new Date(); t.setHours(0, 0, 0, 0);
+    const y = t.getFullYear(), m = t.getMonth(), d = t.getDate(), qm = Math.floor(m / 3) * 3;
+    const D = (yy, mm, dd) => new Date(yy, mm, dd);
+    const r = {
+        today: [t, t], yesterday: [D(y, m, d - 1), D(y, m, d - 1)], last7: [D(y, m, d - 6), t],
+        thisMonth: [D(y, m, 1), D(y, m + 1, 0)], lastMonth: [D(y, m - 1, 1), D(y, m, 0)],
+        thisQuarter: [D(y, qm, 1), D(y, qm + 3, 0)], lastQuarter: [D(y, qm - 3, 1), D(y, qm, 0)],
+        thisYear: [D(y, 0, 1), D(y, 11, 31)], lastYear: [D(y - 1, 0, 1), D(y - 1, 11, 31)]
+    }[key];
+    return r ? [ymd(r[0]), ymd(r[1])] : null;
+}
+// { start, endExcl, label } for the filter, or null for no date limit.
+function dateRange(f) {
+    let a = f.from, b = f.to;
+    if (f.range !== 'custom') { const p = presetDates(f.range); if (!p) return null; [a, b] = p; }
+    if (!isYmd(a) && !isYmd(b)) return null;
+    a = isYmd(a) ? a : '1900-01-01'; b = isYmd(b) ? b : '2999-12-31';
+    if (a > b) [a, b] = [b, a];
+    const after = new Date(b + 'T00:00:00'); after.setDate(after.getDate() + 1);
+    return { start: a, endExcl: ymd(after), label: FBLib.Common.formatDate(a) + ' – ' + FBLib.Common.formatDate(b) };
+}
+const dateWhere = (col, r) => `${col} >= '${r.start} 00:00:00' AND ${col} < '${r.endExcl} 00:00:00'`;
+function rangeText(f) { const r = dateRange(f); return 'Date Range: ' + (r ? r.label : 'All'); }
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS — the panel applies as it changes (one short debounce).
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _acctMs = null, _statusMs = null;
+let _hydrating = false, _applyTimer = null;
+
+function readFilters() {
+    return {
+        range: document.getElementById('fRange').value,
+        from: document.getElementById('fFrom').value,
+        to: document.getElementById('fTo').value,
+        accounts: _acctMs.getSelected().map(String),
+        product: document.getElementById('fProduct').value.trim(),
+        statuses: _statusMs.getSelected().map(Number),
+        details: F.details
+    };
+}
+function writeFilters(f) {
+    _hydrating = true;
+    document.getElementById('fRange').value = RANGES.some(r => r[0] === f.range) ? f.range : DEFAULT_FILTERS.range;
+    const p = f.range === 'custom' ? [f.from, f.to] : (presetDates(f.range) || ['', '']);
+    document.getElementById('fFrom').value = p[0] || '';
+    document.getElementById('fTo').value = p[1] || '';
+    _acctMs.setSelected((f.accounts || []).map(String));
+    _statusMs.setSelected(f.statuses || []);
+    document.getElementById('fProduct').value = f.product || '';
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        F = next;
+        remember();
+        S.noCap = false;
+        loadAll();
+    }, 250);
+}
+
+// ============================================================================
+//  SQL — the iReport query, with the account LIKE replaced by a pick list
+//  and the date range written index-friendly.
+// ============================================================================
+const ACCOUNT_EXPR = `COALESCE(asaccount.name, '${DEFAULT_ACCOUNT}')`;
+
+const FROM_SQL = `
+        FROM soitem
+        LEFT JOIN so ON soitem.soid = so.id
+        LEFT JOIN product ON soitem.productid = product.id
+        LEFT JOIN part ON product.partid = part.id
+        LEFT JOIN asaccount ON part.cogsaccountid = asaccount.id
+        JOIN postsoitem ON soitem.id = postsoitem.soitemid
+        JOIN postso ON postsoitem.postsoid = postso.id`;
+
+function whereSQL(f) {
+    const ok = STATUS_OPTS.map(o => o.value);
+    const statuses = f.statuses.filter(s => ok.indexOf(s) !== -1).concat([STATUS_PICKED]);
+    // The original's "product.num LIKE '%'" also drops lines with no product.
+    const w = ['soitem.typeid IN (' + LINE_TYPES.join(',') + ')', 'soitem.statusid IN (' + statuses.join(', ') + ')',
+               f.product ? `UPPER(product.num) LIKE UPPER('${sqlStr(f.product.replace(/\*/g, '%'))}')` : 'product.num IS NOT NULL'];
+    if (f.accounts.length) w.push(ACCOUNT_EXPR + ' IN (' + f.accounts.map(a => "'" + sqlStr(a) + "'").join(', ') + ')');
+    const r = dateRange(f);
+    if (r) w.push(dateWhere('postso.postdate', r));
+    return w.join('\n          AND ');
+}
+function buildSQL(f) {
+    return `
+        SELECT so.num AS sonum, soitem.solineitem AS solinenum, postsoitem.postedtotalcost AS totalcost,
+               product.num AS productnum, product.description AS productdescription,
+               ${ACCOUNT_EXPR} AS cogsaccount, postso.postdate${FROM_SQL}
+        WHERE ${whereSQL(f)}
+        ORDER BY asaccount.name, so.num, soitem.solineitem`;
+}
+// Every account's line count and total over ALL the matching lines. Run when
+// the lines are capped, so the account rows and the Grand Total (the
+// report's point) stay whole while only the detail is cut.
+function totalsSQL(f) {
+    return `
+        SELECT ${ACCOUNT_EXPR} AS cogsaccount, COUNT(*) AS n, COALESCE(SUM(postsoitem.postedtotalcost), 0) AS total${FROM_SQL}
+        WHERE ${whereSQL(f)}
+        GROUP BY ${ACCOUNT_EXPR}`;
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+const S = { rows: [], company: '', loadedAt: null, collapsed: new Set(), view: 'table', noCap: false,
+            acctTotals: null };   // { account: { n, total } } over every line, when the lines are capped
+let _loadToken = 0;
+
+async function loadLookups() {
+    const [co, accts] = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('COGS accounts', `
+            SELECT DISTINCT COALESCE(a.name, '${DEFAULT_ACCOUNT}') AS name
+            FROM part LEFT JOIN asaccount a ON a.id = part.cogsaccountid
+            ORDER BY 1`)
+    ]);
+    S.company = co.status === 'fulfilled' ? ((co.value[0] || {}).name || '') : '';
+    _acctMs.setItems((accts.status === 'fulfilled' ? accts.value : []).map(r => ({ value: String(r.name), label: String(r.name) })));
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    const f = F;
+    document.getElementById('banner').textContent = '';
+    document.getElementById('loading').classList.add('show');
+    setStatus('Loading…');
+    let rows;
+    const cap = S.noCap ? 0 : undefined;           // FBLib.RowCap: the first 10,000 lines unless Load all
+    try { rows = await q('COGS lines', FBLib.RowCap.sql(buildSQL(f), cap)); }
+    catch (e) {
+        if (tok !== _loadToken) return;
+        document.getElementById('loading').classList.remove('show');
+        document.getElementById('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        FBLib.RowCap.notice({ before: document.getElementById('appView'), capped: false });
+        S.rows = []; S.acctTotals = null; S.loadedAt = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    if (tok !== _loadToken) return;
+    const capped = FBLib.RowCap.apply(rows, cap);
+    rows = capped.rows;
+    let totals = null;
+    if (capped.capped) {
+        try { totals = await q('COGS by account (every line)', totalsSQL(f)); }
+        catch (_) { totals = null; }                // the totals then cover the lines shown
+        if (tok !== _loadToken) return;
+    }
+    document.getElementById('loading').classList.remove('show');
+    S.acctTotals = totals ? {} : null;
+    (totals || []).forEach(t => { S.acctTotals[t.cogsaccount || DEFAULT_ACCOUNT] = { n: num(t.n), total: num(t.total) }; });
+    capNotice(capped);
+    S.rows = rows.map(r => ({
+        account: r.cogsaccount || DEFAULT_ACCOUNT, sonum: r.sonum || '', line: r.solinenum, cost: num(r.totalcost),
+        product: r.productnum || '', desc: r.productdescription || '', postdate: dstr(r.postdate)
+    }));
+    // "Show part details" decides how a fresh load opens.
+    S.collapsed = new Set(F.details ? [] : accounts().map(a => a.name));
+    S.loadedAt = new Date();
+    render();
+}
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+
+// The cap notice (FBLib.RowCap). With every account's totals loaded, its
+// sentence says what the cap does and doesn't cover.
+function capNotice(c) {
+    const before = document.getElementById('appView');
+    FBLib.RowCap.notice({ before, capped: c.capped, limit: c.limit, what: 'lines', onLoadAll: () => { S.noCap = true; loadAll(); } });
+    const span = c.capped && S.acctTotals && before.parentNode.querySelector(':scope > .rowcap-note > span');
+    if (span) span.innerHTML = 'Showing the first <strong>' + Number(c.limit).toLocaleString() + '</strong> lines: more match these filters. ' +
+        'The account totals and the Grand Total cover every line; the lines listed, the Pivot and the Excel detail cover the lines shown. Narrow the filters, or';
+}
+
+// ============================================================================
+//  MODEL + TABLE
+// ============================================================================
+const BASE_COLS = [
+    { key: 'part',  label: 'Part #',      w: 140 },
+    { key: 'desc',  label: 'Description', w: 320 },
+    { key: 'cost',  label: 'COGS Amount', w: 120, num: true },
+    { key: 'so',    label: 'SO #',        w: 100 },
+    { key: 'line',  label: 'Line #',      w: 60 }
+];
+const cols = () => (COLS ? COLS.arrange(BASE_COLS) : BASE_COLS.slice());   // the user's column order (FBLib.RptCols)
+const headRow = cs => '<tr>' + cs.map(c => `<th data-col="${c.key}" class="${c.num ? 'num-cell' : ''}" style="min-width:${c.w}px">${esc(c.label)}</th>`).join('') + '</tr>';
+// Heading-click sort (FBLib.RptCols): lines sort within their account; the
+// accounts keep the standard report's order.
+const sortVal = (r, k) => ({ part: r.product, desc: r.desc, cost: r.cost, so: r.sonum, line: num(r.line) })[k];
+const sortLines = list => (COLS && COLS.sort() ? list.slice().sort((a, b) => COLS.compare(a, b, sortVal)) : list);
+// A totals row: `identity` spans the first run of columns that carry none of
+// this row's figures (whatever order the user has put the columns in), and
+// each figure lands in its own column.
+function totalsCells(cs, identity, figs) {
+    const has = c => figs[c.key] != null && figs[c.key] !== '';
+    let a = cs.findIndex(c => !has(c));
+    if (a < 0) a = 0;
+    let b = a + 1;
+    while (b < cs.length && !has(cs[b])) b++;
+    return cs.map((c, i) => i === a ? `<td colspan="${b - a}">${identity}</td>`
+        : (i > a && i < b) ? '' : `<td class="${c.num ? 'num-cell' : ''}">${figs[c.key] ?? ''}</td>`).join('');
+}
+
+// The accounts in the lines' order, each with its lines and its total. When
+// the lines are capped, `n` / `total` come from every line (S.acctTotals),
+// and an account whose lines all fall past the cap is listed with no lines.
+function accounts() {
+    const out = [];
+    S.rows.forEach(r => {
+        const a = out.length && out[out.length - 1].name === r.account ? out[out.length - 1] : null;
+        if (a) { a.rows.push(r); a.total += r.cost; }
+        else out.push({ name: r.account, rows: [r], total: r.cost });
+    });
+    out.forEach(a => { a.n = a.rows.length; });
+    const T = S.acctTotals;
+    if (!T) return out;
+    out.forEach(a => { if (T[a.name]) { a.n = T[a.name].n; a.total = T[a.name].total; } });
+    const seen = new Set(out.map(a => a.name));
+    Object.keys(T).filter(k => !seen.has(k))
+        .sort((x, y) => (y === DEFAULT_ACCOUNT) - (x === DEFAULT_ACCOUNT) || x.localeCompare(y))   // as ORDER BY name: the default (none) first
+        .forEach(k => out.push({ name: k, rows: [], n: T[k].n, total: T[k].total }));
+    return out;
+}
+
+// A group row: the identity (toggle + account + line count) spans the
+// columns before COGS Amount, and the account total sits in that column.
+function groupRow(cs, a, forPrint) {
+    const open = !S.collapsed.has(a.name) && a.rows.length > 0;
+    const meta = a.n === a.rows.length ? plural(a.n, 'line') : a.rows.length.toLocaleString() + ' of ' + plural(a.n, 'line') + ' shown';
+    const id = '<div class="rpt-grp-inner">' + (forPrint ? '' : `<span class="rpt-toggle">${open ? '▼' : '▶'}</span>`) +
+        `<span>${esc(a.name)}</span><span class="rpt-grp-meta">${esc(meta)}</span></div>`;
+    return `<tr class="rpt-grp" data-acct="${esc(a.name)}">${totalsCells(cs, id, { cost: money(a.total) })}</tr>`;
+}
+function lineRow(cs, r) {
+    const cell = { part: openLink('Product', r.product), desc: cut(r.desc), cost: money(r.cost), so: openLink('Sales Order', r.sonum), line: esc(r.line) };
+    return '<tr>' + cs.map(c => `<td class="${c.num ? 'num-cell' : ''}">${cell[c.key] ?? ''}</td>`).join('') + '</tr>';
+}
+function bodyRows(cs, forPrint) {
+    const out = [];
+    accounts().forEach(a => {
+        out.push(groupRow(cs, a, forPrint));
+        if (!S.collapsed.has(a.name)) sortLines(a.rows).forEach(r => out.push(lineRow(cs, r)));
+    });
+    return out;
+}
+function footRow(cs) {
+    const accts = accounts();
+    const total = accts.reduce((s, a) => s + a.total, 0), n = accts.reduce((s, a) => s + a.n, 0);
+    const lines = plural(n, 'line') + (n !== S.rows.length ? ' (' + S.rows.length.toLocaleString() + ' shown)' : '');
+    return '<tr>' + totalsCells(cs, `Grand Total — ${esc(plural(accts.length, 'account'))}, ${esc(lines)}`,
+        { cost: esc(fmtMoney(total)) }) + '</tr>';
+}
+
+// Long reports paint in chunks as the user scrolls.
+const CHUNK = 600;
+let _paint = { html: [], shown: 0 };
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+function render(keepScroll) {
+    if (S.view === 'pivot' && PIVOT) {
+        PIVOT.render();
+        setStatus([S.company, rangeText(F), 'pivot', S.loadedAt ? plural(S.rows.length, 'line') : ''].filter(Boolean).join(' · '));
+        if (PDF) PDF.refresh();
+        return;
+    }
+    const tbl = document.getElementById('rpt');
+    const wrap = document.getElementById('rptWrap');
+    const top = wrap.scrollTop;
+    const cs = cols();
+    tbl.querySelector('thead').innerHTML = headRow(cs);
+    _paint = { html: bodyRows(cs, false), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    while (keepScroll && _paint.shown < _paint.html.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+    tbl.querySelector('tfoot').innerHTML = S.rows.length ? footRow(cs) : '';
+    tbl.style.display = S.rows.length ? '' : 'none';
+    document.getElementById('rptEmpty').textContent = S.rows.length || !S.loadedAt ? '' : 'No posted COGS matches these filters.';
+    wrap.scrollTop = keepScroll ? top : 0;
+    const parts = [S.company, rangeText(F)];
+    if (S.loadedAt) parts.push(plural(S.rows.length, 'line') + ' · loaded ' + S.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    setStatus(parts.filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the pages as the standard report prints them: Letter
+//  portrait, the company / title / date range on every page (the original's
+//  page header), account rows with their totals, the Grand Total after the
+//  last line. In the Pivot view, the pivot grid.
+// ============================================================================
+let PDF = null;
+const PDF_CSS =
+    '.fbdoc-rpt-tbl .pp-neg{color:inherit}' +
+    // The totals row prints bold: bold while its columns are measured too,
+    // or a grand total wider than every line wraps.
+    '.fbdoc-rpt-tbl tr.pdf-total td{font-weight:700}';
+function docSpec() {
+    if (!S.loadedAt) return null;
+    if (S.view === 'pivot' && PIVOT) {
+        const p = PIVOT.pdfSpec();
+        return { company: S.company, title: 'COGS by Account Summary', subtitle: [rangeText(F), pivotText()], titleEveryPage: true,
+                 head: p.head, rows: p.rows, foot: p.foot ? p.foot.replace(/^<tr>/, '<tr class="pdf-total">') : '',
+                 empty: 'No posted COGS matches these filters.', css: PDF_CSS, fontPt: 10 };
+    }
+    const cs = cols();
+    return {
+        company: S.company, title: 'COGS by Account Summary', subtitle: rangeText(F), titleEveryPage: true,
+        head: headRow(cs), rows: bodyRows(cs, true), foot: S.rows.length ? footRow(cs).replace(/^<tr>/, '<tr class="pdf-total">') : '',
+        empty: 'No posted COGS matches these filters.', css: PDF_CSS, fontPt: 10
+    };
+}
+
+// ============================================================================
+//  PIVOT VIEW (FBLib.Pivot) — COGS by any two of account, part, sales order
+//  and date fulfilled. The account grouping stays in the Table view.
+// ============================================================================
+let PIVOT = null, COLS = null;
+const PIVOT_FIELDS = [
+    { key: 'account', label: 'COGS Account' }, { key: 'product', label: 'Part #' }, { key: 'desc', label: 'Description', dim: false },
+    { key: 'sonum', label: 'SO #' }, { key: 'line', label: 'Line #', dim: false }, { key: 'postdate', label: 'Date Fulfilled', type: 'date' },
+    { key: 'cost', label: 'COGS Amount', type: 'money' }
+];
+const pivotRows = () => S.rows;
+function pivotText() {
+    const c = PIVOT.config(), lbl = k => (PIVOT_FIELDS.find(x => x.key === k) || {}).label || '';
+    const m = c.measure === '__count__' ? 'Row count'
+        : ({ sum: 'Total', count: 'Count of', avg: 'Average', min: 'Lowest', max: 'Highest' }[c.agg] + ' ' + lbl(c.measure));
+    return 'Pivot: ' + m + ' by ' + [lbl(c.rowDim), lbl(c.rowDim2)].filter(Boolean).join(' + ') + (c.colDim ? ' × ' + lbl(c.colDim) : '');
+}
+function setView(v, persist) {
+    S.view = v === 'pivot' && PIVOT ? 'pivot' : 'table';
+    document.getElementById('viewSel').value = S.view;
+    document.getElementById('rptWrap').style.display = S.view === 'pivot' ? 'none' : '';
+    document.getElementById('pivotHost').style.display = S.view === 'pivot' ? '' : 'none';
+    document.getElementById('expandBtn').parentNode.style.display = S.view === 'pivot' ? 'none' : '';
+    if (persist) _saveUserKeys({ view: S.view });
+    render(false);
+}
+
+function setAllOpen(open) {
+    S.collapsed = new Set(open ? [] : accounts().map(a => a.name));
+    F = Object.assign({}, F, { details: open });
+    remember();
+    render(false);
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    const sub = [S.company, rangeText(F)].filter(Boolean);
+    const sheets = [
+        { name: 'By Account', title: 'COGS by Account Summary', subtitle: sub,
+          cols: [{ key: 'name', label: 'COGS Account', w: 260, type: 'text' }, { key: 'lines', label: 'Lines', w: 70, type: 'int' },
+                 { key: 'total', label: 'COGS Amount', w: 130, type: 'money' }],
+          rows: accounts().map(a => ({ name: a.name, lines: a.n, total: a.total })), totals: true },
+        { name: 'Detail', title: 'COGS by Account Summary – Detail', subtitle: sub,
+          cols: [{ key: 'account', label: 'COGS Account', w: 220, type: 'text' }, { key: 'product', label: 'Part #', w: 140, type: 'text' },
+                 { key: 'desc', label: 'Description', w: 300, type: 'text' }, { key: 'cost', label: 'COGS Amount', w: 120, type: 'money' },
+                 { key: 'sonum', label: 'SO #', w: 90, type: 'text' }, { key: 'line', label: 'Line #', w: 60, type: 'int', noTotal: true },
+                 { key: 'postdate', label: 'Date Fulfilled', w: 100, type: 'date' }],
+          rows: S.rows.map(r => Object.assign({}, r, { postdate: r.postdate || null })), totals: true }
+    ];
+    if (S.view === 'pivot' && PIVOT) sheets.unshift(Object.assign(PIVOT.sheet('Pivot'), { title: 'COGS by Account Summary – ' + pivotText(), subtitle: sub }));
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'COGS_by_Account_' + ymd(new Date()), sheets });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's pages (fb-doc). Without fb-doc on the server, the
+// plain printout below: JxBrowser won't print the report page itself, so it
+// is built in a new window and printed there. Collapsed accounts print as
+// their totals.
+function printReport() {
+    if (PDF) {
+        if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+    const cs = cols();
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>COGS by Account Summary</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:11pt;font-weight:700}h2{text-align:center;font-size:14pt;margin:2px 0}.sub{text-align:center;font-size:8.5pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{font-size:8pt;text-align:left;padding:3px 5px;border-bottom:1px solid #000}' +
+        'td{font-size:8pt;padding:2px 5px;vertical-align:top}.num-cell{text-align:right}' +
+        'tr.rpt-grp td{font-weight:700;padding-top:7px;border-bottom:1px solid #999}.rpt-grp-meta{font-weight:400;color:#555;margin-left:8px}' +
+        'tfoot td{font-weight:700;border-top:1px solid #000}a{color:#000;text-decoration:none}.pp-neg{color:#000}' +
+        '@page{size:Letter portrait;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>COGS by Account Summary</h2><p class="sub">' + esc(rangeText(F)) + '</p>' +
+        '<table><thead>' + headRow(cs).replace(/ style="[^"]*"/g, '') + '</thead><tbody>' + bodyRows(cs, true).join('') +
+        '</tbody><tfoot>' + footRow(cs) + '</tfoot></table>' +
+        '<p style="font-size:7.5pt;margin-top:8px">Printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters the starting point for every user who hasn\'t saved their own?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        _acctMs = FBLib.Common.MultiSelect.create({ containerId: 'acctMs', items: [], placeholder: 'All accounts', maxTags: 2, onClose: applySoon });
+        _statusMs = FBLib.Common.MultiSelect.create({ containerId: 'statusMs', items: STATUS_OPTS, placeholder: 'Picked only', maxTags: 3, onClose: applySoon });
+
+        const fRange = document.getElementById('fRange');
+        fRange.innerHTML = RANGES.map(r => `<option value="${r[0]}">${esc(r[1])}</option>`).join('');
+        // A quick range fills the dates; editing a date makes the range Custom.
+        fRange.onchange = () => {
+            const p = presetDates(fRange.value);
+            if (fRange.value !== 'custom') {
+                document.getElementById('fFrom').value = p ? p[0] : '';
+                document.getElementById('fTo').value = p ? p[1] : '';
+            }
+            applySoon();
+        };
+        ['fFrom', 'fTo'].forEach(id => document.getElementById(id).addEventListener('change', () => { fRange.value = 'custom'; applySoon(); }));
+        const fProduct = document.getElementById('fProduct');
+        fProduct.addEventListener('change', applySoon);
+        fProduct.addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        document.getElementById('resetFiltersBtn').onclick = () => { writeFilters(DEFAULT_FILTERS); applySoon(); };
+
+        // Column resize / sort / reorder, and the Pivot view (fb-lib).
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({ table: document.getElementById('rpt'), onSort: () => render(true), onReorder: () => render(true) });
+        if (FBLib.Pivot) PIVOT = FBLib.Pivot.mount(document.getElementById('pivotHost'), {
+            fields: PIVOT_FIELDS, rows: pivotRows,
+            defaults: { rowDim: 'account', colDim: 'postdate', colBucket: 'month', measure: 'cost', agg: 'sum' },
+            format: (fld, v) => (fld && fld.type === 'money' ? fmtMoney(v) : null)
+        });
+        else document.getElementById('viewSelWrap').style.display = 'none';
+        document.getElementById('viewSel').addEventListener('change', e => setView(e.target.value, true));
+        document.getElementById('resetColsBtn').onclick = () => { if (COLS) { COLS.reset(); render(false); } };
+        S.view = _resolve('view', 'table') === 'pivot' && PIVOT ? 'pivot' : 'table';
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: document.getElementById('appView'), toggleBefore: document.getElementById('exportBtn'),
+                page: { size: 'Letter', orientation: 'portrait' },
+                doc: docSpec, title: () => 'COGS by Account Summary'
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+        setView(S.view, false);
+
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('expandBtn').onclick = () => setAllOpen(true);
+        document.getElementById('collapseBtn').onclick = () => setAllOpen(false);
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        const wrap = document.getElementById('rptWrap');
+        wrap.addEventListener('scroll', () => { if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 400) appendChunk(); });
+        document.getElementById('rpt').addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (a) {
+                e.preventDefault();
+                try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+                catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+                return;
+            }
+            const g = e.target.closest('tr.rpt-grp');
+            if (!g) return;
+            const name = g.dataset.acct;
+            if (S.collapsed.has(name)) S.collapsed.delete(name); else S.collapsed.add(name);
+            render(true);
+        });
+
+        await loadLookups();
+        F = savedFilters();
+        writeFilters(F);
+        await loadAll();
+    } catch (e) {
+        console.error('[COGS by Account Summary] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

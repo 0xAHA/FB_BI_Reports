@@ -30,6 +30,22 @@ published to the BI Reports folder or stamped by `tools/stamp`.
 |---|---|
 | `FB_Brand_Mockup.htm` | Shared component mockup: the reference for `scripts/fb-styles.css` and the report template |
 
+## Paperwork proof of concept (`Paperwork_POC/`)
+
+HTML replacements for the stock Jasper paperwork, printed and saved as PDF from
+the BI Report module's own toolbar: Sales Order Report, Sales Invoice, Purchase
+Order Report, Pick Ticket, Packing Slip, Shipping Invoice and Work Order Traveler.
+One engine (`fb-doc.js`: pagination plus the `FBDoc.app` screen shell) and one
+page per stock jrxml. See its README.
+
+## report_btn plugin (`report_btn/`)
+
+Fishbowl client plugin (Java, proof of concept): adds an **Apps** section to every
+module's Reports menu listing the BI reports whose fb-launch tag names that module or
+its menu group (e.g. PURCHASING), and opens one in its own window on the module's open
+record (`window.FB_LAUNCH`). First user: the Sales Order paperwork. Format in
+`Paperwork_POC/LAUNCH_CONTEXT.md`; build, install and client test in its README.
+
 ## Prototypes (`prototypes/`)
 
 Early tools kept for reference.
@@ -38,7 +54,6 @@ Early tools kept for reference.
 |---|---|
 | `Assembly_Disassembly_Helper.htm` | Disassembly in two steps: cycle-counts the assembly out, adds the component stock |
 | `BackOrderDashboard.htm` | Back-order dashboard |
-| `Inventory_Availability_by_Location_Group.htm` | Availability by location group; superseded by the published `- Inventory - Inventory Availability` |
 
 ## Tests and probes (`tests/`)
 

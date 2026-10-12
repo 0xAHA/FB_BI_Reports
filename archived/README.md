@@ -20,3 +20,5 @@ versions live in `Manufacturing/Archived/`.
 | `bi-script-javascript-api-guide.md` | `CLAUDE.md` (an earlier copy of the API guide) |
 | `SalesOrder/QuickOrder.htm` | `SalesOrder/QuickOrder_v1.2.htm` (v1.0, retired 2026-10-01 when v1.2 took over the `- Sales - QuickOrder V2` record and the portal. This is v1.0 as last maintained; tag `quickorder-v1.0` marks where v1.2 forked) |
 | `File_Storage_Test_shelved.htm` | — (shelved experiment) |
+| `iReport_Ports/Accounting/AdjustmentReport.htm`, `ExportSummary.htm`, `COGSByAccountSummary.htm`, `iReport_Ports/Inventory/ConsumptionReport.htm` | The same paths under `iReport_Ports/` (first versions, 2026-10-09, with filter drawers and KPI tiles; replaced the same day by the report-chrome layout) |
+| `iReport_Ports/Inventory/Inventory_Availability_by_Location_Group.htm` | `iReport_Ports/Inventory/InventoryAvailabilityByLG.htm` (the prototype from `Other_NOT_FOR_PRODUCTION/prototypes/`, moved and rebuilt as a faithful port 2026-10-10. It sorted on two customer-specific part custom fields, Medicine and Inv Assets) |

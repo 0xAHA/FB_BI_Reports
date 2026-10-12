@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  REPORT: Pick Ticket  (PROOF OF CONCEPT)
+  PATH:   Other_NOT_FOR_PRODUCTION/Paperwork_POC/PickTicket.htm
+  --------------------------------------------------------------------------------
+  HTML replica of Fishbowl's standard Picking/PickTicket.jrxml and its only
+  subreport Picking/subPickingOrders.jrxml, printed and saved as PDF from the BI
+  Report module's own Print / Save / Email buttons. The page IS the paper:
+  fb-doc.js lays the pick out into fixed-size sheets. Sheet 1 carries the title
+  band (logo, title, date, company, number + barcode, company address, the
+  Priority / Status / Scheduled / Type / Location Group / Carrier / Ship Service
+  block and the "Orders:" list); later sheets carry the short page header. The
+  Part / Quantity / Location / Tag / S# / Destination column header repeats on
+  every sheet the item table reaches; the page footer prints "Page X of Y".
+
+  SOURCE vs BUILD
+    This file is the source. `node build.js PickTicket.htm` inlines fb-doc.js and
+    fb-doc-fonts.css into dist/PickTicket.htm. Paste the dist file into the BI
+    Script Editor (fb-lib and fb-styles are the deployed shared records).
+
+  SCREEN
+    The toolbar, record picker (pick number, order numbers, customer; status
+    chips from pickstatus; created period), Settings drawer, paper choice and
+    launch handling are FBDoc.app (fb-doc.js); this file supplies the document.
+
+  FISHBOWL REPORT SETTINGS (Parameters button on the BI Report)
+    Pick         the pick to print (Fishbowl's own pick setting); adopted once,
+                 after that each user's in-page pick stands
+    Page_setup   paper size / margins (default A4, Jasper margins)
+    The setting tokens are in the text/plain blocks at the top of <body>. They
+    are substituted by global text replacement: never repeat them anywhere else.
+
+  LAUNCH FROM THE PICKING MODULE (LAUNCH_CONTEXT.md)
+    The fb-launch meta tag in <head> (content PICK) lists this report under
+    Reports > Apps in the Picking module (report_btn plugin). Opened from there,
+    the host's window.FB_LAUNCH names the open pick: it is printed straight away
+    and cannot be changed (the toolbar shows only Print and Settings).
+
+  OPTIONS
+    Every parameter of the jrxml is an option. The starting point is the stock
+    report's saved options (reportparameter rows of
+    ../reports/Picking/PickTicket.jasper), else the jrxml default. Combo boxes
+    use the values Fishbowl stores (the jrxml defaults of the two sort combos are
+    their display labels, "Location Name" / "Line Item"; both forms are read):
+      cbPrimarySortBy    mainlocation.name | mainlocation.sortorder
+      cbSecondarySortBy  1 (line item) | part.num
+      cbShowBarcodeAs    Order | Pick
+      cbSalesOrderContact 1 (SO contact) | 2 (SO customer)
+      ckShowCommitted    0 | 30 (also list Committed pick items)
+      ReportTitle        % = "Pick Ticket" (also blank / unset)
+    An admin can override them in Settings and save for everyone.
+
+  ITEMS (the jrxml's WHERE / GROUP BY / ORDER BY, done in the page)
+    Pick items in status Started (20), plus Committed (30) when ckShowCommitted
+    is on, plus non-inventory parts (part type 30) in any status but Hold (6)
+    and Finished (40). CombineLikeItems merges items with the same source LG,
+    location, destination LG + location, tag and part, summing the quantity.
+    Order: kit components first, grouped by kit (SO items with ShowKitHeaders),
+    then the primary sort (location name / location sort order), then the
+    secondary (line item / part number). Tracking is the BI bridge
+    getAllTrackingInfo('PickItem', ids) when present, else read from
+    trackinginfo (tableId of pickitem) and formatted "Abbr: value".
+
+  DELIBERATE DEVIATIONS FROM THE JRXML
+    - LEFT joins for pick type / status / priority / location group: a missing
+      lookup no longer blanks the whole ticket.
+    - A pick with no qualifying items still prints its header and orders, with
+      the column header and the line "No items to pick …" (the stock prints a
+      title band of blank fields).
+    - No literal "null": blank descriptions, location groups, destinations,
+      notes, contacts and addresses print nothing (the stock prints "null" in
+      "num - null", "null - Location", the TO "A -> null" line, the country).
+    - Order notes / customer PO are null-safe (the stock's .equals("") throws on
+      a null note or on a non-SO order's customer PO).
+    - "City, ST Zip" drops the comma / spaces of blank parts.
+    - Orders list: one row per order (and slot when Slot # is shown), ordered
+      by order type, order and slot; the stock's DISTINCT repeats an order once
+      per slot even when slots are hidden, in no set order.
+    - Tracking text is "Abbr: values" per tracking type, types two spaces apart,
+      when it comes from SQL (the server helper's exact format is not visible).
+    - Sheet 1 carries the title band's top (number, barcode) in the page-header
+      slot so later sheets keep the jrxml's 60pt page header; the barcode and
+      the small number reach below that slot exactly where the jrxml puts them.
+    - Location Sort Order sorts numerically (the stock's IF() makes the first
+      ORDER BY key a string, so sort order 10 came before 9); kits are grouped
+      by kit line id numerically.
+    - CombineLikeItems also keys on the UOM (the stock sums quantities across
+      UOMs) and prints the tracking and distinct notes of every merged item (the
+      stock prints only the first item's).
+    - Kit headers are re-shown "(continued)" when a kit runs over a page break.
+    - A very long item note / tracking list or order note splits across sheets
+      (the stock's Prevent bands only split when taller than a page); shorter
+      ones move whole, like the stock.
+    - ReportTitle is offered as a short list of titles (fb-doc has no text
+      option yet); a saved custom title from the stock presets is added to it.
+
+  STATUS: proof of concept. Desk-tested against demodb through the live-SQL
+  harness (tests/PickTicket.test.js). Not client-tested.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <script>
+        window.FB_REPORT = {
+            key:   'cdx.bi.paperwork.pick',
+            name:  'Pick Ticket',
+            build: 'UNSTAMPED'    // @fb-build (Other_NOT_FOR_PRODUCTION is not stamped)
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="fb-launch" content="PICK">
+    <meta name="description" content="The pick ticket for a pick, ready to print or save as PDF.">
+    <title>Pick Ticket</title>
+
+    <script>
+        {% Script fb-lib %}
+    </script>
+    <style>
+        {% Style fb-styles %}
+    </style>
+    <!-- @inline-style fb-doc-fonts.css -->
+    <!-- @inline-script fb-doc.js -->
+
+    <style>
+        /* ---------- the document (pt, black on white — paperwork, not dashboard) ---------- */
+        .pk-doc { font-size: 10pt; color: #000; line-height: 1.36; }
+        .pk-abs { position: absolute; overflow: hidden; }
+        .pk-hdr { position: relative; height: 60pt; }
+        .pk-logo { display: flex; align-items: flex-end; justify-content: flex-start; }
+        .pk-logo img { max-width: 100%; max-height: 100%; object-fit: contain; object-position: left bottom; }
+        .pk-title { font-size: 20pt; font-weight: 700; display: flex; align-items: center; justify-content: center; text-align: center; line-height: 1.1; }
+        .pk-date { font-size: 10pt; text-align: right; white-space: nowrap; }
+        .pk-company { font-size: 13pt; font-weight: 700; line-height: 1.2; }
+        .pk-num { font-size: 12pt; font-weight: 700; display: flex; justify-content: center; text-align: center; line-height: 1.2; white-space: nowrap; }
+        .pk-small { font-size: 9pt; font-weight: 700; text-align: center; white-space: nowrap; line-height: 1.3; }
+        .pk-bc { display: flex; justify-content: center; }
+        .pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+        /* Title band remainder (sheet 1, below the 60pt header). */
+        .pk-addr { white-space: pre-wrap; overflow-wrap: anywhere; min-height: 20pt; }
+        .pk-info { display: grid; margin-top: 7pt; }
+        .pk-info > div { min-height: 14pt; white-space: pre-wrap; overflow-wrap: anywhere; }
+        .pk-info .l { font-weight: 700; }
+        .pk-rule { height: 1pt; border-top: 1pt solid #000; }
+
+        /* Orders: (subPickingOrders) */
+        .pk-ordh { position: relative; height: 16pt; font-size: 9pt; font-weight: 700; }
+        .pk-ord { font-size: 10pt; }
+        .pk-ord .r1 { display: grid; }
+        .pk-ord .r1 > div { min-height: 14pt; }
+        .pk-ord .clip { height: 14pt; overflow: hidden; white-space: nowrap; }
+        .pk-ord .c { text-align: center; }
+        .pk-ord .nt { white-space: pre-wrap; overflow-wrap: anywhere; }
+        .pk-ord .r2 { height: 14pt; overflow: hidden; white-space: nowrap; }
+        .pk-ord .ln { height: 1pt; }
+        .pk-ord .ln.on { border-top: 0.5pt solid #CCCCCC; }
+        .pk-ord .ad { white-space: pre-wrap; overflow-wrap: anywhere; min-height: 14pt; }
+        .pk-ord .ad2 { border-bottom: 0.5pt solid #CCCCCC; }
+
+        /* Item table (column header + detail band). */
+        .pk-items th { font-size: 11pt; font-weight: 700; height: 16pt; padding: 0; vertical-align: middle; text-align: left;
+                       border-bottom: 1pt solid #000; white-space: nowrap; overflow: hidden; line-height: 1.2; }
+        .pk-items th.c { text-align: center; }
+        .pk-items tr.gap td { height: 3pt; padding: 0; font-size: 0; line-height: 0; }
+        .pk-items td { font-size: 10pt; padding: 0.2pt 0 0; line-height: 1.36; vertical-align: top; }
+        .pk-items tr.r td { height: 14pt; white-space: pre-wrap; }
+        .pk-items tr.r td.q { text-align: right; padding-right: 2pt; white-space: nowrap; }
+        .pk-items tr.r td.u { white-space: nowrap; }
+        .pk-items tbody.it > tr:last-child > td { padding-bottom: 1pt; }
+        .pk-items tr.kh td { height: 14pt; font-weight: 700; vertical-align: middle; padding: 0; }
+        .pk-items tr.kh td.cont { font-style: italic; }
+        .pk-items tr.none td { height: 20pt; vertical-align: middle; text-align: center; font-style: italic; }
+
+        /* Page footer: printed-at (left) and "Page X of" | count (right), 9pt. */
+        .pk-foot { position: relative; height: 14pt; font-size: 9pt; white-space: nowrap; }
+        .pk-foot .at { position: absolute; left: 0; bottom: 0; overflow: hidden; }
+        .pk-foot .pg .a { position: absolute; bottom: 0; text-align: right; padding-right: 4pt; }
+        .pk-foot .pg .b { position: absolute; bottom: 0; text-align: left; }
+        .pk-foot .pg .sp { display: none; }
+    </style>
+</head>
+<body>
+
+<!-- Fishbowl report settings: each token exactly once, never elsewhere. -->
+<script type="text/plain" id="set-pick">$PICK{Pick|0|Pick}</script>
+<script type="text/plain" id="set-print">$PRINT{Page_setup|A4|Print}</script>
+
+<script>
+// ============================================================================
+//  BAIL EARLY — needs the Fishbowl embedded browser, fb-lib and fb-doc.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2><p>Open this report from the Fishbowl client\'s BI module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+if (!window.FBLib || !window.FBDoc) {
+    document.body.insertAdjacentHTML('afterbegin', '<div style="background:#F0D7DD;color:#8A1E30;padding:10px 16px;font:13px sans-serif">' +
+        'Missing ' + (!window.FBLib ? 'fb-lib' : 'fb-doc') + '. Paste the BUILT file (dist/PickTicket.htm), not the source.</div>');
+    throw new Error('fb-lib / fb-doc missing');
+}
+
+// Shell access (FBDoc.app, created at the end of this script).
+function opt(name) { return APP.opt(name); }
+function label(key, dflt) { return APP.label(key, dflt); }
+function debugLog(m, t) { APP.debug(m, t); }
+
+var esc = FBDoc.esc;
+function num(v) { var n = parseFloat(v); return isNaN(n) ? 0 : n; }
+function round2(x) { return Math.sign(x) * Math.round(Math.abs(x) * 100 + 1e-7) / 100; }
+function has(v) { return v != null && String(v) !== ''; }
+function int(v) { var n = parseInt(v, 10); return isNaN(n) ? null : n; }
+
+// ============================================================================
+//  OPTIONS — jrxml defaults, stock presets, admin
+// ============================================================================
+var PICK_REPORT_PATH = '../reports/Picking/PickTicket.jasper';
+var PICKITEM_TABLE_ID = -1515431424;          // trackinginfo.tableId of pickitem
+var DEFAULT_TITLE = 'Pick Ticket';
+var TITLE_CHOICES = ['%', 'Pick Ticket', 'Pick List', 'Picking Slip'];
+
+function jrxmlDefaults() {
+    return {
+        ReportTitle: '%', ShowBarcode: true, cbShowBarcodeAs: 'Order', ShowCountry: false,
+        ShowAddress: false, ShowCustomerPO: true, ShowSlotNumber: false, cbSalesOrderContact: '1',
+        ckShowCommitted: '0', CombineLikeItems: false, ShowKitHeaders: true,
+        'Show SO Item Description': true, ShowLocationGroup: true,
+        // The jrxml defaults are the display labels "Location Name" / "Line Item";
+        // these are the values Fishbowl stores for them.
+        cbPrimarySortBy: 'mainlocation.name', cbSecondarySortBy: '1'
+    };
+}
+
+// The options shown in the Settings drawer.
+var OPTION_GROUPS = [
+    ['Header', [['ReportTitle', 'Title (% = Pick Ticket)', TITLE_CHOICES], ['ShowBarcode', 'Barcode'],
+        ['cbShowBarcodeAs', 'Barcode / number shows the (Order or Pick number)', ['Order', 'Pick']],
+        ['ShowCountry', 'Country in addresses']]],
+    ['Orders', [['ShowCustomerPO', 'Customer PO'], ['ShowSlotNumber', 'Slot #'], ['ShowAddress', 'Ship-to / remit-to address'],
+        ['cbSalesOrderContact', 'SO line shows (1 = SO contact, 2 = customer)', ['1', '2']]]],
+    ['Items', [['ckShowCommitted', 'Committed items too (30 = yes, 0 = no)', ['0', '30']], ['CombineLikeItems', 'Combine like items'],
+        ['ShowKitHeaders', 'Kit headers'], ['Show SO Item Description', 'SO item description'], ['ShowLocationGroup', 'Location group in locations']]],
+    ['Sorting', [['cbPrimarySortBy', 'Primary sort (location name / location sort order)', ['mainlocation.name', 'mainlocation.sortorder']],
+        ['cbSecondarySortBy', 'Secondary sort (1 = line item, part.num = part)', ['1', 'part.num']]]]
+];
+
+// Combo / check values -> meaning (accepts the stored value or the display label).
+function optStr(name) { var v = opt(name); return String(v == null ? '' : v).replace(/"/g, '').trim(); }
+function primaryBySortOrder() { return /sort\s*order|sortorder/i.test(optStr('cbPrimarySortBy')); }
+function secondaryByPart() { return /part/i.test(optStr('cbSecondarySortBy')); }
+function barcodeShowsPick() { return /^pick/i.test(optStr('cbShowBarcodeAs')); }
+function soShowsCustomer() { return /^2$|customer/i.test(optStr('cbSalesOrderContact')); }
+function showCommitted() { var v = opt('ckShowCommitted'); return v === true || /^(30|true|1|yes)$/i.test(String(v == null ? '' : v).trim()); }
+function reportTitle() {
+    var t = opt('ReportTitle');
+    return (t == null || t === true || t === false || String(t).trim() === '' || String(t).trim() === '%') ? DEFAULT_TITLE : String(t);
+}
+
+// ============================================================================
+//  DATA
+// ============================================================================
+async function fetchModel(pickId) {
+    var hdr = await FBDoc.q([
+        'SELECT pick.id, pick.num, pick.statusId AS statusid, pick.typeId AS typeid, ps.name AS pickstatus, pt.name AS picktype,',
+        '  pr.name AS priority, lg.name AS lgname, pick.locationGroupId AS lgid,',
+        '  pick.dateCreated AS datecreated, pick.dateScheduled AS datescheduled, company.name AS company,',
+        '  car.name AS carrier, cs.name AS carrierservice',
+        'FROM pick',
+        'LEFT JOIN pickstatus ps ON ps.id = pick.statusId',
+        'LEFT JOIN picktype pt ON pt.id = pick.typeId',
+        'LEFT JOIN priority pr ON pr.id = pick.priority',
+        'LEFT JOIN locationgroup lg ON lg.id = pick.locationGroupId',
+        'LEFT JOIN company ON company.id = 1',
+        // The jrxml finds the order (for its carrier) from the pick number's prefix.
+        "LEFT JOIN so ON LEFT(pick.num, 1) = 'S' AND so.num = SUBSTRING(pick.num, 2, 50)",
+        "LEFT JOIN po ON LEFT(pick.num, 1) = 'P' AND po.num = SUBSTRING(pick.num, 2, 50)",
+        "LEFT JOIN xo ON LEFT(pick.num, 1) = 'T' AND xo.num = SUBSTRING(pick.num, 2, 50)",
+        "LEFT JOIN carrier car ON car.id = (CASE LEFT(pick.num, 1) WHEN 'P' THEN po.carrierId WHEN 'S' THEN so.carrierId WHEN 'T' THEN xo.carrierId END)",
+        "LEFT JOIN carrierservice cs ON cs.id = (CASE LEFT(pick.num, 1) WHEN 'P' THEN po.carrierServiceId WHEN 'S' THEN so.carrierServiceId WHEN 'T' THEN xo.carrierServiceId END)",
+        'WHERE pick.id = ?'
+    ].join('\n'), [pickId]);
+    if (!hdr.length) throw new Error('Pick ' + pickId + ' not found');
+    var h = hdr[0];
+
+    // Every item of the pick; the status filter, Combine Like Items and the sort
+    // are applied in buildDoc (they follow options).
+    var rows = await FBDoc.q([
+        'SELECT pi.id AS itemid, pi.statusId AS statusid, pi.orderTypeId AS ordertypeid, pi.orderId AS orderid,',
+        '  (CASE pi.orderTypeId WHEN 10 THEN poi.poLineItem WHEN 20 THEN soi.soLineItem WHEN 40 THEN xoi.lineItem END) AS lineitem,',
+        '  part.num AS partnum, part.description AS partdesc, part.typeId AS parttypeid, soi.description AS soitemdesc,',
+        '  pi.qty, uom.code AS uom, pi.slotNum AS slotnum,',
+        '  ml.name AS locname, ml.sortOrder AS locsort, mlg.name AS loclg, mt.num AS tagnum,',
+        '  dl.name AS destloc, dlg.name AS destlg,',
+        '  (CASE pi.orderTypeId WHEN 10 THEN poi.note WHEN 20 THEN soi.note WHEN 40 THEN xoi.note END) AS note,',
+        '  kh.id AS kitid, kh.productNum AS kitnum, kh.description AS kitdesc',
+        'FROM pickitem pi',
+        'LEFT JOIN part ON part.id = pi.partId',
+        'LEFT JOIN uom ON uom.id = pi.uomId',
+        'LEFT JOIN tag mt ON mt.id = COALESCE(pi.srcTagId, pi.tagId)',
+        'LEFT JOIN location ml ON ml.id = pi.srcLocationId',
+        'LEFT JOIN locationgroup mlg ON mlg.id = ml.locationGroupId',
+        'LEFT JOIN tag dt ON dt.id = pi.destTagId',
+        'LEFT JOIN location dl ON dl.id = dt.locationId',
+        'LEFT JOIN locationgroup dlg ON dlg.id = dl.locationGroupId',
+        'LEFT JOIN poitem poi ON poi.id = pi.poItemId AND pi.orderTypeId = 10',
+        'LEFT JOIN soitem soi ON soi.id = pi.soItemId AND pi.orderTypeId = 20',
+        'LEFT JOIN xoitem xoi ON xoi.id = pi.xoItemId AND pi.orderTypeId = 40',
+        'LEFT JOIN objecttoobject oto ON oto.recordId1 = soi.id AND oto.typeId = 30',
+        'LEFT JOIN soitem kh ON kh.id = oto.recordId2 AND kh.typeId = 80',
+        'WHERE pi.pickId = ?',
+        'ORDER BY pi.id'
+    ].join('\n'), [pickId]);
+    var seen = {}, items = [];
+    rows.forEach(function (r) { if (!seen[r.itemid]) { seen[r.itemid] = true; items.push(r); } });
+
+    // subPickingOrders: one row per order (+ slot) on the pick.
+    var orders = await FBDoc.q([
+        'SELECT d.orderid, d.ordertypeid, d.slotnum, ot.name AS ordertype,',
+        '  po.num AS ponum, po.vendorContact AS poextra, po.note AS ponote,',
+        '  so.num AS sonum, so.customerContact AS soextra, so.note AS sonote, so.customerPO AS socustomerpo, sc.name AS socustomer,',
+        '  wo.num AS wonum, wc.name AS woextra, wo.note AS wonote,',
+        '  xo.num AS tonum, fl.name AS fromlg, tl.name AS tolg, xo.note AS tonote,',
+        '  (CASE d.ordertypeid WHEN 10 THEN po.remitAddress WHEN 20 THEN so.shipToAddress WHEN 40 THEN xo.shipToAddress END) AS address,',
+        '  (CASE d.ordertypeid WHEN 10 THEN po.remitCity WHEN 20 THEN so.shipToCity WHEN 40 THEN xo.shipToCity END) AS city,',
+        '  (CASE d.ordertypeid WHEN 10 THEN po.remitZip WHEN 20 THEN so.shipToZip WHEN 40 THEN xo.shipToZip END) AS zip,',
+        '  (CASE d.ordertypeid WHEN 10 THEN pst.code WHEN 20 THEN sst.code WHEN 40 THEN xst.code END) AS state,',
+        '  (CASE d.ordertypeid WHEN 10 THEN pco.name WHEN 20 THEN sco.name WHEN 40 THEN xco.name END) AS country',
+        'FROM (SELECT DISTINCT orderId AS orderid, orderTypeId AS ordertypeid, slotNum AS slotnum FROM pickitem WHERE pickId = ?) d',
+        'JOIN ordertype ot ON ot.id = d.ordertypeid',
+        'LEFT JOIN po ON po.id = d.orderid AND d.ordertypeid = 10',
+        'LEFT JOIN so ON so.id = d.orderid AND d.ordertypeid = 20',
+        'LEFT JOIN wo ON wo.id = d.orderid AND d.ordertypeid = 30',
+        'LEFT JOIN xo ON xo.id = d.orderid AND d.ordertypeid = 40',
+        'LEFT JOIN locationgroup fl ON fl.id = xo.fromLGId',
+        'LEFT JOIN locationgroup tl ON tl.id = xo.shipToLGId',
+        'LEFT JOIN stateconst pst ON pst.id = po.remitStateId',
+        'LEFT JOIN stateconst sst ON sst.id = so.shipToStateId',
+        'LEFT JOIN stateconst xst ON xst.id = xo.shipToStateId',
+        'LEFT JOIN countryconst pco ON pco.id = po.remitCountryId',
+        'LEFT JOIN countryconst sco ON sco.id = so.shipToCountryId',
+        'LEFT JOIN countryconst xco ON xco.id = xo.shipToCountryId',
+        'LEFT JOIN customer wc ON wc.id = wo.customerId',
+        'LEFT JOIN customer sc ON sc.id = so.customerId',
+        'ORDER BY d.ordertypeid, d.orderid, d.slotnum'
+    ].join('\n'), [pickId]);
+
+    var trk = await fetchTracking(pickId, items.map(function (r) { return parseInt(r.itemid, 10); }));
+
+    var companyAddress = '';
+    try { companyAddress = typeof getCompanyAddress === 'function' ? String(getCompanyAddress(parseInt(h.lgid, 10), !!opt('ShowCountry')) || '') : ''; }
+    catch (e) { debugLog('getCompanyAddress failed: ' + e.message, 'warn'); }
+
+    return { h: h, items: items, orders: orders, tracking: trk.map, trackingSource: trk.source, companyAddress: companyAddress };
+}
+
+// ---- Tracking: the BI bridge when present (the stock calls the same server
+// helper per item), else the trackinginfo rows of each pick item.
+async function fetchTracking(pickId, ids) {
+    if (!ids.length) return { map: {}, source: 'none' };
+    if (typeof getAllTrackingInfo === 'function') {
+        try {
+            var raw = getAllTrackingInfo('PickItem', ids.join(','));
+            var map = readBridgeTracking(raw, ids);
+            if (map && Object.keys(map).length) return { map: map, source: 'bridge' };
+            debugLog('getAllTrackingInfo: no usable result (' + typeof raw + ': ' + String(raw).slice(0, 200) + '), using trackinginfo SQL', 'warn');
+        } catch (e) { debugLog('getAllTrackingInfo failed (' + FBDoc.errText(e) + '), using trackinginfo SQL', 'warn'); }
+    }
+    var rows = await FBDoc.q([
+        'SELECT ti.recordId AS itemid, ti.id AS tid, ptr.abbr, ptr.typeId AS ttype, ptr.sortOrder AS tsort,',
+        '  ti.info, ti.infoDate AS infodate, ti.infoDouble AS infodouble, ti.infoInteger AS infointeger, sn.serialNum AS serialnum',
+        'FROM trackinginfo ti',
+        'JOIN parttracking ptr ON ptr.id = ti.partTrackingId',
+        'LEFT JOIN trackinginfosn sn ON sn.trackingInfoId = ti.id',
+        'WHERE ti.tableId = ? AND ti.recordId IN (SELECT id FROM pickitem WHERE pickId = ?)',
+        'ORDER BY ti.recordId, ptr.sortOrder, ptr.id, ti.id, sn.id'
+    ].join('\n'), [PICKITEM_TABLE_ID, pickId]);
+    return { map: formatTracking(rows), source: 'sql' };
+}
+
+// The bridge's return shape is not documented: accept a JSON (or plain) string,
+// an object keyed by id, or an array (strings in id order, or {id, info} rows).
+function readBridgeTracking(raw, ids) {
+    var v = raw;
+    if (v == null) return null;
+    if (typeof v === 'string') {
+        var s = v.trim();
+        if (/^[[{]/.test(s)) { try { v = JSON.parse(s); } catch (_) { v = s; } }
+        else return ids.length === 1 ? keyed([[ids[0], s]]) : null;
+    }
+    var text = function (x) { return Array.isArray(x) ? x.filter(has).map(String).join('  ') : (x == null ? '' : typeof x === 'object' ? (x.info || x.tracking || x.text || '') : String(x)); };
+    if (Array.isArray(v)) {
+        if (v.length === ids.length && v.every(function (x) { return x == null || typeof x === 'string'; })) {
+            return keyed(v.map(function (x, i) { return [ids[i], text(x)]; }));
+        }
+        var pairs = v.filter(function (x) { return x && typeof x === 'object' && (x.id != null || x.recordId != null); })
+            .map(function (x) { return [x.id != null ? x.id : x.recordId, text(x)]; });
+        return pairs.length ? keyed(pairs) : null;
+    }
+    if (typeof v === 'object') return keyed(Object.keys(v).map(function (k) { return [k, text(v[k])]; }));
+    return null;
+}
+function keyed(pairs) { var m = {}; pairs.forEach(function (p) { if (has(p[1])) m[String(parseInt(p[0], 10))] = String(p[1]); }); return m; }
+
+// "Abbr: value" per tracking type, values of one type joined by ", ", types by
+// two spaces (the separator the server helper passes).
+function formatTracking(rows) {
+    var E = APP.env, per = {};
+    rows.forEach(function (r) {
+        var id = String(r.itemid), t = parseInt(r.ttype, 10), v = '';
+        switch (t) {
+            case 20: case 30: v = FBDoc.fmt.date(E.date, r.infodate); break;
+            case 40: v = r.serialnum || ''; break;
+            case 50: v = FBDoc.fmt.number('#,##0.00', r.infodouble); break;
+            case 60: v = FBDoc.fmt.number(E.qty, r.infodouble); break;
+            case 70: v = r.infointeger == null ? '' : String(r.infointeger); break;
+            case 80: v = r.infointeger == null ? '' : (parseInt(r.infointeger, 10) === 1 ? 'Yes' : 'No'); break;
+            default: v = r.info || '';
+        }
+        if (!has(v)) return;
+        var p = per[id] = per[id] || { order: [], vals: {} };
+        var key = String(r.abbr || '');
+        if (!p.vals[key]) { p.vals[key] = []; p.order.push(key); }
+        if (p.vals[key].indexOf(v) < 0) p.vals[key].push(v);
+    });
+    var out = {};
+    Object.keys(per).forEach(function (id) {
+        out[id] = per[id].order.map(function (k) { return k + ': ' + per[id].vals[k].join(', '); }).join('  ');
+    });
+    return out;
+}
+
+// ============================================================================
+//  ITEMS — the jrxml's WHERE, GROUP BY (Combine Like Items) and ORDER BY
+// ============================================================================
+function pickItems(model) {
+    var committed = showCommitted();
+    var rows = model.items.filter(function (it) {
+        var st = int(it.statusid), nonInv = int(it.parttypeid) === 30;
+        return st === 20 || (committed && st === 30) || (nonInv && st !== 6 && st !== 40);
+    }).map(function (it) {
+        var id = String(it.itemid);
+        return Object.assign({}, it, { ids: [id], qtySum: num(it.qty), notes: has(it.note) ? [String(it.note)] : [],
+            trk: has(model.tracking[id]) ? [model.tracking[id]] : [] });
+    });
+
+    if (opt('CombineLikeItems')) {
+        var groups = {}, out = [];
+        rows.forEach(function (r) {
+            var key = [r.loclg, r.locname, r.destlg, r.destloc, r.tagnum, r.partnum, r.uom].map(function (x) { return x == null ? '\u0001' : String(x).toLowerCase(); }).join('\u0002');
+            var g = groups[key];
+            if (!g) { groups[key] = r; out.push(r); return; }
+            g.qtySum += num(r.qty);
+            g.ids.push(String(r.itemid));
+            r.notes.forEach(function (n) { if (g.notes.indexOf(n) < 0) g.notes.push(n); });
+            r.trk.forEach(function (t) { if (g.trk.indexOf(t) < 0) g.trk.push(t); });
+        });
+        rows = out;
+    }
+
+    var kitMode = !!opt('ShowKitHeaders'), bySortOrder = primaryBySortOrder(), byPart = secondaryByPart();
+    var str = function (v) { return v == null ? null : String(v).toLowerCase(); };
+    var cmp = function (a, b, numeric) {          // MySQL ASC: NULLs first
+        if (a == null || a === '') return (b == null || b === '') ? 0 : -1;
+        if (b == null || b === '') return 1;
+        if (numeric) return num(a) - num(b);
+        return a < b ? -1 : a > b ? 1 : 0;
+    };
+    var inKit = function (r) { return kitMode && int(r.ordertypeid) === 20 && r.kitid != null; };
+    rows.sort(function (a, b) {
+        var ka = inKit(a), kb = inKit(b);
+        if (ka !== kb) return ka ? -1 : 1;
+        if (ka && int(a.kitid) !== int(b.kitid)) return int(a.kitid) - int(b.kitid);
+        var c = bySortOrder ? cmp(a.locsort, b.locsort, true) : cmp(str(a.locname), str(b.locname));
+        if (c) return c;
+        c = byPart ? cmp(str(a.partnum), str(b.partnum)) : cmp(a.lineitem, b.lineitem, true);
+        if (c) return c;
+        return int(a.itemid) - int(b.itemid);
+    });
+    rows.forEach(function (r) { r._kit = inKit(r); });
+    return rows;
+}
+
+// Long text moves whole with its row (the jrxml's Prevent bands); only text
+// that could not fit a sheet anyway is allowed to split.
+function isLong(s) {
+    var lines = 0;
+    String(s || '').split('\n').forEach(function (p) { lines += Math.max(1, Math.ceil(p.length / 80)); });
+    return lines > 14;
+}
+
+// ============================================================================
+//  DOCUMENT BUILD — bands + blocks for FBDoc.paginate
+// ============================================================================
+var COLS = [164, 47, 31, 112, 52, 24, 122];   // Part | Qty | UOM | Location | Tag | S# | Destination (jrxml x 0..552)
+
+function colWidths(ws, CW) {
+    var total = ws.reduce(function (a, b) { return a + b; }, 0);
+    var out = ws.map(function (w) { return Math.round(w * CW / total * 100) / 100; });
+    var diff = Math.round((CW - out.reduce(function (a, b) { return a + b; }, 0)) * 100) / 100;
+    out[out.length - 1] = Math.round((out[out.length - 1] + diff) * 100) / 100;
+    return out;
+}
+function joinDash(a, b, withA) {
+    return (withA ? [a, b] : [b]).filter(has).join(' - ');
+}
+
+function buildDoc(model, geom) {
+    var h = model.h, E = APP.env;
+    var K = geom.CWpt / 552;                        // jrxml x-positions scale to this page's content width
+    var X = function (x) { return (x * K).toFixed(2) + 'pt'; };
+    var fmtD = function (v) { return FBDoc.fmt.date(E.date, v); };
+    var title = reportTitle();
+    var pickNum = String(h.num || '');
+    var orderNum = pickNum.substring(1);           // the jrxml's ORDERNUMBER field
+    // The jrxml's ORDERNUMBER variable: the barcode and the big number.
+    var di = barcodesHaveDI(E);
+    var bigNum = barcodeShowsPick() ? pickNum : (di == null || String(di).toLowerCase() === 'true') ? pickNum : orderNum;
+    APP.setTitle(title + ' ' + pickNum);
+
+    // ---- page header: sheet 1 = the top of the title band; later sheets = the
+    // 60pt page header. The barcode and the small number reach below the 60pt
+    // band on sheet 1, beside the company address (the first body block).
+    var logo = E.logo ? '<img src="' + E.logo + '" alt="">' : '';
+    var pageHeader = function (ctx) {
+        var first = ctx.first;
+        return '<div class="pk-doc pk-hdr">' +
+            '<div class="pk-abs pk-title" style="left:0;top:0;width:' + X(552) + ';height:40pt">' + esc(title) + '</div>' +
+            '<div class="pk-abs pk-logo" style="left:0;top:0;width:' + X(169) + ';height:40pt">' + logo + '</div>' +
+            '<div class="pk-abs pk-date" style="left:0;top:0;width:' + X(552) + ';height:14pt">' + esc(fmtD(h.datecreated)) + '</div>' +
+            '<div class="pk-abs pk-company" style="left:0;top:40pt;width:' + X(370) + ';height:20pt">' + esc(h.company) + '</div>' +
+            (first
+                ? '<div class="pk-abs pk-num" style="left:' + X(370) + ';top:20pt;width:' + X(182) + ';height:20pt;align-items:flex-end">' + esc(bigNum) + '</div>' +
+                  (opt('ShowBarcode') && has(pickNum)
+                      ? '<div class="pk-abs pk-bc" style="left:' + X(370) + ';top:40pt;width:' + X(182) + ';height:27pt">' + barcodeSvg(bigNum, 182 * K) + '</div>' : '') +
+                  '<div class="pk-abs pk-small" style="left:' + X(370) + ';top:67pt;width:' + X(182) + ';height:13pt">' + esc(orderNum) + '</div>'
+                : '<div class="pk-abs pk-num" style="left:' + X(370) + ';top:40pt;width:' + X(182) + ';height:20pt;align-items:center">' + esc(bigNum) + '</div>') +
+            '</div>';
+    };
+
+    // ---- page footer (every sheet; the jrxml has no last-page footer) ----
+    var printed = FBDoc.fmt.printedAt();
+    var pageFooter = function (ctx) {
+        return '<div class="pk-doc pk-foot">' +
+            '<span class="at" style="width:' + X(321) + '">' + esc(printed) + '</span>' +
+            '<span class="pg"><span class="a" style="left:' + X(321) + ';width:' + X(210) + '">Page ' + ctx.pageNo + ' of</span>' +
+            '<span class="sp"> </span><span class="b" style="left:' + X(531) + ';width:' + X(21) + '">' + ctx.pageCount + '</span></span></div>';
+    };
+
+    var blocks = [], tables = {};
+
+    // ---- title band remainder: company address, info block, rule ----
+    var info = [
+        ['Priority:', h.priority, 'Status:', h.pickstatus],
+        ['Scheduled:', fmtD(h.datescheduled), 'Type:', h.picktype],
+        ['Location Group:', h.lgname],
+        ['Carrier:', h.carrier],
+        ['Ship Service:', h.carrierservice]
+    ];
+    var cell = function (cls, v) { return '<div' + (cls ? ' class="' + cls + '"' : '') + '>' + esc(v == null ? '' : v) + '</div>'; };
+    blocks.push({ html:
+        '<div class="pk-doc">' +
+        '<div class="pk-addr" style="width:' + X(370) + '">' + esc(model.companyAddress) + '</div>' +
+        '<div class="pk-info" style="grid-template-columns:' + X(95) + ' ' + X(241) + ' ' + X(50) + ' ' + X(166) + '">' +
+        info.map(function (r) { return cell('l', r[0]) + cell('', r[1]) + (r.length > 2 ? cell('l', r[2]) + cell('', r[3]) : '<div></div><div></div>'); }).join('') +
+        '</div>' +
+        '<div style="height:5pt"></div><div class="pk-rule"></div></div>' });
+
+    // ---- Orders: (subPickingOrders) ----
+    var showSlot = !!opt('ShowSlotNumber'), showPO = !!opt('ShowCustomerPO'), showAddr = !!opt('ShowAddress');
+    blocks.push({ kwn: true, html:
+        '<div class="pk-doc pk-ordh" style="margin-top:1pt;width:' + X(540) + '">' +
+        '<div class="pk-abs" style="left:0;top:0;width:' + X(121) + ';height:16pt">Orders:</div>' +
+        (showSlot ? '<div class="pk-abs" style="left:' + X(showPO ? 202 : 121) + ';top:0;width:' + X(50) + ';height:16pt;text-align:center">Slot #</div>' : '') +
+        '</div>' });
+    var seenOrder = {};
+    var orders = model.orders.filter(function (o) {           // one row per order (+ slot when shown)
+        var k = o.ordertypeid + ':' + o.orderid + (showSlot ? ':' + o.slotnum : '');
+        if (seenOrder[k]) return false;
+        seenOrder[k] = true; return true;
+    });
+    var gridCols = [X(40), X(81)].concat(showPO ? [X(81)] : []).concat(showSlot ? [X(50)] : []).concat(['minmax(0, 1fr)']).join(' ');
+    orders.forEach(function (o, oi) {
+        var t = int(o.ordertypeid);
+        var numTxt = t === 10 ? o.ponum : t === 20 ? o.sonum : t === 30 ? o.wonum : t === 40 ? o.tonum : '';
+        var note = t === 10 ? o.ponote : t === 20 ? o.sonote : t === 30 ? o.wonote : t === 40 ? o.tonote : '';
+        var extra = t === 10 ? o.poextra
+            : t === 20 ? (soShowsCustomer() ? o.socustomer : o.soextra)
+            : t === 30 ? o.woextra
+            : t === 40 ? [o.fromlg, o.tolg].filter(has).join(' -> ') : '';
+        var noteTxt = has(note) ? 'Notes: ' + note : '';
+        var split = isLong(noteTxt);
+        var r1 = '<div class="clip">' + esc((o.ordertype || '') + ' #') + '</div>' +
+            '<div class="clip">' + esc(numTxt || '') + '</div>' +
+            (showPO ? '<div class="clip">' + esc(has(o.socustomerpo) ? 'PO: ' + o.socustomerpo : '') + '</div>' : '') +
+            (showSlot ? '<div class="clip c">' + esc(o.slotnum == null ? '' : o.slotnum) + '</div>' : '') +
+            '<div class="nt"' + (showPO && !showSlot ? ' style="padding-left:' + X(15) + '"' : '') + (split ? ' data-fbdoc-split' : '') + '>' + esc(noteTxt) + '</div>';
+        var addr = '';
+        if (showAddr && t !== 30) {
+            var csz = [o.city, [o.state, o.zip].filter(has).join(' ')].filter(has).join(', ');
+            addr = '<div class="ad" style="padding-left:' + X(40) + '">' + esc(o.address || '') + '</div>' +
+                '<div class="ad ad2" style="padding-left:' + X(40) + '">' + esc(csz + (opt('ShowCountry') && has(o.country) ? '\n' + o.country : '')) + '</div>';
+        }
+        blocks.push({ split: split, kwn: oi === orders.length - 1, html:
+            '<div class="pk-doc pk-ord" style="width:' + X(540) + '">' +
+            '<div class="r1" style="grid-template-columns:' + gridCols + '">' + r1 + '</div>' +
+            '<div class="r2" style="padding-left:' + X(40) + '">' + esc(extra || '') + '</div>' +
+            '<div class="ln' + (showAddr ? '' : ' on') + '"></div>' + addr + '</div>' });
+    });
+    // The rule under the subreport (jrxml y 175, floats below it).
+    blocks.push({ kwp: orders.length > 0, html: '<div class="pk-doc"><div class="pk-rule"></div></div>' });
+
+    // ---- item table: column header + detail band (+ kit group headers) ----
+    var widths = colWidths(COLS, geom.CWpt);
+    var combine = !!opt('CombineLikeItems');
+    tables.items = {
+        className: 'pk-doc pk-items',
+        colgroup: FBDoc.Columns.colgroup(widths),
+        thead: '<thead><tr><th>Part</th><th class="c" colspan="2">Quantity</th><th>Location</th><th>Tag</th><th>' + (combine ? '' : 'S#') + '</th><th>Destination</th></tr>' +
+            '<tr class="gap"><td colspan="7"></td></tr></thead>'
+    };
+    var items = pickItems(model);
+    var withSoDesc = !!opt('Show SO Item Description'), withLg = !!opt('ShowLocationGroup');
+    if (!items.length) {
+        blocks.push({ table: 'items', html: '<tr class="none"><td colspan="7">No items to pick (only Started' + (showCommitted() ? ' and Committed' : '') + ' items are shown).</td></tr>' });
+    }
+    var lastKit = null;
+    items.forEach(function (it) {
+        var kitKey = it._kit ? 'kit' + it.kitid : null;
+        if (kitKey && kitKey !== lastKit) {
+            var kitTxt = (it.kitnum || '') + (withSoDesc && has(it.kitdesc) ? ' - ' + it.kitdesc : '');
+            blocks.push({ table: 'items', kwn: true, groupHeader: kitKey, cls: 'kh',
+                html: '<tr class="kh"><td colspan="7">' + esc(kitTxt) + '</td></tr>',
+                repeatHtml: '<tr class="kh"><td colspan="7" class="cont">' + esc(kitTxt + ' (continued)') + '</td></tr>' });
+        }
+        lastKit = kitKey;
+        var desc = withSoDesc ? (has(it.soitemdesc) ? it.soitemdesc : it.partdesc) : it.partdesc;
+        var partTxt = [it.partnum, desc].filter(has).join(' - ');
+        var extra = it.trk.concat(it.notes).filter(has).join('\n');
+        var split = isLong(extra);
+        var html =
+            '<tr class="r">' +
+            '<td' + (kitKey ? ' style="padding-left:' + X(10) + '"' : '') + '>' + esc(partTxt) + '</td>' +
+            '<td class="q">' + esc(FBDoc.fmt.number(E.qty, it.qtySum)) + '</td>' +
+            '<td class="u">' + esc(it.uom || '') + '</td>' +
+            '<td>' + esc(joinDash(it.loclg, it.locname, withLg)) + '</td>' +
+            '<td>' + esc(it.tagnum == null ? '' : it.tagnum) + '</td>' +
+            '<td>' + (combine ? '' : esc(it.slotnum == null ? '' : it.slotnum)) + '</td>' +
+            '<td>' + esc(joinDash(it.destlg, it.destloc, withLg)) + '</td></tr>' +
+            (extra ? '<tr class="x"><td colspan="7"><div class="pre" style="padding-left:' + X(88) + '"' + (split ? ' data-fbdoc-split' : '') + '>' + esc(extra) + '</div></td></tr>' : '');
+        var block = { table: 'items', cls: 'it', split: split, html: html };
+        if (kitKey) block.grp = [kitKey];
+        blocks.push(block);
+    });
+
+    return { id: 'pick-' + pickNum, pageHeader: pageHeader, pageFooter: pageFooter, lastPageFooter: null, tables: tables, blocks: blocks };
+}
+
+// Code 128 at Jasper's natural 1pt module, narrowed only when it would not fit the box.
+function barcodeSvg(text, boxPt) {
+    var mods = FBDoc.code128.encode(text).modules.reduce(function (a, b) { return a + b; }, 0);
+    return FBDoc.code128.svg(text, { module: Math.min(1, boxPt / mods), quiet: 0 });
+}
+
+// The "Barcodes have DI" system property, raw (undefined when it is not set).
+function barcodesHaveDI(E) {
+    var s = (E && E.sys) || {};
+    var k = Object.keys(s).filter(function (x) { return x.toLowerCase() === 'barcodes have di'; })[0];
+    return k == null ? null : s[k];
+}
+
+// ============================================================================
+//  PICK PICKER — typeahead + browse with status / period filters (per user)
+// ============================================================================
+var PERIODS = [{ value: '30', label: '30 days' }, { value: '90', label: '90 days' }, { value: '365', label: '1 year' }, { value: 'all', label: 'All' }];
+function pickFilterSql(f) {
+    var where = [];
+    var st = ((f && f.status) || []).map(function (x) { return parseInt(x, 10); }).filter(function (n) { return !isNaN(n); });
+    if (st.length) where.push('pick.statusId IN (' + st.join(',') + ')');
+    var days = parseInt(f && f.period, 10);
+    if (days > 0) where.push('pick.dateCreated >= DATE_SUB(CURDATE(), INTERVAL ' + days + ' DAY)');
+    return where;
+}
+var ORDER_JOINS =
+    ' LEFT JOIN so ON pi.orderTypeId = 20 AND so.id = pi.orderId LEFT JOIN customer c ON c.id = so.customerId' +
+    ' LEFT JOIN po ON pi.orderTypeId = 10 AND po.id = pi.orderId LEFT JOIN wo ON pi.orderTypeId = 30 AND wo.id = pi.orderId' +
+    ' LEFT JOIN xo ON pi.orderTypeId = 40 AND xo.id = pi.orderId';
+async function searchPicks(term, f) {
+    var where = pickFilterSql(f), params = [];
+    if (term) {
+        var like = '%' + term + '%';
+        where.push('(pick.num LIKE ? OR EXISTS (SELECT 1 FROM pickitem pi' + ORDER_JOINS +
+            ' WHERE pi.pickId = pick.id AND (so.num LIKE ? OR c.name LIKE ? OR so.customerPO LIKE ? OR po.num LIKE ? OR wo.num LIKE ? OR xo.num LIKE ?)))');
+        params.push(like, like, like, like, like, like, like);
+    }
+    var rows = await FBDoc.q(
+        'SELECT pick.id, pick.num, ps.name AS status, pt.name AS type, pick.dateCreated AS datecreated, lg.name AS lgname,' +
+        ' (SELECT GROUP_CONCAT(DISTINCT COALESCE(so.num, po.num, wo.num, xo.num) SEPARATOR \', \') FROM pickitem pi' + ORDER_JOINS +
+        '   WHERE pi.pickId = pick.id) AS orders,' +
+        ' (SELECT GROUP_CONCAT(DISTINCT c.name SEPARATOR \', \') FROM pickitem pi' + ORDER_JOINS + ' WHERE pi.pickId = pick.id) AS customers ' +
+        'FROM pick LEFT JOIN pickstatus ps ON ps.id = pick.statusId LEFT JOIN picktype pt ON pt.id = pick.typeId ' +
+        'LEFT JOIN locationgroup lg ON lg.id = pick.locationGroupId ' +
+        (where.length ? 'WHERE ' + where.join(' AND ') + ' ' : '') +
+        'ORDER BY pick.dateCreated DESC, pick.id DESC LIMIT 60', params);
+    return rows.map(function (r) {
+        var sub = [r.orders, r.customers].filter(has).join(' · ');
+        return { value: r.id, label: r.num, sub: sub,
+                 meta: [r.status || '', FBDoc.fmt.date(APP.env ? APP.env.date : 'dd/MM/yyyy', r.datecreated), [r.type, r.lgname].filter(has).join(' · ')] };
+    });
+}
+
+// ============================================================================
+//  THE APP — FBDoc.app runs the screen; this report supplies its document.
+// ============================================================================
+var APP = FBDoc.app({
+    title: 'Pick Ticket',
+    record: { code: 'PICK', table: 'pick', numColumn: 'num', noun: 'pick', setting: 'set-pick',
+        // No setting and no last pick: the newest Started or Committed pick.
+        newest: async function () {
+            var r = await FBDoc.q('SELECT id FROM pick WHERE statusId IN (20, 30) ORDER BY dateCreated DESC, id DESC LIMIT 1');
+            if (!r.length) r = await FBDoc.q('SELECT MAX(id) AS id FROM pick');
+            return r.length ? parseInt(r[0].id, 10) || 0 : 0;
+        } },
+    presets: function () { return [PICK_REPORT_PATH]; },
+    defaults: function () {
+        // A custom title saved on the stock report joins the title choices
+        // (APP.opt reads the stock presets here; the defaults are not set yet).
+        var t = APP.opt('ReportTitle');
+        if (has(t) && typeof t === 'string' && TITLE_CHOICES.indexOf(t) < 0) TITLE_CHOICES.push(t);
+        return jrxmlDefaults();
+    },
+    options: OPTION_GROUPS,
+    optionsIntro: 'the stock Pick Ticket report',
+    fetch: function (id) { return fetchModel(id); },
+    build: function (model, geom) { return buildDoc(model, geom); },
+    picker: {
+        placeholder: 'Pick #, order # or customer…',
+        alias: 'pick',
+        where: pickFilterSql,
+        search: function (term, f) { return searchPicks(term, f); },
+        filters: async function (saved) {
+            var statuses = [];
+            try { statuses = await FBDoc.q('SELECT id, name FROM pickstatus ORDER BY id'); } catch (e) { debugLog('pickstatus: ' + FBDoc.errText(e), 'warn'); }
+            return [
+                { key: 'status', label: 'Status', multi: true, value: saved.status || [],
+                  options: statuses.map(function (r) { return { value: String(r.id), label: r.name }; }) },
+                { key: 'period', label: 'Created', value: saved.period || '365', options: PERIODS }
+            ];
+        }
+    }
+});
+</script>
+
+</body>
+</html>

@@ -1,0 +1,950 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Asset Valuation by Account (iReport port)
+  PATH:   iReport_Ports/Inventory/AssetValuationByAccount.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard Inventory/AssetValuationByAccount.jrxml
+  ("the quantity and total value of all parts currently on hand, broken
+  down by Inventory Asset account"). Same tables, same filters, same
+  columns and totals; only the presentation is interactive.
+
+    Parts      Inventory parts (part.typeId 10), one row each, grouped by
+               the part's Inventory Asset account (part.inventoryAccountId);
+               none set is "Use Default", as the original.
+    Values     Three totals per part, as the original's three columns:
+                 LIFO/FIFO Cost  SUM(costlayer.totalCost) of open layers
+                                 (statusId 10)
+                 Std. Cost       part.stdCost x partcost.qty
+                 Average Cost    partcost.totalCost
+               For a past "Part cost as of" date they come from
+               partcosthistory instead: stdCost x quantity, totalCost,
+               avgCost x quantity.
+    Filters    Part number (LIKE), asset account, Hide zero quantity (the
+               part's on-hand from the qtyonhand view, today's, whatever the
+               date, as the original), Hide inactive parts (on by default).
+    Totals     Each account's row carries its three totals; the grand totals
+               sit in the footer. Collapsed accounts = Show part details off.
+
+  Layout: the REPORT chrome (fb-styles §35).
+  Table tools (fb-lib FBLib.RptCols / RowCap): column headings sort the
+  parts within each account, drag to reorder and resize (remembered per
+  user); the query fetches at most 10,000 parts, with Load all. No pivot
+  view: the account is the report's only dimension, and its grouping
+  already totals the three costs by it.
+  Views: the header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+  report out as pages like the original: Letter landscape by default, the
+  company / title / filters band on every page (the original's page header),
+  the column headings repeated, each account's row with its three totals
+  carried over a page break as "(continued)", the Grand Totals after the last
+  line, "Page X of Y". Collapsed accounts print as their totals (Show part
+  details off). A past date's "not on hand" parts print in black, in italics
+  with their note. Columns fit the page and the font steps down from the
+  original's 10pt when they don't. The paper and the view are remembered per
+  user. Print prints those pages in either view.
+
+  Deliberate differences (bug fixes, checked on the live database):
+    - Today's date shows today's values. The original means to (its
+      UsePartCostHistory test), but Fishbowl passes an "end" date
+      parameter as 23:59:59 of the chosen day (PPDate.getDate), and the
+      test subtracts a day, so a run for today read part cost history
+      and only "tomorrow" read current costs. Here any date from today on
+      reads partcost / costlayer.
+    - Today's values list every inventory part. The original also
+      required a part cost history capture before the date, which drops
+      a part stocked since the last nightly capture.
+    - A past date reads the last cost snapshot on or before the end of
+      that day. Fishbowl's capture job writes a row only for parts with
+      stock, so a part that has since run out keeps its last non-zero
+      capture forever; the original took each part's latest capture
+      whenever it was taken and kept counting that stale stock (on the
+      live database: $1,962,993 Average Cost as of 2026-05-20 against
+      $1,517,119 in that night's snapshot). Here a part's capture counts
+      only if it belongs to the latest snapshot (within 10 minutes of the
+      last capture before the cutoff); otherwise the part had none on
+      hand and values at zero, marked as such. The part list is the
+      original's (parts with any capture before the date).
+    - The asset-account LIKE box is a pick list of the accounts in use.
+    - Open cost layers are summed in a derived table, and the company name
+      and currency come from their own lookups (same figures).
+  Additions: the "Use Default" group names the default Inventory Asset
+  account it posts to (sysproperties 'Acct ID inventoryAsset', the
+  accounting integration's fallback); record links; Excel.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-launch" content="MATERIALS">
+    <meta name="description" content="Quantity and value of on-hand parts, grouped by inventory asset account.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipAssetValByAccount',
+            name:  'Asset Valuation by Account',
+            build: '2026.10.12-6a0d993'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Asset Valuation by Account — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 460px; overflow: hidden; text-overflow: ellipsis; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table th { cursor: default; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        .pp-neg { color: #8A1E30; }
+        .rpt-table tr.rpt-grp .pp-neg { color: #8A1E30; }
+        .rpt-table tr.is-stale td { color: var(--c-tertiary); }
+        .stale-note { font-size: 11px; color: var(--c-tertiary); margin-left: 6px; }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>Asset Valuation by Account</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="split-btn">
+            <button id="expandBtn" class="hdr-btn" type="button" title="Show every account's parts (Show part details)">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+                Expand
+            </button>
+            <button id="collapseBtn" class="hdr-btn" type="button" title="Account totals only">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 12h14" stroke-linecap="round"/></svg>
+                Collapse
+            </button>
+        </span>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook (by-account and detail sheets)">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages: collapsed accounts print as their totals">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Valuation date</div>
+            <div>
+                <div class="rpt-flabel">Part cost as of</div>
+                <input type="date" id="fAsOf" aria-label="Part cost as of">
+            </div>
+            <div class="rpt-fnote">Today or later: today's costs.<br>Earlier: that day's cost snapshot.</div>
+            <button type="button" class="hdr-btn" id="todayBtn" style="align-self:flex-start;" title="Value at today's costs">Today</button>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Accounts &amp; parts</div>
+            <div>
+                <div class="rpt-flabel">Asset account</div>
+                <div class="ms-container" id="acctMs">
+                    <div class="ms-trigger" id="acctMs-trigger"><span class="ms-placeholder" id="acctMs-placeholder">All accounts</span></div>
+                    <div class="ms-dropdown hidden" id="acctMs-dropdown">
+                        <div class="ms-search"><input type="text" id="acctMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="acctMs-all">Select All</span><span id="acctMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="acctMs-list"></div>
+                    </div>
+                </div>
+            </div>
+            <div>
+                <div class="rpt-flabel">Part number</div>
+                <input type="text" id="fPart" placeholder="Any (% is a wildcard)">
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Parts listed</div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fHideInactive"> Hide inactive parts</label>
+            <label class="rpt-fcheck" title="Parts with nothing on hand today"><input type="checkbox" id="fHideZero"> Hide zero quantity</label>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own sort">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters the starting point for everyone who hasn't saved their own.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>What your inventory parts are worth, totalled by the <strong>Inventory Asset account</strong> they post to, under three costing methods side by side. It is the BI version of the standard <strong>Asset Valuation by Account</strong> report.</p>
+                <ul>
+                    <li><strong>LIFO/FIFO Cost</strong>: the open cost layers.</li>
+                    <li><strong>Std. Cost</strong>: standard cost × quantity.</li>
+                    <li><strong>Average Cost</strong>: the part's total average cost.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Valuation date</div>
+                <p><strong>Today</strong> (the default) values at today's costs and quantities.</p>
+                <p>An <strong>earlier date</strong> uses Fishbowl's part cost snapshot, normally taken nightly at 1 am, last taken on or before that day. A part missing from that snapshot had none on hand, so it shows zero, greyed.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Which account</div>
+                <p>The Inventory Asset account set on the part. A part with none is listed under <strong>Use Default</strong>, which posts to your default inventory asset account (named on its row).</p>
+                <p><strong>Hide zero quantity</strong> hides parts with nothing on hand today, whatever the date, as the standard report does.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Ties to</div>
+                <p>The <strong>Inventory Valuation Summary</strong> values the same stock by location. With today's date and <strong>Hide inactive parts</strong> off, this report's Average Cost total matches its grand total (Average Cost, every location group), to the cent.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>Click an account's row to show or hide its parts; <strong>Expand</strong> / <strong>Collapse</strong> do every account.</li>
+                    <li>Click a column heading to sort the parts within each account (again to reverse, a third time for the standard order). Drag a heading onto another to move the column; drag a heading's right edge to resize it. Your layout is remembered; <strong>Settings → Reset column layout</strong> undoes it.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable pages, laid out like the standard report. In PDF view pick the paper size and orientation in the bar above the pages; they are remembered. <strong>Print</strong> prints those pages.</li>
+                    <li>A very large result shows its first 10,000 parts with a <strong>Load all</strong> button; totals then cover the parts shown.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Common || !FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const DEFAULT_ACCOUNT = 'Use Default';                  // the original's label for "none set"
+const ACCOUNT_EXPR = `COALESCE(asaccount.name, '${DEFAULT_ACCOUNT}')`;
+const INVENTORY_PART = 10;                              // part.typeId Inventory
+const OPEN_LAYER = 10;                                  // costlayer.statusId of an open layer
+const SNAPSHOT_WINDOW_MIN = 10;                         // captures this close to the last one are one snapshot
+// asOf '' = today. details = the original's Show Part Details.
+const DEFAULT_FILTERS = { asOf: '', accounts: [], part: '', hideInactive: true, hideZero: false, details: true };
+const QUERY_KEYS = ['asOf', 'accounts', 'part', 'hideInactive', 'hideZero'];
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const dstr = v => { const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v ?? '')); return m ? m[1] : ''; };
+const fmtDate = v => { const d = dstr(v); return d ? FBLib.Common.formatDate(d) : ''; };
+const openLink = (module, number, title) => number
+    ? `<a class="fb-row-link" data-open="${esc(module)}" data-num="${esc(number)}"${title ? ` title="${esc(title)}"` : ''}>${esc(number)}</a>` : '';
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const cut = s => `<span title="${esc(s)}">${esc(s)}</span>`;
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const isYmd = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+const today = () => ymd(new Date());
+
+// Costs at the system's report precision (the original's REPORT_DECIMAL_COST
+// pattern), home currency symbol.
+let COST_DP = 2;
+function fmtCost(v) {
+    const n = num(v), c = FBLib.Common.currency();
+    return (n < 0 ? '-' : '') + c.symbol + Math.abs(n).toLocaleString(c.locale, { minimumFractionDigits: COST_DP, maximumFractionDigits: COST_DP });
+}
+const money = v => '<span class="' + (num(v) < 0 ? 'pp-neg' : '') + '">' + esc(fmtCost(v)) + '</span>';
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS — the panel applies as it changes (one short debounce).
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _acctMs = null;
+let _hydrating = false, _applyTimer = null;
+const S = { rows: [], company: '', defaultAccount: '', snapshot: '', basis: 'current', loadedAt: null, collapsed: new Set(), noCap: false };
+
+// A past date reads the cost history; today or later reads today's costs.
+const historyDate = f => isYmd(f.asOf) && f.asOf < today() ? f.asOf : '';
+
+function readFilters() {
+    const d = document.getElementById('fAsOf').value;
+    return {
+        asOf: isYmd(d) && d < today() ? d : '',
+        accounts: _acctMs.getSelected().map(String),
+        part: document.getElementById('fPart').value.trim(),
+        hideInactive: document.getElementById('fHideInactive').checked,
+        hideZero: document.getElementById('fHideZero').checked,
+        details: F.details
+    };
+}
+function writeFilters(f) {
+    _hydrating = true;
+    document.getElementById('fAsOf').value = historyDate(f) || today();
+    _acctMs.setSelected((f.accounts || []).map(String));
+    document.getElementById('fPart').value = f.part || '';
+    document.getElementById('fHideInactive').checked = f.hideInactive !== false;
+    document.getElementById('fHideZero').checked = !!f.hideZero;
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const requery = QUERY_KEYS.some(k => JSON.stringify(next[k]) !== JSON.stringify(F[k]));
+        F = next;
+        remember();
+        if (requery) { S.noCap = false; loadAll(); } else render(false);
+    }, 250);
+}
+
+function asOfText(f) {
+    const h = historyDate(f);
+    if (!h) return 'Part costs: today';
+    return 'Part costs as of ' + fmtDate(h) + (S.snapshot ? ' (snapshot ' + fmtDate(S.snapshot) + ' ' + S.snapshot.slice(11, 16) + ')' : '');
+}
+function filterText(f) {
+    const out = [asOfText(f)];
+    if (f.accounts.length) out.push('Accounts: ' + f.accounts.join(', '));
+    if (f.part) out.push('Part: ' + f.part);
+    out.push(f.hideInactive ? 'Active parts' : 'Active and inactive parts');
+    if (f.hideZero) out.push('On hand only');
+    return out;
+}
+
+// ============================================================================
+//  SQL — the iReport query, split on its UsePartCostHistory switch (see the
+//  header for why the switch and the history pick differ).
+// ============================================================================
+function buildSQL(f) {
+    const w = ['part.typeid = ' + INVENTORY_PART];
+    if (f.part) w.push(`UPPER(part.num) LIKE UPPER('${sqlStr(f.part.replace(/\*/g, '%'))}')`);
+    if (f.accounts.length) w.push(ACCOUNT_EXPR + ' IN (' + f.accounts.map(a => "'" + sqlStr(a) + "'").join(', ') + ')');
+    if (f.hideInactive) w.push('part.activeflag = 1');
+    // Hide zero qty: the original's HAVING SUM(qtyonhand.qty > 0), one row per part.
+    const onHand = f.hideZero ? `
+        LEFT JOIN (SELECT SUM(qtyonhand.qty) AS qty, qtyonhand.partid AS partid
+                   FROM qtyonhand
+                   GROUP BY partid) AS qtyonhand ON qtyonhand.partid = part.id` : '';
+    if (f.hideZero) w.push('qtyonhand.qty > 0');
+    const where = w.join('\n          AND ');
+    const h = historyDate(f);
+    if (!h) return `
+        SELECT part.num AS partnumber, part.description AS partdescription,
+               ${ACCOUNT_EXPR} AS inventoryaccount,
+               COALESCE(partcost.totalcost, 0) AS averagetotalcost,
+               COALESCE(part.stdcost, 0) * COALESCE(partcost.qty, 0) AS standardtotalcost,
+               COALESCE(cl.totalcost, 0) AS lifofifototalcost,
+               0 AS stale, '' AS snapshot
+        FROM part
+        LEFT JOIN partcost ON partcost.partid = part.id
+        LEFT JOIN (SELECT costlayer.partid, SUM(costlayer.totalcost) AS totalcost
+                   FROM costlayer
+                   WHERE costlayer.statusid = ${OPEN_LAYER}
+                   GROUP BY costlayer.partid) cl ON cl.partid = part.id
+        LEFT JOIN asaccount ON part.inventoryaccountid = asaccount.id${onHand}
+        WHERE ${where}
+        ORDER BY inventoryaccount, part.num`;
+    // The original's cutoff: the "end" date (23:59:59) less one second.
+    const cutoff = `DATE_SUB('${h} 23:59:59', INTERVAL 1 SECOND)`;
+    const inSnap = 'h.datecaptured >= run.since';
+    return `
+        SELECT part.num AS partnumber, part.description AS partdescription,
+               ${ACCOUNT_EXPR} AS inventoryaccount,
+               CASE WHEN ${inSnap} THEN COALESCE(h.avgcost, 0) * COALESCE(h.quantity, 0) ELSE 0 END AS averagetotalcost,
+               CASE WHEN ${inSnap} THEN COALESCE(h.stdcost, 0) * COALESCE(h.quantity, 0) ELSE 0 END AS standardtotalcost,
+               CASE WHEN ${inSnap} THEN COALESCE(h.totalcost, 0) ELSE 0 END AS lifofifototalcost,
+               CASE WHEN ${inSnap} THEN 0 ELSE 1 END AS stale,
+               DATE_FORMAT(run.snapshot, '%Y-%m-%d %H:%i:%s') AS snapshot
+        FROM part
+        JOIN (SELECT MAX(partcosthistory.id) AS costid, partcosthistory.partid AS partcostid
+              FROM partcosthistory
+              WHERE partcosthistory.datecaptured <= ${cutoff}
+              GROUP BY partcosthistory.partid) AS maxcostdate ON part.id = maxcostdate.partcostid
+        LEFT JOIN partcosthistory h ON maxcostdate.costid = h.id
+        CROSS JOIN (SELECT MAX(partcosthistory.datecaptured) AS snapshot,
+                           MAX(partcosthistory.datecaptured) - INTERVAL ${SNAPSHOT_WINDOW_MIN} MINUTE AS since
+                    FROM partcosthistory
+                    WHERE partcosthistory.datecaptured <= ${cutoff}) run
+        LEFT JOIN asaccount ON part.inventoryaccountid = asaccount.id${onHand}
+        WHERE ${where}
+        ORDER BY inventoryaccount, part.num`;
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+let _loadToken = 0;
+
+async function loadLookups() {
+    const res = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('Asset accounts', `
+            SELECT DISTINCT COALESCE(a.name, '${DEFAULT_ACCOUNT}') AS name
+            FROM part LEFT JOIN asaccount a ON a.id = part.inventoryaccountid
+            WHERE part.typeid = ${INVENTORY_PART}
+            ORDER BY 1`),
+        q('Default inventory account', `
+            SELECT a.name FROM sysproperties sp
+            JOIN asaccount a ON a.id = CAST(sp.sysvalue AS UNSIGNED)
+            WHERE sp.syskey = 'Acct ID inventoryAsset'`),
+        q('Report precision', "SELECT sysvalue FROM sysproperties WHERE syskey = 'REPORT_DECIMAL_COST_PRECISION'")
+    ]);
+    const ok = i => res[i].status === 'fulfilled' ? res[i].value : [];
+    S.company = (ok(0)[0] || {}).name || '';
+    _acctMs.setItems(ok(1).map(r => ({ value: String(r.name), label: String(r.name) })));
+    S.defaultAccount = (ok(2)[0] || {}).name || '';
+    const dp = parseInt((ok(3)[0] || {}).sysvalue, 10);
+    if (Number.isInteger(dp) && dp >= 0 && dp <= 9) COST_DP = dp;
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    const f = F;
+    document.getElementById('banner').textContent = '';
+    document.getElementById('loading').classList.add('show');
+    setStatus('Loading…');
+    let rows;
+    const cap = S.noCap ? 0 : undefined;           // FBLib.RowCap: the first 10,000 parts unless Load all
+    try { rows = await q(historyDate(f) ? 'Valuation (cost history)' : 'Valuation (today)', FBLib.RowCap.sql(buildSQL(f), cap)); }
+    catch (e) {
+        if (tok !== _loadToken) return;
+        document.getElementById('loading').classList.remove('show');
+        document.getElementById('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        FBLib.RowCap.notice({ before: document.getElementById('rptWrap'), capped: false });
+        S.rows = []; S.loadedAt = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    if (tok !== _loadToken) return;
+    document.getElementById('loading').classList.remove('show');
+    const capped = FBLib.RowCap.apply(rows, cap);
+    rows = capped.rows;
+    FBLib.RowCap.notice({ before: document.getElementById('rptWrap'), capped: capped.capped, limit: capped.limit, what: 'parts',
+                          onLoadAll: () => { S.noCap = true; loadAll(); } });
+    S.rows = rows.map(r => ({
+        account: r.inventoryaccount || DEFAULT_ACCOUNT, part: r.partnumber || '', desc: r.partdescription || '',
+        lf: num(r.lifofifototalcost), std: num(r.standardtotalcost), avg: num(r.averagetotalcost), stale: Number(r.stale) === 1
+    }));
+    S.snapshot = historyDate(f) ? String((rows[0] || {}).snapshot || '') : '';
+    if (historyDate(f) && rows.length && !S.snapshot) document.getElementById('banner').textContent = 'Fishbowl has no part cost snapshot on or before that date.';
+    // "Show part details" decides how a fresh load opens.
+    S.collapsed = new Set(F.details ? [] : accounts().map(a => a.name));
+    S.loadedAt = new Date();
+    render();
+}
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+
+// ============================================================================
+//  MODEL + TABLE
+// ============================================================================
+const BASE_COLS = [
+    { key: 'part', label: 'Part #',         w: 140 },
+    { key: 'desc', label: 'Description',    w: 320 },
+    { key: 'lf',   label: 'LIFO/FIFO Cost', w: 130, num: true },
+    { key: 'std',  label: 'Std. Cost',      w: 130, num: true },
+    { key: 'avg',  label: 'Average Cost',   w: 130, num: true }
+];
+const FIGS = ['lf', 'std', 'avg'];
+let COLS = null;                                        // FBLib.RptCols: the user's widths, order and sort
+const cols = () => (COLS ? COLS.arrange(BASE_COLS) : BASE_COLS);
+// Heading-click sort (FBLib.RptCols): parts sort within their account; the
+// accounts keep the standard report's order.
+const sortVal = (r, k) => r[k];
+const sortLines = list => (COLS && COLS.sort() ? list.slice().sort((a, b) => COLS.compare(a, b, sortVal)) : list);
+
+function accounts() {
+    const out = [];
+    S.rows.forEach(r => {
+        let a = out.length && out[out.length - 1].name === r.account ? out[out.length - 1] : null;
+        if (!a) { a = { name: r.account, rows: [], lf: 0, std: 0, avg: 0 }; out.push(a); }
+        a.rows.push(r);
+        FIGS.forEach(k => { a[k] += r[k]; });
+    });
+    return out;
+}
+const sumOf = rows => FIGS.reduce((o, k) => { o[k] = rows.reduce((s, r) => s + r[k], 0); return o; }, {});
+const figsOf = (t, fmt) => FIGS.reduce((o, k) => { o[k] = fmt(t[k]); return o; }, {});
+
+// A totals row: `identity` spans the first run of columns that carry none of
+// this row's figures (wherever the user has moved them), and each figure
+// lands in its own column, so moving a column never breaks the row.
+function totalsCells(cs, identity, figs) {
+    const has = c => figs[c.key] != null && figs[c.key] !== '';
+    let at = cs.findIndex(c => !has(c));
+    if (at < 0) at = 0;
+    let end = at;
+    while (end < cs.length && !has(cs[end])) end++;
+    if (end === at) end = at + 1;
+    const cell = c => `<td class="${c.num ? 'num-cell' : ''}">${figs[c.key] ?? ''}</td>`;
+    return cs.slice(0, at).map(cell).join('') + `<td colspan="${end - at}">${identity}</td>` + cs.slice(end).map(cell).join('');
+}
+
+// An account row: the identity spans Part # and Description, and the three
+// totals sit in their own columns (the original's "<account> Totals:").
+function accountRow(cs, a, forPrint) {
+    const open = !S.collapsed.has(a.name);
+    const dflt = a.name === DEFAULT_ACCOUNT && S.defaultAccount ? ' · posts to ' + S.defaultAccount : '';
+    const id = '<div class="rpt-grp-inner">' + (forPrint ? '' : `<span class="rpt-toggle">${open ? '▼' : '▶'}</span>`) +
+        `<span>${esc(a.name)}</span><span class="rpt-grp-meta">${esc(plural(a.rows.length, 'part') + dflt)}</span></div>`;
+    return `<tr class="rpt-grp" data-acct="${esc(a.name)}">${totalsCells(cs, id, figsOf(a, money))}</tr>`;
+}
+function partRow(cs, r) {
+    const note = r.stale ? '<span class="stale-note" title="Not in the cost snapshot: none on hand then">not on hand</span>' : '';
+    const cell = { part: openLink('Part', r.part, r.desc), desc: cut(r.desc) + note, lf: money(r.lf), std: money(r.std), avg: money(r.avg) };
+    return `<tr${r.stale ? ' class="is-stale"' : ''}>` + cs.map(c => `<td class="${c.num ? 'num-cell' : ''}">${cell[c.key] ?? ''}</td>`).join('') + '</tr>';
+}
+function bodyRows(cs, forPrint) {
+    const out = [];
+    accounts().forEach(a => {
+        out.push(accountRow(cs, a, forPrint));
+        if (!S.collapsed.has(a.name)) sortLines(a.rows).forEach(r => out.push(partRow(cs, r)));
+    });
+    return out;
+}
+function footRow(cs) {
+    const label = `Grand Totals — ${plural(accounts().length, 'account')}, ${plural(S.rows.length, 'part')}`;
+    return `<tr>${totalsCells(cs, esc(label), figsOf(sumOf(S.rows), v => esc(fmtCost(v))))}</tr>`;
+}
+const headRow = cs => '<tr>' + cs.map(c => `<th data-col="${c.key}" class="${c.num ? 'num-cell' : ''}" style="min-width:${c.w}px">${esc(c.label)}</th>`).join('') + '</tr>';
+
+// Long reports paint in chunks as the user scrolls.
+const CHUNK = 600;
+let _paint = { html: [], shown: 0 };
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+function render(keepScroll) {
+    const tbl = document.getElementById('rpt');
+    const wrap = document.getElementById('rptWrap');
+    const top = wrap.scrollTop;
+    const cs = cols();
+    tbl.querySelector('thead').innerHTML = headRow(cs);
+    _paint = { html: bodyRows(cs, false), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    while (keepScroll && _paint.shown < _paint.html.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+    tbl.querySelector('tfoot').innerHTML = S.rows.length ? footRow(cs) : '';
+    tbl.style.display = S.rows.length ? '' : 'none';
+    document.getElementById('rptEmpty').textContent = S.rows.length || !S.loadedAt ? '' : 'No parts match these filters.';
+    wrap.scrollTop = keepScroll ? top : 0;
+    const parts = [S.company, asOfText(F)];
+    if (S.loadedAt) parts.push(plural(S.rows.length, 'part') + ' · loaded ' + S.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    setStatus(parts.filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the pages as the standard report prints them: Letter
+//  landscape, the company / title / filters on every page (the original's
+//  page header), each account's three totals on its row, the Grand Totals
+//  after the last line. A past date's "not on hand" parts print black, in
+//  italics, with their note.
+// ============================================================================
+// The totals row carries .pdf-foot so its columns are measured bold, as
+// they print (else a Grand Total wider than every other figure wraps).
+let PDF = null;
+const PDF_CSS =
+    '.fbdoc-rpt-tbl .pp-neg{color:inherit}' +
+    '.fbdoc-rpt-tbl tr.is-stale td{color:inherit;font-style:italic}' +
+    '.fbdoc-rpt-tbl .stale-note{font-size:.9em;color:inherit;margin-left:4pt;white-space:nowrap}' +
+    '.fbdoc-rpt-tbl .stale-note::before{content:"("}.fbdoc-rpt-tbl .stale-note::after{content:")"}' +
+    '.fbdoc-rpt-tbl tr.pdf-foot td{font-weight:700}';
+function docSpec() {
+    if (!S.loadedAt) return null;
+    const cs = cols();
+    return {
+        company: S.company, title: 'Asset Valuation by Account Summary', subtitle: filterText(F).join(' · '), titleEveryPage: true,
+        head: headRow(cs), rows: bodyRows(cs, true), foot: S.rows.length ? footRow(cs).replace(/^<tr>/, '<tr class="pdf-foot">') : '',
+        empty: 'No parts match these filters.', css: PDF_CSS, fontPt: 10
+    };
+}
+
+function setAllOpen(open) {
+    S.collapsed = new Set(open ? [] : accounts().map(a => a.name));
+    F = Object.assign({}, F, { details: open });
+    remember();
+    render(false);
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    const sub = [S.company].concat(filterText(F)).filter(Boolean);
+    const money3 = [{ key: 'lf', label: 'LIFO/FIFO Cost', w: 130, type: 'money' }, { key: 'std', label: 'Std. Cost', w: 130, type: 'money' },
+                    { key: 'avg', label: 'Average Cost', w: 130, type: 'money' }];
+    const sheets = [
+        { name: 'By Account', title: 'Asset Valuation by Account', subtitle: sub,
+          cols: [{ key: 'name', label: 'Inventory Asset Account', w: 260, type: 'text' }, { key: 'parts', label: 'Parts', w: 70, type: 'int', noTotal: true }].concat(money3),
+          rows: accounts().map(a => ({ name: a.name, parts: a.rows.length, lf: a.lf, std: a.std, avg: a.avg })), totals: true },
+        { name: 'Detail', title: 'Asset Valuation by Account – Detail', subtitle: sub,
+          cols: [{ key: 'account', label: 'Inventory Asset Account', w: 220, type: 'text' }, { key: 'part', label: 'Part #', w: 140, type: 'text' },
+                 { key: 'desc', label: 'Description', w: 300, type: 'text' }].concat(money3)
+              .concat(historyDate(F) ? [{ key: 'note', label: 'In snapshot', w: 90, type: 'text' }] : []),
+          rows: S.rows.map(r => Object.assign({}, r, { note: r.stale ? 'No (none on hand)' : 'Yes' })), totals: true }
+    ];
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'Asset_Valuation_by_Account_' + (historyDate(F) || today()), sheets });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's pages (fb-doc). Without fb-doc on the server, the
+// plain printout below: JxBrowser won't print the report page itself, so it
+// is built in a new window and printed there. Collapsed accounts print as
+// their totals.
+function printReport() {
+    if (PDF) {
+        if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+    const cs = cols();
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Asset Valuation by Account</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:11pt;font-weight:700}h2{text-align:center;font-size:14pt;margin:2px 0}.sub{text-align:center;font-size:8.5pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{font-size:8pt;text-align:left;padding:3px 5px;border-bottom:1px solid #000}' +
+        'td{font-size:8pt;padding:2px 5px;vertical-align:top}.num-cell{text-align:right}' +
+        'tr.rpt-grp td{font-weight:700;padding-top:7px;border-bottom:1px solid #999}.rpt-grp-meta{font-weight:400;color:#555;margin-left:8px}' +
+        'tr.is-stale td{color:#777}.stale-note{font-size:7pt;color:#777;margin-left:6px}' +
+        'tfoot td{font-weight:700;border-top:1px solid #000}a{color:#000;text-decoration:none}.pp-neg{color:#000}' +
+        '@page{size:Letter landscape;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>Asset Valuation by Account Summary</h2><p class="sub">' + esc(filterText(F).join(' · ')) + '</p>' +
+        '<table><thead>' + headRow(cs).replace(/ style="[^"]*"/g, '') + '</thead><tbody>' + bodyRows(cs, true).join('') +
+        '</tbody><tfoot>' + footRow(cs) + '</tfoot></table>' +
+        '<p style="font-size:7.5pt;margin-top:8px">Printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters the starting point for every user who hasn\'t saved their own?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        _acctMs = FBLib.Common.MultiSelect.create({ containerId: 'acctMs', items: [], placeholder: 'All accounts', maxTags: 2, onClose: applySoon });
+
+        document.querySelectorAll('#fAsOf, #fHideInactive, #fHideZero').forEach(el => el.addEventListener('change', applySoon));
+        document.getElementById('todayBtn').onclick = () => { document.getElementById('fAsOf').value = today(); applySoon(); };
+        const fPart = document.getElementById('fPart');
+        fPart.addEventListener('change', applySoon);
+        fPart.addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        document.getElementById('resetFiltersBtn').onclick = () => { writeFilters(DEFAULT_FILTERS); applySoon(); };
+
+        // Column resize / sort / reorder (fb-lib).
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({ table: document.getElementById('rpt'), onSort: () => render(true), onReorder: () => render(true) });
+        document.getElementById('resetColsBtn').onclick = () => { if (COLS) { COLS.reset(); render(false); } };
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: document.getElementById('rptWrap'), toggleBefore: document.getElementById('exportBtn'),
+                page: { size: 'Letter', orientation: 'landscape' },
+                doc: docSpec, title: () => 'Asset Valuation by Account Summary'
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('expandBtn').onclick = () => setAllOpen(true);
+        document.getElementById('collapseBtn').onclick = () => setAllOpen(false);
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        const wrap = document.getElementById('rptWrap');
+        wrap.addEventListener('scroll', () => { if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 400) appendChunk(); });
+        document.getElementById('rpt').addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (a) {
+                e.preventDefault();
+                try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+                catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+                return;
+            }
+            const g = e.target.closest('tr.rpt-grp');
+            if (!g) return;
+            const name = g.dataset.acct;
+            if (S.collapsed.has(name)) S.collapsed.delete(name); else S.collapsed.add(name);
+            render(true);
+        });
+
+        await loadLookups();
+        const saved = savedFilters();
+        writeFilters(saved);
+        F = Object.assign(readFilters(), { details: saved.details !== false });
+        await loadAll();
+    } catch (e) {
+        console.error('[Asset Valuation by Account] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

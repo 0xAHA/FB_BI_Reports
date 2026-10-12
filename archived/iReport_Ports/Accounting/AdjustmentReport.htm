@@ -1,0 +1,793 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Adjustment Report (iReport port)
+  PATH:   iReport_Ports/Accounting/AdjustmentReport.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard Accounting/AdjustmentReport.jrxml
+  ("Shows Inventory Adjustments to QuickBooks"). Same source, same rules,
+  same columns; only the presentation is interactive.
+
+    Source     post rows with typeId 50 (inventory adjustment postings),
+               joined to part + its stocking UOM, and to the inventorylog
+               row behind each posting (tableId -1407594912 = post) for
+               the note.
+    Types      post.refItemId: 1 Add Initial, 2 Scrap, 3 Cycle Count,
+               5 Cost Change (labelled Average/Standard Cost Adj from the
+               "Acct Costing Method" property). 4 Manufacture has a label
+               in the original but no filter checkbox, so it never shows.
+    Signs      Scrap qty and amount are shown negative (the post row
+               stores them positive); every other type as stored.
+    Dates      Date range is on post.dateCreated (the adjustment's own,
+               back-dated, date), inclusive of both end days.
+    Posted     Show Posted / Show Not Posted filter on post.datePosted.
+    Total      One grand total: the signed amount over every row shown.
+
+  Additions over the iReport version: KPI tiles per type, record links,
+  Excel export. The Consumption report (iReport_Ports/Inventory/) reports
+  the same scrap events from inventorylog; its totals equal this report's
+  Scrap rows within rounding.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipAdjustment',
+            name:  null,
+            build: '2026.10.09-ca6f8ac'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Adjustment Report — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style. It must come before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <style>
+        * { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; height: 100%; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            font-size: 13px; color: var(--c-primary); background: var(--bg-1);
+            display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+            padding-bottom: var(--debug-drawer-h, 0px);
+        }
+        header h1 { font-size: 16px; font-weight: 700; color: var(--c-primary); margin: 0; line-height: 1.15; }
+        #statusLine { font-size: 12px; color: var(--c-tertiary); line-height: 1.15; margin: 2px 0 0; }
+        .hdr-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .hdr-sep { width: 1px; height: 18px; background: var(--border); margin: 0 4px; }
+
+        /* Drawers */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 220px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+        .fb-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+        .fb-field > label { font-size: 11px; font-weight: 600; color: var(--c-secondary); }
+        .fb-field select, .fb-field input[type=text], .fb-field input[type=date] {
+            padding: 5px 8px; font-size: 12px; border: 1px solid var(--border); border-radius: 6px;
+            background: #fff; font-family: inherit; color: #415157; }
+        .fb-dates { display: flex; gap: 6px; align-items: center; }
+        .fb-dates input { flex: 1; min-width: 0; }
+        .fb-check { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 12px; color: #415157; margin: 3px 0; }
+        .ds-btn { padding: 7px 13px; font-size: 12px; border-radius: 7px; border: 1px solid var(--border-strong); background: #fff;
+            cursor: pointer; font-family: inherit; font-weight: 600; color: #415157; }
+        .ds-btn:hover { background: var(--bg-2); }
+        .ds-btn-primary { background: var(--color-primary); color: #fff; border-color: var(--color-primary); }
+        .ds-btn-admin { background: var(--acc-orange-bg); border-color: var(--acc-orange); color: var(--acc-orange-con); }
+        .pp-note { font-size: 11.5px; color: var(--c-tertiary); }
+
+        /* Main */
+        .app-shell { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+        .kpi-row { display: flex; flex-wrap: wrap; gap: 10px; padding: 10px 12px; flex-shrink: 0; border-bottom: 1px solid var(--border); }
+        .kpi-row:empty { display: none; }
+        .kpi-row .kpi-tile { min-height: 56px; padding: 8px 14px; min-width: 170px; flex: 1 1 170px; }
+        .kpi-row .kpi-chip { width: 32px; height: 32px; border-radius: 8px; }
+        .kpi-row .kpi-chip svg { width: 16px; height: 16px; }
+        .kpi-row .kpi-val { font-size: 19px; }
+        .rpt-wrap { flex: 1 1 auto; min-height: 0; overflow: auto; background: #fff; }
+        .rpt-table th { cursor: default; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table td { max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
+        .rpt-table tr.grp td { background: var(--tint-blue); font-weight: 600; border-top: 2px solid var(--tint-blue-2); }
+        .rpt-table tr.sub td { background: #fff; font-weight: 600; border-bottom: 2px solid var(--border-strong); }
+        .fb-row-link { color: var(--fb-blue); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--fb-blue-accent); }
+        .pp-muted { color: var(--c-tertiary); }
+        .pp-neg { color: #8A1E30; }
+        .spill { padding: 1px 8px; }
+        .rpt-empty { padding: 48px 16px; text-align: center; color: var(--c-tertiary); font-size: 13px; }
+        .rpt-empty:empty { display: none; }
+        .banner { margin: 8px 12px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; }
+        .banner:empty { display: none; }
+    </style>
+</head>
+<body>
+
+<header>
+    <div>
+        <h1>Adjustment Report</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.toggleDrawer('filtersOverlay')" title="Report options">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download the rows shown as an Excel workbook">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the report">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-sep"></span>
+        <button id="helpBtn" class="hdr-btn" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            Help
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — the iReport version's parameters
+     ==================================================================== -->
+<div id="filtersOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>🔍 Filters</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('filtersOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Date created</div>
+                <div class="fb-field">
+                    <label for="fRange">Date range</label>
+                    <select id="fRange"></select>
+                </div>
+                <div class="fb-field fb-dates hidden" id="fCustom">
+                    <input type="date" id="fFrom" aria-label="From">
+                    <span class="pp-muted">→</span>
+                    <input type="date" id="fTo" aria-label="To">
+                </div>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Adjustment types</div>
+                <label class="fb-check"><input type="checkbox" data-type="1"> Add Initial Inventory</label>
+                <label class="fb-check"><input type="checkbox" data-type="2"> Scrap</label>
+                <label class="fb-check"><input type="checkbox" data-type="3"> Cycle Count</label>
+                <label class="fb-check"><input type="checkbox" data-type="5"> <span id="costTypeLabel">Cost Change</span></label>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Part &amp; posting</div>
+                <div class="fb-field">
+                    <label for="fPart">Part number contains</label>
+                    <input type="text" id="fPart" placeholder="All parts (% is a wildcard)">
+                </div>
+                <label class="fb-check"><input type="checkbox" id="fPosted"> Show posted</label>
+                <label class="fb-check"><input type="checkbox" id="fNotPosted"> Show not posted</label>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn" id="resetFiltersBtn">Reset</button>
+        <button type="button" class="ds-btn ds-btn-primary" id="applyBtn">Apply</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="fb-check"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="fb-check"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <p class="pp-note">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters the starting point for everyone who hasn't saved their own.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>Every inventory adjustment Fishbowl has queued for (or sent to) your accounting system: initial inventory, scrap, cycle counts and cost changes. It is the BI version of the standard <strong>Adjustment Report</strong> and reads the same data the same way.</p>
+                <p><strong>Date range</strong> is on the adjustment's date (a back-dated scrap counts on the day it was dated).</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Signs and totals</div>
+                <ul>
+                    <li><strong>Scrap</strong> shows as a negative quantity and amount: stock and value leaving.</li>
+                    <li><strong>Cycle count</strong> amounts carry their own sign (a count down is negative).</li>
+                    <li><strong>Cost changes</strong> revalue stock without moving it; the quantity is the stock revalued.</li>
+                    <li><strong>Amount Total</strong> is the sum of the signed amounts shown. Quantities aren't totalled: they're in each part's own unit.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Posted or not</div>
+                <p><strong>Date Posted</strong> is when the adjustment was exported to accounting. <span class="spill caution">Not Posted</span> rows are still waiting for the next export.</p>
+                <p>The <strong>Consumption Report</strong> shows the same scrap events with location, user and customer detail; its totals match this report's Scrap rows to the cent, give or take rounding.</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="app-shell">
+    <div class="banner" id="banner"></div>
+    <div class="kpi-row" id="kpiRow"></div>
+    <div class="rpt-wrap" id="rptWrap">
+        <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+        <div class="rpt-empty" id="rptEmpty"></div>
+    </div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const POST_TABLE_ID = -1407594912;          // inventorylog.tableId of a post row
+const TYPE_IDS = [1, 2, 3, 5];               // the four checkboxes of the original
+const TYPE_LABEL = { 1: 'Add Initial', 2: 'Scrap', 3: 'Cycle Count Adj', 4: 'Manufacture', 5: 'Average Cost Adj' };
+const DEFAULT_FILTERS = { range: 'thisMonth', from: '', to: '', types: TYPE_IDS.slice(), part: '', posted: true, notPosted: true };
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+// runQuery returns datetimes as 'YYYY-MM-DD HH:MM:SS…'; keep the date part.
+const dstr = v => { const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v ?? '')); return m ? m[1] : ''; };
+const fmtDate = v => { const d = dstr(v); return d ? FBLib.Common.formatDate(d) : ''; };
+const fmtMoney = v => FBLib.Common.formatMoney(v);
+const fmtQty = v => FBLib.Common.formatQty(v);
+const money = v => '<span class="' + (num(v) < 0 ? 'pp-neg' : '') + '">' + esc(fmtMoney(v)) + '</span>';
+const openLink = (module, number, title) => number
+    ? `<a class="fb-row-link" data-open="${esc(module)}" data-num="${esc(number)}"${title ? ` title="${esc(title)}"` : ''}>${esc(number)}</a>` : '';
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// ---- Date ranges (Fishbowl's "This Month" etc.) ----
+const RANGES = [
+    ['today', 'Today'], ['yesterday', 'Yesterday'], ['last7', 'Last 7 days'],
+    ['thisMonth', 'This month'], ['lastMonth', 'Last month'],
+    ['thisQuarter', 'This quarter'], ['lastQuarter', 'Last quarter'],
+    ['thisYear', 'This year'], ['lastYear', 'Last year'],
+    ['all', 'All dates'], ['custom', 'Custom range…']
+];
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const isYmd = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+
+// { start, end, endExcl, label } with ISO dates, or null for "All dates".
+function dateRange(f) {
+    const t = new Date(); t.setHours(0, 0, 0, 0);
+    const y = t.getFullYear(), m = t.getMonth(), d = t.getDate(), qm = Math.floor(m / 3) * 3;
+    const D = (yy, mm, dd) => new Date(yy, mm, dd);
+    let a, b;
+    switch (f.range) {
+        case 'today':       a = t; b = t; break;
+        case 'yesterday':   a = D(y, m, d - 1); b = a; break;
+        case 'last7':       a = D(y, m, d - 6); b = t; break;
+        case 'thisMonth':   a = D(y, m, 1); b = D(y, m + 1, 0); break;
+        case 'lastMonth':   a = D(y, m - 1, 1); b = D(y, m, 0); break;
+        case 'thisQuarter': a = D(y, qm, 1); b = D(y, qm + 3, 0); break;
+        case 'lastQuarter': a = D(y, qm - 3, 1); b = D(y, qm, 0); break;
+        case 'thisYear':    a = D(y, 0, 1); b = D(y, 11, 31); break;
+        case 'lastYear':    a = D(y - 1, 0, 1); b = D(y - 1, 11, 31); break;
+        case 'custom': {
+            if (!isYmd(f.from) && !isYmd(f.to)) return null;
+            const p = s => { const [yy, mm, dd] = s.split('-').map(Number); return D(yy, mm - 1, dd); };
+            a = isYmd(f.from) ? p(f.from) : D(1900, 0, 1);
+            b = isYmd(f.to) ? p(f.to) : D(2999, 11, 31);
+            if (a > b) [a, b] = [b, a];
+            break;
+        }
+        default: return null;
+    }
+    const after = new Date(b); after.setDate(after.getDate() + 1);
+    return { start: ymd(a), end: ymd(b), endExcl: ymd(after),
+             label: FBLib.Common.formatDate(ymd(a)) + ' – ' + FBLib.Common.formatDate(ymd(b)) };
+}
+// SQL predicate "col within the range", inclusive of both end days.
+const dateWhere = (col, r) => r ? `${col} >= '${r.start} 00:00:00' AND ${col} < '${r.endExcl} 00:00:00'` : '';
+
+// ---- KPI tiles (fb-styles §28) ----
+const ICON = {
+    rows:   '<path d="M4 6h16M4 12h16M4 18h16"/>',
+    money:  '<path d="M12 2v20M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/>',
+    add:    '<path d="M12 5v14M5 12h14"/>',
+    scrap:  '<path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/>',
+    count:  '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>',
+    cost:   '<path d="M3 17l6-6 4 4 8-8"/><path d="M14 7h7v7"/>',
+    wait:   '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>'
+};
+const kpi = (label, value, tone, icon, sub) => `
+    <div class="kpi-tile">
+        <div class="kpi-chip tone-${tone}"><svg fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">${ICON[icon]}</svg></div>
+        <div class="kpi-text"><div class="kpi-lbl">${esc(label)}</div><div class="kpi-val">${value}${sub ? ' <span class="kpi-sub">' + esc(sub) + '</span>' : ''}</div></div>
+    </div>`;
+
+// ============================================================================
+//  REPORT TABLE — paints { cols, body, foot } into #rpt. A body row is
+//  { cls, cells: { colKey: html } } or { cls, span: html } for a full-width
+//  row. Long reports paint in chunks as the user scrolls.
+// ============================================================================
+const CHUNK = 600;
+let _paint = { cols: [], html: [], shown: 0 };
+
+function rowHtml(cols, r) {
+    if (r.span != null) return `<tr class="${r.cls || ''}"><td colspan="${cols.length}">${r.span}</td></tr>`;
+    return `<tr class="${r.cls || ''}">` + cols.map(c => `<td class="${c.num ? 'num-cell' : ''}">${r.cells[c.key] ?? ''}</td>`).join('') + '</tr>';
+}
+function paintTable(model, emptyText) {
+    const tbl = document.getElementById('rpt');
+    const cols = model.cols;
+    tbl.querySelector('thead').innerHTML = '<tr>' + cols.map(c =>
+        `<th class="${c.num ? 'num-cell' : ''}"${c.w ? ` style="min-width:${c.w}px"` : ''}>${esc(c.label)}</th>`).join('') + '</tr>';
+    _paint = { cols, html: model.body.map(r => rowHtml(cols, r)), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    tbl.querySelector('tfoot').innerHTML = model.foot && model.body.length ? rowHtml(cols, model.foot) : '';
+    tbl.style.display = model.body.length ? '' : 'none';
+    document.getElementById('rptEmpty').textContent = model.body.length ? '' : emptyText;
+    document.getElementById('rptWrap').scrollTop = 0;
+}
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+
+function readFilters() {
+    return {
+        range: document.getElementById('fRange').value,
+        from: document.getElementById('fFrom').value,
+        to: document.getElementById('fTo').value,
+        types: [...document.querySelectorAll('[data-type]')].filter(c => c.checked).map(c => Number(c.dataset.type)),
+        part: document.getElementById('fPart').value.trim(),
+        posted: document.getElementById('fPosted').checked,
+        notPosted: document.getElementById('fNotPosted').checked
+    };
+}
+function writeFilters(f) {
+    document.getElementById('fRange').value = RANGES.some(r => r[0] === f.range) ? f.range : DEFAULT_FILTERS.range;
+    document.getElementById('fFrom').value = f.from || '';
+    document.getElementById('fTo').value = f.to || '';
+    document.getElementById('fCustom').classList.toggle('hidden', f.range !== 'custom');
+    document.querySelectorAll('[data-type]').forEach(c => { c.checked = (f.types || []).indexOf(Number(c.dataset.type)) !== -1; });
+    document.getElementById('fPart').value = f.part || '';
+    document.getElementById('fPosted').checked = f.posted !== false;
+    document.getElementById('fNotPosted').checked = f.notPosted !== false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+
+// ============================================================================
+//  SQL — the iReport query, with the date range made index-friendly and the
+//  posted/not-posted CASE written as a plain predicate.
+// ============================================================================
+function buildSQL(f) {
+    const w = ['post.typeid = 50'];
+    const r = dateRange(f);
+    if (r) w.push(dateWhere('post.datecreated', r));
+    const types = f.types.filter(t => TYPE_IDS.indexOf(t) !== -1);
+    w.push('post.refitemid IN (' + (types.join(',') || '0') + ')');
+    if (f.part) w.push(`UPPER(part.num) LIKE UPPER('%${sqlStr(f.part)}%')`);
+    if (f.posted && !f.notPosted) w.push('post.dateposted IS NOT NULL');
+    else if (!f.posted && f.notPosted) w.push('post.dateposted IS NULL');
+    else if (!f.posted && !f.notPosted) w.push('1 = 2');
+    return `
+        SELECT post.id, COALESCE(post.amount, 0) AS amount, post.datecreated, post.dateposted,
+               COALESCE(post.quantity, 0) AS qty, part.num AS part, part.description AS partdesc,
+               post.refitemid AS type, uom.code AS uomcode, il.info AS notes
+        FROM post
+        JOIN part ON post.refid = part.id
+        JOIN uom ON uom.id = part.uomid
+        LEFT JOIN inventorylog il ON il.recordid = post.id AND il.tableid = ${POST_TABLE_ID}
+        WHERE ${w.join('\n          AND ')}
+        ORDER BY post.refitemid, post.datecreated, post.dateposted, part.num`;
+}
+
+// ============================================================================
+//  LOAD + MODEL
+// ============================================================================
+const S = { rows: [], company: '', loadedAt: null };
+let _loadToken = 0;
+
+async function loadLookups() {
+    try {
+        const rows = await q('Company + costing method', `
+            SELECT (SELECT name FROM company WHERE id = 1) AS company,
+                   (SELECT sysvalue FROM sysproperties WHERE syskey = 'Acct Costing Method') AS costing`);
+        const r = rows[0] || {};
+        S.company = r.company || '';
+        if (String(r.costing || '').toLowerCase().indexOf('standard') === 0) TYPE_LABEL[5] = 'Standard Cost Adj';
+    } catch (_) { /* labels fall back to the defaults */ }
+    document.getElementById('costTypeLabel').textContent = TYPE_LABEL[5].replace(' Adj', ' Change');
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    const f = F;
+    document.getElementById('banner').textContent = '';
+    setStatus('Loading…');
+    let rows;
+    try { rows = await q('Adjustments', buildSQL(f)); }
+    catch (e) {
+        if (tok !== _loadToken) return;
+        document.getElementById('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        S.rows = [];
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    if (tok !== _loadToken) return;
+    S.rows = rows.map(r => {
+        const type = Number(r.type), sign = type === 2 ? -1 : 1;
+        return {
+            id: Number(r.id), part: r.part || '', partdesc: r.partdesc || '', type,
+            typelabel: TYPE_LABEL[type] || ('Type ' + type),
+            datecreated: dstr(r.datecreated), dateposted: dstr(r.dateposted), posted: !!dstr(r.dateposted),
+            qty: num(r.qty) * sign, uom: r.uomcode || '', amount: num(r.amount) * sign, notes: r.notes || ''
+        };
+    });
+    S.loadedAt = new Date();
+    render();
+}
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+
+function rangeText(f) { const r = dateRange(f); return 'Date Range: ' + (r ? r.label : 'All'); }
+
+const COLS = [
+    { key: 'part',        label: 'Part',         w: 120 },
+    { key: 'datecreated', label: 'Date Created', w: 95 },
+    { key: 'dateposted',  label: 'Date Posted',  w: 95 },
+    { key: 'type',        label: 'Type',         w: 120 },
+    { key: 'notes',       label: 'Notes',        w: 220 },
+    { key: 'qty',         label: 'Qty',          w: 80, num: true },
+    { key: 'uom',         label: 'UOM',          w: 50 },
+    { key: 'amount',      label: 'Amount',       w: 110, num: true }
+];
+
+function buildModel() {
+    const body = S.rows.map(r => ({
+        cls: '',
+        cells: {
+            part: openLink('Part', r.part, r.partdesc),
+            datecreated: esc(fmtDate(r.datecreated)),
+            dateposted: r.posted ? esc(fmtDate(r.dateposted)) : '<span class="spill caution">Not Posted</span>',
+            type: esc(r.typelabel),
+            notes: `<span title="${esc(r.notes)}">${esc(r.notes)}</span>`,
+            qty: esc(fmtQty(r.qty)),
+            uom: esc(r.uom),
+            amount: money(r.amount)
+        }
+    }));
+    const total = S.rows.reduce((s, r) => s + r.amount, 0);
+    const foot = { cells: { part: 'Total — ' + esc(plural(S.rows.length, 'adjustment')), notes: '', qty: '', amount: 'Amount Total: ' + esc(fmtMoney(total)) } };
+    return { cols: COLS, body, foot };
+}
+
+function render() {
+    paintTable(buildModel(), 'No adjustments match these filters.');
+    renderKpis();
+    const parts = [S.company, rangeText(F)];
+    if (S.loadedAt) parts.push(plural(S.rows.length, 'row') + ' · loaded ' + S.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    setStatus(parts.filter(Boolean).join(' · '));
+}
+
+function renderKpis() {
+    const host = document.getElementById('kpiRow');
+    if (!S.loadedAt) { host.innerHTML = ''; return; }
+    const by = t => S.rows.filter(r => r.type === t);
+    const sum = a => a.reduce((s, r) => s + r.amount, 0);
+    const tone = { 1: 'blue', 2: 'negative', 3: 'purple', 5: 'yellow' };
+    const icon = { 1: 'add', 2: 'scrap', 3: 'count', 5: 'cost' };
+    const notPosted = S.rows.filter(r => !r.posted).length;
+    host.innerHTML =
+        kpi('Amount total', esc(fmtMoney(sum(S.rows))), 'neutral', 'money', plural(S.rows.length, 'row')) +
+        F.types.filter(t => TYPE_IDS.indexOf(t) !== -1).map(t => {
+            const a = by(t);
+            return kpi(TYPE_LABEL[t], esc(fmtMoney(sum(a))), tone[t], icon[t], plural(a.length, 'row'));
+        }).join('') +
+        kpi('Not posted', notPosted.toLocaleString(), notPosted ? 'warning' : 'success', 'wait', notPosted ? 'waiting for export' : 'all exported');
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    const sheet = {
+        name: 'Adjustments', title: 'Adjustment Report',
+        subtitle: [S.company, rangeText(F)].filter(Boolean),
+        cols: [
+            { key: 'part', label: 'Part', w: 120, type: 'text' },
+            { key: 'partdesc', label: 'Description', w: 220, type: 'text' },
+            { key: 'datecreated', label: 'Date Created', w: 95, type: 'date' },
+            { key: 'dateposted', label: 'Date Posted', w: 95, type: 'date' },
+            { key: 'status', label: 'Posted?', w: 80, type: 'text' },
+            { key: 'typelabel', label: 'Type', w: 120, type: 'text' },
+            { key: 'notes', label: 'Notes', w: 240, type: 'text' },
+            { key: 'qty', label: 'Qty', w: 80, type: 'qty', noTotal: true },
+            { key: 'uom', label: 'UOM', w: 50, type: 'text' },
+            { key: 'amount', label: 'Amount', w: 110, type: 'money' }
+        ],
+        rows: S.rows.map(r => Object.assign({}, r, { status: r.posted ? 'Posted' : 'Not Posted', dateposted: r.dateposted || null })),
+        totals: true
+    };
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'Adjustment_Report_' + ymd(new Date()), sheets: [sheet] });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// JxBrowser won't print the report page itself: build it in a new window
+// and print that.
+function printReport() {
+    if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+    const model = buildModel();
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Adjustment Report</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:11pt;font-weight:700}h2{text-align:center;font-size:14pt;margin:2px 0}.sub{text-align:center;font-size:8.5pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{font-size:8pt;text-align:left;padding:3px 5px;border-bottom:1px solid #000}' +
+        'td{font-size:8pt;padding:2px 5px;vertical-align:top}.num-cell{text-align:right}tfoot td{font-weight:700;border-top:1px solid #000}' +
+        'a{color:#000;text-decoration:none}.spill{font-style:italic}.pp-neg{color:#000}' +
+        '@page{size:Letter landscape;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>Adjustment Report</h2><p class="sub">' + esc(rangeText(F)) + '</p>' +
+        '<table><thead><tr>' + model.cols.map(c => '<th class="' + (c.num ? 'num-cell' : '') + '">' + esc(c.label) + '</th>').join('') + '</tr></thead><tbody>' +
+        model.body.map(r => rowHtml(model.cols, r)).join('') + '</tbody><tfoot>' + rowHtml(model.cols, model.foot) + '</tfoot></table>' +
+        '<p class="sub" style="text-align:left;margin-top:8px">Printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters the starting point for every user who hasn\'t saved their own?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: readFilters() }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+function apply() {
+    F = readFilters();
+    if (_resolve('remember', true)) _saveUserKeys({ filters: F });
+    FBLib.Common.closeDrawer('filtersOverlay');
+    loadAll();
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerDrawer({ id: 'filtersOverlay', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',     triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay',    triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        document.getElementById('fRange').innerHTML = RANGES.map(r => `<option value="${r[0]}">${esc(r[1])}</option>`).join('');
+        document.getElementById('fRange').onchange = e => document.getElementById('fCustom').classList.toggle('hidden', e.target.value !== 'custom');
+        document.getElementById('applyBtn').onclick = apply;
+        document.getElementById('fPart').addEventListener('keydown', e => { if (e.key === 'Enter') apply(); });
+        document.getElementById('resetFiltersBtn').onclick = () => writeFilters(DEFAULT_FILTERS);
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: readFilters() } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+        document.getElementById('rptWrap').addEventListener('scroll', e => {
+            const w = e.currentTarget;
+            if (w.scrollTop + w.clientHeight > w.scrollHeight - 400) appendChunk();
+        });
+        document.getElementById('rpt').addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (!a) return;
+            e.preventDefault();
+            try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+            catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+        });
+
+        F = savedFilters();
+        writeFilters(F);
+        await loadLookups();
+        await loadAll();
+    } catch (e) {
+        console.error('[Adjustment Report] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

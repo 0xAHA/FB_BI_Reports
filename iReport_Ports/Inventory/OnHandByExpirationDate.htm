@@ -1,0 +1,1090 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   On Hand by Expiration Date (iReport port)
+  PATH:   iReport_Ports/Inventory/OnHandByExpirationDate.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard Inventory/OnHandByExpirationDate.jrxml.
+  Same source, same rules, same columns and grouping; only the presentation
+  is interactive.
+
+    Source     Inventory parts (part.typeId 10) with their tags summed per
+               part + location + tracking encoding (every tag type, as in the
+               original; the highest tag id of each set carries its tracking),
+               joined to the expiration-date tracking value: trackingdate on a
+               parttracking of typeId 30 (Expiration Date). Tags without an
+               expiration date are not listed.
+    Dates      The date range is on the expiration date itself, inclusive of
+               both end days (the original's BETWEEN dateRange1 AND
+               dateRange2 minus one second). Default This month, as the
+               original.
+    Status     Days to expiry = TIMESTAMPDIFF(DAY, CURRENT_DATE, expiry date)
+               on the database server: over 30 Valid, 1-30 Expiring, 0 or
+               less Expired. The Status filter (All / Valid / Expiring /
+               Expired) is the original's cbStatus HAVING clause. The
+               Expiration Date is green / orange / bold red to match.
+    Filters    Location groups (limited to the user's own, as Fishbowl's
+               report dialog is), location, part number (LIKE, % wildcard),
+               Order by Location or Part Num (inside each location group,
+               then part number, upper-cased as the original sorts).
+    Grouping   One collapsible row per location group ("Not In Stock" when a
+               tag has none). The original has no totals; the group rows and
+               the footer carry lot counts and how many are expiring and
+               expired.
+    Columns    Part Number, Description, Qty (with the part's UOM), Location,
+               Expiration Date, Status: each can be switched off, as the
+               colX options did.
+
+  Layout: the REPORT chrome (fb-styles §35): 56px header, push-down filter
+  panel that applies as you change it, collapsible group rows, sticky
+  footer.
+  Table tools (fb-lib FBLib.RptCols / RowCap / Pivot): column headings sort
+  the lots within each location group (Status by days to expiry, so
+  ascending puts the most expired first), drag to reorder and resize
+  (remembered per user); the Order by filter stays the standard order a
+  third click returns to. A Table / Pivot view selector: Qty, Days to
+  Expiry or a lot count by any two of location group, location, part,
+  status, UOM and expiration date (by day / week / month / quarter /
+  year), with drill-down. The query fetches at most 10,000 lots, with Load
+  all (live: 7 lots this month, 216 for all dates).
+  Views: the header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+  report out as pages like the original: Letter landscape by default, the
+  company / title / filters band on every page (the original's page header),
+  the column headings repeated, a location group carried over a page break
+  marked "(continued)", the Expiration Date printed green / orange / bold
+  red as the original prints it, Status as plain text, no totals (the
+  original has none), "Page X of Y". Columns fit the page and the font
+  steps down from the original's 10pt when they don't. The paper size and
+  orientation, and the view, are remembered per user. Print prints those
+  pages in either view.
+
+  Deliberate differences:
+    - The original joins TAGTRACKINGVIEW, a TEMPTABLE view that materialises
+      every tag's tracking values before the join, and that fails outright
+      on a connection running ONLY_FULL_GROUP_BY (the MySQL 8 default and
+      the live server's global mode; Fishbowl's own JDBC sessions switch it
+      off, so the original still runs in the client). Here the view is
+      replaced by its
+      Expiration-Date branch (trackingdate JOIN parttracking typeId 30),
+      which is what the original's typeId = 30 filter keeps. Proved
+      identical on the live database 2026-10-10 against a reconstruction of
+      the view: 216 rows, qty 26,714.093646669, days-to-expiry sum 32,745,
+      126 Valid / 6 Expiring / 84 Expired, both ways.
+    - The tag sum is scoped to the chosen location groups' locations before
+      grouping (location is one of its group keys, so the sums don't
+      change). The original's "OR location / location group IS NULL"
+      branches are dropped: tag.locationId and location.locationGroupId are
+      required columns, so they can't fire.
+    - The outer GROUP BY becomes SELECT DISTINCT over the same columns, so
+      it also runs under ONLY_FULL_GROUP_BY.
+    - Location is a multi-select (the original takes one location).
+    - Extra quick ranges for future dates (next month / 30 / 90 days /
+      quarter / year).
+  Additions: record links (part number opens Inventory), days-to-expiry
+  tooltip, collapsible location groups, Excel (adds Days to Expiry).
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipOnHandByExpiry',
+            name:  null,
+            build: '2026.10.12-2d67a0f'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>On Hand by Expiration Date — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table th { cursor: default; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        .rpt-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 14px; }
+        .spill { padding: 1px 8px; }
+        /* The original's expiration-date colours: green / orange / bold red. */
+        .exp-valid { color: var(--fb-success); }
+        .exp-soon { color: var(--acc-orange-con); font-weight: 600; }
+        .exp-gone { color: #8A1E30; font-weight: 700; }
+        .grp-soon { color: var(--acc-orange-con); font-weight: 600; }
+        .grp-gone { color: #8A1E30; font-weight: 600; }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>On Hand by Expiration Date</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <div class="rpt-viewsel" id="viewSelWrap" title="Table: the report as the standard one lays it out. Pivot: total Qty or count lots by any two fields">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 5h18M3 10h10M3 15h18M3 20h10" stroke-linecap="round"/></svg>
+            <select id="viewSel">
+                <option value="table">Table</option>
+                <option value="pivot">Pivot</option>
+            </select>
+        </div>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="split-btn">
+            <button id="expandBtn" class="hdr-btn" type="button" title="Show every location group's lots">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+                Expand
+            </button>
+            <button id="collapseBtn" class="hdr-btn" type="button" title="Location group counts only">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 12h14" stroke-linecap="round"/></svg>
+                Collapse
+            </button>
+        </span>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages: collapsed groups print as their headings">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Expiration date</div>
+            <div>
+                <div class="rpt-flabel">Quick range</div>
+                <select id="fRange"></select>
+            </div>
+            <div class="rpt-dates">
+                <input type="date" id="fFrom" aria-label="From">
+                <span class="rpt-fnote">→</span>
+                <input type="date" id="fTo" aria-label="To">
+            </div>
+            <div>
+                <div class="rpt-flabel">Status</div>
+                <select id="fStatus">
+                    <option value="All">All</option>
+                    <option value="Valid">Valid (over 30 days)</option>
+                    <option value="Expiring">Expiring (within 30 days)</option>
+                    <option value="Expired">Expired</option>
+                </select>
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Where</div>
+            <div>
+                <div class="rpt-flabel">Location groups</div>
+                <div class="ms-container" id="lgMs">
+                    <div class="ms-trigger" id="lgMs-trigger"><span class="ms-placeholder" id="lgMs-placeholder">All my location groups</span></div>
+                    <div class="ms-dropdown hidden" id="lgMs-dropdown">
+                        <div class="ms-search"><input type="text" id="lgMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="lgMs-all">Select All</span><span id="lgMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="lgMs-list"></div>
+                    </div>
+                </div>
+            </div>
+            <div>
+                <div class="rpt-flabel">Locations</div>
+                <div class="ms-container" id="locMs">
+                    <div class="ms-trigger" id="locMs-trigger"><span class="ms-placeholder" id="locMs-placeholder">All locations</span></div>
+                    <div class="ms-dropdown hidden" id="locMs-dropdown">
+                        <div class="ms-search"><input type="text" id="locMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="locMs-all">Select All</span><span id="locMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="locMs-list"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Parts &amp; order</div>
+            <div>
+                <div class="rpt-flabel">Part number</div>
+                <input type="text" id="fPart" placeholder="All parts (% is a wildcard)">
+            </div>
+            <div>
+                <div class="rpt-flabel">Order by</div>
+                <select id="fOrderBy">
+                    <option value="location">Location</option>
+                    <option value="part">Part Num</option>
+                </select>
+            </div>
+            <div class="rpt-fnote">Within each location group,<br>then by part number.</div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Columns</div>
+            <div class="rpt-cols" id="colChecks"></div>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own sort">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters the starting point for everyone who hasn't saved their own.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>Inventory on hand that carries an <strong>expiration date</strong>, by location group, with when each lot expires. It is the BI version of the standard <strong>On Hand by Expiration Date</strong> report and reads the same data the same way.</p>
+                <p>Each line is one part in one location with one set of tracking values (one lot), its quantity summed across its tags, in the part's own unit.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Status</div>
+                <ul>
+                    <li><span class="spill success">Valid</span> expires in more than 30 days.</li>
+                    <li><span class="spill caution">Expiring</span> expires within the next 30 days.</li>
+                    <li><span class="spill critical">Expired</span> the expiration date is today or past.</li>
+                </ul>
+                <p>Days are counted from today's date on the Fishbowl database server.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>Filter changes apply straight away. The date range is on the expiration date; pick <strong>All dates</strong> for every lot that has one.</li>
+                    <li>Click a location group's row to show or hide its lots; <strong>Expand</strong> / <strong>Collapse</strong> do every group.</li>
+                    <li>Click a part number to open it in Inventory.</li>
+                    <li>Click a column heading to sort the lots within each location group (again to reverse, a third time for the <strong>Order by</strong> order). Status sorts by days to expiry. Drag a heading onto another to move the column; drag a heading's right edge to resize it. Your layout is remembered; <strong>Settings → Reset column layout</strong> undoes it.</li>
+                    <li>The <strong>Table / Pivot</strong> selector switches to a pivot: total Qty, or count lots, by any two of location group, location, part, status, UOM and expiration date (by month, quarter…). Part by expiry month shows what runs out when. Click a figure to see the lots behind it. Print, PDF and Excel follow the view on screen.</li>
+                    <li>A very large result shows its first 10,000 lots with a <strong>Load all</strong> button.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable pages, laid out like the standard report. In PDF view pick the paper size and orientation in the bar above the pages; they are remembered. <strong>Print</strong> prints those pages.</li>
+                    <li>Parts without an expiration-date tracking type are not listed.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-app" id="appView">
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+</div>
+<div class="pivot-host" id="pivotHost" style="display:none"></div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Common || !FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const PART_INVENTORY = 10;                  // part.typeId: Inventory parts only
+const TRACK_EXPIRATION = 30;                // parttracking.typeId: Expiration Date
+const NO_LG = 'Not In Stock';               // the original's label for a blank group
+const STATUSES = ['All', 'Valid', 'Expiring', 'Expired'];
+const ORDER_COL = { location: 'UPPER(x.location)', part: 'UPPER(x.partnum)' };
+const ORDER_LABEL = { location: 'Location', part: 'Part Num' };
+const PILL = { Valid: 'success', Expiring: 'caution', Expired: 'critical' };
+const EXP_CLASS = { Valid: 'exp-valid', Expiring: 'exp-soon', Expired: 'exp-gone' };
+
+// The iReport version's columns, in its order. `tog` = the colX switch that
+// shows it (Qty's switch also shows its UOM, which the original prints in
+// the same cell). The user's own order, widths and heading sort are
+// FBLib.RptCols (COLS).
+const COL_DEFS = [
+    { key: 'part',     label: 'Part Number',     w: 120 },
+    { key: 'desc',     label: 'Description',     w: 280 },
+    { key: 'qty',      label: 'Qty',             w: 90, num: true },
+    { key: 'uom',      label: 'UOM',             w: 60, tog: 'qty' },
+    { key: 'location', label: 'Location',        w: 140 },
+    { key: 'exp',      label: 'Expiration Date', w: 120 },
+    { key: 'status',   label: 'Status',          w: 90 }
+];
+const TOGGLES = COL_DEFS.filter(c => !c.tog);
+const DEFAULT_FILTERS = {
+    range: 'thisMonth', from: '', to: '', status: 'All', lgs: [], locs: [], part: '', orderBy: 'location',
+    cols: TOGGLES.map(c => c.key)
+};
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const ints = a => (Array.isArray(a) ? a : []).map(Number).filter(n => Number.isInteger(n));
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const dstr = v => { const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v ?? '')); return m ? m[1] : ''; };
+const fmtDate = v => { const d = dstr(v); return d ? FBLib.Common.formatDate(d) : ''; };
+const fmtQty = v => FBLib.Common.formatQty(v);
+const openLink = (module, number, title) => number
+    ? `<a class="fb-row-link" data-open="${esc(module)}" data-num="${esc(number)}"${title ? ` title="${esc(title)}"` : ''}>${esc(number)}</a>` : '';
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const cut = s => `<span title="${esc(s)}">${esc(s)}</span>`;
+const daysText = d => d > 0 ? 'Expires in ' + plural(d, 'day') : d === 0 ? 'Expires today' : 'Expired ' + plural(-d, 'day') + ' ago';
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// ---- Date ranges (Fishbowl's "This Month" etc., plus future ones) ----
+const RANGES = [
+    ['custom', 'Custom…'], ['all', 'All dates'], ['today', 'Today'],
+    ['thisMonth', 'This month'], ['nextMonth', 'Next month'], ['lastMonth', 'Last month'],
+    ['next30', 'Next 30 days'], ['next90', 'Next 90 days'],
+    ['thisQuarter', 'This quarter'], ['nextQuarter', 'Next quarter'], ['lastQuarter', 'Last quarter'],
+    ['thisYear', 'This year'], ['nextYear', 'Next year'], ['lastYear', 'Last year']
+];
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const isYmd = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+
+// A quick range as [from, to] ISO dates, or null for "All dates".
+function presetDates(key) {
+    const t = new Date(); t.setHours(0, 0, 0, 0);
+    const y = t.getFullYear(), m = t.getMonth(), d = t.getDate(), qm = Math.floor(m / 3) * 3;
+    const D = (yy, mm, dd) => new Date(yy, mm, dd);
+    const r = {
+        today: [t, t], next30: [t, D(y, m, d + 30)], next90: [t, D(y, m, d + 90)],
+        thisMonth: [D(y, m, 1), D(y, m + 1, 0)], nextMonth: [D(y, m + 1, 1), D(y, m + 2, 0)], lastMonth: [D(y, m - 1, 1), D(y, m, 0)],
+        thisQuarter: [D(y, qm, 1), D(y, qm + 3, 0)], nextQuarter: [D(y, qm + 3, 1), D(y, qm + 6, 0)], lastQuarter: [D(y, qm - 3, 1), D(y, qm, 0)],
+        thisYear: [D(y, 0, 1), D(y, 11, 31)], nextYear: [D(y + 1, 0, 1), D(y + 1, 11, 31)], lastYear: [D(y - 1, 0, 1), D(y - 1, 11, 31)]
+    }[key];
+    return r ? [ymd(r[0]), ymd(r[1])] : null;
+}
+// { start, endExcl, label } for the filter, or null for no date limit.
+function dateRange(f) {
+    let a = f.from, b = f.to;
+    if (f.range !== 'custom') { const p = presetDates(f.range); if (!p) return null; [a, b] = p; }
+    if (!isYmd(a) && !isYmd(b)) return null;
+    a = isYmd(a) ? a : '1900-01-01'; b = isYmd(b) ? b : '2999-12-31';
+    if (a > b) [a, b] = [b, a];
+    const after = new Date(b + 'T00:00:00'); after.setDate(after.getDate() + 1);
+    return { start: a, endExcl: ymd(after), label: FBLib.Common.formatDate(a) + ' – ' + FBLib.Common.formatDate(b) };
+}
+function rangeText(f) { const r = dateRange(f); return 'Expiration Date: ' + (r ? r.label : 'All'); }
+function filterText(f) {
+    const parts = [rangeText(f)];
+    if (f.status !== 'All') parts.push('Status: ' + f.status);
+    if (f.part) parts.push('Part: ' + f.part);
+    parts.push('Ordered by ' + (ORDER_LABEL[f.orderBy] || 'Location'));
+    return parts.join(' · ');
+}
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS — the panel applies as it changes (one short debounce). Column
+//  switches only redraw; the rest re-query.
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _lgMs = null, _locMs = null;
+let _hydrating = false, _applyTimer = null;
+const S = { rows: [], company: '', myLgs: [], loadedAt: null, collapsed: new Set(), view: 'table', noCap: false };
+const QUERY_KEYS = ['range', 'from', 'to', 'status', 'lgs', 'locs', 'part', 'orderBy'];
+// The Columns switches (data-colsw: data-col is the table headings' key).
+const colSwitches = () => [...document.querySelectorAll('#colChecks [data-colsw]')];
+
+function readFilters() {
+    return {
+        range: document.getElementById('fRange').value,
+        from: document.getElementById('fFrom').value,
+        to: document.getElementById('fTo').value,
+        status: document.getElementById('fStatus').value,
+        lgs: ints(_lgMs.getSelected()), locs: ints(_locMs.getSelected()),
+        part: document.getElementById('fPart').value.trim(),
+        orderBy: document.getElementById('fOrderBy').value,
+        cols: colSwitches().filter(c => c.checked).map(c => c.dataset.colsw)
+    };
+}
+function writeFilters(f) {
+    _hydrating = true;
+    document.getElementById('fRange').value = RANGES.some(r => r[0] === f.range) ? f.range : DEFAULT_FILTERS.range;
+    const p = f.range === 'custom' ? [f.from, f.to] : (presetDates(f.range) || ['', '']);
+    document.getElementById('fFrom').value = p[0] || '';
+    document.getElementById('fTo').value = p[1] || '';
+    document.getElementById('fStatus').value = STATUSES.indexOf(f.status) !== -1 ? f.status : 'All';
+    _lgMs.setSelected(ints(f.lgs)); _locMs.setSelected(ints(f.locs));
+    document.getElementById('fPart').value = f.part || '';
+    document.getElementById('fOrderBy').value = ORDER_COL[f.orderBy] ? f.orderBy : 'location';
+    colSwitches().forEach(c => { c.checked = (f.cols || []).indexOf(c.dataset.colsw) !== -1; });
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const requery = QUERY_KEYS.some(k => JSON.stringify(next[k]) !== JSON.stringify(F[k]));
+        F = next;
+        remember();
+        if (requery) { S.noCap = false; loadAll(); } else render(false);
+    }, 250);
+}
+
+// ============================================================================
+//  SQL — the iReport query. TAGTRACKINGVIEW is replaced by its Expiration
+//  Date branch (see the header), and the tag sum is scoped to the chosen
+//  location groups before grouping.
+// ============================================================================
+const DAYS = `TIMESTAMPDIFF(DAY, CURRENT_DATE, CAST(td.info AS DATE))`;
+
+function buildSQL(f) {
+    // Location groups: the chosen ones, else every group this user may see.
+    const lgs = (f.lgs.length ? f.lgs : S.myLgs).filter(id => S.myLgs.indexOf(id) !== -1);
+    const lgIn = lgs.join(',') || '0';
+    const scope = [`locationid IN (SELECT id FROM location WHERE locationgroupid IN (${lgIn}))`];
+    const w = ['part.typeid = ' + PART_INVENTORY, 'locationgroup.id IN (' + lgIn + ')'];
+    if (f.locs.length) {
+        scope.push('locationid IN (' + f.locs.join(',') + ')');
+        w.push('location.id IN (' + f.locs.join(',') + ')');
+    }
+    if (f.part) w.push(`part.num LIKE '${sqlStr(f.part.replace(/\*/g, '%'))}'`);
+    const r = dateRange(f);
+    if (r) w.push(`td.info BETWEEN '${r.start} 00:00:00' AND DATE_SUB('${r.endExcl} 00:00:00', INTERVAL 1 SECOND)`);
+    const status = STATUSES.indexOf(f.status) > 0 ? `WHERE x.status = '${f.status}'` : '';
+    return `
+        SELECT x.* FROM (
+            SELECT DISTINCT part.num AS partnum, tag.partid, tag.locationid, tag.trackingencoding,
+                   part.description AS partdesc, uom.code AS partuom, tag.tagqty,
+                   COALESCE(location.name, '') AS location, COALESCE(locationgroup.name, '') AS locationgroup,
+                   DATE_FORMAT(td.info, '%Y-%m-%d') AS expdate,
+                   ${DAYS} AS dateexpiring,
+                   CASE WHEN ${DAYS} > 30 THEN 'Valid'
+                        WHEN ${DAYS} <= 30 AND ${DAYS} > 0 THEN 'Expiring'
+                        ELSE 'Expired' END AS status
+            FROM part
+            LEFT JOIN uom ON part.uomid = uom.id
+            JOIN (SELECT MAX(id) AS id, COALESCE(SUM(qty), 0) AS tagqty, partid, locationid, trackingencoding
+                  FROM tag
+                  WHERE ${scope.join(' AND ')}
+                  GROUP BY trackingencoding, partid, locationid) tag ON part.id = tag.partid
+            LEFT JOIN location ON tag.locationid = location.id
+            LEFT JOIN locationgroup ON location.locationgroupid = locationgroup.id
+            JOIN trackingdate td ON td.tagid = tag.id
+            JOIN parttracking pt ON pt.id = td.parttrackingid AND pt.typeid = ${TRACK_EXPIRATION}
+            WHERE ${w.join('\n              AND ')}
+        ) x
+        ${status}
+        ORDER BY x.locationgroup, ${ORDER_COL[f.orderBy] || ORDER_COL.location}, UPPER(x.partnum)`;
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+let _loadToken = 0;
+
+async function loadLookups() {
+    let myLgs = [];
+    try { myLgs = ints(typeof getLocationGroupList === 'function' ? getLocationGroupList() : []); } catch (_) {}
+    S.myLgs = myLgs;
+    const lgIn = myLgs.join(',') || '0';
+    const res = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('Location groups', `SELECT id, name, activeflag+0 AS active FROM locationgroup WHERE id IN (${lgIn}) ORDER BY name`),
+        q('Locations with dated stock', `
+            SELECT DISTINCT l.id, l.name, lg.name AS lgname
+            FROM location l
+            JOIN locationgroup lg ON lg.id = l.locationgroupid
+            JOIN tag t ON t.locationid = l.id
+            JOIN trackingdate td ON td.tagid = t.id
+            JOIN parttracking pt ON pt.id = td.parttrackingid AND pt.typeid = ${TRACK_EXPIRATION}
+            WHERE l.locationgroupid IN (${lgIn})
+            ORDER BY lgname, l.name`)
+    ]);
+    const ok = i => res[i].status === 'fulfilled' ? res[i].value : [];
+    S.company = (ok(0)[0] || {}).name || '';
+    _lgMs.setItems(ok(1).map(r => ({ value: Number(r.id), label: r.name + (Number(r.active) === 1 ? '' : ' (inactive)') })));
+    _locMs.setItems(ok(2).map(r => ({ value: Number(r.id), label: r.name, sub: r.lgname })));
+    const failed = res.filter(x => x.status === 'rejected').map(x => x.reason && x.reason.message);
+    if (failed.length) document.getElementById('banner').textContent = 'Some filter lists failed to load: ' + failed.join('; ');
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    document.getElementById('banner').textContent = '';
+    document.getElementById('loading').classList.add('show');
+    setStatus('Loading…');
+    let rows;
+    const cap = S.noCap ? 0 : undefined;           // FBLib.RowCap: the first 10,000 lots unless Load all
+    try { rows = await q('On hand by expiration', FBLib.RowCap.sql(buildSQL(F), cap)); }
+    catch (e) {
+        if (tok !== _loadToken) return;
+        document.getElementById('loading').classList.remove('show');
+        document.getElementById('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        FBLib.RowCap.notice({ before: document.getElementById('appView'), capped: false });
+        S.rows = []; S.loadedAt = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    if (tok !== _loadToken) return;
+    document.getElementById('loading').classList.remove('show');
+    const capped = FBLib.RowCap.apply(rows, cap);
+    rows = capped.rows;
+    FBLib.RowCap.notice({ before: document.getElementById('appView'), capped: capped.capped, limit: capped.limit, what: 'lots',
+                          onLoadAll: () => { S.noCap = true; loadAll(); } });
+    S.rows = rows.map(r => ({
+        lg: r.locationgroup || '', part: r.partnum || '', desc: r.partdesc || '', qty: num(r.tagqty), uom: r.partuom || '',
+        location: r.location || '', exp: dstr(r.expdate), days: parseInt(r.dateexpiring, 10), status: r.status || ''
+    }));
+    S.collapsed = new Set();
+    S.loadedAt = new Date();
+    render();
+}
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+
+// ============================================================================
+//  MODEL + TABLE
+// ============================================================================
+function visibleCols() {
+    const on = new Set(F.cols);
+    const cols = COL_DEFS.filter(c => on.has(c.tog || c.key));
+    return COLS ? COLS.arrange(cols) : cols;      // the user's column order (FBLib.RptCols)
+}
+const headRow = cols => '<tr>' + cols.map(c => `<th data-col="${c.key}" class="${c.num ? 'num-cell' : ''}" style="min-width:${c.w}px">${esc(c.label)}</th>`).join('') + '</tr>';
+// Heading-click sort (FBLib.RptCols): lots sort within their location
+// group; the groups keep the report's order. Status sorts by days to
+// expiry (ascending: the most expired first), not alphabetically.
+const sortVal = (r, k) => ({ part: r.part, desc: r.desc, qty: r.qty, uom: r.uom, location: r.location, exp: r.exp,
+                             status: Number.isFinite(r.days) ? r.days : null })[k];
+const sortLines = list => (COLS && COLS.sort() ? list.slice().sort((a, b) => COLS.compare(a, b, sortVal)) : list);
+
+function groups() {
+    const out = [];
+    S.rows.forEach(r => {
+        const g = out.length && out[out.length - 1].key === r.lg ? out[out.length - 1] : null;
+        if (g) g.rows.push(r); else out.push({ key: r.lg, rows: [r] });
+    });
+    return out;
+}
+// "12 lots · 2 expiring · 1 expired" for a set of rows (`where` follows
+// the lot count).
+function countText(rows, html, where) {
+    const soon = rows.filter(r => r.status === 'Expiring').length, gone = rows.filter(r => r.status === 'Expired').length;
+    const bits = [plural(rows.length, 'lot') + (where || '')];
+    if (soon) bits.push(html ? `<span class="grp-soon">${soon} expiring</span>` : soon + ' expiring');
+    if (gone) bits.push(html ? `<span class="grp-gone">${gone} expired</span>` : gone + ' expired');
+    return bits.join(' · ');
+}
+function lineRow(cols, r) {
+    const tip = Number.isFinite(r.days) ? daysText(r.days) : '';
+    const cell = {
+        part: openLink('Inventory', r.part, r.desc), desc: cut(r.desc), qty: esc(fmtQty(r.qty)), uom: esc(r.uom),
+        location: esc(r.location),
+        exp: `<span class="${EXP_CLASS[r.status] || ''}" title="${esc(tip)}">${esc(fmtDate(r.exp))}</span>`,
+        status: r.status ? `<span class="spill ${PILL[r.status] || 'neutral'}">${esc(r.status)}</span>` : ''
+    };
+    return '<tr>' + cols.map(c => `<td class="${c.num ? 'num-cell' : ''}">${cell[c.key] ?? ''}</td>`).join('') + '</tr>';
+}
+function bodyRows(forPrint) {
+    const cols = visibleCols();
+    const out = [];
+    groups().forEach(g => {
+        const open = !S.collapsed.has(g.key);
+        out.push(`<tr class="rpt-grp" data-grp="${esc(g.key)}"><td colspan="${cols.length}"><div class="rpt-grp-inner">` +
+            (forPrint ? '' : `<span class="rpt-toggle">${open ? '▼' : '▶'}</span>`) +
+            `<span>${esc(g.key || NO_LG)}</span><span class="rpt-grp-meta">${countText(g.rows, true)}</span></div></td></tr>`);
+        if (open) sortLines(g.rows).forEach(r => out.push(lineRow(cols, r)));
+    });
+    return out;
+}
+function footRow() {
+    const cols = visibleCols();
+    return `<tr><td colspan="${cols.length}">Total — ${esc(countText(S.rows, false, ' in ' + plural(groups().length, 'location group')))}</td></tr>`;
+}
+
+// Long reports paint in chunks as the user scrolls.
+const CHUNK = 600;
+let _paint = { html: [], shown: 0 };
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+function render(keepScroll) {
+    if (S.view === 'pivot' && PIVOT) {
+        PIVOT.render();
+        setStatus([S.company, rangeText(F), F.status !== 'All' ? F.status + ' only' : '', 'pivot', S.loadedAt ? plural(S.rows.length, 'lot') : '']
+            .filter(Boolean).join(' · '));
+        if (PDF) PDF.refresh();
+        return;
+    }
+    const tbl = document.getElementById('rpt');
+    const wrap = document.getElementById('rptWrap');
+    const top = wrap.scrollTop;
+    tbl.querySelector('thead').innerHTML = headRow(visibleCols());
+    _paint = { html: bodyRows(false), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    while (keepScroll && _paint.shown < _paint.html.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+    tbl.querySelector('tfoot').innerHTML = S.rows.length ? footRow() : '';
+    tbl.style.display = S.rows.length ? '' : 'none';
+    document.getElementById('rptEmpty').textContent = S.rows.length || !S.loadedAt ? '' : 'Nothing on hand expires in this range.';
+    wrap.scrollTop = keepScroll ? top : 0;
+    const parts = [S.company, rangeText(F)];
+    if (F.status !== 'All') parts.push(F.status + ' only');
+    if (S.loadedAt) parts.push(plural(S.rows.length, 'lot') + ' · loaded ' + S.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    setStatus(parts.filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the pages as the standard report prints them: Letter
+//  landscape, the company / title / filters on every page (the original's
+//  page header), the Expiration Date in its colours (green over 30 days,
+//  orange within 30, bold red expired), Status as plain text, no totals
+//  (the original has none).
+// ============================================================================
+let PDF = null;
+const PDF_CSS =
+    '.fbdoc-rpt-tbl .exp-valid{color:#019B32;font-weight:400}' +
+    '.fbdoc-rpt-tbl .exp-soon{color:#F27F2F;font-weight:400}' +
+    '.fbdoc-rpt-tbl .exp-gone{color:#CA1408;font-weight:700}' +
+    '.fbdoc-rpt-tbl .grp-soon,.fbdoc-rpt-tbl .grp-gone{color:inherit;font-weight:inherit}' +
+    '.fbdoc-rpt-tbl .spill{display:inline;padding:0;border:0;border-radius:0;background:none;color:inherit;font-size:inherit;font-weight:inherit;line-height:inherit;white-space:nowrap}';
+function docSpec() {
+    if (!S.loadedAt) return null;
+    if (S.view === 'pivot' && PIVOT) {
+        const p = PIVOT.pdfSpec();
+        return { company: S.company, title: 'On Hand by Expiration Date', subtitle: [filterText(F), pivotText()], titleEveryPage: true,
+                 head: p.head, rows: p.rows, foot: p.foot, empty: 'Nothing on hand expires in this range.', css: PDF_CSS, fontPt: 10 };
+    }
+    const cols = visibleCols();
+    return {
+        company: S.company, title: 'On Hand by Expiration Date', subtitle: filterText(F), titleEveryPage: true,
+        head: headRow(cols), rows: cols.length ? bodyRows(true) : [], foot: '',
+        empty: cols.length ? 'Nothing on hand expires in this range.' : 'Every column is switched off (Filters → Columns).',
+        css: PDF_CSS, fontPt: 10
+    };
+}
+
+// ============================================================================
+//  PIVOT VIEW (FBLib.Pivot) — Qty, Days to Expiry or a lot count by any two
+//  of location group, location, part, status, UOM and expiration date
+//  (bucketed by day … year). Qty totals one part across lots; across parts
+//  it adds different units, as a lot count does not. The report's own
+//  grouping stays in the Table view.
+// ============================================================================
+let PIVOT = null, COLS = null;
+const PIVOT_FIELDS = [
+    { key: 'lg', label: 'Location Group' }, { key: 'location', label: 'Location' }, { key: 'part', label: 'Part Number' },
+    { key: 'desc', label: 'Description', dim: false }, { key: 'uom', label: 'UOM' }, { key: 'status', label: 'Status' },
+    { key: 'exp', label: 'Expiration Date', type: 'date' },
+    { key: 'qty', label: 'Qty', type: 'qty' }, { key: 'days', label: 'Days to Expiry', type: 'number' }
+];
+const pivotRows = () => S.rows.map(r => Object.assign({}, r, { lg: r.lg || NO_LG, days: Number.isFinite(r.days) ? r.days : null }));
+function pivotText() {
+    const c = PIVOT.config(), lbl = k => (PIVOT_FIELDS.find(x => x.key === k) || {}).label || '';
+    const dl = (k, b) => lbl(k) + (k === 'exp' ? ' (' + b + ')' : '');
+    const m = c.measure === '__count__' ? 'Lot count'
+        : ({ sum: 'Total', count: 'Count of', avg: 'Average', min: 'Lowest', max: 'Highest' }[c.agg] + ' ' + lbl(c.measure));
+    return 'Pivot: ' + m + ' by ' + [dl(c.rowDim, c.rowBucket), c.rowDim2 ? dl(c.rowDim2, c.rowBucket2) : ''].filter(Boolean).join(' + ') +
+        (c.colDim ? ' × ' + dl(c.colDim, c.colBucket) : '');
+}
+function setView(v, persist) {
+    S.view = v === 'pivot' && PIVOT ? 'pivot' : 'table';
+    document.getElementById('viewSel').value = S.view;
+    document.getElementById('rptWrap').style.display = S.view === 'pivot' ? 'none' : '';
+    document.getElementById('pivotHost').style.display = S.view === 'pivot' ? '' : 'none';
+    document.getElementById('expandBtn').parentNode.style.display = S.view === 'pivot' ? 'none' : '';
+    if (persist) _saveUserKeys({ view: S.view });
+    render(false);
+}
+
+function setAllOpen(open) {
+    S.collapsed = new Set(open ? [] : groups().map(g => g.key));
+    render(false);
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    const on = new Set(F.cols);
+    const cols = [{ key: 'lg', label: 'Location Group', w: 140, type: 'text' }];
+    if (on.has('part')) cols.push({ key: 'part', label: 'Part Number', w: 120, type: 'text' });
+    if (on.has('desc')) cols.push({ key: 'desc', label: 'Description', w: 280, type: 'text' });
+    if (on.has('qty')) cols.push({ key: 'qty', label: 'Qty', w: 90, type: 'qty' }, { key: 'uom', label: 'UOM', w: 60, type: 'text' });
+    if (on.has('location')) cols.push({ key: 'location', label: 'Location', w: 140, type: 'text' });
+    if (on.has('exp')) cols.push({ key: 'exp', label: 'Expiration Date', w: 110, type: 'date' }, { key: 'days', label: 'Days to Expiry', w: 90, type: 'int' });
+    if (on.has('status')) cols.push({ key: 'status', label: 'Status', w: 80, type: 'text' });
+    const sheet = {
+        name: 'On Hand by Expiration', title: 'On Hand by Expiration Date', subtitle: [S.company, filterText(F)].filter(Boolean),
+        cols, rows: S.rows.map(r => Object.assign({}, r, { lg: r.lg || NO_LG, exp: r.exp || null, days: Number.isFinite(r.days) ? r.days : null })),
+        totals: false
+    };
+    const sheets = [sheet];
+    if (S.view === 'pivot' && PIVOT) sheets.unshift(Object.assign(PIVOT.sheet('Pivot'), { title: 'On Hand by Expiration Date – ' + pivotText(), subtitle: sheet.subtitle }));
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'On_Hand_by_Expiration_Date_' + ymd(new Date()), sheets });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's pages (fb-doc). Without fb-doc on the server, the
+// plain printout below: JxBrowser won't print the report page itself, so it
+// is built in a new window and printed there. Collapsed groups print as
+// their heading row.
+function printReport() {
+    if (PDF) {
+        if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>On Hand by Expiration Date</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:11pt;font-weight:700}h2{text-align:center;font-size:14pt;margin:2px 0}.sub{text-align:center;font-size:8.5pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{font-size:8pt;text-align:left;padding:3px 5px;border-bottom:1px solid #000}' +
+        'td{font-size:8pt;padding:2px 5px;vertical-align:top}.num-cell{text-align:right}' +
+        'tr.rpt-grp td{font-weight:700;padding-top:7px;border-bottom:1px solid #000}.rpt-grp-meta{font-weight:400;color:#555;margin-left:8px}' +
+        'tfoot td{font-weight:700;border-top:1px solid #000}a{color:#000;text-decoration:none}' +
+        '.exp-valid{color:#019B32}.exp-soon{color:#F27F2F}.exp-gone{color:#CA1408;font-weight:700}.grp-soon,.grp-gone{font-weight:400}' +
+        '.spill{border:0;padding:0;font-weight:400;background:none;color:#111}' +
+        '@page{size:Letter landscape;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>On Hand by Expiration Date</h2><p class="sub">' + esc(filterText(F)) + '</p>' +
+        '<table><thead>' + headRow(visibleCols()).replace(/ style="[^"]*"/g, '') + '</thead><tbody>' + bodyRows(true).join('') +
+        '</tbody><tfoot>' + footRow() + '</tfoot></table>' +
+        '<p style="font-size:7.5pt;margin-top:8px">Printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters the starting point for every user who hasn\'t saved their own?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        const ms = (id, ph) => FBLib.Common.MultiSelect.create({ containerId: id, items: [], placeholder: ph, maxTags: 2, onClose: applySoon });
+        _lgMs = ms('lgMs', 'All my location groups');
+        _locMs = ms('locMs', 'All locations');
+
+        document.getElementById('colChecks').innerHTML = TOGGLES.map(c =>
+            `<label class="rpt-fcheck"><input type="checkbox" data-colsw="${c.key}"> ${esc(c.label)}</label>`).join('');
+        const fRange = document.getElementById('fRange');
+        fRange.innerHTML = RANGES.map(r => `<option value="${r[0]}">${esc(r[1])}</option>`).join('');
+        // A quick range fills the dates; editing a date makes the range Custom.
+        fRange.onchange = () => {
+            const p = presetDates(fRange.value);
+            if (fRange.value !== 'custom') {
+                document.getElementById('fFrom').value = p ? p[0] : '';
+                document.getElementById('fTo').value = p ? p[1] : '';
+            }
+            applySoon();
+        };
+        ['fFrom', 'fTo'].forEach(id => document.getElementById(id).addEventListener('change', () => { fRange.value = 'custom'; applySoon(); }));
+        document.querySelectorAll('#fStatus, #fOrderBy, #colChecks [data-colsw]').forEach(el => el.addEventListener('change', applySoon));
+        const fPart = document.getElementById('fPart');
+        fPart.addEventListener('change', applySoon);
+        fPart.addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        document.getElementById('resetFiltersBtn').onclick = () => { writeFilters(DEFAULT_FILTERS); applySoon(); };
+
+        // Column resize / sort / reorder, and the Pivot view (fb-lib).
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({ table: document.getElementById('rpt'), onSort: () => render(true), onReorder: () => render(true) });
+        if (FBLib.Pivot) PIVOT = FBLib.Pivot.mount(document.getElementById('pivotHost'), {
+            fields: PIVOT_FIELDS, rows: pivotRows,
+            defaults: { rowDim: 'part', colDim: 'exp', colBucket: 'month', measure: 'qty', agg: 'sum' },
+            format: (fld, v) => (fld && fld.type === 'qty' ? fmtQty(v) : null)
+        });
+        else document.getElementById('viewSelWrap').style.display = 'none';
+        document.getElementById('viewSel').addEventListener('change', e => setView(e.target.value, true));
+        document.getElementById('resetColsBtn').onclick = () => { if (COLS) { COLS.reset(); render(false); } };
+        S.view = _resolve('view', 'table') === 'pivot' && PIVOT ? 'pivot' : 'table';
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: document.getElementById('appView'), toggleBefore: document.getElementById('exportBtn'),
+                page: { size: 'Letter', orientation: 'landscape' },
+                doc: docSpec, title: () => 'On Hand by Expiration Date'
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        setView(S.view, false);
+
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('expandBtn').onclick = () => setAllOpen(true);
+        document.getElementById('collapseBtn').onclick = () => setAllOpen(false);
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        const wrap = document.getElementById('rptWrap');
+        wrap.addEventListener('scroll', () => { if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 400) appendChunk(); });
+        document.getElementById('rpt').addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (a) {
+                e.preventDefault();
+                try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+                catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+                return;
+            }
+            const g = e.target.closest('tr.rpt-grp');
+            if (!g) return;
+            const key = g.dataset.grp;
+            if (S.collapsed.has(key)) S.collapsed.delete(key); else S.collapsed.add(key);
+            render(true);
+        });
+
+        await loadLookups();
+        writeFilters(savedFilters());
+        F = readFilters();          // drops saved picks that no longer exist
+        await loadAll();
+    } catch (e) {
+        console.error('[On Hand by Expiration Date] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

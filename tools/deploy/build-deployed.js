@@ -60,7 +60,7 @@ const DEPLOYED_NAMES = {
   'Dashboards/Sales_Dashboard_v1.2.htm':                   ['- Dashboard - Sales v1.2', '- Dashboard - Sales v1.2'],
   'Inventory/Auto_PO_Inventory_Watchlist.htm':             ['- Auto PO', '- Auto PO'],
   'Inventory/HistoricalInventoryValuation.htm':            ['- Inventory - Inventory Valuation by Date', '- Inventory - Inventory Valuation by Date'],
-  'Inventory/InventoryAvailability.htm':                   ['- Inventory - Inventory Availability', '- Inventory - Inventory Availability'],
+  'iReport_Ports/Inventory/InventoryAvailability.htm':     ['- Inventory - Inventory Availability', '- Inventory - Inventory Availability'],
   'Inventory/Inv_Reorder_Watchlist.htm':                   ['- Inventory - Inventory Reorder Monitor', '- Inventory - Inventory Reorder Monitor'],
   'Manufacturing/Production_Scheduling_v1.2.htm':          ['- Manufacturing - Production Scheduling w AI', '- Manufacturing - Production Scheduling w AI'],
   'Part/PartActivity.htm':                                 ['- Part - Part Activity', '- Part - Part Activity'],

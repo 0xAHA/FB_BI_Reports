@@ -20,9 +20,12 @@
     good, part.typeid = 10 inventory):
         perComponentBuilds = FLOOR( availableForSale_base / qtyPerBuild_base )
         Available to Build  = MIN(perComponentBuilds)   (floored at 0)
-    qtyPerBuild_base = bomitem.quantity * uomconversion.multiply / factor
-    (bomitem.uomid -> part.uomid). Availability from qtyInventoryTotals is
-    already in the part base UOM.
+    qtyPerBuild_base = bomitem.quantity * multiply / factor, converting
+    bomitem.uomid -> part.uomid via uomconversion (the stored row,
+    or the exact inverse of one; no chaining). Multiply first, divide last:
+    the ratio form quantity * (multiply / factor) rounds twice and can drop a
+    whole build at a FLOOR boundary. No conversion = unknown, never 1:1.
+    Availability from qtyInventoryTotals is already in the part base UOM.
 
   AVAILABILITY BASIS = "Available for Sale" (matches the standard report):
         OnHand - Allocated - NotAvailable + DropShip   (floored at 0)
@@ -36,8 +39,11 @@
       a BOM search + buildability chips — the same widget PurchaseOrderSummary
       uses. Click a row's Components (or Constraint) cell to drill into the
       component breakdown (constraint rows highlighted).
-    - Incoming supply (On Order) + "Build After Incoming" projection.
-    - Buildable value (Available to Build x finished-good cost).
+    - Incoming supply (On Order) + "Build After Incoming" projection, and
+      Ready By: when that projection can be built, from the scheduled dates
+      of the open order lines behind On Order (buildIncomingSQL).
+    - Buildable value (Available to Build x units per build x finished-good
+      cost), units per build in the finished good's stocking UOM.
     - Constraint (bottleneck) column — the component limiting each build;
       compact (first part + "+N"), click for the full breakdown.
     - Staged / nested sub-assembly expansion in the drill (the .jrxml's
@@ -56,6 +62,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="description" content="How many units of each BOM can be built now from current stock, and which components limit it.">
     <script>
         // ================================================================
         // REPORT IDENTITY
@@ -73,7 +80,7 @@
         window.FB_REPORT = {
             key:   'cdx.bi.availabletobuild',
             name:  null,          // not published yet - set when you publish it
-            build: '2026.09.25-80e8c2a'     // @fb-build
+            build: '2026.10.12-61172a0'     // @fb-build
         };
     </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -200,6 +207,14 @@
         .fb-row-link:hover { text-decoration: underline; color: var(--fb-blue-accent); }
         .fb-col-resize { position: absolute; right: 0; top: 0; width: 6px; height: 100%; cursor: col-resize; user-select: none; }
         .fb-col-resize:hover { background: rgba(255,255,255,0.3); }
+        /* Every heading carries an explanation (fb-styles .app-tooltip, wired by
+           _wireHeaderTips); the dotted underline says so without adding chrome. */
+        table.fb-table thead tr:first-child th,
+        .drill-tbl th[data-tip] {
+            text-decoration: underline dotted; text-underline-offset: 3px;
+            text-decoration-color: rgba(255,255,255,0.45);
+        }
+        .drill-tbl th[data-tip] { text-decoration-color: var(--border-strong); cursor: help; }
 
         /* Drill link inside a table cell (Components column). */
         .drill-link { color: var(--fb-blue); cursor: pointer; font-weight: 600; text-decoration: none; }
@@ -248,6 +263,9 @@
 <body>
 
 <!-- Drawer backdrop scrim is injected + managed by fb-lib (registerDrawer). -->
+
+<!-- Column-heading explanations (fb-styles .app-tooltip), filled on hover by _wireHeaderTips. -->
+<div id="hdrTip" class="app-tooltip" role="tooltip"></div>
 
 <!-- ==================== HEADER ==================== -->
 <header>
@@ -451,9 +469,10 @@
             <div class="fb-group" style="flex:1 1 320px;">
                 <div class="fb-group-title">Drill &amp; columns</div>
                 <ul style="font-size:12px; color:#415157; padding-left:18px; margin:4px 0;">
+                    <li><strong>Hover a column heading</strong> (dotted underline) for what the column means and what its markers (? * † —) stand for.</li>
                     <li>Click the <strong>Components</strong> cell to see every component, its available stock, and how many builds each supports — the limiting one(s) are highlighted.</li>
                     <li>A <strong>staged sub-assembly</strong> expands to show its own components and build count.</li>
-                    <li><strong>Build After Incoming</strong> projects the build count once open POs/MOs arrive.</li>
+                    <li><strong>After Incoming</strong> projects the build count once open orders arrive, and <strong>Ready By</strong> shows when: the scheduled date of the last order it depends on (red "late" when that date has passed).</li>
                     <li><strong>Sort</strong> a column by clicking its header; <strong>reorder</strong> by dragging headers; <strong>resize</strong> by dragging a header edge. Your layout is saved.</li>
                     <li>Click a <strong>BOM #</strong> or <strong>Finished Good</strong> to open it in Fishbowl; click a <strong>Constraint</strong> or <strong>Components</strong> cell for the full component breakdown.</li>
                 </ul>
@@ -574,6 +593,8 @@ var _lgAccessible = [];        // [{id,name}] the user can access
 var _loadToken = 0;
 var _buildFilter = 'now';
 
+var _uomConvMap = {};          // "fromUomId>toUomId" -> { num, den }: value_to = value_from * num / den
+
 var CAP_BOMS = 3000;           // safety cap on the BOM-header query
 var STAGE_MAX_PASSES = 8;      // staged-BOM closure depth guard
 
@@ -600,6 +621,69 @@ function fmtQty(v) { return FBLib.Common.formatQty(v); }
 function fmtMoney(v) { return FBLib.Common.formatMoney(v); }
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' })[c]; }); }
 
+// FLOOR for build counts. Quantities are decimal(28,9), so a quotient within a
+// hair of a whole number IS that number; binary floating point must not turn
+// 10489 complete builds into 10488.999999999998 -> 10488.
+function _floorBuilds(avail, qpb) {
+    var x = avail / qpb, r = Math.round(x);
+    return Math.abs(x - r) <= 1e-9 * Math.max(1, Math.abs(x)) ? r : Math.floor(x);
+}
+
+// A query date as a local 'YYYY-MM-DD' day key (sorts and compares as text),
+// or null. moment reads both "2026-09-11 00:00:00" and ISO-with-zone forms.
+function _dayKey(v) {
+    if (v == null || v === '') return null;
+    if (typeof moment === 'function') { var m = moment(v); return m.isValid() ? m.format('YYYY-MM-DD') : null; }
+    // No moment (CDN blocked): a zoned timestamp needs local time, else take the date part.
+    if (/T.*(Z|[+-]\d{2}:?\d{2})$/.test(String(v))) { var d = new Date(v); return isNaN(d) ? null : _localKey(d); }
+    var s = String(v).match(/^(\d{4}-\d{2}-\d{2})/);
+    return s ? s[1] : null;
+}
+function _localKey(d) {
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+function _todayKey() { return _localKey(new Date()); }
+
+// ============================================================================
+//  UOM CONVERSION
+//  uomconversion semantics, per Fishbowl's own views:
+//      value_in_TO = value_in_FROM * multiply / factor
+//  Uses the stored FROM -> TO row, else the exact inverse of a stored TO -> FROM
+//  row. No chaining through other units: customers' factors are rounded
+//  (kg -> lbs = 2.2046), so g -> lbs -> kg lands 0.0005% high and drops a whole
+//  build at a FLOOR boundary, and Fishbowl's own views never chain either. A
+//  conversion is kept as a numerator / denominator pair so the caller
+//  multiplies first and divides last: quantity * multiply / factor.
+// ============================================================================
+// Re-read on every load (the table is tiny) so a conversion added in Fishbowl
+// is picked up by Refresh.
+async function _loadUomConversions() {
+    var rows = await runQueryP('SELECT fromuomid, touomid, multiply, factor FROM uomconversion');
+    var map = {}, n = 0;
+    rows.forEach(function (r) {
+        var f = parseInt(r.fromuomid, 10), t = parseInt(r.touomid, 10);
+        var m = parseFloat(r.multiply), d = parseFloat(r.factor);
+        if (!(f && t && f !== t && m > 0 && d > 0)) return;
+        map[f + '>' + t] = { num: m, den: d };
+        n++;
+    });
+    // Inverses only where no stored row exists, so a stored row always wins.
+    Object.keys(map).forEach(function (k) {
+        var p = k.split('>'), rk = p[1] + '>' + p[0];
+        if (!map[rk]) map[rk] = { num: map[k].den, den: map[k].num, inverse: true };
+    });
+    _uomConvMap = map;
+    debugLog('UOM conversions: ' + n + ' stored row(s)', 'info');
+}
+// { num, den } converting a quantity in fromId into toId, or null when no
+// conversion exists. Null means unknown — never assume 1:1.
+function _uomConv(fromId, toId) {
+    fromId = parseInt(fromId, 10); toId = parseInt(toId, 10);
+    if (!fromId || !toId) return null;
+    if (fromId === toId) return { num: 1, den: 1 };
+    return _uomConvMap[fromId + '>' + toId] || null;
+}
+
 // The location groups currently in scope: the user's selection, else every
 // accessible LG. Availability is computed per LG within this set.
 function selectedLgIds() {
@@ -618,7 +702,13 @@ function lgNameById(id) {
 function _qtyCell(v) { return (v == null || v === '') ? '' : fmtQty(num(v)); }
 // Plain figures in the grid — no pills. Zero reads as muted, buildable as bold;
 // the colour alone carries the state without a filled chip on every row.
-function _atbCell(v) {
+function _atbCell(v, row) {
+    if (row && row._atbNoConv && row._atbNoConv.length) {
+        return '<span style="color:#b45309;font-weight:700;cursor:help" title="' + esc('Unknown: ' +
+            row._atbNoConv.join(', ') + ' is used on this BOM in a unit with no conversion to its ' +
+            'stocking unit, so it cannot be compared with inventory. Set the conversion up in ' +
+            'Fishbowl\'s UOM module.') + '">?</span>';
+    }
     if (v == null || v === '') return '<span style="color:var(--c-tertiary)">—</span>';
     var n = num(v);
     return n <= 0
@@ -637,15 +727,51 @@ function _constraintCell(v, row) {
         'onclick="openDrill(' + row.bomid + ',' + row.lgid + ')" ' +
         'title="' + esc(parts.join(', ')) + ' — click for the full breakdown">' + label + '</a>';
 }
+// When the After Incoming builds can be made. A past date is supply that is
+// late, not stock on hand: it stays a date (in red, "late"), never "now".
+function _readyCell(v, row) {
+    var r = (row && row._ready) || { state: 'na' };
+    if (r.state === 'na') return '<span style="color:var(--c-tertiary)">—</span>';
+    if (r.state === 'unknown') {
+        return '<span style="color:#b45309;font-weight:700;cursor:help" title="' + esc('Unknown: ' + r.why) + '">?</span>';
+    }
+    var d = FBLib.Common.formatDate(r.date);
+    var why = 'Waiting on ' + r.order + ' for ' + r.part + ', scheduled ' + d + '.';
+    if (r.state === 'overdue') {
+        return '<span style="color:var(--fb-negative);cursor:help" title="' + esc(why + ' That date has passed and the ' +
+            'supply hasn\'t arrived, so the real date is later.') + '">' + esc(d) +
+            ' <span style="font-size:10.5px;font-weight:600">late</span></span>';
+    }
+    return '<span style="cursor:help" title="' + esc(why) + '">' + esc(d) + '</span>';
+}
+// Units of finished good per build, in the finished good's stocking UOM (the
+// unit FG Available and its cost are in). The authored figure rides along in
+// brackets when the BOM line uses another unit.
+function _perBuildCell(v, row) {
+    if (!row) return _qtyCell(v);
+    if (v == null) {
+        return '<span style="color:#b45309;cursor:help" title="' + esc('No UOM conversion from ' +
+            row._fgbomuom + ' to ' + row._fgpartuom + ' (the finished good\'s stocking unit), so ' +
+            'Build Cost / Unit and Build Value cannot be calculated. Set the conversion up in ' +
+            'Fishbowl\'s UOM module.') + '">' + fmtQty(row._fgqtyAuthored) + ' ' + esc(row._fgbomuom) + ' *</span>';
+    }
+    if (row._fgbomuom && row._fgpartuom && row._fgbomuom !== row._fgpartuom) {
+        return '<span title="' + esc('BOM authors this as ' + fmtQty(row._fgqtyAuthored) + ' ' + row._fgbomuom +
+            '; shown in ' + row._fgpartuom + ', the finished good\'s stocking unit.') + '">' + fmtQty(v) +
+            ' <span style="color:var(--c-tertiary);font-size:10.5px">(' + fmtQty(row._fgqtyAuthored) + ' ' +
+            esc(row._fgbomuom) + ')</span></span>';
+    }
+    return fmtQty(v);
+}
 // Cost to build ONE finished unit from its components. Blank when no component
-// carries a cost; flagged when a component's UOM could not be converted, since
-// that line is then costed on an unverified 1:1 assumption.
+// carries a cost or the finished good's UOM cannot be converted; flagged when a
+// component's UOM could not be converted, since that line is then left out.
 function _unitCostCell(v, row) {
     if (v == null || v === '') return '<span style="color:var(--c-tertiary)">—</span>';
     var txt = fmtMoney(num(v));
     if (row && row._costNoConv) {
         return '<span style="color:#b45309" title="' + esc(row._costNoConv + ' component line(s) have no ' +
-            'UOM conversion to the part stocking unit — costed 1:1, so this figure is approximate') + '">' +
+            'UOM conversion to the part stocking unit and are left out, so this figure is understated') + '">' +
             txt + ' *</span>';
     }
     if (row && row._costMissing) {
@@ -670,20 +796,126 @@ function _titleCell(v) { var s = (v == null ? '' : String(v)); return '<span tit
 // resize and persist. BOM Description has NO fixed width, so under
 // table-layout:fixed it absorbs the slack and the table fills the page width.
 var _columns = [
-    { key: 'locationgroup',  label: 'Location Group',     width: 125, filter: false },
+    { key: 'locationgroup',  label: 'Location Group',     width: 110, filter: false },
     { key: 'bomnum',         label: 'BOM #',              width: 90,  link: 'Bill of Materials', filter: false },
     { key: 'bomdesc',        label: 'BOM Description',     filter: false, format: _titleCell },
-    { key: 'fgpartnum',      label: 'Finished Good',      width: 125, link: 'Part', filter: false },
-    { key: 'fgqty',          label: 'Per Build',          width: 85,  align: 'right', qty: true, filter: false, format: _qtyCell },
-    { key: 'atb',            label: 'Available to Build',  width: 145, align: 'right', qty: true, filter: false, format: _atbCell },
-    { key: 'constraint',     label: 'Constraint',         width: 125, filter: false, format: _constraintCell },
-    { key: 'fgavailable',    label: 'FG Available',        width: 105, align: 'right', qty: true, filter: false, format: _qtyCell },
+    { key: 'fgpartnum',      label: 'Finished Good',      width: 115, link: 'Part', filter: false },
+    { key: 'fgqty',          label: 'Per Build',          width: 80,  align: 'right', qty: true, filter: false, format: _perBuildCell },
+    { key: 'atb',           label: 'Available to Build',  width: 125, align: 'right', qty: true, filter: false, format: _atbCell },
+    { key: 'constraint',     label: 'Constraint',         width: 110, filter: false, format: _constraintCell },
+    { key: 'fgavailable',    label: 'FG Available',        width: 95, align: 'right', qty: true, filter: false, format: _qtyCell },
     { key: 'onorder',        label: 'On Order',           width: 85,  align: 'right', qty: true, filter: false, format: _qtyCell },
-    { key: 'atbafter',       label: 'After Incoming',     width: 125, align: 'right', qty: true, filter: false, format: _atbCell },
-    { key: 'unitbuildcost',  label: 'Build Cost / Unit',  width: 130, align: 'right', money: true, filter: false, format: _unitCostCell },
-    { key: 'buildablevalue', label: 'Build Value',        width: 115, align: 'right', money: true, filter: false, format: _moneyCell },
+    { key: 'atbafter',       label: 'After Incoming',     width: 110, align: 'right', qty: true, filter: false, format: _atbCell },
+    { key: 'readyby',        label: 'Ready By',           width: 120, align: 'right', filter: false, format: _readyCell },
+    { key: 'unitbuildcost',  label: 'Build Cost / Unit',  width: 120, align: 'right', money: true, filter: false, format: _unitCostCell },
+    { key: 'buildablevalue', label: 'Build Value',        width: 100, align: 'right', money: true, filter: false, format: _moneyCell },
     { key: 'componentcount', label: 'Components',         width: 110, align: 'center', qty: true, sortable: true, filter: false, format: _drillCell }
 ];
+
+// ============================================================================
+//  COLUMN-HEADING TOOLTIPS
+//  Main grid headings are keyed by column key (FBLib.Table stamps each <th>
+//  with data-col-key); drill headings by their data-tip. `meta` is the small
+//  print under the rule: markers and caveats. Plain text, escaped on render;
+//  \n breaks a line (.app-tooltip is white-space: pre-line).
+// ============================================================================
+var _HEADER_TIPS = {
+    locationgroup: { title: 'Location Group',
+        desc: 'The location group this row is calculated for. Only stock held in this location group counts.',
+        meta: 'One row per BOM × location group.' },
+    bomnum: { title: 'BOM #',
+        desc: 'The bill of materials. Click it to open the BOM in Fishbowl.' },
+    bomdesc: { title: 'BOM Description',
+        desc: 'The description saved on the BOM.' },
+    fgpartnum: { title: 'Finished Good',
+        desc: 'The part this BOM makes. Click it to open the part in Fishbowl.',
+        meta: 'A BOM with several finished goods shows the first.' },
+    fgqty: { title: 'Per Build',
+        desc: 'Units of the finished good one build makes, in the finished good\'s stocking unit. When the BOM uses another unit, its own figure follows in brackets.',
+        meta: '* No conversion to the stocking unit, so Build Cost / Unit and Build Value can\'t be calculated.' },
+    atb: { title: 'Available to Build',
+        desc: 'Complete builds you can make right now from available stock: the lowest count any inventory component supports. Multiply by Per Build for units.',
+        meta: 'Available = On Hand − Allocated − Not Available + Drop Ship.\n? A component\'s unit has no conversion to its stocking unit.\n— The BOM has no inventory components.' },
+    constraint: { title: 'Constraint',
+        desc: 'The component limiting Available to Build, the one that runs out first. Click it for the full component breakdown.',
+        meta: '+N More components tie for the limit.' },
+    fgavailable: { title: 'FG Available',
+        desc: 'Finished goods already available in this location group (On Hand − Allocated − Not Available + Drop Ship), in the finished good\'s stocking unit.' },
+    onorder: { title: 'On Order',
+        desc: 'Fishbowl\'s On Order quantity for the finished good in this location group: open purchase, manufacture, transfer and return orders.' },
+    atbafter: { title: 'After Incoming',
+        desc: 'Available to Build once every component\'s open orders arrive: each component\'s Available plus its On Order. Ready By says when.',
+        meta: 'Same as Available to Build when the limiting component has nothing on order.\nSame ? and — markers as Available to Build.' },
+    readyby: { title: 'Ready By',
+        desc: 'When the After Incoming builds can be made: the scheduled date of the last open order they depend on (PO line, work order, transfer or customer return). Hover a date for the order and part it\'s waiting on.',
+        meta: 'Red "late": the date has passed and the supply hasn\'t arrived.\n— Incoming supply adds no builds.\n? An order it depends on has no scheduled date.\nScheduled dates, not confirmed arrivals.' },
+    unitbuildcost: { title: 'Build Cost / Unit',
+        desc: 'Cost to make one unit of the finished good from its components: each component\'s quantity × its unit cost, divided by Per Build. Uses the cost basis in Settings, falling back to the other basis when a component has no cost.',
+        meta: '† A component has no cost, so the figure is understated.\n* A component\'s unit can\'t be converted. It is left out, so the figure is understated.' },
+    buildablevalue: { title: 'Build Value',
+        desc: 'What you can build now is worth: Available to Build × Per Build × the finished good\'s own cost (standard or average, per Settings).',
+        meta: 'Values the output at the finished good\'s cost, not what its components cost.' },
+    componentcount: { title: 'Components',
+        desc: 'Component lines on the BOM (default options only). Click to see each component\'s stock and how many builds it supports.' },
+
+    'drill.component': { title: 'Component',
+        desc: 'Each component line on the BOM, default options only. Highlighted rows are the constraint. A staged sub-assembly expands to its own components.' },
+    'drill.qpb': { title: 'Qty / Build',
+        desc: 'Quantity used per build, in the part\'s stocking unit so it compares directly with On Hand and Available. When the BOM uses another unit, its own figure follows in brackets.',
+        meta: '* No conversion to the stocking unit, so this line\'s builds are unknown.' },
+    'drill.uom': { title: 'UOM',
+        desc: 'The part\'s stocking unit: the unit On Hand and Available are counted in.' },
+    'drill.onhand': { title: 'On Hand',
+        desc: 'Physical stock of the part in this location group.' },
+    'drill.available': { title: 'Available',
+        desc: 'Stock free to use: On Hand − Allocated − Not Available + Drop Ship.' },
+    'drill.builds': { title: 'Builds',
+        desc: 'Builds this component alone supports: Available ÷ Qty / Build, rounded down. The lowest figure is the BOM\'s Available to Build.',
+        meta: '? The unit can\'t be converted.\n∞ Zero quantity per build.\n— Not an inventory part, so not counted.' }
+};
+
+// One delegated listener pair serves both tables, so the tips survive every
+// FBLib.Table re-render (sort, reorder, resize) and every drill rebuild.
+function _wireHeaderTips() {
+    var tip = document.getElementById('hdrTip');
+    if (!tip) return;
+    var timer = null, current = null;
+    function hide() {
+        clearTimeout(timer); timer = null; current = null;
+        tip.classList.remove('show');
+    }
+    function show(th, t) {
+        tip.innerHTML = '<span class="tt-title">' + esc(t.title) + '</span>' +
+            '<span class="tt-desc">' + esc(t.desc) + '</span>' +
+            (t.meta ? '<span class="tt-meta">' + esc(t.meta) + '</span>' : '');
+        // Below the heading (headings sit at the top of the view), clamped to
+        // the viewport; flipped above only if there is no room below.
+        var r = th.getBoundingClientRect();
+        var w = tip.offsetWidth, h = tip.offsetHeight;
+        var left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8));
+        var top = r.bottom + 6;
+        if (top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 6);
+        tip.style.left = left + 'px';
+        tip.style.top = top + 'px';
+        tip.classList.add('show');
+    }
+    document.addEventListener('mouseover', function (e) {
+        var th = e.target && e.target.closest &&
+            e.target.closest('#reportTable thead tr:first-child th[data-col-key], .drill-tbl th[data-tip]');
+        if (th === current) return;
+        hide();
+        if (!th) return;
+        var t = _HEADER_TIPS[th.getAttribute('data-tip') || th.getAttribute('data-col-key')];
+        if (!t) return;
+        current = th;
+        // A short delay so sweeping the pointer across the header row doesn't
+        // flash a tip for every column it crosses.
+        timer = setTimeout(function () { if (current === th) show(th, t); }, 350);
+    });
+    // Sorting, dragging or scrolling moves the heading out from under the tip.
+    ['mousedown', 'dragstart', 'wheel'].forEach(function (ev) { document.addEventListener(ev, hide, true); });
+    window.addEventListener('blur', hide);
+}
 
 // ============================================================================
 //  FILTERS
@@ -735,8 +967,11 @@ function _applyClientFilters() {
     var fgSel  = _fgMs ? new Set(_fgMs.getSelected().map(String)) : new Set();
     var conSel = _constraintMs ? new Set(_constraintMs.getSelected().map(String)) : new Set();
     _dataset = _allRows.filter(function (r) {
-        if (_buildFilter === 'now'  && !(num(r.atb) >= 1)) return false;
-        if (_buildFilter === 'zero' && !(r.atb != null && num(r.atb) === 0)) return false;
+        // A row whose ATB is unknown (missing UOM conversion) passes every
+        // buildability chip, so the default "Buildable now" view can't hide it.
+        var unknown = r._atbNoConv && r._atbNoConv.length;
+        if (!unknown && _buildFilter === 'now'  && !(num(r.atb) >= 1)) return false;
+        if (!unknown && _buildFilter === 'zero' && !(r.atb != null && num(r.atb) === 0)) return false;
         if (fgSel.size  && !fgSel.has(String(r.fgpartnum))) return false;
         if (conSel.size && !(r._constraintParts || []).some(function (p) { return conSel.has(String(p)); })) return false;
         return true;
@@ -785,10 +1020,14 @@ function buildBomHeaderSQL() {
     return [
         'SELECT bom.id AS bomid, bom.num AS bomnum, bom.description AS bomdesc,',
         '       fgpart.id AS fgpartid, fgpart.num AS fgpartnum, fgpart.description AS fgpartdesc,',
-        '       fgpart.typeid AS fgparttype, fgpart.stdcost AS fgstdcost, fgbi.quantity AS fgqty',
+        '       fgpart.typeid AS fgparttype, fgpart.stdcost AS fgstdcost, fgbi.quantity AS fgqty,',
+        '       fgbi.uomid AS fgbomuomid, fgbiuom.code AS fgbomuom,',
+        '       fgpart.uomid AS fgpartuomid, fgpartuom.code AS fgpartuom',
         'FROM bom',
         'JOIN bomitem fgbi ON fgbi.bomid = bom.id AND fgbi.typeid = 10 AND fgbi.groupdefault = 1',
         'JOIN part fgpart ON fgpart.id = fgbi.partid',
+        'JOIN uom fgbiuom ON fgbiuom.id = fgbi.uomid',
+        'JOIN uom fgpartuom ON fgpartuom.id = fgpart.uomid',
         'WHERE ' + where.join(' AND '),
         'ORDER BY bom.num',
         'LIMIT ' + (CAP_BOMS + 1)
@@ -796,8 +1035,8 @@ function buildBomHeaderSQL() {
 }
 
 // Component lines for a set of BOM ids (default group only). Mirrors the .jrxml
-// FROM/JOIN. Carries the UOM conversion factors so qty-per-build normalises to
-// the part base UOM in JS.
+// FROM/JOIN. Carries both UOM ids so qty-per-build normalises to the part base
+// UOM in JS (_uomConv).
 function buildComponentSQL(bomIds) {
     return [
         'SELECT bomitem.bomid AS bomid, bomitem.id AS bomitemid,',
@@ -807,17 +1046,13 @@ function buildComponentSQL(bomIds) {
         '       part.id AS partid, part.num AS partnum, part.description AS partdesc,',
         '       part.typeid AS parttype, partuom.code AS partuom,',
         '       COALESCE(part.stdCost, 0) AS stdcost, COALESCE(pcost.avgCost, 0) AS avgcost,',
-        // A missing conversion row silently degrades to 1:1 below. Carry the fact
-        // so the build cost can be marked approximate rather than quietly wrong.
-        '       (bomitem.uomid = part.uomid OR uc.multiply IS NOT NULL) AS convok,',
-        '       COALESCE(uc.multiply, 1) AS multiply, COALESCE(uc.factor, 1) AS factor',
+        '       bomitem.uomid AS bomuomid, part.uomid AS partuomid',
         'FROM bomitem',
         'JOIN bomitemtype ON bomitem.typeid = bomitemtype.id',
         'JOIN part ON bomitem.partid = part.id',
         'JOIN uom partuom ON part.uomid = partuom.id',
         'JOIN uom biuom ON bomitem.uomid = biuom.id',
         'LEFT JOIN partcost pcost ON pcost.partId = part.id',
-        'LEFT JOIN uomconversion uc ON bomitem.uomid = uc.fromuomid AND uc.touomid = part.uomid',
         'WHERE bomitem.groupdefault = 1 AND bomitem.bomid IN (' + bomIds.join(',') + ')',
         'ORDER BY bomitem.bomid, bomitem.sortidconfig'
     ].join('\n');
@@ -836,6 +1071,59 @@ function buildAvailabilitySQL(partIds, lgIds) {
         'FROM qtyInventoryTotals',
         'WHERE locationGroupId IN (' + lgIds.join(',') + ') AND partId IN (' + partIds.join(',') + ')',
         'GROUP BY partId, locationGroupId'
+    ].join('\n');
+}
+
+// Incoming supply as dated events, one row per open order line, so After
+// Incoming can say WHEN. Each branch mirrors one of the views behind
+// qtyInventoryTotals.qtyOnOrder (QTYONORDERPO / SO / MO / TORECEIVE / TOSEND,
+// same filters and UOM handling), so per part + LG the rows sum to exactly
+// the On Order figure the availability query returns (demodb: 73/73 pairs).
+// The date is the order's scheduled date: line first, header as fallback.
+function buildIncomingSQL(partIds, lgIds) {
+    var P = partIds.join(','), L = lgIds.join(',');
+    function conv(q, u) { return 'CASE WHEN ' + u + ' <> part.uomid AND uc.id > 0 THEN ' + q + ' * uc.multiply / uc.factor ELSE ' + q + ' END'; }
+    return [
+        'SELECT * FROM (',
+        // Open PO receipt lines (QTYONORDERPO).
+        'SELECT part.id AS partid, receipt.locationgroupid AS lgid, ' + conv('receiptitem.qty', 'receiptitem.uomid') + ' AS qty,',
+        '       COALESCE(poitem.datescheduledfulfillment, po.datefirstship, rpo.datefirstship) AS eta,',
+        "       'PO' AS src, COALESCE(po.num, rpo.num) AS ordernum",
+        'FROM receipt JOIN receiptitem ON receiptitem.receiptid = receipt.id JOIN part ON part.id = receiptitem.partid',
+        'LEFT JOIN uomconversion uc ON uc.touomid = part.uomid AND uc.fromuomid = receiptitem.uomid',
+        'LEFT JOIN poitem ON poitem.id = receiptitem.poitemid LEFT JOIN po ON po.id = poitem.poid',
+        'LEFT JOIN po rpo ON rpo.id = receipt.poid',
+        'WHERE receipt.ordertypeid = 10 AND receiptitem.statusid IN (10, 20)',
+        '  AND part.id IN (' + P + ') AND receipt.locationgroupid IN (' + L + ')',
+        'UNION ALL',
+        // Customer credit-return lines on open SOs (QTYONORDERSO).
+        'SELECT part.id, so.locationgroupid, ' + conv('(soitem.qtytofulfill - soitem.qtyfulfilled)', 'soitem.uomid') + ',',
+        "       COALESCE(soitem.datescheduledfulfillment, so.datefirstship), 'SO', so.num",
+        'FROM part JOIN product ON product.partid = part.id JOIN soitem ON soitem.productid = product.id',
+        'JOIN so ON so.id = soitem.soid',
+        'LEFT JOIN uomconversion uc ON uc.touomid = part.uomid AND uc.fromuomid = soitem.uomid',
+        'WHERE so.statusid IN (20, 25) AND soitem.statusid IN (10, 14, 30) AND soitem.typeid = 20',
+        '  AND part.id IN (' + P + ') AND so.locationgroupid IN (' + L + ')',
+        'UNION ALL',
+        // Finished-good output of open work orders (QTYONORDERMO).
+        'SELECT part.id, wo.locationgroupid, ' + conv('woitem.qtytarget', 'woitem.uomid') + ',',
+        "       COALESCE(wo.datescheduled, moitem.datescheduled), 'WO', wo.num",
+        'FROM part JOIN woitem ON woitem.partid = part.id JOIN wo ON wo.id = woitem.woid',
+        'LEFT JOIN moitem ON moitem.id = wo.moitemid',
+        'LEFT JOIN uomconversion uc ON uc.touomid = part.uomid AND uc.fromuomid = woitem.uomid',
+        'WHERE wo.statusid < 40 AND woitem.typeid IN (10, 31)',
+        '  AND part.id IN (' + P + ') AND wo.locationgroupid IN (' + L + ')',
+        'UNION ALL',
+        // Transfer lines into this LG (QTYONORDERTORECEIVE + QTYONORDERTOSEND).
+        'SELECT part.id, CASE WHEN xoitem.typeid = 20 THEN xo.fromlgid ELSE xo.shiptolgid END,',
+        '       ' + conv('(xoitem.qtytofulfill - xoitem.qtyfulfilled)', 'xoitem.uomid') + ',',
+        "       COALESCE(xoitem.datescheduledfulfillment, xo.datescheduled), 'TO', xo.num",
+        'FROM part JOIN xoitem ON xoitem.partid = part.id JOIN xo ON xo.id = xoitem.xoid',
+        'LEFT JOIN uomconversion uc ON uc.touomid = part.uomid AND uc.fromuomid = xoitem.uomid',
+        'WHERE xo.statusid IN (20, 30, 40, 50, 60) AND xoitem.statusid IN (10, 20, 30, 40, 50)',
+        '  AND xoitem.typeid IN (10, 20) AND part.id IN (' + P + ')',
+        '  AND (CASE WHEN xoitem.typeid = 20 THEN xo.fromlgid ELSE xo.shiptolgid END) IN (' + L + ')',
+        ') s'
     ].join('\n');
 }
 
@@ -862,6 +1150,10 @@ async function loadDashboard() {
             return;
         }
 
+        // 0) UOM conversions (BOM lines are often authored in another unit).
+        await _loadUomConversions();
+        if (tok !== _loadToken) return;
+
         // 1) Matching BOM headers + finished good.
         var hdr = await runQueryP(buildBomHeaderSQL());
         if (tok !== _loadToken) return;
@@ -870,10 +1162,16 @@ async function loadDashboard() {
         hdr.slice(0, CAP_BOMS).forEach(function (r) {
             var bid = parseInt(r.bomid, 10);
             if (fgByBom[bid]) return;   // one FG per BOM (dedupe extra typeid=10 lines)
+            // Units per build in the FG's stocking UOM, the unit its cost and
+            // availability are in. null = no conversion (unknown).
+            var fgAuthored = num(r.fgqty) || 1;
+            var fgConv = _uomConv(r.fgbomuomid, r.fgpartuomid);
             fgByBom[bid] = {
                 bomid: bid, bomnum: r.bomnum || '', bomdesc: r.bomdesc || '',
                 fgpartid: parseInt(r.fgpartid, 10) || 0, fgpartnum: r.fgpartnum || '',
-                fgparttype: parseInt(r.fgparttype, 10) || 0, fgstdcost: num(r.fgstdcost), fgqty: num(r.fgqty) || 1
+                fgparttype: parseInt(r.fgparttype, 10) || 0, fgstdcost: num(r.fgstdcost),
+                fgqty: fgConv ? fgAuthored * fgConv.num / fgConv.den : null,
+                fgqtyauthored: fgAuthored, fgbomuom: r.fgbomuom || '', fgpartuom: r.fgpartuom || ''
             };
             _bomMetaById[bid] = { bomnum: r.bomnum || '', bomdesc: r.bomdesc || '' };
             topBomIds.push(bid);
@@ -899,17 +1197,21 @@ async function loadDashboard() {
             var nextStage = {};
             comps.forEach(function (r) {
                 var bid = parseInt(r.bomid, 10);
+                var bomqty = num(r.bomqty);
+                var conv = _uomConv(r.bomuomid, r.partuomid);
                 var c = {
                     bomid: bid, bomitemid: parseInt(r.bomitemid, 10),
                     bitypeid: parseInt(r.bitypeid, 10), bitype: r.bitype || '',
                     stageflag: (String(r.stageflag) === '1' || r.stageflag === true),
                     stagebomid: (r.stagebomid != null && String(r.stagebomid).length) ? parseInt(r.stagebomid, 10) : null,
-                    bomqty: num(r.bomqty), bomuom: r.bomuom || '',
+                    bomqty: bomqty, bomuom: r.bomuom || '',
                     partid: parseInt(r.partid, 10), partnum: r.partnum || '', partdesc: r.partdesc || '',
                     parttype: parseInt(r.parttype, 10), partuom: r.partuom || '',
                     stdcost: num(r.stdcost), avgcost: num(r.avgcost),
-                    convok: (String(r.convok) === '1' || r.convok === true),
-                    multiply: num(r.multiply) || 1, factor: num(r.factor) || 1
+                    // Qty per build in the part's stocking UOM: multiply first,
+                    // divide last. null = no conversion (unknown).
+                    qpb: conv ? bomqty * conv.num / conv.den : null,
+                    convnum: conv ? conv.num : null, convden: conv ? conv.den : null
                 };
                 (compByBom[bid] = compByBom[bid] || []).push(c);
                 if (c.stageflag && c.stagebomid && !loadedBoms[c.stagebomid]) nextStage[c.stagebomid] = true;
@@ -937,6 +1239,28 @@ async function loadDashboard() {
         }
         _drillAvail = availMap;   // mirror for the drill modal (component On Hand / Available cells)
 
+        // 3b) The same On Order, as dated order lines, for the Ready By date.
+        //     Soonest first; an undated line sorts last and makes the date unknown.
+        var incomingMap = {};   // "partid|lgid" -> [{ qty, eta, label }]
+        if (partIds.length) {
+            try {
+                var inc = await runQueryP(buildIncomingSQL(partIds, lgIds));
+                if (tok !== _loadToken) return;
+                inc.forEach(function (r) {
+                    var q = num(r.qty);
+                    if (!(q > 0)) return;
+                    (incomingMap[r.partid + '|' + r.lgid] = incomingMap[r.partid + '|' + r.lgid] || []).push({
+                        qty: q, eta: _dayKey(r.eta), label: (r.src || '') + ' ' + (r.ordernum || '')
+                    });
+                });
+                Object.keys(incomingMap).forEach(function (k) {
+                    incomingMap[k].sort(function (a, b) {
+                        return a.eta === b.eta ? 0 : a.eta == null ? 1 : b.eta == null ? -1 : (a.eta < b.eta ? -1 : 1);
+                    });
+                });
+            } catch (e) { debugLog('incoming supply query failed: ' + e.message, 'warn'); incomingMap = null; }
+        }
+
         // 4) Cost basis for buildable value.
         var costBasis = _resolve('costBasis', 'std');
         var avgCostByPart = {};
@@ -962,19 +1286,54 @@ async function loadDashboard() {
         function computeBom(bid, lg, proj) {
             var comps = compByBom[bid] || [];
             var cons = comps.filter(function (c) { return c.bitypeid !== 10 && c.parttype === 10; });
-            if (!cons.length) return { atb: null, constraint: [] };
-            var minBuilds = Infinity, per = [];
+            if (!cons.length) return { atb: null, constraint: [], noConv: [] };
+            var minBuilds = Infinity, per = [], noConv = [];
             cons.forEach(function (c) {
-                var qpb = c.bomqty * (c.multiply / c.factor);
+                if (c.qpb == null) { noConv.push(c.partnum); return; }
                 var avail = availGet(c.partid, lg, proj);
-                var builds = qpb > 0 ? Math.floor(avail / qpb) : Infinity;
+                var builds = c.qpb > 0 ? _floorBuilds(avail, c.qpb) : Infinity;
                 per.push({ partid: c.partid, partnum: c.partnum, builds: builds });
                 if (builds < minBuilds) minBuilds = builds;
             });
-            if (!isFinite(minBuilds)) return { atb: null, constraint: [] };
+            // One unconvertible constraint line makes the whole answer unknown:
+            // the MIN over the rest is only an upper bound.
+            if (noConv.length) return { atb: null, constraint: [], noConv: noConv };
+            if (!isFinite(minBuilds)) return { atb: null, constraint: [], noConv: [] };
             var atb = Math.max(0, minBuilds);
             var constraint = per.filter(function (p) { return p.builds === minBuilds; });
-            return { atb: atb, constraint: constraint };
+            return { atb: atb, constraint: constraint, noConv: [] };
+        }
+
+        // When `target` builds (the After Incoming figure) can be made: per
+        // inventory component, walk its incoming lines soonest-first until
+        // available + arrivals cover target x qty per build; the BOM is ready
+        // when its LAST component is. Returns the binding line so the cell can
+        // name what it's waiting on. date null = an undated line was needed (or
+        // the lines didn't add up to On Order).
+        var today = _todayKey();
+        function computeReadyBy(bid, lg, target) {
+            if (!incomingMap) return { state: 'unknown', why: 'The incoming-supply query failed (see the debug console).' };
+            var comps = (compByBom[bid] || []).filter(function (c) { return c.bitypeid !== 10 && c.parttype === 10 && c.qpb > 0; });
+            var worst = null;
+            for (var i = 0; i < comps.length; i++) {
+                var c = comps[i];
+                var a = availMap[c.partid + '|' + lg];
+                var cum = a ? a.available : 0;
+                if (_floorBuilds(cum, c.qpb) >= target) continue;    // covered by stock now
+                var evs = incomingMap[c.partid + '|' + lg] || [], hit = null;
+                for (var j = 0; j < evs.length && !hit; j++) {
+                    cum += evs[j].qty;
+                    if (_floorBuilds(cum, c.qpb) >= target) hit = evs[j];
+                }
+                if (!hit || !hit.eta) {
+                    return { state: 'unknown', part: c.partnum, why: hit
+                        ? hit.label + ' for ' + c.partnum + ' has no scheduled date.'
+                        : 'The open orders for ' + c.partnum + ' could not be matched to its On Order quantity.' };
+                }
+                if (!worst || hit.eta > worst.eta) worst = { eta: hit.eta, part: c.partnum, order: hit.label };
+            }
+            if (!worst) return { state: 'na' };
+            return { state: worst.eta < today ? 'overdue' : 'date', date: worst.eta, part: worst.part, order: worst.order };
         }
 
         // Cost to build ONE unit of the finished good, from its own components:
@@ -986,15 +1345,16 @@ async function loadDashboard() {
         // configurable BOM is priced on its default option, not every option.
         function computeBuildCost(bid, fgQty) {
             var comps = (compByBom[bid] || []).filter(function (c) { return c.bitypeid !== 10; });
-            if (!comps.length) return { unit: null, missing: 0, noconv: 0 };
+            if (!comps.length || fgQty == null) return { unit: null, missing: 0, noconv: 0 };
             var total = 0, missing = 0, noconv = 0;
             comps.forEach(function (c) {
+                // Unknown quantity: left out (and flagged), never costed 1:1.
+                if (c.qpb == null) { noconv++; return; }
                 var unit = (costBasis === 'avg')
                     ? (c.avgcost > 0 ? c.avgcost : c.stdcost)
                     : (c.stdcost > 0 ? c.stdcost : c.avgcost);
                 if (!(unit > 0)) missing++;
-                if (!c.convok) noconv++;
-                total += (c.bomqty * (c.multiply / c.factor)) * (unit || 0);
+                total += c.qpb * (unit || 0);
             });
             var per = (fgQty > 0) ? total / fgQty : total;
             return { unit: per, missing: missing, noconv: noconv };
@@ -1024,21 +1384,30 @@ async function loadDashboard() {
                 var atb = res.atb;
                 var consNames = res.constraint.map(function (c) { return c.partnum; });
                 var bc = computeBuildCost(bid, fg.fgqty);
+                // Ready By only means something when incoming supply adds builds.
+                var rb = (atb != null && proj.atb != null && proj.atb > atb)
+                    ? computeReadyBy(bid, lg, proj.atb) : { state: 'na' };
                 _allRows.push({
                     bomid: bid, lgid: lg,
                     locationgroup: lgNameById(lg),
                     bomnum: fg.bomnum, bomdesc: fg.bomdesc,
                     fgpartnum: fg.fgpartnum, fgqty: fg.fgqty,
+                    _fgqtyAuthored: fg.fgqtyauthored, _fgbomuom: fg.fgbomuom, _fgpartuom: fg.fgpartuom,
                     atb: atb,
+                    _atbNoConv: res.noConv,
                     constraint: consNames.join(', '),      // filter/CSV/datalist value
                     _constraintParts: consNames,           // for the compact constraint cell
                     fgavailable: fgAvail,
                     onorder: fgOnOrder,
                     atbafter: proj.atb,
+                    readyby: rb.date || null,               // 'YYYY-MM-DD': sorts and exports as text
+                    _ready: rb,
                     unitbuildcost: bc.unit,
                     _costMissing: bc.missing,
                     _costNoConv: bc.noconv,
-                    buildablevalue: (atb != null ? atb * (cost || 0) : null),
+                    // Builds x units per build x FG unit cost: ATB counts complete
+                    // builds, and a build can yield many units (Kombucha Batch: 500 L).
+                    buildablevalue: (atb != null && fg.fgqty != null ? atb * fg.fgqty * (cost || 0) : null),
                     // Count the COMPONENT lines only (exclude the finished-good
                     // typeid=10 lines) so it matches what the drill lists.
                     componentcount: (compByBom[bid] || []).filter(function (c) { return c.bitypeid !== 10; }).length
@@ -1070,19 +1439,19 @@ function openDrill(bomid, lgid) {
     var key = bomid + '|' + lgid;
     var meta = _bomMetaById[bomid] || {};
     var atb = _bomAtbByKey[key];
+    var unknown = (_componentsByKey[key] || []).some(function (c) { return c.bitypeid !== 10 && c.parttype === 10 && c.qpb == null; });
     document.getElementById('drillTitle').innerHTML =
         'BOM ' + esc(meta.bomnum || bomid) + ' · ' + esc(lgNameById(lgid)) +
-        ' — Available to Build: ' + (atb == null ? '—' : '<strong>' + fmtQty(atb) + '</strong>');
+        ' — Available to Build: ' + (unknown ? '<strong style="color:#b45309">? (missing UOM conversion, marked *)</strong>'
+            : atb == null ? '—' : '<strong>' + fmtQty(atb) + '</strong>');
     var rows = _drillRows(bomid, lgid, 0, [], new Set([bomid]));
     var body = '<p class="drill-hint"><span class="sw"></span> Highlighted rows are the constraint (the components limiting this build). Click a ▸ staged sub-assembly to fold its own components.</p>' +
         '<table class="drill-tbl"><colgroup>' +
           '<col><col style="width:92px"><col style="width:56px"><col style="width:94px"><col style="width:94px"><col style="width:78px">' +
         '</colgroup><thead><tr>' +
-          '<th>Component</th><th class="num" title="Quantity consumed per build, expressed in the ' +
-          'part&apos;s stocking UOM so it is directly comparable with On Hand and Available. ' +
-          'Where the BOM authored the line in another unit, that original is shown in brackets.">' +
-          'Qty / Build</th><th>UOM</th>' +
-          '<th class="num">On Hand</th><th class="num">Available</th><th class="num">Builds</th>' +
+          '<th data-tip="drill.component">Component</th><th class="num" data-tip="drill.qpb">Qty / Build</th>' +
+          '<th data-tip="drill.uom">UOM</th><th class="num" data-tip="drill.onhand">On Hand</th>' +
+          '<th class="num" data-tip="drill.available">Available</th><th class="num" data-tip="drill.builds">Builds</th>' +
         '</tr></thead><tbody id="drillTbody">' + rows + '</tbody></table>';
     document.getElementById('drillBody').innerHTML = body;
     document.getElementById('drillModal').classList.add('open');
@@ -1106,8 +1475,10 @@ function _drillRows(bomid, lgid, level, ancestorGroups, visited) {
         any = true;
         var inv = (c.parttype === 10);
         var a = _availForDrill(c.partid, lgid);
-        var qpb = c.bomqty * (c.multiply / c.factor);
-        var builds = inv ? (qpb > 0 ? fmtQty(Math.floor((a ? a.available : 0) / qpb)) : '∞') : '—';
+        var qpb = c.qpb;
+        var builds = !inv ? '—'
+            : qpb == null ? '<span class="uom-bad">?</span>'
+            : qpb > 0 ? fmtQty(_floorBuilds(a ? a.available : 0, qpb)) : '∞';
         // Qty/Build and UOM are rendered in the PART'S STOCKING UOM, not the unit the
         // BOM line was authored in. On Hand, Available and Builds all come from inventory,
         // which is always held in the part base UOM, so showing the authored figure here
@@ -1115,20 +1486,21 @@ function _drillRows(bomid, lgid, level, ancestorGroups, visited) {
         // per build against 490.8778 4.8m lengths on hand, and Builds (6056) then looks
         // impossible to derive. The authored quantity is kept in brackets so the
         // conversion stays auditable.
-        var rowUom = (c.partuom || c.bomuom);
+        // With no conversion the line stays in its authored unit, marked.
+        var rowUom = qpb == null ? c.bomuom : (c.partuom || c.bomuom);
         var mixedUom = c.bomuom && c.partuom && c.bomuom !== c.partuom;
-        var qpbCell = fmtQty(qpb) +
-            (mixedUom
-                ? ' <span class="uom-orig" title="BOM line is authored as ' + fmtQty(c.bomqty) + ' ' +
-                  esc(c.bomuom) + '; converted to ' + esc(c.partuom) + ' (x' + fmtQty(c.multiply) + ' / ' +
-                  fmtQty(c.factor) + ') because inventory is held in ' + esc(c.partuom) + '.">(' +
-                  fmtQty(c.bomqty) + ' ' + esc(c.bomuom) + ')</span>'
-                : '') +
-            (!c.convok
-                ? ' <span class="uom-bad" title="No UOM conversion exists from ' + esc(c.bomuom) +
-                  ' to ' + esc(c.partuom) + ', so 1:1 was assumed. This quantity — and the Builds ' +
-                  'figure derived from it — is unreliable until the conversion is set up in Fishbowl.">*</span>'
-                : '');
+        var qpbCell = qpb == null
+            ? fmtQty(c.bomqty) + ' <span class="uom-bad" title="No UOM conversion from ' + esc(c.bomuom) +
+              ' to ' + esc(c.partuom) + ' exists in Fishbowl (in either direction), so this ' +
+              'line cannot be compared with inventory. Its Builds, and the BOM&apos;s Available to Build, ' +
+              'are unknown until the conversion is set up.">*</span>'
+            : fmtQty(qpb) +
+              (mixedUom
+                  ? ' <span class="uom-orig" title="BOM line is authored as ' + fmtQty(c.bomqty) + ' ' +
+                    esc(c.bomuom) + '; converted to ' + esc(c.partuom) + ' (x' + fmtQty(c.convnum) + ' / ' +
+                    fmtQty(c.convden) + ') because inventory is held in ' + esc(c.partuom) + '.">(' +
+                    fmtQty(c.bomqty) + ' ' + esc(c.bomuom) + ')</span>'
+                  : '');
         var isConstraint = inv && constraintSet.has(c.partid);
         var canExpand = c.stageflag && c.stagebomid && _componentsByKey[c.stagebomid + '|' + lgid] && !visited.has(c.stagebomid);
         var gid = canExpand ? (++_drillGroupSeq) : null;
@@ -1379,6 +1751,7 @@ window.addEventListener('DOMContentLoaded', async function () {
     _hydrateSettings();
     _applyDebugDrawer(!!_resolve('showDebug', false));
     _refreshAdminUi();
+    _wireHeaderTips();
 
     document.getElementById('filterBom').addEventListener('keydown', function (e) { if (e.key === 'Enter') loadDashboard(); });
     document.getElementById('filterActiveOnly').addEventListener('change', loadDashboard);

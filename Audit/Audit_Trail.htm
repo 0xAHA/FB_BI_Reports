@@ -7,8 +7,12 @@
     timestamp + modifiedUserId for the commit that produced the revision.
     REVTYPE: 0=created, 1=modified, 2=deleted.
 
-    Volume note: aud tables are large. The Run button is gated by Type +
-    Number so the report never scans without scoping to a specific entity.
+    Volume note: aud tables are large. With a Number entered, Run reads the
+    full history of that one record. With the Number left empty, Run is
+    "browse mode": the latest BROWSE_LIMIT (500) changes across every record
+    of the type, read newest-first off each aud table's REV index and
+    stopped at the limit, so it never scans a whole table. The empty field
+    glows orange, with a hint beside it, whenever browse mode is armed.
 
     Visual baseline: PurchaseOrder/PurchaseOrderSummary.htm (hdr-btn, navy
     table header, ms-* multi-select, settings persistence).
@@ -16,6 +20,8 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8" />
+    <meta name="fb-launch" content="SETUP">
+    <meta name="description" content="Change history for any order or record from Fishbowl’s audit tables: who changed what, and when.">
     <script>
         // ================================================================
         // REPORT IDENTITY
@@ -24,7 +30,7 @@
         //          Fishbowl to make a SEPARATE report? Give the copy its own
         //          key (e.g. add '2') so it keeps its own settings - left
         //          as-is, the copy shares the original's. 31 chars max.
-        //   name   This report's Fishbowl record name ('- Folder - Report').
+        //   name   This report's Fishbowl record name (a plain name; no folder prefix).
         //          Publishing finds its copy in the SharePoint BI Reports
         //          folder by this name; null = not published.
         //   build  Stamped automatically from this file's content by
@@ -32,8 +38,8 @@
         // ================================================================
         window.FB_REPORT = {
             key:   'cdx.bi.audittrail',
-            name:  '- Audit Trail',
-            build: '2026.09.25-61b0fe4'     // @fb-build
+            name:  'Audit Trail',
+            build: '2026.10.12-cf58220'     // @fb-build
         };
     </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -96,6 +102,20 @@
         #filterStrip input[type=text] { min-width: 160px; }
         #filterStrip input[type=date] { width: 140px; font-variant-numeric: tabular-nums; }
         #filterStrip .sep { width: 1px; height: 22px; background: #e2e8f0; }
+
+        /* Empty Number = browse mode: Run lists the latest BROWSE_LIMIT
+           changes across the whole type. The field glows orange and
+           #browseHint says so, so a type-wide list is never mistaken for one
+           record's history. Outranks the :focus border above. */
+        #filterStrip #numInput.browse-mode {
+            border-color: #f59e0b; box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.30);
+        }
+        #browseHint {
+            display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 10px;
+            border: 1px solid #fdba74; border-radius: 999px; background: #fff7ed; color: #9a3412;
+            font-size: 11px; font-weight: 600; white-space: nowrap; cursor: help;
+        }
+        #browseHint.hidden { display: none; }
 
         /* Multi-select (ported from PO Summary) */
         .ms-container { position: relative; }
@@ -413,6 +433,8 @@
             <input type="text" id="numInput" placeholder="e.g. 10042" autocomplete="off" spellcheck="false" />
             <div id="acDropdown" class="ac-dropdown hidden" role="listbox"></div>
         </div>
+        <!-- Shown while the Number is empty — see updateRunButton(). -->
+        <span id="browseHint" class="hidden"></span>
 
         <span class="sep"></span>
 
@@ -517,6 +539,9 @@ const XO_STATUS = {10:'Entered',20:'Issued',30:'In Transit',40:'Fulfilled',50:'C
 //                  each {value, label, sub}. `value` is what we drop into
 //                  the input on selection; `label` is the primary display;
 //                  `sub` is the muted secondary line.
+//   numCol      — BROWSE MODE: the head column that labels a record
+//                  (default 'num'; 'name' where there is no num; null
+//                  where there is neither, which labels by id).
 //
 // Search philosophy: prefer prefix matches (cheap on indexed cols), fall
 // back to LIKE '%term%' when the column is a name/description. Capped at
@@ -635,6 +660,7 @@ const TYPES = {
         // conventions, or a raw receipt id.
         head: 'receipt', headAud: 'receipt_aud',
         item: 'receiptitem', itemAud: 'receiptitem_aud', itemFk: 'receiptId',
+        numCol: null,
         lookupSql: (num) => {
             const m = String(num).match(/^([PpSsTt])(.+)$/);
             if (!m) return `SELECT id, CAST(id AS CHAR) AS num FROM receipt WHERE id = ${qint(num)}`;
@@ -714,7 +740,7 @@ const TYPES = {
         label: 'Customer',
         fieldLabel: 'Customer', placeholder: 'name or number',
         head: 'customer', headAud: 'customer_aud',
-        openModule: 'Customer',
+        openModule: 'Customer', numCol: 'name',
         // Resolution matches name OR number — typeahead surfaces both
         // so a rep can search by either and pick the disambiguated row.
         lookupSql: (num) => `SELECT id, name AS num FROM customer
@@ -730,7 +756,7 @@ const TYPES = {
         label: 'Vendor',
         fieldLabel: 'Vendor', placeholder: 'name or account #',
         head: 'vendor', headAud: 'vendor_aud',
-        openModule: 'Vendor',
+        openModule: 'Vendor', numCol: 'name',
         // Vendor's "number" column is `accountNum` (the customer table
         // calls its equivalent `number`). Earlier versions referenced
         // `number` here and silently returned no results.
@@ -762,6 +788,7 @@ const TYPES = {
         label: 'Pricing Rule',
         fieldLabel: 'Rule Name', placeholder: 'rule name',
         head: 'pricingrule', headAud: 'pricingrule_aud',
+        numCol: 'name',
         lookupSql: (num) => `SELECT id, name AS num FROM pricingrule WHERE name = ${qstr(num)}`,
         searchSql: (term) => `
             SELECT name AS value, name AS label, '' AS sub
@@ -1127,6 +1154,12 @@ let _dateFrom = '', _dateTo = '';
 let _activeMS = null;
 let _lookupCache = {};                    // `${table}|${id}` -> label
 let _resultRows = [];                     // raw enriched timeline
+// Browse mode (Number left empty) lists only the latest BROWSE_LIMIT
+// changes across the whole type — enough to see what's been happening
+// without a query or a table that grows with the database.
+const BROWSE_LIMIT = 500;
+let _lastRun = null;                      // 'record' | 'browse' | null — what's on screen
+let _userFilterDirty = false;             // browse mode re-queries when the user dropdown closes
 
 // ── Util ────────────────────────────────────────────────────────────
 function qstr(s) { return "'" + String(s ?? '').replace(/'/g, "''") + "'"; }
@@ -1317,6 +1350,7 @@ function resetForm() {
     document.getElementById('dateTo').value   = _dateTo;
     _userSel.clear();
     _resultRows = [];
+    _lastRun = null;
     updateRevTypeBtns();
     updateUserTrigger();
     document.getElementById('resultHost').innerHTML = renderEmptyState();
@@ -1358,13 +1392,42 @@ function applyTypeLabels() {
     if (inp) inp.placeholder = cfg.placeholder || '';
 }
 
+/* Run is always available once a type is chosen: with a Number it reads
+   that record's history, without one it browses the latest BROWSE_LIMIT
+   changes to the whole type. An empty Number therefore arms browse mode,
+   and that is made obvious where the eye already is: the field glows
+   orange and #browseHint sits beside it. */
 function updateRunButton() {
     const btn = document.getElementById('runBtn');
-    const ok = _selectedType && _identifier.length > 0;
-    btn.disabled = !ok;
-    btn.title = ok
-        ? `Run audit trail for ${TYPES[_selectedType].label} ${_identifier}`
-        : 'Select a type and enter a number to run';
+    const cfg = TYPES[_selectedType];
+    const browse = !_identifier;
+    btn.disabled = !cfg;
+    btn.title = !cfg ? 'Select a type to run'
+        : browse ? `Run: the latest ${BROWSE_LIMIT} changes to any ${cfg.label}`
+        : `Run audit trail for ${cfg.label} ${_identifier}`;
+    const inp  = document.getElementById('numInput');
+    const hint = document.getElementById('browseHint');
+    if (!cfg) return;
+    const why = `${cfg.fieldLabel} is empty, so Run lists the latest ${BROWSE_LIMIT} changes to ANY ${cfg.label}. `
+              + `Enter a ${cfg.fieldLabel} to see one record's full history.`;
+    if (inp) {
+        inp.classList.toggle('browse-mode', browse);
+        inp.title = browse ? why : '';
+    }
+    if (hint) {
+        hint.classList.toggle('hidden', !browse);
+        hint.textContent = `⚠ All ${cfg.label} records · latest ${BROWSE_LIMIT} changes`;
+        hint.title = why;
+    }
+}
+
+/* After a filter change. A record's whole history is already in memory,
+   so it just re-renders. Browse mode only fetched the latest BROWSE_LIMIT
+   changes that matched, so it asks again — filtering those 500 after the
+   fact would hide older matches instead of finding them. */
+function refilter() {
+    if (_lastRun === 'browse' && !_identifier) runReport();
+    else if (_resultRows.length) renderTimeline();
 }
 
 function toggleRevType(t) {
@@ -1374,7 +1437,7 @@ function toggleRevType(t) {
     if (_revtypeShow.size === 0) _revtypeShow.add(t);
     updateRevTypeBtns();
     saveState();
-    if (_resultRows.length) renderTimeline();
+    refilter();
 }
 
 function updateRevTypeBtns() {
@@ -1390,7 +1453,15 @@ function onDateChange() {
     _dateFrom = document.getElementById('dateFrom').value;
     _dateTo   = document.getElementById('dateTo').value;
     saveState();
-    if (_resultRows.length) renderTimeline();
+    refilter();
+}
+
+/* The user list changes a click at a time. A record's history re-renders
+   straight away; browse mode waits for the dropdown to close (closeMS) so
+   ticking five users costs one query, not five. */
+function onUserFilterChange() {
+    if (_lastRun === 'browse' && !_identifier) _userFilterDirty = true;
+    else if (_resultRows.length) renderTimeline();
 }
 
 // ── Multi-select (user filter) ───────────────────────────────────────
@@ -1405,12 +1476,13 @@ function buildUserMS() {
         e.stopPropagation();
         _users.forEach(u => _userSel.add(String(u.id)));
         updateUserTrigger(); renderUserList(document.getElementById('userSearch').value);
+        onUserFilterChange();
     };
     document.getElementById('userClear').onclick = e => {
         e.stopPropagation();
         _userSel.clear();
         updateUserTrigger(); renderUserList(document.getElementById('userSearch').value);
-        if (_resultRows.length) renderTimeline();
+        onUserFilterChange();
     };
 }
 
@@ -1450,7 +1522,7 @@ function renderUserList(search) {
             const id = cb.dataset.uid;
             if (cb.checked) _userSel.add(id); else _userSel.delete(id);
             updateUserTrigger();
-            if (_resultRows.length) renderTimeline();
+            onUserFilterChange();
         };
     });
 }
@@ -1471,6 +1543,7 @@ function closeMS() {
     const dd = document.getElementById(_activeMS + 'Dropdown');
     if (dd) dd.classList.add('hidden');
     _activeMS = null;
+    if (_userFilterDirty) { _userFilterDirty = false; refilter(); }
 }
 
 // ── Autocomplete on the identifier input ────────────────────────────
@@ -1649,7 +1722,12 @@ async function prewarmLookups(events) {
         for (let i = 0; i < ids.length; i += 500) {
             const slice = ids.slice(i, i + 500);
             tasks.push(qp(`SELECT id, ${info.col} AS lbl FROM ${table} WHERE id IN (${slice.join(',')})`)
-                .then(rows => rows.forEach(r => { _lookupCache[table + '|' + r.id] = String(r.lbl ?? r.id); }))
+                .then(rows => {
+                    rows.forEach(r => { _lookupCache[table + '|' + r.id] = String(r.lbl ?? r.id); });
+                    // An id with no row (since deleted) shows as itself. Cache
+                    // that too, or the renderer looks each one up again singly.
+                    slice.forEach(id => { if (_lookupCache[table + '|' + id] === undefined) _lookupCache[table + '|' + id] = String(id); });
+                })
                 .catch(() => { /* table missing or perm denied — leave raw IDs */ }));
         }
     }
@@ -1795,7 +1873,9 @@ function exportCsv() {
     // BOM + CRLF so Excel opens UTF-8 + multi-line cells correctly.
     const csv = '﻿' + lines.join('\r\n') + '\r\n';
 
-    const safeId = String(_identifier).replace(/[^\w.-]+/g, '_');
+    const safeId = _identifier
+        ? String(_identifier).replace(/[^\w.-]+/g, '_')
+        : 'latest' + BROWSE_LIMIT;   // browse mode
     // moment is fine for the filename stamp — keeps it human-readable.
     const stamp = moment().format('YYYYMMDD-HHmmss');
     const filename = `audit_${_selectedType}_${safeId}_${stamp}.csv`;
@@ -1827,14 +1907,15 @@ function updateExportBtn() {
 async function runReport() {
     const cfg = TYPES[_selectedType];
     if (!cfg) return;
-    const id = _identifier.trim();
-    if (!id) return;
     if (MODE === 'standalone' && !_conn.token) {
         showToast('Connect to Fishbowl first.', 'info', 3000);
         openConnModal();
         return;
     }
     saveState();
+    const id = _identifier.trim();
+    if (!id) return runBrowse(cfg);
+    _lastRun = 'record';
 
     const host = document.getElementById('resultHost');
     host.innerHTML = `<div class="spinner"></div>`;
@@ -1889,38 +1970,8 @@ async function runReport() {
         }
 
         // 4. Diff per (table, id) group; emit one event per rev.
-        const events = [];
-        const groupedHead = groupBy(headRows, r => r.id);
-        for (const [eid, revs] of groupedHead) {
-            events.push(...diffGroup(revs, {
-                kind: 'header',
-                label: `${cfg.label} ${numLookup.get(eid) || eid}`,
-                openNum: numLookup.get(eid),
-                openModule: cfg.openModule,
-                eid,
-            }));
-        }
-        const groupedItem = groupBy(itemRows, r => r.id);
-        for (const [eid, revs] of groupedItem) {
-            const first = revs[0];
-            const parentId = first[cfg.itemFk?.toLowerCase()];
-            const parentNum = numLookup.get(parentId);
-            // Label items with a useful identifier — line item number,
-            // product/part number, or fall back to the item's row id.
-            const lineNo = first.solineitem ?? first.poLineItem ?? first.linenum ?? first.lineitem;
-            const partNum = first.productnum ?? first.partnum ?? first.partid ?? first.productid;
-            const itemTag = lineNo ? `Line ${lineNo}` : `Item ${eid}`;
-            const partTag = partNum ? ` · ${partNum}` : '';
-            events.push(...diffGroup(revs, {
-                kind: 'item',
-                label: `${cfg.label} ${parentNum || parentId} / ${itemTag}${partTag}`,
-                openNum: parentNum,
-                openModule: cfg.openModule,
-                eid,
-            }));
-        }
-
-        events.sort((a, b) => (b.rev || 0) - (a.rev || 0));   // newest first
+        const events = buildEvents(cfg, headRows, itemRows,
+            eid => numLookup.get(eid), pid => numLookup.get(pid), null);
         _resultRows = events;
 
         // 5. Pre-warm FK lookups so the per-cell formatter doesn't fire
@@ -1940,6 +1991,181 @@ async function runReport() {
     }
 }
 
+/* ── Browse mode: no Number entered ──
+   The latest BROWSE_LIMIT revisions across every record of the type,
+   header and line items together, newest first. The Added/Modified/
+   Deleted chips, the dates and the users are applied IN the SQL: filtering
+   500 rows after the fetch would hide older matches rather than find them.
+
+   Each aud table is read twice, newest-first on its REV index and stopped
+   at the limit: once for the revisions themselves, and once for the
+   revision just before each one (a PK lookup), so every change still
+   diffs against the values it replaced. Those earlier rows are baseline
+   only — diffGroup never lists them. */
+async function runBrowse(cfg) {
+    _lastRun = 'browse';
+    const host = document.getElementById('resultHost');
+    host.innerHTML = `<div class="spinner"></div>`;
+    setStatus(`Loading the latest ${BROWSE_LIMIT} changes to any ${cfg.label}…`);
+    try {
+        const where = browseWhere();
+        const tables = [{ aud: cfg.headAud, kind: 'header' }];
+        if (cfg.itemAud && cfg.itemFk) tables.push({ aud: cfg.itemAud, kind: 'item' });
+        const fetched = await Promise.all(tables.map(t =>
+            Promise.all([qp(browseSql(t.aud, where, false)), qp(browseSql(t.aud, where, true))])));
+
+        // Newest BROWSE_LIMIT across header + items together.
+        const newest = [];
+        fetched.forEach(([rows], i) => rows.forEach(row => newest.push({ kind: tables[i].kind, row })));
+        newest.sort((a, b) => b.row.rev - a.row.rev);
+        const kept = newest.slice(0, BROWSE_LIMIT);
+        const more = newest.length > BROWSE_LIMIT || fetched.some(([rows]) => rows.length >= BROWSE_LIMIT);
+
+        const rows = { header: [], item: [] };
+        const keptKeys = new Set();
+        kept.forEach(k => { rows[k.kind].push(k.row); keptKeys.add(k.kind + '|' + k.row.id + '|' + k.row.rev); });
+        const baseline = new Set();
+        fetched.forEach(([, prevRows], i) => prevRows.forEach(r => {
+            const kind = tables[i].kind;
+            if (keptKeys.has(kind + '|' + r.id + '|' + r.rev)) return;   // listed in its own right
+            baseline.add(r);
+            rows[kind].push(r);
+        }));
+
+        const numKey = cfg.numCol === undefined ? 'num' : cfg.numCol && cfg.numCol.toLowerCase();
+        const headNum = (eid, revs) => {
+            if (!numKey) return null;
+            // A deleted record's last aud row has its columns nulled.
+            for (let i = revs.length - 1; i >= 0; i--) {
+                const v = revs[i][numKey];
+                if (v != null && v !== '') return v;
+            }
+            return null;
+        };
+        const parentNums = rows.item.length ? await browseParentNums(cfg, rows.item) : new Map();
+        const events = buildEvents(cfg, rows.header, rows.item, headNum, pid => parentNums.get(pid), baseline);
+        _resultRows = events;
+        await prewarmLookups(events);
+
+        // Fewer events than revisions is normal: a save that changed none
+        // of the table's own columns is dropped by diffGroup.
+        setStatus(more
+            ? `${events.length} change${events.length === 1 ? '' : 's'} from the latest ${BROWSE_LIMIT} revisions to any ${cfg.label}. `
+              + `Narrow the dates or users, or enter a ${cfg.fieldLabel} for one record's full history.`
+            : `Latest ${events.length} change${events.length === 1 ? '' : 's'} to any ${cfg.label}.`);
+        updateExportBtn();
+        renderTimeline();
+    } catch (err) {
+        console.error('Audit browse failed:', err);
+        _resultRows = [];
+        updateExportBtn();
+        host.innerHTML = renderEmptyState('Query failed.', err.message || String(err));
+        setStatus(`Failed: ${err.message || err}`);
+        showToast('Audit query failed: ' + (err.message || err), 'error', 8000);
+    }
+}
+
+/* The secondary filters as SQL over aud alias `a` and revinfo alias `r`.
+   Dates arrive from <input type=date> as yyyy-mm-dd and are checked
+   before they go anywhere near the query. */
+function browseWhere() {
+    const w = [`a.REVTYPE IN (${[..._revtypeShow].map(qint).join(',')})`];
+    const isoDay = /^\d{4}-\d{2}-\d{2}$/;
+    if (isoDay.test(_dateFrom)) w.push(`r.timestamp >= '${_dateFrom}'`);
+    if (isoDay.test(_dateTo))   w.push(`r.timestamp < '${_dateTo}' + INTERVAL 1 DAY`);
+    if (_userSel.size) w.push(`r.modifieduserid IN (${[..._userSel].map(qint).join(',')})`);
+    return w.join(' AND ');
+}
+
+/* `prev` = false: the newest matching revisions themselves.
+   `prev` = true:  for each of those, the revision immediately before it
+   (MAX(REV) below it on the (id, REV) primary key) — the diff baseline. */
+function browseSql(aud, where, prev) {
+    const who = `r.timestamp AS revtimestamp, r.modifieduserid AS revuserid,
+           TRIM(CONCAT(COALESCE(u.firstName, ''), ' ', COALESCE(u.lastName, ''))) AS revfullname,
+           u.userName AS revusername`;
+    if (!prev) return `
+        SELECT a.*, ${who}
+        FROM ${aud} a
+        INNER JOIN revinfo r ON r.id = a.REV
+        LEFT JOIN sysuser u ON u.id = r.modifieduserid
+        WHERE ${where}
+        ORDER BY a.REV DESC LIMIT ${BROWSE_LIMIT}`;
+    return `
+        SELECT p.*, ${who}
+        FROM (SELECT n.id, (SELECT MAX(b.REV) FROM ${aud} b WHERE b.id = n.id AND b.REV < n.REV) AS prevrev
+              FROM (SELECT a.id, a.REV FROM ${aud} a
+                    INNER JOIN revinfo r ON r.id = a.REV
+                    WHERE ${where}
+                    ORDER BY a.REV DESC LIMIT ${BROWSE_LIMIT}) n) k
+        INNER JOIN ${aud} p ON p.id = k.id AND p.REV = k.prevrev
+        LEFT JOIN revinfo r ON r.id = p.REV
+        LEFT JOIN sysuser u ON u.id = r.modifieduserid`;
+}
+
+/* Parent numbers for browse-mode line items: the live header first, then
+   its aud history for a header that has since been deleted. */
+async function browseParentNums(cfg, itemRows) {
+    const out = new Map();
+    const col = cfg.numCol === undefined ? 'num' : cfg.numCol;
+    if (!col) return out;
+    const fk = cfg.itemFk.toLowerCase();
+    const ids = [...new Set(itemRows.map(r => parseInt(r[fk], 10)).filter(n => !isNaN(n)))];
+    if (!ids.length) return out;
+    (await qp(`SELECT id, ${col} AS num FROM ${cfg.head} WHERE id IN (${ids.join(',')})`))
+        .forEach(r => out.set(r.id, r.num));
+    const gone = ids.filter(id => !out.has(id));
+    if (gone.length) {
+        (await qp(`SELECT id, MAX(${col}) AS num FROM ${cfg.headAud} WHERE id IN (${gone.join(',')}) GROUP BY id`))
+            .forEach(r => { if (r.num != null) out.set(r.id, r.num); });
+    }
+    return out;
+}
+
+/* Aud rows → timeline events, newest first. `headNum(eid, revs)` and
+   `parentNum(parentId)` give the human number for a header and for an
+   item's parent. `baseline` (browse mode) is the Set of rows fetched only
+   to diff against — see diffGroup. */
+function buildEvents(cfg, headRows, itemRows, headNum, parentNum, baseline) {
+    const byRev = (a, b) => a.rev - b.rev;
+    const events = [];
+    for (const [eid, revs] of groupBy(headRows, r => r.id)) {
+        revs.sort(byRev);
+        const num = headNum(eid, revs);
+        events.push(...diffGroup(revs, {
+            kind: 'header',
+            label: `${cfg.label} ${num || eid}`,
+            openNum: num,
+            openModule: cfg.openModule,
+            eid,
+        }, baseline));
+    }
+    const fk = cfg.itemFk ? cfg.itemFk.toLowerCase() : null;
+    for (const [eid, revs] of groupBy(itemRows, r => r.id)) {
+        revs.sort(byRev);
+        // A deletion row has its columns nulled, so label from a row that
+        // still carries them.
+        const first = revs.find(r => fk && r[fk] != null) || revs[0];
+        const parentId = fk ? first[fk] : null;
+        const pnum = parentNum(parentId);
+        // Label items with a useful identifier — line item number,
+        // product/part number, or fall back to the item's row id.
+        const lineNo = first.solineitem ?? first.polineitem ?? first.linenum ?? first.lineitem;
+        const partNum = first.productnum ?? first.partnum ?? first.partid ?? first.productid;
+        const itemTag = lineNo ? `Line ${lineNo}` : `Item ${eid}`;
+        const partTag = partNum ? ` · ${partNum}` : '';
+        events.push(...diffGroup(revs, {
+            kind: 'item',
+            label: `${cfg.label} ${pnum || parentId} / ${itemTag}${partTag}`,
+            openNum: pnum,
+            openModule: cfg.openModule,
+            eid,
+        }, baseline));
+    }
+    events.sort((a, b) => (b.rev || 0) - (a.rev || 0));   // newest first
+    return events;
+}
+
 function groupBy(arr, keyFn) {
     const m = new Map();
     for (const x of arr) {
@@ -1955,10 +2181,12 @@ function groupBy(arr, keyFn) {
 // we emit every non-null column as the "initial" state. For REVTYPE=1
 // (modified) we diff against the previous row in the group. For
 // REVTYPE=2 (deleted) we emit a "record removed" event with no diffs.
-function diffGroup(revs, objCtx) {
+// Rows in `baseline` (browse mode) only set `prev` for the row after them.
+function diffGroup(revs, objCtx, baseline) {
     const events = [];
     let prev = null;
     for (const cur of revs) {
+        if (baseline && baseline.has(cur)) { prev = cur; continue; }
         const revType = parseInt(cur.revtype, 10);
         const event = {
             rev: parseInt(cur.rev, 10),
@@ -2041,7 +2269,7 @@ function renderEmptyState(title, hint) {
     return `<div class="empty-state">
         <svg fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
         <div class="title">${escapeHtml(title || 'Audit Trail')}</div>
-        <div class="hint">${escapeHtml(hint || 'Choose an object type, type the number (e.g. SO 10042 → enter “10042”), and press Run. All revisions for that object and its line items will be listed here, newest first.')}</div>
+        <div class="hint">${escapeHtml(hint || 'Choose an object type, type the number (e.g. SO 10042 → enter “10042”), and press Run. All revisions for that object and its line items will be listed here, newest first. Leave the number empty to see the latest ' + BROWSE_LIMIT + ' changes to any record of that type.')}</div>
     </div>`;
 }
 

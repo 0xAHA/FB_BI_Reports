@@ -21,6 +21,7 @@ and `saveSettings`. [CLAUDE.md](CLAUDE.md) documents the full API.
 | `Manufacturing/` | Production Scheduling, WO Finisher, Available to Build, BOM Cost; `jrxml/` holds fixed copies of standard reports |
 | `Part/`, `Product/`, `Customer/`, `Audit/` | Part tools, product and kit tools, customer status, audit trail |
 | `Custom/` | Customer-specific reports |
+| `iReport_Ports/` | BI versions of standard iReport (.jrxml) reports, in the same folders as the originals (see its README) |
 | `Template/` | `Core_Dashboard_Template.htm`, the starting point for new reports |
 | `scripts/` | Shared assets (below) |
 | `schema/` | Database schema reference; start with [schema-index.md](schema/schema-index.md) |

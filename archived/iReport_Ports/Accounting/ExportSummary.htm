@@ -1,0 +1,1051 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Accounting Export Summary (iReport port)
+  PATH:   iReport_Ports/Accounting/ExportSummary.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard Accounting/ExportSummary.jrxml and its
+  three subreports (subSOExport, subPOExport, subWOExport): the PO, SO and
+  WO transactions exported to accounting, or waiting to be. Same sources,
+  same rules, same columns and totals; only the presentation is
+  interactive (one tab per section instead of three stacked subreports).
+
+    Sources    SO  soitem → postsoitem → postso (+ fulfilled Assoc. Price
+                   lines with no posting, as the original includes them)
+               PO  postpo → postpoitem → po / poitem / receiptitem
+               WO  postwo → postwoitem → woitem of Fulfilled WOs
+    Dates      Date Posted (post*.datePosted) or Item Date Fulfilled
+               (post*.postDate), inclusive. As in the original, a posting
+               with no postDate is always listed, and with the Date Posted
+               basis a not-yet-posted transaction has no date to match.
+    Status     Marked as Posted (journal posted, never sent: no external
+               txn id) > Not Posted (no datePosted) > Posted.
+    Groups     One group per order and posted state, as the original's
+               "num + (datePosted == null)" group. SO and WO groups
+               break again on the accounting Ref. #.
+    Totals     SO   Price = unit price x posted qty; Tax = Price x SO
+                    tax rate on taxable lines; group Totals = Price + Tax
+                    and COGS (every line's posted cost); COGS, Margin and
+                    Margin % shown on Sale lines only.
+               PO   Total Costs = posted total cost.
+               WO   Total Adjustment = cost of Finished Good and Repair
+                    Finished Good lines.
+    Sections   A specific SO/PO/WO number shows only the sections that
+               have one; otherwise the Show SO/PO/WO switches decide.
+
+  Deliberate differences, all cosmetic or bug fixes:
+    - SO Total Tax is the sum of the shown groups' tax. The original's
+      "newTax" variable increments once per group from one line's values.
+    - The original's unused tax-line join (TAXPERCENT/FLATTAX, read by no
+      printed field) is dropped; it could duplicate a line when an SO had
+      several tax lines.
+    - Margin % is blank on a zero-price line (the original printed -100 %).
+    - Rows for the same order are kept together by posted state, so an
+      order splits into at most two groups.
+    - A Ref. # row only prints when the posting has a reference.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipExportSummary',
+            name:  null,
+            build: '2026.10.09-ab67573'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Accounting Export Summary — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style. It must come before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <style>
+        * { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; height: 100%; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            font-size: 13px; color: var(--c-primary); background: var(--bg-1);
+            display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+            padding-bottom: var(--debug-drawer-h, 0px);
+        }
+        header h1 { font-size: 16px; font-weight: 700; color: var(--c-primary); margin: 0; line-height: 1.15; }
+        #statusLine { font-size: 12px; color: var(--c-tertiary); line-height: 1.15; margin: 2px 0 0; }
+        .hdr-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .hdr-sep { width: 1px; height: 18px; background: var(--border); margin: 0 4px; }
+
+        /* Drawers */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 220px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+        .fb-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+        .fb-field > label { font-size: 11px; font-weight: 600; color: var(--c-secondary); }
+        .fb-field select, .fb-field input[type=text], .fb-field input[type=date] {
+            padding: 5px 8px; font-size: 12px; border: 1px solid var(--border); border-radius: 6px;
+            background: #fff; font-family: inherit; color: #415157; }
+        .fb-dates { display: flex; gap: 6px; align-items: center; }
+        .fb-dates input { flex: 1; min-width: 0; }
+        .fb-check { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 12px; color: #415157; margin: 3px 0; }
+        .ds-btn { padding: 7px 13px; font-size: 12px; border-radius: 7px; border: 1px solid var(--border-strong); background: #fff;
+            cursor: pointer; font-family: inherit; font-weight: 600; color: #415157; }
+        .ds-btn:hover { background: var(--bg-2); }
+        .ds-btn-primary { background: var(--color-primary); color: #fff; border-color: var(--color-primary); }
+        .ds-btn-admin { background: var(--acc-orange-bg); border-color: var(--acc-orange); color: var(--acc-orange-con); }
+        .pp-note { font-size: 11.5px; color: var(--c-tertiary); }
+
+        /* Main */
+        .app-shell { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+        .kpi-row { display: flex; flex-wrap: wrap; gap: 10px; padding: 10px 12px; flex-shrink: 0; }
+        .kpi-row:empty { display: none; }
+        .kpi-row .kpi-tile { min-height: 56px; padding: 8px 14px; min-width: 170px; flex: 1 1 170px; }
+        .kpi-row .kpi-chip { width: 32px; height: 32px; border-radius: 8px; }
+        .kpi-row .kpi-chip svg { width: 16px; height: 16px; }
+        .kpi-row .kpi-val { font-size: 19px; }
+        .viewbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 0 12px 8px; flex-shrink: 0; border-bottom: 1px solid var(--border); }
+        .viewbar .split-btn .hdr-btn { height: 30px; font-size: 12px; }
+        .viewbar .cnt { font-size: 11px; color: var(--c-tertiary); margin-left: 2px; }
+        .viewbar .legend { display: flex; gap: 6px; align-items: center; font-size: 11.5px; color: var(--c-secondary); }
+        .viewbar .hint { font-size: 11.5px; color: var(--acc-orange-con); }
+        .viewbar .hint:empty { display: none; }
+        .viewbar .fb-check { margin: 0 0 0 auto; }
+        .rpt-wrap { flex: 1 1 auto; min-height: 0; overflow: auto; background: #fff; }
+        .rpt-table th { cursor: default; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table td { max-width: 380px; overflow: hidden; text-overflow: ellipsis; }
+        .rpt-table tr.grp td { background: var(--tint-blue); font-weight: 600; border-top: 2px solid var(--tint-blue-2); }
+        .rpt-table tr.ref td { background: #fff; color: var(--c-secondary); font-size: 11.5px; }
+        .rpt-table tr.tax td { background: #fff; font-style: italic; }
+        .rpt-table tr.sub td { background: #fff; font-weight: 600; border-bottom: 2px solid var(--border-strong); }
+        .rpt-table tfoot tr + tr td { box-shadow: none; }
+        .fb-row-link { color: var(--fb-blue); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--fb-blue-accent); }
+        .pp-muted { color: var(--c-tertiary); }
+        .pp-neg { color: #8A1E30; }
+        .spill { padding: 1px 8px; margin-right: 6px; }
+        .rpt-empty { padding: 48px 16px; text-align: center; color: var(--c-tertiary); font-size: 13px; }
+        .rpt-empty:empty { display: none; }
+        .banner { margin: 8px 12px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; }
+        .banner:empty { display: none; }
+    </style>
+</head>
+<body>
+
+<header>
+    <div>
+        <h1>Accounting Export Summary</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.toggleDrawer('filtersOverlay')" title="Report options">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download every section as one Excel workbook">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print every section, as the standard report does">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-sep"></span>
+        <button id="helpBtn" class="hdr-btn" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            Help
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — the iReport version's parameters
+     ==================================================================== -->
+<div id="filtersOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>🔍 Filters</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('filtersOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Dates</div>
+                <div class="fb-field">
+                    <label for="fBasis">Apply date filter to</label>
+                    <select id="fBasis">
+                        <option value="posted">Date Posted</option>
+                        <option value="fulfilled">Item Date Fulfilled</option>
+                    </select>
+                </div>
+                <div class="fb-field">
+                    <label for="fRange">Date range</label>
+                    <select id="fRange"></select>
+                </div>
+                <div class="fb-field fb-dates hidden" id="fCustom">
+                    <input type="date" id="fFrom" aria-label="From">
+                    <span class="pp-muted">→</span>
+                    <input type="date" id="fTo" aria-label="To">
+                </div>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Show</div>
+                <label class="fb-check"><input type="checkbox" id="fShowSO"> Sales orders</label>
+                <label class="fb-check"><input type="checkbox" id="fShowPO"> Purchase orders</label>
+                <label class="fb-check"><input type="checkbox" id="fShowWO"> Work orders</label>
+                <label class="fb-check" style="margin-top:8px"><input type="checkbox" id="fPosted"> Posted</label>
+                <label class="fb-check"><input type="checkbox" id="fNotPosted"> Not posted</label>
+                <label class="fb-check" style="margin-top:8px"><input type="checkbox" id="fDetails"> Show details (every line)</label>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Sales order</div>
+                <div class="fb-field"><label for="fSoNum">SO number</label><input type="text" id="fSoNum" placeholder="Any (% is a wildcard)"></div>
+                <div class="fb-field"><label for="fProductNum">Product number</label><input type="text" id="fProductNum" placeholder="Any"></div>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Purchase order</div>
+                <div class="fb-field"><label for="fPoNum">PO number</label><input type="text" id="fPoNum" placeholder="Any (% is a wildcard)"></div>
+                <div class="fb-field"><label for="fPartNum">Part number</label><input type="text" id="fPartNum" placeholder="Any"></div>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Work order</div>
+                <div class="fb-field"><label for="fWoNum">WO number</label><input type="text" id="fWoNum" placeholder="Any (% is a wildcard)"></div>
+                <div class="fb-field"><label for="fBomNum">BOM number</label><input type="text" id="fBomNum" placeholder="Any"></div>
+                <p class="pp-note">An SO, PO or WO number shows only the sections that have one.</p>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn" id="resetFiltersBtn">Reset</button>
+        <button type="button" class="ds-btn ds-btn-primary" id="applyBtn">Apply</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="fb-check"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="fb-check"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <p class="pp-note">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters the starting point for everyone who hasn't saved their own.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>The sales, purchase and work order transactions Fishbowl has exported to your accounting system, or is waiting to export. It is the BI version of the standard <strong>Accounting Export Summary</strong> and reads the same data the same way.</p>
+                <p>Work order amounts are the adjustments made, not the final cost of the work order.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Status</div>
+                <p><span class="spill success">Posted</span> exported to accounting.</p>
+                <p><span class="spill caution">Not Posted</span> waiting for the next export.</p>
+                <p><span class="spill active">Marked as Posted</span> marked as posted in Fishbowl without being sent.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Dates</div>
+                <ul>
+                    <li><strong>Date Posted</strong>: when it was exported. A transaction that isn't posted yet has no Date Posted, so it only appears when the filter uses <strong>Item Date Fulfilled</strong>.</li>
+                    <li><strong>Item Date Fulfilled</strong>: when the items were shipped, received or built.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Totals</div>
+                <ul>
+                    <li><strong>SO</strong>: Price is the unit price × the quantity posted; the order total adds tax at the order's rate on taxable lines. COGS is the cost posted for each line.</li>
+                    <li><strong>PO</strong>: the cost posted for each received line.</li>
+                    <li><strong>WO</strong>: the total is the finished goods' cost; raw goods are listed but not added.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="app-shell">
+    <div class="banner" id="banner"></div>
+    <div class="kpi-row" id="kpiRow"></div>
+    <div class="viewbar">
+        <span class="split-btn" id="tabs">
+            <button type="button" class="hdr-btn" data-tab="so">Sales Orders <span class="cnt" data-cnt="so"></span></button>
+            <button type="button" class="hdr-btn" data-tab="po">Purchase Orders <span class="cnt" data-cnt="po"></span></button>
+            <button type="button" class="hdr-btn" data-tab="wo">Work Orders <span class="cnt" data-cnt="wo"></span></button>
+        </span>
+        <span class="legend"><span class="spill success">Posted</span><span class="spill caution">Not Posted</span><span class="spill active">Marked as Posted</span></span>
+        <span class="hint" id="hint"></span>
+        <label class="fb-check"><input type="checkbox" id="vDetails"> Show details</label>
+    </div>
+    <div class="rpt-wrap" id="rptWrap">
+        <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+        <div class="rpt-empty" id="rptEmpty"></div>
+    </div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const SECTIONS = ['so', 'po', 'wo'];
+const SECTION_LABEL = { so: 'SO Summary', po: 'PO Summary', wo: 'WO Summary' };
+const SO_SALE = 10;                    // soitem typeId Sale: the only lines showing COGS / margin
+const SO_SUBTOTAL = 40;                // never listed
+const WO_TOTAL_TYPES = [10, 31];       // Finished Good, Repair Finished Good
+const DEFAULT_FILTERS = {
+    basis: 'posted', range: 'thisMonth', from: '', to: '',
+    showSO: true, showPO: true, showWO: true, posted: true, notPosted: true, details: false,
+    soNum: '', productNum: '', poNum: '', partNum: '', woNum: '', bomNum: ''
+};
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false, tab: 'so' }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const dstr = v => { const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v ?? '')); return m ? m[1] : ''; };
+const fmtDate = v => { const d = dstr(v); return d ? FBLib.Common.formatDate(d) : ''; };
+const fmtMoney = v => FBLib.Common.formatMoney(v);
+const fmtQty = v => FBLib.Common.formatQty(v);
+const money = v => '<span class="' + (num(v) < 0 ? 'pp-neg' : '') + '">' + esc(fmtMoney(v)) + '</span>';
+const fmtPct = f => (f * 100).toLocaleString(undefined, { maximumFractionDigits: 2 }) + ' %';
+const openLink = (module, number, text) => number
+    ? `<a class="fb-row-link" data-open="${esc(module)}" data-num="${esc(number)}">${esc(text ?? number)}</a>` : '';
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const cut = s => `<span title="${esc(s)}">${esc(s)}</span>`;
+// The original's number pickers match exactly; % (or *) is a wildcard.
+const likeExact = (col, v) => `UPPER(${col}) LIKE UPPER('${sqlStr(String(v).replace(/\*/g, '%'))}')`;
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// ---- Date ranges (Fishbowl's "This Month" etc.) ----
+const RANGES = [
+    ['today', 'Today'], ['yesterday', 'Yesterday'], ['last7', 'Last 7 days'],
+    ['thisMonth', 'This month'], ['lastMonth', 'Last month'],
+    ['thisQuarter', 'This quarter'], ['lastQuarter', 'Last quarter'],
+    ['thisYear', 'This year'], ['lastYear', 'Last year'],
+    ['all', 'All dates'], ['custom', 'Custom range…']
+];
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const isYmd = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+
+// { start, end, endExcl, label } with ISO dates, or null for "All dates".
+function dateRange(f) {
+    const t = new Date(); t.setHours(0, 0, 0, 0);
+    const y = t.getFullYear(), m = t.getMonth(), d = t.getDate(), qm = Math.floor(m / 3) * 3;
+    const D = (yy, mm, dd) => new Date(yy, mm, dd);
+    let a, b;
+    switch (f.range) {
+        case 'today':       a = t; b = t; break;
+        case 'yesterday':   a = D(y, m, d - 1); b = a; break;
+        case 'last7':       a = D(y, m, d - 6); b = t; break;
+        case 'thisMonth':   a = D(y, m, 1); b = D(y, m + 1, 0); break;
+        case 'lastMonth':   a = D(y, m - 1, 1); b = D(y, m, 0); break;
+        case 'thisQuarter': a = D(y, qm, 1); b = D(y, qm + 3, 0); break;
+        case 'lastQuarter': a = D(y, qm - 3, 1); b = D(y, qm, 0); break;
+        case 'thisYear':    a = D(y, 0, 1); b = D(y, 11, 31); break;
+        case 'lastYear':    a = D(y - 1, 0, 1); b = D(y - 1, 11, 31); break;
+        case 'custom': {
+            if (!isYmd(f.from) && !isYmd(f.to)) return null;
+            const p = s => { const [yy, mm, dd] = s.split('-').map(Number); return D(yy, mm - 1, dd); };
+            a = isYmd(f.from) ? p(f.from) : D(1900, 0, 1);
+            b = isYmd(f.to) ? p(f.to) : D(2999, 11, 31);
+            if (a > b) [a, b] = [b, a];
+            break;
+        }
+        default: return null;
+    }
+    const after = new Date(b); after.setDate(after.getDate() + 1);
+    return { start: ymd(a), end: ymd(b), endExcl: ymd(after),
+             label: FBLib.Common.formatDate(ymd(a)) + ' – ' + FBLib.Common.formatDate(ymd(b)) };
+}
+const dateWhere = (col, r) => r ? `${col} >= '${r.start} 00:00:00' AND ${col} < '${r.endExcl} 00:00:00'` : '';
+
+// ---- KPI tiles (fb-styles §28) ----
+const ICON = {
+    so:    '<circle cx="9" cy="20" r="1.4"/><circle cx="18" cy="20" r="1.4"/><path d="M2 3h3l2.6 12.2a1.5 1.5 0 0 0 1.5 1.2h8.7a1.5 1.5 0 0 0 1.5-1.1L21 8H6.1"/>',
+    cogs:  '<path d="M12 2v20M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/>',
+    po:    '<path d="M21 7.5l-9-4.5-9 4.5 9 4.5 9-4.5z"/><path d="M3 7.5v9l9 4.5 9-4.5v-9"/><path d="M12 12v9"/>',
+    wo:    '<path d="M14.7 6.3a4 4 0 00-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 005.4-5.4l-2.5 2.5-2.4-.6-.6-2.4z"/>',
+    wait:  '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>'
+};
+const kpi = (label, value, tone, icon, sub) => `
+    <div class="kpi-tile">
+        <div class="kpi-chip tone-${tone}"><svg fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">${ICON[icon]}</svg></div>
+        <div class="kpi-text"><div class="kpi-lbl">${esc(label)}</div><div class="kpi-val">${value}${sub ? ' <span class="kpi-sub">' + esc(sub) + '</span>' : ''}</div></div>
+    </div>`;
+
+// ============================================================================
+//  REPORT TABLE — paints { cols, body, foot } into #rpt. A body row is
+//  { cls, cells: { colKey: html } } or { cls, span: html } for a full-width
+//  row; `foot` is a list of rows. Long reports paint in chunks on scroll.
+// ============================================================================
+const CHUNK = 600;
+let _paint = { cols: [], html: [], shown: 0 };
+
+function rowHtml(cols, r) {
+    if (r.span != null) return `<tr class="${r.cls || ''}"><td colspan="${cols.length}">${r.span}</td></tr>`;
+    return `<tr class="${r.cls || ''}">` + cols.map(c => `<td class="${c.num ? 'num-cell' : ''}">${r.cells[c.key] ?? ''}</td>`).join('') + '</tr>';
+}
+function paintTable(model, emptyText) {
+    const tbl = document.getElementById('rpt');
+    const cols = model.cols;
+    tbl.querySelector('thead').innerHTML = '<tr>' + cols.map(c =>
+        `<th class="${c.num ? 'num-cell' : ''}"${c.w ? ` style="min-width:${c.w}px"` : ''}>${esc(c.label)}</th>`).join('') + '</tr>';
+    _paint = { cols, html: model.body.map(r => rowHtml(cols, r)), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    tbl.querySelector('tfoot').innerHTML = model.body.length ? (model.foot || []).map(r => rowHtml(cols, r)).join('') : '';
+    tbl.style.display = model.body.length ? '' : 'none';
+    document.getElementById('rptEmpty').textContent = model.body.length ? '' : emptyText;
+    document.getElementById('rptWrap').scrollTop = 0;
+}
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+const TEXT_FIELDS = { soNum: 'fSoNum', productNum: 'fProductNum', poNum: 'fPoNum', partNum: 'fPartNum', woNum: 'fWoNum', bomNum: 'fBomNum' };
+const CHECK_FIELDS = { showSO: 'fShowSO', showPO: 'fShowPO', showWO: 'fShowWO', posted: 'fPosted', notPosted: 'fNotPosted', details: 'fDetails' };
+
+function readFilters() {
+    const f = {
+        basis: document.getElementById('fBasis').value,
+        range: document.getElementById('fRange').value,
+        from: document.getElementById('fFrom').value,
+        to: document.getElementById('fTo').value
+    };
+    Object.keys(CHECK_FIELDS).forEach(k => { f[k] = document.getElementById(CHECK_FIELDS[k]).checked; });
+    Object.keys(TEXT_FIELDS).forEach(k => { f[k] = document.getElementById(TEXT_FIELDS[k]).value.trim(); });
+    return f;
+}
+function writeFilters(f) {
+    document.getElementById('fBasis').value = f.basis === 'fulfilled' ? 'fulfilled' : 'posted';
+    document.getElementById('fRange').value = RANGES.some(r => r[0] === f.range) ? f.range : DEFAULT_FILTERS.range;
+    document.getElementById('fFrom').value = f.from || '';
+    document.getElementById('fTo').value = f.to || '';
+    document.getElementById('fCustom').classList.toggle('hidden', f.range !== 'custom');
+    Object.keys(CHECK_FIELDS).forEach(k => { document.getElementById(CHECK_FIELDS[k]).checked = !!f[k]; });
+    Object.keys(TEXT_FIELDS).forEach(k => { document.getElementById(TEXT_FIELDS[k]).value = f[k] || ''; });
+    document.getElementById('vDetails').checked = !!f.details;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+
+// The original's rule: a section prints when its switch is on or it has its
+// own order number, AND either it has one or no section has one.
+function sectionOn(t, f) {
+    const own = !!{ so: f.soNum, po: f.poNum, wo: f.woNum }[t];
+    const any = !!(f.soNum || f.poNum || f.woNum);
+    const show = { so: f.showSO, po: f.showPO, wo: f.showWO }[t];
+    return (show || own) && (own || !any);
+}
+
+// ============================================================================
+//  SQL — the three subreport queries. Posted / Not Posted is applied here
+//  rather than by hiding bands, which gives the same rows and totals.
+// ============================================================================
+function dateFilter(alias, f) {
+    const r = dateRange(f);
+    if (!r) return '';
+    const col = alias + (f.basis === 'fulfilled' ? '.postdate' : '.dateposted');
+    // As the original: a posting with no postDate is always included.
+    return `((${dateWhere(col, r)}) OR ${alias}.postdate IS NULL)`;
+}
+function postedFilter(col, f) {
+    if (f.posted && !f.notPosted) return col + ' IS NOT NULL';
+    if (!f.posted && f.notPosted) return col + ' IS NULL';
+    if (!f.posted && !f.notPosted) return '1 = 2';
+    return '';
+}
+
+function soSQL(f) {
+    const w = ['(psi.id IS NOT NULL OR (si.typeid = 50 AND si.statusid = 50))', 'si.typeid <> ' + SO_SUBTOTAL,
+               likeExact('si.productnum', f.productNum || '%'), likeExact('so.num', f.soNum || '%')];
+    const d = dateFilter('ps', f); if (d) w.push(d);
+    const p = postedFilter('ps.dateposted', f); if (p) w.push(p);
+    return `
+        SELECT DISTINCT psi.id AS postitemid, so.num, c.name AS customername,
+               CASE WHEN si.productnum IS NULL OR si.productnum = '' THEN si.description ELSE si.productnum END AS productnum,
+               COALESCE(si.productid, 0) AS productid, si.solineitem, si.typeid AS soitemtype,
+               COALESCE(psi.postedtotalcost, 0) AS amount, psi.qty, si.unitprice * psi.qty AS price,
+               so.taxrate, si.taxableflag+0 AS taxable, ps.dateposted, ps.postdate,
+               COALESCE(ps.extrefnumber, '') AS refnumber, ps.dateposted IS NULL AS notposted,
+               CASE WHEN ps.journalposted+0 = 1 AND COALESCE(ps.exttxnid, '') = '' THEN 1 ELSE 0 END AS marked
+        FROM soitem si
+        JOIN so ON si.soid = so.id
+        JOIN customer c ON so.customerid = c.id
+        LEFT JOIN postsoitem psi ON si.id = psi.soitemid
+        LEFT JOIN postso ps ON psi.postsoid = ps.id
+        WHERE ${w.join('\n          AND ')}
+        ORDER BY so.num, c.name, notposted, si.solineitem, ps.postdate`;
+}
+
+function poSQL(f) {
+    const w = ['pp.statusid < 1000', 'po.num IS NOT NULL'];
+    if (f.partNum) w.push(likeExact("COALESCE(poitem.partnum, '')", f.partNum));
+    if (f.poNum) w.push(likeExact('po.num', f.poNum));
+    const d = dateFilter('pp', f); if (d) w.push(d);
+    const p = postedFilter('pp.dateposted', f); if (p) w.push(p);
+    return `
+        SELECT po.num, vendor.name AS vendorname, COALESCE(poitem.partnum, part.num) AS partnum,
+               ppi.postedtotalcost AS amount, ppi.qty, pp.dateposted,
+               CASE WHEN pp.journalposted+0 = 1 AND COALESCE(pp.exttxnid, '') = '' THEN 1 ELSE 0 END AS marked
+        FROM postpo pp
+        JOIN postpoitem ppi ON ppi.postpoid = pp.id
+        LEFT JOIN po ON pp.poid = po.id
+        LEFT JOIN vendor ON po.vendorid = vendor.id
+        LEFT JOIN poitem ON ppi.poitemid = poitem.id
+        LEFT JOIN receiptitem ON ppi.receiptitemid = receiptitem.id
+        LEFT JOIN part ON part.id = COALESCE(poitem.partid, receiptitem.partid)
+        WHERE ${w.join('\n          AND ')}
+        ORDER BY po.num, vendor.name, pp.dateposted IS NULL, poitem.polineitem`;
+}
+
+// Driven from postwo: the original's date filter already requires a
+// matching posting, so this is the same row set, found faster.
+function woSQL(f) {
+    const w = ['wo.statusid IN (40)'];
+    if (f.bomNum) w.push(likeExact("COALESCE(bom.num, '')", f.bomNum));
+    if (f.woNum) w.push(likeExact('wo.num', f.woNum));
+    const d = dateFilter('pw', f); if (d) w.push(d);
+    const p = postedFilter('pw.dateposted', f); if (p) w.push(p);
+    return `
+        SELECT wo.num AS wonum, bom.num AS bomnum, part.num AS partnum, bomitemtype.name AS woitemtype,
+               bomitemtype.id AS woitemtypeid, COALESCE(woitem.cost, 0) AS amount, woitem.qtyused,
+               pw.dateposted, COALESCE(pw.extrefnumber, '') AS refnumber,
+               CASE WHEN pw.dateposted IS NOT NULL AND COALESCE(pw.exttxnid, '') = '' THEN 1 ELSE 0 END AS marked
+        FROM postwo pw
+        JOIN postwoitem pwi ON pwi.postwoid = pw.id
+        JOIN woitem ON woitem.id = pwi.woitemid
+        JOIN wo ON wo.id = woitem.woid AND wo.id = pw.woid
+        JOIN part ON woitem.partid = part.id
+        JOIN bomitemtype ON woitem.typeid = bomitemtype.id
+        LEFT JOIN moitem ON wo.moitemid = moitem.id
+        LEFT JOIN bom ON moitem.bomid = bom.id
+        WHERE ${w.join('\n          AND ')}
+        ORDER BY wo.num, pw.dateposted IS NULL, bomitemtype.name, woitem.sortid`;
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+const S = { company: '', data: { so: [], po: [], wo: [] }, on: { so: true, po: true, wo: true }, loadedAt: null, tab: 'so' };
+let _loadToken = 0;
+
+const statusOf = r => r.marked ? 'Marked as Posted' : r.posted ? 'Posted' : 'Not Posted';
+const PILL = { 'Posted': 'success', 'Not Posted': 'caution', 'Marked as Posted': 'active' };
+const pill = s => `<span class="spill ${PILL[s]}">${esc(s)}</span>`;
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    const f = F;
+    document.getElementById('banner').textContent = '';
+    setStatus('Loading…');
+    S.on = { so: sectionOn('so', f), po: sectionOn('po', f), wo: sectionOn('wo', f) };
+    const SQLS = { so: soSQL, po: poSQL, wo: woSQL };
+    const res = await Promise.allSettled(SECTIONS.map(t => S.on[t] ? q(SECTION_LABEL[t], SQLS[t](f)) : Promise.resolve([])));
+    if (tok !== _loadToken) return;
+    const errors = [];
+    SECTIONS.forEach((t, i) => {
+        if (res[i].status === 'rejected') { errors.push(res[i].reason.message); S.data[t] = []; return; }
+        S.data[t] = res[i].value.map(r => Object.assign({}, r, {
+            amount: num(r.amount), qty: num(r.qty !== undefined ? r.qty : r.qtyused), price: num(r.price),
+            taxrate: num(r.taxrate), taxable: Number(r.taxable) === 1, soitemtype: Number(r.soitemtype),
+            productid: Number(r.productid), woitemtypeid: Number(r.woitemtypeid),
+            dateposted: dstr(r.dateposted), posted: !!dstr(r.dateposted), marked: Number(r.marked) === 1,
+            refnumber: r.refnumber || ''
+        }));
+    });
+    if (errors.length) document.getElementById('banner').textContent = 'A query failed: ' + errors.join('; ') + '. The debug console (Settings) has the SQL.';
+    S.loadedAt = new Date();
+    render();
+}
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+function rangeText(f) {
+    const r = dateRange(f);
+    return 'Date Range: ' + (r ? r.label : 'All') + ' (' + (f.basis === 'fulfilled' ? 'Item Date Fulfilled' : 'Date Posted') + ')';
+}
+
+// Distinct order numbers across the groups (an order can be in two).
+const orders = gs => new Set(gs.map(g => g.num)).size;
+
+// Consecutive rows with the same order and posted state form a group,
+// exactly as the original's group expression.
+function groups(rows, numKey) {
+    const out = [];
+    rows.forEach(r => {
+        const key = r[numKey] + '|' + r.posted;
+        const g = out.length && out[out.length - 1].key === key ? out[out.length - 1] : null;
+        if (g) g.rows.push(r); else out.push({ key, num: r[numKey], first: r, rows: [r] });
+    });
+    return out;
+}
+
+// ============================================================================
+//  MODELS — one per section
+// ============================================================================
+function soLineTax(r) { return r.taxable ? r.price * r.taxrate : 0; }
+
+function soModel(details) {
+    const cols = [
+        { key: 'num', label: 'Order #', w: 160 }, { key: 'product', label: 'Product / Parts', w: 220 },
+        { key: 'date', label: 'Date Posted', w: 95 }, { key: 'price', label: 'Price', w: 100, num: true },
+        { key: 'cogs', label: 'COGS', w: 100, num: true }, { key: 'margin', label: 'Margin', w: 100, num: true },
+        { key: 'pct', label: 'Margin %', w: 80, num: true }
+    ];
+    const body = [];
+    let gPrice = 0, gTax = 0, gCogs = 0;
+    const gs = groups(S.data.so, 'num');
+    gs.forEach(g => {
+        body.push({ cls: 'grp', cells: { num: pill(statusOf(g.first)) + openLink('Sales Order', g.num), product: cut(g.first.customername) } });
+        let ref = null, price = 0, tax = 0, cogs = 0;
+        g.rows.forEach(r => {
+            if (r.refnumber !== ref) { ref = r.refnumber; if (ref) body.push({ cls: 'ref', cells: { num: 'Ref. #', product: esc(ref) } }); }
+            price += r.price; tax += soLineTax(r); cogs += r.amount;
+            if (!details) return;
+            const sale = r.soitemtype === SO_SALE;
+            body.push({ cls: '', cells: {
+                product: r.productid ? openLink('Product', r.productnum) : cut(r.productnum),
+                date: esc(fmtDate(r.dateposted)), price: money(r.price),
+                cogs: sale ? money(r.amount) : '', margin: sale ? money(r.price - r.amount) : '',
+                pct: sale ? (r.price ? esc(fmtPct((r.price - r.amount) / r.price)) : '<span class="pp-muted" title="No price, so no margin %">–</span>') : ''
+            } });
+        });
+        if (details) body.push({ cls: 'tax', cells: { product: 'Tax', price: money(tax) } });
+        body.push({ cls: 'sub', cells: { date: 'Totals:', price: money(price + tax), cogs: money(cogs) } });
+        gPrice += price; gTax += tax; gCogs += cogs;
+    });
+    return {
+        cols, body, groups: orders(gs), totals: { price: gPrice + gTax, tax: gTax, cogs: gCogs },
+        foot: [
+            { cells: { date: 'Total Tax:', price: esc(fmtMoney(gTax)) } },
+            { cells: { num: plural(orders(gs), 'order'), date: 'Grand Totals:', price: esc(fmtMoney(gPrice + gTax)), cogs: esc(fmtMoney(gCogs)) } }
+        ]
+    };
+}
+
+function poModel(details) {
+    const cols = [
+        { key: 'num', label: 'Order #', w: 160 }, { key: 'product', label: 'Product / Parts', w: 260 },
+        { key: 'date', label: 'Date Posted', w: 95 }, { key: 'cost', label: 'Cost', w: 110, num: true }
+    ];
+    const body = [];
+    let grand = 0;
+    const gs = groups(S.data.po, 'num');
+    gs.forEach(g => {
+        body.push({ cls: 'grp', cells: { num: pill(statusOf(g.first)) + openLink('Purchase Order', g.num), product: cut(g.first.vendorname) } });
+        let cost = 0;
+        g.rows.forEach(r => {
+            cost += r.amount;
+            if (details) body.push({ cls: '', cells: { product: openLink('Part', r.partnum), date: esc(fmtDate(r.dateposted)), cost: money(r.amount) } });
+        });
+        body.push({ cls: 'sub', cells: { date: 'Total Costs:', cost: money(cost) } });
+        grand += cost;
+    });
+    return { cols, body, groups: orders(gs), totals: { cost: grand },
+             foot: [{ cells: { num: plural(orders(gs), 'order'), date: 'Grand Total:', cost: esc(fmtMoney(grand)) } }] };
+}
+
+function woModel(details) {
+    const cols = [
+        { key: 'num', label: 'Order #', w: 160 }, { key: 'part', label: 'Part', w: 160 }, { key: 'type', label: 'Type', w: 140 },
+        { key: 'date', label: 'Date Posted', w: 95 }, { key: 'qty', label: 'Quantity', w: 90, num: true },
+        { key: 'adj', label: 'Adjustment', w: 110, num: true }
+    ];
+    const body = [];
+    let grand = 0;
+    const counts = r => WO_TOTAL_TYPES.indexOf(r.woitemtypeid) !== -1;
+    const gs = groups(S.data.wo, 'wonum');
+    gs.forEach(g => {
+        body.push({ cls: 'grp', cells: { num: pill(statusOf(g.first)) + openLink('Work Order', g.num), part: g.first.bomnum ? esc('BOM # - ' + g.first.bomnum) : '' } });
+        let ref = null, adj = 0;
+        g.rows.forEach(r => {
+            if (r.refnumber !== ref) { ref = r.refnumber; if (ref) body.push({ cls: 'ref', cells: { num: 'Ref. #', part: esc(ref) } }); }
+            if (counts(r)) adj += r.amount;
+            if (details) body.push({ cls: '', cells: {
+                part: openLink('Part', r.partnum), type: esc(r.woitemtype), date: esc(fmtDate(r.dateposted)),
+                qty: esc(fmtQty(r.qty)), adj: money(r.amount)
+            } });
+        });
+        body.push({ cls: 'sub', cells: { qty: 'Total Adjustment:', adj: money(adj) } });
+        grand += adj;
+    });
+    return { cols, body, groups: orders(gs), totals: { adj: grand },
+             foot: [{ cells: { num: plural(orders(gs), 'order'), qty: 'Grand Total:', adj: esc(fmtMoney(grand)) } }] };
+}
+
+const MODEL = { so: soModel, po: poModel, wo: woModel };
+
+// ============================================================================
+//  RENDER
+// ============================================================================
+function render() {
+    const on = SECTIONS.filter(t => S.on[t]);
+    if (on.indexOf(S.tab) === -1) S.tab = on[0] || 'so';
+    const models = {};
+    on.forEach(t => { models[t] = MODEL[t](F.details); });
+    document.querySelectorAll('[data-tab]').forEach(b => {
+        const t = b.dataset.tab;
+        b.classList.toggle('hidden', !S.on[t]);
+        b.classList.toggle('active', t === S.tab);
+        const c = b.querySelector('.cnt');
+        if (c) c.textContent = models[t] ? '(' + models[t].groups.toLocaleString() + ')' : '';
+    });
+    document.getElementById('hint').textContent = F.basis === 'posted' && F.notPosted && dateRange(F)
+        ? 'Transactions not posted yet have no Date Posted: filter on Item Date Fulfilled to include them.' : '';
+    if (on.length) paintTable(models[S.tab], 'No ' + { so: 'sales', po: 'purchase', wo: 'work' }[S.tab] + ' order transactions match these filters.');
+    else paintTable({ cols: [], body: [] }, 'Every section is switched off. Turn one on in Filters.');
+    renderKpis(models);
+    const parts = [S.company, rangeText(F)];
+    if (S.loadedAt) parts.push('loaded ' + S.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    setStatus(parts.filter(Boolean).join(' · '));
+}
+
+function renderKpis(models) {
+    const host = document.getElementById('kpiRow');
+    if (!S.loadedAt) { host.innerHTML = ''; return; }
+    let html = '';
+    if (models.so) html += kpi('Sales (incl. tax)', esc(fmtMoney(models.so.totals.price)), 'blue', 'so', plural(models.so.groups, 'order')) +
+                           kpi('SO COGS', esc(fmtMoney(models.so.totals.cogs)), 'purple', 'cogs');
+    if (models.po) html += kpi('PO costs', esc(fmtMoney(models.po.totals.cost)), 'yellow', 'po', plural(models.po.groups, 'order'));
+    if (models.wo) html += kpi('WO adjustments', esc(fmtMoney(models.wo.totals.adj)), 'neutral', 'wo', plural(models.wo.groups, 'order'));
+    const waiting = SECTIONS.filter(t => models[t]).reduce((n, t) => n + groups(S.data[t], t === 'wo' ? 'wonum' : 'num').filter(g => !g.first.posted).length, 0);
+    html += kpi('Not posted', waiting.toLocaleString(), waiting ? 'warning' : 'success', 'wait', waiting ? 'orders waiting' : 'all exported');
+    host.innerHTML = html;
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    const on = SECTIONS.filter(t => S.on[t] && S.data[t].length);
+    if (!on.length) { showToast('Nothing to export.', 'warn'); return; }
+    const sub = [S.company, rangeText(F)].filter(Boolean);
+    const T = (key, label, w, type, extra) => Object.assign({ key, label, w, type }, extra || {});
+    const sheets = [];
+    if (on.indexOf('so') !== -1) sheets.push({
+        name: 'Sales Orders', title: 'Accounting Export Summary – SO', subtitle: sub,
+        cols: [T('num', 'SO #', 90, 'text'), T('customername', 'Customer', 180, 'text'), T('status', 'Status', 110, 'text'),
+               T('refnumber', 'Ref. #', 90, 'text'), T('productnum', 'Product', 150, 'text'), T('dateposted', 'Date Posted', 95, 'date'),
+               T('qty', 'Qty', 70, 'qty', { noTotal: true }), T('price', 'Price', 100, 'money'), T('tax', 'Tax', 90, 'money'),
+               T('amount', 'COGS', 100, 'money'), T('margin', 'Margin (Sale lines)', 110, 'money')],
+        rows: S.data.so.map(r => Object.assign({}, r, { status: statusOf(r), tax: soLineTax(r), dateposted: r.dateposted || null,
+            margin: r.soitemtype === SO_SALE ? r.price - r.amount : null })),
+        totals: true
+    });
+    if (on.indexOf('po') !== -1) sheets.push({
+        name: 'Purchase Orders', title: 'Accounting Export Summary – PO', subtitle: sub,
+        cols: [T('num', 'PO #', 90, 'text'), T('vendorname', 'Vendor', 200, 'text'), T('status', 'Status', 110, 'text'),
+               T('partnum', 'Part', 150, 'text'), T('dateposted', 'Date Posted', 95, 'date'), T('qty', 'Qty', 70, 'qty', { noTotal: true }),
+               T('amount', 'Cost', 110, 'money')],
+        rows: S.data.po.map(r => Object.assign({}, r, { status: statusOf(r), dateposted: r.dateposted || null })),
+        totals: true
+    });
+    if (on.indexOf('wo') !== -1) sheets.push({
+        name: 'Work Orders', title: 'Accounting Export Summary – WO', subtitle: sub,
+        cols: [T('wonum', 'WO #', 100, 'text'), T('bomnum', 'BOM #', 120, 'text'), T('status', 'Status', 110, 'text'),
+               T('refnumber', 'Ref. #', 90, 'text'), T('partnum', 'Part', 150, 'text'), T('woitemtype', 'Type', 130, 'text'),
+               T('dateposted', 'Date Posted', 95, 'date'), T('qty', 'Quantity', 80, 'qty', { noTotal: true }),
+               T('amount', 'Line Cost', 110, 'money', { noTotal: true }), T('adj', 'Adjustment (counted)', 130, 'money')],
+        rows: S.data.wo.map(r => Object.assign({}, r, { status: statusOf(r), dateposted: r.dateposted || null,
+            adj: WO_TOTAL_TYPES.indexOf(r.woitemtypeid) !== -1 ? r.amount : null })),
+        totals: true
+    });
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'Accounting_Export_Summary_' + ymd(new Date()), sheets });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// JxBrowser won't print the report page itself: build it in a new window
+// and print that. Every section prints, one after another, as the
+// standard report does.
+function printReport() {
+    const on = SECTIONS.filter(t => S.on[t]);
+    if (!on.some(t => S.data[t].length)) { showToast('Nothing to print.', 'warn'); return; }
+    const table = t => {
+        const m = MODEL[t](F.details);
+        if (!m.body.length) return '';
+        return '<h3>' + esc(SECTION_LABEL[t]) + '</h3><table><thead><tr>' +
+            m.cols.map(c => '<th class="' + (c.num ? 'num-cell' : '') + '">' + esc(c.label) + '</th>').join('') + '</tr></thead><tbody>' +
+            m.body.map(r => rowHtml(m.cols, r)).join('') + '</tbody><tfoot>' + m.foot.map(r => rowHtml(m.cols, r)).join('') + '</tfoot></table>';
+    };
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Accounting Export Summary</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:11pt;font-weight:700}h2{text-align:center;font-size:14pt;margin:2px 0}.sub{text-align:center;font-size:8.5pt;color:#333;margin:0 0 6px}' +
+        'h3{font-size:11pt;margin:14px 0 4px}table{border-collapse:collapse;width:100%}' +
+        'th{font-size:8pt;text-align:left;padding:3px 5px;border-bottom:1px solid #000}td{font-size:8pt;padding:2px 5px;vertical-align:top}' +
+        '.num-cell{text-align:right}tr.grp td{font-weight:700;border-top:1px solid #999;padding-top:5px}tr.ref td{color:#444}' +
+        'tr.tax td{font-style:italic}tr.sub td{font-weight:700;border-bottom:1px solid #999}tfoot td{font-weight:700}' +
+        '.spill{font-size:7pt;border:1px solid #888;border-radius:6px;padding:0 4px;margin-right:5px;font-weight:400}' +
+        'a{color:#000;text-decoration:none}.pp-neg{color:#000}@page{size:Letter portrait;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>Accounting Export Summary</h2><p class="sub">' + esc(rangeText(F)) + '</p>' +
+        on.map(table).join('') +
+        '<p style="font-size:7.5pt;margin-top:10px">Printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters the starting point for every user who hasn\'t saved their own?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: readFilters() }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function apply() {
+    F = readFilters();
+    remember();
+    FBLib.Common.closeDrawer('filtersOverlay');
+    loadAll();
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerDrawer({ id: 'filtersOverlay', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',     triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay',    triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        document.getElementById('fRange').innerHTML = RANGES.map(r => `<option value="${r[0]}">${esc(r[1])}</option>`).join('');
+        document.getElementById('fRange').onchange = e => document.getElementById('fCustom').classList.toggle('hidden', e.target.value !== 'custom');
+        document.getElementById('applyBtn').onclick = apply;
+        Object.values(TEXT_FIELDS).forEach(id => document.getElementById(id).addEventListener('keydown', e => { if (e.key === 'Enter') apply(); }));
+        document.getElementById('resetFiltersBtn').onclick = () => writeFilters(DEFAULT_FILTERS);
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: readFilters() } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+        // Details are already loaded: the switch only changes what's drawn.
+        document.getElementById('vDetails').onchange = e => {
+            F = Object.assign({}, F, { details: e.target.checked });
+            document.getElementById('fDetails').checked = e.target.checked;
+            remember();
+            render();
+        };
+        document.getElementById('tabs').addEventListener('click', e => {
+            const b = e.target.closest('[data-tab]');
+            if (!b || b.dataset.tab === S.tab) return;
+            S.tab = b.dataset.tab;
+            _saveUserKeys({ tab: S.tab });
+            render();
+        });
+        document.getElementById('rptWrap').addEventListener('scroll', e => {
+            const w = e.currentTarget;
+            if (w.scrollTop + w.clientHeight > w.scrollHeight - 400) appendChunk();
+        });
+        document.getElementById('rpt').addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (!a) return;
+            e.preventDefault();
+            try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+            catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+        });
+
+        S.tab = _resolve('tab', 'so');
+        F = savedFilters();
+        writeFilters(F);
+        try { S.company = ((await q('Company', 'SELECT name FROM company WHERE id = 1'))[0] || {}).name || ''; } catch (_) {}
+        await loadAll();
+    } catch (e) {
+        console.error('[Accounting Export Summary] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

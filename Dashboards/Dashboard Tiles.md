@@ -33,18 +33,18 @@ saved-views button doesn't appear.
 
 ### 2. Import the tiles
 
-All eight are in BI Reports ▸ `Company Dashboad and Tiles`:
+All eight are in BI Reports ▸ `Company Dashboad and Tiles`. They were renamed without the `- ` / `Dashboard - Tiles - ` prefixes on 2026-10-12, so a server that imported the old names gets a second copy of each; delete the old ones in the BI Editor.
 
 | Tile | File | Source |
 |---|---|---|
-| Open Sales Orders | `- Open Sales Orders-Page.json` | `Open_Sales_Orders.htm` |
-| Open Purchase Orders | `- Open Purchase Orders-Page.json` | `Open_Purchase_Orders.htm` |
-| Open Work Orders | `- Open Work Orders-Page.json` | `Open_Work_Orders.htm` |
-| Open RMA Orders | `- Open RMA Orders-Page.json` | `Open_RMA_Orders.htm` |
-| Open Transfer Orders | `- Open Transfer Orders-Page.json` | `Open_Transfer_Orders.htm` |
-| Items to be Picked | `Dashboard - Tiles - Items to be Picked-Page.json` | `Items_To_Be_Picked.htm` |
-| Items to be Received | `Dashboard - Tiles - Items to be Received-Page.json` | `Items_To_Be_Received.htm` |
-| Items to be Shipped | `Dashboard - Tiles - Items to be Shipped-Page.json` | `Items_To_Be_Shipped.htm` |
+| Open Sales Orders | `Open Sales Orders-Page.json` | `Open_Sales_Orders.htm` |
+| Open Purchase Orders | `Open Purchase Orders-Page.json` | `Open_Purchase_Orders.htm` |
+| Open Work Orders | `Open Work Orders-Page.json` | `Open_Work_Orders.htm` |
+| Open RMA Orders | `Open RMA Orders-Page.json` | `Open_RMA_Orders.htm` |
+| Open Transfer Orders | `Open Transfer Orders-Page.json` | `Open_Transfer_Orders.htm` |
+| Items to be Picked | `Items to be Picked-Page.json` | `Items_To_Be_Picked.htm` |
+| Items to be Received | `Items to be Received-Page.json` | `Items_To_Be_Received.htm` |
+| Items to be Shipped | `Items to be Shipped-Page.json` | `Items_To_Be_Shipped.htm` |
 
 1. In Fishbowl, open **BI Editor** and click **Import**.
 2. Select the `.json` files you want (you can select several at once).

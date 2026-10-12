@@ -33,17 +33,33 @@ node tools/deploy/build-deployed.js
 ## Report identity & build stamps
 
 Every production report starts its `<head>` (right after `<meta charset>`) with
-an identity block:
+its module association, its description and an identity block:
 
 ```html
+<meta charset="UTF-8">
+<meta name="fb-launch" content="SALES">
+<meta name="description" content="Dashboard tile: open sales orders.">
 <script>
     window.FB_REPORT = {
         key:   'cdx.bi.openSalesOrders',   // storage-key prefix
-        name:  '- Open Sales Orders',      // Fishbowl record name (null = unpublished)
+        name:  'Open Sales Orders',        // Fishbowl record name (null = unpublished)
         build: '2026.09.24-2a6c74c'        // @fb-build
     };
 </script>
 ```
+
+- **The `fb-launch` tag is the report's module association.** Its content is
+  module keys (`SO`, `PO`, `RECEIPT`, …) and/or client menu-group keys (`SALES`,
+  `PURCHASING`, `MATERIALS`, `MANUFACTURING`, `ACCOUNTING`, `SETUP`, `GENERAL`,
+  `REPORTING`, `INTEGRATIONS`). The Report Launcher groups by it, and report_btn
+  lists the report in those modules' Apps menu. Write the tag exactly once in a
+  page and never anywhere else: hosts read the first `name="fb-launch"` they find,
+  so not in comments, strings or inlined scripts.
+  `Other_NOT_FOR_PRODUCTION/Paperwork_POC/LAUNCH_CONTEXT.md` §1 and §3 have the keys.
+- **The description** is one short sentence. Deploy and publish copy it into the
+  Fishbowl and SharePoint description wherever that is empty or only repeats the
+  name; a description written in Fishbowl is kept. The Launcher shows it on the
+  tile and in full in the tile's hover tooltip.
 
 - **`key`** is the prefix of every key the report stores (settings, saved
   views, shared payloads). Build them as `FB_REPORT.key + '.user.v1'` etc.,
@@ -63,37 +79,101 @@ an identity block:
   enable the git hook once per clone, run
   `git config core.hooksPath tools/githooks`. Manual commands:
   `node tools/stamp/stamp.js` (all files), `--check` (verify only), `--list`.
-- **`name`** is the report's Fishbowl record name, `'- <Folder> - <Report>'`.
-  Publishing (below) finds the report's shared copy by it. `null` means the
-  report isn't published. Don't "tidy" an existing name: the name identifies the
-  record, so renaming creates a duplicate on the next import.
+- **`name`** is the report's Fishbowl record name: a **plain name, no
+  `- Folder -` prefix** (prefixes were dropped on 2026-10-12; grouping now comes
+  from the `fb-launch` tag). Publishing and deploying (below) find the report's
+  copies by it. `null` means the report isn't published or deployed anywhere.
+  Don't "tidy" an existing name: the name identifies the record, so renaming
+  creates a duplicate on the next import. When a rename is wanted, rename every
+  copy in place: `fbdeploy.js --rename <old> --to <new>` in Fishbowl and
+  `publish.js --rename <old> <file>` on SharePoint.
 - **New reports** start from `Template/Core_Dashboard_Template.htm`, which
-  already has the block. **Ask the user what the report should be named**
-  before creating it. Set `name` to that, and name the file after it. Give the
-  report a unique key and leave `build` as `'UNSTAMPED'`; the next write stamps
-  it.
+  already has the block. **Ask the user what the report should be named and
+  which module or menu group it belongs to** before creating it. Set `name` to
+  that, name the file after it, set the `fb-launch` tag and write a one-line
+  description. Give the report a unique key and leave `build` as `'UNSTAMPED'`;
+  the next write stamps it. Its first write also asks where it should be
+  deployed (see *Where an edit goes*).
+
+## Where an edit goes: SharePoint, Fishbowl, both or neither
+
+The after-edit hook (`tools/hooks/after-edit.js`, wired in
+`.claude/settings.json`) stamps the file, then can send it to two places:
+the shared SharePoint folder (`publish.js`, below) and the local Fishbowl
+server (`fbdeploy.js`, below). **Which ones is the user's decision, per file**,
+recorded in the gitignored `tools/deploy/targets.local.json` as `fishbowl`,
+`sharepoint`, `both` or `none`.
+
+- **Ask before the first deploy.** A file with no decision goes **nowhere**.
+  Its first edit makes the hook hand you the question. **Ask with
+  AskUserQuestion** whether every edit should go to Fishbowl, SharePoint,
+  both or neither, grouping any files that are waiting; the hook offers only
+  the targets configured on this machine. If SharePoint is picked for a
+  report that has no copy there yet, also ask which folder (the hook lists
+  them). Record the answer with
+  `node tools/deploy/targets.js <fishbowl|sharepoint|both|none> "<file>" [--folder "<folder>"]`;
+  it pushes the file to the chosen targets straight away.
+- **Ask again before a Fishbowl overwrite** (see below). `--force` never runs
+  without a yes for that file.
+- To change an answer, run `targets.js` again; `--list` shows them all. A
+  target needs a record name: `FB_REPORT.name` for a report, the fixed or file
+  name for `scripts/*`. A report with `name: null` is never asked about.
 
 ## Publishing to the shared BI Reports folder
 
 Published reports live as Fishbowl JSON exports in the SharePoint
 "BI Reports" library (synced locally; the path is in the gitignored
 `tools/deploy/publish.local.json`). The owner arranges its folders.
-`tools/deploy/publish.js` **never picks a folder and never creates a file
-there**:
+`tools/deploy/publish.js` **never picks a folder**:
 
 - it searches the folder **recursively** for a `<name>-<Type>.json` whose
   record name equals the report's `FB_REPORT.name` (shared scripts use their
   fixed names: `fb-lib`, `fb-mfg`, `fb-styles`);
 - a match is overwritten **in place** with the freshly wrapped source, and
-  keeps its published description; no match means not published, so nothing
-  happens. A report is published when the owner drops its first copy there.
-- It runs **after every edit**, straight after the build stamp
-  (`tools/hooks/after-edit.js`, wired in `.claude/settings.json`), and reports
-  each publish in a one-line message. Edits made outside Claude Code publish
-  with `node tools/deploy/publish.js <file>` (`--all`, `--list`, `--dry`).
+  keeps its published description. With no match, it creates the first copy
+  only in an existing sub-folder the user named (`--folder`, which
+  `targets.js` passes on); it never creates folders.
+- The hook publishes files whose target includes SharePoint, and reports each
+  publish in a one-line message. Edits made outside Claude Code publish with
+  `node tools/deploy/publish.js <file>` (`--all` skips files the user kept off
+  SharePoint; `--list`, `--folders`, `--dry`).
 - Publishing an edit means consultants can import it from that folder
   straight away, so shared-asset order still matters: publish fb-styles, then
   fb-lib, then the reports that depend on them.
+
+## Deploying to the local Fishbowl server
+
+`tools/deploy/fbdeploy.js` writes a source straight into the dev server's
+tables (`biscript`, plus `bireport` for a page) over REST, so the next time
+the report opens in the client it runs the new code. The server and login
+live in the gitignored `tools/deploy/fishbowl.local.json`; with no file it
+does nothing. The hook deploys files whose target includes Fishbowl, after
+the publish, and updates only records that already exist (the `targets.js`
+answer creates them).
+
+- **Ask again before an overwrite.** The hook overwrites a record only when
+  Fishbowl still holds exactly what the tool last wrote. Otherwise (edited in
+  the BI editor since, or never deployed from here) it leaves the record alone
+  and reports that confirmation is needed. **Ask the user**, and only on a yes
+  run `node tools/deploy/fbdeploy.js --force "<file>"`, which first backs the
+  Fishbowl copy up to `tools/deploy/backups/`. Never pass `--force` without a
+  yes for that file.
+- **The endpoint's limits.** It needs the sysproperty `FbPartnerApi = true`
+  (403 otherwise). It accepts SELECT, UPDATE and INSERT; **DELETE is
+  rejected**, so this tool can't remove a record or revoke access; do both in
+  the client. Its writes skip Fishbowl's `_aud` history, and the response
+  doesn't confirm them, so every write is read back and hash-compared.
+- **Access.** A page created this way has no `bireportaccess` rows, so only
+  admins see it. `--access "Sales,Warehouse"` (or `all`) adds View rows. That
+  grants permissions, so run it only when the user asks for it.
+- **Built pages** (source with `<!-- @inline-script … -->` markers and a
+  `build.js` beside it, e.g. `Paperwork_POC`) ship their built `dist/` page,
+  and an edit to an inlined file such as `fb-doc.js` redeploys every opted-in
+  page built from it (`tools/deploy/built.js`). A variant that exists only in
+  `dist/` takes its target on the dist path.
+- Deploy shared assets in the same order as publishing: fb-styles, then fb-lib,
+  then the reports. Other commands: `--status` (repo vs Fishbowl), `--create`,
+  `--dry`. Setup and the full contract are in `tools/deploy/README.md`.
 
 ---
 

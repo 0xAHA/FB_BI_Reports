@@ -40,6 +40,15 @@
   Available reads as "stock in these locations, less everything the whole LG
   owes" — deliberately conservative.
 
+  SUPPLY FOLLOWS THE SCHEDULED RANGE (2026-10). On Order and Qty In Production
+  count supply due on or before the range's END date (overdue included; no end
+  date = all open supply), recomputed client-side as the range changes, so
+  Qty Required reads "orders due in the range vs stock + builds due by its
+  end". On Order no longer reads QTYONORDER: that view includes open work-
+  order output, which Qty In Production also counts, so the same build showed
+  twice. It is QTYONORDER's PO, inbound-TO and SO-credit-return legs rebuilt
+  with their dates — see loadData step 3.
+
   NOTE ON "ALLOCATED" vs "QTY REQUIRED": Allocated already includes the open
   sales-order demand this report lists, so Available has that demand netted out
   of it. Qty Required is deliberately the other view — Qty to Ship − On Hand −
@@ -69,6 +78,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
+  <meta name="description" content="Open sales order demand by category and part, with live availability alongside.">
   <script>
       // ================================================================
       // REPORT IDENTITY
@@ -86,7 +96,7 @@
       window.FB_REPORT = {
           key:   'cdx.bi.openOrders',
           name:  null,          // not published yet - set when you publish it
-          build: '2026.09.30-ff2b756'     // @fb-build
+          build: '2026.10.12-5b30259'     // @fb-build
       };
   </script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -195,6 +205,15 @@
     tr.so-row .so-indent { border-left: 3px solid var(--border-strong); }
 
     .num-cell { text-align: right; font-variant-numeric: tabular-nums; }
+    /* On Order / Qty In Production carry a hover breakdown (supplyTd). */
+    td.has-tt { cursor: help; text-decoration: underline dotted rgba(80, 104, 114, 0.5); text-underline-offset: 3px; }
+    /* The breakdown table inside the shared .app-tooltip (fb-styles §13). */
+    .app-tooltip .tt-rows { border-collapse: collapse; margin: 2px 0 0; white-space: nowrap; }
+    .app-tooltip .tt-rows td { padding: 2px 12px 2px 0; color: #E3E3E3; vertical-align: top; }
+    .app-tooltip .tt-rows td.n { padding-right: 0; text-align: right; color: #fff; font-weight: 600;
+                                  font-variant-numeric: tabular-nums; }
+    .app-tooltip .tt-rows tr.late td:nth-child(2) { color: #F4A3B0; font-weight: 600; }   /* overdue */
+    .app-tooltip .tt-rows tr.more td { color: #8FA1A7; font-style: italic; }
     .muted { color: var(--c-tertiary); }
     .past-due { color: var(--fb-negative); font-weight: 600; }
     .short   { color: var(--fb-negative); font-weight: 700; }   /* qty required > 0  */
@@ -339,6 +358,11 @@
           <p style="margin:0 0 6px;font-size:12px;color:#415157;"><strong>Qty Required</strong> =
           Qty to Ship − On Hand − In Production. The shortfall against physical and incoming stock,
           <em>regardless of who it is earmarked for</em>. Not floored, so a negative is the surplus.</p>
+          <p style="margin:0 0 6px;font-size:12px;color:#415157;"><strong>With a Scheduled range</strong>,
+          Qty to Ship counts the lines due in the range, and On Order and In Production count supply due
+          by its <em>end</em> date — overdue supply included, since it is still open. Stock arriving before
+          the range starts still covers those orders, so the start date does not cut supply off.
+          On Order leaves work orders out; they are In Production, so no unit is counted twice.</p>
           <p style="margin:0;font-size:12px;color:#415157;"><strong>Available</strong> =
           On Hand − Allocated − Not Available + Dropship, floored at zero. What is genuinely free to
           promise — and since Allocated already includes the demand on these very rows, that demand is
@@ -642,6 +666,15 @@ function _ttBuild(p) {
   let h = '';
   if (p.title) h += '<span class="tt-title">' + escHtml(p.title) + '</span>';
   if (p.desc)  h += '<span class="tt-desc">'  + escHtml(p.desc)  + '</span>';
+  // Optional breakdown table: rows of [cell, cell, …, qty] plus an optional
+  // trailing row class ('late' / 'more'). The last cell right-aligns.
+  if (p.rows && p.rows.length) {
+    h += '<table class="tt-rows">' + p.rows.map(r => {
+      const cells = r.cells || [];
+      return '<tr' + (r.cls ? ' class="' + r.cls + '"' : '') + '>' + cells.map((c, i) =>
+        '<td' + (i === cells.length - 1 ? ' class="n"' : '') + '>' + escHtml(c) + '</td>').join('') + '</tr>';
+    }).join('') + '</table>';
+  }
   if (p.meta)  h += '<span class="tt-meta">'  + escHtml(p.meta)  + '</span>';
   return h;
 }
@@ -680,7 +713,9 @@ function _ttFindHost(el) {
   return null;
 }
 function _ttPayload(h) {
-  return { title: h.dataset.ttTitle || '', desc: h.dataset.ttDesc || '', meta: h.dataset.ttMeta || '' };
+  let rows = null;
+  if (h.dataset.ttRows) { try { rows = JSON.parse(h.dataset.ttRows); } catch (_) {} }
+  return { title: h.dataset.ttTitle || '', desc: h.dataset.ttDesc || '', meta: h.dataset.ttMeta || '', rows: rows };
 }
 document.addEventListener('mouseover', e => {
   // A popover chasing the cursor through a drag or a resize is pure noise.
@@ -720,6 +755,7 @@ async function qp(sql) {
 /* ── STATE ── */
 let _parts = [];        // part groups (see loadData)
 let _shown = [];        // post-filter: [{ g, lines, sumToShip, required }]
+let _dataLoaded = false; // updateStatus() stays quiet until the first load lands
 let _lgList = [];       // [{val,lbl}] accessible + active location groups
 let _selLg = new Set(); // selected LG ids as strings; empty = all accessible
 let _lgMs = null;
@@ -766,7 +802,7 @@ const _DEFAULT_COLS = [
     tip: "The part's base unit of measure. Every part-row quantity is expressed in this unit, and the two line-level quantities (Committed, Allocated) are converted into it so both tiers read in the same unit.",
     meta: 'Part row · part.uomId' },
   { key: 'scheduled', label: 'Scheduled',         vis: true,  w: 105, level: 'line',
-    tip: "The order line's scheduled fulfilment date. Shown in red when it has already passed. The Scheduled range on the filter bar narrows the lines by it.",
+    tip: "The order line's scheduled fulfilment date. Shown in red when it has already passed. The Scheduled range on the filter bar narrows the lines by it, and its end date also bounds On Order and Qty In Production to supply due by then.",
     meta: 'Order line · soitem.dateScheduledFulfillment' },
   { key: 'sonum',     label: 'SO #',              vis: true,  w: 105, level: 'line',
     tip: 'The sales order this line belongs to. Click it to open the order in Fishbowl.',
@@ -805,14 +841,14 @@ const _DEFAULT_COLS = [
     tip: 'Quantity going straight from the vendor to the customer, so it never lands in your stock. It ADDS to Available, because the demand behind it will never draw on the shelf.',
     meta: 'Part row · QTYDROPSHIP view · whole location group' },
   { key: 'onorder',   label: 'On Order',          vis: true,  w: 95,  level: 'part', nr: true,
-    tip: 'Quantity on open purchase orders — incoming supply.\n\nIt is deliberately NOT part of Available and NOT part of Qty Required: it has not arrived, so it cannot be promised. It is here to tell you whether a shortfall is already being dealt with.',
-    meta: 'Part row · QTYONORDER view · whole location group' },
+    tip: 'Incoming supply due by the END of the Scheduled range — what can arrive in time for the orders listed: purchase-order receipts not yet received, transfers coming into the selected location groups, and customer credit returns on open sales orders. Overdue supply still counts (it is still open); with no end date, everything open counts.\n\nWork orders are deliberately left out: their output is Qty In Production, so the two columns never count the same units twice.\n\nNot part of Available or Qty Required — it has not arrived, so it cannot be promised. It tells you whether a shortfall is already being dealt with.\n\nHover a figure to see the POs, transfers and returns behind it, with their due dates.',
+    meta: 'Part row · PO receipt lines (Entered/Reconciled) + inbound TO lines + SO credit returns · dated ≤ Scheduled To (line date, else header) · whole location group' },
   { key: 'inprod',    label: 'Qty In Production', vis: true,  w: 125, level: 'part', nr: true,
-    tip: 'Quantity still to come off open work orders — the build target less what has already been used. The used portion has already been received into stock and is therefore in On Hand, so summing the raw target would count it twice.',
-    meta: 'Part row · SUM(max(woitem.qtyTarget − woitem.qtyUsed, 0)) on typeId-10 lines of WOs below status 40' },
+    tip: 'Finished goods still to come off open work orders scheduled to finish by the END of the Scheduled range. Overdue work orders still count; with no end date, every open work order counts.\n\nIt is the build target less what has already been produced — that part is already in On Hand, so the raw target would count it twice.\n\nHover a figure to see the work orders behind it, with their scheduled finish dates.',
+    meta: 'Part row · Σ max(qtyTarget − qtyUsed, 0) on finished-good lines (type 10/31) of WOs below status 40 · wo.dateScheduled ≤ Scheduled To · base UOM' },
   { key: 'required',  label: 'Qty Required',      vis: true,  w: 115, level: 'part', nr: true,
-    tip: 'The shortfall this report exists to surface: what is owed, less what is on the shelf, less what is already being built. Red above zero, green at or below it.\n\nIt is NOT floored at zero — a negative figure is the surplus.\n\nIt deliberately IGNORES allocation. This is the shortfall against real and incoming stock regardless of who that stock is earmarked for, which is the opposite view from Available. The two are meant to disagree.',
-    meta: 'Part row · Σ Qty to Ship − Qty On Hand − Qty In Production' }
+    tip: 'The shortfall this report exists to surface: what is owed, less what is on the shelf, less what is being built in time. Red above zero, green at or below it. With a Scheduled range, both sides follow it — the orders due in the range against production due by its end.\n\nIt is NOT floored at zero — a negative figure is the surplus.\n\nIt deliberately IGNORES allocation. This is the shortfall against real and incoming stock regardless of who that stock is earmarked for, which is the opposite view from Available. The two are meant to disagree.',
+    meta: 'Part row · Σ Qty to Ship (lines in range) − Qty On Hand − Qty In Production (due by range end)' }
 ];
 let _cols = _DEFAULT_COLS.map(c => Object.assign({}, c));
 let _dragKey = null;      // header drag-reorder
@@ -1246,8 +1282,9 @@ async function loadData() {
     //       filter, unlike the other two) — demodb-verified to match the views
     //       exactly on every part+LG, so unfiltered numbers still agree with
     //       Inv_Reorder_Watchlist.
-    //    2b DEMAND (Allocated / Dropship / On Order) stays on the views: those
-    //       are keyed by part + LG and have no location dimension to filter by.
+    //    2b DEMAND (Allocated / Dropship) stays on the views: those are keyed
+    //       by part + LG and have no location dimension to filter by. On Order
+    //       is NOT read from QTYONORDER any more — see step 3.
     const locIds = selectedLocIds();
     const locClause = locIds ? ' AND l.id IN (' + locIds.join(',') + ') ' : ' ';
     const avail = {};
@@ -1281,12 +1318,10 @@ async function loadData() {
       const dm = await qp(
         "SELECT part.id AS partid, " +
         "  COALESCE(SUM(COALESCE(qtyallocated.qty,0)),0) AS allocated, " +
-        "  COALESCE(SUM(COALESCE(qtydropship.qty,0)),0)  AS dropship, " +
-        "  COALESCE(SUM(COALESCE(qtyonorder.qty,0)),0)   AS onorder " +
+        "  COALESCE(SUM(COALESCE(qtydropship.qty,0)),0)  AS dropship " +
         "FROM part " +
         "CROSS JOIN locationgroup " +
         "LEFT OUTER JOIN qtyallocated ON part.id = qtyallocated.partid AND locationgroup.id = qtyallocated.locationgroupid " +
-        "LEFT OUTER JOIN qtyonorder   ON part.id = qtyonorder.partid   AND locationgroup.id = qtyonorder.locationgroupid " +
         "LEFT OUTER JOIN qtydropship  ON part.id = qtydropship.partid  AND locationgroup.id = qtydropship.locationgroupid " +
         "WHERE part.id IN (" + chunk.join(',') + ") " +
         "AND locationgroup.activeFlag = 1 AND locationgroup.id IN (" + lgIn + ") " +
@@ -1295,7 +1330,6 @@ async function loadData() {
         const a = slot(r.partid);
         a.allocated = parseFloat(r.allocated) || 0;
         a.dropship = parseFloat(r.dropship) || 0;
-        a.onorder = parseFloat(r.onorder) || 0;
       });
     }
     Object.keys(avail).forEach(k => {
@@ -1305,34 +1339,97 @@ async function loadData() {
     dbg('Availability: ' + Object.keys(avail).length + ' part(s) over ' + lgIds.length +
         ' LG(s)' + (locIds ? ', stock scoped to ' + locIds.length + ' location(s)' : ''), 'success');
 
-    // 3. Qty in production — open WOs (status < 40) producing the part, in the
-    //    selected location groups.
+    // 3. SUPPLY — On Order and Qty In Production, fetched DATED so both can be
+    //    bounded by the Scheduled window client-side (supplyBy, applyFilters):
+    //    what arrives by the window's end is what can meet the orders due by it.
     //
-    //    The produced part is the WO's typeid-10 woitem, NOT moitem.partId via
-    //    wo.moItemId: wo.moItemId points at the typeid-50 BUILD HEADER, whose
-    //    partId is NULL, so joining through it silently matched nothing and
-    //    this column read 0 for every part (the bug this replaces).
+    //    The two columns never share a unit. Fishbowl's QTYONORDER includes
+    //    open work-order output (its QTYONORDERMO leg), which Qty In Production
+    //    also counts, so the report used to show the same build twice. On Order
+    //    is now QTYONORDER's other legs, rebuilt here with their dates and each
+    //    leg's own filters copied from its view:
+    //      PO   QTYONORDERPO     — PO receipt lines not yet received (status
+    //                              10 Entered / 20 Reconciled). Dated by the PO
+    //                              line's scheduled date, the header first-ship
+    //                              date where a receipt line has no PO line.
+    //      TO   QTYONORDERTOSEND — inbound transfers: typeId-10 lines arriving
+    //                              at shipToLGID (its TORECEIVE twin filters on
+    //                              typeId 20, which never exists). Dated by the
+    //                              line, else the header.
+    //      SO   QTYONORDERSO     — customer credit returns (typeId 20) on open
+    //                              sales orders. Dated by the line, else header.
+    //    Qty In Production is open WOs (status < 40): finished-good lines
+    //    (typeId 10, and 31 as QTYONORDERMO counts it), target − used — the used
+    //    part is already in On Hand — in the part's base UOM, dated by the WO's
+    //    scheduled finish.
     //
-    //    Qty is target − used, i.e. what is still TO COME. The used portion has
-    //    already been received into stock and is therefore in On Hand — summing
-    //    the raw target would count it twice.
-    const inprod = {};
+    //    The produced part is the WO's finished-good woitem, NOT moitem.partId
+    //    via wo.moItemId: that points at the typeid-50 BUILD HEADER, whose
+    //    partId is NULL, so joining through it silently matched nothing.
+    //
+    //    Kept per DOCUMENT (kind + number) so hovering either figure can list
+    //    the POs / WOs behind it — see supplyTd().
+    const supply = {};   // partid -> { oo: [[day, qty, kind, doc]...], prod: [...] }
+    const conv = (qty, uom) => "CASE WHEN " + uom + " <> p.uomid AND uc.id > 0 " +
+                               "THEN (" + qty + ") * uc.multiply / uc.factor ELSE (" + qty + ") END";
     for (let i = 0; i < partIds.length; i += 500) {
       const chunk = partIds.slice(i, i + 500); if (!chunk.length) continue;
-      const pr = await qp(
-        "SELECT woi.partid AS partid, " +
-        "  COALESCE(SUM(GREATEST(COALESCE(woi.qtytarget,0) - COALESCE(woi.qtyused,0), 0)),0) AS qty " +
-        "FROM wo " +
-        "JOIN woitem woi ON woi.woid = wo.id AND woi.typeid = 10 " +
-        "WHERE wo.statusid < 40 AND woi.partid IN (" + chunk.join(',') + ") " +
-        "AND wo.locationgroupid IN (" + lgIn + ") GROUP BY woi.partid");
-      pr.forEach(r => { inprod[r.partid] = parseFloat(r.qty) || 0; });
+      const pin = chunk.join(',');
+      const sp = await qp(
+        "SELECT s.partid, s.src, s.kind, s.doc, s.d, SUM(s.qty) AS qty FROM (" +
+        "  SELECT ri.partid AS partid, 'oo' AS src, 'PO' AS kind, po.num AS doc, " +
+        "         DATE(COALESCE(poi.datescheduledfulfillment, po.datefirstship)) AS d, " +
+        "         " + conv('ri.qty', 'ri.uomid') + " AS qty " +
+        "  FROM receipt r " +
+        "  JOIN receiptitem ri ON ri.receiptid = r.id " +
+        "  JOIN part p ON p.id = ri.partid " +
+        "  LEFT JOIN uomconversion uc ON uc.touomid = p.uomid AND uc.fromuomid = ri.uomid " +
+        "  LEFT JOIN poitem poi ON poi.id = ri.poitemid " +
+        "  LEFT JOIN po ON po.id = r.poid " +
+        "  WHERE r.ordertypeid = 10 AND ri.statusid IN (10, 20) " +
+        "    AND ri.partid IN (" + pin + ") AND r.locationgroupid IN (" + lgIn + ") " +
+        "  UNION ALL " +
+        "  SELECT xi.partid, 'oo', 'TO', xo.num, DATE(COALESCE(xi.datescheduledfulfillment, xo.datescheduled)), " +
+        "         " + conv('xi.qtytofulfill - xi.qtyfulfilled', 'xi.uomid') + " " +
+        "  FROM xo " +
+        "  JOIN xoitem xi ON xi.xoid = xo.id " +
+        "  JOIN part p ON p.id = xi.partid " +
+        "  LEFT JOIN uomconversion uc ON uc.touomid = p.uomid AND uc.fromuomid = xi.uomid " +
+        "  WHERE xo.statusid IN (20, 30, 40, 50, 60) AND xi.statusid IN (10, 20, 30, 40, 50) AND xi.typeid = 10 " +
+        "    AND xi.partid IN (" + pin + ") AND xo.shiptolgid IN (" + lgIn + ") " +
+        "  UNION ALL " +
+        "  SELECT p.id, 'oo', 'RET', so.num, DATE(COALESCE(si.datescheduledfulfillment, so.datefirstship)), " +
+        "         " + conv('si.qtytofulfill - si.qtyfulfilled', 'si.uomid') + " " +
+        "  FROM so " +
+        "  JOIN soitem si ON si.soid = so.id " +
+        "  JOIN product pr ON pr.id = si.productid " +
+        "  JOIN part p ON p.id = pr.partid " +
+        "  LEFT JOIN uomconversion uc ON uc.touomid = p.uomid AND uc.fromuomid = si.uomid " +
+        "  WHERE so.statusid IN (20, 25) AND si.statusid IN (10, 14, 30) AND si.typeid = 20 " +
+        "    AND p.id IN (" + pin + ") AND so.locationgroupid IN (" + lgIn + ") " +
+        "  UNION ALL " +
+        "  SELECT wi.partid, 'prod', 'WO', wo.num, DATE(wo.datescheduled), " +
+        "         GREATEST(" + conv('COALESCE(wi.qtytarget,0) - COALESCE(wi.qtyused,0)', 'wi.uomid') + ", 0) " +
+        "  FROM wo " +
+        "  JOIN woitem wi ON wi.woid = wo.id AND wi.typeid IN (10, 31) " +
+        "  JOIN part p ON p.id = wi.partid " +
+        "  LEFT JOIN uomconversion uc ON uc.touomid = p.uomid AND uc.fromuomid = wi.uomid " +
+        "  WHERE wo.statusid < 40 " +
+        "    AND wi.partid IN (" + pin + ") AND wo.locationgroupid IN (" + lgIn + ") " +
+        ") s GROUP BY s.partid, s.src, s.kind, s.doc, s.d");
+      sp.forEach(r => {
+        const q = parseFloat(r.qty) || 0;
+        if (!q) return;
+        const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(r.d == null ? '' : r.d));
+        const s = supply[r.partid] || (supply[r.partid] = { oo: [], prod: [] });
+        (r.src === 'prod' ? s.prod : s.oo).push([m ? m[1] : null, q, r.kind, r.doc == null ? '' : String(r.doc)]);
+      });
     }
-    dbg('In production: ' + Object.keys(inprod).length + ' part(s)', 'success');
+    dbg('Supply: ' + Object.keys(supply).length + ' part(s) with stock on order or in production', 'success');
 
     // Group by category + part. Availability / production are part-level (one
     // value per part); qty-to-ship aggregates across the part's SO lines.
-    const map = {}, orderKeys = []; let lineCount = 0;
+    const map = {}, orderKeys = [];
     rows.forEach(r => {
       // Grouped by tree-node ID, not by name. Two distinct nodes are allowed
       // to share a name, and keying on the name would silently merge them —
@@ -1355,8 +1452,10 @@ async function loadData() {
           allocated: a ? a.allocated : 0,
           notavail:  a ? a.notavail  : 0,
           dropship:  a ? a.dropship  : 0,
-          onorder:   a ? a.onorder   : 0,
-          inProd: (r.partid != null ? (inprod[r.partid] || 0) : 0),
+          // Dated supply; onorder / inProd are set from it per Scheduled
+          // window by applyFilters, before anything reads them.
+          supply: (r.partid != null && supply[r.partid]) || { oo: [], prod: [] },
+          onorder: 0, inProd: 0,
           lines: []
         };
         map[key] = g; orderKeys.push(key);
@@ -1368,24 +1467,14 @@ async function loadData() {
         allocated: parseFloat(r.lineallocated) || 0,
         committed: parseFloat(r.linecommitted) || 0
       });
-      lineCount++;
     });
     _parts = orderKeys.map(k => map[k]);
 
     await explainCommitted(partIds, lgIn);
 
+    _dataLoaded = true;
     buildCatFilter();
-    applyFilters();
-
-    let shortParts = 0, shortQty = 0;
-    _parts.forEach(g => {
-      const req = g.lines.reduce((s, l) => s + l.toShip, 0) - g.onhand - g.inProd;
-      if (req > 0) { shortParts++; shortQty += req; }
-    });
-    const lgLabel = _selLg.size ? (_selLg.size + ' of ' + _lgList.length + ' LG') : 'all LGs';
-    const locLabel = _selLoc.size ? (' · stock in ' + _selLoc.size + ' location(s)') : '';
-    setStatus(_parts.length + ' part(s) · ' + lineCount + ' open line(s) · ' +
-              shortParts + ' part(s) short (' + fmtQty(shortQty) + ' units) · ' + lgLabel + locLabel);
+    applyFilters();       // also writes the status line — see updateStatus()
   } catch (e) {
     console.error(e);
     setStatus('Error: ' + (e.message || e));
@@ -1929,6 +2018,9 @@ function applyFilters() {
 
   _shown = [];
   _parts.forEach(g => {
+    // Supply due by the end of the Scheduled window — see supplyBy().
+    g.onorder = supplyBy(g.supply.oo, sTo);
+    g.inProd  = supplyBy(g.supply.prod, sTo);
     // Empty selection = every category. Selecting a branch cascades its
     // descendants into _selCat at tick time, so this stays a flat lookup.
     if (_selCat.size && !_selCat.has(g.categoryId)) return;
@@ -1947,6 +2039,79 @@ function applyFilters() {
     _shown.push({ g: g, lines: lines, sumToShip: sumToShip, required: required });
   });
   render();
+  updateStatus(sTo);
+}
+
+/* On Order / Qty In Production that can meet orders due by the end of the
+   Scheduled window: every open supply row dated on or before `to`. Overdue
+   rows count — they are still open and still coming. The window's START is
+   deliberately ignored: stock that arrives before it still covers those
+   orders. With no end date every open row counts; a row with no date counts
+   only then, the same rule inSchedWindow() applies to the order lines. */
+function supplyBy(rows, to) {
+  let s = 0;
+  for (const [d, q] of rows) if (!to || (d && d <= to)) s += q;
+  return s;
+}
+
+/* On Order / Qty In Production cell with a hover breakdown: the documents
+   behind the figure (PO, inbound TO, SO credit return; or WO), each with its
+   due date and quantity, earliest first, overdue dates flagged. It uses the
+   same due-by rule as supplyBy(), so the rows always add up to the number in
+   the cell, and supply due after the range is summarised underneath rather
+   than silently missing. Rendered through the shared #appTooltip, the same
+   navy popover as the column headings. */
+const _SUPPLY_DOC = { PO: 'PO', TO: 'TO', RET: 'SO', WO: 'WO' };
+const _SUPPLY_TIP_MAX = 12;
+function supplyTd(g, value, rows, label) {
+  const td = numTd(fmtQty(value), value ? '' : 'muted');
+  if (!rows || !rows.length) return td;
+  const to = document.getElementById('schedTo').value;
+  const counted = [], later = [];
+  rows.forEach(r => ((!to || (r[0] && r[0] <= to)) ? counted : later).push(r));
+  if (!counted.length && !later.length) return td;
+  counted.sort((a, b) => (a[0] || '9999').localeCompare(b[0] || '9999') ||
+                         String(a[3]).localeCompare(String(b[3]), undefined, { numeric: true }));
+  const tipRows = counted.slice(0, _SUPPLY_TIP_MAX).map(([d, q, kind, doc]) => ({
+    cells: [(_SUPPLY_DOC[kind] || kind) + ' ' + doc + (kind === 'RET' ? ' (return)' : ''),
+            d ? 'due ' + fmtDate(d) : 'no date',
+            fmtQty(q)],
+    cls: d && d < _todayStr ? 'late' : ''
+  }));
+  if (counted.length > _SUPPLY_TIP_MAX) {
+    const rest = counted.slice(_SUPPLY_TIP_MAX);
+    tipRows.push({ cells: ['+ ' + rest.length + ' more', '', fmtQty(rest.reduce((s, r) => s + r[1], 0))], cls: 'more' });
+  }
+  const meta = [];
+  if (counted.some(r => r[0] && r[0] < _todayStr)) meta.push('Red dates are overdue — still open, so still counted.');
+  if (to) {
+    meta.push('Due by ' + fmtDate(to) + ' (end of the Scheduled range).');
+    if (later.length) meta.push(later.length + ' more due later — ' + fmtQty(later.reduce((s, r) => s + r[1], 0)) +
+                                (g.uom ? ' ' + g.uom : '') + ', not counted.');
+  }
+  td.classList.add('has-tt');
+  td.dataset.ttTitle = label + ': ' + fmtQty(value) + (g.uom ? ' ' + g.uom : '') + ' · ' + (g.partnum || g.productnum);
+  if (!counted.length) td.dataset.ttDesc = 'Nothing due by the end of the Scheduled range.';
+  td.dataset.ttRows = JSON.stringify(tipRows);
+  if (meta.length) td.dataset.ttMeta = meta.join('\n');
+  return td;
+}
+
+/* Counts follow what is on screen — the filters, the Scheduled window and
+   the supply it bounds — so the "short" figure agrees with the red rows. */
+function updateStatus(to) {
+  if (!_dataLoaded) return;
+  let lines = 0, shortParts = 0, shortQty = 0;
+  _shown.forEach(s => {
+    lines += s.lines.length;
+    if (s.required > 0) { shortParts++; shortQty += s.required; }
+  });
+  const parts = _shown.length === _parts.length ? String(_parts.length) : _shown.length + ' of ' + _parts.length;
+  const lgLabel = _selLg.size ? (_selLg.size + ' of ' + _lgList.length + ' LG') : 'all LGs';
+  const locLabel = _selLoc.size ? (' · stock in ' + _selLoc.size + ' location(s)') : '';
+  const supLabel = to ? ' · supply due by ' + fmtDate(to) : '';
+  setStatus(parts + ' part(s) · ' + lines + ' open line(s) · ' +
+            shortParts + ' part(s) short (' + fmtQty(shortQty) + ' units) · ' + lgLabel + locLabel + supLabel);
 }
 
 /* ── SORT ──
@@ -2134,8 +2299,8 @@ function partCell(item, col) {
     }
     case 'notavail':  return numTd(fmtQty(g.notavail),  g.notavail  ? '' : 'muted');
     case 'dropship':  return numTd(fmtQty(g.dropship),  g.dropship  ? '' : 'muted');
-    case 'onorder':   return numTd(fmtQty(g.onorder),   g.onorder   ? '' : 'muted');
-    case 'inprod':    return numTd(fmtQty(g.inProd),    g.inProd    ? '' : 'muted');
+    case 'onorder':   return supplyTd(g, g.onorder, g.supply.oo,   'On Order');
+    case 'inprod':    return supplyTd(g, g.inProd,  g.supply.prod, 'Qty In Production');
     case 'required': {
       const td = numTd(fmtQty(item.required));
       td.classList.add(item.required > 0 ? 'short' : 'covered');

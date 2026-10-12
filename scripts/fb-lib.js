@@ -66,6 +66,11 @@
 //                          scroll container. Plug in via FBLib.Table.init.
 //   FBLib.Export         — Formatted .xlsx download (real dates/numbers,
 //                          SUBTOTAL totals row); no CDN dependency.
+//   FBLib.RowCap         — Cap a big result (first N rows + "Load all").
+//   FBLib.RptCols        — Resize / heading-click sort / drag-reorder for a
+//                          report-rendered .rpt-table (groups, totals…).
+//   FBLib.Pivot          — Pivot (cross-tab) view of a report's flat rows,
+//                          with drill-down, PDF and Excel output.
 //   FBLib.FilterViews    — Saved views (per-user + admin-published company
 //                          views) behind one compact header button. Works
 //                          on filter-row tables out of the box, or on any
@@ -169,7 +174,7 @@ window.FBLib = (function () {
     // Build stamp of this fb-lib, maintained by tools/stamp/stamp.js — never
     // edit by hand. Exposed as FBLib.BUILD so a report can tell which fb-lib
     // the Fishbowl server actually served it.
-    const BUILD = '2026.09.30-4ca940a';   // @fb-build
+    const BUILD = '2026.10.12-96b2943';   // @fb-build
 
     // The report's identity block (window.FB_REPORT, top of every report's
     // <head>): { key: storage-key prefix, build: report build stamp }.
@@ -624,10 +629,15 @@ window.FBLib = (function () {
         //   </div>
         //
         // BEHAVIOR
-        //   - Opening one drawer closes any other registered drawer (one
-        //     open at a time, since they share the slot below the header).
+        //   - One open at a time: opening a drawer closes every other open
+        //     drawer (registered or not) and any open push-down panel
+        //     (see PUSH-DOWN PANEL below), and opening a panel closes them too.
+        //   - A press anywhere outside the open drawer or panel closes it:
+        //     on the scrim, on the header, on another header button. Its own
+        //     trigger button is left to toggle it, and modals, toasts and
+        //     the debug console don't count as outside.
         //   - The trigger button gets `.active` while its drawer is open.
-        //   - ESC closes whichever drawer is open.
+        //   - ESC closes whichever drawer or panel is open.
         //
         // API
         //   FBLib.Common.registerDrawer({
@@ -673,16 +683,15 @@ window.FBLib = (function () {
             var top = hdr ? hdr.offsetHeight : 56;
             try { document.documentElement.style.setProperty('--fb-drawer-top', top + 'px'); } catch (_) {}
         }
-        function _fbAnyDrawerOpen() {
-            return Object.keys(_drawers).some(function (k) {
-                var e = document.getElementById(k); return e && e.classList.contains('open');
-            });
+        // Every open drawer in the page, registered or not.
+        function _fbOpenDrawerEls() {
+            return Array.prototype.slice.call(document.querySelectorAll('.fb-drawer.open'));
         }
+        function _fbAnyDrawerOpen() { return _fbOpenDrawerEls().length > 0; }
         function openDrawer(id) {
-            // Close every other registered drawer first — only one open at a time.
-            Object.keys(_drawers).forEach(function (other) {
-                if (other !== id) closeDrawer(other);
-            });
+            // Only one open at a time: close every other drawer and any panel.
+            _fbOpenDrawerEls().forEach(function (d) { if (d.id !== id) closeDrawer(d.id); });
+            closeAllPanels();
             const cfg = _drawers[id];
             try { if (cfg && cfg.onBeforeOpen) cfg.onBeforeOpen(); } catch (_) {}
             const el = document.getElementById(id);
@@ -720,14 +729,107 @@ window.FBLib = (function () {
             else openDrawer(id);
         }
         function closeAllDrawers() {
-            Object.keys(_drawers).forEach(closeDrawer);
+            _fbOpenDrawerEls().forEach(function (d) { closeDrawer(d.id); });
         }
         // Global ESC handler — bind once. Idempotent guard via _escBound flag.
         if (typeof document !== 'undefined' && !window._fbLibDrawerEscBound) {
             window._fbLibDrawerEscBound = true;
             document.addEventListener('keydown', function (e) {
-                if (e.key === 'Escape') closeAllDrawers();
+                if (e.key === 'Escape') { closeAllDrawers(); closeAllPanels(); }
             });
+        }
+        // Is `target` the button that toggles drawer/panel `id`? Its own
+        // trigger must be left to toggle it, or a press would close it and
+        // the click re-open it. Matches the registered trigger, or any
+        // onclick that names the id.
+        function _fbIsTriggerFor(target, id, triggerId) {
+            if (triggerId) {
+                const b = document.getElementById(triggerId);
+                if (b && b.contains(target)) return true;
+            }
+            const el = target.closest('[onclick]');
+            return !!(el && id && el.getAttribute('onclick').indexOf("'" + id + "'") !== -1);
+        }
+        // Outside-press handler — bind once. Capture phase, so it runs before
+        // the pressed element's own handlers (which may re-render or remove
+        // it) and before another trigger opens its drawer.
+        if (typeof document !== 'undefined' && !window._fbLibOutsideBound) {
+            window._fbLibOutsideBound = true;
+            document.addEventListener('pointerdown', function (e) {
+                const t = e.target;
+                if (!t || !t.closest || !document.documentElement.contains(t)) return;
+                // UI that floats above everything isn't "outside"; nor is the
+                // row-cap notice (closing a panel would slide it from under
+                // the pointer and swallow the Load all click).
+                if (t.closest('.modal-overlay, .toast-container, .fblib-debug-drawer, .app-tooltip, .rowcap-note')) return;
+                _fbOpenDrawerEls().forEach(function (d) {
+                    if (d.contains(t) || _fbIsTriggerFor(t, d.id, (_drawers[d.id] || {}).triggerId)) return;
+                    closeDrawer(d.id);
+                });
+                _fbOpenPanelIds().forEach(function (pid) {
+                    const p = document.getElementById(pid);
+                    if (p.contains(t) || _fbIsTriggerFor(t, pid, _panels[pid].triggerId)) return;
+                    togglePanel(pid, false);
+                });
+            }, true);
+        }
+
+        // ================================================================
+        // PUSH-DOWN PANEL  —  the report-chrome filter panel (fb-styles §35,
+        // .rpt-filters). Unlike a drawer it sits in the page flow under the
+        // header and pushes the table down; it caps its own height and
+        // scrolls, and its multi-selects float above it (see FLOATING in
+        // the multi-select block). The dashboard idiom uses drawers instead.
+        //
+        // CANONICAL MARKUP
+        //   <button id="filtersBtn" class="hdr-btn" onclick="FBLib.Common.togglePanel('filtersPanel')">Filters</button>
+        //   …
+        //   <div id="filtersPanel" class="rpt-filters">
+        //     <div class="rpt-fgrid">
+        //       <div class="rpt-fgroup">
+        //         <div class="rpt-fgroup-title">When</div>
+        //         <div><div class="rpt-flabel">Date range</div><select>…</select></div>
+        //       </div>
+        //     </div>
+        //   </div>
+        //
+        // API
+        //   FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn', onToggle: open => {} });
+        //   FBLib.Common.togglePanel(id[, open])   // returns the new state
+        //   FBLib.Common.closeAllPanels()
+        //   The trigger gets `.active` while the panel is open; closing it
+        //   closes any open multi-select. A panel takes part in the drawers'
+        //   one-open-at-a-time and outside-press rules (see DROP-DOWN DRAWER).
+        //   Register it so the rules know its trigger.
+        // ================================================================
+        const _panels = {};
+        function registerPanel(cfg) {
+            if (!cfg || !cfg.id) return null;
+            _panels[cfg.id] = { triggerId: cfg.triggerId || null, onToggle: typeof cfg.onToggle === 'function' ? cfg.onToggle : null };
+            return { toggle: function (open) { return togglePanel(cfg.id, open); } };
+        }
+        function _fbOpenPanelIds() {
+            return Object.keys(_panels).filter(function (pid) {
+                const e = document.getElementById(pid); return e && e.classList.contains('open');
+            });
+        }
+        function closeAllPanels(exceptId) {
+            _fbOpenPanelIds().forEach(function (pid) { if (pid !== exceptId) togglePanel(pid, false); });
+        }
+        function togglePanel(id, open) {
+            const el = document.getElementById(id);
+            if (!el) return false;
+            if (!_panels[id]) _panels[id] = { triggerId: null, onToggle: null };
+            const next = open === undefined ? !el.classList.contains('open') : !!open;
+            // Only one open at a time: opening a panel closes drawers and other panels.
+            if (next) { closeAllDrawers(); closeAllPanels(id); }
+            el.classList.toggle('open', next);
+            const cfg = _panels[id] || {};
+            const btn = cfg.triggerId ? document.getElementById(cfg.triggerId) : null;
+            if (btn) btn.classList.toggle('active', next);
+            if (!next) { try { _msCloseAll(); } catch (_) {} }
+            if (cfg.onToggle) { try { cfg.onToggle(next); } catch (_) {} }
+            return next;
         }
 
         // ================================================================
@@ -791,6 +893,14 @@ window.FBLib = (function () {
         //       flipUp:   true           // optional — panel flips above the trigger
         //                                // when it would run past the viewport bottom
         //   });
+        //
+        //   FLOATING: a widget inside a box that scrolls or clips (a drawer
+        //   body, a height-capped filter panel) floats its dropdown with
+        //   position:fixed while open, so the box can't clip it and it isn't
+        //   hidden behind the drawer's edge. It opens above the trigger when
+        //   there is more room there, follows the trigger as the box scrolls,
+        //   and closes once the trigger scrolls out of the box. Automatic: no
+        //   option, and widgets outside such a box are unchanged.
         //   ms.getSelected();           // → array of values
         //   ms.setSelected([20, 25]);   // replace selection programmatically
         //   ms.setItems(newItems);      // swap the option list (e.g. cascading dropdowns)
@@ -979,6 +1089,53 @@ window.FBLib = (function () {
                     else triggerEl.appendChild(more);
                 }
             }
+            // ---- Floating (see FLOATING above) ----
+            // The nearest ancestor that scrolls or clips, or null.
+            function _clipBox() {
+                for (let el = container.parentElement; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+                    const cs = getComputedStyle(el);
+                    if (/(auto|scroll|hidden|clip)/.test(cs.overflowX + ' ' + cs.overflowY)) return el;
+                }
+                return null;
+            }
+            let _floatBox = null;
+            const _FLOAT_PROPS = ['position', 'top', 'bottom', 'left', 'right', 'width', 'maxHeight', 'zIndex'];
+            function _place() {
+                if (!_floatBox) return;
+                const t = triggerEl.getBoundingClientRect();
+                const box = _floatBox.getBoundingClientRect();
+                // The trigger has scrolled out of its box: nothing to point at.
+                if (t.bottom < box.top || t.top > box.bottom) { close(); return; }
+                // Under a CSS body zoom getBoundingClientRect is in rendered px
+                // but fixed offsets are layout px: divide by the render scale.
+                const s = (triggerEl.offsetWidth && t.width) ? t.width / triggerEl.offsetWidth : 1;
+                const vw = window.innerWidth, vh = window.innerHeight, gap = 2, edge = 8;
+                const below = vh - t.bottom - gap - edge, above = t.top - gap - edge;
+                const up = below < 200 && above > below;
+                const room = Math.max(120, Math.min(280 * s, up ? above : below));
+                const width = Math.max(t.width, 220 * s);
+                const left = Math.max(edge, Math.min(t.left, vw - width - edge));
+                const st = dropdownEl.style;
+                st.position = 'fixed'; st.right = 'auto'; st.zIndex = '10050';
+                st.left = (left / s) + 'px'; st.width = (width / s) + 'px'; st.maxHeight = (room / s) + 'px';
+                if (up) { st.top = 'auto'; st.bottom = ((vh - t.top + gap) / s) + 'px'; }
+                else    { st.bottom = 'auto'; st.top = ((t.bottom + gap) / s) + 'px'; }
+            }
+            function _float() {
+                _floatBox = _clipBox();
+                if (!_floatBox) return;
+                _place();
+                window.addEventListener('scroll', _place, true);   // capture: any scrolling box
+                window.addEventListener('resize', _place);
+            }
+            function _unfloat() {
+                if (!_floatBox) return;
+                _floatBox = null;
+                window.removeEventListener('scroll', _place, true);
+                window.removeEventListener('resize', _place);
+                _FLOAT_PROPS.forEach(function (p) { dropdownEl.style[p] = ''; });
+            }
+
             function open() {
                 if (_msActive && _msActive !== containerId) {
                     const prev = _msRegistry[_msActive];
@@ -990,10 +1147,12 @@ window.FBLib = (function () {
                 lastFilter = '';
                 if (searchEl) { searchEl.value = ''; setTimeout(function () { searchEl.focus(); }, 0); }
                 _renderList();
+                _float();
                 // Opt-in flip-up: when the panel would run past the bottom of
                 // the viewport, anchor it above the trigger instead. Inline
-                // top/bottom are reset on close so the default returns.
-                if (flipUp) {
+                // top/bottom are reset on close so the default returns. A
+                // floating panel has already chosen its side.
+                if (flipUp && !_floatBox) {
                     dropdownEl.style.top = '';
                     dropdownEl.style.bottom = '';
                     const rect = dropdownEl.getBoundingClientRect();
@@ -1006,6 +1165,7 @@ window.FBLib = (function () {
             function close() {
                 const wasOpen = !dropdownEl.classList.contains('hidden');
                 dropdownEl.classList.add('hidden');
+                _unfloat();
                 if (flipUp) { dropdownEl.style.top = ''; dropdownEl.style.bottom = ''; }
                 if (_msActive === containerId) _msActive = null;
                 // onClose fires only on a real open→closed transition, so a
@@ -1138,6 +1298,10 @@ window.FBLib = (function () {
             closeDrawer: closeDrawer,
             toggleDrawer: toggleDrawer,
             closeAllDrawers: closeAllDrawers,
+            // Push-down panel (report chrome) — see canonical doc block above.
+            registerPanel: registerPanel,
+            togglePanel: togglePanel,
+            closeAllPanels: closeAllPanels,
             // Multi-select dropdown widget — see canonical comment block above.
             MultiSelect: MultiSelect
         };
@@ -4220,6 +4384,667 @@ window.FBLib = (function () {
         return { attach: attach };
     })();
 
+    // ====================================================================
+    // FBLib.RowCap — keep a big result from stalling a report. A query asks
+    // for one row past the cap; when it comes back full the report shows the
+    // cap's rows and a notice with "Load all", which re-runs it uncapped.
+    // (Rendering is already lazy: reports paint in chunks as the user
+    // scrolls. This bounds what is fetched and held.)
+    //
+    //   sql = FBLib.RowCap.sql(sql, limit?)      // + "LIMIT limit+1" (a query
+    //                                            //   that already ends in a
+    //                                            //   LIMIT is left alone)
+    //   const r = FBLib.RowCap.apply(rows, limit?, { keyOf? })
+    //                                            // { rows, capped, limit }; with
+    //                                            // keyOf(row) the cut falls on a
+    //                                            // group boundary, so every group
+    //                                            // shown is complete (a single
+    //                                            // group larger than the cap is
+    //                                            // kept as fetched)
+    //   FBLib.RowCap.notice({ before: el, capped, limit, onLoadAll, what?, totals? })
+    //                                            // totals: false = the report has no
+    //                                            // totals (drops "Totals cover…");
+    //                                            // html: the whole message instead
+    //                                            // (escaped by the caller)
+    //                                            // shows / hides the notice
+    //                                            // just above `before`
+    // limit: default FBLib.RowCap.DEFAULT (10,000); 0 or Infinity = no cap.
+    // ====================================================================
+    const RowCap = (function () {
+        const DEFAULT = 10000;
+        const lim = n => (n == null ? DEFAULT : n);
+        function sql(text, limit) {
+            const n = lim(limit);
+            if (!n || n === Infinity) return text;
+            const s = String(text).replace(/;\s*$/, '');
+            if (/\blimit\s+\d+(\s*,\s*\d+|\s+offset\s+\d+)?\s*$/i.test(s)) return s;
+            return s + '\nLIMIT ' + (n + 1);
+        }
+        function apply(rows, limit, opts) {
+            const n = lim(limit);
+            rows = Array.isArray(rows) ? rows : [];
+            if (!n || n === Infinity || rows.length <= n) return { rows: rows, capped: false, limit: n };
+            let end = n;
+            const keyOf = opts && typeof opts.keyOf === 'function' ? opts.keyOf : null;
+            if (keyOf) {
+                // The row past the cap continues the last group: drop that group.
+                const k = keyOf(rows[n]);
+                let e = n;
+                while (e > 0 && keyOf(rows[e - 1]) === k) e--;
+                if (e > 0) end = e;
+            }
+            return { rows: rows.slice(0, end), capped: true, limit: n };
+        }
+        function notice(opts) {
+            opts = opts || {};
+            const before = opts.before;
+            if (!before || !before.parentNode) return;
+            let el = before.parentNode.querySelector(':scope > .rowcap-note');
+            if (!opts.capped) { if (el) el.remove(); return; }
+            if (!el) {
+                el = document.createElement('div');
+                el.className = 'rowcap-note';
+                before.parentNode.insertBefore(el, before);
+            }
+            const what = opts.what || 'rows';
+            el.innerHTML = opts.html ? '<span>' + opts.html + '</span><button type="button" class="hdr-btn rowcap-all">Load all</button>' : '<span>Showing the first <strong>' + Number(opts.limit).toLocaleString() + '</strong> ' + _esc(what) +
+                ': more match these filters.' + (opts.totals === false ? '' : ' Totals cover the ' + _esc(what) + ' shown.') + ' Narrow the filters, or</span>' +
+                '<button type="button" class="hdr-btn rowcap-all">Load all</button>';
+            el.querySelector('.rowcap-all').onclick = function () {
+                this.disabled = true; this.textContent = 'Loading…';
+                if (typeof opts.onLoadAll === 'function') opts.onLoadAll();
+            };
+        }
+        function _esc(s) {
+            return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+                return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+            });
+        }
+        return { DEFAULT: DEFAULT, sql: sql, apply: apply, notice: notice };
+    })();
+
+    // ====================================================================
+    // FBLib.RptCols — resize, header-click sort and drag-reorder for a
+    // report's own table (the report chrome's .rpt-table), whose rows the
+    // report renders itself (groups, totals, minor rows…). The report keeps
+    // rendering; this decorates its headings after every render and tells it
+    // what changed. State (widths, order, sort) is saved per user in the
+    // report's FBLib.Settings under `key`.
+    //
+    //   const cols = FBLib.RptCols.attach({
+    //       table:     document.getElementById('rpt'),   // headings: <th data-col="key">
+    //       key:       'rptCols',                          // settings key (default)
+    //       sortable:  k => true,                          // which headings sort (default all)
+    //       draggable: k => true,                          // which headings move (default all)
+    //       onSort:    (key, dir) => render(),             // dir 'asc' | 'desc' | null
+    //       onReorder: order => render(),                  // order = column keys
+    //       pinned:    ['so'],                             // columns kept first, in this order
+    //                                                      // (e.g. a tree column); never moved
+    //       noUnsorted: true                               // headings cycle asc ↔ desc only (a
+    //                                                      // report whose standard order is a sort)
+    //   });
+    //   cols.arrange(columns, c => c.key)   // the report's columns in the user's order
+    //   cols.sort()                         // { key, dir } | null
+    //   cols.compare(a, b, valueOf)         // comparator for the current sort (or 0)
+    //   cols.reset()                        // forget widths, order and sort
+    //   FBLib.RptCols.totalsCells(columns, labelHtml, { key: figureHtml })
+    //                                       // a group / totals row that stays aligned
+    //                                       // whatever order the columns are in
+    //
+    // Click a heading: ascending, descending, then back to the report's own
+    // order. Drag a heading onto another to move it there. Drag a heading's
+    // right edge to resize; double-click the edge to return every column
+    // to its natural width.
+    // ====================================================================
+    const RptCols = (function () {
+        const MIN_W = 36;
+        function attach(opts) {
+            const table = opts.table;
+            const KEY = opts.key || 'rptCols';
+            const canSort = typeof opts.sortable === 'function' ? opts.sortable : function () { return opts.sortable !== false; };
+            const pinned = Array.isArray(opts.pinned) ? opts.pinned.slice() : [];
+            const isPinned = k => pinned.indexOf(k) !== -1;
+            const canDrag0 = typeof opts.draggable === 'function' ? opts.draggable : function () { return opts.draggable !== false; };
+            const canDrag = k => !isPinned(k) && canDrag0(k);
+            let st = load();
+            let resizing = false, dragKey = null;
+
+            function load() {
+                let v = null;
+                try { v = Settings.resolve(KEY); } catch (_) {}
+                v = v && typeof v === 'object' ? v : {};
+                return {
+                    order: Array.isArray(v.order) ? v.order.slice() : [],
+                    widths: v.widths && typeof v.widths === 'object' ? Object.assign({}, v.widths) : {},
+                    sort: v.sort && v.sort.key ? { key: v.sort.key, dir: v.sort.dir === 'desc' ? 'desc' : 'asc' } : null
+                };
+            }
+            function save() {
+                try { Settings.setUserKey(KEY, { order: st.order, widths: st.widths, sort: st.sort }); Settings.saveUser(); } catch (_) {}
+            }
+            const heads = () => table.tHead ? Array.prototype.slice.call(table.tHead.querySelectorAll('th[data-col]')) : [];
+            const zoom = el => { const r = el.getBoundingClientRect(); return el.offsetWidth ? r.width / el.offsetWidth : 1; };
+
+            function applyWidths() {
+                const ths = heads();
+                const fixed = Object.keys(st.widths).length > 0 && ths.length > 0;
+                if (!fixed) { table.classList.remove('rpt-fixed'); table.style.width = ''; ths.forEach(th => { th.style.maxWidth = ''; }); return; }
+                // A column shown since the last resize: lay the table out
+                // naturally once and keep that column's own width.
+                const fresh = ths.filter(th => !st.widths[th.dataset.col]);
+                if (fresh.length) {
+                    table.classList.remove('rpt-fixed'); table.style.width = '';
+                    ths.forEach(th => { th.style.width = th.style.minWidth = th.style.maxWidth = ''; });
+                    const z = zoom(table);
+                    fresh.forEach(th => { st.widths[th.dataset.col] = Math.max(MIN_W, Math.round(th.getBoundingClientRect().width / z)) || 120; });
+                    save();
+                }
+                table.classList.add('rpt-fixed');
+                let sum = 0;
+                ths.forEach(th => {
+                    let w = st.widths[th.dataset.col];
+                    if (!w) w = /\bnum-cell\b/.test(th.className) ? 110 : 150;
+                    th.style.width = th.style.minWidth = th.style.maxWidth = w + 'px';
+                    sum += w;
+                });
+                // Headings without data-col (rare) keep a default share.
+                Array.prototype.forEach.call(table.tHead.rows[0] ? table.tHead.rows[0].cells : [], c => {
+                    if (!c.dataset.col) { c.style.width = c.style.width || '120px'; sum += parseFloat(c.style.width) || 120; }
+                });
+                table.style.width = sum + 'px';
+            }
+            function decorate() {
+                const ths = heads();
+                ths.forEach(th => {
+                    const k = th.dataset.col;
+                    th.classList.toggle('sort-asc', !!st.sort && st.sort.key === k && st.sort.dir === 'asc');
+                    th.classList.toggle('sort-desc', !!st.sort && st.sort.key === k && st.sort.dir === 'desc');
+                    th.classList.toggle('rpt-sortable', canSort(k));
+                    if (!th.querySelector(':scope > .rpt-col-grip')) {
+                        const g = document.createElement('span');
+                        g.className = 'rpt-col-grip';
+                        g.title = 'Drag to resize · double-click to reset every column';
+                        th.appendChild(g);
+                    }
+                    th.draggable = canDrag(k);
+                });
+                applyWidths();
+            }
+
+            // Sort: click a heading (not its resize edge).
+            table.addEventListener('click', function (e) {
+                if (resizing) return;
+                const th = e.target.closest('th[data-col]');
+                if (!th || !table.tHead || !table.tHead.contains(th) || e.target.closest('.rpt-col-grip')) return;
+                const k = th.dataset.col;
+                if (!canSort(k)) return;
+                if (!st.sort || st.sort.key !== k) st.sort = { key: k, dir: 'asc' };
+                else if (st.sort.dir === 'asc') st.sort = { key: k, dir: 'desc' };
+                else st.sort = opts.noUnsorted ? { key: k, dir: 'asc' } : null;
+                save();
+                if (typeof opts.onSort === 'function') opts.onSort(st.sort ? st.sort.key : null, st.sort ? st.sort.dir : null);
+                decorate();
+            });
+
+            // Resize: drag a heading's right edge.
+            table.addEventListener('pointerdown', function (e) {
+                const grip = e.target.closest('.rpt-col-grip');
+                if (!grip) return;
+                e.preventDefault(); e.stopPropagation();
+                const th = grip.parentNode, z = zoom(th);
+                // First resize: freeze every column at its current width.
+                if (!Object.keys(st.widths).length) heads().forEach(h => { st.widths[h.dataset.col] = Math.round(h.getBoundingClientRect().width / z); });
+                const k = th.dataset.col, startX = e.clientX, startW = st.widths[k] || Math.round(th.getBoundingClientRect().width / z);
+                resizing = true;
+                th.draggable = false;
+                const move = ev => { st.widths[k] = Math.max(MIN_W, Math.round(startW + (ev.clientX - startX) / z)); applyWidths(); };
+                const up = () => {
+                    document.removeEventListener('pointermove', move);
+                    document.removeEventListener('pointerup', up);
+                    th.draggable = canDrag(k);
+                    save();
+                    setTimeout(() => { resizing = false; }, 0);   // swallow the click that ends the drag
+                };
+                document.addEventListener('pointermove', move);
+                document.addEventListener('pointerup', up);
+            }, true);
+            table.addEventListener('dblclick', function (e) {
+                if (!e.target.closest('.rpt-col-grip')) return;
+                st.widths = {}; save(); applyWidths();
+            });
+
+            // Reorder: drag a heading onto another.
+            table.addEventListener('dragstart', function (e) {
+                const th = e.target.closest && e.target.closest('th[data-col]');
+                if (!th || resizing || !canDrag(th.dataset.col)) return;
+                dragKey = th.dataset.col;
+                try { e.dataTransfer.setData('text/plain', dragKey); e.dataTransfer.effectAllowed = 'move'; } catch (_) {}
+            });
+            table.addEventListener('dragover', function (e) {
+                const th = dragKey && e.target.closest('th[data-col]');
+                if (!th || th.dataset.col === dragKey || isPinned(th.dataset.col)) return;
+                e.preventDefault();
+                heads().forEach(h => h.classList.toggle('col-drag-over', h === th));
+            });
+            table.addEventListener('dragleave', function (e) {
+                const th = e.target.closest && e.target.closest('th[data-col]');
+                if (th) th.classList.remove('col-drag-over');
+            });
+            table.addEventListener('drop', function (e) {
+                const th = dragKey && e.target.closest('th[data-col]');
+                heads().forEach(h => h.classList.remove('col-drag-over'));
+                if (!th || th.dataset.col === dragKey || isPinned(th.dataset.col)) { dragKey = null; return; }
+                e.preventDefault();
+                const shown = heads().map(h => h.dataset.col);
+                const from = shown.indexOf(dragKey), to = shown.indexOf(th.dataset.col);
+                shown.splice(from, 1);
+                shown.splice(to, 0, dragKey);
+                // Keep columns not shown now (switched off) where they were.
+                const rest = st.order.filter(k => shown.indexOf(k) === -1);
+                st.order = shown.concat(rest);
+                dragKey = null;
+                save();
+                if (typeof opts.onReorder === 'function') opts.onReorder(st.order.slice());
+            });
+            table.addEventListener('dragend', function () { dragKey = null; heads().forEach(h => h.classList.remove('col-drag-over')); });
+
+            // Re-decorate after every render of the headings.
+            if (table.tHead && typeof MutationObserver === 'function') new MutationObserver(decorate).observe(table.tHead, { childList: true });
+            decorate();
+
+            function arrange(columns, keyOf) {
+                keyOf = keyOf || (c => c.key);
+                if (!st.order.length) {
+                    if (!pinned.length) return columns.slice();
+                    const first = pinned.map(p => columns.find(c => keyOf(c) === p)).filter(Boolean);
+                    return first.concat(columns.filter(c => !isPinned(keyOf(c))));
+                }
+                // The user's order for the columns they have placed; any other
+                // column (switched on since) goes right after its natural
+                // left-hand neighbour, so untouched columns never jump.
+                const keys = columns.map(keyOf);
+                const res = st.order.filter(k => keys.indexOf(k) !== -1);
+                keys.forEach((k, i) => {
+                    if (res.indexOf(k) !== -1) return;
+                    let j = i - 1;
+                    while (j >= 0 && res.indexOf(keys[j]) === -1) j--;
+                    res.splice(j < 0 ? 0 : res.indexOf(keys[j]) + 1, 0, k);
+                });
+                const list = res.map(k => columns[keys.indexOf(k)]);
+                if (!pinned.length) return list;
+                const first = pinned.map(p => list.find(c => keyOf(c) === p)).filter(Boolean);
+                return first.concat(list.filter(c => !isPinned(keyOf(c))));
+            }
+            function compare(a, b, valueOf) {
+                if (!st.sort) return 0;
+                const va = valueOf(a, st.sort.key), vb = valueOf(b, st.sort.key);
+                const ba = va == null || va === '', bb = vb == null || vb === '';
+                if (ba || bb) return ba === bb ? 0 : (ba ? 1 : -1);   // blanks last, either direction
+                const d = (typeof va === 'number' && typeof vb === 'number') ? va - vb
+                    : String(va).localeCompare(String(vb), undefined, { numeric: true, sensitivity: 'base' });
+                return st.sort.dir === 'desc' ? -d : d;
+            }
+            return {
+                decorate: decorate,
+                arrange: arrange,
+                compare: compare,
+                sort: () => (st.sort ? { key: st.sort.key, dir: st.sort.dir } : null),
+                setSort: (key, dir) => { st.sort = key ? { key: key, dir: dir === 'desc' ? 'desc' : 'asc' } : null; save(); decorate(); },
+                reset: () => { st = { order: [], widths: {}, sort: null }; save(); decorate(); }
+            };
+        }
+        // A totals row's cells for the columns in their current order: the
+        // label (identity html) spans the first run of columns that carry none
+        // of the row's figures; every figure keeps its own column, before or
+        // after that run. figs = { columnKey: html }.
+        function totalsCells(cols, identity, figs, opts) {
+            opts = opts || {};
+            const keyOf = opts.keyOf || (c => c.key);
+            const has = c => figs[keyOf(c)] != null && figs[keyOf(c)] !== '';
+            const cell = opts.cell || (c => '<td class="' + (c.num ? 'num-cell' : '') + '">' + (figs[keyOf(c)] == null ? '' : figs[keyOf(c)]) + '</td>');
+            let at = cols.findIndex(c => !has(c));
+            if (at < 0) at = 0;
+            let end = at;
+            while (end < cols.length && !has(cols[end])) end++;
+            if (end === at) end = at + 1;
+            return cols.slice(0, at).map(cell).join('') + '<td colspan="' + (end - at) + '"' + (opts.labelClass ? ' class="' + opts.labelClass + '"' : '') + '>' + identity + '</td>' +
+                cols.slice(end).map(cell).join('');
+        }
+        return { attach: attach, totalsCells: totalsCells };
+    })();
+
+    // ====================================================================
+    // FBLib.Pivot — a pivot (cross-tab) view of a report's flat rows: rows ×
+    // columns of any two dimensions (a second row dimension nests), one
+    // measure with Sum / Count / Avg / Min / Max, date dimensions bucketed by
+    // day / week / month / quarter / year, row and column totals, swap, and a
+    // click-through to the rows behind a cell. Promoted from the four
+    // summary reports' pivot (fb-styles §34 styles it). Config is saved per
+    // user in the report's FBLib.Settings under `settingsKey`.
+    //
+    //   const pv = FBLib.Pivot.mount(hostEl, {
+    //       fields: [ { key, label, type: 'text'|'date'|'number'|'money'|'qty', dim?, measure? } ],
+    //                // dim: may be a row/column (default: text and date);
+    //                // measure: may be the measure (default: number/money/qty)
+    //       rows:   () => report.rows,          // flat rows, values under field keys
+    //       defaults: { rowDim, rowDim2, colDim, measure, agg, rowBucket, colBucket },
+    //       settingsKey: 'pivot',
+    //       format: (field, value) => text,     // optional cell formatter
+    //       countLabel: 'Tag count'             // the count measure's name (default "Row count")
+    //   });
+    // A field may also carry:
+    //   order: [value, …] or (a, b) => n   // a dimension's own order (e.g. age bands)
+    //   ratio: [numKey, denKey]            // a measure computed as sum(num) / sum(den)
+    //                                      // in every cell and total (e.g. turnover)
+    //   distinct: true                     // a measure counting the distinct values of
+    //                                      // this field (e.g. { key: 'partid',
+    //                                      // label: 'Parts', distinct: true })
+    //   pv.relabel(key, label)             // rename a field after mounting (e.g.
+    //                                      // "Price (inc. tax)")
+    //   pv.render()      // after the rows change, or when the view is shown
+    //   pv.pdfSpec()     // { head, rows, foot } <tr> strings for the PDF view
+    //   pv.sheet()       // { name, cols, rows } for FBLib.Export.xlsx
+    // ====================================================================
+    const Pivot = (function () {
+        const BUCKETS = [['day', 'Day'], ['week', 'Week'], ['month', 'Month'], ['quarter', 'Quarter'], ['year', 'Year']];
+        const AGGS = [['sum', 'Sum'], ['count', 'Count'], ['avg', 'Average'], ['min', 'Min'], ['max', 'Max']];
+        const RS = String.fromCharCode(31);   // compound row key separator (written as an escape: Fishbowl strips control characters)
+        const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+        const isNumType = t => t === 'number' || t === 'money' || t === 'qty';
+
+        function bucketDate(v, bucket) {
+            const s = String(v || '');
+            if (s.length < 10) return '(blank)';
+            const yyyy = s.substring(0, 4), mm = s.substring(5, 7), dd = s.substring(8, 10), m = parseInt(mm, 10);
+            if (bucket === 'year') return yyyy;
+            if (bucket === 'quarter') return yyyy + '-Q' + Math.ceil(m / 3);
+            if (bucket === 'month') return yyyy + '-' + mm;
+            if (bucket === 'week') {
+                const d = new Date(Date.UTC(+yyyy, m - 1, +dd));
+                if (isNaN(d.getTime())) return '(blank)';
+                d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay() || 7));
+                const y0 = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+                return d.getUTCFullYear() + '-W' + String(Math.ceil((((d - y0) / 86400000) + 1) / 7)).padStart(2, '0');
+            }
+            return yyyy + '-' + mm + '-' + dd;
+        }
+
+        function mount(host, opts) {
+            const fields = (opts.fields || []).map(f => Object.assign({ type: 'text' }, f));
+            const byKey = {};
+            fields.forEach(f => { byKey[f.key] = f; });
+            const dims = fields.filter(f => f.dim != null ? f.dim : !isNumType(f.type));
+            const measures = fields.filter(f => f.measure != null ? f.measure : (isNumType(f.type) || !!f.ratio || !!f.distinct));
+            const countLabel = opts.countLabel || 'Row count';
+            const KEY = opts.settingsKey || 'pivot';
+            const d0 = opts.defaults || {};
+            let saved = null;
+            try { saved = Settings.resolve(KEY); } catch (_) {}
+            const cfg = Object.assign({
+                rowDim: d0.rowDim || (dims[0] && dims[0].key) || '', rowDim2: d0.rowDim2 || '', colDim: d0.colDim || '',
+                measure: d0.measure || (measures[0] ? measures[0].key : '__count__'), agg: d0.agg || 'sum',
+                rowBucket: d0.rowBucket || 'month', rowBucket2: d0.rowBucket2 || 'month', colBucket: d0.colBucket || 'month',
+                // defaults.showColTotals: false where totals add unlike units
+                showRowTotals: d0.showRowTotals !== false, showColTotals: d0.showColTotals !== false
+            }, saved && typeof saved === 'object' ? saved : {});
+            const valid = k => !k || !!byKey[k];
+            if (!valid(cfg.rowDim) || !cfg.rowDim) cfg.rowDim = (dims[0] && dims[0].key) || '';
+            if (!valid(cfg.rowDim2)) cfg.rowDim2 = '';
+            if (!valid(cfg.colDim)) cfg.colDim = '';
+            if (cfg.measure !== '__count__' && !byKey[cfg.measure]) cfg.measure = measures[0] ? measures[0].key : '__count__';
+            let last = null;
+
+            const dimOpts = (blank) => (blank ? '<option value="">(none)</option>' : '') + dims.map(f => '<option value="' + esc(f.key) + '">' + esc(f.label) + '</option>').join('');
+            const bucketSel = cls => '<select class="' + cls + '" title="Date grouping">' + BUCKETS.map(b => '<option value="' + b[0] + '">' + b[1] + '</option>').join('') + '</select>';
+            host.classList.add('pivot-host');
+            host.innerHTML =
+                '<div class="pivot-bar open">' +
+                  '<span class="pv-group">Rows <select class="pv-row">' + dimOpts(false) + '</select>' + bucketSel('pv-rowb') +
+                    '<span class="pv-plus">+</span><select class="pv-row2" title="A second row dimension (optional)">' + dimOpts(true) + '</select>' + bucketSel('pv-rowb2') + '</span>' +
+                  '<span class="pv-group">Columns <select class="pv-col">' + dimOpts(true) + '</select>' + bucketSel('pv-colb') + '</span>' +
+                  '<span class="pv-group">Measure <select class="pv-measure"><option value="__count__">' + esc(countLabel) + '</option>' +
+                    measures.map(f => '<option value="' + esc(f.key) + '">' + esc(f.label) + '</option>').join('') + '</select>' +
+                    '<select class="pv-agg">' + AGGS.map(a => '<option value="' + a[0] + '">' + a[1] + '</option>').join('') + '</select></span>' +
+                  '<button type="button" class="pv-swap" title="Swap rows and columns">⇄ Swap</button>' +
+                  '<label class="pv-totals"><input type="checkbox" class="pv-rt"> Row totals</label>' +
+                  '<label class="pv-totals"><input type="checkbox" class="pv-ct"> Column totals</label>' +
+                '</div>' +
+                '<div class="pivot-overflow"></div>' +
+                '<div class="pivot-scroll"><table class="pivot-table"><thead></thead><tbody></tbody></table></div>';
+            const $q = s => host.querySelector(s);
+            const ctl = {
+                row: $q('.pv-row'), rowb: $q('.pv-rowb'), row2: $q('.pv-row2'), rowb2: $q('.pv-rowb2'), col: $q('.pv-col'), colb: $q('.pv-colb'),
+                measure: $q('.pv-measure'), agg: $q('.pv-agg'), rt: $q('.pv-rt'), ct: $q('.pv-ct')
+            };
+            function syncCtl() {
+                ctl.row.value = cfg.rowDim; ctl.row2.value = cfg.rowDim2; ctl.col.value = cfg.colDim;
+                ctl.rowb.value = cfg.rowBucket; ctl.rowb2.value = cfg.rowBucket2; ctl.colb.value = cfg.colBucket;
+                ctl.measure.value = cfg.measure; ctl.agg.value = cfg.agg;
+                ctl.rt.checked = !!cfg.showRowTotals; ctl.ct.checked = !!cfg.showColTotals;
+                const isDate = k => !!k && byKey[k] && byKey[k].type === 'date';
+                ctl.rowb.style.display = isDate(cfg.rowDim) ? '' : 'none';
+                ctl.rowb2.style.display = isDate(cfg.rowDim2) ? '' : 'none';
+                ctl.colb.style.display = isDate(cfg.colDim) ? '' : 'none';
+                ctl.agg.disabled = cfg.measure === '__count__' || !!(byKey[cfg.measure] && (byKey[cfg.measure].ratio || byKey[cfg.measure].distinct));
+            }
+            function readCtl() {
+                cfg.rowDim = ctl.row.value; cfg.rowDim2 = ctl.row2.value; cfg.colDim = ctl.col.value;
+                cfg.rowBucket = ctl.rowb.value; cfg.rowBucket2 = ctl.rowb2.value; cfg.colBucket = ctl.colb.value;
+                cfg.measure = ctl.measure.value; cfg.agg = ctl.agg.value;
+                cfg.showRowTotals = ctl.rt.checked; cfg.showColTotals = ctl.ct.checked;
+            }
+            function save() { try { Settings.setUserKey(KEY, Object.assign({}, cfg)); Settings.saveUser(); } catch (_) {} }
+            host.querySelector('.pivot-bar').addEventListener('change', () => { readCtl(); syncCtl(); save(); render(); });
+            host.querySelector('.pv-swap').addEventListener('click', () => {
+                if (!cfg.colDim) return;
+                const r = cfg.rowDim, rb = cfg.rowBucket;
+                cfg.rowDim = cfg.colDim; cfg.rowBucket = cfg.colBucket; cfg.colDim = r; cfg.colBucket = rb;
+                syncCtl(); save(); render();
+            });
+
+            const keyFor = (row, k, bucket) => {
+                if (!k) return '__all__';
+                const v = row[k];
+                if (v == null || v === '') return '(blank)';
+                return byKey[k].type === 'date' ? bucketDate(v, bucket) : String(v);
+            };
+            function build(rows) {
+                const isCount = cfg.measure === '__count__';
+                const ratio = !isCount && byKey[cfg.measure] && byKey[cfg.measure].ratio;
+                const distinct = !isCount && byKey[cfg.measure] && byKey[cfg.measure].distinct;
+                const acc = () => ({ sum: 0, n: 0, min: Infinity, max: -Infinity, count: 0, num: 0, den: 0, set: distinct ? new Set() : null });
+                const add = (a, v, r, dv) => {
+                    a.count++;
+                    if (a.set) { if (dv != null && dv !== '') a.set.add(dv); return; }
+                    if (r) { a.num += r[0]; a.den += r[1]; return; }
+                    if (v != null && !isNaN(v)) { a.sum += v; a.n++; if (v < a.min) a.min = v; if (v > a.max) a.max = v; }
+                };
+                const nz = x => { const n = parseFloat(x); return isNaN(n) ? 0 : n; };
+                const cells = new Map(), rowAcc = new Map(), colAcc = new Map(), all = acc();
+                const rk0 = [], ck0 = [];
+                rows.forEach(r => {
+                    let rk = keyFor(r, cfg.rowDim, cfg.rowBucket);
+                    if (cfg.rowDim2) rk += RS + keyFor(r, cfg.rowDim2, cfg.rowBucket2);
+                    const ck = keyFor(r, cfg.colDim, cfg.colBucket);
+                    const v = isCount || ratio || distinct ? null : parseFloat(r[cfg.measure]);
+                    const dv = distinct ? r[cfg.measure] : null;
+                    const rv = ratio ? [nz(r[ratio[0]]), nz(r[ratio[1]])] : null;
+                    if (!rowAcc.has(rk)) { rowAcc.set(rk, acc()); rk0.push(rk); }
+                    if (!colAcc.has(ck)) { colAcc.set(ck, acc()); ck0.push(ck); }
+                    const k = rk + '|' + ck;
+                    if (!cells.has(k)) cells.set(k, acc());
+                    add(cells.get(k), v, rv, dv); add(rowAcc.get(rk), v, rv, dv); add(colAcc.get(ck), v, rv, dv); add(all, v, rv, dv);
+                });
+                const reduce = a => {
+                    if (!a || !a.count) return null;
+                    if (isCount) return a.count;
+                    if (distinct) return a.set.size;
+                    if (ratio) return a.den ? a.num / a.den : null;
+                    if (cfg.agg === 'count') return a.count;
+                    if (!a.n) return null;
+                    if (cfg.agg === 'avg') return a.sum / a.n;
+                    if (cfg.agg === 'min') return a.min;
+                    if (cfg.agg === 'max') return a.max;
+                    return a.sum;
+                };
+                const sortKeys = (arr, k) => arr.slice().sort((a, b) => {
+                    const ord = k && byKey[k] && byKey[k].order;
+                    if (typeof ord === 'function') return ord(a, b);
+                    if (Array.isArray(ord)) {
+                        const ia = ord.indexOf(a), ib = ord.indexOf(b);
+                        if (ia !== -1 || ib !== -1) return (ia === -1 ? Infinity : ia) - (ib === -1 ? Infinity : ib);
+                    }
+                    if (k && byKey[k] && byKey[k].type === 'date') return a < b ? -1 : a > b ? 1 : 0;
+                    return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
+                });
+                let rowKeys = sortKeys(rk0, cfg.rowDim), colKeys = cfg.colDim ? sortKeys(ck0, cfg.colDim) : ['__all__'];
+                let overflow = false;
+                if (rowKeys.length * colKeys.length > 10000) {
+                    // Keep the top 50 of each axis by size, in their natural order.
+                    overflow = true;
+                    const top = (keys, accs) => keys.slice().sort((a, b) => Math.abs(reduce(accs.get(b)) || 0) - Math.abs(reduce(accs.get(a)) || 0)).slice(0, 50);
+                    const keepR = new Set(top(rowKeys, rowAcc)), keepC = new Set(top(colKeys, colAcc));
+                    rowKeys = rowKeys.filter(k => keepR.has(k));
+                    if (cfg.colDim) colKeys = colKeys.filter(k => keepC.has(k));
+                }
+                return {
+                    rowKeys, colKeys, overflow,
+                    cell: (rk, ck) => reduce(cells.get(rk + '|' + ck)),
+                    rowTotal: rk => reduce(rowAcc.get(rk)), colTotal: ck => reduce(colAcc.get(ck)), grand: reduce(all)
+                };
+            }
+            function fmt(v) {
+                if (v == null) return '';
+                const f = byKey[cfg.measure];
+                if (cfg.measure === '__count__' || (f && f.distinct) || (cfg.agg === 'count' && !(f && f.ratio))) return Math.round(v).toLocaleString();
+                if (typeof opts.format === 'function') { const t = opts.format(f, v); if (t != null) return t; }
+                try {
+                    if (f && f.type === 'money' && Common.formatMoney) return Common.formatMoney(v);
+                    if (f && f.type === 'qty' && Common.formatQty) return Common.formatQty(v);
+                } catch (_) {}
+                return (Math.round(v * 100) / 100).toLocaleString();
+            }
+            const label = k => (byKey[k] ? byKey[k].label : '');
+            const colHead = ck => (ck === '__all__' ? (cfg.measure === '__count__' ? countLabel : label(cfg.measure)) : ck);
+
+            // The grid as plain rows (cells of text), shared by the screen, PDF and Excel.
+            function grid() {
+                const p = last = build(opts.rows() || []);
+                const two = !!cfg.rowDim2;
+                const head = (two ? [label(cfg.rowDim), label(cfg.rowDim2) + (cfg.colDim ? ' × ' + label(cfg.colDim) : '')]
+                                  : [label(cfg.rowDim) + (cfg.colDim ? ' × ' + label(cfg.colDim) : '')])
+                    .concat(p.colKeys.map(colHead)).concat(cfg.showRowTotals && cfg.colDim ? ['Total'] : []);
+                let prev = null;
+                const body = p.rowKeys.map(rk => {
+                    const parts = rk.split(RS);
+                    const lead = two ? [parts[0] === prev ? '' : parts[0], parts[1] || ''] : [rk];
+                    prev = parts[0];
+                    return { rk, lead, vals: p.colKeys.map(ck => p.cell(rk, ck)), total: p.rowTotal(rk) };
+                });
+                const foot = cfg.showColTotals ? { vals: p.colKeys.map(ck => p.colTotal(ck)), total: p.grand } : null;
+                return { p, two, head, body, foot };
+            }
+
+            function render() {
+                syncCtl();
+                const g = grid(), p = g.p;
+                const withTotal = cfg.showRowTotals && !!cfg.colDim;
+                $q('.pivot-overflow').classList.toggle('show', p.overflow);
+                $q('.pivot-overflow').textContent = p.overflow ? 'The pivot is too large: showing the 50 largest rows and columns. Narrow the filters or use a coarser date grouping for the full grid.' : '';
+                $q('thead').innerHTML = '<tr>' + g.head.map(h => '<th>' + esc(h) + '</th>').join('') + '</tr>';
+                if (!g.body.length) { $q('tbody').innerHTML = '<tr><td class="pv-empty" colspan="99">No data for the current filters.</td></tr>'; return; }
+                const rowsHtml = g.body.map(b =>
+                    '<tr data-rk="' + esc(b.rk) + '">' + b.lead.map(t => '<td class="pv-label">' + esc(t) + '</td>').join('') +
+                    b.vals.map((v, i) => v == null ? '<td class="pv-empty">—</td>' : '<td data-ck="' + esc(p.colKeys[i]) + '">' + esc(fmt(v)) + '</td>').join('') +
+                    (withTotal ? '<td class="pv-total">' + esc(fmt(b.total)) + '</td>' : '') + '</tr>');
+                if (g.foot) rowsHtml.push('<tr class="pv-totals-row"><td class="pv-total"' + (g.two ? ' colspan="2"' : '') + '>Total</td>' +
+                    g.foot.vals.map(v => '<td class="pv-total">' + esc(fmt(v)) + '</td>').join('') +
+                    (withTotal ? '<td class="pv-total">' + esc(fmt(g.foot.total)) + '</td>' : '') + '</tr>');
+                $q('tbody').innerHTML = rowsHtml.join('');
+            }
+
+            // Click a cell: the rows behind it.
+            host.querySelector('.pivot-table').addEventListener('click', e => {
+                const td = e.target.closest('td[data-ck]');
+                if (!td) return;
+                const rk = td.parentNode.getAttribute('data-rk'), ck = td.getAttribute('data-ck');
+                const parts = rk.split(RS);
+                const match = (opts.rows() || []).filter(r =>
+                    keyFor(r, cfg.rowDim, cfg.rowBucket) === parts[0] &&
+                    (!cfg.rowDim2 || keyFor(r, cfg.rowDim2, cfg.rowBucket2) === (parts[1] || '')) &&
+                    (!cfg.colDim || keyFor(r, cfg.colDim, cfg.colBucket) === ck));
+                const title = label(cfg.rowDim) + ' = ' + parts[0] + (cfg.rowDim2 ? ' · ' + label(cfg.rowDim2) + ' = ' + (parts[1] || '') : '') +
+                    (cfg.colDim ? ' · ' + label(cfg.colDim) + ' = ' + ck : '');
+                if (typeof opts.onDrill === 'function') { opts.onDrill(match, title); return; }
+                drill(match, title);
+            });
+            function drill(rows, title) {
+                let ov = document.getElementById('fbPivotDrill');
+                if (!ov) {
+                    ov = document.createElement('div');
+                    ov.id = 'fbPivotDrill'; ov.className = 'modal-overlay';
+                    ov.innerHTML = '<div class="modal-card"><div class="modal-head"><h3></h3><button type="button" class="fb-drawer-close" aria-label="Close">&times;</button></div>' +
+                        '<div class="modal-body pivot-drill-body"></div></div>';
+                    document.body.appendChild(ov);
+                    ov.addEventListener('click', e => { if (e.target === ov || e.target.closest('.fb-drawer-close')) ov.classList.remove('open'); });
+                }
+                ov.querySelector('h3').textContent = title + ' — ' + rows.length.toLocaleString() + ' row' + (rows.length === 1 ? '' : 's');
+                const show = rows.slice(0, 2000);
+                ov.querySelector('.modal-body').innerHTML = '<table><thead><tr>' + fields.map(f => '<th>' + esc(f.label) + '</th>').join('') + '</tr></thead><tbody>' +
+                    show.map(r => '<tr>' + fields.map(f => {
+                        const v = r[f.key];
+                        const t = v == null ? '' : f.type === 'date' ? String(v).slice(0, 10) : isNumType(f.type) && typeof opts.format === 'function' ? (opts.format(f, v) ?? v) : v;
+                        return '<td' + (isNumType(f.type) ? ' class="num-cell"' : '') + '>' + esc(t) + '</td>';
+                    }).join('') + '</tr>').join('') + '</tbody></table>' +
+                    (rows.length > show.length ? '<p style="padding:8px 12px;color:#506872">The first 2,000 rows are shown.</p>' : '');
+                ov.classList.add('open');
+            }
+
+            // For the PDF view: the grid as report rows (first columns text, figures right-aligned).
+            function pdfSpec() {
+                const g = grid(), withTotal = cfg.showRowTotals && !!cfg.colDim, lead = g.two ? 2 : 1;
+                const head = '<tr>' + g.head.map((h, i) => '<th' + (i >= lead ? ' class="num-cell"' : '') + '>' + esc(h) + '</th>').join('') + '</tr>';
+                const rows = g.body.map(b => '<tr>' + b.lead.map(t => '<td>' + esc(t) + '</td>').join('') +
+                    b.vals.map(v => '<td class="num-cell">' + esc(fmt(v)) + '</td>').join('') +
+                    (withTotal ? '<td class="num-cell">' + esc(fmt(b.total)) + '</td>' : '') + '</tr>');
+                const foot = g.foot ? '<tr><td' + (g.two ? ' colspan="2"' : '') + '>Total</td>' + g.foot.vals.map(v => '<td class="num-cell">' + esc(fmt(v)) + '</td>').join('') +
+                    (withTotal ? '<td class="num-cell">' + esc(fmt(g.foot.total)) + '</td>' : '') + '</tr>' : '';
+                return { head, rows, foot };
+            }
+            // For Excel: one sheet of the grid (figures as numbers).
+            function sheet(name) {
+                const g = grid(), withTotal = cfg.showRowTotals && !!cfg.colDim;
+                const isRatio = !!(byKey[cfg.measure] && byKey[cfg.measure].ratio);
+                const isDistinct = !!(byKey[cfg.measure] && byKey[cfg.measure].distinct);
+                const mtype = cfg.measure === '__count__' || isDistinct || (cfg.agg === 'count' && !isRatio) ? 'int' : (byKey[cfg.measure] && byKey[cfg.measure].type === 'money' ? 'money' : 'number');
+                const lead = g.two ? 2 : 1;
+                const cols = g.head.map((h, i) => ({ key: 'c' + i, label: h, w: i < lead ? 160 : 100, type: i < lead ? 'text' : mtype, noTotal: true }));
+                const rows = g.body.map(b => {
+                    const o = {};
+                    b.lead.forEach((t, i) => { o['c' + i] = t; });
+                    b.vals.forEach((v, i) => { o['c' + (lead + i)] = v; });
+                    if (withTotal) o['c' + (lead + b.vals.length)] = b.total;
+                    return o;
+                });
+                if (g.foot) {
+                    const o = { c0: 'Total' };
+                    g.foot.vals.forEach((v, i) => { o['c' + (lead + i)] = v; });
+                    if (withTotal) o['c' + (lead + g.foot.vals.length)] = g.foot.total;
+                    rows.push(o);
+                }
+                return { name: name || 'Pivot', cols, rows, totals: false };
+            }
+            function relabel(key, text) {
+                if (!byKey[key]) return;
+                byKey[key].label = text;
+                host.querySelectorAll('option[value="' + String(key).replace(/"/g, '') + '"]').forEach(o => { o.textContent = text; });
+            }
+            syncCtl();
+            return { render, pdfSpec, sheet, relabel, config: () => Object.assign({}, cfg), el: host, last: () => last };
+        }
+        return { mount: mount, bucketDate: bucketDate };
+    })();
+
     return {
         BUILD: BUILD,
         report: report,
@@ -4232,6 +5057,9 @@ window.FBLib = (function () {
         Columns: Columns,
         Picker: Picker,
         Table: Table,
-        FilterViews: FilterViews
+        FilterViews: FilterViews,
+        RowCap: RowCap,
+        RptCols: RptCols,
+        Pivot: Pivot
     };
 })();
