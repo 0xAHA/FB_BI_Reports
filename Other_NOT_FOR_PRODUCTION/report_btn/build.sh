@@ -1,10 +1,12 @@
 #!/bin/bash
 # report_btn — build the plugin jar (Git Bash on Windows).
 #
-#   ./build.sh            compile + package  -> target/report-btn.jar
-#   ./build.sh --check    ... and run the self-check (src/test/java) on Fishbowl's Java
-#   ./build.sh --install  ... and copy it into the Fishbowl plugins folder, removing
-#                         any older report-btn jar (restart the Fishbowl client)
+#   ./build.sh              compile + package  -> target/report-btn.jar
+#   ./build.sh --check      ... and run the self-checks (src/test/java) on Fishbowl's Java
+#   ./build.sh --install    ... and copy it into the Fishbowl plugins folder, removing
+#                           any older report-btn jar (restart the Fishbowl client)
+#   ./build.sh --no-editor  leave the page editor (the editor/ packages) out, which is
+#                           what deleting those folders does; combines with the others
 #
 # The jar name carries no version (it is in the manifest), so an upgrade replaces
 # the old jar instead of leaving two copies of the plugin in plugins/.
@@ -19,21 +21,41 @@
 #   ECJ_JAR   an ECJ jar                  (optional)
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.12"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 FB_HOME="${FB_HOME:-/c/Program Files/Fishbowl}"
 SRC="$HERE/src/main/java"
 OUT="$HERE/target"
 CLASSES="$OUT/classes"
 JAR="$OUT/report-btn.jar"
+REPO_SCRIPTS="$(cd "$HERE/../../scripts" 2>/dev/null && pwd || true)"
+
+CHECK=0; INSTALL=0; NO_EDITOR=0
+for arg in "$@"; do
+    case "$arg" in
+        --check) CHECK=1 ;;
+        --install) INSTALL=1 ;;
+        --no-editor) NO_EDITOR=1 ;;
+        *) echo "Unknown option: $arg"; exit 1 ;;
+    esac
+done
 
 [ -d "$FB_HOME/lib" ] || { echo "Fishbowl lib folder not found: $FB_HOME/lib (set FB_HOME)"; exit 1; }
+
+# Every .java under the package, sub-packages included; --no-editor skips editor/.
+sources() {
+    if [ "$NO_EDITOR" = 1 ]; then
+        /usr/bin/find com/fbi/plugins/reportbtn -name '*.java' -not -path '*/editor/*' | sort
+    else
+        /usr/bin/find com/fbi/plugins/reportbtn -name '*.java' | sort
+    fi
+}
 
 rm -rf "$OUT"
 mkdir -p "$CLASSES/META-INF"
 # Relative source paths (the repo path has spaces); compile from inside src/.
 cd "$SRC"
-SOURCES=(com/fbi/plugins/reportbtn/*.java)
+mapfile -t SOURCES < <(sources)
 # ECJ does not expand classpath wildcards: list every Fishbowl jar.
 LIBCP=$(for j in "$FB_HOME"/lib/*.jar; do cygpath -w "$j"; done | paste -sd ';')
 
@@ -56,23 +78,34 @@ compile() {
 
 compile "$CLASSES" "" "${SOURCES[@]}"
 
+# The App Library (Home) is built in: only its page goes into the jar. Its includes
+# (fb-lib, fb-styles) stay the scripts saved in Fishbowl; the server expands them.
+LIBRARY="$CLASSES/com/fbi/plugins/reportbtn/library"
+PAGE="$HERE/../Report_Launcher/Report_Launcher.htm"
+[ -f "$PAGE" ] || { echo "App Library page missing: $PAGE"; exit 1; }
+mkdir -p "$LIBRARY"
+cp "$PAGE" "$LIBRARY/App_Library.htm"
+
 printf 'Manifest-Version: 1.0\r\nImplementation-Title: report_btn\r\nImplementation-Version: %s\r\n\r\n' "$VERSION" > "$CLASSES/META-INF/MANIFEST.MF"
 
 # A jar is a zip; Windows' own tar (bsdtar) writes zip with forward-slash names.
 ( cd "$CLASSES" && /c/Windows/System32/tar.exe -a -c -f "../report-btn.zip" META-INF com )
 mv "$OUT/report-btn.zip" "$JAR"
-echo "Built $JAR"
+echo "Built $JAR$([ "$NO_EDITOR" = 1 ] && echo ' (without the page editor)')"
 
-if [ "${1:-}" = "--check" ]; then
+if [ "$CHECK" = 1 ]; then
     TESTS="$OUT/test-classes"
     mkdir -p "$TESTS"
     cd "$HERE/src/test/java"
-    compile "$TESTS" "$(cygpath -w "$CLASSES");" com/fbi/plugins/reportbtn/*.java
-    "$FB_HOME/jre/bin/java.exe" -cp "$(cygpath -w "$TESTS");$(cygpath -w "$CLASSES");$LIBCP" com.fbi.plugins.reportbtn.SelfCheck
-    exit $?
+    mapfile -t TEST_SOURCES < <(sources)
+    compile "$TESTS" "$(cygpath -w "$CLASSES");" "${TEST_SOURCES[@]}"
+    "$FB_HOME/jre/bin/java.exe" -Djava.awt.headless=true \
+        ${REPO_SCRIPTS:+-Dreportbtn.scripts="$(cygpath -w "$REPO_SCRIPTS")"} \
+        -Dreportbtn.repo="$(cygpath -w "$HERE/../..")" \
+        -cp "$(cygpath -w "$TESTS");$(cygpath -w "$CLASSES");$LIBCP" com.fbi.plugins.reportbtn.SelfCheck
 fi
 
-if [ "${1:-}" = "--install" ]; then
+if [ "$INSTALL" = 1 ]; then
     rm -f "$FB_HOME"/plugins/report-btn*.jar
     cp "$JAR" "$FB_HOME/plugins/"
     echo "Installed into $FB_HOME/plugins — restart the Fishbowl client"

@@ -123,26 +123,72 @@ final class AppCatalog {
         refreshTagsInBackground();
     }
 
+    /**
+     * Forgets both caches after a page, its module association or its access is
+     * saved, and rescans the tags straight away. The next menu waits for that scan
+     * (briefly), so a changed module association shows on the next module switch.
+     */
+    static void invalidate() {
+        synchronized (AppCatalog.class) {
+            cachedAt = 0;
+            tagsAt = 0;
+        }
+        synchronized (SCAN) {
+            tagsStale = true;
+            if (tagsLoading.get()) {
+                rescan = true;   // the running scan may predate the change
+                return;
+            }
+        }
+        refreshTagsInBackground();
+    }
+
     private static Map<Integer, Set<String>> tags() {
         if (System.currentTimeMillis() - tagsAt > TAGS_TTL_MS) {
             refreshTagsInBackground();
         }
+        synchronized (SCAN) {
+            long until = System.currentTimeMillis() + 3000;
+            while (tagsStale && tagsLoading.get() && System.currentTimeMillis() < until) {
+                try {
+                    SCAN.wait(100);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
         return tags;
     }
+
+    private static final Object SCAN = new Object();
+    private static volatile boolean tagsStale;
+    private static boolean rescan;
 
     private static void refreshTagsInBackground() {
         if (!tagsLoading.compareAndSet(false, true)) {
             return;   // a scan is already running
         }
         Thread scan = new Thread(() -> {
-            try {
-                tags = readTags();
-            } catch (Exception e) {
-                ReportAppsPlugin.log("Reading the fb-launch tags failed", e);
-            } finally {
-                tagsAt = System.currentTimeMillis();   // a failure also waits for the next interval
-                tagsLoading.set(false);
-            }
+            boolean again;
+            do {
+                try {
+                    tags = readTags();
+                } catch (Exception e) {
+                    ReportAppsPlugin.log("Reading the fb-launch tags failed", e);
+                } finally {
+                    tagsAt = System.currentTimeMillis();   // a failure also waits for the next interval
+                }
+                synchronized (SCAN) {
+                    again = rescan;
+                    rescan = false;
+                    if (!again) {
+                        tagsStale = false;
+                        tagsLoading.set(false);
+                        SCAN.notifyAll();
+                    }
+                }
+            } while (again);
         }, "report_btn-tags");
         scan.setDaemon(true);
         scan.start();
@@ -160,7 +206,7 @@ final class AppCatalog {
         List<?> rows = plugin.runQuery("SELECT b.id AS id, "
             + "SUBSTRING(s.data, GREATEST(1, LOCATE('name=\"fb-launch\"', s.data) - 120), 360) AS tag "
             + "FROM bireport b JOIN biscript s ON s.id = b.biScriptId "
-            + "WHERE s.active+0 = 1 AND s.data LIKE '%name=\"fb-launch\"%'");
+            + "WHERE s.active+0 = 1 AND s.published+0 = 1 AND s.data LIKE '%name=\"fb-launch\"%'");
         if (rows != null) {
             for (Object row : rows) {
                 try {
@@ -193,7 +239,7 @@ final class AppCatalog {
         try {
             String sql = "SELECT b.id AS id, b.name AS name, LEFT(COALESCE(b.description, ''), 300) AS description "
                 + "FROM bireport b JOIN biscript s ON s.id = b.biScriptId "
-                + "WHERE s.active+0 = 1 "
+                + "WHERE s.active+0 = 1 AND s.published+0 = 1 "
                 + ("admin".equalsIgnoreCase(user) ? "" :
                    "AND b.id IN (SELECT a.biReportId FROM bireportaccess a "
                    + "JOIN usergrouprel r ON r.groupId = a.userGroupId WHERE r.userId = " + plugin.getUserId() + ") ")

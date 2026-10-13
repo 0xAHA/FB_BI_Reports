@@ -3,8 +3,8 @@ package com.fbi.plugins.reportbtn;
 import java.util.Locale;
 
 /**
- * What a report asks the Report Workspace for, through the bridge's
- * openModule('Report Workspace', item). The client hands item to the module's
+ * What a report asks the Apps (beta) module for, through the bridge's
+ * openModule('Apps (beta)', item). The client hands item to the module's
  * handleHyperLink, trimmed.
  *
  *   123              open bireport 123 in the selected tab
@@ -12,15 +12,18 @@ import java.util.Locale;
  *   tab:123          ... in a new tab (also tab:&lt;name&gt;)
  *   home             open the Home report (tab:home: in a new tab)
  *   back / forward   step through the selected tab's history
+ *   edit:123         open report 123's page in the editor (also edit:&lt;name&gt;),
+ *                    when the page editor is part of the build
  *
- * Keywords and the tab: prefix ignore case. An empty item only switches to the
+ * Keywords and prefixes ignore case. An empty item only switches to the
  * workspace, so it parses to null, as does anything unusable.
  */
 final class WorkspaceLink {
 
-    enum Action { OPEN, HOME, BACK, FORWARD }
+    enum Action { OPEN, HOME, BACK, FORWARD, EDIT }
 
     private static final String TAB = "tab:";
+    private static final String EDIT = "edit:";
 
     final Action action;
     final boolean newTab;
@@ -48,6 +51,18 @@ final class WorkspaceLink {
         }
         if (text.isEmpty()) {
             return null;
+        }
+        // edit: comes before the id / name fallbacks; the editor opens its own tab.
+        if (text.regionMatches(true, 0, EDIT, 0, EDIT.length())) {
+            String target = text.substring(EDIT.length()).trim();
+            if (target.isEmpty()) {
+                return null;
+            }
+            if (target.matches("\\d{1,9}")) {
+                int id = Integer.parseInt(target);
+                return id > 0 ? new WorkspaceLink(Action.EDIT, false, id, null) : null;
+            }
+            return new WorkspaceLink(Action.EDIT, false, 0, target);
         }
         switch (text.toLowerCase(Locale.ROOT)) {
             case "home":

@@ -21,6 +21,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="fb-launch" content="SETUP">
+    <meta name="fb-folder" content="Other">
     <meta name="description" content="Change history for any order or record from Fishbowl’s audit tables: who changed what, and when.">
     <script>
         // ================================================================
@@ -39,7 +40,7 @@
         window.FB_REPORT = {
             key:   'cdx.bi.audittrail',
             name:  'Audit Trail',
-            build: '2026.10.12-cf58220'     // @fb-build
+            build: '2026.10.13-5d72f36'     // @fb-build
         };
     </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -542,11 +543,35 @@ const XO_STATUS = {10:'Entered',20:'Issued',30:'In Transit',40:'Fulfilled',50:'C
 //   numCol      — BROWSE MODE: the head column that labels a record
 //                  (default 'num'; 'name' where there is no num; null
 //                  where there is neither, which labels by id).
+//   numsSql     — BROWSE MODE, for a type whose number lives on another
+//                  table (receipt): ids → [{id, num}]. Overrides numCol.
 //
 // Search philosophy: prefer prefix matches (cheap on indexed cols), fall
 // back to LIKE '%term%' when the column is a name/description. Capped at
 // 20 rows so the dropdown stays a sensible size and one stray keystroke
 // can't drag down a heavy table.
+
+// Receipts are named by their order: receipt.poId / soId / xoId says which,
+// and the prefix is the one openModule('Receiving', …) takes.
+const RECEIPT_ORDERS = [
+    { prefix: 'P', tbl: 'po', fk: 'poId', sub: 'PO receipt' },
+    { prefix: 'S', tbl: 'so', fk: 'soId', sub: 'SO receipt' },
+    { prefix: 'T', tbl: 'xo', fk: 'xoId', sub: 'TO receipt' },
+];
+/* What the user typed → the order numbers to try for each order type.
+   "P1234" is PO 1234. The whole entry is also tried on every type, for
+   order numbers that themselves start with P, S or T ("PO-1001"), and a
+   bare number ("1234") therefore matches any type. */
+function receiptNums(input) {
+    const s = String(input ?? '').trim();
+    const m = /^([PST])\s*(.*)$/i.exec(s);
+    return RECEIPT_ORDERS.map(o => {
+        const nums = [s];
+        if (m && m[1].toUpperCase() === o.prefix) nums.push(m[2]);
+        return { o, nums };
+    });
+}
+
 const TYPES = {
     so: {
         label: 'Sales Order',
@@ -654,46 +679,47 @@ const TYPES = {
     },
     receipt: {
         label: 'Receipt',
-        fieldLabel: 'Receipt', placeholder: 'P5001  ·  S10042  ·  T5',
-        // Receipts have no num — the user enters the originating order
-        // number with a one-letter prefix (P/S/T) per CLAUDE.md openModule
-        // conventions, or a raw receipt id.
+        fieldLabel: 'Receipt', placeholder: 'P5001  ·  S10042  ·  T5  ·  or an order #',
+        // Receipts have no num: a receipt is named by its order, with the
+        // one-letter prefix openModule('Receiving', …) takes (P/S/T). An
+        // order number without a prefix matches that number on any order
+        // type. Raw receipt ids are not accepted: Fishbowl never shows
+        // them, and a PO number typed without its P used to resolve to
+        // whichever receipt happened to have that id.
         head: 'receipt', headAud: 'receipt_aud',
         item: 'receiptitem', itemAud: 'receiptitem_aud', itemFk: 'receiptId',
+        openModule: 'Receiving',
         numCol: null,
-        lookupSql: (num) => {
-            const m = String(num).match(/^([PpSsTt])(.+)$/);
-            if (!m) return `SELECT id, CAST(id AS CHAR) AS num FROM receipt WHERE id = ${qint(num)}`;
-            const orderNum = m[2].trim();
-            const col = m[1].toUpperCase() === 'P' ? 'poId'
-                      : m[1].toUpperCase() === 'S' ? 'soId' : 'xoId';
-            const orderTbl = m[1].toUpperCase() === 'P' ? 'po'
-                           : m[1].toUpperCase() === 'S' ? 'so' : 'xo';
-            return `SELECT r.id, CAST(r.id AS CHAR) AS num
-                    FROM receipt r
-                    INNER JOIN ${orderTbl} o ON o.id = r.${col}
-                    WHERE o.num = ${qstr(orderNum)}`;
-        },
+        lookupSql: (input) => 'SELECT * FROM (' + receiptNums(input).map(({ o, nums }) => `
+            SELECT r.id, CONCAT('${o.prefix}', ${o.tbl}.num) AS num
+            FROM receipt r INNER JOIN ${o.tbl} ON ${o.tbl}.id = r.${o.fk}
+            WHERE ${o.tbl}.num IN (${nums.filter(Boolean).map(qstr).join(',') || "''"})`
+        ).join(' UNION ALL ') + ') t',
+        numsSql: (ids) => `SELECT k.id,
+                   COALESCE(CONCAT('P', po.num), CONCAT('S', so.num), CONCAT('T', xo.num)) AS num
+            FROM (SELECT u.id, MAX(u.poId) AS poid, MAX(u.soId) AS soid, MAX(u.xoId) AS xoid
+                  FROM (SELECT id, poId, soId, xoId FROM receipt WHERE id IN (${ids.join(',')})
+                        UNION ALL
+                        SELECT id, poId, soId, xoId FROM receipt_aud WHERE id IN (${ids.join(',')})) u
+                  GROUP BY u.id) k
+            LEFT JOIN po ON po.id = k.poid
+            LEFT JOIN so ON so.id = k.soid
+            LEFT JOIN xo ON xo.id = k.xoid`,
         lookups:     { typeid: 'receipttype', statusid: 'receiptstatus', ordertypeid: 'ordertype' },
         itemLookups: { typeid: 'receiptitemtype', statusid: 'receiptitemstatus', ordertypeid: 'ordertype' },
-        // Search across all three originating order types; the prefix is
-        // baked into the suggestion's `value` so the user can pick a row
-        // and the lookup parses it back correctly.
-        searchSql: (term) => {
-            const t = term.replace(/^[PpSsTt]/, '');
-            return `
-            (SELECT CONCAT('P', po.num) AS value, CONCAT('P', po.num) AS label, 'PO receipt' AS sub
-             FROM receipt r INNER JOIN po ON po.id = r.poId
-             WHERE po.num LIKE ${qlike(t)} GROUP BY po.num ORDER BY po.num LIMIT 10)
-            UNION ALL
-            (SELECT CONCAT('S', so.num) AS value, CONCAT('S', so.num) AS label, 'SO receipt' AS sub
-             FROM receipt r INNER JOIN so ON so.id = r.soId
-             WHERE so.num LIKE ${qlike(t)} GROUP BY so.num ORDER BY so.num LIMIT 10)
-            UNION ALL
-            (SELECT CONCAT('T', xo.num) AS value, CONCAT('T', xo.num) AS label, 'TO receipt' AS sub
-             FROM receipt r INNER JOIN xo ON xo.id = r.xoId
-             WHERE xo.num LIKE ${qlike(t)} GROUP BY xo.num ORDER BY xo.num LIMIT 10)`;
-        },
+        // A prefix narrows the suggestions to that order type ("P50" lists
+        // PO receipts only); without one, all three types are searched.
+        // The prefix is baked into each suggestion's `value` so the lookup
+        // parses a picked row back to the same order. The UNION sits in a
+        // derived table because Fishbowl only runs SQL that starts with
+        // SELECT; a leading "(SELECT" made every Receipt search fail.
+        searchSql: (term) => 'SELECT * FROM (' + receiptNums(term).map(({ o, nums }) => `
+            (SELECT DISTINCT CONCAT('${o.prefix}', ${o.tbl}.num) AS value,
+                    CONCAT('${o.prefix}', ${o.tbl}.num) AS label, '${o.sub}' AS sub
+             FROM receipt r INNER JOIN ${o.tbl} ON ${o.tbl}.id = r.${o.fk}
+             WHERE ${nums.map(n => `${o.tbl}.num LIKE ${qlike(n)}`).join(' OR ')}
+             ORDER BY value LIMIT 10)`
+        ).join(' UNION ALL ') + ') t ORDER BY value',
     },
     rma: {
         label: 'RMA',
@@ -1187,6 +1213,7 @@ function showToast(message, type = 'info', duration = 3000) {
 }
 
 async function qp(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
     if (MODE === 'fishbowl') {
         if (typeof runQueryAsync === 'function') {
             const r = await runQueryAsync(sql);
@@ -2032,8 +2059,10 @@ async function runBrowse(cfg) {
             rows[kind].push(r);
         }));
 
+        const nums = cfg.numsSql ? await browseNums(cfg, rows) : null;
         const numKey = cfg.numCol === undefined ? 'num' : cfg.numCol && cfg.numCol.toLowerCase();
         const headNum = (eid, revs) => {
+            if (nums) return nums.get(eid) ?? null;
             if (!numKey) return null;
             // A deleted record's last aud row has its columns nulled.
             for (let i = revs.length - 1; i >= 0; i--) {
@@ -2042,7 +2071,7 @@ async function runBrowse(cfg) {
             }
             return null;
         };
-        const parentNums = rows.item.length ? await browseParentNums(cfg, rows.item) : new Map();
+        const parentNums = nums || (rows.item.length ? await browseParentNums(cfg, rows.item) : new Map());
         const events = buildEvents(cfg, rows.header, rows.item, headNum, pid => parentNums.get(pid), baseline);
         _resultRows = events;
         await prewarmLookups(events);
@@ -2101,6 +2130,20 @@ function browseSql(aud, where, prev) {
         INNER JOIN ${aud} p ON p.id = k.id AND p.REV = k.prevrev
         LEFT JOIN revinfo r ON r.id = p.REV
         LEFT JOIN sysuser u ON u.id = r.modifieduserid`;
+}
+
+/* Browse-mode numbers for a type with `numsSql`: every header id and
+   every line item's parent id, in one query. */
+async function browseNums(cfg, rows) {
+    const out = new Map();
+    const fk = cfg.itemFk ? cfg.itemFk.toLowerCase() : null;
+    const ids = [...new Set([
+        ...rows.header.map(r => parseInt(r.id, 10)),
+        ...(fk ? rows.item.map(r => parseInt(r[fk], 10)) : []),
+    ].filter(n => !isNaN(n)))];
+    if (!ids.length) return out;
+    (await qp(cfg.numsSql(ids))).forEach(r => { if (r.num != null) out.set(r.id, r.num); });
+    return out;
 }
 
 /* Parent numbers for browse-mode line items: the live header first, then

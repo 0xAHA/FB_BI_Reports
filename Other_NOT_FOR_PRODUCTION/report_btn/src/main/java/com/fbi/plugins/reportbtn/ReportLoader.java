@@ -21,7 +21,7 @@ import java.util.Set;
  * Style directives, so the live shared records are used), then the report's saved
  * settings as QueryParameters. The caller hands the result to
  * BiBrowserPanel.loadHTML(html, report.getId(), report.getName(), false, params).
- * Shared by the Apps menu (AppLauncher) and the Report Workspace.
+ * Shared by the Apps menu (AppLauncher) and the Apps (beta) module.
  */
 final class ReportLoader {
 
@@ -100,11 +100,11 @@ final class ReportLoader {
         return params;
     }
 
-    private static boolean failed(EVEvent response) {
+    static boolean failed(EVEvent response) {
         return response == null || response.getMessageType() == MSG_EXCEPTION;
     }
 
-    private static String message(ClientModuleImpl module, EVEvent response) {
+    static String message(ClientModuleImpl module, EVEvent response) {
         if (response == null) {
             return "no response from the server";
         }

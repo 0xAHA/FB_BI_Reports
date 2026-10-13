@@ -171,13 +171,18 @@
 window.FBLib = (function () {
     'use strict';
 
-    // Build stamp of this fb-lib, maintained by tools/stamp/stamp.js — never
-    // edit by hand. Exposed as FBLib.BUILD so a report can tell which fb-lib
-    // the Fishbowl server actually served it.
-    const BUILD = '2026.10.12-96b2943';   // @fb-build
+    /**
+     * Build stamp of this fb-lib (date-hash), maintained by tools/stamp/stamp.js; never edit it by hand.
+     * Exposed as FBLib.BUILD so a report can tell which fb-lib the Fishbowl server actually served it.
+     * @type {string}
+     */
+    const BUILD = '2026.10.13-fd05e95';   // @fb-build
 
-    // The report's identity block (window.FB_REPORT, top of every report's
-    // <head>): { key: storage-key prefix, build: report build stamp }.
+    /**
+     * Returns the host report's identity block (window.FB_REPORT, set at the top of every report's head).
+     * Only key and build are returned; a missing block or field comes back as null.
+     * @returns {{key: ?string, build: ?string}} key = the storage-key prefix, build = the report's build stamp.
+     */
     function report() {
         const r = (typeof window !== 'undefined' && window.FB_REPORT) || {};
         return { key: r.key || null, build: r.build || null };
@@ -192,13 +197,13 @@ window.FBLib = (function () {
     //                status indicators.
     // (replacement for the old dashboard-common.js)
     // ====================================================================
+    /** Formatting, debug console, drop-down drawers, push-down panels, the multi-select widget and status indicators. */
     const Common = (function () {
-        // Resolved at module-load. FB_DATE_FORMAT uses Java SimpleDateFormat
-        // (e.g. "MM/dd/yyyy", "dd/MM/yyyy"). MOMENT_DATE_FORMAT is the
-        // moment.js-compatible variant.
+        /** The DateFormatShort system property (Java SimpleDateFormat, e.g. "dd/MM/yyyy"), read once at load; default "MM/dd/yyyy". */
         const FB_DATE_FORMAT = (typeof getProperty === 'function')
             ? getProperty('DateFormatShort', 'MM/dd/yyyy')
             : 'MM/dd/yyyy';
+        /** FB_DATE_FORMAT rewritten with moment.js tokens (yyyy to YYYY, yy to YY, dd to DD). */
         const MOMENT_DATE_FORMAT = FB_DATE_FORMAT
             .replace(/yyyy/g, 'YYYY')
             .replace(/yy/g, 'YY')
@@ -230,6 +235,12 @@ window.FBLib = (function () {
             return false;
         }
 
+        /**
+         * Formats a date string in the company's short date format (FB_DATE_FORMAT).
+         * Uses moment.js when the page loads it; otherwise reorders a "YYYY-MM-DD[ time]" string as MM/dd or dd/MM.
+         * @param {string} dateStr - The date, e.g. "2026-10-13" or "2026-10-13 09:30:00".
+         * @returns {string} The formatted date; '' when blank, or the input unchanged when it can't be split.
+         */
         function formatDate(dateStr) {
             if (!dateStr) return '';
             // Prefer moment.js when available (handles every DateFormatShort
@@ -246,10 +257,12 @@ window.FBLib = (function () {
                 : `${day}/${month}/${year}`;
         }
 
-        // Home-company currency locale + symbol, resolved once. Falls back to
-        // en-US / $ when currencyLocale() is unavailable (e.g. outside the
-        // Fishbowl client). Mirrors the inline block reports used to carry.
         let _currency = null;
+        /**
+         * Returns the home company's currency locale and symbol, resolved once and cached.
+         * Falls back to en-US / "$" when currencyLocale() is unavailable (e.g. outside the Fishbowl client).
+         * @returns {{locale: string, symbol: string}} e.g. { locale: 'en-US', symbol: '$' }.
+         */
         function currency() {
             if (_currency) return _currency;
             try {
@@ -264,7 +277,12 @@ window.FBLib = (function () {
             return _currency;
         }
 
-        // Symbol + locale-aware 2-dp money formatting with negative handling.
+        /**
+         * Formats an amount as home-currency money: symbol, locale grouping and always 2 decimals.
+         * Negatives render as "-$1,234.50". Rounding is toLocaleString's, not Fishbowl's roundMoney().
+         * @param {number|string} value - The amount; strings are parsed, null and '' become 0.
+         * @returns {string} e.g. "$1,234.50"; '' when the value isn't numeric.
+         */
         function formatMoney(value) {
             const num = parseFloat(value || 0);
             if (isNaN(num)) return '';
@@ -274,18 +292,32 @@ window.FBLib = (function () {
                 abs.toLocaleString(c.locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
         }
 
-        // Integer-or-trimmed-decimal quantity formatting (drops trailing zeros).
+        /**
+         * Formats a quantity: whole numbers without decimals, others to at most 4 places with trailing zeros dropped.
+         * No thousands separator is added.
+         * @param {number|string} value - The quantity.
+         * @returns {string} e.g. "2" or "1.5"; '' when the value isn't numeric.
+         */
         function formatQty(value) {
             const v = parseFloat(value);
             if (isNaN(v)) return '';
             return v % 1 === 0 ? String(Math.round(v)) : v.toFixed(4).replace(/\.?0+$/, '');
         }
 
-        // Escape single quotes for safe inlining into a SQL string literal.
+        /**
+         * Escapes single quotes for safe inlining into a SQL string literal (each ' becomes '').
+         * @param {*} s - The value; null and undefined become ''.
+         * @returns {string} The escaped text, without surrounding quotes.
+         */
         function escSQL(s) {
             return String(s == null ? '' : s).replace(/'/g, "''");
         }
 
+        /**
+         * Classifies a scheduled date against today, for createScheduleIndicator().
+         * @param {string} dateStr - A "YYYY-MM-DD[ time]" date.
+         * @returns {string} 'red' past due, 'orange' today, 'blue' later this week (Sun-Sat); '' otherwise or when blank.
+         */
         function getScheduleStatus(dateStr) {
             if (!dateStr) return '';
             const parts = String(dateStr).split(' ')[0].split('-');
@@ -303,6 +335,15 @@ window.FBLib = (function () {
             return '';
         }
 
+        /**
+         * Builds the tooltip text for an availability status indicator.
+         * @param {string} status - 'committed' | 'green' | 'red' | 'orange'; anything else reads "No pending items".
+         * @param {number} fullItems - Items fully available.
+         * @param {number} partialItems - Items partially available.
+         * @param {number} noneItems - Items with nothing available.
+         * @param {number} pendingItems - Items still pending.
+         * @returns {string} e.g. "Partially available (3 full, 1 partial, 2 none of 6 pending)".
+         */
         function getStatusTitle(status, fullItems, partialItems, noneItems, pendingItems) {
             if (status === 'committed') return `All items committed (${pendingItems} items)`;
             if (status === 'green')     return `All pending items available (${fullItems}/${pendingItems})`;
@@ -311,6 +352,12 @@ window.FBLib = (function () {
             return 'No pending items (all finished)';
         }
 
+        /**
+         * Creates a centred table cell holding a clock icon coloured for a schedule status, with a tooltip.
+         * A second (date) argument is accepted for compatibility and ignored.
+         * @param {string} scheduleStatus - A getScheduleStatus() result; '' gives an empty cell.
+         * @returns {HTMLTableCellElement} The cell, ready to append to a row.
+         */
         function createScheduleIndicator(scheduleStatus /* dateStr unused, kept for API compat */) {
             const td = document.createElement('td');
             td.style.textAlign = 'center';
@@ -337,6 +384,11 @@ window.FBLib = (function () {
             return td;
         }
 
+        /**
+         * Creates a table cell showing a row's availability: a padlock when committed, else a .status-circle in the status colour.
+         * @param {object} row - Query row with availabilitystatus, fullitems, partialitems, noneitems and pendingitems.
+         * @returns {HTMLTableCellElement} The cell, titled with getStatusTitle().
+         */
         function createAvailabilityIndicator(row) {
             const td = document.createElement('td');
             const title = getStatusTitle(row.availabilitystatus, row.fullitems, row.partialitems, row.noneitems, row.pendingitems);
@@ -361,6 +413,13 @@ window.FBLib = (function () {
             return td;
         }
 
+        /**
+         * Appends a timestamped line to the #debugLog console, only while debug mode is on (see DEBUG_MODE).
+         * The message is inserted as HTML, so escape untrusted text. Does nothing without a #debugLog element.
+         * @param {string} message - The text to log (HTML allowed).
+         * @param {string} [type] - 'info' | 'success' | 'warning' | 'error' | 'query'; sets the colour.
+         * @param {string} [tileId] - Shown as a [tileId] prefix.
+         */
         function debugLog(message, type, tileId) {
             if (!_debugMode()) return;
             const logDiv = document.getElementById('debugLog');
@@ -380,6 +439,7 @@ window.FBLib = (function () {
             logDiv.scrollTop = logDiv.scrollHeight;
         }
 
+        /** Clears the #debugLog console, leaving a "Log cleared..." placeholder. */
         function clearDebugLog() {
             const logDiv = document.getElementById('debugLog');
             if (logDiv) logDiv.innerHTML = '<div style="color: #64748b; font-style: italic;">Log cleared...</div>';
@@ -649,6 +709,16 @@ window.FBLib = (function () {
         //   FBLib.Common.openDrawer(id) / closeDrawer(id) / toggleDrawer(id) / closeAllDrawers();
         // ================================================================
         const _drawers = {};
+        /**
+         * Registers a drop-down drawer (.fb-drawer) so it joins the shared rules: one open at a time, outside press and ESC close.
+         * See the DROP-DOWN DRAWER block above for the canonical markup and CSS.
+         * @param {object} cfg - Drawer config.
+         * @param {string} cfg.id - The drawer element's id.
+         * @param {string} [cfg.triggerId] - The header button that toggles it; it gets .active while the drawer is open.
+         * @param {Function} [cfg.onBeforeOpen] - Called just before it opens (e.g. to hydrate form values).
+         * @param {Function} [cfg.onAfterClose] - Called after it closes.
+         * @returns {?{open: Function, close: Function, toggle: Function}} Helpers bound to this drawer, or null without cfg.id.
+         */
         function registerDrawer(cfg) {
             if (!cfg || !cfg.id) return null;
             _drawers[cfg.id] = {
@@ -688,6 +758,11 @@ window.FBLib = (function () {
             return Array.prototype.slice.call(document.querySelectorAll('.fb-drawer.open'));
         }
         function _fbAnyDrawerOpen() { return _fbOpenDrawerEls().length > 0; }
+        /**
+         * Opens a drawer by id after closing every other drawer and push-down panel, and shows the page scrim.
+         * Runs the drawer's onBeforeOpen hook and marks its trigger button .active.
+         * @param {string} id - The drawer element's id (registered or not).
+         */
         function openDrawer(id) {
             // Only one open at a time: close every other drawer and any panel.
             _fbOpenDrawerEls().forEach(function (d) { if (d.id !== id) closeDrawer(d.id); });
@@ -707,6 +782,10 @@ window.FBLib = (function () {
                 if (btn) btn.classList.add('active');
             }
         }
+        /**
+         * Closes a drawer by id, clears its trigger's .active, hides the scrim once none is open and runs onAfterClose.
+         * @param {string} id - The drawer element's id.
+         */
         function closeDrawer(id) {
             const el = document.getElementById(id);
             if (el) el.classList.remove('open');
@@ -722,12 +801,17 @@ window.FBLib = (function () {
             }
             try { if (cfg && cfg.onAfterClose) cfg.onAfterClose(); } catch (_) {}
         }
+        /**
+         * Opens a drawer when it is closed, otherwise closes it; does nothing if the element doesn't exist.
+         * @param {string} id - The drawer element's id.
+         */
         function toggleDrawer(id) {
             const el = document.getElementById(id);
             if (!el) return;
             if (el.classList.contains('open')) closeDrawer(id);
             else openDrawer(id);
         }
+        /** Closes every open .fb-drawer on the page, registered or not. */
         function closeAllDrawers() {
             _fbOpenDrawerEls().forEach(function (d) { closeDrawer(d.id); });
         }
@@ -803,6 +887,15 @@ window.FBLib = (function () {
         //   Register it so the rules know its trigger.
         // ================================================================
         const _panels = {};
+        /**
+         * Registers a push-down filter panel (.rpt-filters) so it joins the drawers' one-open-at-a-time and outside-press rules.
+         * See the PUSH-DOWN PANEL block above for the canonical markup.
+         * @param {object} cfg - Panel config.
+         * @param {string} cfg.id - The panel element's id.
+         * @param {string} [cfg.triggerId] - The button that toggles it; it gets .active while the panel is open.
+         * @param {Function} [cfg.onToggle] - Called with the new open state (boolean) after each toggle.
+         * @returns {?{toggle: Function}} toggle(open?) bound to this panel, or null without cfg.id.
+         */
         function registerPanel(cfg) {
             if (!cfg || !cfg.id) return null;
             _panels[cfg.id] = { triggerId: cfg.triggerId || null, onToggle: typeof cfg.onToggle === 'function' ? cfg.onToggle : null };
@@ -813,9 +906,19 @@ window.FBLib = (function () {
                 const e = document.getElementById(pid); return e && e.classList.contains('open');
             });
         }
+        /**
+         * Closes every open registered push-down panel.
+         * @param {string} [exceptId] - A panel id to leave open.
+         */
         function closeAllPanels(exceptId) {
             _fbOpenPanelIds().forEach(function (pid) { if (pid !== exceptId) togglePanel(pid, false); });
         }
+        /**
+         * Opens, closes or flips a push-down panel. Opening closes all drawers and other panels; closing closes open multi-selects.
+         * @param {string} id - The panel element's id (registered without a trigger on first use if needed).
+         * @param {boolean} [open] - true to open, false to close; omit to flip.
+         * @returns {boolean} The new open state; false when the element doesn't exist.
+         */
         function togglePanel(id, open) {
             const el = document.getElementById(id);
             if (!el) return false;
@@ -938,6 +1041,22 @@ window.FBLib = (function () {
             });
         }
 
+        /**
+         * Creates a multi-select dropdown on host markup (see the MULTI-SELECT DROPDOWN block above) and registers it.
+         * onChange fires on every toggle, so query from onClose. setSelected and setItems don't fire onChange.
+         * @param {object} opts - Widget options.
+         * @param {string} opts.containerId - The .ms-container id; children are id + '-trigger', '-dropdown', '-list', etc.
+         * @param {Array<object|string|number>} [opts.items] - Options { value, label, tagLabel?, sub?, group? }, or bare values.
+         * @param {Array} [opts.selected] - Values selected initially.
+         * @param {string} [opts.placeholder] - Text shown when nothing is selected (default "Select...").
+         * @param {number} [opts.maxTags=3] - Tags shown on the trigger before "+N more".
+         * @param {Function} [opts.onChange] - Called with the selected values after every change.
+         * @param {Function} [opts.onOpen] - Called with the widget API as the dropdown opens.
+         * @param {Function} [opts.onClose] - Called with the selected values once per real close.
+         * @param {boolean} [opts.flipUp=false] - Open above the trigger when it would run past the viewport bottom.
+         * @returns {object} API: getSelected(), setSelected(vals), setItems(items), getItems(), open(), close(), toggle(), element.
+         * @throws {Error} When the container or its trigger, dropdown or list child is missing.
+         */
         function _msCreate(opts) {
             if (!opts || !opts.containerId) throw new Error('MultiSelect.create: containerId required');
             const containerId = opts.containerId;
@@ -1239,23 +1358,31 @@ window.FBLib = (function () {
             };
         }
 
+        /**
+         * Looks up a multi-select created with MultiSelect.create().
+         * @param {string} containerId - Its container id.
+         * @returns {?object} The widget API, or null.
+         */
         function _msGet(containerId) { return _msRegistry[containerId] || null; }
 
-        // Close every registered multi-select. Lets a host's OTHER dropdown
-        // widgets (e.g. a report's legacy CF-value dropdown) enforce mutual
-        // exclusion against the fb-lib ones.
+        /**
+         * Closes every registered multi-select (each one that was open fires its onClose).
+         * Lets a host's other dropdown widgets (e.g. a legacy CF-value dropdown) enforce mutual exclusion with fb-lib's.
+         */
         function _msCloseAll() {
             Object.keys(_msRegistry).forEach(function (id) {
                 try { _msRegistry[id].close(); } catch (_) {}
             });
         }
 
+        /** Multi-select dropdown widget: create(opts), get(containerId) and closeAll(). */
         const MultiSelect = { create: _msCreate, get: _msGet, closeAll: _msCloseAll };
 
-        // Public entry point. Idempotent — first call builds + wires the
-        // drawer and returns its API; subsequent calls return the cached
-        // API. Safe to call before DOMContentLoaded — the call will defer
-        // until the body is ready.
+        /**
+         * Mounts the bottom-anchored debug console drawer that debugLog() writes to. Idempotent: later calls return the same API.
+         * Before the body exists it defers to DOMContentLoaded and returns null. The drawer starts hidden; call show() or expand().
+         * @returns {?object} API { show, hide, toggle, expand, collapse, isOpen, isVisible, element }, or null when deferred.
+         */
         function mountDebugDrawer() {
             if (_drawerMounted) return _drawerApi;
             if (typeof document === 'undefined') return null;
@@ -1279,6 +1406,7 @@ window.FBLib = (function () {
         return {
             FB_DATE_FORMAT: FB_DATE_FORMAT,
             MOMENT_DATE_FORMAT: MOMENT_DATE_FORMAT,
+            /** True while the user's saved debug (or legacy showDebug) setting is on; read live, false before Settings.init(). */
             get DEBUG_MODE() { return _debugMode(); },
             formatDate: formatDate,
             currency: currency,
@@ -1292,17 +1420,14 @@ window.FBLib = (function () {
             debugLog: debugLog,
             clearDebugLog: clearDebugLog,
             mountDebugDrawer: mountDebugDrawer,
-            // Drop-down drawer pattern — see canonical doc block above.
             registerDrawer: registerDrawer,
             openDrawer: openDrawer,
             closeDrawer: closeDrawer,
             toggleDrawer: toggleDrawer,
             closeAllDrawers: closeAllDrawers,
-            // Push-down panel (report chrome) — see canonical doc block above.
             registerPanel: registerPanel,
             togglePanel: togglePanel,
             closeAllPanels: closeAllPanels,
-            // Multi-select dropdown widget — see canonical comment block above.
             MultiSelect: MultiSelect
         };
     })();
@@ -1360,18 +1485,28 @@ window.FBLib = (function () {
     //  - A write REPLACES the whole value. Read-merge-write, never write a
     //    partial object.
     // ====================================================================
+    /** Org-wide payloads that an admin writes and every user reads, stored in userproperties (no saveReportData needed). */
     const SharedData = (function () {
         const _cache = new Map();
 
         function _esc(v) { return String(v == null ? '' : v).replace(/'/g, "''"); }
 
+        /**
+         * Returns the logged-in Fishbowl user's userName.
+         * @returns {string} The user name, or '' outside the client or on error.
+         */
         function currentUserName() {
             try {
                 if (typeof getUser !== 'function') return '';
                 return (JSON.parse(getUser() || '{}') || {}).userName || '';
             } catch (_) { return ''; }
         }
-        // The client-side twin of the SQL filter below. Keep them in step.
+        /**
+         * Tells whether the current user may publish shared data: userName 'admin', a listed name, or hasUserAccess('Admin').
+         * This is the client-side twin of the admin filter in read()'s SQL; keep the two in step.
+         * @param {string|string[]} [alsoTrust] - Extra user names to trust (case-insensitive).
+         * @returns {boolean} True for a trusted publisher.
+         */
         function isAdmin(alsoTrust) {
             const me = String(currentUserName() || '').toLowerCase();
             if (me === 'admin') return true;
@@ -1384,6 +1519,16 @@ window.FBLib = (function () {
             return key + '|' + (adminOnly ? 'a' : '*') + '|' + extra.join(',');
         }
 
+        /**
+         * Reads the newest shared payload stored under a key in userproperties (category 'Dashboard').
+         * The newest row wins by its _sharedAt or _masterPublishedAt stamp, else by row id. Results are cached per load.
+         * @param {string} key - The shared key, e.g. FB_REPORT.key + '.shared.v1'.
+         * @param {object} [opts] - Options.
+         * @param {boolean} [opts.adminOnly=true] - Trust only rows owned by an admin (see isAdmin).
+         * @param {string|string[]} [opts.alsoTrust] - Extra publisher user names to trust; pass the same list to write().
+         * @param {boolean} [opts.fresh=false] - Bypass the cache.
+         * @returns {?string} The raw stored string, or null when there is none or the read fails.
+         */
         function read(key, opts) {
             opts = opts || {};
             if (!key) return null;
@@ -1441,6 +1586,13 @@ window.FBLib = (function () {
             return out;
         }
 
+        /**
+         * Reads a shared payload and parses it as JSON; never throws.
+         * @param {string} key - The shared key.
+         * @param {*} [fallback=null] - Returned when nothing is stored, the JSON is bad or it isn't an object.
+         * @param {object} [opts] - Same options as read().
+         * @returns {?object} The parsed object, or the fallback.
+         */
         function readJson(key, fallback, opts) {
             const raw = read(key, opts);
             if (!raw) return (fallback === undefined ? null : fallback);
@@ -1450,6 +1602,10 @@ window.FBLib = (function () {
             } catch (_) { return (fallback === undefined ? null : fallback); }
         }
 
+        /**
+         * Drops cached read() results so the next read goes to the database.
+         * @param {string} [key] - Only this key's entries; omit to clear the whole cache.
+         */
         function invalidate(key) {
             if (!key) { _cache.clear(); return; }
             Array.from(_cache.keys()).forEach(function (ck) {
@@ -1457,8 +1613,17 @@ window.FBLib = (function () {
             });
         }
 
-        // Returns TRUE only when the value verifiably round-tripped. An in-memory
-        // success proves nothing — that is exactly the trap saveReportData set.
+        /**
+         * Writes a shared payload under a key, as the current user's own userproperties row (via saveSettings).
+         * Replaces the whole value, so read, merge, then write. True only when it verifiably round-tripped.
+         * @param {string} key - The shared key.
+         * @param {string} value - The value to store (coerced to a string; null becomes '').
+         * @param {object} [opts] - Options.
+         * @param {boolean} [opts.adminOnly=true] - Refuse unless isAdmin(); readers then trust admin rows only.
+         * @param {string|string[]} [opts.alsoTrust] - Extra trusted user names; use the same list as read().
+         * @param {boolean} [opts.verify=true] - Read back to confirm; false returns true as soon as it is saved.
+         * @returns {boolean} False when refused, when saving throws, or when the read-back doesn't match.
+         */
         function write(key, value, opts) {
             opts = opts || {};
             if (!key) return false;
@@ -1479,7 +1644,13 @@ window.FBLib = (function () {
             return back === str;
         }
 
-        // Stamps the payload so the newest publish is identifiable, then writes it.
+        /**
+         * Stamps a copy of an object with _sharedAt and _sharedBy, so the newest publish is identifiable, then writes it as JSON.
+         * @param {string} key - The shared key.
+         * @param {object} obj - The whole payload (a write replaces the stored value).
+         * @param {object} [opts] - Same options as write().
+         * @returns {boolean} write()'s result.
+         */
         function writeJson(key, obj, opts) {
             const payload = Object.assign({}, obj || {});
             payload._sharedAt = new Date().toISOString();
@@ -1506,6 +1677,7 @@ window.FBLib = (function () {
     //   4. defaults literal
     // Mirrors the working DashboardSettingsCore in Dashboard_Combined.htm.
     // ====================================================================
+    /** Layered preference resolver: the user's payload, then the admin master, then getProperty, then defaults. */
     const Settings = (function () {
         let _initialised = false;
         let _userKey = null;
@@ -1595,10 +1767,27 @@ window.FBLib = (function () {
             try { return JSON.parse(raw); } catch (_) { return null; }
         }
 
+        /**
+         * Tells whether users may change their own settings (an admin locks them with setLock).
+         * @returns {boolean} False only when the master payload sets _userEditingAllowed to false.
+         */
         function _userEditingAllowed() {
             return MASTER._userEditingAllowed !== false;
         }
 
+        /**
+         * Initialises the settings layers; call it before anything that calls resolve().
+         * Keys default from FB_REPORT.key + '.user.v1' / '.master.v1', with a warning past 41 characters.
+         * @param {object} [config] - Settings config.
+         * @param {string} [config.userKey] - Per-user loadSettings key.
+         * @param {string} [config.masterKey] - Master key for userProperties storage (and the localStorage fallback).
+         * @param {object} [config.defaults] - Fallback values by key.
+         * @param {object} [config.propFallback] - key: { name, dflt, parse? }, read with getProperty when no layer has the key.
+         * @param {string} [config.masterStorage='reportData'] - 'reportData' | 'userProperties' | 'none'.
+         *   reportData raises a native dialog in the BI editor preview; useReportDataMaster:false is a legacy alias for 'none'.
+         * @param {string[]} [config.defaultTileOrder] - Exposed as DEFAULT_TILE_ORDER.
+         * @param {object} [config.tileToTable] - Tile key to custom-field tableRefName, used by CfCatalog (TILE_TO_TABLE).
+         */
         function init(config) {
             config = config || {};
             // Keys default from the report's identity block, so a report copied
@@ -1652,6 +1841,11 @@ window.FBLib = (function () {
             _initialised = true;
         }
 
+        /**
+         * Resolves a setting: the user's value (unless an admin locked editing), then the master, then propFallback, then defaults.
+         * @param {string} key - The setting key.
+         * @returns {*} The resolved value, or undefined when no layer has it.
+         */
         function resolve(key) {
             const locked = MASTER && MASTER._userEditingAllowed === false;
             if (!locked && USER && USER[key] !== undefined) return USER[key];
@@ -1665,6 +1859,11 @@ window.FBLib = (function () {
             return _defaults[key];
         }
 
+        /**
+         * Resolves every known key into one object: defaults, propFallback, then keys saved in the user payload.
+         * User keys starting with '_' are skipped; master-only keys are not included.
+         * @returns {object} Setting key to resolved value.
+         */
         function effective() {
             const out = {};
             const seen = new Set();
@@ -1677,16 +1876,32 @@ window.FBLib = (function () {
             return out;
         }
 
+        /**
+         * Sets a key in the in-memory user payload; call saveUser() to persist it.
+         * @param {string} key - The setting key.
+         * @param {*} value - Any JSON-serialisable value.
+         */
         function setUserKey(key, value) { USER[key] = value; }
+        /**
+         * Persists the user payload through saveSettings.
+         * @returns {boolean} False (nothing saved) when an admin has locked editing and the user isn't an admin; else true.
+         */
         function saveUser() {
             if (MASTER._userEditingAllowed === false && !_isAdmin) return false;
             _writeSettings(_userKey, JSON.stringify(USER));
             return true;
         }
+        /** Empties the user payload in memory and in storage, so every key falls back to the master and defaults. */
         function clearUser() {
             USER = {};
             _writeSettings(_userKey, '');
         }
+        /**
+         * Publishes the admin master payload that every user resolves beneath their own values. Admins only.
+         * REPLACES the whole master (keeping the lock flag), so pass the full payload, not a patch. true is not a read-back check.
+         * @param {object} payload - The complete master settings.
+         * @returns {boolean} False when the user isn't an admin.
+         */
         function publishMaster(payload) {
             if (!_isAdmin) return false;
             const next = Object.assign({}, payload);
@@ -1695,6 +1910,12 @@ window.FBLib = (function () {
             _writeMaster(JSON.stringify(MASTER));
             return true;
         }
+        /**
+         * Locks or unlocks everyone's own settings by rewriting the master payload. Admins only.
+         * While locked, resolve() ignores user values and saveUser() refuses for non-admins.
+         * @param {boolean} locked - True to lock.
+         * @returns {boolean} False when the user isn't an admin.
+         */
         function setLock(locked) {
             if (!_isAdmin) return false;
             MASTER._userEditingAllowed = !locked;
@@ -1702,9 +1923,12 @@ window.FBLib = (function () {
             return true;
         }
 
-        // Intersect the user's saved CF id list for a tile with the live
-        // catalog, silently pruning fields that have been deactivated or
-        // deleted in Fishbowl since they were saved.
+        /**
+         * Returns the custom fields picked for a tile (the customFields setting), intersected with the live CF catalog.
+         * Fields deactivated or deleted in Fishbowl since they were saved are dropped silently. Empty until CfCatalog loads.
+         * @param {string} tileKey - The tile key, e.g. 'SO' (case-insensitive).
+         * @returns {object[]} CF definitions { id, name, description, fieldType, sortOrder, required, listId }, in saved order.
+         */
         function activeCfsFor(tileKey) {
             const code = String(tileKey || '').toUpperCase();
             const cfg = resolve('customFields') || {};
@@ -1728,12 +1952,25 @@ window.FBLib = (function () {
 
         return {
             init: init,
+            /** True once init() has run. */
             get _initialised() { return _initialised; },
             resolve: resolve,
             effective: effective,
+            /**
+             * Tells whether init() found the current user to be an admin (userName 'admin' or the Admin access right).
+             * @returns {boolean} True for an admin.
+             */
             isAdmin: function () { return _isAdmin; },
             userEditingAllowed: _userEditingAllowed,
+            /**
+             * Returns the live user payload object (not a copy); change it with setUserKey() and persist with saveUser().
+             * @returns {object} The user layer.
+             */
             getUser: function () { return USER; },
+            /**
+             * Returns the live admin master payload object (not a copy).
+             * @returns {object} The master layer, including its _userEditingAllowed flag.
+             */
             getMaster: function () { return MASTER; },
             setUserKey: setUserKey,
             saveUser: saveUser,
@@ -1741,7 +1978,9 @@ window.FBLib = (function () {
             publishMaster: publishMaster,
             setLock: setLock,
             activeCfsFor: activeCfsFor,
+            /** A copy of config.defaultTileOrder from init(). */
             get DEFAULT_TILE_ORDER() { return _defaultTileOrder.slice(); },
+            /** A copy of config.tileToTable from init(): tile key to custom-field tableRefName. */
             get TILE_TO_TABLE() { return Object.assign({}, _tileToTable); }
         };
     })();
@@ -1750,6 +1989,7 @@ window.FBLib = (function () {
     // FBLib.CfCatalog — discover all active custom fields and bucket them
     // by tile (using Settings.TILE_TO_TABLE). Runs ONCE per report load.
     // ====================================================================
+    /** Discovers every active custom field once per load and buckets it by tile (see Settings.TILE_TO_TABLE). */
     const CfCatalog = (function () {
         let loaded = false;
         let map = new Map();
@@ -1833,8 +2073,11 @@ window.FBLib = (function () {
             }
         }
 
-        // Defer until after first paint so it doesn't block the report's
-        // own initial query. Returns a Promise that resolves to the Map.
+        /**
+         * Loads the active custom-field catalog once, deferred past first paint so it doesn't block the report's own query.
+         * Buckets by Settings.TILE_TO_TABLE (call Settings.init first), then calls window.onFbLibCfCatalogLoaded if defined.
+         * @returns {Promise<Map<string, object[]>>} Tile key to CF definitions; the same promise on every call; empty on failure.
+         */
         function load() {
             if (readyPromise) return readyPromise;
             readyPromise = new Promise(function (resolve) {
@@ -1853,8 +2096,11 @@ window.FBLib = (function () {
 
         return {
             load: load,
+            /** True once load() has finished. */
             get loaded() { return loaded; },
+            /** The catalog Map (tile key to CF definitions); empty until load() finishes. */
             get map() { return map; },
+            /** The promise from the first load() call, or null before it. */
             get readyPromise() { return readyPromise; }
         };
     })();
@@ -1862,6 +2108,7 @@ window.FBLib = (function () {
     // ====================================================================
     // FBLib.CfCols — SQL injection + DOM rendering for active CFs
     // ====================================================================
+    /** Splices a tile's active custom fields into its SQL, header, filter row and body cells. */
     const CfCols = (function () {
         // Per-report registry mapping tileKey → window-level module name
         // (e.g. {'SO': 'ReportSO'}). Used to wire CF column-header sort
@@ -1871,6 +2118,11 @@ window.FBLib = (function () {
         // sortTable().
         const _tileModules = {};
 
+        /**
+         * Registers the window-level module whose sortTable(key) a tile's custom-field headers call when clicked.
+         * @param {string} tileKey - The tile key, e.g. 'SO'.
+         * @param {string} moduleName - Name of a global exposing sortTable(), e.g. 'ReportSO'.
+         */
         function registerTileModule(tileKey, moduleName) {
             _tileModules[String(tileKey).toUpperCase()] = moduleName;
         }
@@ -1883,6 +2135,11 @@ window.FBLib = (function () {
             } catch (_) { return []; }
         }
 
+        /**
+         * Escapes single quotes for a SQL string literal (same as Common.escSQL).
+         * @param {*} s - The value; null and undefined become ''.
+         * @returns {string} The escaped text, without surrounding quotes.
+         */
         function escSqlString(s) {
             return String(s == null ? '' : s).replace(/'/g, "''");
         }
@@ -1897,9 +2154,14 @@ window.FBLib = (function () {
                 .replace(/'/g, '&#39;');
         }
 
-        // Build the SELECT fragment to splice into a per-tile query.
-        // Returns a single space when no CFs are active so the existing
-        // query is byte-identical to the pre-CF behaviour.
+        /**
+         * Builds the SELECT-list fragment for a tile's active custom fields, each aliased cf_N (N = the field id).
+         * Returns a single space when none are active, so the query is unchanged.
+         * @param {string} tileKey - The tile key.
+         * @param {string} tableAlias - Alias of the table that holds customFields, e.g. 'so'.
+         * @param {boolean} [useMax=false] - Wrap each value in MAX() for a GROUP BY query.
+         * @returns {string} e.g. ", CustomFieldByName(so.customFields, 'Region') AS cf_12 " (note the leading comma).
+         */
         function sqlSelectFor(tileKey, tableAlias, useMax) {
             const cfs = _activeFor(tileKey);
             if (cfs.length === 0) return ' ';
@@ -1911,13 +2173,22 @@ window.FBLib = (function () {
             return ", " + parts.join(", ") + " ";
         }
 
+        /**
+         * Counts a tile's active custom-field columns.
+         * @param {string} tileKey - The tile key.
+         * @returns {number} The count; 0 before Settings.init() or when none are picked.
+         */
         function extraColCount(tileKey) {
             return _activeFor(tileKey).length;
         }
 
-        // Format a CF value for display. Date CFs use Common.formatDate so
-        // they match the rest of the report's date columns. Checkbox CFs
-        // render 'Yes' / 'No' so the dropdown filter can substring-match.
+        /**
+         * Formats a custom-field value for display by its field type.
+         * Dates use Common.formatDate, numbers toLocaleString, checkboxes 'Yes'/'No' (so the Yes/No filter can match).
+         * @param {object} cf - The CF definition (its fieldType is used).
+         * @param {*} value - The raw value.
+         * @returns {string} The display text; '' for null, undefined or ''.
+         */
         function formatValue(cf, value) {
             if (value === null || value === undefined || value === '') return '';
             const t = (cf.fieldType || '').toLowerCase();
@@ -1937,10 +2208,12 @@ window.FBLib = (function () {
             return String(value);
         }
 
-        // Append CF <th> headers + <td> filter cells to the existing
-        // <thead> of the tile's table. Idempotent — strips prior CF cells
-        // before re-adding. Wires the sort handler back through the host
-        // module's sortTable() (registerTileModule must have been called).
+        /**
+         * Appends a header cell per active custom field (plus an empty filter-row cell) to a tile table's head. Idempotent.
+         * Header clicks call the registered module's sortTable('cf_N'); see registerTileModule.
+         * @param {string|HTMLElement} containerOrTable - The table, a .tile-table, a container holding the table, or its id.
+         * @param {string} tileKey - The tile key.
+         */
         function injectHeader(containerOrTable, tileKey) {
             try {
                 const root = (typeof containerOrTable === 'string')
@@ -2009,6 +2282,12 @@ window.FBLib = (function () {
             return inp;
         }
 
+        /**
+         * Fills the filter-row cells added by injectHeader with inputs: a Yes/No select for checkbox fields, else a text box.
+         * Inputs carry data-filter="cf_N" and class cf-filter; the host wires their events.
+         * @param {string} tileKey - The tile key.
+         * @param {HTMLElement} filterRowEl - The table's tr.filter-row.
+         */
         function injectFilters(tileKey, filterRowEl) {
             try {
                 if (!filterRowEl) return;
@@ -2025,6 +2304,12 @@ window.FBLib = (function () {
             }
         }
 
+        /**
+         * Appends one formatted cell per active custom field to a body row, reading row['cf_N'].
+         * @param {object} row - The data row (from a query that used sqlSelectFor).
+         * @param {string} tileKey - The tile key.
+         * @param {HTMLTableRowElement} tr - The row element to append to.
+         */
         function injectCells(row, tileKey, tr) {
             const cfs = _activeFor(tileKey);
             cfs.forEach(function (cf) {
@@ -2046,10 +2331,13 @@ window.FBLib = (function () {
             return td;
         }
 
-        // Build a single CF cell for a key like 'cf_<id>'. Returns null if
-        // the key isn't a CF key or the CF isn't currently active. Lets
-        // hosts interleave CF cells with static cells inside one render
-        // loop instead of appending CFs at the end via injectCells().
+        /**
+         * Builds one custom-field cell for a column key like 'cf_12', so hosts can interleave CF and static cells in one loop.
+         * @param {object} row - The data row.
+         * @param {string} tileKey - The tile key.
+         * @param {string} key - The column key.
+         * @returns {?HTMLTableCellElement} The cell, or null when the key isn't a CF key or that CF isn't active.
+         */
         function buildCell(row, tileKey, key) {
             if (typeof key !== 'string' || key.indexOf('cf_') !== 0) return null;
             const id = parseInt(key.slice(3), 10);
@@ -2077,9 +2365,12 @@ window.FBLib = (function () {
             return null;
         }
 
-        // Format a raw CF value the same way injectCells would, so column
-        // filters compare against the displayed string (e.g. Date CFs
-        // match what moment.js rendered, not the raw SQL value).
+        /**
+         * Formats a raw value the way injectCells displays it, so column filters compare against the shown text.
+         * @param {string} filterKey - A key like 'cf_12'; the CF is looked up across every loaded tile.
+         * @param {*} rawValue - The raw SQL value.
+         * @returns {?string} The display text, or null when the key isn't a known CF.
+         */
         function formatForFilter(filterKey, rawValue) {
             const cf = _findCfByFilterKey(filterKey);
             return cf ? formatValue(cf, rawValue) : null;
@@ -2105,9 +2396,16 @@ window.FBLib = (function () {
     // [{key, label, alwaysOn?}, ...]. The user's hidden columns persist
     // in Settings under the `hiddenStandardColumns` key.
     // ====================================================================
+    /** Per-tile static-column manifests plus visibility and ordering helpers backed by FBLib.Settings. */
     const Columns = (function () {
         const _manifests = {};
 
+        /**
+         * Registers a tile's static-column manifest, replacing any earlier one.
+         * @param {string} tileKey - The tile key (case-insensitive).
+         * @param {Array<{key: string, label: (string|undefined), alwaysOn: (boolean|undefined)}>} manifest - Columns in default
+         *   order; label defaults to the key, and alwaysOn columns can't be hidden.
+         */
         function register(tileKey, manifest) {
             _manifests[String(tileKey).toUpperCase()] =
                 (manifest || []).map(function (c) {
@@ -2115,10 +2413,20 @@ window.FBLib = (function () {
                 });
         }
 
+        /**
+         * Returns a copy of a tile's registered column manifest.
+         * @param {string} tileKey - The tile key.
+         * @returns {Array<{key: string, label: string, alwaysOn: boolean}>} The columns, or [] when none are registered.
+         */
         function manifest(tileKey) {
             return (_manifests[String(tileKey).toUpperCase()] || []).slice();
         }
 
+        /**
+         * Returns the static column keys the user has hidden for a tile (the hiddenStandardColumns setting).
+         * @param {string} tileKey - The tile key.
+         * @returns {Set<string>} Hidden keys; empty before Settings.init(). May include alwaysOn keys, which stay visible.
+         */
         function hiddenSetFor(tileKey) {
             try {
                 if (!Settings._initialised) return new Set();
@@ -2128,13 +2436,24 @@ window.FBLib = (function () {
             } catch (_) { return new Set(); }
         }
 
+        /**
+         * Tells whether a static column is hidden for a tile; alwaysOn columns never are.
+         * @param {string} tileKey - The tile key.
+         * @param {string} key - The column key.
+         * @returns {boolean} True when hidden.
+         */
         function isHidden(tileKey, key) {
             const m = manifest(tileKey).find(function (c) { return c.key === key; });
             if (m && m.alwaysOn) return false;
             return hiddenSetFor(tileKey).has(key);
         }
 
-        // Filter a list of column keys, dropping any that are hidden.
+        /**
+         * Filters a list of column keys, dropping any the user has hidden (alwaysOn keys are kept).
+         * @param {string} tileKey - The tile key.
+         * @param {string[]} orderedKeys - Keys in display order.
+         * @returns {string[]} The visible keys, in the same order.
+         */
         function visibleKeysFrom(tileKey, orderedKeys) {
             const hidden = hiddenSetFor(tileKey);
             const m = manifest(tileKey);
@@ -2145,10 +2464,12 @@ window.FBLib = (function () {
             });
         }
 
-        // Walk the table's <thead> and hide any header / filter cells whose
-        // data-column / data-filter key is currently hidden. Idempotent
-        // (sets display:none on hidden cells; '' on visible cells). Pass
-        // either the container element or the table itself.
+        /**
+         * Shows or hides a table's header and filter-row cells by their data-column / data-filter keys. Idempotent.
+         * Custom-field (.cf-col) cells are skipped, and body cells are left to the host's render loop.
+         * @param {HTMLElement} rootEl - The table, or a container holding it.
+         * @param {string} tileKey - The tile key.
+         */
         function applyVisibilityToTable(rootEl, tileKey) {
             try {
                 if (!rootEl) return;
@@ -2177,8 +2498,11 @@ window.FBLib = (function () {
             }
         }
 
-        // Count of hidden static columns for this tile — used by render
-        // loops to adjust empty-state colspan.
+        /**
+         * Counts a tile's hidden static columns, e.g. to adjust an empty-state colspan.
+         * @param {string} tileKey - The tile key.
+         * @returns {number} Hidden columns, not counting alwaysOn ones.
+         */
         function hiddenCount(tileKey) {
             const hidden = hiddenSetFor(tileKey);
             const m = manifest(tileKey);
@@ -2188,13 +2512,13 @@ window.FBLib = (function () {
             return n;
         }
 
-        // Resolve the column order for a tile by merging the user's saved
-        // order (Settings key `columnOrder.<TILE>`) with the live set of
-        // valid keys (static manifest keys + 'cf_<id>' for each active CF).
-        // Unknown keys in the saved order are dropped; new keys not yet in
-        // the saved order are appended (statics in manifest order, then
-        // CFs in catalog order). Pass `fallbackOrder` (a starting array)
-        // for the case where nothing is saved yet.
+        /**
+         * Resolves a tile's column order: the user's saved columnOrder[TILE] limited to valid keys, then any new keys appended.
+         * Valid keys are the manifest's plus 'cf_N' per active CF; new ones go statics first (manifest order), then CFs.
+         * @param {string} tileKey - The tile key.
+         * @param {string[]} [fallbackOrder] - Starting order used when nothing is saved yet.
+         * @returns {string[]} Every valid key, once each.
+         */
         function resolveOrder(tileKey, fallbackOrder) {
             const code = String(tileKey || '').toUpperCase();
             const m = manifest(code);
@@ -2253,6 +2577,7 @@ window.FBLib = (function () {
     // calls this once per tile to build the DOM, then reads checkbox
     // state via the returned `read()` callback.
     // ====================================================================
+    /** Builds the settings-panel column picker: one collapsible, drag-to-reorder section per tile. */
     const Picker = (function () {
         // HTML5 drag-and-drop for a single picker row inside its body. The
         // grip is the only visual cue; we make the whole row draggable so
@@ -2300,16 +2625,18 @@ window.FBLib = (function () {
                 .replace(/'/g, '&#39;');
         }
 
-        // opts: {
-        //   tileKey:     'SO',
-        //   label:       'Sales Orders',
-        //   currentHiddenStatic: Set<string>,
-        //   currentSelectedCfs:  Set<number>,
-        //   onChange:    function()  // fired on each checkbox flip
-        // }
-        // Returns: { element, read() }
-        //   element — the <div.ds-cf-mod> to appendChild into the host
-        //   read()  — returns { tileKey, hiddenStatic: [...keys], selectedCfs: [...ids] }
+        /**
+         * Renders one collapsible picker section for a tile: its static columns and custom fields as drag-to-reorder checkboxes.
+         * A checked box means visible; alwaysOn columns are checked and disabled.
+         * @param {object} opts - Section options.
+         * @param {string} opts.tileKey - The tile key, e.g. 'SO'.
+         * @param {string} [opts.label] - Section heading, e.g. 'Sales Orders' (defaults to the tile key).
+         * @param {Set<string>} [opts.currentHiddenStatic] - Static keys currently hidden.
+         * @param {Set<number>} [opts.currentSelectedCfs] - CF ids currently shown.
+         * @param {Function} [opts.onChange] - Called on each checkbox flip and each drag reorder.
+         * @returns {{element: HTMLElement, read: Function}} element (a div.ds-cf-mod) to append; read() returns
+         *   { tileKey, hiddenStatic, selectedCfs, orderedKeys }, where orderedKeys is the row order with CFs as 'cf_N'.
+         */
         function renderTileSection(opts) {
             opts = opts || {};
             const tileKey = String(opts.tileKey || '').toUpperCase();
@@ -2525,6 +2852,7 @@ window.FBLib = (function () {
     //   table.setFilter(colKey, value);  // programmatic filter
     //   table.clearFilters();
     // ====================================================================
+    /** Sort, filter, drag-reorder, drag-resize and lazy-render scaffolding for a plain table; start with init(). */
     const Table = (function () {
 
         function _escHtml(s) {
@@ -2534,6 +2862,23 @@ window.FBLib = (function () {
             });
         }
 
+        /**
+         * Turns a table into a sortable, filterable, drag-reorder and drag-resize grid with lazy chunked rendering.
+         * See the FBLib.Table block above for the column shape and CSS. Nothing is drawn until you call render().
+         * @param {object} opts - Table options.
+         * @param {HTMLTableElement} opts.tableEl - The table; wrapped in a .fb-table-container if it isn't in one.
+         * @param {Function} opts.getRows - Returns the full row array; called on every render.
+         * @param {object[]} [opts.columns] - Column definitions { key, label, vis, width, align, filter, format, link, ... }.
+         * @param {number} [opts.chunkSize=200] - Rows appended per chunk.
+         * @param {boolean} [opts.lazy=true] - Append further chunks as the user scrolls.
+         * @param {Function} [opts.onSort] - Called with (key, dir) after a sort; both null when unsorted.
+         * @param {Function} [opts.onReorder] - Called with the reordered columns.
+         * @param {Function} [opts.onResize] - Called with (key, width) after a resize.
+         * @param {string} [opts.settingsKey] - FBLib.Settings key that persists order, widths, hidden columns and sort.
+         * @returns {object} API: render(), setColumns(cols), getColumns(), sort(key, dir?), getFilters(), setFilter(key, value),
+         *   clearFilters(), getVisibleRows(), element.
+         * @throws {Error} Without tableEl or getRows.
+         */
         function init(opts) {
             opts = opts || {};
             if (!opts.tableEl) throw new Error('FBLib.Table.init: tableEl required');
@@ -3024,11 +3369,20 @@ window.FBLib = (function () {
     //   row uses SUBTOTAL(109,…) rather than static values, so it follows
     //   whatever the user picks in the AutoFilter instead of going stale.
     // ====================================================================
+    /** File downloads that work in JxBrowser, plus CSV and native .xlsx writers (no CDN dependency). */
     const Export = (function () {
 
         const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 
         // ─── DOWNLOAD ────────────────────────────────────────────────
+        /**
+         * Downloads data as a file in a way that works in JxBrowser (an attached anchor, its URL revoked after 4 s).
+         * The Save-As dialog can open behind the Fishbowl window; tell users to Alt+Tab if nothing seems to happen.
+         * @param {Blob|string|BufferSource} data - The content; anything but a Blob is wrapped in a Blob of type mime.
+         * @param {string} [filename='download'] - The suggested file name.
+         * @param {string} [mime='application/octet-stream'] - MIME type for non-Blob data.
+         * @returns {string} The filename argument, as passed.
+         */
         function download(data, filename, mime) {
             const blob = (typeof Blob !== 'undefined' && data instanceof Blob)
                 ? data
@@ -3051,10 +3405,20 @@ window.FBLib = (function () {
         }
 
         // ─── SHARED HELPERS ──────────────────────────────────────────
+        /**
+         * Makes a filename-safe slug for composing a filename: runs of non-alphanumerics become '_', trimmed at both ends.
+         * @param {*} s - The text, e.g. a customer name.
+         * @param {string} [fallback='export'] - Returned when nothing is left.
+         * @returns {string} e.g. "Acme_Corp_Pty_Ltd".
+         */
         function slug(s, fallback) {
             const out = String(s == null ? '' : s).replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
             return out || (fallback || 'export');
         }
+        /**
+         * Returns today's local date as YYYY-MM-DD, for composing a filename.
+         * @returns {string} e.g. "2026-10-13".
+         */
         function stamp() {
             const d = new Date();
             return d.getFullYear() + '-' +
@@ -3102,9 +3466,15 @@ window.FBLib = (function () {
         }
 
         // ─── CSV ─────────────────────────────────────────────────────
-        // Kept alongside the xlsx path: plenty of downstream systems still
-        // want a plain delimited file, and it is the safe fallback if a
-        // site's Excel is locked down.
+        /**
+         * Downloads rows as a UTF-8 CSV (with a BOM so Excel reads it as UTF-8); every field is quoted.
+         * Kept beside xlsx() for systems that want a plain file, and as the fallback where Excel is locked down.
+         * @param {object} opts - CSV options.
+         * @param {string} [opts.filename='export'] - File name; '.csv' is added if missing.
+         * @param {object[]} opts.cols - Columns { key, label, type } (as for xlsx); dates use formatDate, money 2 decimals.
+         * @param {object[]} opts.rows - Row objects keyed by col.key.
+         * @returns {string} The file name used.
+         */
         function csv(opts) {
             opts = opts || {};
             const cols = opts.cols || [];
@@ -3490,6 +3860,18 @@ window.FBLib = (function () {
         }
 
         // ─── WORKBOOK ────────────────────────────────────────────────
+        /**
+         * Builds a formatted .xlsx workbook (real dates and numbers, banded rows, SUBTOTAL totals row) and downloads it.
+         * See the FBLib.Export block above for the sheet and column shapes. Percent cells want a fraction (0.82, not 82).
+         * @async
+         * @param {object} opts - Workbook options.
+         * @param {string} [opts.filename='export'] - File name; '.xlsx' is added if missing.
+         * @param {object[]} [opts.sheets] - Sheet specs { name, title, subtitle, cols, rows, totals, freeze, freezeCols, ... }.
+         * @param {object} [opts.sheet] - Single-sheet shorthand for sheets: [sheet].
+         * @param {string} [opts.headerFill='FF1E3A5F'] - ARGB header colour for every sheet.
+         * @returns {Promise<string>} The file name used.
+         * @throws {Error} When no sheets are supplied.
+         */
         async function xlsx(opts) {
             opts = opts || {};
             const sheets = (opts.sheets || (opts.sheet ? [opts.sheet] : [])).filter(Boolean);
@@ -3573,7 +3955,6 @@ window.FBLib = (function () {
             download: download,
             csv: csv,
             xlsx: xlsx,
-            // Small utilities reports use when composing a filename.
             slug: slug,
             stamp: stamp
         };
@@ -3640,6 +4021,7 @@ window.FBLib = (function () {
     // load fb-styles yet; it reads the fb-styles tokens with literal fallbacks,
     // so it follows the brand palette wherever fb-styles is present.
     // ====================================================================
+    /** Saved views (My views plus admin-published Company views) behind one compact header button; see attach(). */
     const FilterViews = (function () {
         const CSS_ID = 'fbLibFilterViewsStyle';
         const T = function (name, fallback) { return 'var(' + name + ',' + fallback + ')'; };
@@ -3775,6 +4157,21 @@ window.FBLib = (function () {
             try { return new Date(iso).toLocaleDateString(); } catch (_) { return String(iso).slice(0, 10); }
         }
 
+        /**
+         * Mounts the saved-views button and popover, wired to the page's filters. See the FBLib.FilterViews block above.
+         * Default mode reads .filter-row [data-filter] inputs, toggles and sort; pass capture and restore to own the state.
+         * @param {object} opts - Options (also canon, matches, describe, chips, storage, filterSelector, company, alsoTrust).
+         * @param {string} opts.tile - Tile key that scopes the stored views.
+         * @param {string|HTMLElement} opts.mount - Host element, or its id, for the button.
+         * @param {string[]} [opts.toggles] - Ids of checkboxes saved with a view.
+         * @param {Function} [opts.getSort] - Returns the live { col, dir }.
+         * @param {Function} [opts.setSort] - Applies a saved { col, dir }.
+         * @param {Function} [opts.apply] - Re-runs the page's filtering after a view loads (which should call changed()).
+         * @param {Function} [opts.capture] - Custom mode: returns the JSON-able state.
+         * @param {Function} [opts.restore] - Custom mode: applies a saved state; may return a Promise.
+         * @param {string} [opts.sharedKey] - Company-views SharedData key (default FB_REPORT.key + '.shared.v1').
+         * @returns {object} API: beforeLoad(), changed(), detach(), openDefault(), adoptDefault(), open(), close(), activeView.
+         */
         function attach(opts) {
             opts = opts || {};
             const TILE = String(opts.tile || '').toUpperCase();
@@ -4410,9 +4807,18 @@ window.FBLib = (function () {
     //                                            // just above `before`
     // limit: default FBLib.RowCap.DEFAULT (10,000); 0 or Infinity = no cap.
     // ====================================================================
+    /** Caps a large result at N rows with a "Load all" notice; see sql(), apply() and notice(). */
     const RowCap = (function () {
+        /** The row cap used when a limit is omitted (10,000). */
         const DEFAULT = 10000;
         const lim = n => (n == null ? DEFAULT : n);
+        /**
+         * Appends "LIMIT limit+1" to a query so apply() can tell a capped result from a complete one.
+         * Strips a trailing semicolon; a query that already ends in a LIMIT is left alone.
+         * @param {string} text - The SELECT statement.
+         * @param {number} [limit=RowCap.DEFAULT] - The cap; 0 or Infinity returns the query unchanged.
+         * @returns {string} The query to run.
+         */
         function sql(text, limit) {
             const n = lim(limit);
             if (!n || n === Infinity) return text;
@@ -4420,6 +4826,14 @@ window.FBLib = (function () {
             if (/\blimit\s+\d+(\s*,\s*\d+|\s+offset\s+\d+)?\s*$/i.test(s)) return s;
             return s + '\nLIMIT ' + (n + 1);
         }
+        /**
+         * Cuts a result fetched with sql() back to the cap and reports whether more rows matched.
+         * @param {object[]} rows - The fetched rows.
+         * @param {number} [limit=RowCap.DEFAULT] - The cap; 0 or Infinity means no cap.
+         * @param {object} [opts] - Options.
+         * @param {Function} [opts.keyOf] - Group key of a row; the cut then falls on a group boundary (one oversized group is kept whole).
+         * @returns {{rows: object[], capped: boolean, limit: number}} The rows to show, and the flags for notice().
+         */
         function apply(rows, limit, opts) {
             const n = lim(limit);
             rows = Array.isArray(rows) ? rows : [];
@@ -4435,6 +4849,17 @@ window.FBLib = (function () {
             }
             return { rows: rows.slice(0, end), capped: true, limit: n };
         }
+        /**
+         * Shows the "Showing the first N ... Load all" notice just above an element, or removes it when not capped.
+         * @param {object} opts - Notice options.
+         * @param {HTMLElement} opts.before - The element the notice sits above (e.g. the table wrapper).
+         * @param {boolean} opts.capped - apply()'s capped flag.
+         * @param {number} opts.limit - apply()'s limit.
+         * @param {Function} opts.onLoadAll - Called when Load all is clicked; re-run the query uncapped.
+         * @param {string} [opts.what='rows'] - Noun for the rows, e.g. 'orders'.
+         * @param {boolean} [opts.totals] - false drops the "Totals cover the rows shown" sentence.
+         * @param {string} [opts.html] - The whole message as HTML instead (the caller escapes it).
+         */
         function notice(opts) {
             opts = opts || {};
             const before = opts.before;
@@ -4496,8 +4921,23 @@ window.FBLib = (function () {
     // right edge to resize; double-click the edge to return every column
     // to its natural width.
     // ====================================================================
+    /** Resize, heading-click sort and drag-reorder for a report-rendered .rpt-table; see attach(). */
     const RptCols = (function () {
         const MIN_W = 36;
+        /**
+         * Adds resize, heading-click sort and drag-reorder to a report-rendered table whose headings are th[data-col].
+         * The report keeps rendering its rows and re-sorts on onSort; state is saved per user under opts.key.
+         * @param {object} opts - Options.
+         * @param {HTMLTableElement} opts.table - The .rpt-table.
+         * @param {string} [opts.key='rptCols'] - FBLib.Settings key for widths, order and sort.
+         * @param {Function|boolean} [opts.sortable] - Per-key predicate, or false to turn sorting off.
+         * @param {Function|boolean} [opts.draggable] - Per-key predicate, or false to turn reordering off.
+         * @param {Function} [opts.onSort] - Called with (key, dir); dir is 'asc', 'desc' or null for the report's own order.
+         * @param {Function} [opts.onReorder] - Called with the new column-key order.
+         * @param {string[]} [opts.pinned] - Keys kept first, in this order, and never moved.
+         * @param {boolean} [opts.noUnsorted] - Headings cycle asc and desc only.
+         * @returns {object} API: decorate(), arrange(columns, keyOf?), compare(a, b, valueOf), sort(), setSort(key, dir), reset().
+         */
         function attach(opts) {
             const table = opts.table;
             const KEY = opts.key || 'rptCols';
@@ -4693,10 +5133,15 @@ window.FBLib = (function () {
                 reset: () => { st = { order: [], widths: {}, sort: null }; save(); decorate(); }
             };
         }
-        // A totals row's cells for the columns in their current order: the
-        // label (identity html) spans the first run of columns that carry none
-        // of the row's figures; every figure keeps its own column, before or
-        // after that run. figs = { columnKey: html }.
+        /**
+         * Builds a group or totals row's cells for columns in their current order, so the row stays aligned after a reorder.
+         * The label spans the first run of columns with no figure; every figure keeps its own column, before or after it.
+         * @param {object[]} cols - The columns in display order (a truthy num gives a cell the num-cell class).
+         * @param {string} identity - The label's HTML.
+         * @param {object} figs - Column key to figure HTML.
+         * @param {object} [opts] - Options: keyOf(col), cell(col) for a custom cell, labelClass for the label cell.
+         * @returns {string} The row's td cells as HTML.
+         */
         function totalsCells(cols, identity, figs, opts) {
             opts = opts || {};
             const keyOf = opts.keyOf || (c => c.key);
@@ -4745,6 +5190,7 @@ window.FBLib = (function () {
     //   pv.pdfSpec()     // { head, rows, foot } <tr> strings for the PDF view
     //   pv.sheet()       // { name, cols, rows } for FBLib.Export.xlsx
     // ====================================================================
+    /** Pivot (cross-tab) view of a report's flat rows, with drill-down, PDF and Excel output; see mount(). */
     const Pivot = (function () {
         const BUCKETS = [['day', 'Day'], ['week', 'Week'], ['month', 'Month'], ['quarter', 'Quarter'], ['year', 'Year']];
         const AGGS = [['sum', 'Sum'], ['count', 'Count'], ['avg', 'Average'], ['min', 'Min'], ['max', 'Max']];
@@ -4752,6 +5198,12 @@ window.FBLib = (function () {
         const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
         const isNumType = t => t === 'number' || t === 'money' || t === 'qty';
 
+        /**
+         * Buckets a "YYYY-MM-DD..." date into a pivot period label.
+         * @param {string} v - The date value.
+         * @param {string} bucket - 'day' | 'week' | 'month' | 'quarter' | 'year'; anything else means day.
+         * @returns {string} e.g. "2026-10-13", "2026-W42" (ISO week), "2026-10", "2026-Q4" or "2026"; '(blank)' when too short.
+         */
         function bucketDate(v, bucket) {
             const s = String(v || '');
             if (s.length < 10) return '(blank)';
@@ -4769,6 +5221,20 @@ window.FBLib = (function () {
             return yyyy + '-' + mm + '-' + dd;
         }
 
+        /**
+         * Mounts a pivot view in a host element: row and column dimensions, a measure and its aggregate; click a cell to drill.
+         * Config is saved per user under opts.settingsKey. Nothing is drawn until you call render(). Field options: see above.
+         * @param {HTMLElement} host - The element to render into (its content is replaced).
+         * @param {object} opts - Options.
+         * @param {object[]} opts.fields - { key, label, type: 'text'|'date'|'number'|'money'|'qty', dim?, measure?, order?, ratio?, distinct? }.
+         * @param {Function} opts.rows - Returns the current flat rows.
+         * @param {object} [opts.defaults] - Initial rowDim, rowDim2, colDim, measure, agg, bucket choices and totals flags.
+         * @param {string} [opts.settingsKey='pivot'] - FBLib.Settings key.
+         * @param {Function} [opts.format] - (field, value) returns display text, or null for the default.
+         * @param {string} [opts.countLabel='Row count'] - Name of the count measure.
+         * @param {Function} [opts.onDrill] - (rows, title) replaces the built-in drill-down modal.
+         * @returns {object} API: render(), pdfSpec(), sheet(name?), relabel(key, label), config(), el, last().
+         */
         function mount(host, opts) {
             const fields = (opts.fields || []).map(f => Object.assign({ type: 'text' }, f));
             const byKey = {};

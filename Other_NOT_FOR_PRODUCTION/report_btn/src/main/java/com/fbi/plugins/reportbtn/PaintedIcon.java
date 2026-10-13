@@ -11,7 +11,7 @@ import java.awt.geom.Path2D;
 import java.awt.geom.RoundRectangle2D;
 
 /**
- * 24 px line icons for the Report Workspace toolbar. Fishbowl ships no Back,
+ * 24 px line icons for the Apps (beta) module toolbar. Fishbowl ships no Back,
  * Forward or Home toolbar image, so these are drawn, in the grey of the
  * client's own toolbar icons.
  */

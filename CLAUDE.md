@@ -33,11 +33,14 @@ node tools/deploy/build-deployed.js
 ## Report identity & build stamps
 
 Every production report starts its `<head>` (right after `<meta charset>`) with
-its module association, its description and an identity block:
+its module association, its folder, its origin (system apps only), its
+description and an identity block:
 
 ```html
 <meta charset="UTF-8">
 <meta name="fb-launch" content="SALES">
+<meta name="fb-folder" content="Dashboards">
+<meta name="fb-origin" content="system">
 <meta name="description" content="Dashboard tile: open sales orders.">
 <script>
     window.FB_REPORT = {
@@ -51,15 +54,40 @@ its module association, its description and an identity block:
 - **The `fb-launch` tag is the report's module association.** Its content is
   module keys (`SO`, `PO`, `RECEIPT`, …) and/or client menu-group keys (`SALES`,
   `PURCHASING`, `MATERIALS`, `MANUFACTURING`, `ACCOUNTING`, `SETUP`, `GENERAL`,
-  `REPORTING`, `INTEGRATIONS`). The Report Launcher groups by it, and report_btn
-  lists the report in those modules' Apps menu. Write the tag exactly once in a
-  page and never anywhere else: hosts read the first `name="fb-launch"` they find,
-  so not in comments, strings or inlined scripts.
+  `REPORTING`, `INTEGRATIONS`). It only decides which modules' **Reports ›
+  Apps** menus list the report (report_btn); it is not a folder. Write the tag
+  exactly once in a page and never anywhere else: hosts read the first
+  `name="fb-launch"` they find, so not in comments, strings or inlined scripts.
   `Other_NOT_FOR_PRODUCTION/Paperwork_POC/LAUNCH_CONTEXT.md` §1 and §3 have the keys.
+- **The `fb-folder` tag is the report's folder:** one name, no sub-folders.
+  It decides where the report sits in the App editor's Apps panel and the App
+  Library (the Report Launcher, renamed 2026-10-13), and nothing else. Use a
+  folder of Fishbowl's own report tree (Reporting › Reports › Company:
+  `Accounting`, `Customer`, `Inventory`, `Part`, `Product`, `Sales Order`,
+  `Purchase Order`, `Receiving`, `Picking`, `Ship`, `Work Order`,
+  `Manufacture Order`, …), so an iReport port sits where its stock report
+  lives; otherwise `Dashboards`, `Custom` (client work) or `Other`. A page
+  without the tag is *Unfiled*. The same write-once rule as `fb-launch`
+  applies; it goes on the line after the `fb-launch` tag. The Apps panel's
+  drag-and-drop and *Move to folder* rewrite it, or add it to pages without one.
+- **The `fb-origin` tag marks a system app:** `content="system"` for an app
+  that ships with Fishbowl. Today that means every iReport port, every
+  `Dashboards/` page (including Individual Pages) and the Paperwork POC
+  replicas. Anything else is custom, and needs no tag (`content="custom"`
+  says it explicitly, and is what a copy of a system app gets). The App
+  editor locks a system app's code, name, description, folder and Apps
+  menus, even for admin. Users duplicate it to change it, and Delete offers
+  to deactivate it instead; Active, Published, gadget and access stay
+  changeable. The Apps panel draws system apps black and custom ones green,
+  as Fishbowl's report tree does. The editor won't save a page newly marked
+  system (it offers to save it as custom), so system apps reach Fishbowl
+  only through this repo's deploy. The same write-once rule applies; it goes
+  on the line after the `fb-folder` tag. A new report is custom: leave the
+  tag out.
 - **The description** is one short sentence. Deploy and publish copy it into the
   Fishbowl and SharePoint description wherever that is empty or only repeats the
-  name; a description written in Fishbowl is kept. The Launcher shows it on the
-  tile and in full in the tile's hover tooltip.
+  name; a description written in Fishbowl is kept. The App Library shows it on
+  the tile and in full in the tile's hover tooltip.
 
 - **`key`** is the prefix of every key the report stores (settings, saved
   views, shared payloads). Build them as `FB_REPORT.key + '.user.v1'` etc.,
@@ -80,18 +108,18 @@ its module association, its description and an identity block:
   `git config core.hooksPath tools/githooks`. Manual commands:
   `node tools/stamp/stamp.js` (all files), `--check` (verify only), `--list`.
 - **`name`** is the report's Fishbowl record name: a **plain name, no
-  `- Folder -` prefix** (prefixes were dropped on 2026-10-12; grouping now comes
-  from the `fb-launch` tag). Publishing and deploying (below) find the report's
+  `- Folder -` prefix** (prefixes were dropped on 2026-10-12; the folder is the
+  `fb-folder` tag). Publishing and deploying (below) find the report's
   copies by it. `null` means the report isn't published or deployed anywhere.
   Don't "tidy" an existing name: the name identifies the record, so renaming
   creates a duplicate on the next import. When a rename is wanted, rename every
   copy in place: `fbdeploy.js --rename <old> --to <new>` in Fishbowl and
   `publish.js --rename <old> <file>` on SharePoint.
 - **New reports** start from `Template/Core_Dashboard_Template.htm`, which
-  already has the block. **Ask the user what the report should be named and
-  which module or menu group it belongs to** before creating it. Set `name` to
-  that, name the file after it, set the `fb-launch` tag and write a one-line
-  description. Give the report a unique key and leave `build` as `'UNSTAMPED'`;
+  already has the block. **Ask the user what the report should be named,
+  which modules' Apps menus should list it, and which folder it goes in**
+  before creating it. Set `name` to that, name the file after it, set the
+  `fb-launch` and `fb-folder` tags and write a one-line description. Give the report a unique key and leave `build` as `'UNSTAMPED'`;
   the next write stamps it. Its first write also asks where it should be
   deployed (see *Where an edit goes*).
 

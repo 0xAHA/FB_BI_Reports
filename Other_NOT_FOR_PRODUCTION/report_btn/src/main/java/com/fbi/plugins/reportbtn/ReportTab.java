@@ -1,6 +1,5 @@
 package com.fbi.plugins.reportbtn;
 
-import com.evnt.client.modules.ClientModuleImpl;
 import com.evnt.client.modules.bireport.panels.BiBrowserPanel;
 
 import javax.swing.BorderFactory;
@@ -13,7 +12,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * One Report Workspace tab: a native BiBrowserPanel and the tab's history.
+ * One Apps (beta) tab: a native BiBrowserPanel and the tab's history.
  *
  * History is a list of report ids kept here, not Chromium's: BiBrowserPanel and
  * its BiBrowser remember only the report given to the last loadHTML (the id that
@@ -21,7 +20,7 @@ import java.util.List;
  * would show an older page while those still pointed at the newer report, so
  * every step reloads its report through the native path.
  */
-final class ReportTab extends JPanel {
+final class ReportTab extends JPanel implements WorkspaceTab {
 
     static final class Entry {
         final int id;
@@ -36,6 +35,7 @@ final class ReportTab extends JPanel {
     private static final String BROWSER = "browser";
     private static final String MESSAGE = "message";
 
+    private final ReportWorkspacePlugin module;
     private final int serial;
     private final CardLayout cards = new CardLayout();
     private final BiBrowserPanel browser = new BiBrowserPanel();
@@ -43,7 +43,8 @@ final class ReportTab extends JPanel {
     private final List<Entry> history = new ArrayList<>();
     private int index = -1;
 
-    ReportTab(ClientModuleImpl module, int serial) {
+    ReportTab(ReportWorkspacePlugin module, int serial) {
+        this.module = module;
         this.serial = serial;
         setLayout(cards);
         // The page's own openModule calls resolve through this module, as in the BI module.
@@ -101,13 +102,27 @@ final class ReportTab extends JPanel {
         }
     }
 
+    /** Re-shows the current report (e.g. after its page was saved). History is unchanged. */
+    void reload(ReportLoader.Loaded loaded) {
+        if (index >= 0) {
+            history.set(index, new Entry(loaded.report.getId(), loaded.report.getName()));
+            render(loaded);
+        }
+    }
+
     /** A note in place of a report (e.g. no Home report). History is unchanged. */
     void showMessage(String html) {
         message.setText("<html><div style='text-align:center;width:420px'>" + html + "</div></html>");
         cards.show(this, MESSAGE);
     }
 
-    void dispose() {
+    @Override
+    public boolean confirmClose() {
+        return true;
+    }
+
+    @Override
+    public void dispose() {
         try {
             browser.dispose();
         } catch (Exception e) {
@@ -116,13 +131,15 @@ final class ReportTab extends JPanel {
     }
 
     // As BiReportModuleClient does: clear, then load. window.FB_WORKSPACE tells the
-    // page it is in the workspace and what Back / Forward can do.
+    // page it is in the workspace, what Back / Forward can do, and any extension's
+    // flags (e.g. edit: the page editor is there and the user may use it).
     private void render(ReportLoader.Loaded loaded) {
         String json = "{\"v\":1,\"module\":" + AppLauncher.jsonString(ReportWorkspacePlugin.MODULE_NAME)
             + ",\"tab\":" + serial
             + ",\"reportId\":" + loaded.report.getId()
             + ",\"canBack\":" + canBack()
-            + ",\"canForward\":" + canForward() + "}";
+            + ",\"canForward\":" + canForward()
+            + module.workspaceFlags(loaded.report.getId()) + "}";
         String html = AppLauncher.insertScript(loaded.html, "FB_WORKSPACE", json);
         cards.show(this, BROWSER);
         browser.clear();

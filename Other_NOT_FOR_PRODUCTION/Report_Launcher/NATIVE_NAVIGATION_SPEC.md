@@ -2,7 +2,7 @@
 
 **For:** Fishbowl client developers.
 **Status:** proposal. A working plugin version of every behaviour here is the
-**Report Workspace** in [`../report_btn`](../report_btn/README.md) (0.4.0).
+**Apps (beta)** in [`../report_btn`](../report_btn/README.md) (0.4.0).
 **Basis:** the 26.9.1 client jars (`fbswing`, `client`, `jxbrowser` 8.12.2), read on 2026-10-12.
 
 ## The problem
@@ -116,7 +116,7 @@ A link to a report the user can't open should say so, not fail silently.
 | Native change | Plugin equivalent (report_btn 0.4.0) |
 |---|---|
 | `BiReportModuleClient.handleHyperLink` | `ReportWorkspacePlugin.handleHyperLink` + `WorkspaceLink` |
-| Tabs in the BI module | The Report Workspace module's `FBTabbedPane` of `ReportTab`s |
+| Tabs in the BI module | The Apps (beta) module's `FBTabbedPane` of `ReportTab`s |
 | Back / Forward / Home | The workspace toolbar; `ReportTab` keeps the id history |
 | Load path | `ReportLoader`: `BI_REPORT_LOAD`, `REPLACE_INCLUDES_BI_SCRIPT`, saved params |
 | `window.FB_NAV` | `window.FB_WORKSPACE`, inserted into the page before `loadHTML` |

@@ -1,0 +1,1309 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Part Cost Over Time (iReport port)
+  PATH:   iReport_Ports/Part/PartCostOverTime.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard Part/PartCostOverTime.jrxml ("This report
+  generates a part's costing information over a specified date range."). Same
+  source, same rules, same figures and chart; only the presentation is
+  interactive.
+
+    Parts      Every part (part number LIKE, case-insensitive; % is a
+               wildcard) with at least one cost layer created in the date
+               range (default This month, as the original's dateRange
+               parameter).
+    Figures    Per part, as the original prints them:
+                 Std. Cost   part.stdCost.
+                 First Cost  unit cost (orgTotalCost / orgQty) of the part's
+                             FIRST cost layer ever.
+                 Last Cost   unit cost of its LATEST cost layer ever.
+                 Low / High  lowest / highest unit cost over ALL its layers.
+                 Avg. Cost   the average cost in the part's latest nightly
+                             capture (partcosthistory, highest id) on or
+                             before the range's end date.
+               First / Last / Low / High cover every layer the part has ever
+               had, not just the range, exactly as the original computes
+               them (its cost sub-query has no date filter). The range picks
+               the parts and the chart's points. The chart caption gives the
+               range's own lowest and highest.
+    Chart      The original's "Timeline" sub-dataset: one point per cost
+               layer created in the range, its unit cost, in date order,
+               evenly spaced (a category axis, as Jasper's line chart),
+               labelled with the layer's date and time, rotated -45°, the
+               value axis from zero, no legend.
+    Order      Part number (see the differences).
+
+  Layout: the REPORT chrome (fb-styles §35): 56px header, push-down filter
+  panel that applies as you change it, .rpt-table with one line per part;
+  under each line its chart (Expand / Collapse, or click the line).
+  Table tools (fb-lib FBLib.RptCols / RowCap / Pivot): column headings sort
+  the parts (asc, desc, then part number), drag to reorder, the edge to
+  resize (remembered per user); the charts stay with their part. The cost
+  layers are fetched first, at most 10,000, cut back to whole parts, with
+  Load all; the parts' figures are then fetched for exactly those parts.
+  A Table / Pivot view selector: the cost layers in the range by part and
+  date (by month by default; day, week, quarter or year), measured as the
+  weighted unit cost (total cost / quantity), the layer unit cost (average,
+  lowest, highest), quantity, total cost or the layer count, with
+  drill-down to the layers.
+  Views: the header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+  report out as pages like the original: Letter portrait by default, the
+  company / title / date range band on every page (the original's page
+  header), then one page per part: its number and description over a rule
+  (the original's column header), the six figures in two columns, a rule,
+  and the chart, as large as the page allows (the original's 510pt on
+  Letter portrait), "Page X of Y". A part whose chart is collapsed prints
+  its figures only, and with every chart collapsed the pages are a plain
+  table, one line per part. The Pivot view prints the pivot. The paper size
+  and orientation, and the view, are remembered per user. Print prints those
+  pages in either view.
+  Launch: opened from the Part or Inventory module (a PART record) or the
+  Product module (a product with a part), the part filter starts on that
+  part exactly; the status line ends "from <module> module". A launch is
+  never remembered as the user's filter. A launch for another module is
+  logged to the debug console and ignored.
+
+  Deliberate differences:
+    - Each part's chart plots that part's layers. The original's chart
+      dataset is run with the report's part-number PARAMETER, not the row's
+      part, so with a wildcard every page drew every matching part's layers
+      (as unlabelled series, the legend being off).
+    - Every layer is its own point. The original's category is the date and
+      time to the minute, so layers of a part created in the same minute
+      collapsed into one point (15% of all layers on the live database).
+    - Axis labels are thinned when the layers are too many to label without
+      overlapping; the original drew them all over each other. Every point
+      has a hover tooltip in the App view.
+    - A part with layers in the range but no nightly cost capture on or
+      before the end date (e.g. a part first received today, captured
+      tonight) is listed with Avg. Cost "n/a"; the original's inner join
+      dropped the part altogether (13 of 918 parts on the live database for
+      All dates; 14 of 93 parts on a test server for 2025).
+    - Ordered by part number; the original's SELECT DISTINCT has no ORDER
+      BY, so its order was the database's.
+    - The query is rewritten: one row per part with a layer in the range,
+      each figure a sub-query on that part's own layers / captures (both
+      tables are indexed by part). Same rows and figures as the original
+      (run side by side on a Fishbowl server for five ranges / part
+      patterns: every row and chart point identical). The original's plan
+      joins every layer in the range to every part's roll-up and capture
+      (MySQL estimates 4.8 billion rows); this one takes 0.1-1.2 s live.
+    - A tie on a first / last layer's exact creation time picks the lowest
+      layer id; the original's LIMIT 1 had no order (no ties exist live).
+  Additions: the in-range low / high in the chart caption, the capture date
+  and layer dates as tooltips, the pivot, Part links, Excel.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-launch" content="MATERIALS">
+    <meta name="fb-folder" content="Part">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="Each part's standard, first, last, low, high and average cost, with a chart of its cost layers over a date range.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipPartCostTime',
+            name:  'Part Cost Over Time',
+            build: '2026.10.14-2a71df9'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Part Cost Over Time — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table th { cursor: default; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        .na { color: var(--c-tertiary); }
+        tr.pct-part { cursor: pointer; }
+        tr.pct-part.is-open td { background: var(--bg-1); font-weight: 600; }
+        tr.pct-part.is-open td .fb-row-link { font-weight: 700; }
+        .pct-tog { display: inline-block; width: 16px; color: var(--c-tertiary); font-size: 10px; }
+        .rpt-table tbody tr.pct-chart-row td.pct-chart-cell { max-width: none; overflow: visible; padding: 6px 16px 16px 30px; background: #fff; cursor: default; }
+        .pct-cap { font-size: 12px; color: var(--c-secondary); margin: 2px 0 6px; }
+        .pct-cap b { color: var(--c-primary); font-weight: 600; }
+        .pct-chart svg { display: block; width: 100%; max-width: 1100px; height: auto; }
+        .rpt-table tbody tr.pct-chart-row:hover td.pct-chart-cell { background: #fff; }
+        .pct-tip { position: fixed; z-index: 9000; pointer-events: none; display: none; background: #fff; border: 1px solid var(--border-strong);
+            border-radius: 8px; box-shadow: 0 4px 14px rgba(0,0,0,.12); padding: 6px 10px; font-size: 12px; line-height: 1.45; color: var(--c-primary); }
+        .pct-tip .m { color: var(--c-secondary); }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>Part Cost Over Time</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <div class="rpt-viewsel" id="viewSelWrap" title="Table: each part's costs and chart, as the standard report. Pivot: the cost layers by part and month (or any date grouping)">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 5h18M3 10h10M3 15h18M3 20h10" stroke-linecap="round"/></svg>
+            <select id="viewSel">
+                <option value="table">Table</option>
+                <option value="pivot">Pivot</option>
+            </select>
+        </div>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="split-btn">
+            <button id="expandBtn" class="hdr-btn" type="button" title="Show every part's chart">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+                Expand
+            </button>
+            <button id="collapseBtn" class="hdr-btn" type="button" title="Hide the charts: one line per part">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 12h14" stroke-linecap="round"/></svg>
+                Collapse
+            </button>
+        </span>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook (parts and their cost layers)">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages: a page per part with its chart, as the standard report">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Date range</div>
+            <div>
+                <div class="rpt-flabel">Quick range</div>
+                <select id="fRange"></select>
+            </div>
+            <div class="rpt-dates">
+                <input type="date" id="fFrom" aria-label="From">
+                <span class="rpt-fnote">→</span>
+                <input type="date" id="fTo" aria-label="To">
+            </div>
+            <div class="rpt-fnote">Parts with a cost layer created in the range;<br>the chart plots those layers.</div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">What</div>
+            <div>
+                <div class="rpt-flabel">Part number</div>
+                <input type="text" id="fPart" placeholder="All parts (% is a wildcard)">
+            </div>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own sort">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters the starting point for everyone who hasn't saved their own.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>How a part's cost has moved: every part that got stock (a <strong>cost layer</strong>: a receipt, a finished build, an adjustment in) in the date range, with its costs and a chart of each layer's unit cost. It is the BI version of the standard <strong>Part Cost Over Time</strong> report and reads the same data the same way.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">The figures</div>
+                <ul>
+                    <li><strong>Std. Cost</strong>: the part's standard cost.</li>
+                    <li><strong>First / Last Cost</strong>: the unit cost of the part's first and latest cost layer <em>ever</em>.</li>
+                    <li><strong>Low / High Cost</strong>: the lowest and highest unit cost over <em>all</em> its layers, as the standard report. The chart's caption gives the range's own low and high.</li>
+                    <li><strong>Avg. Cost</strong>: the average cost Fishbowl captured overnight on or before the range's end date (the latest capture of the part). <strong>n/a</strong> = no capture yet, e.g. stock first received today.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>Filter changes apply straight away. <strong>Part number</strong> takes % as a wildcard.</li>
+                    <li>Click a part's line to show or hide its chart; <strong>Expand</strong> / <strong>Collapse</strong> do every part (remembered). Hover a chart for each layer's date, unit cost and quantity. Click a part number to open it in the Part module.</li>
+                    <li>Click a column heading to sort the parts (again to reverse, a third time for part order). Drag a heading onto another to move the column; drag a heading's right edge to resize it. Your layout is remembered; <strong>Settings → Reset column layout</strong> undoes it.</li>
+                    <li>The <strong>Table / Pivot</strong> selector switches to a pivot of the cost layers: by default each part's weighted unit cost (total cost ÷ quantity) per month. Pick another date grouping, measure (layer unit cost average / lowest / highest, quantity, total cost, layer count) or dimension; click a figure to see the layers behind it. Print, PDF and Excel follow the view on screen.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable pages, laid out like the standard report: a page per part with its chart. A collapsed part prints without its chart; with every chart collapsed the pages are a one-line-per-part list. In PDF view pick the paper size and orientation in the bar above the pages; they are remembered. <strong>Print</strong> prints those pages.</li>
+                    <li>Opened from the Part, Inventory or Product module's Apps menu, the report starts on that part.</li>
+                    <li>A very large result shows the parts whose layers fit in the first 10,000, with a <strong>Load all</strong> button.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-app" id="appView">
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+</div>
+<div class="pivot-host" id="pivotHost" style="display:none"></div>
+</div>
+<div class="pct-tip" id="pctTip"></div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.RowCap) missing.push('FBLib.RowCap');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const TITLE = 'Part Cost Over Time';
+// The original's dateRange parameter defaults to "This Month".
+const DEFAULT_FILTERS = { range: 'thisMonth', from: '', to: '', part: '' };
+const QUERY_KEYS = ['range', 'from', 'to', 'part'];
+const MODULE_NAME = { PART: 'Part', PROD: 'Product' };
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false, charts: 'open' }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const dstr = v => { const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v ?? '')); return m ? m[1] : ''; };
+const fmtDate = v => { const d = dstr(v); return d ? FBLib.Common.formatDate(d) : ''; };
+const hhmm = v => { const m = /\d{4}-\d{2}-\d{2}[ T](\d{2}:\d{2})/.exec(String(v ?? '')); return m ? m[1] : ''; };
+const fmtDateTime = v => [fmtDate(v), hhmm(v)].filter(Boolean).join(' ');
+const openLink = (module, number, title) => number
+    ? `<a class="fb-row-link" data-open="${esc(module)}" data-num="${esc(number)}"${title ? ` title="${esc(title)}"` : ''}>${esc(number)}</a>` : '';
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const cut = s => `<span title="${esc(s)}">${esc(s)}</span>`;
+const loc = () => FBLib.Common.currency().locale;
+
+// Costs and quantities at the system's report precision (the original's
+// REPORT_DECIMAL_COST pattern; quantities REPORT_DECIMAL_QTY), home currency
+// symbol.
+let COST_DP = 2, QTY_DP = 5;
+function fmtCost(v) {
+    const n = num(v), c = FBLib.Common.currency();
+    return (n < 0 ? '-' : '') + c.symbol + Math.abs(n).toLocaleString(c.locale, { minimumFractionDigits: COST_DP, maximumFractionDigits: COST_DP });
+}
+const fmtQty = v => num(v).toLocaleString(loc(), { maximumFractionDigits: QTY_DP });
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// ---- Date ranges (Fishbowl's "This Month" etc.) ----
+const RANGES = [
+    ['custom', 'Custom…'], ['all', 'All dates'], ['today', 'Today'], ['yesterday', 'Yesterday'], ['last7', 'Last 7 days'],
+    ['thisMonth', 'This month'], ['lastMonth', 'Last month'], ['thisQuarter', 'This quarter'], ['lastQuarter', 'Last quarter'],
+    ['thisYear', 'This year'], ['lastYear', 'Last year']
+];
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const isYmd = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+
+// A quick range as [from, to] ISO dates, or null for "All dates".
+function presetDates(key) {
+    const t = new Date(); t.setHours(0, 0, 0, 0);
+    const y = t.getFullYear(), m = t.getMonth(), d = t.getDate(), qm = Math.floor(m / 3) * 3;
+    const D = (yy, mm, dd) => new Date(yy, mm, dd);
+    const r = {
+        today: [t, t], yesterday: [D(y, m, d - 1), D(y, m, d - 1)], last7: [D(y, m, d - 6), t],
+        thisMonth: [D(y, m, 1), D(y, m + 1, 0)], lastMonth: [D(y, m - 1, 1), D(y, m, 0)],
+        thisQuarter: [D(y, qm, 1), D(y, qm + 3, 0)], lastQuarter: [D(y, qm - 3, 1), D(y, qm, 0)],
+        thisYear: [D(y, 0, 1), D(y, 11, 31)], lastYear: [D(y - 1, 0, 1), D(y - 1, 11, 31)]
+    }[key];
+    return r ? [ymd(r[0]), ymd(r[1])] : null;
+}
+// { start, end, endExcl, label } for the filter, or null for no date limit.
+function dateRange(f) {
+    let a = f.from, b = f.to;
+    if (f.range !== 'custom') { const p = presetDates(f.range); if (!p) return null; [a, b] = p; }
+    if (!isYmd(a) && !isYmd(b)) return null;
+    a = isYmd(a) ? a : '1900-01-01'; b = isYmd(b) ? b : '2999-12-31';
+    if (a > b) [a, b] = [b, a];
+    const after = new Date(b + 'T00:00:00'); after.setDate(after.getDate() + 1);
+    return { start: a, end: b, endExcl: ymd(after), label: FBLib.Common.formatDate(a) + ' - ' + FBLib.Common.formatDate(b) };
+}
+// DATE(col) BETWEEN start AND end, written so an index on col can be used.
+const dateWhere = (col, r) => `${col} >= '${r.start} 00:00:00' AND ${col} < '${r.endExcl} 00:00:00'`;
+// The original's page-header line ("Date Range: All" for Fishbowl's All).
+function rangeText(f) { const r = dateRange(f); return 'Date Range: ' + (r ? r.label : 'All'); }
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS — the panel applies as it changes (one short debounce). Every
+//  filter re-queries.
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _hydrating = false, _applyTimer = null;
+const S = {
+    parts: [], layers: [], byNum: new Map(), company: '', loadedAt: null, view: 'table', noCap: false, cap: null,
+    charts: 'open', toggled: new Set(),          // charts open or closed by default; the parts toggled the other way
+    launch: null                                 // { num, module } when opened for a record
+};
+
+function readFilters() {
+    return {
+        range: document.getElementById('fRange').value,
+        from: document.getElementById('fFrom').value,
+        to: document.getElementById('fTo').value,
+        part: document.getElementById('fPart').value.trim()
+    };
+}
+function writeFilters(f) {
+    _hydrating = true;
+    document.getElementById('fRange').value = RANGES.some(r => r[0] === f.range) ? f.range : DEFAULT_FILTERS.range;
+    const p = f.range === 'custom' ? [f.from, f.to] : (presetDates(f.range) || ['', '']);
+    document.getElementById('fFrom').value = p[0] || '';
+    document.getElementById('fTo').value = p[1] || '';
+    document.getElementById('fPart').value = f.part || '';
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+// A launched part is never remembered as the user's filter.
+function remember() { if (!S.launch && _resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const requery = QUERY_KEYS.some(k => JSON.stringify(next[k]) !== JSON.stringify(F[k]));
+        F = next;
+        remember();
+        if (requery) { S.noCap = false; loadAll(); } else render(false);
+    }, 250);
+}
+
+// ============================================================================
+//  SQL — the original's main query and its "Timeline" chart dataset.
+//  The part filter: UPPER(num) LIKE UPPER(pattern), as the original; a
+//  launched part matches exactly (part numbers may hold _ or %).
+// ============================================================================
+function partCond(f, col) {
+    if (S.launch && f.part === S.launch.num) return `${col} = '${sqlStr(f.part)}'`;
+    if (!f.part) return '';
+    return `UPPER(${col}) LIKE UPPER('${sqlStr(f.part.replace(/\*/g, '%'))}')`;
+}
+
+// The chart's points: every cost layer created in the range, in part order
+// then date order (so a capped result cuts between parts).
+function layersSQL(f) {
+    const r = dateRange(f);
+    const w = [partCond(f, 'part.num'), r ? dateWhere('costlayer.datecreated', r) : ''].filter(Boolean);
+    return `
+        SELECT costlayer.id AS layerid, costlayer.partid, part.num AS partnum,
+               DATE_FORMAT(costlayer.datecreated, '%Y-%m-%d %H:%i:%s') AS datecreated,
+               costlayer.orgqty AS qty, costlayer.orgtotalcost AS totalcost
+        FROM costlayer
+        INNER JOIN part ON part.id = costlayer.partid
+        ${w.length ? 'WHERE ' + w.join('\n          AND ') : ''}
+        ORDER BY part.num, costlayer.datecreated, costlayer.id`;
+}
+
+// One row per part: the original's figures, for the parts with a layer in
+// the range (`inr`). Each figure is a sub-query on that part's own layers /
+// captures (both tables are indexed by part); the original grouped every
+// cost layer and every capture first. lastNum: the last part the (capped)
+// layer query reached.
+function partsSQL(f, lastNum) {
+    const r = dateRange(f);
+    const pc = partCond(f, 'p.num');
+    const rangeW = [r ? dateWhere('cl.datecreated', r) : '', pc].filter(Boolean);
+    const inr = `SELECT cl.partid, COUNT(*) AS layers FROM costlayer cl${pc ? ' JOIN part p ON p.id = cl.partid' : ''}` +
+        `${rangeW.length ? ' WHERE ' + rangeW.join(' AND ') : ''} GROUP BY cl.partid`;
+    const capW = r ? ` AND h.datecaptured < '${r.endExcl} 00:00:00'` : '';
+    const layer = (col, at) => `COALESCE((SELECT l.orgtotalcost / l.orgqty FROM costlayer l
+                         WHERE l.partid = x.partid AND l.datecreated = x.${at} ORDER BY l.id LIMIT 1), 0) AS ${col}`;
+    return `
+        SELECT x.partid, x.partnum, x.partdesc, x.stdcost,
+               COALESCE(x.lowcost, 0) AS lowcost, COALESCE(x.highcost, 0) AS highcost,
+               COALESCE(pch.avgcost, 0) AS avgcost,
+               CASE WHEN pch.id IS NULL THEN 0 ELSE 1 END AS captured,
+               COALESCE(DATE_FORMAT(pch.datecaptured, '%Y-%m-%d %H:%i:%s'), '') AS capturedat,
+               DATE_FORMAT(x.firstdate, '%Y-%m-%d %H:%i:%s') AS firstdate,
+               DATE_FORMAT(x.lastdate, '%Y-%m-%d %H:%i:%s') AS lastdate,
+               ${layer('firstcost', 'firstdate')},
+               ${layer('lastcost', 'lastdate')},
+               x.layers
+        FROM (SELECT part.id AS partid, part.num AS partnum, part.description AS partdesc,
+                     COALESCE(part.stdcost, 0) AS stdcost, inr.layers,
+                     (SELECT MIN(c.datecreated) FROM costlayer c WHERE c.partid = part.id) AS firstdate,
+                     (SELECT MAX(c.datecreated) FROM costlayer c WHERE c.partid = part.id) AS lastdate,
+                     (SELECT MIN(c.orgtotalcost / c.orgqty) FROM costlayer c WHERE c.partid = part.id) AS lowcost,
+                     (SELECT MAX(c.orgtotalcost / c.orgqty) FROM costlayer c WHERE c.partid = part.id) AS highcost,
+                     (SELECT MAX(h.id) FROM partcosthistory h WHERE h.partid = part.id${capW}) AS costid
+              FROM (${inr}) inr
+              JOIN part ON part.id = inr.partid${lastNum != null ? `
+              WHERE part.num <= '${sqlStr(lastNum)}'` : ''}) x
+        LEFT JOIN partcosthistory pch ON pch.id = x.costid
+        ORDER BY x.partnum`;
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+let _loadToken = 0;
+
+async function loadLookups() {
+    const res = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('Report precision', `
+            SELECT syskey, sysvalue FROM sysproperties
+            WHERE syskey IN ('REPORT_DECIMAL_COST_PRECISION', 'REPORT_DECIMAL_QTY_PRECISION')`)
+    ]);
+    const ok = i => res[i].status === 'fulfilled' ? res[i].value : [];
+    S.company = (ok(0)[0] || {}).name || '';
+    ok(1).forEach(r => {
+        const n = parseInt(r.sysvalue, 10);
+        if (!Number.isInteger(n) || n < 0 || n > 9) return;
+        if (r.syskey === 'REPORT_DECIMAL_COST_PRECISION') COST_DP = n;
+        if (r.syskey === 'REPORT_DECIMAL_QTY_PRECISION') QTY_DP = n;
+    });
+}
+
+// window.FB_LAUNCH (report_btn): a PART record (Part / Inventory module) or a
+// product with a part (Product module) starts the report on that part.
+async function readLaunch() {
+    const L = window.FB_LAUNCH;
+    if (!L || typeof L !== 'object') return null;
+    const mod = String(L.module || '').toUpperCase();
+    const id = parseInt(L.id, 10) > 0 ? parseInt(L.id, 10) : 0;
+    const from = L.moduleName || MODULE_NAME[mod] || mod;
+    try {
+        if (mod === 'PART') {
+            if (id) { const r = await q('Launched part', `SELECT num FROM part WHERE id = ${id}`); if (r[0]) return { num: String(r[0].num), from }; }
+            if (L.num) return { num: String(L.num), from };
+        } else if (mod === 'PROD') {
+            const w = id ? `pr.id = ${id}` : (L.num ? `pr.num = '${sqlStr(L.num)}'` : '');
+            if (w) {
+                const r = await q('Launched product', `SELECT p.num FROM product pr JOIN part p ON p.id = pr.partid WHERE ${w}`);
+                if (r[0]) return { num: String(r[0].num), from };
+                debugLog('Launched for a product without a part (a kit?): ignored.', 'warn');
+            }
+        } else debugLog('Launched from module ' + mod + ': not a part, ignored.', 'warn');
+    } catch (e) { debugLog('Reading the launch failed: ' + (e && e.message || e), 'error'); }
+    return null;
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    document.getElementById('banner').textContent = '';
+    document.getElementById('loading').classList.add('show');
+    setStatus('Loading…');
+    const cap = S.noCap ? 0 : undefined;           // FBLib.RowCap: the first 10,000 cost layers (whole parts) unless Load all
+    let layers, parts, capped;
+    try {
+        const lr = await q('Cost layers', FBLib.RowCap.sql(layersSQL(F), cap));
+        if (tok !== _loadToken) return;
+        capped = FBLib.RowCap.apply(lr, cap, { keyOf: r => String(r.partid) });
+        layers = capped.rows;
+        const lastNum = capped.capped && layers.length ? String(layers[layers.length - 1].partnum) : null;
+        parts = layers.length ? await q('Part costs', partsSQL(F, lastNum)) : [];
+    } catch (e) {
+        if (tok !== _loadToken) return;
+        document.getElementById('loading').classList.remove('show');
+        document.getElementById('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        S.cap = null; capNotice();
+        S.parts = []; S.layers = []; S.byNum = new Map(); S.loadedAt = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    if (tok !== _loadToken) return;
+    document.getElementById('loading').classList.remove('show');
+    S.cap = capped;
+    capNotice();
+    // Parts, in part-number order, each with its layers in date order.
+    const byId = new Map();
+    S.parts = parts.map(r => {
+        const p = {
+            id: Number(r.partid), part: String(r.partnum ?? ''), desc: r.partdesc || '',
+            std: num(r.stdcost), first: num(r.firstcost), last: num(r.lastcost), low: num(r.lowcost), high: num(r.highcost),
+            avg: Number(r.captured) === 1 ? num(r.avgcost) : null, capturedAt: String(r.capturedat || ''),
+            firstDate: String(r.firstdate || ''), lastDate: String(r.lastdate || ''), nLayers: Math.round(num(r.layers)), layers: []
+        };
+        byId.set(p.id, p);
+        return p;
+    });
+    S.layers = [];
+    layers.forEach(r => {
+        const p = byId.get(Number(r.partid));
+        if (!p) return;
+        const qty = num(r.qty), total = num(r.totalcost);
+        const l = { id: Number(r.layerid), date: String(r.datecreated || ''), qty, total, cost: qty ? total / qty : null };
+        p.layers.push(l);
+        S.layers.push({ part: p.part, desc: p.desc, date: l.date, cost: l.cost, qty, total });
+    });
+    S.byNum = new Map(S.parts.map(p => [p.part, p]));
+    S.toggled = new Set();
+    S.loadedAt = new Date();
+    render();
+}
+
+// The RowCap notice: the cut falls between parts.
+function capNotice() {
+    const c = S.cap || { capped: false };
+    FBLib.RowCap.notice({ before: document.getElementById('appView'), capped: c.capped, limit: c.limit, onLoadAll: () => { S.noCap = true; loadAll(); },
+        html: 'Showing the parts whose cost layers fit in the first <strong>' + Number(c.limit || 0).toLocaleString() + '</strong>: more match these filters.' +
+              (S.view === 'pivot' ? ' The pivot covers the layers shown.' : '') + ' Narrow the filters, or' });
+}
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+
+// ============================================================================
+//  CHART — one part's cost layers as the original's line chart: one point
+//  per layer, evenly spaced in date order (a category axis), the value axis
+//  from zero (JFreeChart's default), date / time labels rotated -45°, no
+//  legend. The App draws it at 1000 × 300 (scaled to the cell) with hover
+//  targets; the PDF at the page's width, in points, black.
+// ============================================================================
+function niceStep(raw) {
+    if (!(raw > 0)) return 1;
+    const mag = Math.pow(10, Math.floor(Math.log10(raw))), r = raw / mag;
+    return (r <= 1 ? 1 : r <= 2 ? 2 : r <= 2.5 ? 2.5 : r <= 5 ? 5 : 10) * mag;
+}
+function tickText(v, step) {
+    const s = String(+step.toFixed(9)), dot = s.indexOf('.');
+    const d = Math.min(6, dot < 0 ? 0 : s.length - dot - 1);
+    const c = FBLib.Common.currency();
+    return (v < 0 ? '-' : '') + c.symbol + Math.abs(v).toLocaleString(c.locale, { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+const r1 = v => Math.round(v * 10) / 10;
+
+function chartSvg(p, o) {
+    const L = p.layers, n = L.length;
+    const W = o.w, H = o.h, fs = o.fs, print = !!o.print;
+    const ink = print ? '#000' : '#506872', gridC = print ? '#BBBBBB' : '#E3E3E3', axisC = print ? '#000' : '#C6D0D4';
+    const lineC = print ? '#000' : '#2d9cdb';
+    const vals = L.filter(l => l.cost != null).map(l => l.cost);
+    let lo = Math.min(0, ...vals), hi = Math.max(0, ...vals);
+    if (hi === lo) hi = lo + 1;
+    const step = niceStep((hi - lo) / 5);
+    lo = Math.floor(lo / step + 1e-9) * step; hi = Math.ceil(hi / step - 1e-9) * step;
+    const nt = Math.round((hi - lo) / step), ticks = [];
+    for (let k = 0; k <= nt; k++) ticks.push(lo + k * step);
+    const yW = Math.max(...ticks.map(t => tickText(t, step).length)) * fs * 0.6;
+    const xLab = i => fmtDateTime(L[i].date);
+    const labLen = Math.max(1, ...L.map((l, i) => xLab(i).length)) * fs * 0.56 * 0.7071;     // a rotated label's reach
+    const padT = Math.round(fs * 0.8), padR = Math.round(fs * 1.2);
+    // room on the left for the value labels and for the first category
+    // label, which reaches left of its point
+    const band0 = (W - padR - yW - fs) / Math.max(n, 1);
+    const padL = Math.ceil(Math.max(yW + fs, labLen - band0 / 2 + fs * 0.5));
+    const padB = Math.ceil(labLen + fs * 1.4);
+    const pw = W - padL - padR, ph = H - padT - padB;
+    if (pw < 40 || ph < 40) return '';
+    const band = pw / Math.max(n, 1);
+    const X = i => padL + (i + 0.5) * band, Y = v => padT + (hi - v) / (hi - lo) * ph;
+    const every = Math.max(1, Math.ceil(fs * 1.45 / band));
+    const out = [];
+    out.push(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}"` +
+        (print ? ` width="${W}pt" height="${H}pt"` : ` data-part="${esc(p.part)}"`) +
+        ` role="img" aria-label="${esc('Unit cost of each cost layer of ' + p.part)}" font-size="${fs}" font-family="inherit">`);
+    // grid + value axis labels
+    ticks.forEach(t => {
+        const y = r1(Y(t));
+        out.push(`<line x1="${padL}" x2="${r1(padL + pw)}" y1="${y}" y2="${y}" stroke="${gridC}" stroke-width="${print ? 0.5 : 1}"/>`);
+        out.push(`<text x="${r1(padL - fs * 0.5)}" y="${y}" dy="0.35em" text-anchor="end" fill="${ink}">${esc(tickText(t, step))}</text>`);
+    });
+    out.push(`<line x1="${padL}" x2="${padL}" y1="${padT}" y2="${r1(padT + ph)}" stroke="${axisC}" stroke-width="${print ? 0.75 : 1}"/>`);
+    out.push(`<line x1="${padL}" x2="${r1(padL + pw)}" y1="${r1(padT + ph)}" y2="${r1(padT + ph)}" stroke="${axisC}" stroke-width="${print ? 0.75 : 1}"/>`);
+    // category labels (thinned so they never overlap), rotated -45°
+    for (let i = 0; i < n; i += every) {
+        const x = r1(X(i)), y = r1(padT + ph + fs * 0.6);
+        out.push(`<line x1="${x}" x2="${x}" y1="${r1(padT + ph)}" y2="${r1(padT + ph + fs * 0.3)}" stroke="${axisC}" stroke-width="${print ? 0.5 : 1}"/>`);
+        out.push(`<text transform="translate(${x} ${y}) rotate(-45)" dy="0.35em" text-anchor="end" fill="${ink}">${esc(xLab(i))}</text>`);
+    }
+    // the line (a layer without a quantity has no cost: a gap, as Jasper's null)
+    let d = '', pen = false;
+    L.forEach((l, i) => {
+        if (l.cost == null) { pen = false; return; }
+        d += (pen ? 'L' : 'M') + r1(X(i)) + ' ' + r1(Y(l.cost)) + ' ';
+        pen = true;
+    });
+    if (d) out.push(`<path d="${d.trim()}" fill="none" stroke="${lineC}" stroke-width="${print ? 1 : 2}" stroke-linejoin="round" stroke-linecap="round"/>`);
+    // markers, while they don't crowd each other
+    if (band >= (print ? 3 : 7)) L.forEach((l, i) => {
+        if (l.cost == null) return;
+        out.push(print
+            ? `<circle cx="${r1(X(i))}" cy="${r1(Y(l.cost))}" r="1.8" fill="${lineC}"/>`
+            : `<circle cx="${r1(X(i))}" cy="${r1(Y(l.cost))}" r="4" fill="${lineC}" stroke="#fff" stroke-width="2"/>`);
+    });
+    if (!print) {
+        // hover: a crosshair, the point ringed, a band per layer to catch the mouse
+        out.push(`<line class="pct-xh" x1="0" x2="0" y1="${padT}" y2="${r1(padT + ph)}" stroke="#8FA1A7" stroke-width="1" visibility="hidden"/>`);
+        out.push(`<circle class="pct-hl" cx="0" cy="0" r="6" fill="${lineC}" stroke="#fff" stroke-width="2" visibility="hidden"/>`);
+        L.forEach((l, i) => out.push(`<rect class="pct-hit" data-i="${i}" data-x="${r1(X(i))}" data-y="${l.cost == null ? '' : r1(Y(l.cost))}"` +
+            ` x="${r1(X(i) - band / 2)}" y="${padT}" width="${r1(Math.max(band, 1))}" height="${r1(ph)}" fill="transparent"/>`));
+    }
+    out.push('</svg>');
+    return out.join('');
+}
+
+// The range's own low and high (the table's Low / High cover every layer).
+function rangeStats(p) {
+    const v = p.layers.filter(l => l.cost != null).map(l => l.cost);
+    return v.length ? { lo: Math.min(...v), hi: Math.max(...v) } : null;
+}
+function chartCaption(p) {
+    const st = rangeStats(p);
+    return `<div class="pct-cap"><b>Unit cost of each cost layer</b> · ${esc(plural(p.layers.length, 'layer'))} created ${esc(rangeText(F).replace(/^Date Range: /, '').replace(/^All$/, 'at any date'))}` +
+        (st ? ` · lowest ${esc(fmtCost(st.lo))}, highest ${esc(fmtCost(st.hi))} in the range` : '') +
+        (p.layers.length < p.nLayers ? ` · ${esc(plural(p.nLayers - p.layers.length, 'layer'))} not loaded` : '') + '</div>';
+}
+
+// ============================================================================
+//  MODEL + TABLE
+// ============================================================================
+let PDF = null, PIVOT = null, COLS = null;
+const isOpen = p => (S.charts === 'open') !== S.toggled.has(p.part);
+
+// The original's figures, in its reading order (left column, then right),
+// then in the user's order (FBLib.RptCols).
+function cols() {
+    const base = [
+        { key: 'part',  label: 'Part',        w: 140 },
+        { key: 'desc',  label: 'Description', w: 260 },
+        { key: 'std',   label: 'Std. Cost',   w: 100, num: true, tip: 'The part\'s standard cost' },
+        { key: 'first', label: 'First Cost',  w: 100, num: true, tip: 'Unit cost of the part\'s first cost layer ever' },
+        { key: 'last',  label: 'Last Cost',   w: 100, num: true, tip: 'Unit cost of the part\'s latest cost layer ever' },
+        { key: 'low',   label: 'Low Cost',    w: 100, num: true, tip: 'Lowest unit cost over all the part\'s cost layers' },
+        { key: 'high',  label: 'High Cost',   w: 100, num: true, tip: 'Highest unit cost over all the part\'s cost layers' },
+        { key: 'avg',   label: 'Avg. Cost',   w: 100, num: true, tip: 'Average cost in the part\'s latest nightly capture on or before the range\'s end date' }
+    ];
+    return COLS ? COLS.arrange(base) : base;
+}
+const headRow = cs => '<tr>' + cs.map(c =>
+    `<th data-col="${c.key}" class="${c.num ? 'num-cell' : ''}" style="min-width:${c.w}px"${c.tip ? ` title="${esc(c.tip)}"` : ''}>${esc(c.label)}</th>`).join('') + '</tr>';
+// Heading-click sort (FBLib.RptCols): parts sort by the heading; "n/a"
+// averages sort last. The report's own order is part number.
+const sortVal = (p, k) => p[k];
+function sortedParts() {
+    const s = COLS && COLS.sort();
+    if (!s) return S.parts;
+    return S.parts.slice().sort((a, b) => {
+        const va = a[s.key], vb = b[s.key];
+        if (va == null && vb == null) return 0;
+        if (va == null) return 1;
+        if (vb == null) return -1;
+        return COLS.compare(a, b, sortVal);
+    });
+}
+const noCapture = () => 'No nightly cost capture of this part on or before ' + (dateRange(F) ? FBLib.Common.formatDate(dateRange(F).end) : 'today') +
+    ': Fishbowl captures average costs overnight, for stocked parts only';
+function cells(p, forPrint) {
+    const tip = (d, what) => d ? ` title="${esc(what + ' ' + fmtDateTime(d))}"` : '';
+    return {
+        part: (forPrint ? '' : `<span class="pct-tog">${isOpen(p) ? '▼' : '▶'}</span>`) + openLink('Part', p.part, p.desc),
+        desc: cut(p.desc),
+        std: esc(fmtCost(p.std)),
+        first: `<span${tip(p.firstDate, 'Layer created')}>${esc(fmtCost(p.first))}</span>`,
+        last: `<span${tip(p.lastDate, 'Layer created')}>${esc(fmtCost(p.last))}</span>`,
+        low: esc(fmtCost(p.low)), high: esc(fmtCost(p.high)),
+        avg: p.avg == null ? `<span class="na" title="${esc(noCapture())}">n/a</span>` : `<span${tip(p.capturedAt, 'Captured')}>${esc(fmtCost(p.avg))}</span>`
+    };
+}
+function partRow(cs, p, forPrint) {
+    const c = cells(p, forPrint);
+    return `<tr class="pct-part${!forPrint && isOpen(p) ? ' is-open' : ''}" data-part="${esc(p.part)}">` +
+        cs.map(k => `<td class="${k.num ? 'num-cell nw' : ''}">${c[k.key] ?? ''}</td>`).join('') + '</tr>';
+}
+const APP_CHART = { w: 1000, h: 270, fs: 11 };
+function chartRow(cs, p) {
+    return `<tr class="pct-chart-row"><td class="pct-chart-cell" colspan="${cs.length}">${chartCaption(p)}<div class="pct-chart">${chartSvg(p, APP_CHART)}</div></td></tr>`;
+}
+// Table rows: each part's line, then its chart when open. Charts are drawn
+// as the rows are painted (chunked), so a long result stays quick.
+function bodyItems() {
+    const out = [];
+    sortedParts().forEach(p => { out.push({ p, chart: false }); if (isOpen(p)) out.push({ p, chart: true }); });
+    return out;
+}
+
+// Long reports paint in chunks as the user scrolls.
+const CHUNK = 120;
+let _paint = { items: [], shown: 0, cs: [] };
+function appendChunk() {
+    if (_paint.shown >= _paint.items.length) return;
+    const next = _paint.items.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend',
+        next.map(it => (it.chart ? chartRow(_paint.cs, it.p) : partRow(_paint.cs, it.p, false))).join(''));
+    _paint.shown += next.length;
+}
+
+function filterText() {
+    return [rangeText(F), F.part ? 'Part ' + F.part : ''].filter(Boolean).join(' · ');
+}
+const emptyText = () => 'No part has a cost layer created in this date range' + (F.part ? ' matching part ' + F.part : '') + '. Try a wider date range (Filters).';
+
+function render(keepScroll) {
+    const pivot = S.view === 'pivot' && PIVOT;
+    if (pivot) PIVOT.render();
+    else {
+        const tbl = document.getElementById('rpt');
+        const wrap = document.getElementById('rptWrap');
+        const top = wrap.scrollTop;
+        const cs = cols();
+        hideTip();
+        tbl.querySelector('thead').innerHTML = headRow(cs);
+        _paint = { items: bodyItems(), shown: 0, cs };
+        tbl.querySelector('tbody').innerHTML = '';
+        appendChunk();
+        while (keepScroll && _paint.shown < _paint.items.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+        tbl.querySelector('tfoot').innerHTML = '';
+        tbl.style.display = S.parts.length ? '' : 'none';
+        document.getElementById('rptEmpty').textContent = S.parts.length || !S.loadedAt ? '' : emptyText();
+        wrap.scrollTop = keepScroll ? top : 0;
+    }
+    const parts = [S.company];
+    if (S.loadedAt) parts.push(plural(S.parts.length, 'part') + ', ' + plural(S.layers.length, 'cost layer') + (pivot ? ' · pivot' : '') + ' · ' + filterText());
+    if (S.launch) parts.push('from ' + S.launch.from + ' module');
+    setStatus(parts.filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  HOVER — the chart's crosshair and tooltip (App view).
+// ============================================================================
+let _tipSvg = null;
+function hideTip() {
+    document.getElementById('pctTip').style.display = 'none';
+    if (_tipSvg) { _tipSvg.querySelectorAll('.pct-xh, .pct-hl').forEach(el => el.setAttribute('visibility', 'hidden')); _tipSvg = null; }
+}
+function onChartHover(e) {
+    const hit = e.target && e.target.closest ? e.target.closest('.pct-hit') : null;
+    if (!hit) { hideTip(); return; }
+    const svg = hit.ownerSVGElement, p = S.byNum.get(svg.getAttribute('data-part'));
+    const l = p && p.layers[+hit.getAttribute('data-i')];
+    if (!l) { hideTip(); return; }
+    if (_tipSvg && _tipSvg !== svg) hideTip();
+    _tipSvg = svg;
+    const x = hit.getAttribute('data-x'), y = hit.getAttribute('data-y');
+    const xh = svg.querySelector('.pct-xh'), hl = svg.querySelector('.pct-hl');
+    xh.setAttribute('x1', x); xh.setAttribute('x2', x); xh.setAttribute('visibility', 'visible');
+    if (y !== '') { hl.setAttribute('cx', x); hl.setAttribute('cy', y); hl.setAttribute('visibility', 'visible'); }
+    else hl.setAttribute('visibility', 'hidden');
+    const tip = document.getElementById('pctTip');
+    tip.innerHTML = `<div><b>${esc(fmtDateTime(l.date))}</b></div>` +
+        `<div>Unit cost <b>${l.cost == null ? 'n/a' : esc(fmtCost(l.cost))}</b></div>` +
+        `<div class="m">${esc(fmtQty(l.qty))} for ${esc(fmtCost(l.total))} · layer ${l.id}</div>`;
+    tip.style.display = 'block';
+    const r = tip.getBoundingClientRect();
+    let tx = e.clientX + 14, ty = e.clientY + 14;
+    if (tx + r.width > window.innerWidth - 8) tx = e.clientX - r.width - 14;
+    if (ty + r.height > window.innerHeight - 8) ty = e.clientY - r.height - 14;
+    tip.style.left = tx + 'px'; tip.style.top = ty + 'px';
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the pages as the standard report prints them:
+//  Letter portrait, the company / title / date range on every page (the
+//  original's page header), one page per part: number and description over
+//  a rule (its column header), the six figures in two columns, a rule, the
+//  chart. Without any chart open: one line per part.
+// ============================================================================
+const PDF_CSS =
+    '.fbdoc-rpt-flow .pct-h{display:flex;gap:0;border-bottom:1pt solid #000;font-size:11pt;font-weight:700;line-height:15pt;padding-bottom:1pt}' +
+    '.fbdoc-rpt-flow .pct-hn{flex:0 0 auto;min-width:175pt;padding-right:6pt}' +
+    '.fbdoc-rpt-flow .pct-hd{flex:1 1 auto;min-width:0;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}' +
+    '.fbdoc-rpt-flow .pct-figs{border-collapse:collapse;margin-top:1pt;table-layout:fixed;width:428pt}' +
+    '.fbdoc-rpt-flow .pct-figs td{font-size:10pt;line-height:14pt;padding:0 2pt 0 0;white-space:nowrap;color:#000}' +
+    '.fbdoc-rpt-flow .pct-figs td.v{text-align:right;font-variant-numeric:tabular-nums}' +
+    '.fbdoc-rpt-flow .pct-rule{border-top:.25pt solid #000;margin:6pt 0 3pt}' +
+    '.fbdoc-rpt-flow .pct-svg svg{display:block}' +
+    '.fbdoc-rpt-tbl .pct-tog{display:none}' +
+    '.fbdoc-rpt-tbl .na,.fbdoc-rpt-flow .na{color:inherit}';
+// The chart's size on the current paper: the page's width, and the height
+// left under the title band, the footer and the part's heading and figures
+// (the original's 510pt on Letter portrait, never more).
+function pdfPage() {
+    const pp = PDF && PDF.paper ? PDF.paper() : { size: 'Letter', orientation: 'portrait' };
+    try {
+        const spec = FBDoc.page.resolve(pp.size + ' ' + pp.orientation, { fallback: 'Letter', margin: 'document' });
+        const g = FBDoc.page.geometry(spec, {});
+        return { w: g.CWpt, h: g.innerH * 72 / 96 };
+    } catch (_) { return { w: 552, h: 732 }; }
+}
+// A heading's lines: the description wraps beside the part number (11pt
+// bold; at most 3 lines print, see PDF_CSS).
+function headLines(p, wPt) {
+    const numW = Math.max(175, String(p.part).length * 11 * 0.62 + 6);
+    const perLine = Math.max(8, Math.floor(Math.max(60, wPt - numW) / (11 * 0.6)));
+    return Math.min(3, Math.max(1, Math.ceil(String(p.desc || ' ').length / perLine)));
+}
+function pdfChartSize(p, pg) {
+    // title band 59pt + footer 18pt + part heading 17pt a line + figures 42pt + rules 10pt + slack 20pt
+    const h = pg.h - 166 - (headLines(p, pg.w) - 1) * 16;
+    return { w: Math.floor(pg.w), h: Math.max(150, Math.min(510, Math.floor(h))) };
+}
+const fig = (label, v) => `<td style="width:75pt">${esc(label)}</td><td class="v" style="width:100pt">${v}</td>`;
+function partBlock(p, chart, size) {
+    const c = cells(p, true);
+    return '<div class="pct-doc">' +
+        `<div class="pct-h"><span class="pct-hn">${esc(p.part)}</span><span class="pct-hd">${esc(p.desc)}</span></div>` +
+        '<table class="pct-figs"><tbody>' +
+        `<tr>${fig('Std. Cost:', c.std)}<td style="width:78pt"></td>${fig('Low Cost', c.low)}</tr>` +
+        `<tr>${fig('First Cost', c.first)}<td></td>${fig('High Cost', c.high)}</tr>` +
+        `<tr>${fig('Last Cost', c.last)}<td></td>${fig('Avg. Cost', c.avg)}</tr>` +
+        '</tbody></table><div class="pct-rule"></div>' +
+        (chart ? `<div class="pct-svg">${chartSvg(p, { w: size.w, h: size.h, fs: 8, print: true })}</div>` : '') +
+        '</div>';
+}
+function docSpec() {
+    if (!S.loadedAt) return null;
+    const base = { company: S.company, title: TITLE, titleEveryPage: true, empty: emptyText(), css: PDF_CSS, fontPt: 10 };
+    if (S.view === 'pivot' && PIVOT) {
+        const p = PIVOT.pdfSpec();
+        return Object.assign(base, { subtitle: [filterText(), pivotText()], head: p.head, rows: p.rows, foot: p.foot });
+    }
+    const list = sortedParts();
+    if (!list.length) return Object.assign(base, { subtitle: filterText(), head: '', rows: [], foot: '' });
+    if (!list.some(isOpen)) {
+        // every chart collapsed: one line per part
+        const cs = cols();
+        return Object.assign(base, { subtitle: filterText(), head: headRow(cs), rows: list.map(p => partRow(cs, p, true)), foot: '' });
+    }
+    // a page per part with its chart, as the original; a part without its
+    // chart follows on the same page
+    const pg = pdfPage();
+    return Object.assign(base, {
+        subtitle: filterText(),
+        sections: list.map((p, i) => ({ newPage: i > 0 && (isOpen(p) || isOpen(list[i - 1])), flow: [partBlock(p, isOpen(p), pdfChartSize(p, pg))] }))
+    });
+}
+
+// ============================================================================
+//  PIVOT VIEW (FBLib.Pivot) — the cost layers in the range by part and date
+//  (month by default). The weighted unit cost is total cost / quantity in
+//  every cell and total.
+// ============================================================================
+const PIVOT_FIELDS = [
+    { key: 'part', label: 'Part' }, { key: 'desc', label: 'Description', dim: false },
+    { key: 'date', label: 'Date created', type: 'date' },
+    { key: 'ucost', label: 'Unit cost (weighted)', type: 'money', ratio: ['total', 'qty'] },
+    { key: 'cost', label: 'Layer unit cost', type: 'money' },
+    { key: 'qty', label: 'Quantity', type: 'qty' },
+    { key: 'total', label: 'Total cost', type: 'money' }
+];
+const pivotRows = () => S.layers;
+function pivotText() {
+    const c = PIVOT.config(), lbl = k => (PIVOT_FIELDS.find(x => x.key === k) || {}).label || '';
+    const fld = PIVOT_FIELDS.find(x => x.key === c.measure);
+    const m = c.measure === '__count__' ? 'Cost layers'
+        : fld && fld.ratio ? lbl(c.measure)
+        : ({ sum: 'Total', count: 'Count of', avg: 'Average', min: 'Lowest', max: 'Highest' }[c.agg] + ' ' + lbl(c.measure));
+    return 'Pivot: ' + m + ' by ' + [lbl(c.rowDim), lbl(c.rowDim2)].filter(Boolean).join(' + ') + (c.colDim ? ' × ' + lbl(c.colDim) : '');
+}
+function setView(v, persist) {
+    S.view = v === 'pivot' && PIVOT ? 'pivot' : 'table';
+    document.getElementById('viewSel').value = S.view;
+    document.getElementById('rptWrap').style.display = S.view === 'pivot' ? 'none' : '';
+    document.getElementById('pivotHost').style.display = S.view === 'pivot' ? '' : 'none';
+    document.getElementById('expandBtn').parentNode.style.display = S.view === 'pivot' ? 'none' : '';
+    if (persist) _saveUserKeys({ view: S.view });
+    capNotice();
+    render(false);
+}
+function setCharts(open) {
+    S.charts = open ? 'open' : 'closed';
+    S.toggled = new Set();
+    _saveUserKeys({ charts: S.charts });
+    render(false);
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.parts.length) { showToast('Nothing to export.', 'warn'); return; }
+    const sub = [S.company, filterText(), 'As of ' + (S.loadedAt || new Date()).toLocaleString()].filter(Boolean);
+    const money = (key, label, w) => ({ key, label, w: w || 100, type: 'money', noTotal: true });
+    const parts = {
+        name: 'Parts', title: TITLE, subtitle: sub,
+        cols: [{ key: 'part', label: 'Part', w: 140, type: 'text' }, { key: 'desc', label: 'Description', w: 260, type: 'text' },
+               money('std', 'Std. Cost'), money('first', 'First Cost'), { key: 'firstDate', label: 'First Layer', w: 90, type: 'date' },
+               money('last', 'Last Cost'), { key: 'lastDate', label: 'Last Layer', w: 90, type: 'date' },
+               money('low', 'Low Cost'), money('high', 'High Cost'), money('avg', 'Avg. Cost'),
+               { key: 'capturedAt', label: 'Avg. Captured', w: 100, type: 'date' }, { key: 'nLayers', label: 'Layers in Range', w: 90, type: 'int' }],
+        rows: sortedParts().map(p => Object.assign({}, p, { firstDate: dstr(p.firstDate) || null, lastDate: dstr(p.lastDate) || null,
+                                                             capturedAt: dstr(p.capturedAt) || null })),
+        totals: false
+    };
+    const layers = {
+        name: 'Cost Layers', title: TITLE + ' – cost layers', subtitle: sub,
+        cols: [{ key: 'part', label: 'Part', w: 140, type: 'text' }, { key: 'desc', label: 'Description', w: 240, type: 'text' },
+               { key: 'day', label: 'Date Created', w: 90, type: 'date' }, { key: 'time', label: 'Time', w: 60, type: 'text' },
+               money('cost', 'Unit Cost'), { key: 'qty', label: 'Quantity', w: 90, type: 'qty', noTotal: true }, money('total', 'Total Cost', 110)],
+        rows: S.layers.map(l => Object.assign({}, l, { day: dstr(l.date) || null, time: hhmm(l.date) })),
+        totals: false
+    };
+    const sheets = [parts, layers];
+    if (S.view === 'pivot' && PIVOT) sheets.unshift(Object.assign(PIVOT.sheet('Pivot'), { title: TITLE + ' – ' + pivotText(), subtitle: sub }));
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'Part_Cost_Over_Time_' + ymd(new Date()), sheets });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's pages (fb-doc). Without fb-doc on the server, the
+// plain printout below: JxBrowser won't print the report page itself, so it
+// is built in a new window and printed there (a part per page with its
+// chart while charts are open, as the original).
+function printReport() {
+    if (PDF) {
+        if (!S.parts.length) { showToast('Nothing to print.', 'warn'); return; }
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    if (!S.parts.length) { showToast('Nothing to print.', 'warn'); return; }
+    const list = sortedParts(), size = { w: 552, h: 480 };
+    const body = list.some(isOpen)
+        ? list.map((p, i) => `<div class="fbdoc-rpt-flow" style="${i ? 'page-break-before:always;' : ''}">${partBlock(p, isOpen(p), size)}</div>`).join('')
+        : '<table class="fbdoc-rpt-tbl"><thead>' + headRow(cols()).replace(/ style="[^"]*"/g, '') + '</thead><tbody>' + list.map(p => partRow(cols(), p, true)).join('') + '</tbody></table>';
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' + TITLE + '</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:9pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:12pt;font-weight:700}h2{text-align:center;font-size:15pt;margin:2px 0}.sub{text-align:center;font-size:9pt;color:#333;margin:0 0 10px}' +
+        'table.fbdoc-rpt-tbl{border-collapse:collapse;width:100%}th{text-align:left;padding:3px 5px;border-bottom:1px solid #000}th.num-cell,.num-cell{text-align:right}' +
+        'td{padding:2px 5px;vertical-align:top}a{color:#000;text-decoration:none}' + PDF_CSS +
+        '@page{size:Letter portrait;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>' + TITLE + '</h2><p class="sub">' + esc(filterText()) + '</p>' + body +
+        '<p style="font-size:7.5pt;margin-top:8px">Printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters the starting point for every user who hasn\'t saved their own?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        const fRange = document.getElementById('fRange');
+        fRange.innerHTML = RANGES.map(r => `<option value="${r[0]}">${esc(r[1])}</option>`).join('');
+        // A quick range fills the dates; editing a date makes the range Custom.
+        fRange.onchange = () => {
+            const p = presetDates(fRange.value);
+            if (fRange.value !== 'custom') {
+                document.getElementById('fFrom').value = p ? p[0] : '';
+                document.getElementById('fTo').value = p ? p[1] : '';
+            }
+            applySoon();
+        };
+        ['fFrom', 'fTo'].forEach(id => document.getElementById(id).addEventListener('change', () => { fRange.value = 'custom'; applySoon(); }));
+        const fPart = document.getElementById('fPart');
+        fPart.addEventListener('change', applySoon);
+        fPart.addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        document.getElementById('resetFiltersBtn').onclick = () => { writeFilters(DEFAULT_FILTERS); applySoon(); };
+
+        // Column resize / sort / reorder, and the Pivot view (fb-lib).
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({ table: document.getElementById('rpt'),
+                                                         onSort: () => render(true), onReorder: () => render(true) });
+        if (FBLib.Pivot) PIVOT = FBLib.Pivot.mount(document.getElementById('pivotHost'), {
+            fields: PIVOT_FIELDS, rows: pivotRows, countLabel: 'Cost layers',
+            defaults: { rowDim: 'part', colDim: 'date', colBucket: 'month', measure: 'ucost', agg: 'avg' },
+            format: (fld, v) => (fld && fld.type === 'money' ? fmtCost(v) : fld && fld.type === 'qty' ? fmtQty(v) : null)
+        });
+        else document.getElementById('viewSelWrap').style.display = 'none';
+        document.getElementById('viewSel').addEventListener('change', e => setView(e.target.value, true));
+        document.getElementById('resetColsBtn').onclick = () => { if (COLS) { COLS.reset(); render(false); } };
+        S.view = _resolve('view', 'table') === 'pivot' && PIVOT ? 'pivot' : 'table';
+        S.charts = _resolve('charts', 'open') === 'closed' ? 'closed' : 'open';
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: document.getElementById('appView'), toggleBefore: document.getElementById('exportBtn'),
+                page: { size: 'Letter', orientation: 'portrait' },
+                doc: docSpec, title: () => TITLE
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        setView(S.view, false);
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('expandBtn').onclick = () => setCharts(true);
+        document.getElementById('collapseBtn').onclick = () => setCharts(false);
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        const wrap = document.getElementById('rptWrap');
+        wrap.addEventListener('scroll', () => { hideTip(); if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 600) appendChunk(); });
+        const rpt = document.getElementById('rpt');
+        rpt.addEventListener('mousemove', onChartHover);
+        rpt.addEventListener('mouseleave', hideTip);
+        rpt.addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (a) {
+                e.preventDefault();
+                try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+                catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+                return;
+            }
+            const tr = e.target.closest('tr.pct-part');
+            if (!tr) return;
+            const key = tr.dataset.part;
+            if (S.toggled.has(key)) S.toggled.delete(key); else S.toggled.add(key);
+            render(true);
+        });
+
+        await loadLookups();
+        writeFilters(savedFilters());
+        F = readFilters();
+        // Opened from a module for a record: start on its part (not remembered).
+        S.launch = await readLaunch();
+        if (S.launch) {
+            _hydrating = true;
+            document.getElementById('fPart').value = S.launch.num;
+            _hydrating = false;
+            F = readFilters();
+        }
+        await loadAll();
+    } catch (e) {
+        console.error('[' + TITLE + '] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

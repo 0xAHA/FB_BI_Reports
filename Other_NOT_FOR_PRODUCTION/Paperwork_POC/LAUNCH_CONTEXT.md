@@ -5,7 +5,7 @@
   paperwork document uses (`SOReport.htm` first).
 - **Host:** the report_btn plugin (`../report_btn/`).
 - **Client-tested:** the Sales Order launch (0.1.0). report_btn 0.4.0 (module and group
-  keys, plus the Report Workspace) is installed and working. Both on 2026-10-12.
+  keys, plus the Apps (beta) module) is installed and working. Both on 2026-10-12.
 - **Report developers:** the step-by-step guide is
   [report_btn README → Building a report for report_btn](../report_btn/README.md#building-a-report-for-report_btn).
   This page is the format spec.
@@ -77,7 +77,7 @@ report-setting title, but no host fills it yet. Reports must not depend on it. T
 settings come from the report's saved setting values, which the host applies as the BI
 Report module does.
 
-**Only the Apps menu sends `FB_LAUNCH`.** Reports opened in the Report Workspace get
+**Only the Apps menu sends `FB_LAUNCH`.** Reports opened in the Apps (beta) module get
 `window.FB_WORKSPACE` instead (see the report_btn README), with no record. The BI Report
 module and the BI Script Editor preview send nothing.
 
@@ -142,8 +142,9 @@ record, so a part report reads the same fields from either module. Their tag key
 differ (`INVENTORY`, `CONSIGNMENT`), so a tag can still target exactly one of them.
 
 **Where the list lives:** report_btn's `ModuleCodes`, `FBDoc.launch.MODULES`, this
-table, and the tag-key to group map (`MODULE_GROUP`) in the Report Launcher, which groups
-reports by it. Keep all four in step.
+table, and the tag-key to group map (`MODULE_GROUP`) in the App Library (and report_btn's
+`editor.AppGroups`, for the module picker). Keep them in step. The tag is the module
+association only: where an app is filed is its separate `fb-folder` tag.
 
 ## 4. Reading it in a report
 
