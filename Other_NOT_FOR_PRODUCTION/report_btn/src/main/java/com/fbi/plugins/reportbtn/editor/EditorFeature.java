@@ -109,7 +109,18 @@ public final class EditorFeature implements WorkspaceExtension {
     public Map<String, Boolean> workspaceFlags(int reportId) {
         Map<String, Boolean> flags = new LinkedHashMap<>();
         flags.put("edit", ClientRights.mayEdit(host));
+        // The Report Builder may publish from this host.
+        flags.put("publish", true);
         return flags;
+    }
+
+    @Override
+    public void build(String verb, String arg) {
+        if ("publish".equals(verb)) {
+            BuilderPublisher.publish(this, arg);
+        } else {
+            host.showError("The Report Builder asked for something this version doesn't do (" + verb + ").");
+        }
     }
 
     @Override

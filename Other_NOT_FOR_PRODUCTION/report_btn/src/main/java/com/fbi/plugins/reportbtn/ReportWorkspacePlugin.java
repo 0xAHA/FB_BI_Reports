@@ -52,6 +52,8 @@ public class ReportWorkspacePlugin extends FishbowlPlugin {
     static final String MODULE_NAME = "Apps (beta)";
     /** The Home tab: the App Library, built into the plugin (AppLibrary), shown under this name. */
     static final String HOME_REPORT = "App Library";
+    /** The module right for the Report Builder (the full string is MODULE_NAME + "-" + this). */
+    static final String BUILD_RIGHT = "Build Reports";
     /** The page editor, if it is in the jar. -Dreportbtn.editor=off turns it off. */
     private static final String EDITOR_CLASS = "com.fbi.plugins.reportbtn.editor.EditorFeature";
 
@@ -73,6 +75,8 @@ public class ReportWorkspacePlugin extends FishbowlPlugin {
         setMenuGroup(MenuGroupNameConst.REPORTING);
         setIconClassPath("/module/bireport48.png");
         addAccessRight("View");
+        // Apps (beta)-Build Reports: the Report Builder, publishing to the user's own groups.
+        addAccessRight(BUILD_RIGHT);
         current = this;
         AppWindow.closeAll();   // a re-login: windows of the previous session go
         AppModules.install();   // app tabs reopen from the client's saved bookmarks
@@ -285,12 +289,19 @@ public class ReportWorkspacePlugin extends FishbowlPlugin {
                     }
                     break;
                 }
+                case BUILD:
+                    if (extension == null) {
+                        error("The Report Builder's publishing isn't part of this build of the Apps (beta) module.");
+                    } else {
+                        extension.build(link.name, link.arg);
+                    }
+                    break;
                 default:
                     break;
             }
         } catch (Exception e) {
             ReportAppsPlugin.log("Apps (beta): " + link + " failed", e);
-            error("Could not open the app: " + e.getMessage());
+            error((link.action == WorkspaceLink.Action.BUILD ? "Could not publish: " : "Could not open the app: ") + e.getMessage());
         }
     }
 

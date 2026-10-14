@@ -54,6 +54,7 @@ final class ReportTab extends JPanel implements WorkspaceTab {
         messagePanel.add(message, BorderLayout.CENTER);
         add(browser, BROWSER);
         add(messagePanel, MESSAGE);
+        BrowserFit.attach(browser);
     }
 
     int serial() {
@@ -144,5 +145,6 @@ final class ReportTab extends JPanel implements WorkspaceTab {
         cards.show(this, BROWSER);
         browser.clear();
         browser.loadHTML(html, loaded.report.getId(), loaded.report.getName(), false, loaded.params);
+        BrowserFit.afterLoad(browser);
     }
 }

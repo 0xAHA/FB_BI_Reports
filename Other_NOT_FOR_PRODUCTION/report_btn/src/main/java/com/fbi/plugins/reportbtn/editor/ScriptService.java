@@ -383,6 +383,42 @@ final class ScriptService {
         }
     }
 
+    // ---------------------------------------------------------------- Report Builder
+    /** A setting the user saved (saveSettings: userproperties under Dashboard); null when there is none. */
+    String userSetting(int userId, String key) {
+        List<?> rows = query("SELECT up.userValue AS v FROM userproperties up JOIN propertycategory pc ON pc.id = up.categoryId"
+            + " WHERE pc.name = 'Dashboard' AND up.userId = " + userId + " AND up.userKey = " + sq(key) + " ORDER BY up.id DESC LIMIT 1");
+        return rows.isEmpty() ? null : host.column(rows.get(0), "v");
+    }
+
+    /** True when one of the user's groups holds this right (useraccess.moduleName, as the client stores it). */
+    boolean groupsHaveRight(int userId, String moduleRight) {
+        return !query("SELECT ua.id AS id FROM useraccess ua JOIN usergrouprel r ON r.groupId = ua.groupId WHERE r.userId = " + userId
+            + " AND ua.moduleName = " + sq(moduleRight) + " AND (ua.modifyFlag+0 = 1 OR ua.viewFlag+0 = 1) LIMIT 1").isEmpty();
+    }
+
+    /** The user's groups, id to name, A-Z. */
+    java.util.Map<Integer, String> myGroups(int userId) {
+        java.util.Map<Integer, String> out = new java.util.LinkedHashMap<>();
+        for (Object row : query("SELECT g.id AS id, g.name AS n FROM usergroup g JOIN usergrouprel r ON r.groupId = g.id WHERE r.userId = "
+            + userId + " ORDER BY g.name")) {
+            out.put(intOf(host.column(row, "id")), nz(host.column(row, "n")));
+        }
+        return out;
+    }
+
+    /** The page (type 10) with this name: its id, or 0. */
+    int pageIdByName(String name) {
+        List<?> rows = query("SELECT id FROM biscript WHERE typeId = 10 AND name = " + sq(name) + " LIMIT 1");
+        return rows.isEmpty() ? 0 : intOf(host.column(rows.get(0), "id"));
+    }
+
+    /** True when another page's identity block uses this storage key. */
+    boolean storageKeyTaken(String key, int exceptId) {
+        return !query("SELECT id FROM biscript WHERE typeId = 10 AND id <> " + exceptId
+            + " AND LOCATE(" + sq("'" + key + "'") + ", data) > 0 LIMIT 1").isEmpty();
+    }
+
     private List<?> query(String sql) {
         try {
             List<?> rows = host.query(sql);

@@ -39,6 +39,13 @@ public final class SelfCheck {
         link("edit:", null);
         link("edit:0", null);
         link("editor report", "OPEN \"editor report\"");
+        link("build:publish:3f9a2c1d", "BUILD publish 3f9a2c1d");
+        link("BUILD: publish:ab_c-1", "BUILD publish ab_c-1");
+        link("build:publish", "BUILD publish");
+        link("build:publish:a b", null);
+        link("build:publish:a'b", null);
+        link("build:", null);
+        link("tab:build:publish:x", "BUILD publish x");
 
         // insertScript: after the first real head tag, never inside a comment.
         eq(AppLauncher.insertScript("<html><head><title>x</title></head></html>", "FB_WORKSPACE", "{}"),

@@ -21,7 +21,7 @@
 #   ECJ_JAR   an ECJ jar                  (optional)
 set -euo pipefail
 
-VERSION="0.5.12"
+VERSION="0.6.1"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 FB_HOME="${FB_HOME:-/c/Program Files/Fishbowl}"
 SRC="$HERE/src/main/java"

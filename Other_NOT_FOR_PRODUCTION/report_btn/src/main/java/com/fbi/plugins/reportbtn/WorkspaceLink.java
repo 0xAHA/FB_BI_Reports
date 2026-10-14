@@ -20,10 +20,12 @@ import java.util.Locale;
  */
 final class WorkspaceLink {
 
-    enum Action { OPEN, HOME, BACK, FORWARD, EDIT }
+    enum Action { OPEN, HOME, BACK, FORWARD, EDIT, BUILD }
 
     private static final String TAB = "tab:";
     private static final String EDIT = "edit:";
+    /** build:<verb>[:<arg>], for the Report Builder (e.g. build:publish:<nonce>). */
+    private static final String BUILD = "build:";
 
     final Action action;
     final boolean newTab;
@@ -31,12 +33,19 @@ final class WorkspaceLink {
     final int id;
     /** The report name, or null when the report is an id. */
     final String name;
+    /** A build: link's argument (letters, digits, - and _), or null. */
+    final String arg;
 
     private WorkspaceLink(Action action, boolean newTab, int id, String name) {
+        this(action, newTab, id, name, null);
+    }
+
+    private WorkspaceLink(Action action, boolean newTab, int id, String name, String arg) {
         this.action = action;
         this.newTab = newTab;
         this.id = id;
         this.name = name;
+        this.arg = arg;
     }
 
     static WorkspaceLink parse(String item) {
@@ -51,6 +60,11 @@ final class WorkspaceLink {
         }
         if (text.isEmpty()) {
             return null;
+        }
+        // build:<verb>[:<arg>] (the Report Builder's own requests); name is the verb.
+        if (text.regionMatches(true, 0, BUILD, 0, BUILD.length())) {
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("([a-z]{1,20})(?::([A-Za-z0-9_-]{1,64}))?").matcher(text.substring(BUILD.length()).trim());
+            return m.matches() ? new WorkspaceLink(Action.BUILD, false, 0, m.group(1), m.group(2)) : null;
         }
         // edit: comes before the id / name fallbacks; the editor opens its own tab.
         if (text.regionMatches(true, 0, EDIT, 0, EDIT.length())) {
@@ -83,6 +97,9 @@ final class WorkspaceLink {
 
     @Override
     public String toString() {
+        if (action == Action.BUILD) {
+            return "BUILD " + name + (arg != null ? " " + arg : "");
+        }
         return action + (newTab ? " tab" : "") + (id > 0 ? " #" + id : "") + (name != null ? " \"" + name + "\"" : "");
     }
 }

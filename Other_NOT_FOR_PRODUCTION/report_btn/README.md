@@ -1,6 +1,6 @@
 # report_btn: module-related BI reports, and the Apps (beta) module
 
-**Status:** proof of concept, version 0.5.12.
+**Status:** proof of concept, version 0.6.1.
 - **0.1.0 works in the client** (2026-10-12): Reports → Apps in Sales Order opens the
   Sales Order paperwork on the open order.
 - **0.3.0** adds module and menu-group keys.
@@ -69,6 +69,24 @@
   listed in grey. The App Library and the Apps menus list only active, published apps.
 - **0.5.12:** the Apps panel shows inactive and unpublished apps by colour alone (no words
   beside the name), and the editor's shading behind embedded JS and CSS is fainter.
+- **0.6.0: Report Builder publishing.** The Report Builder app (`scripts/fb-builder.js`) puts its
+  definition in the user's own settings (`cdx.bi.reportBuilder.outbox.v1`) and asks for
+  `openModule('Apps (beta)', 'build:publish:<nonce>')`. The plugin (`editor/BuilderPublisher`) reads
+  it back, checks the nonce, and asks for the name, description, folder, Apps menus and who can
+  open it. It then writes the page itself from the definition (`editor/BuilderPage`: no code or
+  SQL from the user; every piece of user text escaped against the browser and Fishbowl's
+  substitution) and saves it. The page's `fb-builder` tag carries the nonce, which is how the
+  builder learns the record, so publishing again updates it.
+  - **Who may publish:** admin and BI Editor-Edit publish anywhere. The new right
+    **Apps (beta)-Build Reports** publishes a new report for the user's own groups only, in the
+    Custom folder and no Apps menu. It republishes a builder report the user has Edit Settings on,
+    keeping its access, folder and menus.
+  - **Never replaced:** system pages, and pages the builder didn't write.
+- **0.6.1:** an app no longer stays narrower than its tab. Chromium sometimes missed the
+  size it was given while the page was starting (a new tab, the module's first show) until the
+  window was resized; `BrowserFit` now gives the page a one-pixel resize after each load and
+  whenever the tab, window or preview is shown. The native BI Reports module is Fishbowl's own
+  and keeps the problem.
 
 **Building a report for these hosts?** Read
 [Building a report for report_btn](#building-a-report-for-report_btn).

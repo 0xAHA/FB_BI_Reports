@@ -37,6 +37,9 @@ public interface WorkspaceHost {
         }
     }
 
+    /** The Report Builder's right, as useraccess.moduleName holds it (ReportWorkspacePlugin adds it). */
+    String BUILD_RIGHT = ReportWorkspacePlugin.MODULE_NAME + "-" + ReportWorkspacePlugin.BUILD_RIGHT;
+
     /** The workspace module: runQuery, the user, and the module a BiBrowserPanel is initialised with. */
     FishbowlPlugin plugin();
 

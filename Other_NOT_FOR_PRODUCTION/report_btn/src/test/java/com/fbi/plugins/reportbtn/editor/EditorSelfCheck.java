@@ -33,6 +33,7 @@ public final class EditorSelfCheck {
         inserts();
         policy();
         template();
+        builderPage();
         System.out.println("EditorSelfCheck: " + passed + " checks passed");
     }
 
@@ -344,6 +345,44 @@ public final class EditorSelfCheck {
 
     private static String read(String dir, String file) throws Exception {
         return new String(Files.readAllBytes(Paths.get(dir, file)), StandardCharsets.UTF_8);
+    }
+
+    // ------------------------------------------------------------------ Report Builder page
+    private static void builderPage() throws Exception {
+        com.fasterxml.jackson.databind.ObjectMapper om = new com.fasterxml.jackson.databind.ObjectMapper();
+        // User text that a browser or Fishbowl's substitution could misread.
+        String hostile = "</script><script>alert(1)</script> {% Script fb-lib %} $SO{x} 100%   O'Brien \\ \"q\"";
+        com.fasterxml.jackson.databind.JsonNode spec = om.readTree("{\"kind\":\"fb-report-spec\",\"v\":1,\"subject\":\"sales.posted\",\"title\":"
+            + om.writeValueAsString(hostile) + ",\"steps\":[{\"type\":\"table\",\"columns\":[]}]}");
+        BuilderPage.Def d = new BuilderPage.Def();
+        d.name = "Margin $SO{x} 50% <b>";
+        d.key = "cdx.bi.rbTest";
+        d.folder = "Custom";
+        d.launch = "SO";
+        d.description = hostile;
+        d.spec = spec;
+        d.publishNonce = "abc123";
+        String page = BuilderPage.render(d);
+        check(!page.contains("$SO{x}"), "builder page: no setting token survives anywhere");
+        eq(String.valueOf(count(page, "{% Script fb-lib %}")), "1", "builder page: the one fb-lib include is ours");
+        eq(String.valueOf(count(page, "</script>")), String.valueOf(count(page, "<script")), "builder page: user text never closes a script");
+        check(page.contains("<meta name=\"fb-builder\" content=\"1; p=abc123\">"), "builder page: the publish nonce is in its tag");
+        check(page.contains("<meta name=\"fb-origin\" content=\"custom\">") && page.contains("<meta name=\"fb-launch\" content=\"SO\">"), "builder page: tags");
+        check(BuilderPage.isBuilderPage(page) && !AppGroups.isSystem(page), "builder page: recognised, custom");
+        eq(BuilderPage.storageKey(page), "cdx.bi.rbTest", "builder page: storage key reads back");
+        eq(om.writeValueAsString(BuilderPage.extract(page)), om.writeValueAsString(spec), "builder page: the spec round-trips exactly");
+        check(BuilderPage.problem(spec, 100).isEmpty(), "builder page: a spec is publishable");
+        check(!BuilderPage.problem(om.readTree("{\"kind\":\"x\"}"), 10).isEmpty(), "builder page: not a spec is refused");
+        check(!BuilderPage.problem(spec, BuilderPage.MAX_SPEC + 1).isEmpty(), "builder page: too large is refused");
+        check(!page.contains("{\"kind\":\"fb-report-spec\",\"v\":1,\"subject\":\"sales.posted\",\"title\":\"</script>"), "builder page: escaped");
+    }
+
+    private static int count(String s, String part) {
+        int n = 0;
+        for (int i = s.indexOf(part); i >= 0; i = s.indexOf(part, i + part.length())) {
+            n++;
+        }
+        return n;
     }
 
     private static void check(boolean ok, String what) {

@@ -75,6 +75,7 @@ final class AppLauncher {
         frame.setLocationRelativeTo(client);
         frame.setVisible(true);
         panel.loadHTML(html, report.getId(), report.getName(), false, params);
+        BrowserFit.afterLoad(panel);
     }
 
     /** The record's number (or name), for the window title and FB_LAUNCH.num. */

@@ -28,4 +28,12 @@ public interface WorkspaceExtension {
 
     /** The module or client is closing: false cancels (unsaved work the user wants to keep). */
     boolean checkForSave();
+
+    /**
+     * openModule('Apps (beta)', 'build:<verb>[:<arg>]'): a request from the Report
+     * Builder page (e.g. publish). arg is letters, digits, - and _ only, or null.
+     */
+    default void build(String verb, String arg) {
+        throw new UnsupportedOperationException("The Report Builder's publishing isn't part of this build.");
+    }
 }

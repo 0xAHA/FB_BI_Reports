@@ -79,12 +79,14 @@ final class PreviewPane extends JPanel {
             browser = new BiBrowserPanel();
             browser.init(module, false);
             add(browser, BorderLayout.CENTER);
+            com.fbi.plugins.reportbtn.BrowserFit.attach(browser);
             revalidate();
         }
         note.setText(caption);
         note.setToolTipText(caption);
         browser.clear();
         browser.loadHTML(html, reportId, name, false, params);
+        com.fbi.plugins.reportbtn.BrowserFit.afterLoad(browser);
     }
 
     /** Stops the previewed page (its timers and queries) without throwing the browser away. */
