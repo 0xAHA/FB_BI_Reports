@@ -2,6 +2,16 @@
 
 This guide covers every built-in JavaScript function available in Fishbowl BI reports. These functions connect directly to Fishbowl's data and client, enabling interactive, data-rich reports without needing backend changes.
 
+**Guides** (in `docs/`, index in `docs/README.md`): building an app or report
+(`building-apps.md`), porting a stock iReport (`porting-ireport.md`), the
+printable-document engine fb-doc (`fb-doc.md`), the App Builder's catalog
+(`app-builder-models.md`), the launch contract (`launch-context.md`), the
+dashboards (`dashboards-review.md`). **Skills** (`.claude/skills/`):
+`create-bi-app`, `port-ireport-report`, `add-printable-view`,
+`extend-app-builder-model`, `fishbowl-bi-save-error`. Every app must run
+standalone in the plain BI Reports viewer; report_btn (Apps menus, launch,
+document output) is an optional extra.
+
 ---
 
 ## Importable JSON exports — only when asked
@@ -58,7 +68,7 @@ description and an identity block:
   Apps** menus list the report (report_btn); it is not a folder. Write the tag
   exactly once in a page and never anywhere else: hosts read the first
   `name="fb-launch"` they find, so not in comments, strings or inlined scripts.
-  `Other_NOT_FOR_PRODUCTION/Paperwork_POC/LAUNCH_CONTEXT.md` §1 and §3 have the keys.
+  `docs/launch-context.md` §1 and §3 have the keys.
 - **The `fb-folder` tag is the report's folder:** one name, no sub-folders.
   It decides where the report sits in the App editor's Apps panel and the App
   Library (the Report Launcher, renamed 2026-10-13), and nothing else. Use a
@@ -115,11 +125,14 @@ description and an identity block:
   creates a duplicate on the next import. When a rename is wanted, rename every
   copy in place: `fbdeploy.js --rename <old> --to <new>` in Fishbowl and
   `publish.js --rename <old> <file>` on SharePoint.
-- **New reports** start from `Template/Core_Dashboard_Template.htm`, which
-  already has the block. **Ask the user what the report should be named,
-  which modules' Apps menus should list it, and which folder it goes in**
-  before creating it. Set `name` to that, name the file after it, set the
-  `fb-launch` and `fb-folder` tags and write a one-line description. Give the report a unique key and leave `build` as `'UNSTAMPED'`;
+- **New reports** start from a template in `Template/`: `List_Report_Template.htm`
+  (rows, groups, totals), `Record_Document_Template.htm` (one record) or
+  `Form_Tool_Template.htm` (a tool that writes); each has the block
+  (`docs/building-apps.md`, skill `create-bi-app`). **Ask the user what the
+  report should be named, which modules' Apps menus should list it (normally
+  none: only paperwork documents), and which folder it goes in** before
+  creating it. Set `name` to that, name the file after it, set the
+  `fb-folder` tag (and `fb-launch` only when asked) and write a one-line description. Give the report a unique key and leave `build` as `'UNSTAMPED'`;
   the next write stamps it. Its first write also asks where it should be
   deployed (see *Where an edit goes*).
 
@@ -195,7 +208,8 @@ answer creates them).
   admins see it. `--access "Sales,Warehouse"` (or `all`) adds View rows. That
   grants permissions, so run it only when the user asks for it.
 - **Built pages** (source with `<!-- @inline-script … -->` markers and a
-  `build.js` beside it, e.g. `Paperwork_POC`) ship their built `dist/` page,
+  `build.js` beside it; none at present: the Paperwork POC's were archived on
+  2026-10-15 and its documents now include the shared `fb-doc`) ship their built `dist/` page,
   and an edit to an inlined file such as `fb-doc.js` redeploys every opted-in
   page built from it (`tools/deploy/built.js`). A variant that exists only in
   `dist/` takes its target on the dist path.
@@ -547,21 +561,31 @@ const report = getHighValueReport("part", 55);
 #### `getAutoPo(vendorId, locationGroupId, qbClassId, showVendorPartNumber, includeNoRopOul, alwaysManufacture, startDate, endDate)`
 Returns the Auto PO calculation data — the same data used by the Auto PO wizard. Returns a JSON string of an array.
 
-- Dates should be in `"YYYY-MM-DD"` format
+- **Dates must be `"YYYY-MM-DD HH:MM:SS"`.** The client parses them with
+  `yyyy-MM-dd HH:mm:ss` (`Util.parse(…, 4)` in `BiBrowser`). Any other string,
+  a bare `"YYYY-MM-DD"` included, fails to parse silently and the engine runs
+  with **no date range**. Send `"… 00:00:00"` for the start and `"… 23:59:59"`
+  for the end.
 - Any ID parameter can be `null` to include all
+- It always lists **every vendor's** parts: the stock Auto PO report's
+  "Only show default parts for vendor" option has no argument here, so a
+  report that needs it must filter the rows itself
+  (`iReport_Ports/PurchaseOrder/AutoPO.htm` does).
 - **Field names are `snake_case`** (e.g., `part_num`, `vendor_name`, `qty_suggested`, `last_cost`) — the data is serialized with `LOWER_CASE_WITH_UNDERSCORES` naming
 
 ```js
-const poData = JSON.parse(getAutoPo(null, 1, null, false, true, false, "2025-01-01", "2025-12-31"));
+const poData = JSON.parse(getAutoPo(null, 1, null, false, true, false, "2025-01-01 00:00:00", "2025-12-31 23:59:59"));
 ```
 
 ---
 
 #### `getAutoMo(startDate, endDate, isIncludeNoRop?, isIncludeConfigurable?, locationGroupId?, qbClassId?)`
 Returns the Auto MO calculation data. Returns a JSON string of an array. Field names are also `snake_case` for the same reason.
+Its dates follow the same rule as `getAutoPo`: `"YYYY-MM-DD HH:MM:SS"`, or the
+date is silently ignored.
 
 ```js
-const moData = JSON.parse(getAutoMo("2025-01-01", "2025-12-31", true, false, 1, -1));
+const moData = JSON.parse(getAutoMo("2025-01-01 00:00:00", "2025-12-31 23:59:59", true, false, 1, -1));
 ```
 
 ---

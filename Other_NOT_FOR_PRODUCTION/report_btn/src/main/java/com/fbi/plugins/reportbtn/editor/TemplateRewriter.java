@@ -11,7 +11,10 @@ import java.util.regex.Pattern;
  * (key, name, an unstamped build), <title>, module tag, description and banner;
  * and an app into a copy of itself (copyOf). Either result is a custom app, since
  * only Fishbowl ships system apps. Pure, so SelfCheck runs it over the real
- * Template/Core_Dashboard_Template.htm.
+ * Template/List_Report_Template.htm, Record_Document_Template.htm and
+ * Form_Tool_Template.htm. Their "TEMPLATE" marker comments go from the lines this
+ * fills in (folder, key, name, title, h1, REPORT_TITLE) and stay everywhere else,
+ * where the author still has work to do.
  */
 final class TemplateRewriter {
 
@@ -33,6 +36,13 @@ final class TemplateRewriter {
     private static final Pattern CHARSET = Pattern.compile("^([ \\t]*)<meta charset[^>]*>[^\\r\\n]*$",
         Pattern.MULTILINE | Pattern.CASE_INSENSITIVE);
     private static final Pattern FILE_LINE = Pattern.compile("(?m)^(\\s*FILE:\\s*)(.*)$");
+    // A template's marker after a line this fills in: "<!-- TEMPLATE… -->" or "// TEMPLATE…".
+    private static final Pattern FOLDER_MARK = Pattern.compile("(?m)(<meta name=\"fb-folder\"[^>]*>)[ \\t]*<!--\\s*TEMPLATE[^>]*-->");
+    private static final Pattern IDENT_MARK = Pattern.compile("(?m)^([ \\t]*(?:key|name):[^\\r\\n]*?,)[ \\t]*//[ \\t]*TEMPLATE\\b[^\\r\\n]*$");
+    private static final Pattern TITLE_MARK = Pattern.compile("(?mi)(</title>)[ \\t]*<!--\\s*TEMPLATE[^>]*-->");
+    private static final Pattern H1_MARK = Pattern.compile("(?m)(<h1>)[^<\\r\\n]*(</h1>)[ \\t]*<!--\\s*TEMPLATE[^>]*-->");
+    private static final Pattern CONST_TITLE = Pattern.compile(
+        "(?m)^([ \\t]*const REPORT_TITLE\\s*=\\s*)'(?:[^'\\\\]|\\\\.)*'(;)[ \\t]*//[ \\t]*TEMPLATE\\b[^\\r\\n]*$");
 
     private TemplateRewriter() {
     }
@@ -51,8 +61,12 @@ final class TemplateRewriter {
         }
 
         String eol = text.contains("\r\n") ? "\r\n" : "\n";
-        text = replaceOrInsert(text, LAUNCH, launchTag, "<meta name=\"fb-launch\" content=\"" + attr(launchTag) + "\">",
-            eol, applied, missed, "module tag");
+        if (launchTag != null && !launchTag.trim().isEmpty()) {
+            text = replaceOrInsert(text, LAUNCH, launchTag, "<meta name=\"fb-launch\" content=\"" + attr(launchTag) + "\">",
+                eol, applied, missed, "module tag");
+        } else if (LAUNCH.matcher(text).find()) {
+            text = replaceOrInsert(text, LAUNCH, "", "", eol, applied, missed, "module tag");
+        }   // no Apps menus: a template without the tag stays without one
         text = replaceOrInsert(text, DESC, description, "<meta name=\"description\" content=\"" + attr(description) + "\">",
             eol, applied, missed, "description");
 
@@ -68,6 +82,20 @@ final class TemplateRewriter {
             text = text.substring(0, m.start(2)) + name + text.substring(m.end(2));
             applied.add("banner FILE line");
         }
+        m = H1_MARK.matcher(text);
+        if (m.find()) {
+            text = text.substring(0, m.start()) + m.group(1) + html(name) + m.group(2) + text.substring(m.end());
+            applied.add("heading");
+        }
+        m = CONST_TITLE.matcher(text);
+        if (m.find()) {
+            text = text.substring(0, m.start()) + m.group(1) + "'" + name.replace("\\", "\\\\").replace("'", "\\'") + "'"
+                + m.group(2) + text.substring(m.end());
+            applied.add("REPORT_TITLE");
+        }
+        text = FOLDER_MARK.matcher(text).replaceAll("$1");
+        text = IDENT_MARK.matcher(text).replaceAll("$1");
+        text = TITLE_MARK.matcher(text).replaceAll("$1");
         if (AppGroups.isSystem(text)) {
             text = AppGroups.setOrigin(text, AppGroups.CUSTOM);   // a system app used as a template
             applied.add("custom origin");

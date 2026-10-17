@@ -36,7 +36,7 @@ const { execFileSync } = require('child_process');
 const ROOT = path.resolve(__dirname, '..', '..');
 const MARKER = '@fb-build';
 const TOKEN = /\d{4}\.\d{2}\.\d{2}-[0-9a-f]{7}|UNSTAMPED/;
-const IN_SCOPE = /^(?:(?!Other_NOT_FOR_PRODUCTION\/|archived\/|mockups\/|tools\/|node_modules\/|Manufacturing\/Archived\/|Manufacturing\/Temp\/).*\.html?|scripts\/[^/]+\.(?:js|css))$/;
+const IN_SCOPE = /^(?:(?!Other_NOT_FOR_PRODUCTION\/|archived\/|mockups\/|tools\/|node_modules\/|Custom\/Manufacturing\/Archived\/|Custom\/Manufacturing\/Temp\/).*\.html?|scripts\/[^/]+\.(?:js|css))$/;
 
 function today() {
     const d = new Date();

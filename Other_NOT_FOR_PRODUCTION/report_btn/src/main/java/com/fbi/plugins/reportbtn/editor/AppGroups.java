@@ -19,7 +19,7 @@ import java.util.regex.Pattern;
  * - fb-origin: "system" for an app that ships with Fishbowl (locked in the editor;
  *   duplicate it to change it), "custom" (or no tag) for everything else.
  * The module tables are the App Library's (CATS, MODULE_GROUP) and
- * LAUNCH_CONTEXT.md section 3: keep them in step. Pure, so EditorSelfCheck holds it.
+ * docs/launch-context.md section 3: keep them in step. Pure, so EditorSelfCheck holds it.
  */
 final class AppGroups {
 

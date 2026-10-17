@@ -1,8 +1,8 @@
-# Dashboard - Company (Combined Dashboard)
+# Company Dashboard v1.2 (Combined Dashboard)
 
 ## Overview
 
-**Dashboard - Company** shows up to eight order and inventory tiles in one
+**Company Dashboard v1.2** shows up to eight order and inventory tiles in one
 configurable grid. It is the combined version of the individual
 [Dashboard Tiles](Dashboard%20Tiles.md): each tile has the same columns,
 sorting, filters and click-through as its standalone report.
@@ -36,20 +36,23 @@ dashboard expects, some features may be missing.
 
 | File | Where | Record |
 |---|---|---|
-| `Dashboard - Company-Page.json` | BI Reports ▸ `Company Dashboad and Tiles` | Page `Dashboard - Company` |
+| `Company Dashboard v1.2-Page.json` | BI Reports ▸ `Company Dashboad and Tiles` | Page `Company Dashboard v1.2` |
 
 1. In Fishbowl, open **BI Editor** and click **Import**.
-2. Select `Dashboard - Company-Page.json`.
+2. Select `Company Dashboard v1.2-Page.json`.
 3. Tick **Publish** and choose the access rights for each user group.
 4. Click **OK**.
 
-Importing over an existing `Dashboard - Company` record updates it. Users'
+Importing over an existing `Company Dashboard v1.2` record updates it. Users'
 saved settings are kept, because they are stored against the user, not the
 report.
 
+Before 2026-10-12 the record was called `Dashboard - Company`. A server that
+imported that name gets a second copy; delete the old one in the BI Editor.
+
 ### 3. Enable it as a dashboard gadget
 
-1. Open **Dashboard - Company** in the BI Report window.
+1. Open **Company Dashboard v1.2** in the BI Report window.
 2. On the **Details** tab, tick **Dashboard Gadget** and click **Save**.
 3. Add it to a Fishbowl dashboard.
 
@@ -193,7 +196,7 @@ errors.
 The eight tiles are also published as separate reports, one gadget each. See
 [Dashboard Tiles](Dashboard%20Tiles.md). The two versions differ as follows:
 
-| | Dashboard - Company | Individual tiles |
+| | Company Dashboard v1.2 | Individual tiles |
 |---|---|---|
 | Gadgets | 1 | 8 |
 | Layout | 1–4 columns, choose tiles and order | One tile per gadget |

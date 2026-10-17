@@ -10,9 +10,9 @@ wiki pages.
 
 | Dashboard | File | Record name | Storage key |
 |---|---|---|---|
-| Sales | `Sales_Dashboard_v1.2.htm` | `- Dashboard - Sales v1.2` | `cdx.bi.salesdash` |
-| Inventory | `Inventory_Dashboard_v1.2.htm` | `- Dashboards - Inventory v1.2` | `cdx.bi.invdash` |
-| Purchasing | `Purchasing_Dashboard_v1.2.htm` | `- Dashboard - Purchasing v1.2` | `cdx.bi.purchdash` |
+| Sales | `Sales_Dashboard_v1.2.htm` | `Sales Dashboard v1.2` | `cdx.bi.salesdash` |
+| Inventory | `Inventory_Dashboard_v1.2.htm` | `Inventory Dashboard v1.2` | `cdx.bi.invdash` |
+| Purchasing | `Purchasing_Dashboard_v1.2.htm` | `Purchasing Dashboard v1.2` | `cdx.bi.purchdash` |
 
 The older fixed-layout versions (`Sales_Dashboard.htm`,
 `Inventory_Dashboard.htm`, `Purchasing_Dashboard.htm`) and the Sales v1.2
@@ -312,7 +312,7 @@ Currency comes from `currencyLocale()`, falling back to `$` / en-US.
   not operational pages, so they show every location group rather than
   limiting a user to their assigned ones (`getLocationGroupList()`). Users
   narrow a view with the Location Group filter. The operational order tiles
-  and Dashboard - Company do apply the user's location groups.
+  and Company Dashboard v1.2 do apply the user's location groups.
 - **No saved views or .xlsx export.** Export is CSV per tile and per
   drill-down.
 

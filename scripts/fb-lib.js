@@ -176,7 +176,7 @@ window.FBLib = (function () {
      * Exposed as FBLib.BUILD so a report can tell which fb-lib the Fishbowl server actually served it.
      * @type {string}
      */
-    const BUILD = '2026.10.13-fd05e95';   // @fb-build
+    const BUILD = '2026.10.15-5505873';   // @fb-build
 
     /**
      * Returns the host report's identity block (window.FB_REPORT, set at the top of every report's head).
@@ -1658,6 +1658,46 @@ window.FBLib = (function () {
             return write(key, JSON.stringify(payload), opts);
         }
 
+        let _editSettingsCache = null;
+        /**
+         * The user names whose group has Edit Settings on this report: the native BI right to change a report's settings.
+         * Pass them as alsoTrust to let those users publish (Settings config.company.editors, FilterViews opts.editors).
+         * Read from bireportaccess, so a row written by anyone else is never believed. The report is the one a host
+         * opened (FB_LAUNCH / FB_WORKSPACE reportId), else the bireport named FB_REPORT.name. Cached per load.
+         * @returns {string[]} The user names; empty outside the client or for an unpublished report.
+         */
+        function editSettingsUsers() {
+            if (_editSettingsCache) return _editSettingsCache.slice();
+            let out = [];
+            if (typeof runQuery === 'function') {
+                let where = '';
+                try {
+                    const w = typeof window !== 'undefined' ? window : {};
+                    const launched = (w.FB_LAUNCH && typeof w.FB_LAUNCH === 'object' && parseInt(w.FB_LAUNCH.reportId, 10)) ||
+                        (w.FB_WORKSPACE && parseInt(w.FB_WORKSPACE.reportId, 10)) || 0;
+                    const name = (w.FB_REPORT && w.FB_REPORT.name) || '';
+                    if (launched > 0) where = 'a.biReportId = ' + launched;
+                    else if (name) where = "a.biReportId IN (SELECT b.id FROM bireport b WHERE b.name = '" + _esc(name) + "')";
+                } catch (_) { where = ''; }
+                if (where) {
+                    try {
+                        const rows = JSON.parse(runQuery(
+                            "SELECT DISTINCT su.userName AS username FROM bireportaccess a " +
+                            "INNER JOIN usergrouprel r ON r.groupId = a.userGroupId " +
+                            "INNER JOIN sysuser su ON su.id = r.userId " +
+                            "WHERE a.accessLevel = 'Edit Settings' AND " + where
+                        ) || '[]');
+                        out = (Array.isArray(rows) ? rows : []).map(function (r) { return String(r.username || ''); }).filter(Boolean);
+                    } catch (e) {
+                        try { console.warn('[FBLib.SharedData] reading the Edit Settings users failed:', e); } catch (_) {}
+                        out = [];
+                    }
+                }
+            }
+            _editSettingsCache = out;
+            return out.slice();
+        }
+
         return {
             read: read,
             readJson: readJson,
@@ -1665,7 +1705,8 @@ window.FBLib = (function () {
             writeJson: writeJson,
             invalidate: invalidate,
             isAdmin: isAdmin,
-            currentUserName: currentUserName
+            currentUserName: currentUserName,
+            editSettingsUsers: editSettingsUsers
         };
     })();
 
@@ -1717,6 +1758,10 @@ window.FBLib = (function () {
         let USER = {};
         let MASTER = {};
         let _isAdmin = false;
+        // config.company (opt-in): keys whose company value wins over the user's
+        // own, and the report's Edit Settings users trusted as publishers too.
+        let _companyKeys = [];
+        let _editors = [];
 
         function _readSettings(key) {
             if (typeof loadSettings === 'function') {
@@ -1733,7 +1778,7 @@ window.FBLib = (function () {
         // The 'userProperties' layer is FBLib.SharedData — see its doc block above
         // for the mechanism, the admin-trust rule and the watch-outs.
         function _readMasterFromUserProperties() {
-            return SharedData.read(_masterKey, { adminOnly: true });
+            return SharedData.read(_masterKey, { adminOnly: true, alsoTrust: _editors });
         }
         // publishMaster/setLock already gate on _isAdmin; SharedData.write gates
         // again, so a future call site cannot publish from a normal account.
@@ -1744,7 +1789,7 @@ window.FBLib = (function () {
             // report-local shims still sort correctly against new ones.
             payload._masterPublishedAt = new Date().toISOString();
             payload._masterPublisher = _userName || '';
-            SharedData.write(_masterKey, JSON.stringify(payload), { adminOnly: true, verify: false });
+            SharedData.write(_masterKey, JSON.stringify(payload), { adminOnly: true, alsoTrust: _editors, verify: false });
         }
         function _readMaster() {
             if (_masterStorage === 'none') return null;
@@ -1787,6 +1832,9 @@ window.FBLib = (function () {
          *   reportData raises a native dialog in the BI editor preview; useReportDataMaster:false is a legacy alias for 'none'.
          * @param {string[]} [config.defaultTileOrder] - Exposed as DEFAULT_TILE_ORDER.
          * @param {object} [config.tileToTable] - Tile key to custom-field tableRefName, used by CfCatalog (TILE_TO_TABLE).
+         * @param {object} [config.company] - Company defaults (userProperties master only), e.g. { keys: ['filters'], editors: true }.
+         *   keys: settings whose company value wins over the user's own, so every open starts from it (until it is cleared).
+         *   editors: users with Edit Settings on this report may publish too (isAdmin() is true for them), and their rows are trusted.
          */
         function init(config) {
             config = config || {};
@@ -1811,6 +1859,8 @@ window.FBLib = (function () {
             _propFallback = config.propFallback || {};
             _defaultTileOrder = (config.defaultTileOrder || []).slice();
             _tileToTable = Object.assign({}, config.tileToTable || {});
+            const company = config.company && typeof config.company === 'object' ? config.company : null;
+            _companyKeys = company && Array.isArray(company.keys) ? company.keys.map(String) : [];
             // Shared-payload backing store. Defaults to report data, so every saved
             // report keeps its existing admin-master layer untouched. See the
             // _masterStorage doc block above for when to pick the other two.
@@ -1834,6 +1884,11 @@ window.FBLib = (function () {
                         (typeof hasUserAccess === 'function' && hasUserAccess('Admin'));
                 }
             } catch (_) { _isAdmin = false; }
+            // Before the master read: the read trusts the editors' rows as well.
+            _editors = (company && company.editors && _masterStorage === 'userProperties') ? SharedData.editSettingsUsers() : [];
+            if (!_isAdmin && _userName && _editors.some(function (n) { return n.toLowerCase() === _userName.toLowerCase(); })) {
+                _isAdmin = true;
+            }
 
             USER   = _loadJson(_readSettings(_userKey))   || {};
             MASTER = _loadJson(_readMaster())             || {};
@@ -1848,6 +1903,8 @@ window.FBLib = (function () {
          */
         function resolve(key) {
             const locked = MASTER && MASTER._userEditingAllowed === false;
+            // config.company.keys: the company's value, when there is one, comes first.
+            if (_companyKeys.indexOf(key) >= 0 && MASTER && MASTER[key] != null) return MASTER[key];
             if (!locked && USER && USER[key] !== undefined) return USER[key];
             if (MASTER && MASTER[key] !== undefined) return MASTER[key];
             const prop = _propFallback[key];
@@ -1924,6 +1981,41 @@ window.FBLib = (function () {
         }
 
         /**
+         * Sets one key of the company (master) settings, keeping the rest. Admin or, with config.company.editors, Edit Settings users.
+         * For a config.company.keys key, every user then starts from this value each time the report opens.
+         * @param {string} key - The setting key, e.g. 'filters' or 'docPaper'.
+         * @param {*} value - Any JSON-serialisable value.
+         * @returns {boolean} False when the user may not publish.
+         */
+        function publishCompany(key, value) {
+            if (!_isAdmin) return false;
+            const next = Object.assign({}, MASTER);
+            next[key] = value;
+            return publishMaster(next);
+        }
+
+        /**
+         * Removes keys from the company (master) settings, so users go back to their own values. Same rights as publishCompany.
+         * @param {string|string[]} keys - The setting key(s).
+         * @returns {boolean} False when the user may not publish.
+         */
+        function clearCompany(keys) {
+            if (!_isAdmin) return false;
+            const next = Object.assign({}, MASTER);
+            [].concat(keys || []).forEach(function (k) { delete next[k]; });
+            return publishMaster(next);
+        }
+
+        /**
+         * Tells whether the company (master) settings hold a value for a key.
+         * @param {string} key - The setting key.
+         * @returns {boolean} True when a company value is set.
+         */
+        function hasCompany(key) {
+            return !!(MASTER && MASTER[key] != null);
+        }
+
+        /**
          * Returns the custom fields picked for a tile (the customFields setting), intersected with the live CF catalog.
          * Fields deactivated or deleted in Fishbowl since they were saved are dropped silently. Empty until CfCatalog loads.
          * @param {string} tileKey - The tile key, e.g. 'SO' (case-insensitive).
@@ -1977,6 +2069,14 @@ window.FBLib = (function () {
             clearUser: clearUser,
             publishMaster: publishMaster,
             setLock: setLock,
+            publishCompany: publishCompany,
+            clearCompany: clearCompany,
+            hasCompany: hasCompany,
+            /**
+             * The user names trusted to publish besides admin: those with Edit Settings on this report (config.company.editors).
+             * @returns {string[]} A copy of the list; empty without config.company.editors.
+             */
+            editors: function () { return _editors.slice(); },
             activeCfsFor: activeCfsFor,
             /** A copy of config.defaultTileOrder from init(). */
             get DEFAULT_TILE_ORDER() { return _defaultTileOrder.slice(); },
@@ -4170,10 +4270,15 @@ window.FBLib = (function () {
          * @param {Function} [opts.capture] - Custom mode: returns the JSON-able state.
          * @param {Function} [opts.restore] - Custom mode: applies a saved state; may return a Promise.
          * @param {string} [opts.sharedKey] - Company-views SharedData key (default FB_REPORT.key + '.shared.v1').
+         * @param {boolean} [opts.editors] - Users with Edit Settings on this report may publish company views too (see SharedData.editSettingsUsers).
+         * @param {boolean} [opts.companyFirst] - The company default view opens even for users who starred their own.
          * @returns {object} API: beforeLoad(), changed(), detach(), openDefault(), adoptDefault(), open(), close(), activeView.
          */
         function attach(opts) {
-            opts = opts || {};
+            opts = Object.assign({}, opts || {});
+            if (opts.editors) {
+                opts.alsoTrust = [].concat(opts.alsoTrust || [], SharedData.editSettingsUsers());
+            }
             const TILE = String(opts.tile || '').toUpperCase();
             const CUSTOM = typeof opts.capture === 'function' && typeof opts.restore === 'function';
             const FILTER_SEL = opts.filterSelector ||
@@ -4280,6 +4385,7 @@ window.FBLib = (function () {
                 return allViews().filter(function (v) { return v.id === id; })[0] || null;
             }
             function defaultView() {
+                if (opts.companyFirst) return findView(company().defaultId) || findView(mine().defaultId) || null;
                 return findView(mine().defaultId) || findView(company().defaultId) || null;
             }
             function setMsg(text, ok) { _msg = text || ''; _msgOk = !!ok; }

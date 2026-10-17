@@ -1,6 +1,6 @@
 # QuickOrder Portal — Cloudflare Worker + Pages Function
 
-This is the auth + proxy layer that lets `SalesOrder/QuickOrder_v1.2.htm`
+This is the auth + proxy layer that lets `Custom/SalesOrder/QuickOrder_v1.2.htm`
 run from any browser instead of only inside the Fishbowl desktop
 client.
 
@@ -10,7 +10,7 @@ Two pieces of code live here:
   API. Holds the KV namespace, the `TokenManager` Durable Object, and
   the proxy logic. Has NO public URL — it's reachable only via a
   Service Binding from the Pages Function.
-- **`../../SalesOrder/functions/api/[[path]].js`** — a Cloudflare
+- **`../../Custom/SalesOrder/functions/api/[[path]].js`** — a Cloudflare
   Pages Function that sits behind Cloudflare Access. Verifies the
   Access JWT on every request, then forwards to the Worker via the
   Service Binding with `X-User-Email` set to the verified email
@@ -90,7 +90,7 @@ Configured in `wrangler.toml`:
 | `FB_URL`        | env var              | Tunnel hostname for the FB REST API              |
 | `WORKER_VERSION`| env var              | Surfaced at `/health` for cache-bust visibility  |
 
-### Pages Function (`SalesOrder/functions/api/[[path]].js`)
+### Pages Function (`Custom/SalesOrder/functions/api/[[path]].js`)
 
 Configured in the Pages project dashboard → Settings → Bindings:
 
@@ -263,7 +263,7 @@ Deploy from inside the Pages source directory so Wrangler picks up
 the `functions/` subdirectory:
 
 ```cmd
-cd SalesOrder
+cd Custom/SalesOrder
 npx wrangler pages deploy . --project-name quickorder-portal --branch main
 ```
 
@@ -433,7 +433,7 @@ cd tools\cloudflare-worker
 npx wrangler dev --env production
 
 :: Pages dev (with Functions)
-cd SalesOrder
+cd Custom/SalesOrder
 npx wrangler pages dev .
 ```
 

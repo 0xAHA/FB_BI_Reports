@@ -18,7 +18,7 @@
 (function (global) {
     'use strict';
 
-    const BUILD = '2026.10.14-794394b';   // @fb-build
+    const BUILD = '2026.10.15-c7fd0a0';   // @fb-build
     const SPEC_VERSION = 1;
 
     // ================================================================ helpers
@@ -719,7 +719,7 @@
             return plan;
         }
         if (spec.v > SPEC_VERSION) {
-            fail('newerSpec', 'This report was made with a newer Report Builder. Update the shared scripts to run it.');
+            fail('newerSpec', 'This report was made with a newer App Builder. Update the shared scripts to run it.');
             return plan;
         }
         let b;
@@ -1390,7 +1390,11 @@
             // ---- settings: the user's own filter values and display choices
             if (!preview) {
                 try {
-                    L().Settings.init({ masterStorage: 'none', userKey: (fbr.key || 'cdx.bi.rb.preview') + '.user.v1',
+                    // The company's filter values ('values') and paper (fb-doc's 'docPaper') live in the shared
+                    // master; every open starts from them. Admin or the report's Edit Settings users set them.
+                    const key = fbr.key || 'cdx.bi.rb.preview';
+                    L().Settings.init({ masterStorage: 'userProperties', company: { keys: ['values'], editors: true },
+                        userKey: key + '.user.v1', masterKey: key + '.master.v1',
                         defaults: { v: 1, values: null, remember: true, showDebug: false } });
                 } catch (e) { debug('Settings failed: ' + (e && e.message || e), 'warn'); }
             }
@@ -1417,6 +1421,10 @@
                     + '<div class="rpt-fgroup"><div class="rpt-fgroup-title">&nbsp;</div><button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start">Reset filters</button></div></div></div>' : '')
                 + (preview ? '' : drawer('setOverlay', '⚙ Settings', '<div class="fbr-grid"><div class="fbr-group"><div class="fbr-group-title">Display</div>'
                     + (hasFilters ? '<label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>' : '')
+                    + (hasFilters ? '<div id="companyFilters" hidden style="margin-top:10px"><div class="fbr-group-title">Everyone</div>'
+                        + '<p style="margin:2px 0 6px;font-size:12px">Make the current filters what everyone sees each time this report opens. Anyone can still change them while it is open.</p>'
+                        + '<div style="display:flex;gap:6px;flex-wrap:wrap"><button type="button" class="hdr-btn ds-btn-admin" id="companyPubBtn">Use these filters for everyone</button>'
+                        + '<button type="button" class="hdr-btn" id="companyUnpubBtn" title="Everyone goes back to their own last choices">Stop using them</button></div></div>' : '')
                     + '<label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>'
                     + '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"><button type="button" class="hdr-btn" id="expandBtn">Expand all</button>'
                     + '<button type="button" class="hdr-btn" id="collapseBtn">Collapse all</button><button type="button" class="hdr-btn" id="resetColsBtn">Reset column layout</button></div>'
@@ -1507,7 +1515,7 @@
                 dbg.checked = !!resolve('showDebug', false);
                 dbg.onchange = () => { saveUser({ showDebug: dbg.checked }); showDebug(dbg.checked); };
             }
-            debug('Report Builder runtime ' + BUILD + ' · catalog ' + (cat ? cat.id + ' v' + cat.version : 'missing') + ' · page ' + (fbr.build || ''));
+            debug('App Builder runtime ' + BUILD + ' · catalog ' + (cat ? cat.id + ' v' + cat.version : 'missing') + ' · page ' + (fbr.build || ''));
             try {
                 if (L().RptCols) COLS = L().RptCols.attach({ table: $('rpt'), onSort: () => render(true), onReorder: () => render(true) });
             } catch (e) { debug('Column tools failed: ' + (e && e.message || e), 'warn'); }
@@ -1547,7 +1555,10 @@
             } catch (e) { debug('The PDF view failed: ' + (e && e.message || e), 'warn'); }
 
             // ---- filters: the saved values, else the report's own
-            const saved = resolve('remember', true) ? resolve('values', null) : null;
+            // The company's values, when set, apply every time; else the user's remembered ones.
+            let company = false;
+            try { company = !preview && L().Settings.hasCompany('values'); } catch (_) { company = false; }
+            const saved = company || resolve('remember', true) ? resolve('values', null) : null;
             askParams.forEach(p => { S.values[p.id] = saved && Object.prototype.hasOwnProperty.call(saved, p.id) ? saved[p.id] : p.value; });
             let applyTimer = null;
             const applySoon = () => {
@@ -1566,6 +1577,23 @@
                     rem.onchange = () => saveUser(rem.checked ? { remember: true, values: S.values } : { remember: false, values: null });
                 }
                 $('resetFiltersBtn').onclick = () => { askParams.forEach(p => { S.values[p.id] = p.value; }); writeFilters(); applySoon(); };
+                let mayPublish = false;
+                try { mayPublish = !preview && !!L().Settings.isAdmin(); } catch (_) { mayPublish = false; }
+                const box = $('companyFilters');
+                if (box && mayPublish) {
+                    box.hidden = false;
+                    $('companyPubBtn').onclick = () => {
+                        if (!confirm('Make the current filters what everyone sees each time this report opens?')) return;
+                        readFilters();
+                        const ok = L().Settings.publishCompany('values', Object.assign({}, S.values)) !== false;
+                        toast(ok ? 'Everyone now opens this report with these filters.' : 'That was not saved.', ok ? 'success' : 'error');
+                    };
+                    $('companyUnpubBtn').onclick = () => {
+                        if (!confirm('Stop using company filters for this report? Everyone goes back to their own last choices.')) return;
+                        const ok = L().Settings.clearCompany('values') !== false;
+                        toast(ok ? 'This report no longer has company filters.' : 'That was not saved.', ok ? 'success' : 'error');
+                    };
+                }
                 askParams.forEach((p, i) => {
                     const f = cat.fields[p.field];
                     const id = 'fp' + i;

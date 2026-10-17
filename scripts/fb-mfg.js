@@ -4,7 +4,7 @@
  its own Script directive, AFTER fb-lib (this module reads FBLib.Common helpers).
 
  Pure, DOM-free logic lifted VERBATIM from the mature (bug-fixed) copy in
- Manufacturing/Production_Scheduling_v1.2.htm — the canonical source. Do not
+ Custom/Manufacturing/Production_Scheduling_v1.2.htm — the canonical source. Do not
  hand-edit here; regenerate from that report so the two never drift.
 
    FBMfg.Finisher  — WO finish engine: stock query, FIFO/serial allocation,
@@ -1620,7 +1620,7 @@ function psOrderMoRowsByChain(items, deps) {
 
   global.FBMfg = {
     // Build stamp, maintained by tools/stamp/stamp.js - never edit by hand.
-    BUILD: '2026.09.24-46e47b9',   // @fb-build
+    BUILD: '2026.10.17-3c67d00',   // @fb-build
     Finisher: Finisher,
     Scrap: Scrap,
     Staging: Staging,

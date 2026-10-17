@@ -70,12 +70,12 @@ which is which for every file:
 
 ## Known caveats
 
-- **`- Sales - QuickOrder V2` is `SalesOrder/QuickOrder_v1.2.htm`** (v1.2 is
+- **`- Sales - QuickOrder V2` is `Custom/SalesOrder/QuickOrder_v1.2.htm`** (v1.2 is
   the released version, confirmed 2026-10-01). The name was recovered from an
   export of the older v1.0, which is now `archived/SalesOrder/QuickOrder.htm`.
 - **Payloads are faithful, including existing defects.** Three source files
-  carry mojibake from an old Windows-1252 save (`Manufacturing/Temp/ProdSched_vA.htm`
-  and `_vB.htm`, 18 occurrences each in visible text; `SalesOrder/QuickOrder_v1.2.htm`,
+  carry mojibake from an old Windows-1252 save (`Custom/Manufacturing/Temp/ProdSched_vA.htm`
+  and `_vB.htm`, 18 occurrences each in visible text; `Custom/SalesOrder/QuickOrder_v1.2.htm`,
   1 occurrence inside a JS comment). The wrapper reproduces the bytes as found
   rather than guessing a repair — but it does clean the *record name*, so the
   corruption never reaches Fishbowl's page list. Fix the sources if you want
@@ -151,7 +151,9 @@ question comes back on the next edit.
 
 Some pages only run once built. Their source carries markers such as
 `<!-- @inline-script fb-doc.js -->`, and the `build.js` beside it inlines
-them into `dist/<page>`. Today that's `Other_NOT_FOR_PRODUCTION/Paperwork_POC`.
+them into `dist/<page>`. No folder does this at present: the only one, the
+Paperwork POC, was archived on 2026-10-15 and its documents now include the
+shared `fb-doc` Script. The mechanism stays for future built pages.
 For these pages, `fbdeploy.js` and `publish.js` ship the built page and never
 the source. `built.js` runs the build first.
 
@@ -163,7 +165,7 @@ the source. `built.js` runs the build first.
 - **Variants** are pages built from another page, such as `SOInvoiceReport`
   from `SOReport`. They exist only in `dist/`, so their target is recorded
   against the dist path:
-  `targets.js fishbowl Other_NOT_FOR_PRODUCTION/Paperwork_POC/dist/SOInvoiceReport.htm`.
+  `targets.js fishbowl <folder>/dist/<Variant>.htm`.
 
 ## Commands
 

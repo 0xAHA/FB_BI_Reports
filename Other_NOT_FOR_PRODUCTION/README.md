@@ -10,8 +10,6 @@ published to the BI Reports folder or stamped by `tools/stamp`.
 | `Cycle_Count.htm` | Cycle-count cards with discrepancy review, posting through `ImportCycleCountData` |
 | `Document_Order_Parser.htm` | Drop a customer PDF, image or spreadsheet: OCR, parse, match, then import as an order |
 | `Import_Builder.htm` | Map an external file onto a Fishbowl import (`/api/import/…`) |
-| `Inventory_Adjustment_Helper.htm` | Inventory adjustments in bulk |
-| `Inventory_Adjustment_Helper_Tracked.htm` | The same for tracked parts (lot / serial / date) |
 | `Part_Cost_Updater.htm` | Part cost against the last purchase cost |
 | `PPP_Pricing_Validator.htm` | Validates a Part, Product & Vendor Pricing import CSV before it is imported |
 | `Solidworks_BOM_Converter.htm` | Converts a SolidWorks BOM export into a Fishbowl BOM import; `sample_bom*.csv` are its test inputs |
@@ -23,6 +21,7 @@ published to the BI Reports folder or stamped by `tools/stamp`.
 | `Fishbowl_Advanced_API_Tool.htm` | REST / legacy API explorer; the documented request shapes several reports follow |
 | `Fishbowl_API_App_Guide.htm` | Guide to building an app on the Fishbowl API |
 | `Cloudflare/` | Portal package (worker, pages, docs) for hosting a report outside Fishbowl; see its README |
+| `PowerBIAgent/` | Windows service (Python) that pushes Fishbowl data to Power BI; see its `SETUP.md` |
 
 ## Design
 
@@ -30,13 +29,15 @@ published to the BI Reports folder or stamped by `tools/stamp`.
 |---|---|
 | `FB_Brand_Mockup.htm` | Shared component mockup: the reference for `scripts/fb-styles.css` and the report template |
 
-## Paperwork proof of concept (`Paperwork_POC/`)
+## Paperwork proof of concept (archived)
 
-HTML replacements for the stock Jasper paperwork, printed and saved as PDF from
-the BI Report module's own toolbar: Sales Order Report, Sales Invoice, Purchase
-Order Report, Pick Ticket, Packing Slip, Shipping Invoice and Work Order Traveler.
-One engine (`fb-doc.js`: pagination plus the `FBDoc.app` screen shell) and one
-page per stock jrxml. See its README.
+The HTML replacements for the stock Jasper paperwork started here and became
+iReport ports on 2026-10-15: `iReport_Ports/SalesOrder/` (Sales Order Report,
+Sales Invoice), `Ship/` (Packing Slip, Shipping Invoice), `PurchaseOrder/POReport.htm`,
+`Picking/PickTicket.htm` and `WorkOrder/WOTraveler.htm`, on the shared
+`scripts/fb-doc.js`. The POC itself is in `archived/Other_NOT_FOR_PRODUCTION/Paperwork_POC/`;
+its launch spec is now [docs/launch-context.md](../docs/launch-context.md) and its
+jrxml specs are in `iReport_Ports/specs/`.
 
 ## report_btn plugin (`report_btn/`)
 
@@ -44,7 +45,7 @@ Fishbowl client plugin (Java, proof of concept): adds an **Apps** section to eve
 module's Reports menu listing the BI reports whose fb-launch tag names that module or
 its menu group (e.g. PURCHASING), and opens one in its own window on the module's open
 record (`window.FB_LAUNCH`). First user: the Sales Order paperwork. Format in
-`Paperwork_POC/LAUNCH_CONTEXT.md`; build, install and client test in its README.
+`docs/launch-context.md`; build, install and client test in its README.
 
 ## Prototypes (`prototypes/`)
 

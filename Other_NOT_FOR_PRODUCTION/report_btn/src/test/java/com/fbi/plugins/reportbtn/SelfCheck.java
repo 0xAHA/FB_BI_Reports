@@ -76,20 +76,27 @@ public final class SelfCheck {
 
         System.out.println("SelfCheck: " + passed + " checks passed");
 
-        // The page editor's own checks, when it is part of the build (--no-editor leaves it out).
+        // The optional features' own checks, when they are part of the build
+        // (--no-editor / --no-docs leave them out).
+        optional("com.fbi.plugins.reportbtn.editor.EditorSelfCheck", "EditorSelfCheck: editor not built; skipped");
+        optional("com.fbi.plugins.reportbtn.docs.DocsSelfCheck", "DocsSelfCheck: documents PoC not built; skipped");
+    }
+
+    private static void optional(String className, String skipped) {
+        String name = className.substring(className.lastIndexOf('.') + 1);
         try {
-            Class.forName("com.fbi.plugins.reportbtn.editor.EditorSelfCheck").getMethod("run").invoke(null);
+            Class.forName(className).getMethod("run").invoke(null);
         } catch (ClassNotFoundException e) {
-            System.out.println("EditorSelfCheck: editor not built; skipped");
+            System.out.println(skipped);
         } catch (java.lang.reflect.InvocationTargetException e) {
             Throwable cause = e.getCause();
-            System.out.println("FAIL EditorSelfCheck: " + cause);
+            System.out.println("FAIL " + name + ": " + cause);
             if (cause != null) {
                 cause.printStackTrace(System.out);
             }
             System.exit(1);
         } catch (ReflectiveOperationException e) {
-            System.out.println("FAIL EditorSelfCheck could not run: " + e);
+            System.out.println("FAIL " + name + " could not run: " + e);
             System.exit(1);
         }
     }

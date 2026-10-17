@@ -75,7 +75,30 @@ final class Completions {
             }
         }
         provider.clear();
-        provider.addCompletions(list);
+        try {
+            provider.addCompletions(firstOfEachName(list));
+        } catch (RuntimeException e) {
+            // Autocomplete is a help, not a reason the app can't open.
+            provider.clear();
+            System.out.println("[report_btn] Editor completions skipped: " + e);
+        }
+    }
+
+    /**
+     * One completion per name (case-insensitive), the first kept: the bridge, then the modules in
+     * include order. The provider sorts its list, and a function and a plain completion of the same
+     * name compare inconsistently ("Comparison method violates its general contract").
+     */
+    static List<Completion> firstOfEachName(List<Completion> list) {
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        List<Completion> out = new ArrayList<>();
+        for (Completion c : list) {
+            String key = c.getInputText() == null ? "" : c.getInputText().toLowerCase(java.util.Locale.ROOT);
+            if (seen.add(key)) {
+                out.add(c);
+            }
+        }
+        return out;
     }
 
     void dispose() {

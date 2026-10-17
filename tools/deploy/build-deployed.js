@@ -36,16 +36,16 @@ const OUT = path.join(REPO, 'Deployed');
 const DEPLOYED_NAMES = {
   // Published as '- Audit Trail'. Older databases may still hold a record
   // named plain 'Audit Trail'; importing this creates a second one there.
-  'Audit/Audit_Trail.htm':                                 ['- Audit Trail', '- Audit Trail'],
+  'Custom/Audit/Audit_Trail.htm':                                 ['- Audit Trail', '- Audit Trail'],
   // Client-specific pair: the entry screen captures the pricing rule into an
   // soitem custom field, the report reads it back. New records on first import.
-  'Custom/Babor/Babor_SO_Entry.htm':                       ['- Sales - Babor SO Entry', '- Sales - Babor SO Entry'],
-  'Custom/Babor/Babor_Pricing_Rule_Sales.htm':             ['- Sales - Babor Sales by Pricing Rule', '- Sales - Babor Sales by Pricing Rule'],
+  'Custom/Client Reports/Babor/Babor_SO_Entry.htm':                       ['- Sales - Babor SO Entry', '- Sales - Babor SO Entry'],
+  'Custom/Client Reports/Babor/Babor_Pricing_Rule_Sales.htm':             ['- Sales - Babor Sales by Pricing Rule', '- Sales - Babor Sales by Pricing Rule'],
   // Bright Steel: they sell by the kilo but are ordered by the bar. The
   // quoting screen and the replacement for the hand-written product card.
   // New records on first import.
-  'Custom/BrightSteel/Bars_To_Kilos.htm':                  ['- Sales - Bright Steel Bars to Kilos', '- Sales - Bright Steel Bars to Kilos'],
-  'Custom/BrightSteel/Product_Card.htm':                   ['- Part - Bright Steel Product Card', '- Part - Bright Steel Product Card'],
+  'Custom/Client Reports/BrightSteel/Bars_To_Kilos.htm':                  ['- Sales - Bright Steel Bars to Kilos', '- Sales - Bright Steel Bars to Kilos'],
+  'Custom/Client Reports/BrightSteel/Product_Card.htm':                   ['- Part - Bright Steel Product Card', '- Part - Bright Steel Product Card'],
   'Dashboards/Dashboard_Combined.htm':                     ['Dashboard - Company', 'Dashboard - Company'],
   'Dashboards/Individual Pages/Items_To_Be_Picked.htm':    ['Dashboard - Tiles - Items to be Picked', 'Dashboard - Tiles - Items to be Picked'],
   'Dashboards/Individual Pages/Items_To_Be_Received.htm':  ['Dashboard - Tiles - Items to be Received', 'Dashboard - Tiles - Items to be Received'],
@@ -58,18 +58,18 @@ const DEPLOYED_NAMES = {
   'Dashboards/Inventory_Dashboard_v1.2.htm':               ['- Dashboards - Inventory v1.2', '- Dashboards - Inventory v1.2'],
   'Dashboards/Purchasing_Dashboard_v1.2.htm':              ['- Dashboard - Purchasing v1.2', '- Dashboard - Purchasing v1.2'],
   'Dashboards/Sales_Dashboard_v1.2.htm':                   ['- Dashboard - Sales v1.2', '- Dashboard - Sales v1.2'],
-  'Inventory/Auto_PO_Inventory_Watchlist.htm':             ['- Auto PO', '- Auto PO'],
+  'Custom/Inventory/Auto_PO_Inventory_Watchlist.htm':             ['- Auto PO', '- Auto PO'],
   'Inventory/HistoricalInventoryValuation.htm':            ['- Inventory - Inventory Valuation by Date', '- Inventory - Inventory Valuation by Date'],
   'iReport_Ports/Inventory/InventoryAvailability.htm':     ['- Inventory - Inventory Availability', '- Inventory - Inventory Availability'],
-  'Inventory/Inv_Reorder_Watchlist.htm':                   ['- Inventory - Inventory Reorder Monitor', '- Inventory - Inventory Reorder Monitor'],
-  'Manufacturing/Production_Scheduling_v1.2.htm':          ['- Manufacturing - Production Scheduling w AI', '- Manufacturing - Production Scheduling w AI'],
+  'Custom/Inventory/Inv_Reorder_Watchlist.htm':                   ['- Inventory - Inventory Reorder Monitor', '- Inventory - Inventory Reorder Monitor'],
+  'Custom/Manufacturing/Production_Scheduling_v1.2.htm':          ['- Manufacturing - Production Scheduling w AI', '- Manufacturing - Production Scheduling w AI'],
   'Part/PartActivity.htm':                                 ['- Part - Part Activity', '- Part - Part Activity'],
-  'PurchaseOrder/PurchaseOrderSummary.htm':                ['- Purchasing - Purchase Order Summary', '- Purchasing - Purchase Order Summary'],
-  'PurchaseOrder/receivingsummary.htm':                    ['- Purchasing - Receiving Summary', '- Purchasing - Receiving Summary'],
+  'iReport_Ports/PurchaseOrder/PurchaseOrderSummary.htm':              ['- Purchasing - Purchase Order Summary', '- Purchasing - Purchase Order Summary'],
+  'iReport_Ports/Receiving/receivingsummary.htm':              ['- Purchasing - Receiving Summary', '- Purchasing - Receiving Summary'],
   // v1.2 is the released QuickOrder (confirmed 2026-10-01). The record was
   // first recovered from a v1.0 export; v1.0 now lives in archived/.
-  'SalesOrder/QuickOrder_v1.2.htm':                        ['- Sales - QuickOrder V2', '- Sales - QuickOrder V2'],
-  'SalesOrder/SalesOrderSummary.htm':                      ['- Sales - Sales Order Summary', '- Sales - Sales Order Summary'],
+  'Custom/SalesOrder/QuickOrder_v1.2.htm':                        ['- Sales - QuickOrder V2', '- Sales - QuickOrder V2'],
+  'Custom/SalesOrder/SalesOrderSummary.htm':                      ['- Sales - Sales Order Summary', '- Sales - Sales Order Summary'],
   'Template/Core_Dashboard_Template.htm':                  ['- System - BI Template', '- System - BI Template'],
   // Shared assets — names must match exactly or the {% Script %} /
   // {% Style %} directives in every report stop resolving.

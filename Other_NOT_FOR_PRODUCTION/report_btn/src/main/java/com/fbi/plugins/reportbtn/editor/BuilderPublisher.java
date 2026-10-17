@@ -191,7 +191,7 @@ final class BuilderPublisher {
             return "\"" + page.getName() + "\" is a Fishbowl system app, so it can't be replaced.";
         }
         if (!BuilderPage.isBuilderPage(data)) {
-            return "\"" + page.getName() + "\" wasn't made with the Report Builder (or was changed in the code editor), so publishing would overwrite its code.";
+            return "\"" + page.getName() + "\" wasn't made with the App Builder (or was changed in the code editor), so publishing would overwrite its code.";
         }
         List<AccessPolicy.Report> reports = service.reportsFor(page.getId());
         AccessPolicy.Rights rights = ClientRights.current(host, service);

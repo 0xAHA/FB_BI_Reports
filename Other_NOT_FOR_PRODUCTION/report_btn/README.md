@@ -1,6 +1,6 @@
 # report_btn: module-related BI reports, and the Apps (beta) module
 
-**Status:** proof of concept, version 0.6.1.
+**Status:** proof of concept, version 0.7.2.
 - **0.1.0 works in the client** (2026-10-12): Reports → Apps in Sales Order opens the
   Sales Order paperwork on the open order.
 - **0.3.0** adds module and menu-group keys.
@@ -87,6 +87,16 @@
   window was resized; `BrowserFit` now gives the page a one-pixel resize after each load and
   whenever the tab, window or preview is shown. The native BI Reports module is Fishbowl's own
   and keeps the problem.
+- **0.7.0: documents and email, a removable proof of concept** (`docs/`). An app can stand
+  in for a module's Jasper document, through new **Print (App)** and **Email (rich)** ribbon
+  buttons, and emails open in a rich HTML window. See
+  [Documents and email (PoC)](#documents-and-email-poc).
+- **0.7.2:** Edit on an app no longer fails with "Comparison method violates its general contract". When two scripts exported the same name, the autocomplete list held a function and a plain entry under one name, and their sort broke; now one entry per name is kept, and a completion failure no longer stops the editor opening. System apps open read-only, ready to duplicate. The App Library's folder chips are strictly A-Z (All first, Unfiled last).
+- **0.7.1:** "Open in my email program" goes to the user's default email app (the one Windows
+  uses for mailto: links), not just whichever Outlook is installed. New Outlook gets the draft
+  through its own command (`olk.exe`), as a `.eml` marked unsent on its first line. Classic
+  Outlook gets its main window opened when it isn't running, because one started only for
+  the email closed with it and kept the sent email in its Outbox.
 
 **Building a report for these hosts?** Read
 [Building a report for report_btn](#building-a-report-for-report_btn).
@@ -126,7 +136,7 @@ Reports                          (in the Purchase Order module)
   - the live fb-lib and fb-styles.
 - **The record** reaches the report as `window.FB_LAUNCH`. The format, every module's
   key and group, and what each module's record id is are in
-  [`../Paperwork_POC/LAUNCH_CONTEXT.md`](../Paperwork_POC/LAUNCH_CONTEXT.md).
+  [`docs/launch-context.md`](../../docs/launch-context.md).
 
 ## Building a report for report_btn
 
@@ -166,7 +176,7 @@ Put one tag in `<head>`, written exactly like this:
   - Manufacturing: `MO WO BOM`
   - Materials: `PART PROD INVENTORY TO CONSIGNMENT`
   - The full table, with each module's record, is
-    [LAUNCH_CONTEXT §3](../Paperwork_POC/LAUNCH_CONTEXT.md#3-modules-tag-keys-groups-and-record-ids).
+    [LAUNCH_CONTEXT §3](../../docs/launch-context.md#3-modules-tag-keys-groups-and-record-ids).
 - **Group keys:** `SALES PURCHASING MATERIALS MANUFACTURING ACCOUNTING SETUP GENERAL
   REPORTING INTEGRATIONS`. Separate keys with commas or spaces; case doesn't matter.
 - **Write the tag exactly once.** Use `name="fb-launch"` with double quotes. The plugin
@@ -180,7 +190,11 @@ Put one tag in `<head>`, written exactly like this:
 
 ### 2. Name and key the page
 
-Start from `Template/Core_Dashboard_Template.htm`. Its first `<head>` script is the
+Start from one of the three templates in `Template/`: `List_Report_Template.htm`
+(a list report), `Record_Document_Template.htm` (one record's document) or
+`Form_Tool_Template.htm` (a tool that changes data). The App editor's *New* fills in
+the lines marked `TEMPLATE` that it can (name, key, folder, Apps menus, description,
+title, heading) and leaves the rest for you. Its first `<head>` script is the
 identity block:
 
 ```js
@@ -193,7 +207,7 @@ window.FB_REPORT = {
 
 - **`name`** is the report's plain name, with no `- Folder -` prefix (dropped
   2026-10-12). Name the file after the report, in the matching repo folder:
-  `Sales Order Summary` is `SalesOrder/SalesOrderSummary.htm`.
+  `Sales Order Summary` is `Custom/SalesOrder/SalesOrderSummary.htm`.
 - **The module tag (§1) only drives the Apps menus.** Where an app is filed (the App
   Library and the Apps panel) is its own `<meta name="fb-folder" content="…">` tag:
   one folder name, written once, after the `fb-launch` tag. A page without it is
@@ -245,7 +259,7 @@ if (poId) {
   the Apps (beta) module. Every report needs its normal, unlaunched start.
 - **Don't save a launched record as the user's last choice,** and fix it in place: hide
   or disable the picker and prev/next. The paperwork reports do this; see
-  [LAUNCH_CONTEXT §4](../Paperwork_POC/LAUNCH_CONTEXT.md#4-reading-it-in-a-report).
+  [LAUNCH_CONTEXT §4](../../docs/launch-context.md#4-reading-it-in-a-report).
 - **With fb-doc,** `FBDoc.launch.get()` returns the normalised payload, and
   `FBDoc.launch.id('PO')` returns the id, or 0.
 
@@ -515,6 +529,70 @@ convention the editor enforces, not a server rule.
 `tools/deploy/fbdeploy.js` reports it as edited in Fishbowl (`needs-confirm`) and won't
 overwrite it without `--force`.
 
+## Documents and email (PoC)
+
+**A proof of concept, not for production.** It is all in `src/main/java/.../docs/` (with
+`docs/mail/`) and `src/test/java/.../docs/`; nothing outside refers to it.
+- **Leaving it out:** `./build.sh --no-docs`, the same as deleting both folders.
+- **Turning it off:** `-Dreportbtn.docs=off` on the client hides its buttons and dialog.
+- **Its only touches on the core:** `ReportWorkspacePlugin` loads it as a second extension,
+  `WorkspaceHost.loadPage` loads a page for it, and `build.sh` copies its editor page.
+
+**What it does**
+- **Fishbowl's default documents stay Jasper.** Module Options can only store a Jasper
+  report in `module.reportId`, and the stock Print and Email are untouched.
+- **An app can stand in for a document.** A *document* is a row of the `module` table: the
+  module's own row, plus extras such as Sales Order Invoice or Work Order Traveler.
+  `docs/DocSlots` covers SO, PO, Picking, Shipping, WO, MO, TO and RMA.
+- **The choice is company-wide.** It is a plugin property (`doc.<document>`) of the plugin
+  `report_btn.docs`, read back by SQL so every PC sees it at once.
+- **Who may set it:** admin, or Reports-Company Edit (to confirm against the native Module
+  Options).
+- **Print (App)** shows in a module's ribbon while one of its documents has an app. It opens
+  a viewer of the open record's document with Print, Save PDF and Email.
+- **Email (rich)** shows in every covered module. It attaches the app's PDF, or the Jasper
+  default's (made with the module's own report viewer, as the stock Email does). It then
+  opens the email window.
+- **Apps (beta) › Documents…** chooses the app per document, with a Test button that opens
+  the newest record. It also holds the user's own email choice.
+
+**The page side: document output.** The plugin loads the app as the BI Reports module does
+and adds `output: 'pdf'` to `FB_LAUNCH`. The page answers in `window.FB_DOC`
+(`docs/launch-context.md` §6). fb-doc does this for every document built on
+`FBDoc.app` or `FBDoc.Report`, so the Paperwork replicas, the iReport ports and Report
+Builder reports all qualify. The PDF comes from the native panel's own Save→PDF, in a
+window off the screen.
+
+**The email window** (`docs/mail/EmailComposer`)
+- **Fields:** To, Cc, Bcc, Subject, attachments and the body.
+- **The body editor is `Composer.htm` in the jar.** It keeps an HTML template's own style
+  sheet and shows it as it will arrive. It has formatting, links and an HTML view.
+- **Template:** the module's email template, as the client's settings name it (SO, PO,
+  Ship, else Generic), with its eight tokens filled from the record. A plain-text template
+  becomes simple HTML.
+- **Sending goes through the client's own helpers and settings:** SMTP, or the linked
+  Google or Microsoft account.
+- **The message:** `multipart/mixed` holding `alternative` (a text part, plus HTML with
+  inline images), then the attachments. The style sheet is copied onto the elements
+  (`CssInliner`), so Gmail and Outlook keep the look.
+- **"Open in my email program"** is remembered per user. Classic Outlook gets the mail
+  through COM, with HTML and attachments (its main window is opened if it wasn't running, so
+  the email leaves the Outbox). New Outlook gets a `.eml` draft marked unsent, through
+  `olk.exe`. Anything else gets the `.eml` draft, opened with the `.eml` program. Which
+  program is the user's default email app (the mailto: handler).
+
+**Checks:** `DocsSelfCheck` covers slots, `FB_LAUNCH` and `FB_DOC`, templates, tokens, the
+inliner, the MIME tree and the `.eml` draft. The page side's desk tests are
+`tools/doc-tests/Output.test.js`.
+
+**Not tried in the client yet**
+- The off-screen render and the PDF timing.
+- The ribbon buttons appearing and hiding.
+- The plugin-property save.
+- The Jasper PDF for the extra documents (e.g. the invoice).
+- The OAuth routes.
+- How new Outlook and Thunderbird take a `.eml` draft.
+
 ## Build and install
 
 ```
@@ -522,6 +600,7 @@ overwrite it without `--force`.
 ./build.sh --check       # ... and run the self-checks (core, plus the editor's over ../../scripts)
 ./build.sh --install     # ... replace any report-btn*.jar in C:\Program Files\Fishbowl\plugins
 ./build.sh --no-editor   # leave the page editor out (combines with the others)
+./build.sh --no-docs     # leave the documents and email PoC out (combines with the others)
 ```
 
 Restart the Fishbowl client after installing.

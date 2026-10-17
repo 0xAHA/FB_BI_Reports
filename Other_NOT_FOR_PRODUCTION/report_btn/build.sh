@@ -7,6 +7,7 @@
 #                           any older report-btn jar (restart the Fishbowl client)
 #   ./build.sh --no-editor  leave the page editor (the editor/ packages) out, which is
 #                           what deleting those folders does; combines with the others
+#   ./build.sh --no-docs    leave the documents and email PoC (the docs/ packages) out
 #
 # The jar name carries no version (it is in the manifest), so an upgrade replaces
 # the old jar instead of leaving two copies of the plugin in plugins/.
@@ -21,7 +22,7 @@
 #   ECJ_JAR   an ECJ jar                  (optional)
 set -euo pipefail
 
-VERSION="0.6.1"
+VERSION="0.7.2"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 FB_HOME="${FB_HOME:-/c/Program Files/Fishbowl}"
 SRC="$HERE/src/main/java"
@@ -30,25 +31,29 @@ CLASSES="$OUT/classes"
 JAR="$OUT/report-btn.jar"
 REPO_SCRIPTS="$(cd "$HERE/../../scripts" 2>/dev/null && pwd || true)"
 
-CHECK=0; INSTALL=0; NO_EDITOR=0
+CHECK=0; INSTALL=0; NO_EDITOR=0; NO_DOCS=0
 for arg in "$@"; do
     case "$arg" in
         --check) CHECK=1 ;;
         --install) INSTALL=1 ;;
         --no-editor) NO_EDITOR=1 ;;
+        --no-docs) NO_DOCS=1 ;;
         *) echo "Unknown option: $arg"; exit 1 ;;
     esac
 done
 
 [ -d "$FB_HOME/lib" ] || { echo "Fishbowl lib folder not found: $FB_HOME/lib (set FB_HOME)"; exit 1; }
 
-# Every .java under the package, sub-packages included; --no-editor skips editor/.
+# Every file named like $1 under the package, sub-packages included; --no-editor
+# skips editor/ and --no-docs skips docs/.
+files() {
+    local skip=()
+    [ "$NO_EDITOR" = 1 ] && skip+=(-not -path '*/editor/*')
+    [ "$NO_DOCS" = 1 ] && skip+=(-not -path '*/docs/*')
+    /usr/bin/find com/fbi/plugins/reportbtn -name "$1" ${skip[@]+"${skip[@]}"} | sort
+}
 sources() {
-    if [ "$NO_EDITOR" = 1 ]; then
-        /usr/bin/find com/fbi/plugins/reportbtn -name '*.java' -not -path '*/editor/*' | sort
-    else
-        /usr/bin/find com/fbi/plugins/reportbtn -name '*.java' | sort
-    fi
+    files '*.java'
 }
 
 rm -rf "$OUT"
@@ -78,6 +83,12 @@ compile() {
 
 compile "$CLASSES" "" "${SOURCES[@]}"
 
+# Pages kept beside their classes (e.g. the email composer's editor page).
+while IFS= read -r res; do
+    mkdir -p "$CLASSES/$(dirname "$res")"
+    cp "$res" "$CLASSES/$res"
+done < <(files '*.htm')
+
 # The App Library (Home) is built in: only its page goes into the jar. Its includes
 # (fb-lib, fb-styles) stay the scripts saved in Fishbowl; the server expands them.
 LIBRARY="$CLASSES/com/fbi/plugins/reportbtn/library"
@@ -91,7 +102,7 @@ printf 'Manifest-Version: 1.0\r\nImplementation-Title: report_btn\r\nImplementat
 # A jar is a zip; Windows' own tar (bsdtar) writes zip with forward-slash names.
 ( cd "$CLASSES" && /c/Windows/System32/tar.exe -a -c -f "../report-btn.zip" META-INF com )
 mv "$OUT/report-btn.zip" "$JAR"
-echo "Built $JAR$([ "$NO_EDITOR" = 1 ] && echo ' (without the page editor)')"
+echo "Built $JAR$([ "$NO_EDITOR" = 1 ] && echo ' (without the page editor)')$([ "$NO_DOCS" = 1 ] && echo ' (without the documents PoC)')"
 
 if [ "$CHECK" = 1 ]; then
     TESTS="$OUT/test-classes"
@@ -102,6 +113,7 @@ if [ "$CHECK" = 1 ]; then
     "$FB_HOME/jre/bin/java.exe" -Djava.awt.headless=true \
         ${REPO_SCRIPTS:+-Dreportbtn.scripts="$(cygpath -w "$REPO_SCRIPTS")"} \
         -Dreportbtn.repo="$(cygpath -w "$HERE/../..")" \
+        -Dreportbtn.fbhome="$(cygpath -w "$FB_HOME")" \
         -cp "$(cygpath -w "$TESTS");$(cygpath -w "$CLASSES");$LIBCP" com.fbi.plugins.reportbtn.SelfCheck
 fi
 

@@ -1,7 +1,7 @@
 /*
  fb-pricing.js  —  Fishbowl's own pricing-rule engine, in JavaScript (namespace: FBPricing).
 
- WHAT IT IS. A line-for-line port of Custom/Babor/GetPrices.sql, which reproduces
+ WHAT IT IS. A line-for-line port of Custom/Client Reports/Babor/GetPrices.sql, which reproduces
  how Fishbowl prices a product for a customer: two tiers of pricing rules, the
  priority ladder (customer > customer group > fixed > other), a HIGHEST/LOWEST
  choice per tier held in system properties, cost bases converted into the
@@ -552,7 +552,7 @@
 
   global.FBPricing = {
     // Build stamp, maintained by tools/stamp/stamp.js - never edit by hand.
-    BUILD: '2026.09.25-f4b1b41',   // @fb-build
+    BUILD: '2026.10.17-f9cdf68',   // @fb-build
     loadBook: loadBook,
     clearCache: function () { _shared = null; },
     today: today

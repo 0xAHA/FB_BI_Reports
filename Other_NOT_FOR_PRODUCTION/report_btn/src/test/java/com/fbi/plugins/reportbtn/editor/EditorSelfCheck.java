@@ -288,20 +288,39 @@ public final class EditorSelfCheck {
     // ------------------------------------------------------------------ template
     private static void template() throws Exception {
         String repo = System.getProperty("reportbtn.repo");
-        Path tpl = repo == null ? null : Paths.get(repo, "Template", "Core_Dashboard_Template.htm");
-        if (tpl == null || !Files.exists(tpl)) {
+        String[] names = {"List_Report_Template.htm", "Record_Document_Template.htm", "Form_Tool_Template.htm"};
+        String text = null;
+        for (String file : names) {
+            Path tpl = repo == null ? null : Paths.get(repo, "Template", file);
+            if (tpl == null || !Files.exists(tpl)) {
+                System.out.println("EditorSelfCheck: no " + file + "; its rewrite checks skipped");
+                continue;
+            }
+            String t = new String(Files.readAllBytes(tpl), StandardCharsets.UTF_8);
+            text = text == null ? t : text;
+            TemplateRewriter.Result r = TemplateRewriter.rewrite(t, "Kit Shortage Board", "Kits short of a component.", "MATERIALS");
+            check(r.missed.isEmpty(), file + ": every template rewrite applied (missed: " + r.missed + ")");
+            check(r.text.contains("'cdx.bi.kitShortageBoard'"), file + ": storage key");
+            check(r.text.contains("name:  'Kit Shortage Board',"), file + ": record name");
+            check(r.text.contains("build: 'UNSTAMPED'"), file + ": unstamped build");
+            check(r.text.matches("(?s).*<meta charset=\"UTF-8\">\\r?\\n\\s*<meta name=\"fb-launch\" content=\"MATERIALS\">\\r?\\n\\s*<meta name=\"fb-folder\".*"),
+                file + ": module tag added after charset, before the folder");
+            check(r.text.contains("<meta name=\"description\" content=\"Kits short of a component.\">"), file + ": description");
+            check(r.text.contains("<title>Kit Shortage Board</title>"), file + ": title");
+            check(r.text.contains("<h1>Kit Shortage Board</h1>"), file + ": heading");
+            check(!r.text.matches("(?s).*(fb-folder\"[^>]*>[ \\t]*<!--\\s*TEMPLATE|(key|name):[^\\r\\n]*//\\s*TEMPLATE|</title>[ \\t]*<!--\\s*TEMPLATE|</h1>[ \\t]*<!--\\s*TEMPLATE).*"),
+                file + ": no TEMPLATE marker left on a filled-in line");
+            check(r.text.contains("TEMPLATE:"), file + ": the author's other TEMPLATE markers stay");
+            String none = TemplateRewriter.rewrite(t, "Kit Board", "Kits.", "").text;
+            check(!none.contains("name=\"fb-launch\""), file + ": no Apps menus, no module tag");
+            check(!none.contains("name=\"fb-origin\""), file + ": no origin tag on a new app");
+        }
+        if (text == null) {
             System.out.println("EditorSelfCheck: no template; rewrite checks skipped");
             return;
         }
-        String text = new String(Files.readAllBytes(tpl), StandardCharsets.UTF_8);
-        TemplateRewriter.Result r = TemplateRewriter.rewrite(text, "Kit Shortage Board", "Kits short of a component.", "MATERIALS");
-        check(r.missed.isEmpty(), "every template rewrite applied (missed: " + r.missed + ")");
-        check(r.text.contains("key:   'cdx.bi.kitShortageBoard'") || r.text.contains("'cdx.bi.kitShortageBoard'"), "storage key");
-        check(r.text.contains("'Kit Shortage Board'"), "record name");
-        check(r.text.contains("build: 'UNSTAMPED'"), "unstamped build");
-        check(r.text.contains("<meta name=\"fb-launch\" content=\"MATERIALS\">"), "module tag");
-        check(r.text.contains("<meta name=\"description\" content=\"Kits short of a component.\">"), "description");
-        check(r.text.contains("<title>Kit Shortage Board</title>"), "title");
+        check(TemplateRewriter.rewrite(text, "Kit Board", "x", "SO").text.contains("const REPORT_TITLE = 'Kit Board';"),
+            "List_Report_Template: REPORT_TITLE");
         eq(TemplateRewriter.storageKey("Inventory Valuation Summary by Location Group"), "cdx.bi.inventoryValuationSummar", "key capped at 31");
 
         // A system app used as a template, and a system app's copy: both come out custom.

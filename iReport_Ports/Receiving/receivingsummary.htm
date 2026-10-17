@@ -1,0 +1,3413 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  REPORT: Receiving Summary
+  PATH:   iReport_Ports/Receiving/receivingsummary.htm
+  --------------------------------------------------------------------------------
+  Receipt-line activity across PO, SO, and TO order types with Flat /
+  grouped-by-receipt / Pivot views. Filters across order type, item +
+  receipt status, vendor, part, location group, date range, and free-text
+  search (order #, customer, receipt #, ref no, description, vendor part);
+  supports CSV / Print export and saved pivot presets.
+
+  STANDARD REPORT
+    The BI version of Fishbowl's Receiving/ReceivingSummary.jrxml ("Receiving
+    Summary", Letter landscape): receipt lines grouped by order (one receipt
+    per order, checked live: 2,947 PO / 425 SO / 140 TO receipts, one each),
+    with order totals and grand totals of Qty Received, Total Cost (billed),
+    Landed Cost and their Difference. Its parameters and what they are here:
+      cbApplyDateFilter + dateRange1/2  Date Field + Quick Range / dates
+      ckEntered/ckReconciled/ckReceived/ckFulfilled (receipt LINE status)
+                                        Item Status (Order Status here is the
+                                        receipt header's own status, an extra)
+      ckShowPurchaseOrders/SalesOrders/TransferOrders   Order Type PO/SO/TO
+      partNum / receiptID / locationGroupID   Part, Receipt #, Location Group
+      vendorID / customerID             Vendor (PO), Customer (SO). As in the
+                                        standard report, a vendor leaves only
+                                        PO receipts and a customer only SO
+                                        receipts (both: nothing)
+      col* column switches              Columns (Date Issued, Part #,
+                                        Description, Qty, Unit Cost, Billed
+                                        Total, Landed Total, Difference, Date
+                                        Received / Billed / Reconciled / Last
+                                        Modified); colCostingMethod and
+                                        colTotalCostingMethod drive no column
+                                        in the standard report either
+      ReportTitle                       Title box in the PDF view's paper bar
+    Audit 2026-10-14 added what this report lacked: the Unit Cost (billed
+    total / qty, as the standard report computes it; receiptitem's own billed
+    unit cost differs on 5 lines live) and Difference (billed - landed)
+    columns, their totals, the order qty total on each receipt row, the
+    vendor / customer scoping above, the report title, and "Load all" past the
+    5,000-line cap (the standard report has no cap, so its totals cover every
+    line). It also fixed SO-only / TO-only runs (a bare NULL placeholder
+    column made the client's runQuery fail; see buildSQL). Every deviation
+    from the standard report, with its evidence, is in the differences
+    register kept with the port notes (diff_rcs.md).
+    Deliberately kept: PO freight / misc lines (receipt lines with no PO line
+    or no part, 908 live) are listed here; the standard report's inner joins
+    drop them and their cost. Default filters stay this report's (this fiscal
+    year; Entered / Reconciled / Received lines), where the standard report
+    opens on this month and every line status.
+
+  VIEWS
+    The header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+    report out as pages like the standard Receiving Summary:
+      - Letter landscape by default; company, title (or the Title typed in
+        the paper bar) and "Date Range: ..." on the first page; the column
+        headings on every page; date / time and "Page X of Y" at the foot.
+      - By Receipt view: a heading per order ("PO: 1234" and the vendor,
+        customer or From location group, with the receipt #, location group
+        and line count as a note), its lines, an "Order Totals:" line and
+        "Grand Totals:" at the end, over Qty, Total Cost, Landed Cost and
+        Difference (Unit Cost has no total, as in the standard report).
+        Orders in order-number order (the standard report's) unless a
+        receipt-level heading sort is set; lines in date order unless a
+        column sort is set. Every order prints its lines whatever is expanded
+        on screen; "Order lines" off in the paper bar prints the headings and
+        order totals only.
+      - The columns are the App table's (what Columns shows, in its order)
+        under the standard report's headings; as there, the column of the
+        chosen Date Field prints even when switched off.
+      - Flat view prints the lines as one list in the App's order (with its
+        Order # column) and the grand totals; Pivot view prints the pivot as
+        shown, with its totals.
+    Paper size, orientation, the view, the title and "Order lines" are
+    remembered per user (FBLib.Settings, FB_REPORT.key + '.user.v1', apart
+    from this report's own settings blob); Print prints the pages in either
+    view (the plain table printout without fb-doc). Not reproduced: money
+    prints with the currency symbol and two decimals (the standard report
+    prints plain figures in the REPORT_DECIMAL_COST pattern unless the
+    company is multi-currency). The PDF view needs the fb-doc Script and the
+    fb-doc-fonts Style (deployed after fb-styles and fb-lib); without them
+    the report is App only.
+
+  SETTINGS KEY
+    This report's own settings (filters, columns, views, pivot presets) stay
+    under the legacy key 'receiving.bi.v3' (_KEY below), so saved settings
+    and views keep working. Do not rename it.
+================================================================================
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="fb-folder" content="Receiving">
+  <meta name="fb-origin" content="system">
+  <meta name="description" content="Receipt lines across PO, SO and TO in flat, by-receipt and pivot views.">
+  <script>
+      // ================================================================
+      // REPORT IDENTITY
+      //   key    Prefix of every setting, saved view and shared payload
+      //          this report stores in Fishbowl. Copying this report in
+      //          Fishbowl to make a SEPARATE report? Give the copy its own
+      //          key (e.g. add '2') so it keeps its own settings - left
+      //          as-is, the copy shares the original's. 31 chars max.
+      //   name   This report's Fishbowl record name (a plain name; no folder prefix).
+      //          Publishing finds its copy in the SharePoint BI Reports
+      //          folder by this name; null = not published.
+      //   build  Stamped automatically from this file's content by
+      //          tools/stamp/stamp.js - never edit it by hand.
+      // ================================================================
+      window.FB_REPORT = {
+          key:   'cdx.bi.rcvSummary',
+          name:  'Receiving Summary',
+          build: '2026.10.16-bee4839'     // @fb-build
+      };
+  </script>
+  <title>Receiving Summary - Fishbowl BI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+
+  <!-- Shared Fishbowl BI lib — inlined by Fishbowl from the saved "fb-lib"
+       script. Source of truth: scripts/fb-lib.js. Powers the multi-select
+       filter widgets (FBLib.Common.MultiSelect). Must sit BEFORE the shared
+       style include so window.FBLib exists by the time inline code runs. -->
+  <script>
+    {% Script fb-lib %}
+  </script>
+
+  <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+       Source of truth: scripts/fb-doc.js. -->
+  <script>
+    {% Script fb-doc %}
+  </script>
+
+  <!-- Shared Fishbowl BI stylesheet — injected from the saved "fb-styles" Style.
+       Source of truth: scripts/fb-styles.css. Provides .hdr-btn, .btn, modal-*,
+       toasts, scrollbar, spinner, tokens, plus (2026-07) .rpt-table, .ms-*,
+       .row-link and the .b* status badges. MUST come BEFORE the inline block
+       so per-report rules win the cascade on identical selectors. -->
+  <style>
+    {% Style fb-styles %}
+  </style>
+
+  <!-- Open Sans for the PDF view (the standard reports' font), from the
+       saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+  <style>
+    {% Style fb-doc-fonts %}
+  </style>
+
+  <style>
+    html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family: 'Inter', sans-serif; }
+
+    #filtersPanel { background: white; border-bottom: 1px solid #e2e8f0; padding: 10px 20px; display: none; flex-shrink: 0; }
+    #filtersPanel.open { display: block; }
+    #filtersPanel select, #filtersPanel input[type=text], #filtersPanel input[type=date] {
+      padding: 4px 8px; border: 1px solid #e2e8f0; border-radius: 6px;
+      font-size: 12px; color: #374151; background: #f9fafb; font-family: 'Inter', sans-serif;
+    }
+    #filtersPanel input[type=date] { background: white; }
+
+    /* Multi-select — the .ms-* skin ships from fb-styles (§32); the widgets
+       are built by FBLib.Common.MultiSelect (fb-lib). */
+
+    /* Table — the compact report tier ships from fb-styles (§29) as
+       .rpt-table; the <table> keeps id="dataTable" for JS and adds the
+       class for styling. Local residual: fixed layout + overflow clipping
+       for the column-resize machinery. NOTE: .rpt-table adds zebra striping
+       + row hover this table historically didn't have. */
+    #dataTable { table-layout: fixed; }
+    #dataTable th { overflow: hidden; }
+    #dataTable td { overflow: hidden; text-overflow: ellipsis; }
+    .col-resize-handle {
+      position: absolute; top: 0; right: 0; bottom: 0; width: 5px;
+      cursor: col-resize; z-index: 2; background: transparent;
+    }
+    .col-resize-handle:hover  { background: rgba(255,255,255,0.35); }
+    .col-resize-handle.active { background: rgba(255,255,255,0.6); }
+    .num-cell { text-align: right; font-variant-numeric: tabular-nums; }
+    .desc-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    /* Status badges (.badge/.b10/.b20/.b40/.b60) ship from fb-styles (§33). */
+    .ot-po { background:#dbeafe; color:#1e40af; padding:1px 6px; border-radius:3px; font-size:11px; font-weight:700; }
+    .ot-so { background:#d1fae5; color:#065f46; padding:1px 6px; border-radius:3px; font-size:11px; font-weight:700; }
+    .ot-to { background:#fef3c7; color:#92400e; padding:1px 6px; border-radius:3px; font-size:11px; font-weight:700; }
+
+    /* .row-link ships from fb-styles (§31). */
+
+    /* Receipt group rows */
+    tr.rcpt-hdr td {
+      background: #DEEAF4; border-bottom: 2px solid #CBE5FB;
+      cursor: pointer; padding: 4px 10px; vertical-align: middle;
+    }
+    tr.rcpt-hdr:hover td { background: #CBE5FB; }
+    .rcpt-hdr-inner { display:flex; align-items:center; gap:6px; white-space:nowrap; }
+    .rcpt-toggle { width:14px; flex-shrink:0; font-size:10px; color:var(--link); text-align:center; }
+    .rcpt-id { font-weight:700; color:#0B3140; font-size:12px; white-space:nowrap; }
+    .rcpt-total { font-weight:600; color:#0B3140; font-variant-numeric:tabular-nums; font-size:12px; white-space:nowrap; }
+    .rcpt-meta { font-size:11px; color:#9ca3af; white-space:nowrap; }
+    tr.item-row.even-item td { background:#f9fafb; }
+    tr.item-row:hover td { background:#eff6ff !important; }
+
+    #colPanel {
+      position: absolute; z-index: 200; top: calc(100% + 4px); right: 0;
+      background: white; border: 1px solid #d1d5db; border-radius: 8px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.13); width: 220px; max-height: 400px; overflow-y: auto;
+    }
+    .col-row { display: flex; align-items: center; gap: 8px; padding: 5px 10px; border-bottom: 1px solid #f3f4f6; cursor: grab; user-select: none; }
+    .col-row:last-child { border: none; }
+    .col-row:active { cursor: grabbing; }
+    .col-row.drag-over { background: #eff6ff; border-top: 2px solid var(--link); }
+    .col-row.dragging { opacity: 0.4; }
+    .col-row label { font-size: 12px; cursor: pointer; flex: 1; color: #374151; }
+    .drag-handle { color: #94a3b8; font-size: 13px; flex-shrink: 0; cursor: grab; line-height: 1; }
+
+    /* .hdr-btn family + @keyframes spin live in fb-styles.css. */
+    .spinner { animation: spin 0.75s linear infinite; }
+
+    /* Styled tooltip — ported from QuickOrder.htm's .qo-tooltip so help
+       text matches the rest of the report family (dark slate bg, light
+       label/value pair colours, pre-line whitespace so \n breaks render). */
+    .pa-tooltip {
+      position: absolute; background: rgba(15, 23, 42, 0.95); color: white;
+      padding: 10px 12px; border-radius: 8px; font-size: 11px; line-height: 1.55;
+      pointer-events: none; z-index: 10000; box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+      opacity: 0; transition: opacity 0.15s ease; max-width: 340px;
+      white-space: pre-line;
+    }
+    .pa-tooltip.show { opacity: 1; }
+    .pa-tooltip .lbl { color: #94a3b8; font-weight: 600; }
+    .pa-tooltip .val { color: #ffffff; }
+    .pa-tooltip code {
+      background: rgba(255,255,255,0.1); color: #fde68a;
+      padding: 1px 4px; border-radius: 3px; font-family: ui-monospace, monospace;
+    }
+    .pa-tooltip .kbd {
+      display: inline-block; background: #334155; color: #e2e8f0;
+      padding: 1px 5px; border-radius: 3px; font-size: 10px; font-weight: 600;
+      border: 1px solid #475569; font-family: ui-monospace, monospace;
+    }
+
+    /* .toast / .toast-container live in fb-styles.css. */
+
+    /* Pivot chrome (.pivot-bar / .pivot-table / .pivot-overflow /
+       .pivot-drill-body) ships from fb-styles (§34) — markup carries the
+       classes alongside the ids the JS targets. */
+
+    /* Saved views: FBLib.FilterViews (fb-lib) ships its own popover CSS. */
+
+    /* PDF view: Title / Order lines in fb-doc's paper bar. */
+    .pdf-opts { display: inline-flex; align-items: center; gap: 6px; margin-left: 4px; padding-left: 10px; border-left: 1px solid #e2e8f0; }
+    .pdf-opts input[type=text] { width: 180px; padding: 3px 6px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 12px; }
+    .pdf-opts label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+  </style>
+</head>
+<body class="bg-slate-50 flex flex-col">
+
+<!-- Shared styled tooltip — content is swapped in on hover by paTooltipShow. -->
+<div id="paTooltip" class="pa-tooltip"></div>
+
+  <!-- HEADER -->
+  <header class="bg-white border-b border-slate-200 px-5 flex items-center justify-between flex-shrink-0 shadow-sm" style="height:56px;">
+    <div>
+      <h1 class="text-base font-bold text-slate-900 leading-tight">Receiving Summary</h1>
+      <p id="statusLine" class="text-xs text-slate-400 leading-tight">Initialising...</p>
+    </div>
+    <div class="flex items-center gap-2">
+
+      <button id="filtersBtn" onclick="toggleFilters()" class="hdr-btn">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+        Filters
+      </button>
+
+      <!-- Saved views (FBLib.FilterViews): My views + Company views in one popover. -->
+      <span id="fvMount"></span>
+
+      <div class="relative" id="colWrap">
+        <button onclick="toggleColPanel()" class="hdr-btn" id="colBtn">
+          <svg fill="currentColor" viewBox="0 0 24 24"><circle cx="8" cy="6" r="1.5"/><circle cx="8" cy="12" r="1.5"/><circle cx="8" cy="18" r="1.5"/><circle cx="16" cy="6" r="1.5"/><circle cx="16" cy="12" r="1.5"/><circle cx="16" cy="18" r="1.5"/></svg>
+          Columns
+        </button>
+        <div id="colPanel" class="hidden">
+          <div class="px-3 py-2 text-xs font-semibold text-slate-400 border-b border-slate-100 sticky top-0 bg-white">Show / Reorder</div>
+          <div id="colList"></div>
+        </div>
+      </div>
+
+      <div class="w-px h-6 bg-slate-200 mx-1"></div>
+
+      <button onclick="runReport()" class="hdr-btn">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+        Refresh
+      </button>
+
+      <!-- View mode selector -->
+      <div class="flex items-center gap-1" style="border:1px solid #e2e8f0;border-radius:8px;padding:4px 10px;background:white;flex-shrink:0;">
+        <svg width="14" height="14" fill="none" stroke="#94a3b8" stroke-width="2" viewBox="0 0 24 24" style="flex-shrink:0;"><path d="M3 5h18M3 10h10M3 15h18M3 20h10" stroke-linecap="round"/></svg>
+        <select id="viewModeSelect" onchange="setViewMode(this.value)" style="border:none;background:transparent;font-size:12px;color:#475569;font-family:'Inter',sans-serif;cursor:pointer;outline:none;font-weight:500;">
+          <option value="flat">Flat</option>
+          <option value="grouped" selected>By Receipt</option>
+          <option value="pivot">Pivot</option>
+        </select>
+      </div>
+
+      <!-- Expand / Collapse (only visible in grouped mode) -->
+      <div id="expandBtnGroup" class="flex" style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;flex-shrink:0;">
+        <button onclick="expandAll()" class="hdr-btn" style="border:none;border-radius:0;border-right:1px solid #e2e8f0;" title="Expand all">
+          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+          Expand
+        </button>
+        <button onclick="collapseAll()" class="hdr-btn" style="border:none;border-radius:0;" title="Collapse all">
+          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 12h14" stroke-linecap="round"/></svg>
+          Collapse
+        </button>
+      </div>
+
+      <div class="flex" style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;flex-shrink:0;">
+        <button onclick="saveCurrentSettings()" class="hdr-btn" style="border:none;border-radius:0;border-right:1px solid #e2e8f0;" title="Save settings">
+          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+          Save
+        </button>
+        <button onclick="resetSettings()" class="hdr-btn" style="border:none;border-radius:0;" title="Reset to defaults">
+          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+          Reset
+        </button>
+      </div>
+
+      <div class="w-px h-6 bg-slate-200 mx-1"></div>
+
+      <button id="csvBtn" onclick="exportCSV()" class="hdr-btn">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+        CSV
+      </button>
+
+      <button id="printBtn" onclick="printReport()" class="hdr-btn" title="Print the PDF view's pages (laid out like the standard report)">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+        Print
+      </button>
+
+    </div>
+  </header>
+
+
+  <!-- FILTERS PANEL — laid out as side-by-side column groups so related
+       filters stack vertically inside their group rather than wrapping
+       across the panel.
+       Tip: text filters use SQL LIKE '%input%' — you can also use % and _
+       as MySQL wildcards. -->
+  <div id="filtersPanel">
+    <div class="flex flex-wrap items-start" style="gap:14px 22px;">
+
+      <!-- ── WHEN + EVENT ─────────────────────────────────────────── -->
+      <div class="flex flex-col gap-2" style="min-width:230px;">
+        <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide border-b border-slate-200 pb-1 flex items-center justify-between gap-2">
+          <span>When &amp; Event</span>
+          <!-- (i) help button — lives on the leftmost section header so it's
+               consistent across the report family. Filters auto-apply, so
+               no Apply button is needed. -->
+          <button type="button" tabindex="-1" id="filterHelpBtn"
+                  class="flex items-center justify-center rounded-full text-slate-400 hover:text-blue-600 hover:bg-blue-50 transition-colors cursor-help"
+                  style="width:18px; height:18px; border:1px solid #e2e8f0; flex-shrink:0;"
+                  aria-label="Filter help">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="12" y1="16" x2="12" y2="12"/>
+              <line x1="12" y1="8" x2="12.01" y2="8"/>
+            </svg>
+          </button>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Order Type</div>
+          <div class="flex items-center gap-3 flex-wrap" style="padding-top:2px;">
+            <label class="flex items-center gap-1 text-xs cursor-pointer"><input type="checkbox" id="ckPO" value="10" /><span class="ot-po">PO</span></label>
+            <label class="flex items-center gap-1 text-xs cursor-pointer"><input type="checkbox" id="ckSO" value="20" /><span class="ot-so">SO</span></label>
+            <label class="flex items-center gap-1 text-xs cursor-pointer"><input type="checkbox" id="ckTO" value="40" /><span class="ot-to">TO</span></label>
+          </div>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Order Status</div>
+          <div class="ms-container" id="rcptstatus-ms">
+            <div class="ms-trigger" id="rcptstatusTrigger"><span class="ms-placeholder" id="rcptstatusPlaceholder">All statuses</span></div>
+            <div class="ms-dropdown hidden" id="rcptstatusDropdown">
+              <div class="ms-actions"><span id="rcptstatusAll">Select All</span><span id="rcptstatusClear">Clear All</span></div>
+              <div class="ms-list" id="rcptstatusList"></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Item Status</div>
+          <div class="ms-container" id="itemstatus-ms">
+            <div class="ms-trigger" id="itemstatusTrigger"><span class="ms-placeholder" id="itemstatusPlaceholder">All statuses</span></div>
+            <div class="ms-dropdown hidden" id="itemstatusDropdown">
+              <div class="ms-actions"><span id="itemstatusAll">Select All</span><span id="itemstatusClear">Clear All</span></div>
+              <div class="ms-list" id="itemstatusList"></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Date Field</div>
+          <select id="dateField" style="width:100%;">
+            <option value="rcv">Date Received</option>
+            <option value="bll">Date Billed</option>
+            <option value="rec">Date Reconciled</option>
+            <option value="mod">Date Last Modified</option>
+            <option value="ord">Order Date Issued</option>
+            <option value="sch">Date Scheduled</option>
+          </select>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Quick Range</div>
+          <select id="dateRange" style="width:100%;" onchange="applyDateRange(this.value)">
+            <option value="custom">Custom…</option>
+            <option value="all" title="No date limit at all — every matching record, whatever its date. On a large database this can be slow.">All dates</option>
+            <!-- OPEN-ENDED: one bound only, the other deliberately empty. An
+                 "overdue" view needs this — a bounded preset like Yesterday
+                 asks for one single day, not for everything already due. -->
+            <optgroup label="Open-ended">
+              <option value="upyday" title="Everything dated on or before yesterday, with NO start date. Pair it with Date Scheduled and an unfulfilled item status for an overdue view.">On or before yesterday</option>
+              <option value="uptoday" title="Everything dated on or before today, with no start date.">On or before today</option>
+              <option value="fromtoday" title="Today and everything after it, with no end date.">Today onward</option>
+              <option value="fromtmrw" title="Tomorrow and everything after it, with no end date — strictly in the future.">Tomorrow onward</option>
+            </optgroup>
+            <optgroup label="Single day">
+              <option value="today">Today</option>
+              <option value="yday">Yesterday</option>
+            </optgroup>
+            <optgroup label="Rolling">
+              <option value="l7">Last 7 Days</option>
+              <option value="n7">Next 7 Days</option>
+              <option value="l30">Last 30 Days</option>
+              <option value="n30">Next 30 Days</option>
+              <option value="l90">Last 90 Days</option>
+            </optgroup>
+            <optgroup label="Calendar">
+              <option value="tm">This Month</option>
+              <option value="lm">Last Month</option>
+              <option value="nm" title="The whole of next calendar month, 1st to last day — not the same as the rolling Next 30 Days.">Next Month</option>
+              <option value="ytd">Year to Date</option>
+              <option value="ly">Last Year (Jan–Dec)</option>
+            </optgroup>
+            <optgroup label="Fiscal (Jul–Jun)">
+              <option value="lq2" title="The two most recently COMPLETED fiscal quarters, as one continuous range. Fiscal quarters run Jul–Sep, Oct–Dec, Jan–Mar, Apr–Jun.">Last &amp; Prev Quarter</option>
+              <option value="fy">This FY (Jul–Jun)</option>
+              <option value="lfy">Last FY (Jul–Jun)</option>
+            </optgroup>
+          </select>
+        </div>
+        <div class="flex items-center gap-1">
+          <input type="date" id="dateFrom" style="flex:1;" />
+          <span class="text-slate-400 text-xs">→</span>
+          <input type="date" id="dateTo" style="flex:1;" />
+        </div>
+      </div>
+
+      <!-- ── WHO + WHAT ───────────────────────────────────────────── -->
+      <div class="flex flex-col gap-2" style="min-width:220px;">
+        <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide border-b border-slate-200 pb-1">Who &amp; What</div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Location Group</div>
+          <div class="ms-container" id="lg-ms">
+            <div class="ms-trigger" id="lgTrigger"><span class="ms-placeholder" id="lgPlaceholder">All location groups</span></div>
+            <div class="ms-dropdown hidden" id="lgDropdown">
+              <div class="ms-actions" style="padding:5px 10px;"><span id="lgAll">Select All</span><span id="lgClear">Clear All</span></div>
+              <div class="ms-list" id="lgList"></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Vendor <span class="font-normal text-slate-300">(PO)</span></div>
+          <div class="ms-container" id="vendor-ms">
+            <div class="ms-trigger" id="vendorTrigger"><span class="ms-placeholder" id="vendorPlaceholder">All vendors</span></div>
+            <div class="ms-dropdown hidden" id="vendorDropdown">
+              <div class="ms-search"><input type="text" placeholder="Search..." id="vendorSearch" /></div>
+              <div class="ms-actions"><span id="vendorAll">Select All</span><span id="vendorClear">Clear All</span></div>
+              <div class="ms-list" id="vendorList"></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Customer Job</div>
+          <div class="ms-container" id="custjob-ms">
+            <div class="ms-trigger" id="custjobTrigger"><span class="ms-placeholder" id="custjobPlaceholder">All customer jobs</span></div>
+            <div class="ms-dropdown hidden" id="custjobDropdown">
+              <div class="ms-search"><input type="text" placeholder="Search..." id="custjobSearch" /></div>
+              <div class="ms-actions"><span id="custjobAll">Select All</span><span id="custjobClear">Clear All</span></div>
+              <div class="ms-list" id="custjobList"></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Part</div>
+          <div class="ms-container" id="part-ms">
+            <div class="ms-trigger" id="partTrigger"><span class="ms-placeholder" id="partPlaceholder">All parts</span></div>
+            <div class="ms-dropdown hidden" id="partDropdown">
+              <div class="ms-search"><input type="text" placeholder="Search..." id="partSearch" /></div>
+              <div class="ms-actions"><span id="partAll">Select All</span><span id="partClear">Clear All</span></div>
+              <div class="ms-list" id="partList"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── TEXT SEARCH ──────────────────────────────────────────── -->
+      <div class="flex flex-col gap-2" style="min-width:220px;">
+        <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide border-b border-slate-200 pb-1">Text Search</div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Order #</div>
+          <input type="text" id="filterOrderNum" placeholder="contains…" style="width:100%;" />
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Customer <span class="font-normal text-slate-300">(SO)</span></div>
+          <input type="text" id="filterCustomer" placeholder="contains…" style="width:100%;" />
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Receipt #</div>
+          <input type="text" id="filterReceiptId" placeholder="contains…" style="width:100%;" />
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Ref No</div>
+          <input type="text" id="filterRefNo" placeholder="contains…" style="width:100%;" />
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Description</div>
+          <input type="text" id="filterDesc" placeholder="contains…" style="width:100%;" />
+        </div>
+        <div>
+          <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Vendor Part # <span class="font-normal text-slate-300">(PO)</span></div>
+          <input type="text" id="filterVendorPart" placeholder="contains…" style="width:100%;" />
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- PIVOT CONFIG STRIP — visible only when viewMode === 'pivot'.
+       Row 1 is required, Row 2 is optional (nest a second dim). Each row
+       slot has its own date-bucket select that only shows for date columns.
+       Cols stays single-dim for now. -->
+  <div id="pivotBar" class="pivot-bar">
+    <span class="pv-group">Preset
+      <select id="pivotPreset" title="Apply a saved or built-in pivot setup"></select>
+    </span>
+    <button type="button" class="pv-swap" onclick="savePresetPrompt()" title="Save current setup as a new preset">+ Save preset</button>
+    <button type="button" class="pv-swap" id="pivotDelBtn" onclick="deleteCurrentPreset()" title="Delete the selected saved preset" style="display:none;">Delete</button>
+    <span class="pv-group">Rows
+      <select id="pivotRowDim"></select>
+      <select id="pivotRowBucket" style="display:none;">
+        <option value="day">Day</option>
+        <option value="week">Week</option>
+        <option value="month" selected>Month</option>
+        <option value="quarter">Quarter</option>
+        <option value="year">Year</option>
+      </select>
+      <span style="color:#94a3b8;font-weight:500;font-size:11px;">+</span>
+      <select id="pivotRowDim2" title="Second row dimension (optional)"></select>
+      <select id="pivotRowBucket2" style="display:none;">
+        <option value="day">Day</option>
+        <option value="week">Week</option>
+        <option value="month" selected>Month</option>
+        <option value="quarter">Quarter</option>
+        <option value="year">Year</option>
+      </select>
+    </span>
+    <span class="pv-group">Cols
+      <select id="pivotColDim"></select>
+      <select id="pivotColBucket" style="display:none;">
+        <option value="day">Day</option>
+        <option value="week">Week</option>
+        <option value="month" selected>Month</option>
+        <option value="quarter">Quarter</option>
+        <option value="year">Year</option>
+      </select>
+    </span>
+    <span class="pv-group">Measure <select id="pivotMeasure"></select></span>
+    <span class="pv-group">Agg
+      <select id="pivotAgg">
+        <option value="sum">Sum</option>
+        <option value="count">Count</option>
+        <option value="avg">Avg</option>
+        <option value="min">Min</option>
+        <option value="max">Max</option>
+      </select>
+    </span>
+    <button type="button" class="pv-swap" onclick="pivotSwap()" title="Swap rows ↔ columns">↔ Swap</button>
+    <label class="pv-totals"><input type="checkbox" id="pivotShowRowTotals" checked> Row totals</label>
+    <label class="pv-totals"><input type="checkbox" id="pivotShowColTotals" checked> Col totals</label>
+  </div>
+
+  <!-- TABLE WRAPPER -->
+  <div id="tableWrap" class="flex-1 overflow-auto" style="min-height:0; position:relative;">
+    <div id="loadingOverlay" style="display:none; position:sticky; top:0; left:0; right:0; height:0; z-index:30; overflow:visible;">
+      <div style="display:flex; align-items:center; justify-content:center; flex-direction:column; gap:10px; height:100vh; background:rgba(248,250,252,0.85);">
+        <svg class="spinner" width="36" height="36" viewBox="0 0 24 24" fill="none">
+          <circle cx="12" cy="12" r="10" stroke="#e2e8f0" stroke-width="3"/>
+          <path d="M12 2a10 10 0 0 1 10 10" stroke="var(--link)" stroke-width="3" stroke-linecap="round"/>
+        </svg>
+        <span style="font-size:13px; color:#64748b; font-family:'Inter',sans-serif; font-weight:500;">Loading data...</span>
+      </div>
+    </div>
+    <table id="dataTable" class="rpt-table">
+      <thead id="tHead"></thead>
+      <tbody id="tBody">
+        <tr><td style="padding:2rem;color:#9ca3af;text-align:center;" colspan="99">Loading...</td></tr>
+      </tbody>
+      <tfoot id="tFoot"></tfoot>
+    </table>
+    <div id="pivotOverflow" class="pivot-overflow"></div>
+    <table id="pivotTable" class="pivot-table" style="display:none;">
+      <thead id="pivotHead"></thead>
+      <tbody id="pivotBody"></tbody>
+    </table>
+  </div>
+
+  <!-- PIVOT DRILL-DOWN MODAL — opened when the user clicks a pivot cell. -->
+  <div id="pivotDrillModal" class="modal-overlay" onclick="if(event.target.id==='pivotDrillModal')closePivotDrill()">
+    <div class="modal-card" onclick="event.stopPropagation()" style="max-width: 1100px;">
+      <div class="modal-head">
+        <h3 id="pivotDrillTitle">Drill-down</h3>
+        <button type="button" class="fb-drawer-close" onclick="closePivotDrill()" aria-label="Close" style="background:transparent;border:none;font-size:22px;color:#fff;cursor:pointer;line-height:1;padding:0 6px;">&times;</button>
+      </div>
+      <div class="modal-body pivot-drill-body" id="pivotDrillBody"></div>
+      <div class="modal-foot">
+        <div class="left-grp"><span id="pivotDrillCount" style="font-size:12px; color:#64748b;"></span></div>
+        <div class="right-grp">
+          <button type="button" class="btn btn-sm" onclick="closePivotDrill()">Close</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<!-- TOAST -->
+<div class="toast-container"></div>
+
+<script>
+/* ── RUNTIME GUARD ── */
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+  document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#475569;"><h2>Not running inside Fishbowl</h2><p>This report requires the Fishbowl BI environment.</p></div>';
+  throw new Error('Fishbowl API not available');
+}
+/* fb-lib guard — the multi-select filters are built by FBLib.Common.MultiSelect.
+   If the fb-lib Script isn't deployed/expanded, surface the fix instead of a
+   half-dead page. (Literal hexes: fb-styles may be missing for the same reason.) */
+if (!window.FBLib || !FBLib.Common || !FBLib.Common.MultiSelect) {
+  document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#8A1E30;background:#F0D7DD;">' +
+    '<h2>fb-lib not loaded</h2><p>This report requires the shared <code>fb-lib</code> script. ' +
+    'In BI Script Editor, confirm a Script named exactly <code>fb-lib</code> exists with the current ' +
+    'contents of scripts/fb-lib.js, then re-save THIS report (directives expand at save time).</p></div>';
+  throw new Error('FBLib not available');
+}
+
+/* ── CONFIG ── */
+const _KEY = 'receiving.bi.v3';
+
+const RCPT_ITEM_STATUS_MAP = {
+  10:{label:'Entered',    cls:'b10'},
+  20:{label:'Reconciled', cls:'b20'},
+  30:{label:'Received',   cls:'b40'},
+  40:{label:'Fulfilled',  cls:'b60'},
+};
+const RCPT_STATUS_MAP = {
+  10:{label:'Entered',    cls:'b10'},
+  20:{label:'Reconciled', cls:'b20'},
+  30:{label:'Received',   cls:'b40'},
+  40:{label:'Fulfilled',  cls:'b60'},
+};
+
+/* date field key → {po, so, to} branch column */
+const DATE_COL = {
+  rcv: {po:'receiptitem.datereceived',    so:'receiptitem.datereceived',    to:'receiptitem.datereceived'},
+  bll: {po:'receiptitem.datebilled',      so:'receiptitem.datebilled',      to:'receiptitem.datebilled'},
+  rec: {po:'receiptitem.datereconciled',  so:'receiptitem.datereconciled',  to:'receiptitem.datereconciled'},
+  mod: {po:'receiptitem.datelastmodified',so:'receiptitem.datelastmodified',to:'receiptitem.datelastmodified'},
+  // NB there is deliberately no 'crt' (receipt-header creation) entry. The
+  // `receipt` table carries NO date column at all — only receiptitem does
+  // (dateReceived / dateBilled / dateReconciled / dateLastModified). This
+  // report used to select `receipt.datecreated` unconditionally, which made
+  // EVERY query fail with "Unknown column 'receipt.datecreated'" and left the
+  // report completely dead. Nothing here invents a substitute: use Date
+  // Received for when stock arrived, or Last Modified for last touch.
+  ord: {po:'po.dateissued',               so:'so.dateissued',               to:'xo.dateissued'},
+  // "Date Scheduled" exists at TWO grains on every order type, and the
+  // Fishbowl client labels BOTH of them that way:
+  //     header   po.dateFirstShip / so.dateFirstShip / xo.dateScheduled   (nullable)
+  //     line     {po,so,xo}item.dateScheduledFulfillment                  (NOT NULL)
+  // They are not the same date. In demodb they disagree on 28 of 226 PO lines
+  // and 11 of 472 SO lines, so picking the wrong grain quietly changes which
+  // rows count as overdue.
+  //
+  // A receipt row is line-grained, so the LINE date wins. The header is a real
+  // fallback rather than decoration: 10 of 235 PO receipt lines in demodb have
+  // no poitem behind them (receiptitem.poItemId null or dangling) and would
+  // otherwise carry no scheduled date at all.
+  //
+  // TO previously read the xo HEADER, on a comment claiming XO lines carry no
+  // scheduled date. xoitem.dateScheduledFulfillment does exist, is NOT NULL,
+  // and disagrees with the header on 4 of 102 rows.
+  sch: {po:'COALESCE(poitem.datescheduledfulfillment, po.datefirstship)',
+        so:'COALESCE(soitem.datescheduledfulfillment, so.datefirstship)',
+        to:'COALESCE(xoitem.datescheduledfulfillment, xo.datescheduled)'},
+};
+
+/* ── CURRENCY / DATE ── */
+var _currencyLocale = (function() {
+  try { return typeof currencyLocale === 'function' ? currencyLocale() : {locale:'en-US',symbol:'$'}; }
+  catch(e) { return {locale:'en-US',symbol:'$'}; }
+})();
+var _currSym    = _currencyLocale.symbol || '$';
+var _localeCode = _currencyLocale.locale || 'en-US';
+
+var _dateFmt = 'MM/DD/YYYY';
+(function() {
+  try {
+    var jf = typeof getProperty === 'function' ? getProperty('DateFormatShort','MM/dd/yyyy') : 'MM/dd/yyyy';
+    _dateFmt = jf.replace(/yyyy/g,'YYYY').replace(/dd/g,'DD');
+  } catch(e) {}
+})();
+
+function formatDate(s) {
+  if (!s || String(s).length < 10) return '';
+  var str = String(s);
+  return _dateFmt.replace('YYYY',str.substring(0,4)).replace('MM',str.substring(5,7)).replace('DD',str.substring(8,10));
+}
+function formatMoney(val) {
+  var num = parseFloat(val || 0);
+  if (isNaN(num)) return '';
+  // A sum of differences that cancel can land a hair below zero
+  // (-7e-15): it prints $0.00, never "-$0.00".
+  var neg = num < 0 && Math.round(num * 100) !== 0, abs = Math.abs(num);
+  return (neg?'-':'') + _currSym + abs.toLocaleString(_localeCode,{minimumFractionDigits:2,maximumFractionDigits:2});
+}
+function formatQty(v) {
+  if (v == null || isNaN(v)) return '';
+  return v % 1 === 0 ? String(Math.round(v)) : parseFloat(v).toFixed(4).replace(/\.?0+$/,'');
+}
+
+/* ── COLUMNS (item-level)
+   `pivotRole` controls each column's eligibility in the pivot config:
+     - 'dim'     — selectable as a row/col dimension
+     - 'measure' — selectable as a measure (money/qty columns)
+     - 'skip'    — not shown in pivot dropdowns (e.g. free-text descriptions). */
+let _columns = [
+  // The PO / SO / TO number. Flat view only (`flatOnly`): By Receipt already
+  // shows it on every group row, so there it would just repeat. Opens the order.
+  {key:'ordernum',         label:'Order #',         vis:true,  money:false, date:false, qty:false, link:null, orderLink:true, flatOnly:true, colW:'90px', pivotRole:'skip'},
+  {key:'linenum',          label:'Line',            vis:true,  money:false, date:false, qty:false, link:null,       colW:'36px',  pivotRole:'skip'},
+  {key:'itemstatusid',     label:'Status',          vis:true,  money:false, date:false, qty:false, ibadge:true, link:null, colW:'80px',  pivotRole:'dim'},
+  {key:'ordertype',        label:'Order Type',      vis:false, money:false, date:false, qty:false, link:null,       colW:'70px',  pivotRole:'dim'},
+  {key:'lg',               label:'Location Group',  vis:false, money:false, date:false, qty:false, link:null,       colW:'120px', pivotRole:'dim'},
+  {key:'fromname',         label:'From',            vis:false, money:false, date:false, qty:false, link:null,       colW:'160px', pivotRole:'dim'},
+  // Customer Job = receiptitem.customerId, the customer this line is being
+  // received FOR. Distinct from "From" (the vendor / source location).
+  {key:'customerjob',      label:'Customer Job',    vis:false, money:false, date:false, qty:false, link:null,       colW:'160px', pivotRole:'dim'},
+  {key:'partnum',          label:'Part #',          vis:true,  money:false, date:false, qty:false, link:'Part',     colW:'110px', pivotRole:'dim'},
+  {key:'description',      label:'Description',     vis:true,  money:false, date:false, qty:false, link:null,       colW:'200px', pivotRole:'skip'},
+  {key:'vendorpartnum',    label:'Vendor Part #',   vis:false, money:false, date:false, qty:false, link:null,       colW:'120px', pivotRole:'skip'},
+  {key:'qty',              label:'Qty',             vis:true,  money:false, date:false, qty:true,  link:null,       colW:'65px',  pivotRole:'measure'},
+  {key:'uomcode',          label:'UOM',             vis:true,  money:false, date:false, qty:false, link:null,       colW:'55px',  pivotRole:'dim'},
+  {key:'datescheduled',    label:'Date Scheduled',  vis:true,  money:false, date:true,  qty:false, link:null,       colW:'90px',  pivotRole:'dim'},
+  {key:'dateissued',       label:'Date Issued',     vis:true,  money:false, date:true,  qty:false, link:null,       colW:'90px',  pivotRole:'dim'},
+  // Receipt-header grain: every line under one receipt shares it, so the
+  // grouped view carries it on the receipt row rather than repeating it.
+  {key:'datereceived',     label:'Date Received',   vis:true,  money:false, date:true,  qty:false, link:null,       colW:'95px',  pivotRole:'dim'},
+  {key:'datebilled',       label:'Date Billed',     vis:false, money:false, date:true,  qty:false, link:null,       colW:'90px',  pivotRole:'dim'},
+  {key:'datereconciled',   label:'Date Reconciled', vis:false, money:false, date:true,  qty:false, link:null,       colW:'105px', pivotRole:'dim'},
+  {key:'datelastmodified', label:'Last Modified',   vis:false, money:false, date:true,  qty:false, link:null,       colW:'105px', pivotRole:'dim'},
+  {key:'refno',            label:'Reference',       vis:false, money:false, date:false, qty:false, link:null,       colW:'90px',  pivotRole:'skip'},
+  {key:'orderedunitcost',  label:'Ordered Cost',    vis:false, money:true,  date:false, qty:false, link:null,       colW:'95px',  pivotRole:'measure'},
+  {key:'billedunitcost',   label:'Billed Cost',     vis:false, money:true,  date:false, qty:false, link:null,       colW:'90px',  pivotRole:'measure'},
+  // The standard report's Unit Cost: billed total / qty (computed in
+  // _deriveRow). Not the same as Billed Cost above, receiptitem's stored
+  // billed unit cost, which a reconcile can leave behind its total (5 lines
+  // live, e.g. 700.00 stored vs 756.00 = 3,780.00 / 5).
+  {key:'unitcost',         label:'Unit Cost',       vis:true,  money:true,  date:false, qty:false, link:null,       colW:'85px',  pivotRole:'measure'},
+  {key:'billedtotalcost',  label:'Billed Total',    vis:true,  money:true,  date:false, qty:false, link:null,       colW:'95px',  pivotRole:'measure'},
+  {key:'landedtotalcost',  label:'Landed Total',    vis:true,  money:true,  date:false, qty:false, link:null,       colW:'95px',  pivotRole:'measure'},
+  // The standard report's Difference: billed total - landed total.
+  {key:'difference',       label:'Difference',      vis:true,  money:true,  date:false, qty:false, link:null,       colW:'90px',  pivotRole:'measure'},
+  {key:'landedunitcost',   label:'Landed Cost',     vis:false, money:true,  date:false, qty:false, link:null,       colW:'90px',  pivotRole:'measure'},
+];
+
+/* The two computed columns, worked out once per loaded row. */
+function _deriveRow(r) {
+  const q = parseFloat(r.qty), b = parseFloat(r.billedtotalcost), l = parseFloat(r.landedtotalcost);
+  r.unitcost   = (!isNaN(q) && q !== 0 && !isNaN(b)) ? b / q : null;
+  r.difference = (isNaN(b) && isNaN(l)) ? null : (isNaN(b) ? 0 : b) - (isNaN(l) ? 0 : l);
+  return r;
+}
+
+let _dataset = [], _groups = [], _expanded = new Set();
+let _sortCol = null, _sortDir = 'asc';
+let _rcptSortCol = null, _rcptSortDir = 'asc';
+
+/* View mode: 'flat' | 'grouped' | 'pivot'. Default is 'grouped' (matches
+   the pre-pivot behaviour where the report was always receipt-grouped). */
+let _viewMode = 'grouped';
+
+/* Pivot mode — config + last result. See the PIVOT VIEW block below for
+   the engine + render + drill. Receiving defaults: rows=Order Type,
+   cols=Date Received (Month), measure=Billed Total (sum). Persisted in
+   the settings JSON under `pivot`. */
+let _pivotCfg = {
+  rowDim: 'ordertype',
+  rowBucket: 'month',
+  rowDim2: '',
+  rowBucket2: 'month',
+  colDim: 'datereceived',
+  colBucket: 'month',
+  measure: 'billedtotalcost',
+  agg: 'sum',
+  showRowTotals: true,
+  showColTotals: true
+};
+let _pivotResult = null;
+
+/* Built-in presets — starter pivots for Receiving. Each `cfg` carries
+   only the structural fields (dims, buckets, measure, agg). */
+const _BUILTIN_PRESETS = [
+  {id: 'b:cost-ot-month', name: 'Billed: Order Type × Month',
+   cfg: {rowDim:'ordertype', rowBucket:'month', rowDim2:'', rowBucket2:'month', colDim:'datereceived', colBucket:'month', measure:'billedtotalcost', agg:'sum'}},
+  {id: 'b:cost-from-month', name: 'Billed: Vendor/Customer × Month',
+   cfg: {rowDim:'fromname', rowBucket:'month', rowDim2:'', rowBucket2:'month', colDim:'datereceived', colBucket:'month', measure:'billedtotalcost', agg:'sum'}},
+  {id: 'b:qty-part-month', name: 'Qty: Part × Month',
+   cfg: {rowDim:'partnum', rowBucket:'month', rowDim2:'', rowBucket2:'month', colDim:'datereceived', colBucket:'month', measure:'qty', agg:'sum'}},
+  {id: 'b:landed-from-month', name: 'Landed: Vendor/Customer × Month',
+   cfg: {rowDim:'fromname', rowBucket:'month', rowDim2:'', rowBucket2:'month', colDim:'datereceived', colBucket:'month', measure:'landedtotalcost', agg:'sum'}},
+  {id: 'b:count-ot-quarter', name: 'Line Count: Order Type × Quarter',
+   cfg: {rowDim:'ordertype', rowBucket:'month', rowDim2:'', rowBucket2:'month', colDim:'datereceived', colBucket:'quarter', measure:'__count__', agg:'count'}},
+  // Two-row preset — Row 1 → Row 2 nesting against the time axis.
+  {id: 'b:inflow-ot-from-month', name: 'Inflow: Order Type → Vendor/Customer × Month',
+   cfg: {rowDim:'ordertype', rowBucket:'month', rowDim2:'fromname', rowBucket2:'month', colDim:'datereceived', colBucket:'month', measure:'billedtotalcost', agg:'sum'}},
+];
+
+let _savedPresets = [];   // [{name, cfg}] — loaded from settings.
+
+const STATUS_LIST = [
+  {val:'10', lbl:'Entered'},
+  {val:'20', lbl:'Reconciled'},
+  {val:'30', lbl:'Received'},
+  {val:'40', lbl:'Fulfilled'},
+];
+let _lgList = [], _vendorList = [], _partList = [], _custJobList = [];
+let _selLg = new Set(), _selVendor = new Set(), _selPart = new Set();
+// "Customer Job" is receiptitem.customerId -- the customer the line is received
+// FOR. It sits on the receipt line itself, so it works for PO, SO and TO alike.
+let _selCustJob = new Set();
+let _selItemStatus = new Set(['10','20','30']);
+let _selRcptStatus = new Set(['10','20','30','40']);
+
+let _dragIdx = null, _dragColKey = null;
+const CHUNK_SIZE = 200;
+let _renderOffset = 0;
+let _visRows = [];
+let _resizing = false;
+
+/* ── INIT ── */
+async function init() {
+  setStatus('Loading...');
+
+  const today = new Date();
+  const fyStart = new Date(today.getMonth() >= 6 ? today.getFullYear() : today.getFullYear()-1, 6, 1);
+  document.getElementById('dateFrom').value = _ymd(fyStart);
+  document.getElementById('dateTo').value   = _ymd(today);
+
+  ['ckPO','ckSO','ckTO'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.checked = true;
+  });
+
+  loadSavedSettings();
+
+  _fvMigrateOnce();   // one-off: old savedViews -> FilterViews storage
+  _createFilterMS();   // widgets first (empty lists) — populate*() fills them via setItems
+  // Filter dropdown lists load in the background — the first query doesn't
+  // need them (buildSQL reads the selection Sets, never the lists), and a
+  // widget keeps its selection while its list is still arriving.
+  const _listsReady = Promise.all([populateLG(), populateVendor(), populateCustJob(), populatePart()])
+    .catch(e => console.warn('Filter lists failed to load', e));
+  // The company name, for the PDF view's title band (the standard report prints it).
+  qp('SELECT name FROM company WHERE id = 1')
+    .then(r => { _company = (r[0] && r[0].name) || ''; if (PDF) PDF.refresh(); })
+    .catch(e => console.warn('Company name unavailable', e));
+
+  try {
+    buildColPanel();
+  } catch(e) {
+    console.error('buildColPanel error:', e);
+  }
+
+  // Pivot dropdowns populate from _columns tagged pivotRole. setViewMode()
+  // applies the persisted mode and toggles pivotBar / pivotTable / Expand
+  // buttons accordingly.
+  _initPivotUI();
+  setViewMode(_viewMode);
+
+  document.getElementById('tableWrap').addEventListener('scroll', function() {
+    // Flat view renders in chunks; grouped opens collapsed and pivot is capped.
+    if (_viewMode === 'flat' && _renderOffset < _visRows.length &&
+        this.scrollTop + this.clientHeight >= this.scrollHeight - 400) {
+      appendChunk(visCols(), document.getElementById('tBody'));
+    }
+  });
+
+  wireFilterHelp();
+  wireAutoApply();
+
+  document.addEventListener('click', e => {
+    // Multi-select outside-click close is handled by fb-lib's registry.
+    const cw = document.getElementById('colWrap');
+    if (!cw.contains(e.target)) document.getElementById('colPanel').classList.add('hidden');
+  });
+
+  // Saved views (FBLib.FilterViews). The starred default is adopted BEFORE
+  // the pivot UI / view mode / first query, so opening on it costs no extra load.
+  _pageViews = (window.FBLib && FBLib.FilterViews) ? FBLib.FilterViews.attach({
+    editors: true, companyFirst: true,   // the company's default view opens for everyone
+    tile: 'RCV', mount: 'fvMount',
+    capture: _fvCapture, restore: _fvRestore, matches: _fvMatches, describe: _viewSummary,
+    storage: { load: _fvLoad, save: _fvSave },
+    legacyCompany: _fvLegacyCompany,
+    legacyCleanup: b => { delete b.rcvViews; delete b.rcvViewsReset; }
+  }) : null;
+  const _dv = _pageViews ? _pageViews.adoptDefault() : null;
+  if (_dv) {
+    _suppressAutoApply = true;
+    try {
+      applyFilterState(_dv.filters, true);
+      if (_dv.pivot && typeof _dv.pivot === 'object') Object.assign(_pivotCfg, _dv.pivot);
+      if (_dv.viewMode) _viewMode = _dv.viewMode;
+    } finally { _suppressAutoApply = false; }
+    // The pivot bar and view mode were already set up above, from the saved
+    // settings - re-sync them to the default view before the first query.
+    syncPivotBarFromCfg();
+    setViewMode(_viewMode);
+  }
+
+  // App / PDF views (needs the fb-doc script; without it the report is App
+  // only). The view's own preferences (App or PDF, paper, orientation, and
+  // the Title / Order lines below) live in FBLib.Settings under
+  // FB_REPORT.key + '.user.v1', apart from this report's own settings blob
+  // (_KEY), which they never touch.
+  if (window.FBDoc && FBDoc.Report) {
+    try { FBLib.Settings.init({ masterStorage: 'userProperties', company: { keys: [], editors: true } });   // company paper } catch (e) { console.warn('PDF view settings unavailable', e); }
+    PDF = FBDoc.Report.view({
+      app: document.getElementById('tableWrap'), toggleBefore: document.getElementById('csvBtn'),
+      page: { size: 'Letter', orientation: 'landscape' },
+      doc: docSpec, title: function () { return _pdfTitle(); }
+    });
+    _pdfMountOptions();
+  } else console.warn('fb-doc is not loaded: the PDF view is unavailable.');
+
+  _initDone = true;
+  try {
+    await runReport();
+    if (_dv && _dv.expandAll) expandAll();
+  } catch(e) {
+    console.error('runReport top-level error:', e);
+  }
+}
+
+// fb-lib owns the panel when it can: one drawer or panel open at a time, and
+// a press outside closes it. The local toggle below is the fallback for an
+// older saved fb-lib.
+if (window.FBLib && FBLib.Common && FBLib.Common.registerPanel) FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+function toggleFilters() {
+  if (window.FBLib && FBLib.Common && FBLib.Common.togglePanel) { FBLib.Common.togglePanel('filtersPanel'); return; }
+  const panel = document.getElementById('filtersPanel');
+  const btn   = document.getElementById('filtersBtn');
+  panel.classList.toggle('open');
+  btn.classList.toggle('active', panel.classList.contains('open'));
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════
+   SAVED VIEWS — FBLib.FilterViews adapter.
+   The popover (My views, Company views, admin publish / delete-for-all)
+   lives in fb-lib. This report supplies what a view IS:
+     state = { filters: captureFilterState(), viewMode, pivot, expandAll }
+   My views live in this report's own settings blob (_KEY) under
+   `filterViews` = { views, defaultId }. Company views are read live from
+   FBLib.SharedData (SHARED_KEY, field filterViews.RCV); until an admin
+   first publishes, the old org-push set (`rcvViews`) is shown as the
+   company list, and that first publish removes the old fields.
+   ════════════════════════════════════════════════════════════════════════ */
+let _pageViews = null;
+function _fvChanged() { if (_pageViews) _pageViews.changed(); }
+
+function newViewId() {
+  return 'v' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+function _fvBlob() {
+  try { const raw = loadSettings(_KEY); if (raw) return JSON.parse(raw) || {}; } catch (_) {}
+  return {};
+}
+function _fvLoad() {
+  const fv = _fvBlob().filterViews;
+  return (fv && typeof fv === 'object') ? fv : { views: [], defaultId: null };
+}
+/* Read-modify-write so a view change never drops the rest of the blob.
+   `v: 1` is (re)stamped — loadSavedSettings() ignores a blob without it. */
+function _fvSave(o) {
+  try {
+    const s = _fvBlob();
+    s.v = 1;
+    s.filterViews = { views: o.views || [], defaultId: o.defaultId || null };
+    saveSettings(_KEY, JSON.stringify(s));
+    return true;
+  } catch (e) { console.warn('Persist views failed', e); return false; }
+}
+function _fvLegacyState(v) {
+  return { filters: v.filters, viewMode: v.viewMode || 'flat', pivot: v.pivot || null, expandAll: !!v.expandAll };
+}
+/* The pre-FilterViews org-push set, shown as the company list until an admin
+   publishes through the popover. Ids are positional so a user's star on one
+   survives until then. */
+function _fvLegacyCompany(blob) {
+  const pub = blob && blob.rcvViews;
+  if (!pub || !Array.isArray(pub.views) || !pub.views.length) return null;
+  return {
+    views: pub.views.filter(v => v && v.name && v.filters)
+      .map((v, i) => ({ id: 'legacy' + i, name: String(v.name), state: _fvLegacyState(v), updated: pub.at || '' })),
+    defaultId: null, at: pub.at || '', by: pub.by || ''
+  };
+}
+/* One-off: move the old `savedViews` list into filterViews. Copies an admin
+   pushed (marked `shared` and never edited) are dropped when that view is
+   still published — it shows under Company views now, so keeping the copy
+   would list it twice. */
+function _fvMigrateOnce() {
+  const s = _fvBlob();
+  if (s.filterViews || !Array.isArray(s.savedViews)) return;
+  let published = new Set();
+  try {
+    const pub = (readSharedBlob() || {}).rcvViews;
+    if (pub && Array.isArray(pub.views)) published = new Set(pub.views.map(v => String(v.name || '').toLowerCase()));
+  } catch (_) {}
+  s.filterViews = {
+    views: s.savedViews
+      .filter(v => v && v.name && v.filters)
+      .filter(v => !(v.shared && published.has(String(v.name).toLowerCase())))
+      .map(v => ({ id: v.id || newViewId(), name: String(v.name), state: _fvLegacyState(v), updated: v.savedAt || '' })),
+    defaultId: null
+  };
+  delete s.savedViews; delete s.viewsAdoptedRev; delete s.viewsResetAck;
+  s.v = 1;
+  try { saveSettings(_KEY, JSON.stringify(s)); } catch (e) { console.warn('View migration failed', e); }
+}
+function _fvCapture() {
+  return { filters: captureFilterState(), viewMode: _viewMode, pivot: capturePivotCfg(), expandAll: captureExpandAll() };
+}
+/* Is the view's state what's on screen? Same rules the old picker used:
+   filters + mode always; the pivot only in pivot mode (and only if the view
+   recorded one); expand-all only in grouped modes. */
+function _fvMatches(v, live) {
+  if (_viewKey(v.filters) !== _viewKey(live.filters)) return false;
+  if ((v.viewMode || 'flat') !== (live.viewMode || 'flat')) return false;
+  const mode = live.viewMode || 'flat';
+  if (mode === 'pivot' && v.pivot) return _cfgKey(v.pivot) === _cfgKey(live.pivot);
+  if (mode !== 'flat' && mode !== 'pivot' && v.expandAll !== undefined) return !!v.expandAll === !!live.expandAll;
+  return true;
+}
+async function _fvRestore(st) {
+  // One re-run at the end: applyFilterState writes a dozen fields and can
+  // call applyDateRange, each of which would otherwise fire its own query.
+  _suppressAutoApply = true;
+  try {
+    applyFilterState(st.filters, true);
+    // Before setViewMode: switching INTO pivot renders immediately, and it
+    // must render the view's own pivot rather than the one already on screen.
+    applyPivotCfg(st.pivot);
+    if (st.viewMode) setViewMode(st.viewMode);
+  } finally {
+    _suppressAutoApply = false;
+  }
+  _noCap = false;
+  await runReport();
+  // Strictly after the query: the refresh rebuilds _groups and clears _expanded.
+  if (st.expandAll) expandAll();
+  const v = _pageViews && _pageViews.activeView;
+  setStatus('View applied' + (v ? ': ' + v.name : '') + (typeof _statusSuffix !== 'undefined' && _statusSuffix ? ' — ' + _statusSuffix : ''));
+}
+
+let _suppressAutoApply = false;
+let _initDone = false;   // set by init() just before its first query
+
+function mkOpt(value, label) {
+  const o = document.createElement('option');
+  o.value = value; o.textContent = label;
+  return o;
+}
+
+/* ── PIVOT CONFIG IN A SAVED VIEW ──
+   A view used to record only `viewMode`, so applying a saved PIVOT view put
+   the report back into pivot mode and then showed whatever rows / columns /
+   measure happened to be on screen — the saved pivot was silently lost. The
+   config travels with the view now.
+
+   Views saved before this change have no `pivot` key. They are treated as
+   "no opinion": the mode is restored, the pivot config is left alone, and
+   they still match in the picker. */
+function capturePivotCfg() {
+  return Object.assign({}, _pivotCfg);
+}
+
+/* Expand / collapse state, as a BOOLEAN rather than the set of expanded
+   receipt ids. The ids are worthless to a saved view: runReport() clears
+   _expanded on every refresh and the next run returns a different set of
+   receipts anyway, so the only durable question is "does this view open
+   expanded or collapsed?". Partially expanded counts as collapsed. */
+function captureExpandAll() {
+  return _groups.length > 0 && _expanded.size === _groups.length;
+}
+
+function applyPivotCfg(cfg) {
+  if (!cfg || typeof cfg !== 'object') return;
+  Object.assign(_pivotCfg, cfg);
+  syncPivotBarFromCfg();
+}
+
+/* Push _pivotCfg into the pivot bar's own controls. Shared with
+   _applyPresetById, which needs exactly the same DOM sync. */
+function syncPivotBarFromCfg() {
+  const set = (id, val) => { const el = document.getElementById(id); if (el) el.value = val; };
+  set('pivotRowDim',     _pivotCfg.rowDim || '');
+  set('pivotRowDim2',    _pivotCfg.rowDim2 || '');
+  set('pivotColDim',     _pivotCfg.colDim || '');
+  set('pivotRowBucket',  _pivotCfg.rowBucket || 'month');
+  set('pivotRowBucket2', _pivotCfg.rowBucket2 || 'month');
+  set('pivotColBucket',  _pivotCfg.colBucket || 'month');
+  set('pivotMeasure',    _pivotCfg.measure);
+  set('pivotAgg',        _pivotCfg.agg);
+  const rt = document.getElementById('pivotShowRowTotals');
+  if (rt) rt.checked = !!_pivotCfg.showRowTotals;
+  const ct = document.getElementById('pivotShowColTotals');
+  if (ct) ct.checked = !!_pivotCfg.showColTotals;
+  _updatePivotBucketVisibility();
+  _renderPresetDropdown();
+}
+
+/* The multi-select filters, as one table driving a view snapshot. `get`
+   returns the live Set — never the Set itself at module scope, because the
+   widgets close over the object and it must be mutated in place. `ms` is the
+   fb-lib widget container id; `cfv` marks a custom-field VALUE picker, which
+   runs on the local async engine and repaints via updateCFValueTrigger.
+   `skipEmpty` marks a filter whose empty state would make buildSQL bail. */
+const _FILTER_SETS = [
+  {key:'statuses',        get: () => _selItemStatus,   ms:'itemstatus-ms',  skipEmpty:true},
+  {key:'rcptStatuses',    get: () => _selRcptStatus,   ms:'rcptstatus-ms', skipEmpty:true},
+  {key:'selLg',           get: () => _selLg,           ms:'lg-ms'},
+  {key:'selVendor',       get: () => _selVendor,       ms:'vendor-ms'},
+  {key:'selCustJob',      get: () => _selCustJob,      ms:'custjob-ms'},
+  {key:'selPart',         get: () => _selPart,         ms:'part-ms'},
+];
+/* Plain inputs — the id IS the settings key. */
+const _FILTER_INPUTS = [
+  'dateField', 'dateRange', 'dateFrom', 'dateTo',
+  'filterOrderNum', 'filterCustomer', 'filterReceiptId',
+  'filterRefNo', 'filterDesc', 'filterVendorPart',
+];
+/* Checkbox filters — captured by checked state rather than value. */
+const _FILTER_CHECKS = ['ckPO', 'ckSO', 'ckTO'];
+
+function captureFilterState() {
+  const f = {};
+  _FILTER_SETS.forEach(d => { f[d.key] = [...d.get()].map(String); });
+  _FILTER_INPUTS.forEach(id => { const el = document.getElementById(id); f[id] = el ? el.value : ''; });
+  _FILTER_CHECKS.forEach(id => { const el = document.getElementById(id); f[id] = el ? !!el.checked : false; });
+  return f;
+}
+
+/* Push a captured state back into the globals and — when `syncWidgets` is set
+   — into the live DOM. Sets are mutated IN PLACE: every fb-lib multi-select
+   closes over the Set object it was created with, so reassigning one orphans
+   its widget. (loadSavedSettings can get away with reassignment because it
+   runs before _createFilterMS(); this cannot.) */
+function applyFilterState(f, syncWidgets) {
+  if (!f || typeof f !== 'object') return;
+  _FILTER_SETS.forEach(d => {
+    const vals = f[d.key];
+    if (!Array.isArray(vals)) return;
+    // An empty list here makes the query bail, so treat it as "no opinion"
+    // rather than wiping the user's selection.
+    if (d.skipEmpty && !vals.length) return;
+    const set = d.get();
+    set.clear();
+    vals.forEach(v => set.add(String(v)));
+    if (!syncWidgets) return;
+    if (d.ms) { const w = FBLib.Common.MultiSelect.get(d.ms); if (w) w.setSelected([...set]); }
+    if (d.cfv && typeof updateCFValueTrigger === 'function') updateCFValueTrigger(d.cfv);
+  });
+  _FILTER_INPUTS.forEach(id => {
+    if (f[id] === undefined) return;
+    const el = document.getElementById(id);
+    if (el) el.value = f[id];
+  });
+  _FILTER_CHECKS.forEach(id => {
+    if (f[id] === undefined) return;
+    const el = document.getElementById(id);
+    if (el) el.checked = !!f[id];
+  });
+  // A relative Quick Range (Last 30 Days, This Month…) must recompute against
+  // TODAY rather than replay the dates captured when the view was saved.
+  if (f.dateRange && f.dateRange !== 'custom') applyDateRange(f.dateRange);
+}
+
+const SHARED_KEY = FB_REPORT.key + '.shared.v1';
+
+/* ── SHARED (ORG-WIDE) BLOB ──
+   One JSON payload every user reads and an admin writes, held in
+   FBLib.SharedData under 'cdx.bi.rcvSummary.shared.v1'.
+
+   It used to live in report data (loadReportData/saveReportData). That only
+   works on a SAVED report: in the BI Script Editor, which previews with report
+   id -1, the first read raised the client's native "Loading data is only
+   available on reports" modal and the publish was a silent no-op — the admin
+   pressed Share, saw no error, and nothing reached any other user.
+
+   SharedData caches the read for the load, so calling readSharedBlob() from
+   several places costs one query. Every write still MERGES onto the current
+   payload because a write replaces the whole value. */
+function readSharedBlob() {
+  try {
+    if (window.FBLib && FBLib.SharedData) return FBLib.SharedData.readJson(SHARED_KEY, {}) || {};
+  } catch (e) { console.warn('shared blob unavailable', e); }
+  return {};
+}
+
+
+/* Canonical key for comparing two filter states. Set members are sorted so
+   selection order never matters, and the dates of a relative Quick Range are
+   dropped — they are re-derived on apply, so keeping them would break the
+   match the moment the clock rolls past midnight. */
+function _viewKey(f) {
+  if (!f) return '';
+  const n = {};
+  _FILTER_SETS.forEach(d => { n[d.key] = [...(f[d.key] || [])].map(String).sort(); });
+  _FILTER_INPUTS.forEach(id => { n[id] = f[id] || ''; });
+  _FILTER_CHECKS.forEach(id => { n[id] = !!f[id]; });
+  if (n.dateRange && n.dateRange !== 'custom') { n.dateFrom = ''; n.dateTo = ''; }
+  return JSON.stringify(n);
+}
+
+
+/* Human-readable one-liner for a view row — enough to tell two views apart
+   without applying them. */
+function _viewSummary(v) {
+  const f = v.filters || {};
+  const parts = [];
+  const ot = ['ckPO','ckSO','ckTO'].filter(k => f[k]).map(k => k.slice(2));
+  if (ot.length && ot.length < 3) parts.push(ot.join('/'));
+  const st = (f.statuses || []).length;
+  if (st) parts.push(st + ' item status' + (st === 1 ? '' : 'es'));
+  [[f.selVendor, 'vendor'], [f.selCustJob, 'customer job'], [f.selPart, 'part'],
+   [f.selLg, 'loc. group']].forEach(([arr, label]) => {
+    const n = (arr || []).length;
+    if (n) parts.push(n + ' ' + label + (n === 1 ? '' : 's'));
+  });
+  const texts = ['filterOrderNum','filterCustomer','filterReceiptId','filterRefNo','filterDesc','filterVendorPart']
+    .filter(k => (f[k] || '').trim()).length;
+  if (texts) parts.push(texts + ' text filter' + (texts === 1 ? '' : 's'));
+  const rangeSel = document.getElementById('dateRange');
+  if (f.dateRange && f.dateRange !== 'custom' && rangeSel) {
+    const opt = [...rangeSel.options].find(o => o.value === f.dateRange);
+    if (opt) parts.push(opt.textContent);
+  } else if (f.dateFrom || f.dateTo) {
+    parts.push(formatDate(f.dateFrom) + ' → ' + formatDate(f.dateTo));
+  }
+  const MODE_LABEL = {flat:'Flat', grouped:'Grouped', pivot:'Pivot'};
+  let mode = MODE_LABEL[v.viewMode] || MODE_LABEL['grouped'] || '';
+  // Two pivot views differ by their pivot, not their filters, so spell it out
+  // or the drawer shows several identical-looking rows called "Pivot".
+  if (v.viewMode === 'pivot' && v.pivot) {
+    const lbl = k => (_columns.find(c => c.key === k) || {}).label || k;
+    const bits = [lbl(v.pivot.rowDim)];
+    if (v.pivot.rowDim2) bits.push('→ ' + lbl(v.pivot.rowDim2));
+    if (v.pivot.colDim)  bits.push('× ' + lbl(v.pivot.colDim));
+    const mea = v.pivot.measure === '__count__' ? 'Row count' : lbl(v.pivot.measure);
+    mode += ': ' + bits.join(' ') + ' — ' + (v.pivot.agg || 'sum') + ' of ' + mea;
+  }
+  if (v.viewMode === 'grouped' && v.expandAll) mode += ', expanded';
+  parts.push(mode);
+  return parts.filter(Boolean).join(' · ');
+}
+
+
+/* ── SETTINGS ── */
+function loadSavedSettings() {
+  try {
+    const raw = loadSettings(_KEY);
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    if (s.v !== 1) return;
+
+    // Saved views are read by FBLib.FilterViews (see _fvLoad) — not here.
+
+    if (Array.isArray(s.orderTypes)) {
+      ['ckPO','ckSO','ckTO'].forEach(id => {
+        const el = document.getElementById(id); if (el) el.checked = s.orderTypes.includes(el.value);
+      });
+    }
+    if (Array.isArray(s.statuses))     { _selItemStatus.clear(); s.statuses.forEach(v => _selItemStatus.add(v)); }
+    if (Array.isArray(s.rcptStatuses)) { _selRcptStatus.clear(); s.rcptStatuses.forEach(v => _selRcptStatus.add(v)); }
+    if (s.dateField) document.getElementById('dateField').value = s.dateField;
+    if (s.dateFrom)  document.getElementById('dateFrom').value  = s.dateFrom;
+    if (s.dateTo)    document.getElementById('dateTo').value    = s.dateTo;
+    // Quick Range — restore the dropdown; relative presets recompute from today
+    // (applyDateRange no-ops the report during init, so the from/to it writes
+    // are what init()'s runReport picks up).
+    if (s.dateRange) {
+      const r = document.getElementById('dateRange');
+      if (r) { r.value = s.dateRange; if (s.dateRange !== 'custom') applyDateRange(s.dateRange); }
+    }
+    // Mutate the Sets in place (never reassign) — _createFilterMS() captures
+    // these exact Set objects in its onChange closures.
+    if (Array.isArray(s.selLg))     { _selLg.clear();     s.selLg.forEach(v => _selLg.add(v)); }
+    if (Array.isArray(s.selVendor)) { _selVendor.clear(); s.selVendor.forEach(v => _selVendor.add(v)); }
+    if (Array.isArray(s.selCustJob)) { _selCustJob.clear(); s.selCustJob.forEach(v => _selCustJob.add(v)); }
+    if (Array.isArray(s.selPart))   { _selPart.clear();   s.selPart.forEach(v => _selPart.add(v)); }
+
+    const textIds = ['filterOrderNum','filterCustomer','filterReceiptId','filterRefNo','filterDesc','filterVendorPart'];
+    textIds.forEach(id => { if (s[id]) { const el = document.getElementById(id); if (el) el.value = s[id]; } });
+
+    if (Array.isArray(s.cols)) {
+      const defaultKeys = _columns.map(c => c.key);
+      const savedMap    = Object.fromEntries(s.cols.map(c => [c.key, c]));
+      const reordered   = s.cols.map(sc => _columns.find(c => c.key === sc.key)).filter(Boolean);
+      const extras      = _columns.filter(c => !savedMap[c.key]);
+      _columns = [...reordered];
+      extras.forEach(col => {
+        const di = defaultKeys.indexOf(col.key);
+        let insertAt = _columns.length;
+        for (let i = di + 1; i < defaultKeys.length; i++) {
+          const pos = _columns.findIndex(c => c.key === defaultKeys[i]);
+          if (pos !== -1) { insertAt = pos; break; }
+        }
+        _columns.splice(insertAt, 0, col);
+      });
+      _columns.forEach(c => { if (savedMap[c.key]) { c.vis = savedMap[c.key].vis; if (savedMap[c.key].colW) c.colW = savedMap[c.key].colW; } });
+    }
+    if (s.viewMode) {
+      _viewMode = (s.viewMode === 'flat' || s.viewMode === 'grouped' || s.viewMode === 'pivot') ? s.viewMode : 'grouped';
+      const sel = document.getElementById('viewModeSelect');
+      if (sel) sel.value = _viewMode;
+    }
+    // Pivot config — restored before _initPivotUI() runs so the
+    // dropdowns hydrate with the user's last values.
+    if (s.pivot && typeof s.pivot === 'object') {
+      Object.assign(_pivotCfg, s.pivot);
+    }
+    if (Array.isArray(s.savedPresets)) {
+      _savedPresets = s.savedPresets.filter(p => p && p.name && p.cfg);
+    }
+  } catch(e) { console.warn('loadSettings error', e); }
+}
+
+function resetSettings() {
+  // Saved views survive a reset — they're managed from the views popover.
+  if (typeof confirm === 'function' &&
+      !confirm('Reset this report to its defaults?\n\nThis clears your filters, columns and pivot presets. ' +
+               'Your saved views are kept.')) return;
+  saveSettings(_KEY, JSON.stringify({ v: 1, filterViews: _fvLoad() }));
+  location.reload();
+}
+
+var _statusSuffix = '';
+
+function saveCurrentSettings() {
+  const s = {
+    v: 1,
+    orderTypes:   checkedOrderTypes().map(String),
+    // Saved views ride in the same blob (FilterViews writes them through
+    // _fvSave); carried here so a full Save — which replaces the whole
+    // payload — cannot drop them.
+    filterViews: _fvLoad(),
+    statuses:     checkedStatuses().map(String),
+    rcptStatuses: checkedReceiptStatuses().map(String),
+    dateField:   document.getElementById('dateField').value,
+    dateRange:   document.getElementById('dateRange')?.value || 'custom',
+    dateFrom:    document.getElementById('dateFrom').value,
+    dateTo:      document.getElementById('dateTo').value,
+    selLg:       [..._selLg],
+    selVendor:   [..._selVendor],
+    selCustJob:  [..._selCustJob],
+    selPart:     [..._selPart],
+    cols: _columns.map(c => ({key:c.key, vis:c.vis, colW:c.colW})),
+    viewMode:    _viewMode,
+    pivot:       Object.assign({}, _pivotCfg),
+    savedPresets: _savedPresets,
+  };
+  ['filterOrderNum','filterCustomer','filterReceiptId','filterRefNo','filterDesc','filterVendorPart'].forEach(id => {
+    s[id] = document.getElementById(id)?.value || '';
+  });
+  saveSettings(_KEY, JSON.stringify(s));
+  setStatus('Settings saved. ' + _statusSuffix);
+  showToast('Layout settings saved');
+}
+
+/* ── DROPDOWN POPULATION ── */
+async function populateLG() {
+  const ids  = getLocationGroupList();
+  if (!ids.length) return;
+  const rows = await qp(`SELECT id, name FROM locationgroup WHERE id IN (${ids.join(',')}) AND activeFlag = 1 ORDER BY name`);
+  _lgList = rows.map(r => ({val:String(r.id), lbl:r.name}));
+  FBLib.Common.MultiSelect.get('lg-ms').setItems(_lgList);
+}
+async function populateVendor() {
+  const rows = await qp('SELECT id, name FROM vendor WHERE activeFlag = 1 ORDER BY name LIMIT 2000');
+  _vendorList = rows.map(r => ({val:String(r.id), lbl:r.name}));
+  FBLib.Common.MultiSelect.get('vendor-ms').setItems(_vendorList);
+}
+/* Only customers actually used as a job on a receipt line -- the full customer
+   list would be thousands of rows, almost none of them ever a job. */
+async function populateCustJob() {
+  const rows = await qp(`SELECT DISTINCT c.id, c.name
+    FROM receiptitem ri JOIN customer c ON c.id = ri.customerid
+    ORDER BY c.name LIMIT 2000`);
+  _custJobList = rows.map(r => ({val:String(r.id), lbl:r.name}));
+  FBLib.Common.MultiSelect.get('custjob-ms').setItems(_custJobList);
+}
+
+async function populatePart() {
+  const rows = await qp('SELECT num FROM part WHERE activeFlag = 1 AND num IS NOT NULL ORDER BY num LIMIT 3000');
+  _partList = rows.map(r => ({val:r.num, lbl:r.num}));
+  FBLib.Common.MultiSelect.get('part-ms').setItems(_partList);
+}
+
+/* ── MULTI-SELECT (FBLib.Common.MultiSelect) ──
+   The filter multi-selects are built by fb-lib; the .ms-* skin ships from
+   fb-styles. The _sel* Sets stay the single source of truth for buildSQL +
+   settings persistence — onChange only syncs them (always .clear()+.add(),
+   never reassigned after create). onClose → autoApply preserves the legacy
+   query-once-per-dropdown-session semantics of the legacy close handler. */
+function _createFilterMS() {
+  const defs = [
+    { id: 'rcptstatus-ms', sel: _selRcptStatus, ph: 'All statuses',        items: STATUS_LIST },
+    { id: 'itemstatus-ms', sel: _selItemStatus, ph: 'All statuses',        items: STATUS_LIST },
+    { id: 'lg-ms',         sel: _selLg,         ph: 'All location groups' },
+    { id: 'vendor-ms',     sel: _selVendor,     ph: 'All vendors' },
+    { id: 'custjob-ms',    sel: _selCustJob,    ph: 'All customer jobs' },
+    { id: 'part-ms',       sel: _selPart,       ph: 'All parts' },
+  ];
+  defs.forEach(d => FBLib.Common.MultiSelect.create({
+    containerId: d.id,
+    items: d.items || [],          // async lists arrive via setItems in populate*()
+    selected: [...d.sel],
+    placeholder: d.ph,
+    onClose: function () { autoApply(); },
+    onChange: function (vals) { d.sel.clear(); vals.forEach(v => d.sel.add(String(v))); }
+  }));
+}
+
+/* ── TOOLTIP (styled, ported from QuickOrder.htm) ── */
+function paTooltipShow(event, html) {
+  const el = document.getElementById('paTooltip');
+  el.innerHTML = html;
+  const tw = 340;
+  const r = event.currentTarget.getBoundingClientRect();
+  const x = Math.min(window.innerWidth - tw - 12, r.left + window.scrollX);
+  const aboveY = r.top + window.scrollY - el.offsetHeight - 8;
+  const belowY = r.bottom + window.scrollY + 8;
+  el.style.left = Math.max(12, x) + 'px';
+  el.style.top = aboveY + 'px';
+  el.classList.add('show');
+  if (aboveY < window.scrollY + 8) el.style.top = belowY + 'px';
+}
+function paTooltipHide() {
+  document.getElementById('paTooltip').classList.remove('show');
+}
+
+/* ── FILTER HELP (i) button — uses paTooltip ── */
+function wireFilterHelp() {
+  const btn = document.getElementById('filterHelpBtn');
+  if (!btn) return;
+  const html =
+    '<div><span class="lbl">Auto-apply:</span> filters re-run on <span class="kbd">Enter</span>, ' +
+    'blur (clicking out of a field), or closing a multi-select dropdown.</div>' +
+    '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #334155;">' +
+    '<span class="lbl">Wildcards (text filters):</span><br>' +
+    '<code>%</code> matches any sequence of characters<br>' +
+    '<code>_</code> matches a single character' +
+    '</div>' +
+    '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #334155;">' +
+    '<span class="lbl">Examples:</span><br>' +
+    '<code>WIDGET%</code> — starts with WIDGET<br>' +
+    '<code>%-A</code> — ends with -A<br>' +
+    '<code>LOT_2024</code> — LOT, any char, 2024' +
+    '</div>' +
+    '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #334155;">' +
+    '<span class="lbl">Vendor / Customer:</span> as in the standard report, choosing a vendor shows PO receipts only, ' +
+    'and a customer SO receipts only.' +
+    '</div>' +
+    '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #334155;">' +
+    '<span class="lbl">App / PDF:</span> the two buttons left of CSV switch between this table and ' +
+    'printable pages laid out like the standard Receiving Summary: a heading per order with its lines and order ' +
+    'totals, the columns Columns shows, and grand totals. Pick the paper, a title and whether to print each ' +
+    'order\'s lines in the bar above the pages (all remembered). Print prints those pages. In Flat and Pivot ' +
+    'view they print the list or the pivot.' +
+    '</div>';
+  btn.addEventListener('mouseenter', e => paTooltipShow(e, html));
+  btn.addEventListener('mouseleave', paTooltipHide);
+  btn.addEventListener('focus',      e => paTooltipShow(e, html));
+  btn.addEventListener('blur',       paTooltipHide);
+}
+
+/* ── AUTO-APPLY ── filters re-run automatically on:
+   - text input change (commits on blur OR Enter)
+   - explicit Enter keypress in text fields
+   - date / select change
+   - order type checkboxes
+   Multi-select dropdowns trigger autoApply when closed (fb-lib onClose). */
+const _autoApplyIds = [
+  'filterOrderNum', 'filterCustomer', 'filterReceiptId',
+  'filterRefNo', 'filterDesc', 'filterVendorPart',
+  'dateFrom', 'dateTo', 'dateField',
+  'ckPO', 'ckSO', 'ckTO',
+];
+function autoApply() {
+  // A view apply writes every filter at once and re-runs the query itself.
+  if (_suppressAutoApply) return;
+  // Nothing auto-runs until init() has fired the first query itself (a
+  // saved Quick Range restored during init calls this). The filter lists
+  // load in the background, so they're no longer the signal.
+  if (!_initDone) return;
+  _noCap = false;   // a filter change goes back to the first ROW_CAP lines
+  runReport();
+}
+function wireAutoApply() {
+  for (const id of _autoApplyIds) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    el.addEventListener('change', autoApply);
+    if (el.tagName === 'INPUT' && el.type === 'text') {
+      el.addEventListener('keydown', e => {
+        if (e.key === 'Enter') { e.preventDefault(); el.blur(); }
+      });
+    }
+  }
+  // Editing a date input by hand drops the Quick Range back to Custom.
+  ['dateFrom','dateTo'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('change', () => {
+      const r = document.getElementById('dateRange'); if (r) r.value = 'custom';
+    });
+  });
+}
+
+/* ── QUICK DATE RANGES ──
+   The Quick Range dropdown is a convenience over the two date inputs: pick a
+   preset and it fills dateFrom/dateTo, then re-runs via autoApply(). Relative
+   presets (Last/Next N, This Month…) recompute from *today* every time they're
+   applied — including on load — so a saved "Last 30 Days" stays relative. */
+function _ymd(d) {
+  return d.getFullYear() + '-' +
+    String(d.getMonth() + 1).padStart(2, '0') + '-' +
+    String(d.getDate()).padStart(2, '0');
+}
+function applyDateRange(key) {
+  if (!key || key === 'custom') return;
+  const T = new Date(); T.setHours(0, 0, 0, 0);
+  const off = n => { const x = new Date(T); x.setDate(T.getDate() + n); return x; };
+
+  /* FISCAL CALENDAR — Jul–Jun, the rule the pre-existing 'fy' preset already
+     encoded. `fyY` is the calendar year the CURRENT fiscal year started in.
+     Everything fiscal below derives from it, so an install on a different year
+     start needs changing in one place, not four.
+
+     Fiscal quarters follow from the same start: Q1 Jul–Sep, Q2 Oct–Dec,
+     Q3 Jan–Mar, Q4 Apr–Jun. `qIdx` is which of those contains today, and
+     `curQStart` its first day — Date's month overflow does the year rollover
+     for Q3/Q4 (month 12 and 15 become Jan and Apr of the next year). */
+  const fyY = T.getMonth() >= 6 ? T.getFullYear() : T.getFullYear() - 1;
+  const qIdx = Math.floor(((T.getMonth() + 6) % 12) / 3);
+  const curQStart = new Date(fyY, 6 + qIdx * 3, 1);
+
+  /* `null` on either side means NO bound that way; buildSQL degrades the
+     BETWEEN to a one-sided >= or <=. That is what makes the Open-ended
+     presets possible, and what "All dates" (null both sides) now rides on. */
+  let from, to;
+  switch (key) {
+    case 'all':   from = null;    to = null;     break;
+    // Open-ended. The MISSING bound is the point: "on or before yesterday" is
+    // every line already due, where "Yesterday" is one single day.
+    case 'upyday':    from = null;   to = off(-1); break;
+    case 'uptoday':   from = null;   to = T;       break;
+    case 'fromtoday': from = T;      to = null;    break;
+    case 'fromtmrw':  from = off(1); to = null;    break;
+    case 'today': from = T;       to = T;        break;
+    case 'yday':  from = off(-1); to = off(-1);  break;
+    case 'l7':    from = off(-7);  to = T;        break;
+    case 'n7':    from = T;        to = off(7);   break;
+    case 'l30':   from = off(-30); to = T;        break;
+    case 'n30':   from = T;        to = off(30);  break;
+    case 'l90':   from = off(-90); to = T;        break;
+    case 'tm':    from = new Date(T.getFullYear(), T.getMonth(), 1);
+                  to   = new Date(T.getFullYear(), T.getMonth() + 1, 0); break;
+    case 'lm':    from = new Date(T.getFullYear(), T.getMonth() - 1, 1);
+                  to   = new Date(T.getFullYear(), T.getMonth(), 0);     break;
+    // The WHOLE of next calendar month — deliberately distinct from 'n30',
+    // which is a rolling 30-day window starting today. Day 0 of the following
+    // month is the last day of this one, and Date's month overflow rolls the
+    // year over for a December "today".
+    case 'nm':    from = new Date(T.getFullYear(), T.getMonth() + 1, 1);
+                  to   = new Date(T.getFullYear(), T.getMonth() + 2, 0); break;
+    // The two most recently COMPLETED fiscal quarters, as one continuous
+    // range: from the start of the quarter before last, through the day before
+    // the current quarter began. The quarter in progress is deliberately
+    // excluded — a part-finished quarter alongside two whole ones reads as a
+    // collapse in the figures rather than as a shorter period.
+    case 'lq2':   from = new Date(curQStart.getFullYear(), curQStart.getMonth() - 6, 1);
+                  to   = new Date(curQStart.getFullYear(), curQStart.getMonth(), 0); break;
+    case 'fy':    from = new Date(fyY, 6, 1);     to = new Date(fyY + 1, 5, 30); break;
+    case 'lfy':   from = new Date(fyY - 1, 6, 1); to = new Date(fyY, 5, 30);     break;
+    case 'ytd':   from = new Date(T.getFullYear(), 0, 1); to = T;        break;
+    // Calendar year, not fiscal — 'lfy' is the fiscal one. Both are offered
+    // because the two answer to different audiences.
+    case 'ly':    from = new Date(T.getFullYear() - 1, 0, 1);
+                  to   = new Date(T.getFullYear() - 1, 11, 31); break;
+    default: return;
+  }
+  document.getElementById('dateFrom').value = from ? _ymd(from) : '';
+  document.getElementById('dateTo').value   = to   ? _ymd(to)   : '';
+  autoApply();
+}
+
+/* ── QUERY ── */
+function checkedOrderTypes() {
+  return ['ckPO','ckSO','ckTO'].filter(id => document.getElementById(id)?.checked).map(id => parseInt(document.getElementById(id).value));
+}
+function checkedStatuses()       { return [..._selItemStatus].map(Number); }
+function checkedReceiptStatuses() { return [..._selRcptStatus].map(Number); }
+
+function buildSQL() {
+  const types          = checkedOrderTypes();
+  const statuses       = checkedStatuses();
+  const rcptStatuses   = checkedReceiptStatuses();
+  if (!types.length || !statuses.length || !rcptStatuses.length) return null;
+
+  const dfKey  = document.getElementById('dateField').value;
+  const from   = document.getElementById('dateFrom').value;
+  const to     = document.getElementById('dateTo').value;
+  const lgIds  = getLocationGroupList();
+  const selLgIds = _selLg.size > 0 ? lgIds.filter(id => _selLg.has(String(id))) : lgIds;
+  const dateCols = DATE_COL[dfKey] || DATE_COL['rcv'];
+
+  /* Common conditions */
+  const commonW = [];
+  commonW.push(`receiptitem.statusid IN (${statuses.join(',')})`);
+  commonW.push(`receipt.statusid IN (${rcptStatuses.join(',')})`);
+  if (selLgIds.length) commonW.push(`receipt.locationgroupid IN (${selLgIds.join(',')})`);
+  const ridF = (document.getElementById('filterReceiptId')?.value||'').trim();
+  if (ridF) commonW.push(`CAST(receipt.id AS CHAR) LIKE '%${escSQL(ridF)}%'`);
+  const refF = (document.getElementById('filterRefNo')?.value||'').trim();
+  if (refF) commonW.push(`receiptitem.refno LIKE '%${escSQL(refF)}%'`);
+  // receiptitem.customerid is on the common table, so one clause covers all
+  // three branches rather than three copies against three different joins.
+  if (_selCustJob.size) {
+    const cjIds = [..._selCustJob].map(v => parseInt(v)).filter(n => !isNaN(n));
+    if (cjIds.length) commonW.push(`receiptitem.customerid IN (${cjIds.join(',')})`);
+  }
+
+  const partNums  = _selPart.size ? [..._selPart].map(v=>`'${escSQL(v)}'`).join(',') : null;
+  const descF     = (document.getElementById('filterDesc')?.value||'').trim();
+  const vpF       = (document.getElementById('filterVendorPart')?.value||'').trim();
+  const orderNumF = (document.getElementById('filterOrderNum')?.value||'').trim();
+  const custF     = (document.getElementById('filterCustomer')?.value||'').trim();
+
+  /* One bound, both, or neither. This used to require BOTH (`from && to`),
+     which silently dropped the entire predicate the moment either box was
+     empty — so an open-ended range returned the whole table rather than the
+     half that was asked for. */
+  function dateCond(branchKey) {
+    const col = dateCols[branchKey];
+    if (!col) return null;
+    const f = safeDate(from), t = safeDate(to);
+    if (f && t) return `DATE(${col}) BETWEEN '${f}' AND '${t}'`;
+    if (f)      return `DATE(${col}) >= '${f}'`;
+    if (t)      return `DATE(${col}) <= '${t}'`;
+    return null;
+  }
+
+  /* The standard report's vendorID / customerID: a vendor exists only on a
+     PO and a customer only on an SO, so choosing one leaves out the order
+     types that cannot match it (its PO branch carries IF(customerID = '%'…),
+     its SO branch the same for vendorID and its TO branch both). Before the
+     2026-10 audit a vendor here still listed every SO and TO receipt beside
+     that vendor's POs. Vendor Part # is a PO-only filter in the same way. */
+  const vendorSet = [..._selVendor].some(v => !isNaN(parseInt(v)));
+  const poOnly = vendorSet || !!vpF;
+  const soOnly = !!custF;
+
+  const branches = [];
+
+  if (types.includes(10) && !soOnly) {
+    const w = [...commonW];
+    const dc = dateCond('po'); if (dc) w.push(dc);
+    if (_selVendor.size) { const ids = [..._selVendor].map(v=>parseInt(v)).filter(n=>!isNaN(n)); if (ids.length) w.push(`vendor.id IN (${ids.join(',')})`); }
+    if (orderNumF) w.push(`po.num LIKE '%${escSQL(orderNumF)}%'`);
+    if (descF)     w.push(`COALESCE(part.description, poitem.description) LIKE '%${escSQL(descF)}%'`);
+    if (vpF)       w.push(`poitem.vendorpartnum LIKE '%${escSQL(vpF)}%'`);
+    if (partNums)  w.push(`COALESCE(part.num, poitem.partnum) IN (${partNums})`);
+    branches.push(`(SELECT
+  receipt.id AS receiptid,
+  receipt.statusid AS receiptstatusid,
+  10 AS ordertypeid,
+  'PO' AS ordertype,
+  po.num AS ordernum,
+  vendor.name AS fromname,
+  custjob.name AS customerjob,
+  locationgroup.name AS lg,
+  receiptitem.id AS itemid,
+  receiptitem.statusid AS itemstatusid,
+  poitem.poLineItem AS linenum,
+  COALESCE(part.num, poitem.partnum) AS partnum,
+  COALESCE(part.description, poitem.description) AS description,
+  poitem.vendorpartnum AS vendorpartnum,
+  receiptitem.qty AS qty,
+  uom.code AS uomcode,
+  COALESCE(poitem.datescheduledfulfillment, po.datefirstship) AS datescheduled,
+  po.dateissued AS dateissued,
+  receiptitem.datereceived AS datereceived,
+  receiptitem.datebilled AS datebilled,
+  receiptitem.datereconciled AS datereconciled,
+  receiptitem.datelastmodified AS datelastmodified,
+  receiptitem.refno AS refno,
+  poitem.unitcost AS orderedunitcost,
+  receiptitem.billedunitcost AS billedunitcost,
+  receiptitem.billedtotalcost AS billedtotalcost,
+  receiptitem.landedtotalcost AS landedtotalcost,
+  CASE WHEN receiptitem.qty > 0 THEN receiptitem.landedtotalcost / receiptitem.qty ELSE NULL END AS landedunitcost
+FROM receiptitem
+JOIN receipt ON receiptitem.receiptid = receipt.id AND receipt.ordertypeid = 10
+LEFT JOIN po ON receipt.poid = po.id
+LEFT JOIN poitem ON receiptitem.poitemid = poitem.id
+LEFT JOIN part ON receiptitem.partid = part.id
+LEFT JOIN uom ON receiptitem.uomid = uom.id
+LEFT JOIN vendor ON po.vendorid = vendor.id
+-- Customer Job. The receipt line's own customerId wins; poitem is the fallback
+-- for a line that was never stamped (they agree on every populated row in
+-- demodb, so this only guards the gap).
+LEFT JOIN customer custjob ON custjob.id = COALESCE(receiptitem.customerid, poitem.customerid)
+LEFT JOIN locationgroup ON receipt.locationgroupid = locationgroup.id
+WHERE ${w.join('\n  AND ')})`);
+  }
+
+  // The SO and TO branches type their placeholder columns (CAST(NULL AS …),
+  // never a bare NULL): when no PO branch runs, a column that is NULL in
+  // every branch comes back binary-typed and the client's runQuery fails
+  // with "An unknown error has occurred." (SO / TO alone used to do this).
+  if (types.includes(20) && !poOnly) {
+    const w = [...commonW];
+    const dc = dateCond('so'); if (dc) w.push(dc);
+    if (custF)     w.push(`customer.name LIKE '%${escSQL(custF)}%'`);
+    if (orderNumF) w.push(`so.num LIKE '%${escSQL(orderNumF)}%'`);
+    if (descF)     w.push(`COALESCE(part.description, soitem.description) LIKE '%${escSQL(descF)}%'`);
+    if (partNums)  w.push(`part.num IN (${partNums})`);
+    branches.push(`(SELECT
+  receipt.id AS receiptid,
+  receipt.statusid AS receiptstatusid,
+  20 AS ordertypeid,
+  'SO' AS ordertype,
+  so.num AS ordernum,
+  customer.name AS fromname,
+  custjob.name AS customerjob,
+  locationgroup.name AS lg,
+  receiptitem.id AS itemid,
+  receiptitem.statusid AS itemstatusid,
+  soitem.soLineItem AS linenum,
+  part.num AS partnum,
+  COALESCE(part.description, soitem.description) AS description,
+  CAST(NULL AS CHAR) AS vendorpartnum,
+  receiptitem.qty AS qty,
+  uom.code AS uomcode,
+  COALESCE(soitem.datescheduledfulfillment, so.datefirstship) AS datescheduled,
+  so.dateissued AS dateissued,
+  receiptitem.datereceived AS datereceived,
+  receiptitem.datebilled AS datebilled,
+  receiptitem.datereconciled AS datereconciled,
+  receiptitem.datelastmodified AS datelastmodified,
+  receiptitem.refno AS refno,
+  soitem.unitprice AS orderedunitcost,
+  receiptitem.billedunitcost AS billedunitcost,
+  receiptitem.billedtotalcost AS billedtotalcost,
+  receiptitem.landedtotalcost AS landedtotalcost,
+  CASE WHEN receiptitem.qty > 0 THEN receiptitem.landedtotalcost / receiptitem.qty ELSE NULL END AS landedunitcost
+FROM receiptitem
+JOIN receipt ON receiptitem.receiptid = receipt.id AND receipt.ordertypeid = 20
+LEFT JOIN so ON receipt.soid = so.id
+LEFT JOIN soitem ON receiptitem.soitemid = soitem.id
+LEFT JOIN part ON receiptitem.partid = part.id
+LEFT JOIN uom ON receiptitem.uomid = uom.id
+LEFT JOIN customer ON so.customerid = customer.id
+LEFT JOIN customer custjob ON custjob.id = receiptitem.customerid
+LEFT JOIN locationgroup ON receipt.locationgroupid = locationgroup.id
+WHERE ${w.join('\n  AND ')})`);
+  }
+
+  if (types.includes(40) && !poOnly && !soOnly) {
+    const w = [...commonW];
+    const dc = dateCond('to'); if (dc) w.push(dc);
+    if (orderNumF) w.push(`xo.num LIKE '%${escSQL(orderNumF)}%'`);
+    if (descF)     w.push(`part.description LIKE '%${escSQL(descF)}%'`);
+    if (partNums)  w.push(`part.num IN (${partNums})`);
+    branches.push(`(SELECT
+  receipt.id AS receiptid,
+  receipt.statusid AS receiptstatusid,
+  40 AS ordertypeid,
+  'TO' AS ordertype,
+  xo.num AS ordernum,
+  lg1.name AS fromname,
+  custjob.name AS customerjob,
+  locationgroup.name AS lg,
+  receiptitem.id AS itemid,
+  receiptitem.statusid AS itemstatusid,
+  xoitem.lineItem AS linenum,
+  part.num AS partnum,
+  COALESCE(part.description, xoitem.description) AS description,
+  CAST(NULL AS CHAR) AS vendorpartnum,
+  receiptitem.qty AS qty,
+  uom.code AS uomcode,
+  COALESCE(xoitem.datescheduledfulfillment, xo.datescheduled) AS datescheduled,
+  xo.dateissued AS dateissued,
+  receiptitem.datereceived AS datereceived,
+  receiptitem.datebilled AS datebilled,
+  receiptitem.datereconciled AS datereconciled,
+  receiptitem.datelastmodified AS datelastmodified,
+  receiptitem.refno AS refno,
+  CAST(NULL AS DECIMAL(28,9)) AS orderedunitcost,
+  receiptitem.billedunitcost AS billedunitcost,
+  receiptitem.billedtotalcost AS billedtotalcost,
+  receiptitem.landedtotalcost AS landedtotalcost,
+  CASE WHEN receiptitem.qty > 0 THEN receiptitem.landedtotalcost / receiptitem.qty ELSE NULL END AS landedunitcost
+FROM receiptitem
+JOIN receipt ON receiptitem.receiptid = receipt.id AND receipt.ordertypeid = 40
+LEFT JOIN xo ON receipt.xoid = xo.id
+LEFT JOIN xoitem ON receiptitem.xoitemid = xoitem.id
+LEFT JOIN part ON receiptitem.partid = part.id
+LEFT JOIN uom ON receiptitem.uomid = uom.id
+LEFT JOIN customer custjob ON custjob.id = receiptitem.customerid
+LEFT JOIN locationgroup ON receipt.locationgroupid = locationgroup.id
+LEFT JOIN locationgroup lg1 ON xo.fromlgid = lg1.id
+WHERE ${w.join('\n  AND ')})`);
+  }
+
+  // Every checked order type ruled out by a vendor / customer: nothing can
+  // match ('' tells runReport to show an empty result, not to query).
+  if (!branches.length) return '';
+  // The cap (ROW_CAP lines, "Load all" for the rest) is added by runReport.
+  const sql = branches.map(b => b.replace(/^\(/, '').replace(/\)$/, '')).join('\nUNION ALL\n') + '\nORDER BY receiptid DESC, linenum';
+  return sql;
+}
+
+/* ── ROW CAP ──
+   The standard report has no cap, so its totals cover every line. This one
+   fetches the newest ROW_CAP lines (FBLib.RowCap: one row past the cap tells
+   a capped result from a complete one; the cut falls between receipts, so
+   every receipt shown is whole) and offers "Load all" for the rest, so a
+   wide filter never stalls the client. It used to stop at a silent LIMIT
+   5000, flagged only in the status line. */
+const ROW_CAP = 5000;
+let _noCap  = false;   // "Load all" pressed: runs fetch every line until a filter changes
+let _capped = false;   // the last run stopped at the cap
+
+function _capNotice() {
+  const before = document.getElementById('tableWrap');
+  if (!(window.FBLib && FBLib.RowCap)) return;
+  FBLib.RowCap.notice({
+    before, capped: _capped, limit: ROW_CAP,
+    html: 'Showing the newest <strong>' + _dataset.length.toLocaleString() + '</strong> lines (whole receipts, up to ' +
+      ROW_CAP.toLocaleString() + '): more match these filters. Totals cover the lines shown. Narrow the filters, or',
+    onLoadAll: () => { _noCap = true; runReport(); }
+  });
+}
+
+async function runReport() {
+  // Every filter change funnels through here, so this is where the Views
+  // picker re-syncs — a hand-edited filter drops it to "Custom (unsaved)".
+  _fvChanged();
+  const sql = buildSQL();
+  if (sql === null) { setStatus('Select at least one order type and status.'); return; }
+  _pdfState = captureFilterState();   // the PDF view's title band names these filters
+  if (sql === '') {
+    // A vendor (or Vendor Part #) and a customer together rule out every
+    // order type, as in the standard report: nothing to query.
+    _dataset = []; _groups = buildGroups(_dataset); _expanded.clear();
+    _capped = false; _capNotice();
+    _pdfLoaded = true; _pdfError = '';
+    _statusSuffix = 'No receipts: a vendor means POs only, a customer SOs only';
+    setStatus(_statusSuffix);
+    renderTable();
+    _fvChanged();
+    return;
+  }
+  setStatus('Loading...');
+  showSpinner();
+  const t0 = Date.now();
+  try {
+    const cap = _noCap ? 0 : ROW_CAP;
+    const RC = window.FBLib && FBLib.RowCap;
+    const rows = await qp(RC ? RC.sql(sql, cap) : sql + '\nLIMIT ' + ROW_CAP);
+    const res = RC ? RC.apply(rows, cap, { keyOf: r => r.receiptid })
+                   : { rows, capped: rows.length >= ROW_CAP };
+    _dataset = res.rows.map(_deriveRow);
+    _capped = !!res.capped;
+    _pdfLoaded = true; _pdfError = '';
+    const ms = Date.now() - t0;
+    const capNote = _capped ? ' — capped, see Load all' : '';
+    _groups = buildGroups(_dataset);
+    applyRcptSort();
+    _expanded.clear();
+    if (_viewMode === 'pivot') {
+      _statusSuffix = `${_dataset.length.toLocaleString()} row${_dataset.length!==1?'s':''} (${(ms/1000).toFixed(1)}s) · pivot view${capNote}`;
+    } else if (_viewMode === 'flat') {
+      _statusSuffix = `${_dataset.length.toLocaleString()} item${_dataset.length!==1?'s':''} (${(ms/1000).toFixed(1)}s)${capNote}`;
+    } else {
+      _statusSuffix = `${_groups.length.toLocaleString()} receipt${_groups.length!==1?'s':''}, ${_dataset.length.toLocaleString()} item${_dataset.length!==1?'s':''} (${(ms/1000).toFixed(1)}s)${capNote}`;
+    }
+    setStatus(_statusSuffix);
+    _capNotice();
+    renderTable();
+    // AGAIN, deliberately. The call at the top of this function runs before
+    // _groups is rebuilt and _expanded is cleared, so it judges the picker on
+    // the PREVIOUS query's expand state. Re-running it here is what makes the
+    // expand/collapse part of a saved view resolve correctly.
+    _fvChanged();
+  } catch(e) {
+    const msg = e.message || String(e);
+    setStatus('Error: ' + msg);
+    console.error(e);
+    _capped = false; _capNotice();
+    _pdfLoaded = true; _pdfError = msg;
+    if (PDF) PDF.refresh();
+  } finally { hideSpinner(); }
+}
+
+/* ── GROUPING ── */
+function buildGroups(data) {
+  const map = new Map();
+  data.forEach(row => {
+    const rid = row.receiptid;
+    if (!map.has(rid)) {
+      map.set(rid, {
+        receiptid:       rid,
+        receiptstatusid: row.receiptstatusid,
+        ordertypeid:     row.ordertypeid,
+        ordertype:       row.ordertype,
+        ordernum:        row.ordernum || '',
+        fromname:        row.fromname || '',
+        customerjob:     row.customerjob || '',
+        lg:              row.lg || '',
+        datereceived:    row.datereceived,
+        dateissued:      row.dateissued,
+        items: [], totalBilled:0, totalLanded:0, totalQty:0, totalDiff:0,
+      });
+    }
+    const g = map.get(rid);
+    g.items.push(row);
+    g.totalBilled += parseFloat(row.billedtotalcost||0);
+    g.totalLanded += parseFloat(row.landedtotalcost||0);
+    g.totalQty    += parseFloat(row.qty||0);
+    g.totalDiff   += parseFloat(row.difference||0);
+    if (row.datereceived && (!g.datereceived || String(row.datereceived) > String(g.datereceived)))
+      g.datereceived = row.datereceived;
+  });
+  return [...map.values()];
+}
+
+/* ── TABLE RENDER ── */
+/* Columns on screen: the visible ones, minus the Flat-only ones outside Flat. */
+function visCols() {
+  return _columns.filter(c => c.vis && !(c.flatOnly && _viewMode !== 'flat'));
+}
+
+function renderTable() {
+  // Pivot operates on the same `_dataset` — no extra SQL — so a mode switch
+  // is just a dispatch on `_viewMode`. flat/grouped both use renderHead +
+  // renderBody; renderHead checks `_viewMode === 'flat'` to skip the
+  // receipt-level sort header row.
+  if (_viewMode === 'pivot') { renderPivot(); return; }
+  const vis = visCols();
+  renderHead(vis);
+  renderBody(vis);
+  renderTotals(vis);
+  if (PDF) PDF.refresh();
+}
+
+/* Grand-totals footer — sums the measure columns over the ENTIRE filtered
+   `_dataset` (not just the lazily-rendered chunk), shown in flat + grouped
+   views. Pivot has its own totals and early-returns before this. Only the
+   extended (line-total) measures are summed — the per-unit COST columns
+   (orderedunitcost / billedunitcost / unitcost / landedunitcost) are RATES,
+   not summed (the standard report leaves Unit Cost's total blank too).
+   The footer cells are styled like the header and pinned to the bottom of the
+   scroll box in CSS. */
+const _SUM_COLS = new Set(['qty', 'billedtotalcost', 'landedtotalcost', 'difference']);
+
+function renderTotals(vis) {
+  const foot = document.getElementById('tFoot');
+  if (!foot) return;
+  foot.innerHTML = '';
+  if (!_dataset.length) return;
+
+  const sums = {};
+  _SUM_COLS.forEach(k => sums[k] = 0);
+  _dataset.forEach(r => _SUM_COLS.forEach(k => { sums[k] += parseFloat(r[k]) || 0; }));
+
+  const tr = document.createElement('tr');
+  let labelled = false;
+  vis.forEach(col => {
+    const td = document.createElement('td');
+    if (_SUM_COLS.has(col.key)) {
+      td.className = 'num-cell';
+      td.textContent = col.money ? formatMoney(sums[col.key]) : formatQty(sums[col.key]);
+    } else if (!labelled) {
+      const n = _dataset.length;
+      td.textContent = `Total — ${n.toLocaleString()} line${n === 1 ? '' : 's'}`;
+      labelled = true;
+    }
+    tr.appendChild(td);
+  });
+  foot.appendChild(tr);
+}
+
+function setViewMode(mode) {
+  _viewMode = mode;
+  // The mode is part of a saved view, so changing it can make the live state
+  // stop matching the selected one — resync the picker. (A filter change gets
+  // this via the refresh fn; a mode switch never goes near it.) Set here, not
+  // at the end, because the pivot branch can return early.
+  _fvChanged();
+  const sel       = document.getElementById('viewModeSelect');
+  const expBtns   = document.getElementById('expandBtnGroup');
+  const pivotBar  = document.getElementById('pivotBar');
+  const dataTbl   = document.getElementById('dataTable');
+  const pivotTbl  = document.getElementById('pivotTable');
+  if (sel) sel.value = mode;
+
+  if (mode === 'pivot') {
+    if (expBtns)  expBtns.classList.add('hidden');
+    if (pivotBar) pivotBar.classList.add('open');
+    if (dataTbl)  dataTbl.style.display  = 'none';
+    if (pivotTbl) pivotTbl.style.display = '';
+    _statusSuffix = `${_dataset.length.toLocaleString()} rows · pivot view`;
+    setStatus(_statusSuffix);
+  } else {
+    if (pivotBar) pivotBar.classList.remove('open');
+    if (dataTbl)  dataTbl.style.display  = '';
+    if (pivotTbl) pivotTbl.style.display = 'none';
+    if (mode === 'grouped') {
+      if (expBtns) expBtns.classList.remove('hidden');
+    } else {
+      if (expBtns) expBtns.classList.add('hidden');
+    }
+  }
+  _pdfSyncOptions();   // Order lines shows in By Receipt view only
+  renderTable();
+}
+
+function renderHead(vis) {
+  /* ── colgroup (drives fixed-layout column widths) ── */
+  const table = document.getElementById('dataTable');
+  let cg = table.querySelector('colgroup');
+  if (!cg) { cg = document.createElement('colgroup'); table.insertBefore(cg, table.firstChild); }
+  cg.innerHTML = '';
+  const colEls = vis.map(col => {
+    const c = document.createElement('col');
+    c.style.width = col.colW || 'auto';
+    cg.appendChild(c);
+    return c;
+  });
+
+  /* ── Receipt-level sort header row ── */
+  const RCPT_COL_MAP = {
+    partnum:         { key: 'ordernum',     label: 'Order #',   align: 'left'   },
+    description:     { key: 'fromname',     label: 'From',      align: 'left'   },
+    dateissued:      { key: 'dateissued',   label: 'Date Issued', align: 'center' },
+    datereceived:    { key: 'datereceived', label: 'Date Received', align: 'center' },
+    qty:             { key: 'totalQty',     label: 'Qty',       align: 'right'  },
+    billedtotalcost: { key: 'totalBilled',  label: 'Billed Total', align: 'right'  },
+    landedtotalcost: { key: 'totalLanded',  label: 'Landed Total',  align: 'right'  },
+    difference:      { key: 'totalDiff',    label: 'Difference',    align: 'right'  },
+  };
+  const partnumIdx = vis.findIndex(c => c.key === 'partnum');
+  const mergeCount = partnumIdx > 1 ? partnumIdx : 1;
+  const dataStart  = partnumIdx >= 1 ? partnumIdx : 1;
+
+  function mkRcptTh(label, sortKey, colSpan, align) {
+    const th = document.createElement('th');
+    const isActive = !!(sortKey && _rcptSortCol === sortKey);
+    th.style.cssText = 'background:' + (isActive ? 'var(--fb-blue-pressed)' : 'var(--color-primary)') + ';color:white;font-weight:500;padding:5px 10px;font-size:11px;position:sticky;top:0;z-index:11;text-align:' + (align || 'left') + ';white-space:nowrap;border-bottom:1px solid rgba(255,255,255,0.25);' + (sortKey ? 'cursor:pointer;' : 'cursor:default;') + 'user-select:none;';
+    if (colSpan > 1) th.colSpan = colSpan;
+    th.textContent = label + (isActive ? (_rcptSortDir === 'asc' ? ' ↑' : ' ↓') : '');
+    if (sortKey) {
+      th.addEventListener('click', () => rcptSortBy(sortKey));
+      th.addEventListener('mouseenter', () => { if (!isActive) th.style.background = 'var(--color-primary-dark)'; });
+      th.addEventListener('mouseleave', () => { th.style.background = isActive ? 'var(--fb-blue-pressed)' : 'var(--color-primary)'; });
+    }
+    return th;
+  }
+
+  const rcptTr = document.createElement('tr');
+  rcptTr.appendChild(mkRcptTh('Receipt #', 'receiptid', mergeCount, 'left'));
+  vis.slice(dataStart).forEach(col => {
+    const m = RCPT_COL_MAP[col.key];
+    if (m) {
+      rcptTr.appendChild(mkRcptTh(m.label, m.key, 1, m.align));
+    } else {
+      const th = document.createElement('th');
+      th.style.cssText = 'background:var(--color-primary);position:sticky;top:0;z-index:11;border-bottom:1px solid rgba(255,255,255,0.25);';
+      rcptTr.appendChild(th);
+    }
+  });
+
+  /* ── Item-level column header row ── */
+  const tr = document.createElement('tr');
+  vis.forEach((col, idx) => {
+    const th = document.createElement('th');
+    th.textContent = col.label; th.draggable = true;
+    // In flat mode there is no receipt-sort row above, so the item header
+    // sticks at the top edge (top: 0). In grouped mode it sits 26px down
+    // to make room for the receipt-sort row.
+    th.style.top = _viewMode === 'flat' ? '0px' : '26px';
+    if (col.money || col.qty) th.style.textAlign = 'right';
+    else if (col.date) th.style.textAlign = 'center';
+    if (_sortCol === col.key) th.classList.add('sort-' + _sortDir);
+    th.addEventListener('click', () => { if (!_resizing) sortBy(col.key); });
+    th.addEventListener('dragstart', e => {
+      if (_resizing) { e.preventDefault(); return; }
+      _dragColKey = col.key; setTimeout(() => th.style.opacity='0.4',0); e.dataTransfer.effectAllowed='move';
+    });
+    th.addEventListener('dragend',   () => { _dragColKey=null; th.style.opacity=''; tr.querySelectorAll('th').forEach(h=>h.classList.remove('col-drag-over')); });
+    th.addEventListener('dragover',  e => { e.preventDefault(); e.dataTransfer.dropEffect='move'; tr.querySelectorAll('th').forEach(h=>h.classList.remove('col-drag-over')); if (_dragColKey&&_dragColKey!==col.key) th.classList.add('col-drag-over'); });
+    th.addEventListener('dragleave', () => th.classList.remove('col-drag-over'));
+    th.addEventListener('drop', e => {
+      e.preventDefault(); th.classList.remove('col-drag-over');
+      if (!_dragColKey || _dragColKey===col.key) return;
+      const fi=_columns.findIndex(c=>c.key===_dragColKey), ti=_columns.findIndex(c=>c.key===col.key);
+      if (fi===-1||ti===-1) return;
+      const [mv]=_columns.splice(fi,1); _columns.splice(ti,0,mv); renderTable(); buildColPanel();
+    });
+
+    /* ── resize handle ── */
+    const rh = document.createElement('div'); rh.className = 'col-resize-handle';
+    const colEl = colEls[idx];
+    rh.addEventListener('mousedown', e => {
+      e.stopPropagation(); e.preventDefault();
+      _resizing = true; rh.classList.add('active');
+      const startX = e.clientX, startW = th.offsetWidth;
+      function onMove(ev) {
+        const w = Math.max(24, startW + (ev.clientX - startX));
+        col.colW = w + 'px';
+        colEl.style.width = col.colW;
+      }
+      function onUp() {
+        _resizing = false; rh.classList.remove('active');
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      }
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+    th.appendChild(rh);
+
+    tr.appendChild(th);
+  });
+  const head = document.getElementById('tHead'); head.innerHTML = '';
+  // Flat mode skips the receipt-level sort header row.
+  if (_viewMode !== 'flat') head.appendChild(rcptTr);
+  head.appendChild(tr);
+}
+
+function renderBody(vis) {
+  const tbody = document.getElementById('tBody');
+  tbody.innerHTML = '';
+  if (_viewMode === 'flat') {
+    // Up to 5,000 lines: render the first CHUNK_SIZE and append the rest as
+    // the table scrolls (see the scroll listener in init).
+    _visRows = sortedItems(_dataset);
+    _renderOffset = 0;
+    if (!_visRows.length) {
+      tbody.innerHTML = `<tr><td style="padding:2rem;color:#9ca3af;text-align:center;" colspan="${vis.length}">No results for the selected filters.</td></tr>`;
+      return;
+    }
+    appendChunk(vis, tbody);
+    return;
+  }
+  // Grouped mode (default).
+  if (!_groups.length) {
+    tbody.innerHTML = `<tr><td style="padding:2rem;color:#9ca3af;text-align:center;" colspan="${vis.length}">No results for the selected filters.</td></tr>`;
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  _groups.forEach(g => {
+    frag.appendChild(buildGroupHeader(g, vis));
+    if (_expanded.has(g.receiptid)) {
+      sortedItems(g.items).forEach((row, idx) => {
+        const tr = buildItemRow(row, vis);
+        if (idx % 2 === 1) tr.classList.add('even-item');
+        frag.appendChild(tr);
+      });
+    }
+  });
+  tbody.appendChild(frag);
+}
+
+function appendChunk(vis, tbody) {
+  const slice = _visRows.slice(_renderOffset, _renderOffset + CHUNK_SIZE);
+  if (!slice.length) return;
+  const frag = document.createDocumentFragment();
+  slice.forEach((row, i) => {
+    const tr = buildItemRow(row, vis);
+    if ((_renderOffset + i) % 2 === 1) tr.classList.add('even-item');
+    frag.appendChild(tr);
+  });
+  tbody.appendChild(frag);
+  _renderOffset += slice.length;
+}
+
+function buildGroupHeader(g, vis) {
+  const tr = document.createElement('tr');
+  tr.className = 'rcpt-hdr'; tr.dataset.rid = g.receiptid;
+  const expanded = _expanded.has(g.receiptid);
+  const statusInfo = RCPT_STATUS_MAP[g.receiptstatusid] || {label:'', cls:'b10'};
+  const otCls = g.ordertype === 'PO' ? 'ot-po' : g.ordertype === 'SO' ? 'ot-so' : 'ot-to';
+
+  // Merge all columns before Part # into one identity cell so order# aligns with Part # header
+  const partnumIdx = vis.findIndex(c => c.key === 'partnum');
+  const mergeCount = partnumIdx > 1 ? partnumIdx : 1;
+  const dataStart  = partnumIdx >= 1 ? partnumIdx : 1;
+
+  const idTd = document.createElement('td');
+  if (mergeCount > 1) idTd.colSpan = mergeCount;
+  idTd.style.overflow = 'hidden';
+  const inner = document.createElement('div'); inner.className = 'rcpt-hdr-inner';
+  const tog = document.createElement('span'); tog.className = 'rcpt-toggle'; tog.textContent = expanded ? '▼' : '▶';
+  const rid = document.createElement('span'); rid.className = 'rcpt-id'; rid.textContent = 'Rcpt #' + g.receiptid;
+  const otBadge = document.createElement('span'); otBadge.className = otCls; otBadge.textContent = g.ordertype;
+  inner.appendChild(tog); inner.appendChild(rid); inner.appendChild(otBadge);
+  idTd.appendChild(inner);
+  tr.appendChild(idTd);
+
+  vis.slice(dataStart).forEach(col => {
+    const td = document.createElement('td');
+    switch (col.key) {
+      case 'partnum': {
+        const a = document.createElement('a'); a.className = 'row-link'; a.href = '#'; a.textContent = g.ordernum;
+        a.addEventListener('click', e => {
+          e.stopPropagation(); e.preventDefault();
+          const prefix = g.ordertype === 'PO' ? 'P' : g.ordertype === 'SO' ? 'S' : g.ordertype === 'TO' ? 'T' : '';
+          openModule('Receiving', prefix + g.ordernum);
+        });
+        td.appendChild(a);
+        break;
+      }
+      case 'description': {
+        // From, then the line count (which the Qty cell gave up to the order's qty total).
+        const nItems = g.items.length + ' item' + (g.items.length !== 1 ? 's' : '');
+        const sp = document.createElement('span'); sp.className = 'rcpt-meta';
+        sp.textContent = (g.fromname ? g.fromname + ' · ' : '') + nItems; sp.title = g.fromname;
+        td.appendChild(sp);
+        break;
+      }
+      case 'dateissued': {
+        const sp = document.createElement('span'); sp.className = 'rcpt-meta'; sp.textContent = g.dateissued ? formatDate(String(g.dateissued)) : '—';
+        td.appendChild(sp);
+        break;
+      }
+      case 'datereceived': {
+        const sp = document.createElement('span'); sp.className = 'rcpt-meta'; sp.textContent = g.datereceived ? formatDate(String(g.datereceived)) : '—';
+        td.appendChild(sp);
+        break;
+      }
+      case 'qty': {
+        // The order's qty total (the standard report's Order Totals), summed
+        // across the lines whatever their UOM, as the standard report does.
+        td.className = 'num-cell';
+        const nItems = g.items.length + ' item' + (g.items.length !== 1 ? 's' : '');
+        const sp = document.createElement('span'); sp.className = 'rcpt-total'; sp.textContent = formatQty(g.totalQty);
+        sp.title = nItems + ', qty ' + formatQty(g.totalQty);
+        td.appendChild(sp);
+        break;
+      }
+      case 'billedtotalcost': {
+        td.className = 'num-cell';
+        const sp = document.createElement('span'); sp.className = 'rcpt-total'; sp.textContent = formatMoney(g.totalBilled);
+        td.appendChild(sp);
+        break;
+      }
+      case 'landedtotalcost': {
+        td.className = 'num-cell';
+        const sp = document.createElement('span'); sp.className = 'rcpt-total'; sp.textContent = formatMoney(g.totalLanded);
+        td.appendChild(sp);
+        break;
+      }
+      case 'difference': {
+        td.className = 'num-cell';
+        const sp = document.createElement('span'); sp.className = 'rcpt-total'; sp.textContent = formatMoney(g.totalDiff);
+        td.appendChild(sp);
+        break;
+      }
+    }
+    tr.appendChild(td);
+  });
+
+  tr.addEventListener('click', e => { if (e.target.closest('a')) return; toggleGroup(g.receiptid); });
+  return tr;
+}
+
+function buildItemRow(row, vis) {
+  const tr = document.createElement('tr'); tr.className = 'item-row';
+  vis.forEach(col => {
+    const td = document.createElement('td');
+    const raw = row[col.key];
+    if (col.ibadge) {
+      const sid = parseInt(raw), info = RCPT_ITEM_STATUS_MAP[sid] || {label:String(raw??''), cls:'b10'};
+      const sp = document.createElement('span'); sp.className = 'badge ' + info.cls; sp.textContent = info.label; td.appendChild(sp);
+    } else if (col.orderLink) {
+      if (raw) {
+        const mod = {PO:'Purchase Order', SO:'Sales Order', TO:'Transfer Order'}[row.ordertype];
+        const a = document.createElement('a'); a.className = 'row-link'; a.href = '#'; a.textContent = raw;
+        a.addEventListener('click', e => { e.preventDefault(); if (mod) openModule(mod, raw); });
+        td.appendChild(a);
+      }
+    } else if (col.link) {
+      if (raw) { const a = document.createElement('a'); a.className = 'row-link'; a.href = '#'; a.textContent = raw; a.addEventListener('click', e => { e.preventDefault(); openModule(col.link, raw); }); td.appendChild(a); }
+    } else if (col.date)   { td.textContent = raw ? formatDate(String(raw)) : ''; td.style.textAlign = 'center'; }
+    else if (col.money)    { td.className = 'num-cell'; td.textContent = raw != null ? formatMoney(parseFloat(raw)) : ''; }
+    else if (col.qty)      { td.className = 'num-cell'; td.textContent = raw != null ? formatQty(parseFloat(raw)) : ''; }
+    else if (col.truncate) { td.className = 'desc-cell'; td.textContent = raw ?? ''; if (raw) td.title = raw; }
+    else                   { td.textContent = raw ?? ''; }
+    tr.appendChild(td);
+  });
+  return tr;
+}
+
+function toggleGroup(rid) {
+  if (_expanded.has(rid)) _expanded.delete(rid); else _expanded.add(rid);
+  renderTable();
+  _fvChanged();
+}
+function expandAll()  { _groups.forEach(g => _expanded.add(g.receiptid)); renderTable(); _fvChanged(); }
+function collapseAll(){ _expanded.clear(); renderTable(); _fvChanged(); }
+
+function sortedItems(items) {
+  if (!_sortCol) return items;
+  const col = _columns.find(c => c.key === _sortCol);
+  return [...items].sort((a,b) => {
+    let va = a[_sortCol], vb = b[_sortCol];
+    if (col && (col.money || col.qty)) { va = parseFloat(va)||0; vb = parseFloat(vb)||0; }
+    else { va = (va??'').toString().toLowerCase(); vb = (vb??'').toString().toLowerCase(); }
+    return (va < vb ? -1 : va > vb ? 1 : 0) * (_sortDir === 'asc' ? 1 : -1);
+  });
+}
+
+function sortBy(key) {
+  _sortDir = _sortCol === key ? (_sortDir === 'asc' ? 'desc' : 'asc') : 'asc';
+  _sortCol = key;
+  renderTable();
+}
+
+function rcptSortBy(key) {
+  _rcptSortDir = _rcptSortCol === key ? (_rcptSortDir === 'asc' ? 'desc' : 'asc') : 'asc';
+  _rcptSortCol = key;
+  applyRcptSort();
+  renderTable();
+}
+
+function applyRcptSort() {
+  if (!_rcptSortCol) return;
+  const numericKeys = new Set(['receiptid', 'totalBilled', 'totalLanded', 'totalQty', 'totalDiff']);
+  const dir = _rcptSortDir === 'asc' ? 1 : -1;
+  _groups.sort((a, b) => {
+    let va = a[_rcptSortCol], vb = b[_rcptSortCol];
+    if (numericKeys.has(_rcptSortCol)) {
+      va = parseFloat(va) || 0; vb = parseFloat(vb) || 0;
+      return (va < vb ? -1 : va > vb ? 1 : 0) * dir;
+    }
+    return (va ?? '').toString().localeCompare((vb ?? '').toString(), undefined, {numeric: true, sensitivity: 'base'}) * dir;
+  });
+}
+
+/* ── COLUMN PANEL ── */
+function buildColPanel() {
+  const list = document.getElementById('colList'); list.innerHTML = '';
+  _columns.forEach((col, i) => {
+    const div = document.createElement('div'); div.className = 'col-row'; div.draggable = true; div.dataset.idx = i;
+    const handle = document.createElement('span'); handle.className = 'drag-handle';
+    handle.innerHTML = '<svg width="12" height="10" viewBox="0 0 12 10" fill="currentColor"><rect y="0" width="12" height="2" rx="1"/><rect y="4" width="12" height="2" rx="1"/><rect y="8" width="12" height="2" rx="1"/></svg>';
+    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = col.vis; cb.id = 'cv_' + col.key;
+    cb.addEventListener('change', () => { col.vis = cb.checked; renderTable(); });
+    const lbl = document.createElement('label'); lbl.htmlFor = cb.id; lbl.textContent = col.label + (col.flatOnly ? ' (Flat view)' : '');
+    div.appendChild(handle); div.appendChild(cb); div.appendChild(lbl);
+    div.addEventListener('dragstart', e => { _dragIdx=i; setTimeout(()=>div.classList.add('dragging'),0); e.dataTransfer.effectAllowed='move'; });
+    div.addEventListener('dragend',   () => { _dragIdx=null; div.classList.remove('dragging'); list.querySelectorAll('.col-row').forEach(r=>r.classList.remove('drag-over')); });
+    div.addEventListener('dragover',  e => { e.preventDefault(); e.dataTransfer.dropEffect='move'; list.querySelectorAll('.col-row').forEach(r=>r.classList.remove('drag-over')); if (_dragIdx!==null&&_dragIdx!==i) div.classList.add('drag-over'); });
+    div.addEventListener('dragleave', () => div.classList.remove('drag-over'));
+    div.addEventListener('drop', e => {
+      e.preventDefault(); div.classList.remove('drag-over');
+      const from = _dragIdx; if (from===null||from===i) return;
+      const [moved]=_columns.splice(from,1); _columns.splice(i,0,moved); buildColPanel(); renderTable();
+    });
+    list.appendChild(div);
+  });
+}
+
+function toggleColPanel() { document.getElementById('colPanel').classList.toggle('hidden'); }
+
+/* ── EXPORT ── */
+function exportCSV() {
+  if (_viewMode === 'pivot') { exportPivotCSV(); return; }
+  // Flat-only columns are skipped: every export row already leads with Order #.
+  const vis  = _columns.filter(c => c.vis && !c.flatOnly);
+  const extraHdrs = ['"Receipt #"','"Order Type"','"Order #"','"From"','"To LG"','"Receipt Status"'];
+  const rows = [];
+  _groups.forEach(g => {
+    const statusInfo = RCPT_STATUS_MAP[g.receiptstatusid] || {label:''};
+    sortedItems(g.items).forEach(row => {
+      const extra = [g.receiptid, g.ordertype, g.ordernum, g.fromname, g.lg, statusInfo.label].map(v=>`"${String(v??'').replace(/"/g,'""')}"`);
+      const cells = vis.map(col => {
+        let v = row[col.key] ?? '';
+        if (col.date && v)   v = formatDate(String(v));
+        if (col.ibadge)      { const info = RCPT_ITEM_STATUS_MAP[parseInt(v)]; v = info ? info.label : v; }
+        if (col.money && v!=='') v = parseFloat(v).toFixed(2);
+        if (col.qty   && v!=='') v = formatQty(parseFloat(v));
+        return `"${String(v).replace(/"/g,'""')}"`;
+      });
+      rows.push([...extra, ...cells].join(','));
+    });
+  });
+  const blob = new Blob(['﻿' + [extraHdrs.join(',') + ',' + vis.map(c=>`"${c.label.replace(/"/g,'""')}"`).join(','), ...rows].join('\r\n')], {type:'text/csv;charset=utf-8;'});
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url; a.download = 'ReceivingSummary_' + _ymd(new Date()) + '.csv';
+  a.click(); URL.revokeObjectURL(url);
+}
+
+/* ── PRINT ──
+   The PDF view's pages (fb-doc), in either view. Without fb-doc on the
+   server, the plain table printout below (the report's printout before the
+   PDF view). */
+function printReport() {
+  if (PDF) {
+    PDF.print().catch(e => setStatus('Printing failed: ' + ((e && e.message) || e)));
+    return;
+  }
+  printPlain();
+}
+function printPlain() {
+  // Flat-only columns are skipped: each receipt band already prints the order #.
+  const vis = _columns.filter(c => c.vis && !c.flatOnly);
+  const esc = s => String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const hdrHtml = vis.map(c=>`<th>${esc(c.label)}</th>`).join('');
+  let bodyHtml = '';
+  _groups.forEach(g => {
+    const si = RCPT_STATUS_MAP[g.receiptstatusid]||{label:''};
+    bodyHtml += `<tr class="ghdr"><td colspan="${vis.length}"><b>Receipt #${g.receiptid}</b> &nbsp; <b>${esc(g.ordertype)}</b> ${esc(g.ordernum)} &nbsp; ${esc(g.fromname)} &nbsp; ${esc(g.lg)} &nbsp; ${esc(si.label)} &nbsp; ${g.datereceived?esc(formatDate(String(g.datereceived))):''} &nbsp; <b>${esc(formatMoney(g.totalBilled))}</b></td></tr>`;
+    sortedItems(g.items).forEach((row, idx) => {
+      const cells = vis.map(col => {
+        const raw = row[col.key]; let val = '';
+        if (col.ibadge)    { const info = RCPT_ITEM_STATUS_MAP[parseInt(raw)]; val = info ? info.label : (raw??''); }
+        else if (col.date) { val = raw ? formatDate(String(raw)) : ''; }
+        else if (col.money){ val = raw!=null ? formatMoney(parseFloat(raw)) : ''; }
+        else if (col.qty)  { val = raw!=null ? formatQty(parseFloat(raw)) : ''; }
+        else               { val = raw??''; }
+        return `<td${(col.money||col.qty)?' class="nr"':''}>${esc(val)}</td>`;
+      }).join('');
+      bodyHtml += `<tr${idx%2===1?' class="alt"':''}>${cells}</tr>`;
+    });
+  });
+
+  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"/>
+<title>Receiving Summary</title>
+<style>
+  body{font-family:Arial,sans-serif;font-size:8pt;margin:.4in;color:#111}
+  h2{font-size:11pt;margin:0 0 4px;color:#0B3140}.sub{font-size:7.5pt;color:#64748b;margin:0 0 10px}
+  table{border-collapse:collapse;width:100%}
+  th{background:#0B3140;color:#fff;font-size:7pt;padding:4px 5px;text-align:left;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  td{font-size:7.5pt;padding:3px 5px;border-bottom:1px solid #e5e7eb}
+  tr.alt td{background:#f9fafb;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  tr.ghdr td{background:#DEEAF4;font-size:8pt;padding:5px;border-bottom:2px solid #CBE5FB;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .nr{text-align:right} @page{size:A4 landscape;margin:.4in}
+</style></head><body>
+<h2>Receiving Summary</h2>
+<p class="sub">${_groups.length.toLocaleString()} receipts, ${_dataset.length.toLocaleString()} items &mdash; printed ${new Date().toLocaleDateString()}</p>
+<table><thead><tr>${hdrHtml}</tr></thead><tbody>${bodyHtml}</tbody></table>
+</body></html>`;
+
+  const w = window.open('', '_blank');
+  w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   PDF VIEW (fb-doc FBDoc.Report) — pages laid out like the standard
+   Receiving Summary (see VIEWS in the header comment). Built from the rows
+   already loaded (_dataset / _groups) and, in Pivot view, the pivot on
+   screen (_pivotResult); no query of its own.
+   ════════════════════════════════════════════════════════════════════════ */
+var PDF = null;
+var _company = '';          // company name, for the title band
+var _pdfLoaded = false;     // a load has finished (docSpec is null before)
+var _pdfError = '';         // that load's SQL error, printed on the page
+var _pdfState = null;       // the filters that load ran with
+
+// The standard report's column headings, for the App columns they match;
+// the rest print under their App label (Landed / Billed unit costs spelt
+// out so they never read as the standard report's Landed Cost total).
+const PDF_HEAD = {
+  partnum: 'Part #', qty: 'Qty Received', dateissued: 'Date Issued', datereceived: 'Date Received',
+  datebilled: 'Bill Date', datereconciled: 'Date Reconciled', datelastmodified: 'Date Last Changed',
+  billedtotalcost: 'Total Cost', landedtotalcost: 'Landed Cost', unitcost: 'Unit Cost', difference: 'Difference',
+  billedunitcost: 'Billed Unit Cost', landedunitcost: 'Landed Unit Cost', orderedunitcost: 'Ordered Unit Cost'
+};
+// Date Field -> the column the standard report prints whatever its switch.
+const PDF_DATE_COL = { rcv: 'datereceived', bll: 'datebilled', rec: 'datereconciled', mod: 'datelastmodified', ord: 'dateissued', sch: 'datescheduled' };
+const PDF_DATE_LABEL = { rcv: 'Date Received', bll: 'Bill Date', rec: 'Date Reconciled', mod: 'Date Last Changed', ord: 'Order Date Issued', sch: 'Date Scheduled' };
+const PDF_CSS = [
+  // The standard report's detail rows: a light rule under each line.
+  '.fbdoc-rpt-tbl tr.pdf-ln>td{border-bottom:.25pt solid #ccc}',
+  // Order Totals (its group footer): bold figures under a rule.
+  '.fbdoc-rpt-tbl tr.rpt-minor.pdf-ordtot>td{font-weight:700;color:#000;border-top:.5pt solid #000;padding-top:1.5pt;padding-bottom:4pt}',
+  '.fbdoc-rpt-tbl td.pdf-totlbl{text-align:right;font-weight:700}',
+  // Pivot: the row totals column bold, as the App shows it.
+  '.fbdoc-rpt-tbl td.pdf-pvtot{font-weight:700}'
+].join('');
+
+function _pdfEsc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+/* Title (the standard report's Report Title) and Order lines: remembered per
+   user beside the paper (FBLib.Settings, never this report's _KEY blob). */
+function _pdfOpt(k) {
+  let o = null;
+  try { o = FBLib.Settings.resolve('pdfLayout'); } catch (_) {}
+  o = (o && typeof o === 'object') ? o : {};
+  if (k === 'title') return typeof o.title === 'string' ? o.title : '';
+  return o.lines !== false;   // 'lines'
+}
+function _pdfSetOpt(k, v) {
+  try {
+    const o = Object.assign({}, FBLib.Settings.resolve('pdfLayout') || {});
+    o[k] = v;
+    FBLib.Settings.setUserKey('pdfLayout', o);
+    FBLib.Settings.saveUser();
+  } catch (e) { console.warn('PDF layout not saved', e); }
+  if (PDF) PDF.refresh();
+}
+function _pdfTitle() { return _pdfOpt('title').trim() || 'Receiving Summary'; }
+/* The Title box and the Order lines switch go in the PDF view's paper bar,
+   after the orientation buttons: they only shape the pages. Order lines
+   shows in By Receipt view only. */
+function _pdfMountOptions() {
+  const bar = document.querySelector('.fbdoc-view .fbdoc-view-bar');
+  if (!bar) return;
+  const span = document.createElement('span');
+  span.id = 'pdfLayoutOpts';
+  span.className = 'pdf-opts';
+  span.innerHTML =
+    '<span>Title</span><input type="text" id="pdfTitle" placeholder="Receiving Summary" maxlength="120" ' +
+      'title="An alternate title for the pages (the standard report\'s Report Title); empty = Receiving Summary">' +
+    '<label id="pdfLinesWrap" title="Print each order\'s lines; off prints the order headings and their totals only">' +
+      '<input type="checkbox" id="pdfLines"> Order lines</label>';
+  bar.insertBefore(span, bar.querySelector('.fbdoc-vb-info'));
+  const t = document.getElementById('pdfTitle');
+  t.addEventListener('change', () => _pdfSetOpt('title', t.value.trim()));
+  t.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); t.blur(); } });
+  document.getElementById('pdfLines').addEventListener('change', e => _pdfSetOpt('lines', e.target.checked));
+  _pdfSyncOptions();
+}
+function _pdfSyncOptions() {
+  const box = document.getElementById('pdfLayoutOpts');
+  if (!box) return;
+  document.getElementById('pdfTitle').value = _pdfOpt('title');
+  document.getElementById('pdfLines').checked = _pdfOpt('lines');
+  document.getElementById('pdfLinesWrap').style.display = _viewMode === 'grouped' ? '' : 'none';
+}
+
+// The title band's date line, as the standard report words it (plus the field).
+function _pdfDateLine(st) {
+  const f = safeDate(st.dateFrom || ''), t = safeDate(st.dateTo || '');
+  if (!f && !t) return 'Date Range: All';
+  const fld = ' (' + (PDF_DATE_LABEL[st.dateField] || PDF_DATE_LABEL.rcv) + ')';
+  if (f && t) return 'Date Range' + fld + ': ' + formatDate(f) + ' - ' + formatDate(t);
+  return 'Date Range' + fld + ': ' + (f ? 'from ' + formatDate(f) : 'to ' + formatDate(t));
+}
+// The other filters, as one line (only the ones set).
+function _pdfFilterLine(st) {
+  const p = [];
+  const arr = v => Array.isArray(v) ? v : [];
+  const few = a => a.length <= 3 ? a.join(', ') : a.slice(0, 3).join(', ') + ' +' + (a.length - 3) + ' more';
+  const names = (vals, list) => vals.map(v => { const it = list.find(o => String(o.val) === String(v)); return it ? it.lbl : v; });
+  const ot = ['ckPO', 'ckSO', 'ckTO'].filter(k => st[k]).map(k => k.slice(2));
+  if (ot.length < 3) p.push('Order types: ' + (ot.join(', ') || 'none'));
+  const is = arr(st.statuses), rs = arr(st.rcptStatuses);
+  if (is.length && is.length < STATUS_LIST.length) p.push('Line status: ' + names(is, STATUS_LIST).join(', '));
+  if (rs.length && rs.length < STATUS_LIST.length) p.push('Receipt status: ' + names(rs, STATUS_LIST).join(', '));
+  if (arr(st.selLg).length)      p.push('Location groups: ' + few(names(st.selLg, _lgList)));
+  if (arr(st.selVendor).length)  p.push('Vendors: ' + few(names(st.selVendor, _vendorList)));
+  if (arr(st.selCustJob).length) p.push('Customer jobs: ' + few(names(st.selCustJob, _custJobList)));
+  if (arr(st.selPart).length)    p.push('Parts: ' + few(st.selPart));
+  [['filterOrderNum', 'Order #'], ['filterCustomer', 'Customer'], ['filterReceiptId', 'Receipt #'],
+   ['filterRefNo', 'Reference'], ['filterDesc', 'Description'], ['filterVendorPart', 'Vendor part #']]
+    .forEach(([id, lbl]) => { const v = String(st[id] || '').trim(); if (v) p.push(lbl + ' contains "' + v + '"'); });
+  return p.join(' · ');
+}
+function _pdfLimitNote() {
+  return _capped ? 'Only the newest ' + _dataset.length.toLocaleString() + ' lines (whole receipts, the report\'s cap): ' +
+    'Load all on screen prints every line.' : '';
+}
+
+/* The columns the pages print: the App's (what Columns shows, in its order;
+   Order # only in Flat view), plus the chosen Date Field's column when it is
+   switched off, in its place, as the standard report prints it. */
+function _pdfCols(flat) {
+  const shown = new Set(_columns.filter(c => c.vis && (flat || !c.flatOnly)).map(c => c.key));
+  const dk = PDF_DATE_COL[(_pdfState || {}).dateField];
+  if (dk) shown.add(dk);
+  return _columns.filter(c => shown.has(c.key));
+}
+// Date headings on two lines ("Date / Received"), as the standard report
+// sets them: a date column is then only as wide as its dates, which leaves
+// the width to Description.
+function _pdfHead(cols) {
+  return '<tr>' + cols.map(c => {
+    const h = _pdfEsc(PDF_HEAD[c.key] || c.label);
+    return '<th' + ((c.money || c.qty) ? ' class="num-cell"' : '') + '>' + (c.date ? h.replace(' ', '<br>') : h) + '</th>';
+  }).join('') + '</tr>';
+}
+/* One cell's text, as the App shows it (no badge, no links). */
+function _pdfCellText(col, row) {
+  const raw = row[col.key];
+  if (col.ibadge) { const info = RCPT_ITEM_STATUS_MAP[parseInt(raw)]; return info ? info.label : (raw == null ? '' : String(raw)); }
+  if (col.date)  return raw ? formatDate(String(raw)) : '';
+  if (col.money) { const n = parseFloat(raw); return isNaN(n) ? '' : formatMoney(n); }
+  if (col.qty)   { const n = parseFloat(raw); return isNaN(n) ? '' : formatQty(n); }
+  return raw == null ? '' : String(raw);
+}
+function _pdfLineRow(cols, r) {
+  return '<tr class="pdf-ln">' + cols.map(c => {
+    const t = _pdfEsc(_pdfCellText(c, r));
+    if (c.date) return '<td><span class="nw">' + t + '</span></td>';
+    return '<td' + ((c.money || c.qty) ? ' class="num-cell"' : '') + '>' + t + '</td>';
+  }).join('') + '</tr>';
+}
+function _pdfZeroSums() { const s = {}; _SUM_COLS.forEach(k => { s[k] = 0; }); return s; }
+function _pdfAdd(s, r) { _SUM_COLS.forEach(k => { s[k] += parseFloat(r[k]) || 0; }); }
+/* A totals row: the label right-aligned across the columns before the first
+   column that carries a total, each total under its column (so a moved
+   column never breaks the row). '' when no total column is shown. */
+function _pdfTotalsRow(cols, label, sums, cls) {
+  const first = cols.findIndex(c => _SUM_COLS.has(c.key));
+  if (first < 0) return '';
+  let html = '<tr' + (cls ? ' class="' + cls + '"' : '') + '>';
+  if (first > 0) html += '<td class="pdf-totlbl"' + (first > 1 ? ' colspan="' + first + '"' : '') + '>' + _pdfEsc(label) + '</td>';
+  cols.slice(first).forEach(c => {
+    html += _SUM_COLS.has(c.key)
+      ? '<td class="num-cell">' + _pdfEsc(c.money ? formatMoney(sums[c.key]) : formatQty(sums[c.key])) + '</td>'
+      : '<td></td>';
+  });
+  return html + '</tr>';
+}
+/* Orders: the standard report's order (order number, then name) unless the
+   user sorted the receipt rows; lines: date received, billed, reconciled,
+   last changed (the standard report's ORDER BY) unless a column sort is set. */
+function _pdfGroupOrder() {
+  if (_rcptSortCol) return _groups.slice();
+  return _groups.slice().sort((a, b) =>
+    String(a.ordernum).localeCompare(String(b.ordernum), undefined, { numeric: true, sensitivity: 'base' }) ||
+    String(a.fromname).localeCompare(String(b.fromname), undefined, { sensitivity: 'base' }) ||
+    (a.receiptid - b.receiptid));
+}
+function _pdfLineOrder(items) {
+  if (_sortCol) return sortedItems(items);
+  const key = r => [r.datereceived, r.datebilled, r.datereconciled, r.datelastmodified].map(v => v ? String(v) : '').join('|');
+  return items.slice().sort((a, b) => {
+    const x = key(a), y = key(b);
+    if (x !== y) return x < y ? -1 : 1;
+    return (parseFloat(a.linenum) || 0) - (parseFloat(b.linenum) || 0);
+  });
+}
+
+/* By Receipt view: the standard report's layout — a heading per order, its
+   lines, Order Totals, and Grand Totals at the end. */
+function _pdfGroupedSpec(spec, st) {
+  const cols = _pdfCols(false);
+  if (!cols.length) return Object.assign(spec, { empty: 'No columns are switched on (Columns).' });
+  const n = cols.length, withLines = _pdfOpt('lines');
+  spec.head = _pdfHead(cols);
+  const rows = [], grand = _pdfZeroSums();
+  _pdfGroupOrder().forEach(g => {
+    const status = (RCPT_STATUS_MAP[g.receiptstatusid] || {}).label;
+    const meta = ['Receipt ' + g.receiptid, g.lg, status,
+      g.items.length + (g.items.length === 1 ? ' line' : ' lines')].filter(Boolean).join(' · ');
+    rows.push('<tr class="rpt-grp"><td colspan="' + n + '"><div class="rpt-grp-inner">' +
+      '<span>' + _pdfEsc((g.ordertype || '') + ': ' + g.ordernum) + '</span>' +
+      (g.fromname ? '<span>' + _pdfEsc(g.fromname) + '</span>' : '') +
+      '<span class="rpt-grp-meta">' + _pdfEsc(meta) + '</span></div></td></tr>');
+    const sums = _pdfZeroSums();
+    _pdfLineOrder(g.items).forEach(r => {
+      _pdfAdd(sums, r); _pdfAdd(grand, r);
+      if (withLines) rows.push(_pdfLineRow(cols, r));
+    });
+    const tot = _pdfTotalsRow(cols, 'Order Totals:', sums, 'rpt-minor pdf-ordtot');
+    if (tot) rows.push(tot);
+  });
+  spec.rows = rows;
+  spec.foot = rows.length ? _pdfTotalsRow(cols, 'Grand Totals:', grand, '') : '';
+  spec.subtitle = [_pdfDateLine(st), _pdfFilterLine(st), _pdfLimitNote()];
+  return spec;
+}
+/* Flat view: the lines as one list in the App's order, with Grand Totals. */
+function _pdfFlatSpec(spec, st) {
+  const cols = _pdfCols(true);
+  if (!cols.length) return Object.assign(spec, { empty: 'No columns are switched on (Columns).' });
+  spec.head = _pdfHead(cols);
+  const grand = _pdfZeroSums();
+  spec.rows = sortedItems(_dataset).map(r => { _pdfAdd(grand, r); return _pdfLineRow(cols, r); });
+  spec.foot = spec.rows.length ? _pdfTotalsRow(cols, 'Grand Totals:', grand, '') : '';
+  spec.subtitle = [_pdfDateLine(st), _pdfFilterLine(st), _pdfLimitNote()];
+  return spec;
+}
+/* Pivot view: the pivot as the App shows it — its rows, columns and totals.
+   With a second row dimension, each Row 1 value becomes a heading over its
+   Row 2 lines (one label column, and "(continued)" over a page break). */
+function _pdfPivotSpec(spec, st) {
+  const r = _pivotResult || buildPivot(_dataset, _pivotCfg);
+  const BUCKET = { day: 'Day', week: 'Week', month: 'Month', quarter: 'Quarter', year: 'Year' };
+  const lbl = c => c ? c.label + (c.date ? ' (' + (BUCKET[
+    c === r.rowDimCol ? r.cfg.rowBucket : c === r.rowDim2Col ? r.cfg.rowBucket2 : r.cfg.colBucket] || 'Month') + ')' : '') : '';
+  const isCount = r.cfg.measure === '__count__' || r.cfg.agg === 'count';
+  const what = isCount ? 'Count of rows' :
+    ({ sum: 'Sum', avg: 'Average', min: 'Minimum', max: 'Maximum' }[r.cfg.agg] || 'Sum') + ' of ' + (r.measureCol ? r.measureCol.label : 'rows');
+  const pivotLine = 'Pivot: ' + what + ' by ' + lbl(r.rowDimCol) + (r.rowDim2Col ? ' → ' + lbl(r.rowDim2Col) : '') +
+    (r.colDimCol ? ' × ' + lbl(r.colDimCol) : '');
+  const ovf = r.overflow ? 'Narrowed to the top 50 × 50 by ' + (r.measureCol ? r.measureCol.label : 'row count') + ', as on screen.' : '';
+  spec.subtitle = [_pdfDateLine(st), pivotLine, _pdfFilterLine(st), _pdfLimitNote(), ovf];
+  spec.empty = 'No data for the current filters.';
+  if (!r.rowKeys.length) return spec;
+  const rowTot = !!_pivotCfg.showRowTotals, colTot = !!_pivotCfg.showColTotals;
+  const n = 1 + r.colKeys.length + (rowTot ? 1 : 0);
+  const fmt = v => v == null ? '—' : _formatMeasure(v);
+  const corner = (r.rowDimCol ? r.rowDimCol.label : '(row)') + (r.rowDim2Col ? ' → ' + r.rowDim2Col.label : '') +
+    (r.colDimCol ? ' × ' + r.colDimCol.label : '');
+  spec.head = '<tr><th>' + _pdfEsc(corner) + '</th>' +
+    r.colKeys.map(ck => '<th class="num-cell">' + _pdfEsc(ck === '__all__' ? (r.measureCol ? r.measureCol.label : 'Count') : ck) + '</th>').join('') +
+    (rowTot ? '<th class="num-cell">Total</th>' : '') + '</tr>';
+  const rows = [];
+  let last = null;
+  r.rowKeys.forEach(rk => {
+    let label = rk;
+    if (r.rowDim2Col) {
+      const parts = rk.split(r.rowSep);
+      if (parts[0] !== last) {
+        rows.push('<tr class="rpt-grp"><td colspan="' + n + '"><div class="rpt-grp-inner"><span>' + _pdfEsc(parts[0]) + '</span></div></td></tr>');
+        last = parts[0];
+      }
+      label = parts[1] == null ? '' : parts[1];
+    }
+    rows.push('<tr class="pdf-ln"><td>' + _pdfEsc(label) + '</td>' +
+      r.colKeys.map(ck => '<td class="num-cell">' + _pdfEsc(fmt(r.cells.get(rk + '|' + ck))) + '</td>').join('') +
+      (rowTot ? '<td class="num-cell pdf-pvtot">' + _pdfEsc(r.rowTotals[rk] == null ? '' : _formatMeasure(r.rowTotals[rk])) + '</td>' : '') + '</tr>');
+  });
+  spec.rows = rows;
+  if (colTot) {
+    spec.foot = '<tr><td>Total</td>' +
+      r.colKeys.map(ck => '<td class="num-cell">' + _pdfEsc(r.colTotals[ck] == null ? '' : _formatMeasure(r.colTotals[ck])) + '</td>').join('') +
+      (rowTot ? '<td class="num-cell">' + _pdfEsc(r.grandTotal == null ? '' : _formatMeasure(r.grandTotal)) + '</td>' : '') + '</tr>';
+  }
+  return spec;
+}
+
+function docSpec() {
+  if (!_pdfLoaded) return null;
+  const st = _pdfState || captureFilterState();
+  const spec = {
+    company: _company, title: _pdfTitle(), subtitle: [_pdfDateLine(st)], titleEveryPage: false,
+    head: '', rows: [], foot: '', empty: 'No receipt lines match these filters.', css: PDF_CSS, fontPt: 10
+  };
+  if (_pdfError) return Object.assign(spec, { empty: 'The query failed: ' + _pdfError });
+  if (_viewMode === 'pivot') return _pdfPivotSpec(spec, st);
+  return _viewMode === 'flat' ? _pdfFlatSpec(spec, st) : _pdfGroupedSpec(spec, st);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   PIVOT VIEW
+   ════════════════════════════════════════════════════════════════════════
+   2-D cross-tab over the same `_dataset` the flat / grouped views render
+   from — no extra SQL. Receiving defaults: rows=Order Type, cols=Date
+   Received (Month), measure=Billed Total (sum). Same engine + drill
+   behaviour as PurchaseOrderSummary / SalesOrderSummary; promoted into a
+   shared module later. */
+function _bucketDate(dateStr, bucket) {
+  const s = String(dateStr || '');
+  if (s.length < 10) return '(invalid)';
+  const yyyy = s.substring(0, 4);
+  const mm   = s.substring(5, 7);
+  const dd   = s.substring(8, 10);
+  const m    = parseInt(mm, 10);
+  if (bucket === 'year')    return yyyy;
+  if (bucket === 'quarter') return yyyy + '-Q' + Math.ceil(m / 3);
+  if (bucket === 'month')   return yyyy + '-' + mm;
+  if (bucket === 'week') {
+    const d = new Date(yyyy + '-' + mm + '-' + dd + 'T00:00:00Z');
+    if (isNaN(d.getTime())) return '(invalid)';
+    d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay() || 7));
+    const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+    const wk = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+    return d.getUTCFullYear() + '-W' + String(wk).padStart(2, '0');
+  }
+  return yyyy + '-' + mm + '-' + dd;
+}
+
+function _bucketKeyFor(row, col, bucket) {
+  if (!col) return '__all__';
+  const v = row[col.key];
+  if (v == null || v === '') return '(blank)';
+  if (col.date) return _bucketDate(v, bucket);
+  return String(v);
+}
+
+function buildPivot(rows, cfg) {
+  const rowDimCol  = _columns.find(c => c.key === cfg.rowDim);
+  const rowDim2Col = cfg.rowDim2 ? _columns.find(c => c.key === cfg.rowDim2) : null;
+  const colDimCol  = cfg.colDim ? _columns.find(c => c.key === cfg.colDim) : null;
+  const measureKey = cfg.measure || '__count__';
+  const isCountMeasure = (measureKey === '__count__');
+  const agg = cfg.agg || 'sum';
+
+  // Compound row key — String.fromCharCode(31) is the ASCII Unit Separator,
+  // guaranteed not to appear in real text. Constructed at runtime so
+  // Fishbowl's pre-JxBrowser HTML pipeline does not strip the byte (which
+  // it does for literal 0x1F in script source).
+  const RS = String.fromCharCode(31);
+  function rowKeyFor(r) {
+    const k1 = _bucketKeyFor(r, rowDimCol, cfg.rowBucket);
+    if (!rowDim2Col) return k1;
+    return k1 + RS + _bucketKeyFor(r, rowDim2Col, cfg.rowBucket2);
+  }
+
+  const rowKeys = [], rowKeySet = new Set();
+  const colKeys = [], colKeySet = new Set();
+  const accum = new Map();
+
+  rows.forEach(r => {
+    const rk = rowKeyFor(r);
+    const ck = _bucketKeyFor(r, colDimCol, cfg.colBucket);
+    if (!rowKeySet.has(rk)) { rowKeySet.add(rk); rowKeys.push(rk); }
+    if (!colKeySet.has(ck)) { colKeySet.add(ck); colKeys.push(ck); }
+    const key = rk + '|' + ck;
+    let cell = accum.get(key);
+    if (!cell) { cell = {sum:0, count:0, min:Infinity, max:-Infinity}; accum.set(key, cell); }
+    cell.count++;
+    if (!isCountMeasure) {
+      const num = parseFloat(r[measureKey]);
+      if (!isNaN(num)) {
+        cell.sum += num;
+        if (num < cell.min) cell.min = num;
+        if (num > cell.max) cell.max = num;
+      }
+    }
+  });
+
+  function reduce(cell) {
+    if (!cell || cell.count === 0) return null;
+    if (isCountMeasure || agg === 'count') return cell.count;
+    if (agg === 'sum') return cell.sum;
+    if (agg === 'avg') return cell.count ? (cell.sum / cell.count) : null;
+    if (agg === 'min') return cell.min === Infinity ? null : cell.min;
+    if (agg === 'max') return cell.max === -Infinity ? null : cell.max;
+    return cell.sum;
+  }
+  const cells = new Map();
+  accum.forEach((c, k) => { cells.set(k, reduce(c)); });
+
+  function sortKeys(arr, col) {
+    if (col && col.date) return arr.slice().sort();
+    return arr.slice().sort((a, b) => {
+      const na = parseFloat(a), nb = parseFloat(b);
+      if (!isNaN(na) && !isNaN(nb)) return na - nb;
+      return String(a).localeCompare(String(b), undefined, {sensitivity:'base'});
+    });
+  }
+  let sortedRowKeys = sortKeys(rowKeys, rowDimCol);
+  let sortedColKeys = colDimCol ? sortKeys(colKeys, colDimCol) : ['__all__'];
+
+  const rowTotals = {}, colTotals = {};
+  let grandTotal = 0, grandHas = false;
+  sortedRowKeys.forEach(rk => {
+    let t = 0, any = false;
+    sortedColKeys.forEach(ck => {
+      const v = cells.get(rk + '|' + ck);
+      if (v != null) { t += v; any = true; }
+    });
+    rowTotals[rk] = any ? t : null;
+    if (any) { grandTotal += t; grandHas = true; }
+  });
+  sortedColKeys.forEach(ck => {
+    let t = 0, any = false;
+    sortedRowKeys.forEach(rk => {
+      const v = cells.get(rk + '|' + ck);
+      if (v != null) { t += v; any = true; }
+    });
+    colTotals[ck] = any ? t : null;
+  });
+
+  let overflow = false;
+  if (sortedRowKeys.length * sortedColKeys.length > 10000) {
+    overflow = true;
+    sortedRowKeys = sortedRowKeys.slice()
+      .sort((a, b) => Math.abs(rowTotals[b] || 0) - Math.abs(rowTotals[a] || 0))
+      .slice(0, 50);
+    sortedColKeys = sortedColKeys.slice()
+      .sort((a, b) => Math.abs(colTotals[b] || 0) - Math.abs(colTotals[a] || 0))
+      .slice(0, 50);
+    sortedRowKeys = sortKeys(sortedRowKeys, rowDimCol);
+    sortedColKeys = colDimCol ? sortKeys(sortedColKeys, colDimCol) : sortedColKeys;
+  }
+
+  return {
+    rowKeys: sortedRowKeys, colKeys: sortedColKeys,
+    cells, rowTotals, colTotals,
+    grandTotal: grandHas ? grandTotal : null,
+    overflow,
+    rowDimCol, rowDim2Col, colDimCol,
+    measureCol: _columns.find(c => c.key === measureKey) || null,
+    rowSep: RS,
+    cfg
+  };
+}
+
+function _formatMeasure(v) {
+  if (v == null) return '';
+  if (_pivotCfg.measure === '__count__' || _pivotCfg.agg === 'count') {
+    return Math.round(v).toLocaleString(_localeCode);
+  }
+  const col = _columns.find(c => c.key === _pivotCfg.measure);
+  if (col && col.money) return formatMoney(v);
+  if (col && col.qty)   return formatQty(v);
+  return (Math.round(v * 100) / 100).toLocaleString(_localeCode);
+}
+
+/* Every pivot repaint (a config change, a preset, Swap, a mode switch)
+   comes through here, so the PDF view follows it. */
+function renderPivot() {
+  _renderPivotGrid();
+  if (PDF) PDF.refresh();
+}
+function _renderPivotGrid() {
+  const result = buildPivot(_dataset, _pivotCfg);
+  _pivotResult = result;
+
+  const head = document.getElementById('pivotHead');
+  const body = document.getElementById('pivotBody');
+  const ofl  = document.getElementById('pivotOverflow');
+  head.innerHTML = ''; body.innerHTML = '';
+
+  if (result.overflow) {
+    const meaLabel = result.measureCol ? result.measureCol.label : 'row count';
+    ofl.textContent = '⚠ Pivot too large — narrowed to top 50 × 50 by ' + meaLabel +
+                      '. Refine filters or pick a coarser date bucket for the full grid.';
+    ofl.classList.add('show');
+  } else {
+    ofl.classList.remove('show');
+  }
+
+  if (!result.rowKeys.length) {
+    body.innerHTML = '<tr><td style="padding:2rem; color:#9ca3af; text-align:center;" colspan="99">No data for the current filters.</td></tr>';
+    return;
+  }
+
+  const rowLbl  = result.rowDimCol ? result.rowDimCol.label : '(row)';
+  const row2Lbl = result.rowDim2Col ? result.rowDim2Col.label : '';
+  const colLbl  = result.colDimCol ? result.colDimCol.label : '';
+  const hr = document.createElement('tr');
+  if (result.rowDim2Col) {
+    const c1 = document.createElement('th'); c1.textContent = rowLbl; hr.appendChild(c1);
+    const c2 = document.createElement('th'); c2.textContent = row2Lbl + (colLbl ? ' × ' + colLbl : ''); hr.appendChild(c2);
+  } else {
+    const corner = document.createElement('th');
+    corner.textContent = rowLbl + (colLbl ? ' × ' + colLbl : '');
+    hr.appendChild(corner);
+  }
+  result.colKeys.forEach(ck => {
+    const th = document.createElement('th');
+    th.textContent = (ck === '__all__') ? (result.measureCol ? result.measureCol.label : 'Count') : ck;
+    hr.appendChild(th);
+  });
+  if (_pivotCfg.showRowTotals) {
+    const tt = document.createElement('th'); tt.textContent = 'Total'; hr.appendChild(tt);
+  }
+  head.appendChild(hr);
+
+  // Body rows. Adjacent rows that share the same Row 1 value get a blank
+  // Row 1 cell so the grid reads vertically grouped without merging.
+  let lastRow1 = null;
+  result.rowKeys.forEach(rk => {
+    const tr = document.createElement('tr');
+    if (result.rowDim2Col) {
+      const parts = rk.split(result.rowSep);
+      const v1 = parts[0], v2 = parts[1] ?? '';
+      const lbl1 = document.createElement('td');
+      lbl1.textContent = (v1 === lastRow1) ? '' : v1;
+      tr.appendChild(lbl1);
+      const lbl2 = document.createElement('td'); lbl2.textContent = v2; tr.appendChild(lbl2);
+      lastRow1 = v1;
+    } else {
+      const lbl = document.createElement('td'); lbl.textContent = rk; tr.appendChild(lbl);
+    }
+    result.colKeys.forEach(ck => {
+      const td = document.createElement('td');
+      const v  = result.cells.get(rk + '|' + ck);
+      if (v == null) {
+        td.textContent = '—'; td.classList.add('pv-empty');
+      } else {
+        td.textContent = _formatMeasure(v);
+        td.dataset.rk = rk; td.dataset.ck = ck;
+        td.addEventListener('click', () => openPivotDrill(rk, ck));
+      }
+      tr.appendChild(td);
+    });
+    if (_pivotCfg.showRowTotals) {
+      const tt = document.createElement('td'); tt.className = 'pv-total';
+      tt.textContent = result.rowTotals[rk] == null ? '' : _formatMeasure(result.rowTotals[rk]);
+      tr.appendChild(tt);
+    }
+    body.appendChild(tr);
+  });
+
+  if (_pivotCfg.showColTotals) {
+    const tr = document.createElement('tr'); tr.className = 'pv-totals-row';
+    const lbl = document.createElement('td');
+    lbl.className = 'pv-total';
+    lbl.textContent = 'Total';
+    if (result.rowDim2Col) lbl.colSpan = 2;
+    tr.appendChild(lbl);
+    result.colKeys.forEach(ck => {
+      const td = document.createElement('td'); td.className = 'pv-total';
+      td.textContent = result.colTotals[ck] == null ? '' : _formatMeasure(result.colTotals[ck]);
+      tr.appendChild(td);
+    });
+    if (_pivotCfg.showRowTotals) {
+      const gt = document.createElement('td'); gt.className = 'pv-total';
+      gt.textContent = result.grandTotal == null ? '' : _formatMeasure(result.grandTotal);
+      tr.appendChild(gt);
+    }
+    body.appendChild(tr);
+  }
+}
+
+function openPivotDrill(rk, ck) {
+  const r = _pivotResult;
+  if (!r) return;
+  const parts = r.rowDim2Col ? rk.split(r.rowSep) : [rk];
+  const rk1 = parts[0];
+  const rk2 = r.rowDim2Col ? (parts[1] ?? '') : null;
+  const matches = _dataset.filter(row => {
+    if (_bucketKeyFor(row, r.rowDimCol, r.cfg.rowBucket) !== rk1) return false;
+    if (r.rowDim2Col && _bucketKeyFor(row, r.rowDim2Col, r.cfg.rowBucket2) !== rk2) return false;
+    if (r.colDimCol && _bucketKeyFor(row, r.colDimCol, r.cfg.colBucket) !== ck) return false;
+    return true;
+  });
+
+  document.getElementById('pivotDrillTitle').textContent =
+    (r.rowDimCol ? (r.rowDimCol.label + ' = ' + rk1) : rk) +
+    (r.rowDim2Col ? '  ·  ' + r.rowDim2Col.label + ' = ' + rk2 : '') +
+    (r.colDimCol ? '  ·  ' + r.colDimCol.label + ' = ' + ck : '');
+  document.getElementById('pivotDrillCount').textContent = matches.length + ' row' + (matches.length === 1 ? '' : 's');
+
+  const visCols = _columns.filter(c => c.vis);
+  const body = document.getElementById('pivotDrillBody');
+  body.innerHTML = '';
+  const tbl = document.createElement('table');
+  const thead = document.createElement('thead');
+  const headTr = document.createElement('tr');
+  visCols.forEach(c => {
+    const th = document.createElement('th'); th.textContent = c.label; headTr.appendChild(th);
+  });
+  thead.appendChild(headTr); tbl.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  matches.forEach(row => {
+    const tr = document.createElement('tr');
+    visCols.forEach(col => {
+      const td = document.createElement('td');
+      const raw = row[col.key];
+      if (col.ibadge) {
+        const sid = parseInt(raw), info = RCPT_ITEM_STATUS_MAP[sid] || {label: String(raw ?? ''), cls: 'b10'};
+        const span = document.createElement('span');
+        span.className = 'badge ' + info.cls; span.textContent = info.label;
+        td.appendChild(span);
+      } else if (col.date)   { td.textContent = raw ? formatDate(String(raw)) : ''; }
+      else if (col.money)    { td.className = 'num-cell'; td.textContent = raw != null ? formatMoney(parseFloat(raw)) : ''; }
+      else if (col.qty)      { td.className = 'num-cell'; td.textContent = raw != null ? formatQty(parseFloat(raw)) : ''; }
+      else                   { td.textContent = raw ?? ''; }
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  tbl.appendChild(tbody);
+  body.appendChild(tbl);
+
+  document.getElementById('pivotDrillModal').classList.add('open');
+}
+function closePivotDrill() {
+  document.getElementById('pivotDrillModal').classList.remove('open');
+}
+
+function pivotSwap() {
+  if (!_pivotCfg.colDim) return;
+  const r = _pivotCfg.rowDim, b = _pivotCfg.rowBucket;
+  _pivotCfg.rowDim    = _pivotCfg.colDim;
+  _pivotCfg.rowBucket = _pivotCfg.colBucket;
+  _pivotCfg.colDim    = r;
+  _pivotCfg.colBucket = b;
+  document.getElementById('pivotRowDim').value    = _pivotCfg.rowDim;
+  document.getElementById('pivotColDim').value    = _pivotCfg.colDim;
+  document.getElementById('pivotRowBucket').value = _pivotCfg.rowBucket;
+  document.getElementById('pivotColBucket').value = _pivotCfg.colBucket;
+  _updatePivotBucketVisibility();
+  if (_viewMode === 'pivot') renderPivot();
+}
+
+/* ── PRESETS ──
+   See PartActivity for design notes. Same shape across the four pivot
+   reports; only _BUILTIN_PRESETS differs per report. */
+function _cfgKey(cfg) {
+  return [
+    cfg.rowDim || '', cfg.rowBucket || '',
+    cfg.rowDim2 || '', cfg.rowBucket2 || '',
+    cfg.colDim || '', cfg.colBucket || '',
+    cfg.measure || '', cfg.agg || ''
+  ].join('|');
+}
+
+function _findMatchingPreset() {
+  const k = _cfgKey(_pivotCfg);
+  const b = _BUILTIN_PRESETS.find(p => _cfgKey(p.cfg) === k);
+  if (b) return b.id;
+  const sIdx = _savedPresets.findIndex(p => _cfgKey(p.cfg) === k);
+  if (sIdx >= 0) return 's:' + sIdx;
+  return '';
+}
+
+function _renderPresetDropdown() {
+  const sel = document.getElementById('pivotPreset');
+  if (!sel) return;
+  sel.innerHTML = '';
+  const optCustom = document.createElement('option');
+  optCustom.value = ''; optCustom.textContent = '— Custom —';
+  sel.appendChild(optCustom);
+  if (_BUILTIN_PRESETS.length) {
+    const g = document.createElement('optgroup'); g.label = 'Built-in';
+    _BUILTIN_PRESETS.forEach(p => {
+      const o = document.createElement('option'); o.value = p.id; o.textContent = p.name;
+      g.appendChild(o);
+    });
+    sel.appendChild(g);
+  }
+  if (_savedPresets.length) {
+    const g = document.createElement('optgroup'); g.label = 'Saved';
+    _savedPresets.forEach((p, i) => {
+      const o = document.createElement('option'); o.value = 's:' + i; o.textContent = p.name;
+      g.appendChild(o);
+    });
+    sel.appendChild(g);
+  }
+  sel.value = _findMatchingPreset() || '';
+  const del = document.getElementById('pivotDelBtn');
+  if (del) del.style.display = (sel.value && sel.value.indexOf('s:') === 0) ? '' : 'none';
+}
+
+function _applyPresetById(id) {
+  if (!id) return;
+  let cfg = null;
+  if (id.indexOf('b:') === 0) {
+    const p = _BUILTIN_PRESETS.find(x => x.id === id);
+    if (p) cfg = p.cfg;
+  } else if (id.indexOf('s:') === 0) {
+    const i = parseInt(id.substring(2), 10);
+    if (!isNaN(i) && _savedPresets[i]) cfg = _savedPresets[i].cfg;
+  }
+  if (!cfg) return;
+  Object.assign(_pivotCfg, cfg);
+  syncPivotBarFromCfg();
+  _fvChanged();        // a preset change can leave the saved view behind
+  if (_viewMode === 'pivot') renderPivot();
+}
+
+function savePresetPrompt() {
+  const raw = (typeof prompt === 'function') ? prompt('Save current pivot as preset.\n\nName:') : null;
+  if (raw == null) return;
+  const name = String(raw).trim();
+  if (!name) return;
+  if (_BUILTIN_PRESETS.some(p => p.name === name)) {
+    if (typeof alert === 'function') alert('That name is reserved by a built-in preset. Pick another.');
+    return;
+  }
+  const cfg = {
+    rowDim: _pivotCfg.rowDim, rowBucket: _pivotCfg.rowBucket,
+    rowDim2: _pivotCfg.rowDim2 || '', rowBucket2: _pivotCfg.rowBucket2 || 'month',
+    colDim: _pivotCfg.colDim || '', colBucket: _pivotCfg.colBucket || 'month',
+    measure: _pivotCfg.measure, agg: _pivotCfg.agg,
+  };
+  const idx = _savedPresets.findIndex(p => p.name === name);
+  if (idx >= 0) {
+    if (typeof confirm === 'function' && !confirm('A saved preset named "' + name + '" already exists. Overwrite?')) return;
+    _savedPresets[idx] = {name, cfg};
+  } else {
+    _savedPresets.push({name, cfg});
+  }
+  _persistSavedPresets();
+  _renderPresetDropdown();
+  setStatus('Preset saved: ' + name);
+}
+
+function deleteCurrentPreset() {
+  const sel = document.getElementById('pivotPreset');
+  if (!sel || sel.value.indexOf('s:') !== 0) return;
+  const i = parseInt(sel.value.substring(2), 10);
+  if (isNaN(i) || !_savedPresets[i]) return;
+  const name = _savedPresets[i].name;
+  if (typeof confirm === 'function' && !confirm('Delete saved preset "' + name + '"?')) return;
+  _savedPresets.splice(i, 1);
+  _persistSavedPresets();
+  _renderPresetDropdown();
+  setStatus('Preset deleted: ' + name);
+}
+
+function _persistSavedPresets() {
+  try {
+    let s = {};
+    try { const raw = loadSettings(_KEY); if (raw) s = JSON.parse(raw) || {}; } catch(_) {}
+    s.v = 1;
+    s.savedPresets = _savedPresets;
+    saveSettings(_KEY, JSON.stringify(s));
+  } catch(e) { console.warn('Persist savedPresets failed', e); }
+}
+
+function _initPivotUI() {
+  function fillDim(id, allowNone) {
+    const sel = document.getElementById(id);
+    sel.innerHTML = '';
+    if (allowNone) {
+      const opt = document.createElement('option');
+      opt.value = ''; opt.textContent = '(none — 1-D pivot)';
+      sel.appendChild(opt);
+    }
+    _columns.filter(c => c.pivotRole === 'dim').forEach(c => {
+      const o = document.createElement('option');
+      o.value = c.key; o.textContent = c.label;
+      sel.appendChild(o);
+    });
+  }
+  fillDim('pivotRowDim',  false);
+  fillDim('pivotRowDim2', true);
+  fillDim('pivotColDim',  true);
+
+  const mea = document.getElementById('pivotMeasure');
+  mea.innerHTML = '';
+  _columns.filter(c => c.pivotRole === 'measure').forEach(c => {
+    const o = document.createElement('option');
+    o.value = c.key; o.textContent = c.label;
+    mea.appendChild(o);
+  });
+  const cnt = document.createElement('option');
+  cnt.value = '__count__'; cnt.textContent = 'Row count';
+  mea.appendChild(cnt);
+
+  document.getElementById('pivotRowDim').value     = _pivotCfg.rowDim;
+  document.getElementById('pivotRowDim2').value    = _pivotCfg.rowDim2 || '';
+  document.getElementById('pivotColDim').value     = _pivotCfg.colDim || '';
+  document.getElementById('pivotMeasure').value    = _pivotCfg.measure;
+  document.getElementById('pivotAgg').value        = _pivotCfg.agg;
+  document.getElementById('pivotRowBucket').value  = _pivotCfg.rowBucket;
+  document.getElementById('pivotRowBucket2').value = _pivotCfg.rowBucket2;
+  document.getElementById('pivotColBucket').value  = _pivotCfg.colBucket;
+  document.getElementById('pivotShowRowTotals').checked = _pivotCfg.showRowTotals;
+  document.getElementById('pivotShowColTotals').checked = _pivotCfg.showColTotals;
+
+  _updatePivotBucketVisibility();
+
+  ['pivotRowDim','pivotRowDim2','pivotColDim','pivotMeasure','pivotAgg',
+   'pivotRowBucket','pivotRowBucket2','pivotColBucket',
+   'pivotShowRowTotals','pivotShowColTotals'].forEach(id => {
+    document.getElementById(id).addEventListener('change', _onPivotConfigChange);
+  });
+  document.getElementById('pivotPreset').addEventListener('change', function() {
+    _applyPresetById(this.value);
+  });
+  _renderPresetDropdown();
+}
+
+function _updatePivotBucketVisibility() {
+  const rowDim  = document.getElementById('pivotRowDim').value;
+  const rowDim2 = document.getElementById('pivotRowDim2').value;
+  const colDim  = document.getElementById('pivotColDim').value;
+  const rowCol  = _columns.find(c => c.key === rowDim);
+  const row2Col = rowDim2 ? _columns.find(c => c.key === rowDim2) : null;
+  const colCol  = _columns.find(c => c.key === colDim);
+  document.getElementById('pivotRowBucket').style.display  = (rowCol && rowCol.date) ? '' : 'none';
+  document.getElementById('pivotRowBucket2').style.display = (row2Col && row2Col.date) ? '' : 'none';
+  document.getElementById('pivotColBucket').style.display  = (colCol && colCol.date) ? '' : 'none';
+}
+
+function _onPivotConfigChange() {
+  _pivotCfg.rowDim     = document.getElementById('pivotRowDim').value;
+  _pivotCfg.rowDim2    = document.getElementById('pivotRowDim2').value;
+  _pivotCfg.colDim     = document.getElementById('pivotColDim').value;
+  _pivotCfg.measure    = document.getElementById('pivotMeasure').value;
+  _pivotCfg.agg        = document.getElementById('pivotAgg').value;
+  _pivotCfg.rowBucket  = document.getElementById('pivotRowBucket').value;
+  _pivotCfg.rowBucket2 = document.getElementById('pivotRowBucket2').value;
+  _pivotCfg.colBucket  = document.getElementById('pivotColBucket').value;
+  _pivotCfg.showRowTotals = document.getElementById('pivotShowRowTotals').checked;
+  _pivotCfg.showColTotals = document.getElementById('pivotShowColTotals').checked;
+  if (_pivotCfg.rowDim2 && _pivotCfg.rowDim2 === _pivotCfg.rowDim) {
+    _pivotCfg.rowDim2 = '';
+    document.getElementById('pivotRowDim2').value = '';
+  }
+  _updatePivotBucketVisibility();
+  _renderPresetDropdown();   // hand-editing drops the preset menu to "Custom"
+  _fvChanged();        // ...and can drop the saved VIEW to "Custom" too
+  if (_viewMode === 'pivot') renderPivot();
+}
+
+function exportPivotCSV() {
+  if (!_pivotResult) return;
+  const r = _pivotResult;
+  const esc = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+  const lines = [];
+  const head = [];
+  if (r.rowDim2Col) {
+    head.push(r.rowDimCol ? r.rowDimCol.label : 'Row 1');
+    head.push((r.rowDim2Col.label) + (r.colDimCol ? ' × ' + r.colDimCol.label : ''));
+  } else {
+    head.push((r.rowDimCol ? r.rowDimCol.label : 'Row') + (r.colDimCol ? ' × ' + r.colDimCol.label : ''));
+  }
+  r.colKeys.forEach(ck => head.push(ck === '__all__' ? (r.measureCol ? r.measureCol.label : 'Count') : ck));
+  if (_pivotCfg.showRowTotals) head.push('Total');
+  lines.push(head.map(esc).join(','));
+  r.rowKeys.forEach(rk => {
+    const row = [];
+    if (r.rowDim2Col) {
+      const parts = rk.split(r.rowSep);
+      row.push(parts[0]);
+      row.push(parts[1] ?? '');
+    } else {
+      row.push(rk);
+    }
+    r.colKeys.forEach(ck => {
+      const v = r.cells.get(rk + '|' + ck);
+      row.push(v == null ? '' : v);
+    });
+    if (_pivotCfg.showRowTotals) row.push(r.rowTotals[rk] == null ? '' : r.rowTotals[rk]);
+    lines.push(row.map(esc).join(','));
+  });
+  if (_pivotCfg.showColTotals) {
+    const row = ['Total'];
+    if (r.rowDim2Col) row.push('');
+    r.colKeys.forEach(ck => row.push(r.colTotals[ck] == null ? '' : r.colTotals[ck]));
+    if (_pivotCfg.showRowTotals) row.push(r.grandTotal == null ? '' : r.grandTotal);
+    lines.push(row.map(esc).join(','));
+  }
+  const blob = new Blob(['﻿' + lines.join('\r\n')], {type: 'text/csv;charset=utf-8;'});
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url; a.download = 'ReceivingSummary_pivot_' + _ymd(new Date()) + '.csv';
+  a.click(); URL.revokeObjectURL(url);
+}
+
+/* ── HELPERS ── */
+function showSpinner() { document.getElementById('loadingOverlay').style.display = 'block'; }
+function hideSpinner() { document.getElementById('loadingOverlay').style.display = 'none'; }
+
+/* Run a SELECT, preferring the async built-in and falling back to the sync one.
+   This report does NOT define a function called runQuery, so the name below
+   reaches Fishbowl's built-in as intended — unlike SalesOrderSummary /
+   PurchaseOrderSummary / OutsourcedPartDemand, whose refresh function used to
+   shadow it and turned every SQL error into a stack overflow (fixed
+   2026-09-17 by renaming those to refreshData). Keep it that way: never name
+   a report-level function runQuery. */
+async function qp(sql) {
+  try { return normalise(await runQueryAsync(sql)); }
+  catch(e) {
+    if (typeof runQuery !== 'function') throw e;
+    return normalise(runQuery(sql));
+  }
+}
+function normalise(r) {
+  if (r==null) return [];
+  if (typeof r==='string') { try { var p=JSON.parse(r); return Array.isArray(p)?p:[]; } catch(_){return[];} }
+  return Array.isArray(r) ? r : [];
+}
+function setStatus(msg) { document.getElementById('statusLine').textContent = msg; }
+function showToast(message, type = 'info', duration = 3000) {
+  const container = document.querySelector('.toast-container');
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+  const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : 'ℹ';
+  toast.innerHTML = `
+      <div class="flex items-center gap-3">
+          <span class="text-lg">${icon}</span>
+          <span class="text-sm font-medium text-slate-700">${message}</span>
+      </div>
+  `;
+  container.appendChild(toast);
+  setTimeout(() => {
+      toast.style.opacity = '0';
+      setTimeout(() => toast.remove(), 300);
+  }, duration);
+}
+function escSQL(s) { return String(s).replace(/'/g,"''"); }
+function safeDate(s) { return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ''; }
+
+init();
+</script>
+</body>
+</html>

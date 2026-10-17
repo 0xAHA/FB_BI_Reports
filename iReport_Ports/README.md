@@ -11,10 +11,21 @@ export, and a print layout close to the original. The first versions, with
 filter drawers and KPI tiles, are in `archived/iReport_Ports/`.
 
 Each file's header comment lists its rules and every place it deliberately
-differs from the original. Each carries the stock report's display name as
-`FB_REPORT.name`, its Apps-menu modules and its folder (the folder of its
-original), and deploys to the local Fishbowl server; none is on SharePoint
-yet. They need the current fb-lib (`FBLib.Common.togglePanel`) and
+differs from the original. **[DIFFERENCES.md](DIFFERENCES.md)** collects
+every one of those deviations in one register (fix, addition, omission,
+layout, performance or data), with its evidence, how to verify it, and a
+Reviewed column for sign-off in the Fishbowl client. Each carries the stock report's display name as
+`FB_REPORT.name` and its folder (the folder of its original), and deploys to
+the local Fishbowl server; none is on SharePoint yet.
+
+**Module association.** Only the paperwork documents carry an `fb-launch`
+tag, which lists them in that module's Apps menu (with report_btn): Sales
+Order Report and Sales Invoice (SO), Purchase Order Report (PO), Pick Ticket
+(PICK), Packing Slip and Shipping Invoice (SHIP), Work Order Traveler (WO) and
+Manufacture Order Traveler (MO). Every other port has none (decided
+2026-10-16) and is opened from BI Reports or the App Library. Ports that
+understand a launch (`window.FB_LAUNCH`) keep that code, so it works if a
+module is added later. They need the current fb-lib (`FBLib.Common.togglePanel`) and
 fb-styles (§35), and for the PDF view the `fb-doc` Script
 (`scripts/fb-doc.js`) and the `fb-doc-fonts` Style
 (`scripts/fb-doc-fonts.css`). Deploy fb-styles, then fb-lib, then fb-doc and
@@ -44,6 +55,47 @@ The bar above the pages changes the paper size (Letter, Legal, A4, A3, A5,
 Tabloid, Executive) and the orientation, and **Standard paper** goes back to
 the original's. Each user's view and paper are remembered per report, in the
 report's own settings (user key `docView`).
+
+## Company defaults: paper and filters (2026-10-15)
+
+So business paperwork comes out the same for everyone:
+- **Paper for all reports.** One paper **size** for every report, while each report
+  keeps its own orientation (portrait, or landscape where the original is).
+  - **Until an admin sets one,** the size follows the Fishbowl edition (`QBVersion`):
+    Letter for US and Canada, A4 for every other edition.
+  - **Setting it:** admin only, with **Use A4 for all reports** (or whichever size is on
+    show) in any report's PDF-view paper bar. The Paperwork POC documents have the
+    button in their Settings drawer.
+  - It is the SharedData key `cdx.bi.paper.v1` = `{ size }`, read by `FBDoc.paper.all()`
+    in `scripts/fb-doc.js`.
+  - **It is the bottom layer.** A user's own choice, a report's company paper and a
+    POC document's Page_setup (when changed from its A4 default) all win over it.
+- **Company paper.**
+  - **Who sets it:** admin, or a user whose group has **Edit Settings** on the
+    report. In the PDF view's paper bar they press **Use for everyone**; **Stop using
+    company paper** clears it.
+  - **Who gets it:** every user who hasn't picked a paper of their own, and the
+    documents a module prints or emails through Print (App) / Email (rich), which
+    always use it.
+  - **Users can still choose their own paper.** The bar then offers **Company paper**
+    to go back to it.
+  - It is the report's FBLib.Settings master key `docPaper`, handled by
+    `FBDoc.Report.view`.
+- **Company filters.**
+  - **Who sets them:** the same people, with **Use these filters for everyone** in
+    the Settings drawer.
+  - **What it does:** every open starts from them. Anyone can still change the
+    filters while the report is open, but nothing they change carries over.
+  - **Stop using them** clears them, and users go back to their own last choices.
+- **How a port opts in:** `FBLib.Settings.init({ masterStorage: 'userProperties',
+  company: { keys: ['filters', 'opts'], editors: true }, … })`.
+  - `keys` are the settings whose company value wins.
+  - `editors` trusts the report's Edit Settings users, read from `bireportaccess`, so
+    nobody else's settings row is believed.
+- **Saved-views ports** (Part Activity, the two Summaries) pass
+  `editors: true, companyFirst: true` to `FBLib.FilterViews.attach`, so the company
+  default view opens even for users who starred their own.
+- **The test:** `tools/fb-lib-tests/company-settings.test.js`.
 
 **Print** prints those pages in either view. In PDF view the BI Report
 module's own Print, Save → PDF and Email print the pages too. Without fb-doc
@@ -92,8 +144,9 @@ to run over several pages:
 The PDF view has **not yet been tried in the Fishbowl client**, including
 what its toolbar's Save → PDF and Email produce from it.
 
-The engine was promoted from the Paperwork proof of concept
-(`Other_NOT_FOR_PRODUCTION/Paperwork_POC`, which still has its own copy).
+The engine was promoted from the Paperwork proof of concept (archived
+2026-10-15 in `archived/Other_NOT_FOR_PRODUCTION/Paperwork_POC/`; its documents
+are now ports and use this shared copy).
 
 ### Accounting
 
@@ -106,8 +159,8 @@ The engine was promoted from the Paperwork proof of concept
 ### Inventory
 
 Two of these predate the porting process and moved here on 2026-10-10.
-**InventoryAvailability.htm** is the published `- Inventory - Inventory
-Availability` report: an extended BI version of the original, with a drill-down
+**InventoryAvailability.htm** is the published Inventory Availability
+report: an extended BI version of the original, with a drill-down
 and a projected-availability timeline, in its own chrome. Publishing finds it
 by record name, so the move doesn't affect it. Its standalone launcher (`.bat`)
 moved with it, but no longer works: the report runs only inside Fishbowl.
@@ -117,7 +170,7 @@ moved with it, but no longer works: the report runs only inside Fishbowl.
 | Port | Original | Notes |
 |---|---|---|
 | [Inventory/AgingReport.htm](Inventory/AgingReport.htm) | `Inventory/AgingReport.jrxml` | Tag sets with their Created date and age in days (the original has no aging buckets and no totals); grouped by location group or part |
-| [Inventory/AssetValuationByAccount.htm](Inventory/AssetValuationByAccount.htm) | `Inventory/AssetValuationByAccount.jrxml` | LIFO/FIFO, Std and Average value per part, by asset account. Fixes: run for today, the original used last night's cost snapshot ($1.97M against $1.49M on the live data); past dates now use that night's snapshot, not each part's last capture (which kept sold-out stock) |
+| [Inventory/AssetValuationByAccount.htm](Inventory/AssetValuationByAccount.htm) | `Inventory/AssetValuationByAccount.jrxml` | LIFO/FIFO, Std and Average value per part, by asset account. Fixes: a run for today read the cost history instead of today's costs; a past date now uses that night's snapshot, not each part's last capture, which kept sold-out stock ($1,962,993 against $1,517,119 Average Cost, 2026-05-20 live) |
 | [Inventory/ConsumptionReport.htm](Inventory/ConsumptionReport.htm) | `Inventory/ConsumptionReport.jrxml` | Scraps (`inventorylog` typeId 67), grouped, with the per-part summary as a second view. The original's User column toggle (wired to the Location Group option) is fixed |
 | [Inventory/CostingLayerValuation.htm](Inventory/CostingLayerValuation.htm) | `Inventory/CostingLayerValuation.jrxml` | Cost layers per part with Show historical data (org qty / cost). The default account is now matched by one rule for display, filter and order |
 | [Inventory/CycleCountList.htm](Inventory/CycleCountList.htm) | `Inventory/CycleCountList.jrxml` + `subSerialList` | The count sheet: Print is Letter portrait with a blank Count column, optional page per location group or location, blind-count mode |
@@ -151,11 +204,10 @@ moved with it, but no longer works: the report runs only inside Fishbowl.
 ### Manufacture Order
 
 Ported 2026-10-13, all filed in the Manufacture Order folder. The two record
-documents (Traveler, Projected Cost) are listed in the MO module's Apps menu;
-opened from there they load the open MO and lock it (no picker, no
-prev / next), as the paperwork reports do. Opened anywhere else they have an
-MO picker with typeahead. The list reports are listed in every Manufacturing
-module.
+documents (Traveler, Projected Cost) have an MO picker with typeahead;
+launched for an MO (the Traveler is listed in the MO module's Apps menu) they
+load that MO and lock it (no picker, no prev / next), as the paperwork reports
+do.
 
 **AvailableToBuild.htm** predates the porting process and moved here from
 `Manufacturing/` on 2026-10-13: an extended rebuild of the original (UOM
@@ -207,7 +259,7 @@ and Order by, on Letter landscape (the Export's page is spreadsheet-width).
 
 ### Product
 
-Ported 2026-10-14. `Product/KitAvailability.htm` (outside this tree) rebuilds
+Ported 2026-10-14. `Custom/Product/KitAvailability.htm` (outside this tree) rebuilds
 a Custom report, not the stock Kit Report. **Product Catalog** and **Product
 Catalog V2** are one port on V2 with every V1 option folded in (the
 same-name rule): V2's catalog, contents and order sheet, plus V1's list layout,
@@ -226,14 +278,17 @@ Report and Pick Report (special characters, SO custom fields) into one Pick
 Ticket, keeping every feature of each. The stock ticket lists only Started
 (and optionally Committed) items, so an Entered pick printed an empty ticket
 (54 of the 73 Entered picks on the live data). **Show items** has three modes:
-- *Still to pick* (default): every item not Finished, with a Status column;
-- *Ready to pick*: exactly the stock Pick Ticket's items (333/333 picks
-  identical locally);
-- *All items*: exactly the stock Pick Report's items (333/333).
+- *All items* (the default, the user's choice 2026-10-14): exactly the stock
+  Pick Report's items (333/333 picks identical locally), so a finished pick
+  still lists its lines;
+- *Still to pick*: every item not Finished, with a Status column;
+- *Ready to pick*: exactly the stock Pick Ticket's items (333/333).
 
 Items not yet allocated (Entered, Short, Hold) show **suggested locations**:
-where the part has available stock in the pick's location group, the default
-location first, up to three, in italics. They are suggestions; Fishbowl
+where the part has available stock in the pick's location group (on hand,
+less what is committed, less what Started items already hold there), the
+default location first, up to three, in italics. With none available the
+Location stays empty. They are suggestions; Fishbowl
 assigns the real location when the pick is started. The SO and SO-item custom
 fields of the Pick Report variant are options. It replaced the Paperwork POC's
 Pick Ticket (archived) in the local Fishbowl `Pick Ticket` record.
@@ -242,6 +297,126 @@ Pick Ticket (archived) in the local Fishbowl `Pick Ticket` record.
 |---|---|---|
 | [Picking/PickEfficiency.htm](Picking/PickEfficiency.htm) | `Picking/PickEfficiency.jrxml` | Whole minutes from start to finish per finished pick, per user with count and average. Fixes: one group per user (the original's restarted at every change of user: 182 blocks for 17 users in a month); a finished pick with no start time no longer stops the report |
 | [Picking/PickTicket.htm](Picking/PickTicket.htm) | `Picking/PickTicket.jrxml`, `PickReport.jrxml`, `PickReportSpecialCharactersWithSOCustomFieldTab.jrxml` + `subPickingOrders` | See above |
+
+### Purchase Order
+
+**POReport.htm** replaced (2026-10-15) the Paperwork POC's
+Purchase Order Report (archived) in the local Fishbowl `Purchase Order Report`
+record #130. **PurchaseOrderSummary.htm** predates the porting process (an
+extended BI report, not a faithful port) and moved into the tree.
+
+| Port | Original | Notes |
+|---|---|---|
+| [PurchaseOrder/POReport.htm](PurchaseOrder/POReport.htm) | `PurchaseOrder/POReport.jrxml` + `Common/subMemo` | One PO as the vendor document. Fixes: vendor-currency figures from the stored `mc*` costs, a home-currency PO uses rate 1, blank address lines left out, a PO without lines still prints |
+| [PurchaseOrder/AutoPO.htm](PurchaseOrder/AutoPO.htm) | `PurchaseOrder/AutoPO.jrxml` (`JRAutoPOHelper`) | Rows from Fishbowl's own Auto PO engine through `getAutoPo()`, as the stock's helper; dates sent as `"YYYY-MM-DD HH:MM:SS"`; the "only default vendor parts" option filtered in the page |
+| [PurchaseOrder/AdvancedPurchasingBySoReport.htm](PurchaseOrder/AdvancedPurchasingBySoReport.htm) | `PurchaseOrder/AdvancedPurchasingBySoReport.jrxml` | What each SO still needs against stock at its location group, and when to order. Fixes: Qty Needed is what is left, converted to the part's UOM; closed lines and credit returns need nothing |
+| [PurchaseOrder/AdvancedPurchasingByWoReport.htm](PurchaseOrder/AdvancedPurchasingByWoReport.htm) | `PurchaseOrder/AdvancedPurchasingByWoReport.jrxml` | The same per work order. Fixes as the SO version (finished WOs / MOs and repair outputs need nothing) |
+| [PurchaseOrder/PurchaseOrderSummary.htm](PurchaseOrder/PurchaseOrderSummary.htm) | `PurchaseOrder/PurchaseOrderSummary.jrxml` (extended) | PO line activity in flat, by-PO, by-vendor, by-part and pivot views |
+
+### Receiving
+
+**receivingsummary.htm** predates the porting process (an
+extended BI report) and moved into the tree.
+
+| Port | Original | Notes |
+|---|---|---|
+| [Receiving/ReceivingList.htm](Receiving/ReceivingList.htm) | `Receiving/ReceivingList.jrxml` | One receipt's list of parts to receive (record document with a receipt picker). Fixes: one line per receipt line (the stock repeated a line per extra vendor part number / default location) |
+| [Receiving/ReceivingHistory.htm](Receiving/ReceivingHistory.htm) | `Receiving/ReceivingHistory.jrxml` | Every receipt line in a date range. Fixes: customer (SO / RMA) lines group by the chosen field as vendor lines do; the end day counts in full |
+| [Receiving/ReconcileReport.htm](Receiving/ReconcileReport.htm) | `Receiving/ReconcileReport.jrxml` | Reconciled PO receipt lines: Original vs Billed vs Landed cost, per PO. Fixes: grand totals equal the lines listed; the end day counts in full |
+| [Receiving/receivingsummary.htm](Receiving/receivingsummary.htm) | `Receiving/ReceivingSummary` (extended) | Receipt lines across PO, SO and TO in flat, by-receipt and pivot views |
+
+### RMA
+
+| Port | Original | Notes |
+|---|---|---|
+| [RMA/RMAReport.htm](RMA/RMAReport.htm) | `RMA/RMAReport.jrxml` | One RMA's return ticket (record document with an RMA picker). Header lookups are LEFT joins, so a missing one leaves its field blank |
+| [RMA/RMASummary.htm](RMA/RMASummary.htm) | `RMA/RMASummary.jrxml` | RMAs issued in a date range by location group, optionally with their items |
+
+### Transfer Order
+
+| Port | Original | Notes |
+|---|---|---|
+| [TransferOrder/TOReport.htm](TransferOrder/TOReport.htm) | `TransferOrder/TOReport.jrxml` | One transfer order's document (record document with a TO picker): from / to location groups, addresses, packing details, items. One `xoitem` carries both legs |
+| [TransferOrder/TransferOrderSummary.htm](TransferOrder/TransferOrderSummary.htm) | `TransferOrder/TransferOrderSummary.jrxml` | Transfer orders in a date range with ordered, shipped and remaining quantities, by order or by part |
+
+Each section's deviations are in [DIFFERENCES.md](DIFFERENCES.md).
+
+### Sales Order and Ship (paperwork)
+
+The business documents, moved here on 2026-10-15 from the Paperwork proof of
+concept (archived). Since 2026-10-16 they use the REPORT chrome like every
+other record document: an **App view** (the record on screen, its lines with
+table tools, Excel) and a **PDF view** that is the printed document (fb-doc
+lays out the proof of concept's own sheets, unchanged: `FBDoc.Report.view`
+with `pages`). The record comes from `FBDoc.Record`, the stock report's options
+(with its saved presets) from `FBDoc.Options`, the formats from `FBDoc.env`.
+They are what report_btn's documents **Print (App)** / **Email (rich)** use as
+each module's default document (`FB_LAUNCH.output` → `FB_DOC`); Fishbowl's own
+Module Options (`module.reportId`) still take Jasper reports only. Opened from
+the module's Apps menu, a document locks to the open record. Tests:
+`tools/doc-tests/` (62, against a live database).
+
+| Port | Original | Notes |
+|---|---|---|
+| [SalesOrder/SOReport.htm](SalesOrder/SOReport.htm) | `SalesOrder/SOReport.jrxml` | The sales order document (#128) |
+| [SalesOrder/SOInvoiceReport.htm](SalesOrder/SOInvoiceReport.htm) | `SalesOrder/SOInvoiceReport.jrxml` | SOReport with the Invoice flag on (#129). Must stay identical to SOReport.htm except five lines: `node tools/doc-tests/variant-check.js` |
+| [Ship/PackingList.htm](Ship/PackingList.htm) | `Ship/PackingList.jrxml` (+ the Colorized / Landscape variants, same family) | Packing Slip for SO / PO / TO shipments, the V2 layouts (#132). Not covered: the By Carton layouts and the colour palettes |
+| [Ship/ShippingInvoice.htm](Ship/ShippingInvoice.htm) | `Ship/ShippingInvoice.jrxml` (+ `ShippingInvoiceSpecialCharacters`) | Invoice or pro-forma by ship status, AU / US / CA (#133) |
+
+### Vendor
+
+Ported 2026-10-15. Each report has its own port: Part Vendor List
+and Vendor Part List are mirror images (part → vendors, vendor → parts) and
+Vendor Address / Vendor Address List differ in layout and filters, so the
+same-name rule doesn't merge them. Launched for a vendor, a report starts on
+that vendor (locked in Vendor Part List, a starting filter elsewhere).
+
+| Port | Original | Notes |
+|---|---|---|
+| [Vendor/PartVendorList.htm](Vendor/PartVendorList.htm) | `Vendor/PartVendorList.jrxml` | Every vendor of a part with vendor part #, last date and cost (`vendorparts.lastDate` / `lastCost`, as the stock). Fix: costs carry the vendor's currency (the stock printed the home symbol: 12 foreign-currency vendor parts live). Optional cost in home currency per part UOM. 536 = 536 rows live |
+| [Vendor/VendorPartList.htm](Vendor/VendorPartList.htm) | `Vendor/VendorPartList.jrxml` | Every part a vendor sells, same rules and fixes as Part Vendor List; "%" lists every vendor where the stock printed "You Must Select A Vendor" |
+| [Vendor/VendorAddress.htm](Vendor/VendorAddress.htm) | `Vendor/VendorAddress.jrxml` | Every vendor address with the stock's Sort by; optional vendor and address-type columns. Same 94 addresses as the stock live |
+| [Vendor/VendorAddressList.htm](Vendor/VendorAddressList.htm) | `Vendor/VendorAddressList.jrxml` + `Customer/subCustAdsList` | Address cards (the label sheet) / table / pivot, as the Customer Address List port. Fixes: no "null" country, no stray ", " for an empty city (11 of 86 cards live). Cards fill across, not down (fb-doc flow blocks) |
+| [Vendor/VendorBackOrderReport.htm](Vendor/VendorBackOrderReport.htm) | `Vendor/VendorBackOrderReport.jrxml` | Incoming PO lines past their scheduled date, by vendor / part / PO. 106 = 106 lines live. Fix: the part filter no longer pulls in misc. lines without a part. Optional "leave out lines received in full" and More columns (days late, value…) |
+| [Vendor/VendorFulfillmentHistory.htm](Vendor/VendorFulfillmentHistory.htm) | `Vendor/VendorFulfillmentHistory.jrxml` | Per vendor and part: average lead time from PO issue, qty received, last cost, PO count. Fix: each receipt counts once (the stock repeated it per vendor-part record: Apex Coconuts FOOD187 396,320 → 99,080); parts without a vendor-part record are no longer dropped |
+| [Vendor/VendorPerformanceReport.htm](Vendor/VendorPerformanceReport.htm) | `Vendor/VendorPerformanceReport.jrxml` | PO receipt lines with scheduled vs received dates and quantities. Fix: "late" is a later calendar day (the stock's 864,000 ms divisor marked 1,071 same-day receipts late). New Scorecard view (on-time % per vendor) |
+
+### Work Order
+
+Ported 2026-10-15. The three single-work-order documents (Traveler, Report,
+Instructions) have a picker, and lock to the work order when launched for one
+(the Traveler is listed in the Work Order module's Apps menu).
+**WOTraveler.htm** replaced the Paperwork POC's Work Order Traveler (archived)
+in the local Fishbowl `Work Order Traveler` record #134, keeping every POC
+feature. `subWOTracking` and `subBOMInstructions` are not used by any stock
+report; their SQL serves as reference.
+
+| Port | Original | Notes |
+|---|---|---|
+| [WorkOrder/WOTraveler.htm](WorkOrder/WOTraveler.htm) | `WorkOrder/WOTraveler.jrxml` | The stock traveler on every page (header, barcode, notes, instructions, Finished / Raw Goods with write-ins, tracking prompts or values). Fixes: fetched by id (the stock matched `wo.num LIKE`); the BOM line no longer comes from an unordered row; no "null" title, no "Start - " for empty descriptions (60,774 of 60,776 steps live) |
+| [WorkOrder/WOReport.htm](WorkOrder/WOReport.htm) | `WorkOrder/WOReport.jrxml` | One work order's document with Available per item; matches the stock render of 17115:001. Fixes: fetched by id; BOM / SO line from the first item that has one (1,181 of 1,195 blank-BOM WOs filled); columns fit the page (the stock ran 108pt off it with Instructions and Tracking on) |
+| [WorkOrder/WOInstructions.htm](WorkOrder/WOInstructions.htm) | `WorkOrder/WOInstructions.jrxml` | The instruction steps to tick off. Fixes: fetched by id; no "Start - " for empty descriptions |
+| [WorkOrder/WorkOrderCost.htm](WorkOrder/WorkOrderCost.htm) | `WorkOrder/WorkOrderCost.jrxml` + `Common/subOrderProjectedCost` | Work orders' costs line by line, by the costing method while open, actual once fulfilled (MO Projected Cost's rules). April 2026 live: 1,905 lines / 230 WOs, $1,102,739.64, 0 differences. Fixes as MO Projected Cost (UOM inverse fallback, "Group - Location") |
+| [WorkOrder/ProductionYieldReport.htm](WorkOrder/ProductionYieldReport.htm) | `WorkOrder/ProductionYieldReport.jrxml` | Fulfilled WOs' yield against the quantity ordered; 231 = 231 rows for April live. Optional Group by part |
+| [WorkOrder/WOSummary.htm](WorkOrder/WOSummary.htm) | `WorkOrder/WOSummary.jrxml` | Work orders by location group or calendar category. Fix: every column fits the page with Location Group on (the stock's table was 666pt on a 552pt page). Optional WO items and More columns |
+| [WorkOrder/OutstandingWorkOrders.htm](WorkOrder/OutstandingWorkOrders.htm) | `WorkOrder/OutstandingWorkOrders.jrxml` | Open WOs due in a range with their SO and customer, days past due in the stock's wording (53 = 53 live). Fix: past due counts calendar days (the stock's year × 365 + day formula drifts across a leap year) |
+| [WorkOrder/WOFlag.htm](WorkOrder/WOFlag.htm) | `WorkOrder/WOFlag.jrxml` + `WOFlagSub` | Open WOs with every item, raw goods short of on hand in red, open POs, and the Total Shortage Summary; identical to the stock live (417 lines, 9 summary parts). Fixes: need = target − used; WOs under a closed MO left out; exact assigned-user match |
+| [WorkOrder/InvAllocatedToWorkOrders.htm](WorkOrder/InvAllocatedToWorkOrders.htm) | `WorkOrder/InvAllocatedToWorkOrders.jrxml` | Raw goods still allocated to open WOs, valued at Average / Standard / FIFO / LIFO; grand totals equal the stock render for May 2026 (330,302.88 / $333,511.76). Fixes: qty is what is still allocated (target − used; the stock prints the full plan, $94.7M with Fulfilled and all dates); a part's mixed UOMs total in its own UOM |
+| [WorkOrder/WIPReport.htm](WorkOrder/WIPReport.htm) | `WorkOrder/WIPReport.jrxml` | Picked parts in manufacturing locations (`location.typeId` 80) for open WOs, with qty and value. Fixes: qty sums all the part's tags and WO Qty all its finished pick items (the stock showed one arbitrary row). The live and local data have no open WO with a finished pick, so it was checked with picks treated as finished: same 4 parts and $653,718.26 as the stock query |
+| [WorkOrder/WOConsumption.htm](WorkOrder/WOConsumption.htm) | `WorkOrder/WOConsumption.jrxml` | Planned vs consumed per component of fulfilled WOs, with the Summary; April 2026 live: 1,688 lines and the summary identical to the stock. Fixes: UOM inverse fallback (FOOD104's kg lines were labelled Sachet); a total across mixed units shows "mixed" instead of adding kg + ea + hr |
+
+## Record documents
+
+The ports that print one record (an order, a pick, a receipt, a work order)
+share one style: the REPORT chrome with an App view and a PDF view, and
+fb-doc's **FBDoc.Record** for the record: a picker in the Filters panel
+(typeahead, status chips, previous / next, Refresh), the start order (a launch
+from a module, then the record report setting adopted once per user, then the
+user's last, then the newest), the launch lock, and the document-output guard
+report_btn relies on. Each has a Page_setup report setting and, where Fishbowl
+has a picker for the record type, a record setting (no RMA picker exists). See
+[DIFFERENCES.md](DIFFERENCES.md) › Record documents, and
+[docs/fb-doc.md](../docs/fb-doc.md).
 
 ## Table tools, large results and views
 
@@ -322,6 +497,21 @@ Each report was assessed for alternative views and a pivot:
 | Product Price List | Whole categories | Price by category | Recommended: nested category tree |
 | Pick Efficiency | Whole users | Minutes by user × week | Recommended: items per pick |
 | Pick Ticket | None (one pick) | None (one document) | **Show items** modes; recommended: a wave sheet across picks |
+| Part Vendor List / Vendor Part List | 10,000 rows, whole parts / vendors | Part × Vendor, lowest home cost per part UOM | Recommended: "Last PO" columns, stale-cost and single-source filters |
+| Vendor Address | 10,000 addresses | Address count by any two of vendor, type, state, country… | — |
+| Vendor Address List | 10,000 addresses | Count by letter, vendor, state… | **Cards / Table** |
+| Vendor Backorder Report | Whole groups | Backordered value by vendor × weeks overdue | — |
+| Vendor Fulfillment History | Whole vendors | Lead time by vendor × quarter | — |
+| Vendor Performance Report | Whole vendors | On-time % by vendor × month | **Scorecard**; recommended: monthly on-time trend chart |
+| WO Traveler / WO Report / WO Instructions | None (one WO) | None (one document) | — |
+| Work Order Cost | 10,000 lines, whole WOs | Cost by finished part × month | Recommended: one row per WO (Excel has it) |
+| Production Yield | Whole parts | Yield % by part × month | **Group by part** |
+| Work Order Summary | Whole WOs | WO count by week scheduled × status | Recommended: calendar / Gantt, per-user workload |
+| Outstanding Work Orders | Whole WOs | WOs by due band × location group | Recommended: kanban by due week |
+| Work Order Flag | Whole WOs (summary uncapped) | Qty needed by item type + part × week | **Only work orders with a shortage** |
+| Inventory Allocated To Work Orders | 10,000 lines, whole groups | Total cost by part × WO status | Recommended: allocated vs available per part |
+| Work In Progress | 10,000 rows, whole parts | WIP value by part × location | **Show locations**; recommended: a by-work-order view |
+| Work Order Consumption | 10,000 lines + 10,000 summary rows, whole groups | Difference by part × month | Summary (Include / Only) |
 
 ## Why Adjustment and Consumption stay separate
 
@@ -358,7 +548,19 @@ every query ran against the live Fishbowl database
 through the iReport MCP SQL validator, and each page was rendered in Chrome
 with fb-lib and fb-styles expanded and `runQuery` answered from real rows.
 Totals were checked by hand, and Excel export and Print were exercised.
-**Not yet run inside the Fishbowl client.**
+The Purchase Order, Receiving, RMA, Transfer Order, Vendor and Work Order
+ports were desk-tested the same way on 2026-10-14 / 15.
+
+2026-10-16: every record document moved to fb-doc's shared FBDoc.Record
+(picker, launch lock, document output guard) and the four paperwork documents
+to the REPORT chrome with App and PDF views. Each was compared before and
+after on the same data (`tools/report-harness/ab.js`; the paperwork against a
+live database, `tools/doc-tests/`): same queries, same printed sheets, the
+launch lock and output states as expected. The list ports were laid out again
+on the new fb-doc: no change (28 ports compared).
+
+**Not yet run inside the Fishbowl client**, except the Sales Order Report's
+launch (report_btn 0.1.0) and the WO Traveler / Advanced Auto PO workspaces.
 
 Gaps in the test data, for the Customer ports:
 

@@ -13,7 +13,7 @@ queries the Fishbowl database directly and has these features:
 - named saved views.
 
 The same eight tiles are available together in one grid as
-[Dashboard - Company](Dashboard%20Combined%20-%20Import%20Instructions.md).
+[Company Dashboard v1.2](Dashboard%20Combined%20-%20Import%20Instructions.md).
 
 Source files: `Dashboards/Individual Pages/*.htm`.
 

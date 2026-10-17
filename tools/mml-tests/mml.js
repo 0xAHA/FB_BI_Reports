@@ -1,4 +1,4 @@
-// Drives Custom/Malmet/MML_Build_Planner.htm in jsdom against the REAL
+// Drives Custom/Client Reports/Malmet/MML_Build_Planner.htm in jsdom against the REAL
 // reference sheet, with Fishbowl's host globals stubbed.
 //
 //   node mml.js [report.htm] [sheet.csv]
@@ -11,8 +11,8 @@ const path = require('path');
 const { JSDOM } = require('jsdom');
 
 const ROOT = path.resolve(__dirname, '..', '..');
-const REPORT = process.argv[2] || path.join(ROOT, 'Custom/Malmet/MML_Build_Planner.htm');
-const SHEET = process.argv[3] || path.join(ROOT, 'Custom/Malmet/MML - BWFW 105 Litre (AE2510NT).csv');
+const REPORT = process.argv[2] || path.join(ROOT, 'Custom/Client Reports/Malmet/MML_Build_Planner.htm');
+const SHEET = process.argv[3] || path.join(ROOT, 'Custom/Client Reports/Malmet/MML - BWFW 105 Litre (AE2510NT).csv');
 
 let pass = 0, fail = 0;
 function ok(name, cond, extra) {

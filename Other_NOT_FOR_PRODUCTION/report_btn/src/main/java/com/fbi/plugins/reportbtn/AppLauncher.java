@@ -94,7 +94,7 @@ final class AppLauncher {
         }
     }
 
-    /** window.FB_LAUNCH, spec in LAUNCH_CONTEXT.md. */
+    /** window.FB_LAUNCH, spec in docs/launch-context.md. */
     static String payload(ModuleCodes.Entry record, String moduleName, int id, String num, int reportId) {
         StringBuilder json = new StringBuilder("{\"v\":1,\"host\":\"report_btn\"");
         json.append(",\"module\":").append(jsonString(record.code));

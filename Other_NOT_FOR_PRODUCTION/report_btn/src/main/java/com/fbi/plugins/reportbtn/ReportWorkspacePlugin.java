@@ -56,6 +56,8 @@ public class ReportWorkspacePlugin extends FishbowlPlugin {
     static final String BUILD_RIGHT = "Build Reports";
     /** The page editor, if it is in the jar. -Dreportbtn.editor=off turns it off. */
     private static final String EDITOR_CLASS = "com.fbi.plugins.reportbtn.editor.EditorFeature";
+    /** The documents and email PoC, if it is in the jar. -Dreportbtn.docs=off turns it off. */
+    private static final String DOCS_CLASS = "com.fbi.plugins.reportbtn.docs.DocsFeature";
 
     // The newest instance: a re-login builds a new one.
     private static volatile ReportWorkspacePlugin current;
@@ -100,12 +102,21 @@ public class ReportWorkspacePlugin extends FishbowlPlugin {
             "Open this app in its own window, which dialogs in the main window don't block", this::windowSelected);
         bar.add(btnMainTab);
         bar.add(btnWindow);
-        extension = loadExtension();
+        extension = loadExtension(EDITOR_CLASS, "reportbtn.editor", "the editor");
         if (extension != null) {
             try {
                 extension.install(new Host(), bar);
             } catch (RuntimeException | LinkageError e) {
                 ReportAppsPlugin.log("Apps (beta): the editor failed to start", e);
+            }
+        }
+        // The documents and email proof of concept (docs package), when it is in the jar.
+        WorkspaceExtension docs = loadExtension(DOCS_CLASS, "reportbtn.docs", "the documents PoC");
+        if (docs != null) {
+            try {
+                docs.install(new Host(), bar);
+            } catch (RuntimeException | LinkageError e) {
+                ReportAppsPlugin.log("Apps (beta): the documents PoC failed to start", e);
             }
         }
         setMainToolBar(bar);   // the client shows these in its toolbar while this module is active
@@ -140,17 +151,20 @@ public class ReportWorkspacePlugin extends FishbowlPlugin {
         return current;
     }
 
-    /** The optional feature, if its class is in the jar; failures to load leave the workspace as it was. */
-    private static WorkspaceExtension loadExtension() {
-        if ("off".equalsIgnoreCase(System.getProperty("reportbtn.editor", ""))) {
+    /**
+     * An optional feature, if its class is in the jar and -D&lt;property&gt;=off isn't set;
+     * failures to load leave the workspace as it was.
+     */
+    private static WorkspaceExtension loadExtension(String className, String property, String what) {
+        if ("off".equalsIgnoreCase(System.getProperty(property, ""))) {
             return null;
         }
         try {
-            return (WorkspaceExtension) Class.forName(EDITOR_CLASS).getDeclaredConstructor().newInstance();
+            return (WorkspaceExtension) Class.forName(className).getDeclaredConstructor().newInstance();
         } catch (ClassNotFoundException e) {
-            return null;   // built without the editor
+            return null;   // built without it
         } catch (ReflectiveOperationException | RuntimeException | LinkageError e) {
-            ReportAppsPlugin.log("Apps (beta): the editor could not be loaded", e);
+            ReportAppsPlugin.log("Apps (beta): " + what + " could not be loaded", e);
             return null;
         }
     }
@@ -291,7 +305,7 @@ public class ReportWorkspacePlugin extends FishbowlPlugin {
                 }
                 case BUILD:
                     if (extension == null) {
-                        error("The Report Builder's publishing isn't part of this build of the Apps (beta) module.");
+                        error("The App Builder's publishing isn't part of this build of the Apps (beta) module.");
                     } else {
                         extension.build(link.name, link.arg);
                     }
@@ -683,6 +697,16 @@ public class ReportWorkspacePlugin extends FishbowlPlugin {
         @Override
         public Set<QueryParameter> savedParams(BiReportFpo report) {
             return ReportLoader.savedParams(report);
+        }
+
+        @Override
+        public Page loadPage(int reportId, String label) throws Exception {
+            try {
+                ReportLoader.Loaded l = ReportLoader.load(reportId, label, ReportWorkspacePlugin.this);
+                return new Page(l.report.getId(), l.report.getName(), l.html, l.params);
+            } catch (ReportLoader.LoadException e) {
+                throw new Exception(e.getMessage(), e);
+            }
         }
 
         @Override

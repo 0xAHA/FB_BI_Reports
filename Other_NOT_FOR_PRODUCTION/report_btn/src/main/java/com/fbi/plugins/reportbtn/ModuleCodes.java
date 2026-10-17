@@ -18,7 +18,7 @@ import java.util.Map;
  * report-setting codes (QueryParamTypeConst) where one exists; RMA and the setup
  * modules have none, so they use the module's own enum name. Any other module
  * gets a code derived from its name and no table.
- * Keep in step with LAUNCH_CONTEXT.md and FBDoc.launch.MODULES.
+ * Keep in step with docs/launch-context.md and FBDoc.launch.MODULES.
  */
 final class ModuleCodes {
 

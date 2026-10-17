@@ -119,7 +119,7 @@ public final class EditorFeature implements WorkspaceExtension {
         if ("publish".equals(verb)) {
             BuilderPublisher.publish(this, arg);
         } else {
-            host.showError("The Report Builder asked for something this version doesn't do (" + verb + ").");
+            host.showError("The App Builder asked for something this version doesn't do (" + verb + ").");
         }
     }
 

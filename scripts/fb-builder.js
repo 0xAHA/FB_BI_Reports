@@ -17,7 +17,7 @@
 (function (global) {
     'use strict';
 
-    const BUILD = '2026.10.14-530c2c7';   // @fb-build
+    const BUILD = '2026.10.15-f3725b4';   // @fb-build
     const R = () => global.FBReport;
     const L = () => global.FBLib || {};
     const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -712,7 +712,7 @@
         function publish() {
             const ws = global.FB_WORKSPACE;
             if (typeof openModule !== 'function' || !ws || !ws.module || !ws.publish) {
-                say('Publishing works when the Report Builder is open in Apps (beta), with its latest plugin. Copy definition works meanwhile.');
+                say('Publishing works when the App Builder is open in Apps (beta), with its latest plugin. Copy definition works meanwhile.');
                 return;
             }
             const plan = compileNow();

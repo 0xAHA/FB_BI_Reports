@@ -1,12 +1,12 @@
 # Custom_Supplement_WO test harness
 
-Runs `Custom/Infinit_Nutrition/Custom_Supplement_WO.htm` in jsdom with the Fishbowl
+Runs `Custom/Client Reports/Infinit_Nutrition/Custom_Supplement_WO.htm` in jsdom with the Fishbowl
 host globals (`runQuery`, `runQueryAsync`, `runRestApiAsync`, `getUser`, …) and the
 `fb-lib` / `fb-mfg` namespaces stubbed, so the report's real logic can be exercised
 without a Fishbowl client.
 
     npm install                     # jsdom + moment (+ xlsx, to read the customer workbook)
-    node <suite>.js ../../Custom/Infinit_Nutrition/Custom_Supplement_WO.htm [mode]
+    node <suite>.js "../../Custom/Client Reports/Infinit_Nutrition/Custom_Supplement_WO.htm" [mode]
 
 Each suite strips the `{% Script %}` / `{% Style %}` directives and the CDN tags,
 stubs the host globals, then `win.eval`s the report's last inline script block.
@@ -24,13 +24,13 @@ stubs the host globals, then `win.eval`s the report's last inline script block.
 
 Run them all:
 
-    R=../../Custom/Infinit_Nutrition/Custom_Supplement_WO.htm
-    node stage0.js $R;            node stage2.js $R found;   node stage2.js $R none
-    node note_contract.js $R
-    node setup_editor.js $R edit;      node setup_editor.js $R readonly
-    node stage_moper_so.js $R happy;   node stage_moper_so.js $R suffix
-    node stage_moper_so.js $R covered; node stage_moper_so.js $R partial
-    node realbom.js $R default;   node realbom.js $R truestage;  node realbom.js $R rawbit
+    R="../../Custom/Client Reports/Infinit_Nutrition/Custom_Supplement_WO.htm"
+    node stage0.js "$R";            node stage2.js "$R" found;   node stage2.js "$R" none
+    node note_contract.js "$R"
+    node setup_editor.js "$R" edit;      node setup_editor.js "$R" readonly
+    node stage_moper_so.js "$R" happy;   node stage_moper_so.js "$R" suffix
+    node stage_moper_so.js "$R" covered; node stage_moper_so.js "$R" partial
+    node realbom.js "$R" default;   node realbom.js "$R" truestage;  node realbom.js "$R" rawbit
 
 `e2e.js` / `e2e_live.js` were removed: they asserted the per-LINE drawer API
 (`CSBuild.open(<soitem key>)`, a single component table) that the per-SO rewrite

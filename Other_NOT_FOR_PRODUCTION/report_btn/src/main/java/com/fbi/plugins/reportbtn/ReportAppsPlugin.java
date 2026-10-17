@@ -12,7 +12,7 @@ import javax.swing.SwingUtilities;
  * listing the BI reports that declare that module (an fb-launch meta tag in the
  * report page). Choosing one opens it in its own window with the module's
  * current record passed in as window.FB_LAUNCH.
- * Spec: Other_NOT_FOR_PRODUCTION/Paperwork_POC/LAUNCH_CONTEXT.md.
+ * Spec: docs/launch-context.md.
  *
  * This class is only the bootstrap. The client instantiates every FishbowlPlugin
  * at login (Client.loadModules), so the constructor hooks the Reports menu; the

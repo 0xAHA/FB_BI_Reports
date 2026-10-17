@@ -179,12 +179,10 @@ final class ScriptService {
         rq.add(KeyConst.ID, scriptId);
         EVEvent rs = send(rq, "load the history");
         List<AuditRecord> list = rawList(rs, KeyConst.AUDIT_LIST, AuditRecord.class);
-        list.sort((a, b) -> {
-            if (a.getTimestamp() == null || b.getTimestamp() == null) {
-                return 0;
-            }
-            return a.getTimestamp().compareTo(b.getTimestamp());
-        });
+        // Versions without a timestamp sort first. (Treating them as equal to everything broke
+        // the sort's contract and threw on long histories, e.g. Fishbowl's built-in apps.)
+        list.sort(java.util.Comparator.comparing(AuditRecord::getTimestamp,
+            java.util.Comparator.nullsFirst(java.util.Comparator.naturalOrder())));
         return list;
     }
 

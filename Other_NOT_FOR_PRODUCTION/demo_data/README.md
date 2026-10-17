@@ -45,7 +45,7 @@ inventory `Location` column is written **`LocationGroup-Location`**
 Column sets taken verbatim from the repo's own tools:
 - **PPVP** ← `Import_Builder.htm` schema registry (exact keys, incl. `PartTypeID`
   10=Inventory / 21=Labor, `PartTaxCode`, product `Price`, vendor `Cost`/`DefaultVendor`).
-- **Add Inventory** ← `Inventory_Adjustment_Helper.htm` (`ImportAddInventory`).
+- **Add Inventory** ← `Custom/Inventory/Inventory_Adjustment_Helper.htm` (`ImportAddInventory`).
 - **Sales Order** ← `QuickOrder_v1.2.htm` — the two‑header layout (an `SO` column
   header row, then an `Item` column header row, then `SO`/`Item` data rows).
 

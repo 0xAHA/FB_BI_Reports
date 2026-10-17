@@ -34,6 +34,6 @@ public interface WorkspaceExtension {
      * Builder page (e.g. publish). arg is letters, digits, - and _ only, or null.
      */
     default void build(String verb, String arg) {
-        throw new UnsupportedOperationException("The Report Builder's publishing isn't part of this build.");
+        throw new UnsupportedOperationException("The App Builder's publishing isn't part of this build.");
     }
 }

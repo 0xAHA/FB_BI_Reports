@@ -15,7 +15,7 @@
  * FORMAT CONFIDENCE (see README):
  *   CONFIRMED (matched against repo tools + demodb):
  *     - PPVP  (Import_Builder.htm SCHEMAS registry)
- *     - ImportAddInventory (Inventory_Adjustment_Helper.htm)
+ *     - ImportAddInventory (Custom/Inventory/Inventory_Adjustment_Helper.htm)
  *     - ImportSalesOrder   (QuickOrder_v1.2.htm — two-header layout)
  *   BEST-EFFORT (verify the header in your client's Import wizard first):
  *     - BOM import

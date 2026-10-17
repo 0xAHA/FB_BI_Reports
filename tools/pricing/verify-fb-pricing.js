@@ -3,7 +3,7 @@
 //  tools/pricing/verify-fb-pricing.js — hold scripts/fb-pricing.js to its spec
 // ============================================================================
 //
-// scripts/fb-pricing.js is a JavaScript port of Custom/Babor/GetPrices.sql.
+// scripts/fb-pricing.js is a JavaScript port of Custom/Client Reports/Babor/GetPrices.sql.
 // This runs BOTH against a Fishbowl database and compares every price the SQL
 // schedules: for each customer, every product, every quantity x date band —
 // unit price, list price, both winning rule ids and the requires-native flag.
@@ -23,7 +23,7 @@ const path = require('path');
 const vm = require('vm');
 
 const ROOT = path.resolve(__dirname, '..', '..');
-const SPEC = path.join(ROOT, 'Custom', 'Babor', 'GetPrices.sql');
+const SPEC = path.join(ROOT, 'Custom', 'Client Reports', 'Babor', 'GetPrices.sql');
 const PORT = path.join(ROOT, 'scripts', 'fb-pricing.js');
 
 const args = process.argv.slice(2);

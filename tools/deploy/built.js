@@ -7,7 +7,8 @@
 //   <!-- @inline-script fb-doc.js -->
 // that the build.js beside it replaces, writing dist/<page>. Only the built
 // page runs, so that is what fbdeploy.js deploys and publish.js publishes.
-// Other_NOT_FOR_PRODUCTION/Paperwork_POC is the one such folder today.
+// No folder does this at present (the Paperwork POC, the only one, was
+// archived on 2026-10-15); the mechanism stays for future built pages.
 //
 // A build.js takes part by answering --plan (its text must mention it):
 //   node build.js --plan       prints JSON [{ src, out, page, inputs }]

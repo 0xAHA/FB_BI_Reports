@@ -284,7 +284,8 @@
       id: id > 0 ? id : 0,
       num: raw.num == null ? '' : String(raw.num).trim(),
       reportId: parseInt(raw.reportId, 10) > 0 ? parseInt(raw.reportId, 10) : 0,
-      params: params
+      params: params,
+      output: raw.output === 'pdf' ? 'pdf' : ''
     };
   }
   FBDoc.launch = {
@@ -301,6 +302,19 @@
       return l && Object.prototype.hasOwnProperty.call(l.params, name) ? l.params[name] : fallback;
     }
   };
+
+  // Document output (LAUNCH_CONTEXT.md §6). FB_LAUNCH.output 'pdf' asks for the
+  // record's pages only: a host (report_btn's documents PoC) renders the page in a
+  // hidden browser and prints it to a PDF once window.FB_DOC.state is 'ready'.
+  function outputRequested() { var l = global.FB_LAUNCH; return !!(l && typeof l === 'object' && l.output === 'pdf'); }
+  function outputSet(o) { if (outputRequested()) global.FB_DOC = o; }
+  FBDoc.output = {
+    requested: outputRequested,
+    loading: function () { outputSet({ state: 'loading' }); },
+    ready: function (info) { outputSet(Object.assign({ state: 'ready' }, info || {})); },
+    fail: function (msg) { outputSet({ state: 'error', message: String(msg || 'The document could not be made.') }); }
+  };
+  FBDoc.output.loading();
 
   // ===================================================================
   //  Page model
@@ -1633,6 +1647,7 @@
     '.fbd-pick button,.fbd-select{padding:6px 9px;border:1px solid var(--border-strong,#c9d1d6);border-radius:7px;background:#fff;cursor:pointer;font:inherit;font-size:12px}',
     '.fbd-check{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;color:var(--c-secondary,#415157);cursor:pointer}',
     'body.fbd-launched .fbd-browse{display:none!important}',
+    'body.fbd-output>header,body.fbd-output .fb-drawer{display:none!important}',
     '#docCanvas{flex:1 1 auto;min-height:0}',
     '#docEmpty{padding:60px 20px;text-align:center;color:#8a989f;font-size:14px}',
     '.opt-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px 22px}',
@@ -1651,7 +1666,7 @@
     'REPORT_DATE_FORMAT', 'Barcodes have DI', 'Currency Use Code'];
 
   function app(cfg) {
-    var A = { cfg: cfg, env: null, flags: {}, model: null, id: 0, launched: false };
+    var A = { cfg: cfg, env: null, flags: {}, model: null, id: 0, launched: false, output: false };
     var rec = cfg.record || {};
     var codes = [].concat(rec.code || []).map(function (c) { return String(c).toUpperCase(); });
     var noun = rec.noun || 'record';
@@ -1666,7 +1681,9 @@
     function resolve(k, d) { try { var v = L.Settings.resolve(k); return v == null ? d : v; } catch (_) { return d; } }
     function setUser(k, v) { try { L.Settings.setUserKey(k, v); L.Settings.saveUser(); } catch (_) {} }
     try {
-      L.Settings.init({ masterStorage: 'userProperties', userKey: storeKey + '.user.v1', masterKey: storeKey + '.master.v1',
+      // company.editors: the report's Edit Settings users may set the company options and paper, like admin.
+      L.Settings.init({ masterStorage: 'userProperties', company: { keys: [], editors: true },
+        userKey: storeKey + '.user.v1', masterKey: storeKey + '.master.v1',
         defaults: { v: 1, lastId: 0, seenSetting: '', showDebug: false, pickFilters: null, paper: '' } });
     } catch (e) { console.warn('FBLib.Settings.init failed:', e); }
 
@@ -1725,7 +1742,41 @@
     function pageLabel(spec) {
       return (spec.name || (Math.round(spec.wMm) + '×' + Math.round(spec.hMm) + ' mm')) + (spec.orientation === 'landscape' ? ' landscape' : '');
     }
-    function pageSpec() { return pageOverride ? resolvePage(pageOverride, { fallback: 'A4', margin: 'document' }) : settingPage(); }
+    // Paper, first match wins: the user's own choice, the company's paper for this document
+    // (master 'docPaper', { size, orientation }), then the report's Page_setup setting.
+    // Document output never uses the user's choice.
+    function companyPaper() {
+      try {
+        var p = L.Settings.getMaster().docPaper;
+        var s = p && p.size ? p.size + (p.orientation === 'landscape' ? ' landscape' : '') : '';
+        return APP_PAPERS.indexOf(s) >= 0 ? s : '';
+      } catch (_) { return ''; }
+    }
+    // The size for all reports (the admin's, SharedData 'cdx.bi.paper.v1', else by edition:
+    // Letter for US and Canada, A4 elsewhere), in the Page_setup setting's orientation.
+    function allReportsSize() {
+      try { var o = L.SharedData.readJson('cdx.bi.paper.v1', null); if (o && /^(A3|A4|A5|Letter|Legal|Tabloid|Executive)$/.test(o.size)) return o.size; } catch (_) {}
+      var ed = A.env && A.env.edition;
+      return ed ? (ed === 'US' || ed === 'CA' ? 'Letter' : 'A4') : '';
+    }
+    // A Page_setup changed from the page's own default (data-default, else A4) was set on
+    // purpose for this report, so it wins over the all-reports size.
+    function settingChosen() {
+      var el = document.getElementById('set-print');
+      var raw = String(param.fromEl('set-print', '') || '').trim().toLowerCase();
+      var dflt = String((el && el.getAttribute('data-default')) || 'A4').trim().toLowerCase();
+      return !!raw && raw !== dflt;
+    }
+    function standardPage() {
+      var sp = settingPage();
+      if (settingChosen()) return sp;
+      var size = allReportsSize();
+      return size ? resolvePage(size + (sp.orientation === 'landscape' ? ' landscape' : ''), { fallback: 'A4', margin: 'document' }) : sp;
+    }
+    function pageSpec() {
+      var p = (A.output ? '' : pageOverride) || companyPaper();
+      return p ? resolvePage(p, { fallback: 'A4', margin: 'document' }) : standardPage();
+    }
 
     // ---- load / render ----
     A.fetch = function (id) { return cfg.fetch(id, A); };
@@ -1747,6 +1798,7 @@
         if (tok !== loadTok) return;
         A.debug('load ' + id + ': ' + errText(e) + (e && e.stack ? ' | ' + e.stack : ''), 'error');
         status('Error — ' + errText(e));
+        if (A.output) FBDoc.output.fail(errText(e));
       }
     };
     async function render(m, tok) {
@@ -1755,6 +1807,10 @@
       A.lastDoc = doc;
       var res = await paginate({ mount: $('docCanvas'), page: spec, docs: [doc] });
       if (tok != null && tok !== loadTok) return res;
+      if (A.output) {
+        FBDoc.output.ready({ pages: res.sheets, title: ($('docTitle') || {}).textContent || document.title,
+          paper: { name: spec.name, orientation: spec.orientation, wMm: spec.wMm, hMm: spec.hMm } });
+      }
       status(res.sheets + ' page' + (res.sheets === 1 ? '' : 's') + ' · ' + pageLabel(spec) + ' · ' + res.ms + ' ms' +
         (res.warnings.length ? ' · ' + res.warnings.length + ' warning(s), see debug' : '') +
         (A.launched ? ' · from ' + launchedFrom + ' module' : ''));
@@ -1852,9 +1908,12 @@
         '<button type="button" class="fb-drawer-close" id="setClose" aria-label="Close">&times;</button></div>' +
         '<div class="fb-drawer-body">' +
         '<div class="fbd-docset">' + flagsHtml +
-        '<label class="fbd-check" title="Paper size, remembered for you. ‘Report setting’ = the Page_setup setting on this BI report.">Paper ' +
+        '<label class="fbd-check" title="Paper size, remembered for you. The first choice is the company paper for this document, else the Page_setup setting on this BI report.">Paper ' +
         '<select id="pageSel" class="fbd-select"><option value="" id="pageSettingOpt">Report setting</option>' +
-        APP_PAPERS.map(function (p) { return '<option>' + p + '</option>'; }).join('') + '</select></label></div>' +
+        APP_PAPERS.map(function (p) { return '<option>' + p + '</option>'; }).join('') + '</select></label>' +
+        '<button type="button" class="ds-btn ds-btn-admin" id="paperPublish" style="display:none" title="Make the paper on show the one everyone gets for this document, including when a module prints or emails it">Use this paper for everyone</button>' +
+        '<button type="button" class="ds-btn" id="paperUnpublish" style="display:none">Stop using company paper</button>' +
+        '<button type="button" class="ds-btn ds-btn-admin" id="paperAll" style="display:none" title="Make the size on show the paper size of every report that has no paper of its own; each keeps its orientation"></button></div>' +
         '<p style="font-size:12px;color:#415157;margin:0 0 12px">Starting point: ' + esc(cfg.optionsIntro || 'the stock report') +
         '’s saved options (<span class="opt-src j">J</span>), else the jrxml default (<span class="opt-src">D</span>). ' +
         '<span class="opt-src c">C</span> = saved for everyone by an admin, <span class="opt-src s">S</span> = changed in this session only.</p>' +
@@ -1882,7 +1941,10 @@
         $('optPublish').addEventListener('click', publishOptions);
         $('setShowDebug').checked = !!resolve('showDebug', false);
         $('setShowDebug').addEventListener('change', function (e) { setUser('showDebug', e.target.checked); applyDebug(e.target.checked); });
-        applyDebug(!!resolve('showDebug', false));
+        var asked = FBDoc.launch.get();
+        A.output = !!(asked && asked.output === 'pdf');
+        if (A.output) document.body.classList.add('fbd-output');
+        else applyDebug(!!resolve('showDebug', false));
         try { $('optPublish').style.display = L.Settings.isAdmin() ? '' : 'none'; } catch (_) {}
 
         // Flags (report CHECK settings, switchable in the drawer).
@@ -1904,12 +1966,49 @@
         A.debug('Edition ' + A.env.edition + ', multi-currency ' + A.env.multiCurrency + ', ' + Object.keys(presetVals).length + ' stock presets', 'info');
 
         var sp = settingPage(), spRaw = ($('set-print') || {}).textContent || '';
-        $('pageSettingOpt').textContent = 'Report setting (' + pageLabel(sp) + ')';
         A.debug('Page_setup setting raw: ' + JSON.stringify(spRaw.trim()) + ' -> ' + pageLabel(sp) + (sp.warnings.length ? ' (' + sp.warnings.join('; ') + ')' : ''), 'info');
+        var mayPublish = false;
+        try { mayPublish = !!L.Settings.isAdmin() && typeof L.Settings.publishCompany === 'function'; } catch (_) {}
+        var mayAll = false;
+        try { mayAll = !!L.SharedData.isAdmin(); } catch (_) {}
+        function syncPaper() {
+          var co = companyPaper();
+          $('pageSettingOpt').textContent = co ? 'Company paper (' + co + ')' : 'Standard paper (' + pageLabel(standardPage()) + ')';
+          $('paperPublish').style.display = mayPublish && !(co && !pageOverride) ? '' : 'none';
+          $('paperUnpublish').style.display = mayPublish && co ? '' : 'none';
+          var size = pageSpec().name || '';
+          $('paperAll').textContent = 'Use ' + size + ' for all reports';
+          $('paperAll').style.display = mayAll && size && size !== allReportsSize() ? '' : 'none';
+        }
+        $('paperAll').addEventListener('click', function () {
+          var size = pageSpec().name || '';
+          if (!size || !confirm('Use ' + size + ' for every report that has no paper of its own? Each report keeps its own orientation.')) return;
+          var ok = false;
+          try { ok = !!L.SharedData.writeJson('cdx.bi.paper.v1', { size: size }, { adminOnly: true }); } catch (_) { ok = false; }
+          if (!ok) { status('The paper for all reports wasn\'t saved.'); return; }
+          syncPaper(); A.rerender();
+          A.debug('Paper for all reports: ' + size, 'success');
+        });
         pageOverride = String(resolve('paper', '') || '');
         if (pageOverride && APP_PAPERS.indexOf(pageOverride) < 0) pageOverride = '';
         $('pageSel').value = pageOverride;
-        $('pageSel').addEventListener('change', function (e) { pageOverride = e.target.value; setUser('paper', pageOverride); A.rerender(); });
+        syncPaper();
+        $('pageSel').addEventListener('change', function (e) { pageOverride = e.target.value; setUser('paper', pageOverride); syncPaper(); A.rerender(); });
+        $('paperPublish').addEventListener('click', function () {
+          var spec = pageSpec();
+          var paper = { size: spec.name || 'A4', orientation: spec.orientation === 'landscape' ? 'landscape' : 'portrait' };
+          if (!confirm('Use ' + paper.size + ' ' + paper.orientation + ' for this document for everyone, including when a module prints or emails it?')) return;
+          if (L.Settings.publishCompany('docPaper', paper) === false) { status('The company paper wasn\'t saved.'); return; }
+          pageOverride = ''; setUser('paper', ''); $('pageSel').value = '';
+          syncPaper(); A.rerender();
+          A.debug('Company paper set: ' + paper.size + ' ' + paper.orientation, 'success');
+        });
+        $('paperUnpublish').addEventListener('click', function () {
+          if (!confirm('Stop using a company paper for this document? Everyone goes back to the report setting, or their own choice.')) return;
+          if (L.Settings.clearCompany('docPaper') === false) { status('The company paper wasn\'t cleared.'); return; }
+          syncPaper(); A.rerender();
+          A.debug('Company paper cleared', 'success');
+        });
         $('printBtn').addEventListener('click', function () {
           if (!printWindow({ title: $('docTitle').textContent })) status('Print window was blocked — use the BI Report toolbar Print / Save instead');
         });
@@ -1950,12 +2049,14 @@
             else if (rec.table) { var r = await q('SELECT MAX(id) AS id FROM ' + rec.table); startId = r.length ? parseInt(r[0].id, 10) : 0; }
           }
         }
-        if (startId) await A.load(startId);
+        if (A.output && !A.launched) FBDoc.output.fail('This document takes ' + codes.join('/') + ' records; it was asked for ' + ((launched && launched.module) || 'none') + '.');
+        else if (startId) await A.load(startId);
         else status('Pick ' + (/^[aeiou]/i.test(noun) ? 'an ' : 'a ') + noun);
       } catch (e) {
         console.error('[FBDoc.app]', e);
         status('Init failed — ' + errText(e));
         A.debug('Init failed: ' + errText(e) + (e && e.stack ? ' | ' + e.stack : ''), 'error');
+        if (A.output) FBDoc.output.fail('Init failed: ' + errText(e));
       }
     }
     function masterDoc() { try { var m = L.Settings.getMaster(); return (m && m.doc) || {}; } catch (_) { return {}; } }

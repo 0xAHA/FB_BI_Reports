@@ -75,6 +75,29 @@ public interface WorkspaceHost {
     /** The report's saved setting values, as the BI Reports module passes them to loadHTML. */
     Set<QueryParameter> savedParams(BiReportFpo report);
 
+    /** An app's page as the BI Reports module loads it: ready for BiBrowserPanel.loadHTML. */
+    final class Page {
+        public final int id;
+        public final String name;
+        public final String html;
+        public final Set<QueryParameter> params;
+
+        public Page(int id, String name, String html, Set<QueryParameter> params) {
+            this.id = id;
+            this.name = name;
+            this.html = html;
+            this.params = params;
+        }
+    }
+
+    /**
+     * Loads an app's page (BI_REPORT_LOAD, then the server's include expansion, then its
+     * saved settings). Throws with a message ready to show. label names it in messages.
+     */
+    default Page loadPage(int reportId, String label) throws Exception {
+        throw new UnsupportedOperationException("Loading pages isn't part of this host.");
+    }
+
     /** Runs a SELECT through the workspace module; never null. Any thread. */
     java.util.List<?> query(String sql);
 

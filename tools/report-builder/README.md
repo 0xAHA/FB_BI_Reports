@@ -38,7 +38,7 @@ refuses anything else.
     `Dashboards/Sales_Dashboard_v1.2.htm`. That dashboard's own `REV_EXPR` and
     `BASE_JOIN` are read from the page, so a change there is caught.
   - P2: order-line values match `SalesOrderSummary`.
-  - P3: invoiced matches `Custom/Malmet/SOA_Report.htm`'s two legs.
+  - P3: invoiced matches `Custom/Client Reports/Malmet/SOA_Report.htm`'s two legs.
   - P4: every total equals the sum beneath it. Distinct counts count once. A
     customer-group grouping keeps the true grand total.
 
