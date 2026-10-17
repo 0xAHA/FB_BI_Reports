@@ -1,0 +1,984 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Historical Part Cost (iReport port)
+  PATH:   iReport_Ports/Inventory/historicalPartCost.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard Inventory/historicalPartCost.jrxml. Same
+  source, same rules, same columns and total; only the presentation is
+  interactive.
+
+    Source     partcosthistory: Fishbowl's scheduled task captures every
+               part that has stock (quantity, average, standard and next
+               cost) once a day. The report reads each inventory part's
+               capture made ON the Report For date (the latest one when
+               there are several that day), as the original does. A part
+               with no stock that day has no capture.
+    Parts      Inventory parts (typeId 10), active only unless Show inactive
+               parts; part number LIKE (% is a wildcard); default vendor
+               (vendorparts.defaultFlag) as the vendor filter.
+    Cost       Costing method: Average Cost = avgCost, Standard Cost =
+               stdCost, FIFO Cost and LIFO Cost = nextCost (the original
+               maps both to the captured next cost). Total Cost = unit cost
+               x quantity; the report total sums it over every row.
+    N/A        Quantity <= 0: Unit Cost and Total Cost show N/A; Quantity
+               shows N/A (and no UOM) when the part existed on the date.
+    Order      Part number.
+
+  Layout: the REPORT chrome (fb-styles §35): 56px header, push-down filter
+  panel that applies as you change it, flat .rpt-table, sticky totals footer.
+  Table tools (fb-lib FBLib.RptCols / RowCap / Pivot): column headings sort
+  (asc, desc, then the report's own part order; N/A figures last), drag to
+  reorder and resize (remembered per user); a Table / Pivot view selector
+  (pivot of quantity, unit cost or total cost by default vendor and / or
+  UOM, with drill-down: e.g. stock value per vendor on the date); the query
+  fetches at most 10,000 parts, with Load all.
+  Views: the header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+  report out as pages like the original: Letter portrait by default, the
+  title / Report For band on the first page only (the original's title band,
+  which has no company line), the column headings on every page, N/A cells
+  printed as the original, the report Total after the last line, "Page X of
+  Y". Rows follow the App view's sort and the vendor column switch. Columns
+  fit the page and the font steps down from the original's 10pt when they
+  don't. The paper and the view are remembered per user. Print prints those
+  pages in either view.
+
+  Fixed while porting:
+    - Show parts with zero quantity did nothing: its LEFT / INNER switch was
+      on the join from the day's capture to partcosthistory by id, after an
+      inner join from the part to that capture, so parts without a capture
+      never came through either way. The switch now sits on the part-to-
+      capture join, so with it ticked the date's inventory parts with no
+      capture are listed with a zero quantity, shown N/A as the original's
+      display rules intend.
+    - Show parts created after date was declared but never used. It now
+      leaves out parts created after the Report For date when unticked
+      (ticked by default, as in the original). Such a part can only appear
+      with Show parts with zero quantity, as it can't have a capture.
+  Differences:
+    - The capture-day test is datecaptured >= day AND < next day instead of
+      CAST(datecaptured AS DATE) = day: the same rows (checked live). There
+      is no index on dateCaptured, so both scan the table: 1.4-1.9 s on the
+      live database (the original 1.4-3.0 s).
+    - Vendor is a pick list of default vendors (with "(No default vendor)")
+      in place of the single vendor id LIKE.
+    - When nothing was captured on the date the page says so and offers the
+      latest capture day before it; the original printed an empty report.
+    - Additions: an optional Default Vendor column (the original selected
+      the vendor name but never printed it), the capture time in the status
+      line, the table tools and pivot above, part links, Excel.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-folder" content="Inventory">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="Part quantities and costs (average, standard, next) as captured on a chosen date.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipHistPartCost',
+            name:  'Historical Part Cost',
+            build: '2026.10.16-d9c9d71'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Historical Part Cost — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 460px; overflow: hidden; text-overflow: ellipsis; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table th { cursor: default; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        .pp-neg { color: #8A1E30; }
+        .na { color: var(--c-tertiary); }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        .note { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid var(--border);
+            background: var(--tint-blue); color: #415157; flex-shrink: 0; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .note:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>Historical Part Cost</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <div class="rpt-viewsel" id="viewSelWrap" title="Table: the report as the standard one lays it out. Pivot: total any figure by default vendor and UOM">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 5h18M3 10h10M3 15h18M3 20h10" stroke-linecap="round"/></svg>
+            <select id="viewSel">
+                <option value="table">Table</option>
+                <option value="pivot">Pivot</option>
+            </select>
+        </div>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Report for</div>
+            <div>
+                <div class="rpt-flabel">Date</div>
+                <input type="date" id="fDate" aria-label="Report for">
+            </div>
+            <div class="rpt-fnote">Costs and quantities as Fishbowl<br>captured them on this day.</div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Cost</div>
+            <div>
+                <div class="rpt-flabel">Costing method</div>
+                <select id="fMethod">
+                    <option value="avg">Average Cost</option>
+                    <option value="std">Standard Cost</option>
+                    <option value="fifo">FIFO Cost</option>
+                    <option value="lifo">LIFO Cost</option>
+                </select>
+            </div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fShowVendor"> Show default vendor column</label>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Parts</div>
+            <div>
+                <div class="rpt-flabel">Part number</div>
+                <input type="text" id="fPart" placeholder="Any (% is a wildcard)">
+            </div>
+            <div>
+                <div class="rpt-flabel">Default vendor</div>
+                <div class="ms-container" id="vendorMs">
+                    <div class="ms-trigger" id="vendorMs-trigger"><span class="ms-placeholder" id="vendorMs-placeholder">All vendors</span></div>
+                    <div class="ms-dropdown hidden" id="vendorMs-dropdown">
+                        <div class="ms-search"><input type="text" id="vendorMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="vendorMs-all">Select All</span><span id="vendorMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="vendorMs-list"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Include</div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fInactive"> Show inactive parts</label>
+            <label class="rpt-fcheck"><input type="checkbox" id="fZero"> Show parts with zero quantity</label>
+            <label class="rpt-fcheck"><input type="checkbox" id="fCreatedAfter"> Show parts created after date</label>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own sort">Reset column layout</button>
+                <p class="rpt-fnote">The report always opens on today's date. The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters what everyone sees each time this report opens. Anyone can still change them while it is open.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+                <button type="button" class="ds-btn" id="unpublishBtn" title="Everyone goes back to their own last choices">Stop using them</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>What each inventory part was worth on a past date: its quantity and unit cost as Fishbowl recorded them that day, and the total. It is the BI version of the standard <strong>Historical Part Cost</strong> and reads the same data the same way.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Where the figures come from</div>
+                <ul>
+                    <li>Once a day a Fishbowl scheduled task records, for every part with stock, its quantity and its average, standard and next cost. The time is in the status line.</li>
+                    <li>A part with no stock that day isn't recorded: tick <strong>Show parts with zero quantity</strong> to list it anyway, as N/A.</li>
+                    <li>If the server was off that day nothing was recorded; the page offers the last day that was.</li>
+                    <li><strong>FIFO Cost</strong> and <strong>LIFO Cost</strong> both use the recorded next cost (the cost of the next layer to be used), as the standard report does.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>Filter changes apply straight away. The costing method and the vendor column only redraw.</li>
+                    <li>Click a column heading to sort by it (again to reverse, a third time for part number order); N/A figures sort last. Drag a heading onto another to move the column; drag a heading's right edge to resize it. Your layout is remembered; <strong>Settings → Reset column layout</strong> undoes it.</li>
+                    <li>The <strong>Table / Pivot</strong> selector switches to a pivot: total any figure (Total Cost, Quantity…) by default vendor and / or UOM, for example what the stock from each vendor was worth that day. Click a figure to see the parts behind it. Print, PDF and Excel follow the view on screen.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable pages, laid out like the standard report. In PDF view pick the paper size and orientation in the bar above the pages; they are remembered. <strong>Print</strong> prints those pages.</li>
+                    <li>The total adds every part's quantity × unit cost.</li>
+                    <li>A very large result shows its first 10,000 parts with a <strong>Load all</strong> button; the total then covers the parts shown.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="note" id="note"></div>
+<div class="rpt-app" id="appView">
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+</div>
+<div class="pivot-host" id="pivotHost" style="display:none"></div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Common || !FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+// The original's Costing Method choices and the captured cost each one reads.
+const METHODS = {
+    avg:  { label: 'Average Cost',  col: 'avg' },
+    std:  { label: 'Standard Cost', col: 'std' },
+    fifo: { label: 'FIFO Cost',     col: 'next' },
+    lifo: { label: 'LIFO Cost',     col: 'next' }
+};
+const DEFAULT_FILTERS = {
+    date: '', method: 'avg', showVendor: false, part: '', vendors: [],
+    inactive: false, zero: false, createdAfter: true
+};
+const QUERY_KEYS = ['date', 'part', 'vendors', 'inactive', 'zero', 'createdAfter'];
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        company: { keys: ['filters', 'opts'], editors: true },   // every open starts from the company defaults
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const ints = a => (Array.isArray(a) ? a : []).map(Number).filter(n => Number.isInteger(n));
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const dstr = v => { const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v ?? '')); return m ? m[1] : ''; };
+const fmtDate = v => { const d = dstr(v); return d ? FBLib.Common.formatDate(d) : ''; };
+const fmtMoney = v => FBLib.Common.formatMoney(v);
+const fmtQty = v => FBLib.Common.formatQty(v);
+const money = v => '<span class="' + (num(v) < 0 ? 'pp-neg' : '') + '">' + esc(fmtMoney(v)) + '</span>';
+const NA = '<span class="na">N/A</span>';
+const openLink = (module, number, title) => number
+    ? `<a class="fb-row-link" data-open="${esc(module)}" data-num="${esc(number)}"${title ? ` title="${esc(title)}"` : ''}>${esc(number)}</a>` : '';
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const cut = s => `<span title="${esc(s)}">${esc(s)}</span>`;
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const isYmd = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+const today = () => ymd(new Date());
+const nextDay = s => { const d = new Date(s + 'T00:00:00'); d.setDate(d.getDate() + 1); return ymd(d); };
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+const reportDate = f => isYmd(f.date) ? f.date : today();
+const forText = f => 'Report For: ' + FBLib.Common.formatDate(reportDate(f));
+const methodOf = f => METHODS[f.method] || METHODS.avg;
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS — the panel applies as it changes (one short debounce). The
+//  costing method and the vendor column only redraw; the rest re-query.
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _vendorMs = null;
+let _hydrating = false, _applyTimer = null;
+
+function readFilters() {
+    return {
+        date: document.getElementById('fDate').value,
+        method: document.getElementById('fMethod').value,
+        showVendor: document.getElementById('fShowVendor').checked,
+        part: document.getElementById('fPart').value.trim(),
+        vendors: ints(_vendorMs.getSelected()),
+        inactive: document.getElementById('fInactive').checked,
+        zero: document.getElementById('fZero').checked,
+        createdAfter: document.getElementById('fCreatedAfter').checked
+    };
+}
+function writeFilters(f) {
+    _hydrating = true;
+    document.getElementById('fDate').value = reportDate(f);
+    document.getElementById('fMethod').value = METHODS[f.method] ? f.method : 'avg';
+    document.getElementById('fShowVendor').checked = !!f.showVendor;
+    document.getElementById('fPart').value = f.part || '';
+    _vendorMs.setSelected(ints(f.vendors));
+    document.getElementById('fInactive').checked = !!f.inactive;
+    document.getElementById('fZero').checked = !!f.zero;
+    document.getElementById('fCreatedAfter').checked = f.createdAfter !== false;
+    _hydrating = false;
+}
+// The date is never restored: the report opens on today, as the original.
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {}, { date: '' });
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const requery = QUERY_KEYS.some(k => JSON.stringify(next[k]) !== JSON.stringify(F[k]));
+        F = next;
+        remember();
+        if (requery) { S.noCap = false; loadAll(); } else render(true);
+    }, 250);
+}
+function goToDate(d) {
+    document.getElementById('fDate').value = d;
+    applySoon();
+}
+
+// ============================================================================
+//  SQL — the iReport query. The zero-quantity switch is on the part-to-
+//  capture join, where it makes a difference (see "Fixed while porting").
+// ============================================================================
+function buildSQL(f) {
+    const day = reportDate(f), after = nextDay(day);
+    const w = ['part.typeid = 10', 'part.activeflag IN (' + (f.inactive ? '0, 1' : '1') + ')'];
+    if (f.part) w.push(`part.num LIKE '${sqlStr(f.part.replace(/\*/g, '%'))}'`);
+    if (f.vendors.length) w.push('COALESCE(vendor.id, 0) IN (' + f.vendors.join(', ') + ')');
+    if (!f.createdAfter) w.push(`part.datecreated < '${after} 00:00:00'`);
+    return `
+        SELECT part.num AS partnum, part.description, vendor.name AS vendor,
+               COALESCE(h.avgcost, 0) AS avgcost, COALESCE(h.stdcost, 0) AS stdcost, COALESCE(h.nextcost, 0) AS nextcost,
+               COALESCE(h.quantity, 0) AS quantity, uom.code AS uom,
+               DATE_FORMAT(h.datecaptured, '%Y-%m-%d %H:%i') AS captured,
+               CASE WHEN part.datecreated < '${after} 00:00:00' THEN 1 ELSE 0 END AS existed
+        FROM part
+        ${f.zero ? 'LEFT JOIN' : 'JOIN'} (SELECT MAX(partcosthistory.id) AS costid, partcosthistory.partid
+              FROM partcosthistory
+              WHERE partcosthistory.datecaptured >= '${day} 00:00:00' AND partcosthistory.datecaptured < '${after} 00:00:00'
+              GROUP BY partcosthistory.partid) m ON m.partid = part.id
+        LEFT JOIN partcosthistory h ON h.id = m.costid
+        LEFT JOIN vendorparts ON vendorparts.partid = part.id AND vendorparts.defaultflag = 1
+        LEFT JOIN vendor ON vendorparts.vendorid = vendor.id
+        LEFT JOIN uom ON part.uomid = uom.id
+        WHERE ${w.join('\n          AND ')}
+        ORDER BY part.num`;
+}
+const lastCaptureSQL = day => `
+    SELECT DATE_FORMAT(MAX(datecaptured), '%Y-%m-%d') AS lastday
+    FROM partcosthistory
+    WHERE datecaptured < '${day} 00:00:00'`;
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+const S = { rows: [], company: '', loadedAt: null, captured: '', lastDay: '', view: 'table', noCap: false };
+let _loadToken = 0;
+
+async function loadLookups() {
+    const [co, vendors] = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('Default vendors', `
+            SELECT DISTINCT v.id, v.name
+            FROM vendor v
+            JOIN vendorparts vp ON vp.vendorid = v.id AND vp.defaultflag = 1
+            JOIN part p ON p.id = vp.partid AND p.typeid = 10
+            ORDER BY v.name`)
+    ]);
+    S.company = co.status === 'fulfilled' ? ((co.value[0] || {}).name || '') : '';
+    _vendorMs.setItems([{ value: 0, label: '(No default vendor)' }].concat(
+        (vendors.status === 'fulfilled' ? vendors.value : []).map(r => ({ value: Number(r.id), label: String(r.name) }))));
+    if (vendors.status === 'rejected') document.getElementById('banner').textContent = 'The vendor list failed to load: ' + vendors.reason.message;
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    const f = F;
+    document.getElementById('banner').textContent = '';
+    document.getElementById('loading').classList.add('show');
+    setStatus('Loading…');
+    let rows;
+    const appView = document.getElementById('appView');
+    const cap = S.noCap ? 0 : undefined;           // FBLib.RowCap: the first 10,000 parts unless Load all
+    try { rows = await q('Part costs', FBLib.RowCap.sql(buildSQL(f), cap)); }
+    catch (e) {
+        if (tok !== _loadToken) return;
+        document.getElementById('loading').classList.remove('show');
+        document.getElementById('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        FBLib.RowCap.notice({ before: appView, capped: false });
+        S.rows = []; S.loadedAt = null; S.captured = ''; S.lastDay = '';
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    if (tok !== _loadToken) return;
+    const capped = FBLib.RowCap.apply(rows, cap);
+    rows = capped.rows;
+    FBLib.RowCap.notice({ before: appView, capped: capped.capped, limit: capped.limit, what: 'parts',
+                          onLoadAll: () => { S.noCap = true; loadAll(); } });
+    S.rows = rows.map(r => ({
+        part: r.partnum || '', desc: r.description || '', vendor: r.vendor || '', uom: r.uom || '',
+        qty: num(r.quantity), avg: num(r.avgcost), std: num(r.stdcost), next: num(r.nextcost),
+        captured: r.captured || '', existed: Number(r.existed) === 1
+    }));
+    S.captured = (S.rows.find(r => r.captured) || {}).captured || '';
+    // Nothing captured that day: find the last day that was, to offer it.
+    S.lastDay = '';
+    if (!S.captured) {
+        try { S.lastDay = dstr(((await q('Last capture', lastCaptureSQL(reportDate(f))))[0] || {}).lastday); }
+        catch (_) { /* the offer is optional */ }
+        if (tok !== _loadToken) return;
+    }
+    document.getElementById('loading').classList.remove('show');
+    S.loadedAt = new Date();
+    render();
+}
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+
+// ============================================================================
+//  MODEL + TABLE
+// ============================================================================
+const BASE_COLS = [
+    { key: 'part',   label: 'Part',           w: 140 },
+    { key: 'desc',   label: 'Description',    w: 300 },
+    { key: 'vendor', label: 'Default Vendor', w: 170, opt: true },
+    { key: 'qty',    label: 'Quantity',       w: 100, num: true },
+    { key: 'uom',    label: 'UOM',            w: 60 },
+    { key: 'unit',   label: 'Unit Cost',      w: 120, num: true },
+    { key: 'total',  label: 'Total Cost',     w: 130, num: true }
+];
+// The columns shown (the vendor column is a switch), in the user's order
+// (FBLib.RptCols; a column switched off keeps its place for when it's back).
+const visibleCols = () => {
+    const shown = BASE_COLS.filter(c => !c.opt || F.showVendor);
+    return COLS ? COLS.arrange(shown) : shown;
+};
+
+// The original's figures and N/A rules for one row.
+function fig(r) {
+    const unit = r[methodOf(F).col];
+    return { unit, total: unit * r.qty, na: r.qty <= 0, qtyNa: r.qty <= 0 && r.existed };
+}
+function grandTotal() { return S.rows.reduce((s, r) => s + fig(r).total, 0); }
+
+// Heading-click sort (FBLib.RptCols): the chosen column; N/A figures sort
+// last either way; ties (and no sort) keep the report's part number order.
+const sortVal = (r, k) => {
+    const x = fig(r);
+    if (k === 'qty') return x.qtyNa ? null : r.qty;
+    if (k === 'uom') return x.qtyNa ? '' : r.uom;
+    if (k === 'unit') return x.na ? null : x.unit;
+    if (k === 'total') return x.na ? null : x.total;
+    return r[k];
+};
+const sortedRows = () => (COLS && COLS.sort() ? S.rows.slice().sort((a, b) => COLS.compare(a, b, sortVal)) : S.rows);
+
+function headRow(cols, forPrint) {
+    return '<tr>' + cols.map(c =>
+        `<th data-col="${c.key}" class="${c.num ? 'num-cell' : ''}"${forPrint ? '' : ` style="min-width:${c.w}px"`}>${esc(c.label)}</th>`).join('') + '</tr>';
+}
+function lineRow(cols, r, forPrint) {
+    const x = fig(r);
+    const cell = {
+        part: forPrint ? esc(r.part) : openLink('Part', r.part, r.desc), desc: cut(r.desc), vendor: cut(r.vendor),
+        qty: x.qtyNa ? NA : esc(fmtQty(r.qty)), uom: x.qtyNa ? '' : esc(r.uom),
+        unit: x.na ? NA : money(x.unit), total: x.na ? NA : money(x.total)
+    };
+    return '<tr>' + cols.map(c => `<td class="${c.num ? 'num-cell' : ''}">${cell[c.key] ?? ''}</td>`).join('') + '</tr>';
+}
+// A totals row: `identity` spans the first run of columns that carry none of
+// this row's figures (wherever the user has moved them), and each figure
+// lands in its own column, so moving a column never breaks the row.
+function totalsCells(cs, identity, figs) {
+    const has = c => figs[c.key] != null && figs[c.key] !== '';
+    let at = cs.findIndex(c => !has(c));
+    if (at < 0) at = 0;
+    let end = at;
+    while (end < cs.length && !has(cs[end])) end++;
+    if (end === at) end = at + 1;
+    const cell = c => `<td class="${c.num ? 'num-cell' : ''}">${figs[c.key] ?? ''}</td>`;
+    return cs.slice(0, at).map(cell).join('') + `<td colspan="${end - at}">${identity}</td>` + cs.slice(end).map(cell).join('');
+}
+// Footer: the report total lands in Total Cost.
+function footRow(cols) {
+    return `<tr>${totalsCells(cols, esc('Total — ' + plural(S.rows.length, 'part')), { total: esc(fmtMoney(grandTotal())) })}</tr>`;
+}
+
+// Long reports paint in chunks as the user scrolls.
+const CHUNK = 600;
+let _paint = { html: [], shown: 0 };
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+function captureText() {
+    return S.captured ? 'captured ' + FBLib.Common.formatDate(dstr(S.captured)) + ' ' + S.captured.slice(11, 16) : '';
+}
+function noteHtml() {
+    if (!S.loadedAt || S.captured) return '';
+    const day = FBLib.Common.formatDate(reportDate(F));
+    if (!S.lastDay) return `<span>Fishbowl recorded no part costs on ${esc(day)} or before it.</span>`;
+    return `<span>Fishbowl recorded no part costs on ${esc(day)} (it records them once a day while the server runs). ` +
+        `The last day it did before that is ${esc(FBLib.Common.formatDate(S.lastDay))}.</span>` +
+        `<button type="button" class="hdr-btn" data-goto="${esc(S.lastDay)}">Show ${esc(FBLib.Common.formatDate(S.lastDay))}</button>`;
+}
+
+function render(keepScroll) {
+    if (S.view === 'pivot' && PIVOT) {
+        PIVOT.render();
+        document.getElementById('note').innerHTML = noteHtml();
+        setStatus([S.company, forText(F), methodOf(F).label, captureText(), 'pivot', S.loadedAt ? plural(S.rows.length, 'part') : ''].filter(Boolean).join(' · '));
+        if (PDF) PDF.refresh();
+        return;
+    }
+    const cols = visibleCols();
+    const tbl = document.getElementById('rpt');
+    const wrap = document.getElementById('rptWrap');
+    const top = wrap.scrollTop;
+    tbl.querySelector('thead').innerHTML = headRow(cols, false);
+    _paint = { html: sortedRows().map(r => lineRow(cols, r, false)), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    while (keepScroll && _paint.shown < _paint.html.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+    tbl.querySelector('tfoot').innerHTML = S.rows.length ? footRow(cols) : '';
+    tbl.style.display = S.rows.length ? '' : 'none';
+    const note = noteHtml();
+    document.getElementById('note').innerHTML = note;
+    document.getElementById('rptEmpty').textContent = S.rows.length || !S.loadedAt || note ? '' : 'No part costs match these filters.';
+    wrap.scrollTop = keepScroll ? top : 0;
+    const bits = [S.company, forText(F), methodOf(F).label, captureText()];
+    if (S.loadedAt) bits.push(plural(S.rows.length, 'part') + ' · loaded ' + S.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    setStatus(bits.filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the pages as the standard report prints them: Letter
+//  portrait, the title and Report For line on the first page only (the
+//  original's title band: no company line), N/A cells in black, the report
+//  Total after the last line.
+// ============================================================================
+// The totals row carries .pdf-foot so its column is measured bold, as it
+// prints (else the Total, the widest figure, wraps).
+let PDF = null;
+const PDF_CSS =
+    '.fbdoc-rpt-tbl .na,.fbdoc-rpt-tbl .pp-neg{color:inherit}' +
+    '.fbdoc-rpt-tbl tr.pdf-foot td{font-weight:700}';
+function docSpec() {
+    if (!S.loadedAt) return null;
+    const cols = visibleCols();
+    const day = FBLib.Common.formatDate(reportDate(F));
+    const empty = S.captured ? 'No part costs match these filters.'
+        : 'Fishbowl recorded no part costs on ' + day + (S.lastDay ? '. The last day it did before that is ' + FBLib.Common.formatDate(S.lastDay) + '.' : ' or before it.');
+    if (S.view === 'pivot' && PIVOT) {
+        const p = PIVOT.pdfSpec();
+        return { company: '', title: 'Historical Part Cost', subtitle: [[forText(F), methodOf(F).label, captureText()].filter(Boolean).join(' · '), pivotText()],
+                 titleEveryPage: false, head: p.head, rows: p.rows, foot: p.foot ? p.foot.replace(/^<tr>/, '<tr class="pdf-foot">') : '',
+                 empty, css: PDF_CSS, fontPt: 10 };
+    }
+    return {
+        company: '', title: 'Historical Part Cost', subtitle: [forText(F), methodOf(F).label, captureText()].filter(Boolean).join(' · '),
+        titleEveryPage: false,
+        head: headRow(cols, true), rows: sortedRows().map(r => lineRow(cols, r, true)),
+        foot: S.rows.length ? footRow(cols).replace(/^<tr>/, '<tr class="pdf-foot">') : '',
+        empty, css: PDF_CSS, fontPt: 10
+    };
+}
+
+// ============================================================================
+//  PIVOT VIEW (FBLib.Pivot) — quantity, unit cost or total cost by default
+//  vendor and / or UOM (part for the drill-down). Figures follow the costing
+//  method. Quantity and Total Cost keep every part, as the report total does;
+//  Unit Cost leaves out the N/A ones.
+// ============================================================================
+let PIVOT = null, COLS = null;
+const NO_VENDOR = '(No default vendor)';
+const PIVOT_FIELDS = [
+    { key: 'vendor', label: 'Default Vendor' }, { key: 'uom', label: 'UOM' }, { key: 'part', label: 'Part' },
+    { key: 'desc', label: 'Description', dim: false },
+    { key: 'qty', label: 'Quantity', type: 'qty' }, { key: 'unit', label: 'Unit Cost', type: 'money' }, { key: 'total', label: 'Total Cost', type: 'money' }
+];
+const pivotRows = () => S.rows.map(r => {
+    const x = fig(r);
+    return { vendor: r.vendor || NO_VENDOR, uom: r.uom, part: r.part, desc: r.desc, qty: r.qty, unit: x.na ? null : x.unit, total: x.total };
+});
+function pivotText() {
+    const c = PIVOT.config(), lbl = k => (PIVOT_FIELDS.find(x => x.key === k) || {}).label || '';
+    const m = c.measure === '__count__' ? 'Part count'
+        : ({ sum: 'Total', count: 'Count of', avg: 'Average', min: 'Lowest', max: 'Highest' }[c.agg] + ' ' + lbl(c.measure));
+    return 'Pivot: ' + m + ' by ' + [lbl(c.rowDim), lbl(c.rowDim2)].filter(Boolean).join(' + ') + (c.colDim ? ' × ' + lbl(c.colDim) : '');
+}
+function setView(v, persist) {
+    S.view = v === 'pivot' && PIVOT ? 'pivot' : 'table';
+    document.getElementById('viewSel').value = S.view;
+    document.getElementById('rptWrap').style.display = S.view === 'pivot' ? 'none' : '';
+    document.getElementById('pivotHost').style.display = S.view === 'pivot' ? '' : 'none';
+    if (persist) _saveUserKeys({ view: S.view });
+    render(false);
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    const sub = [S.company, forText(F), 'Costing method: ' + methodOf(F).label, captureText()].filter(Boolean);
+    const type = { qty: 'qty', unit: 'money', total: 'money' };
+    const cols = visibleCols().map(c => ({ key: c.key, label: c.label, w: c.w, type: type[c.key] || 'text',
+        noTotal: c.key === 'qty' || c.key === 'unit' }));
+    // N/A figures export as empty cells.
+    const rows = sortedRows().map(r => {
+        const x = fig(r);
+        return { part: r.part, desc: r.desc, vendor: r.vendor, uom: x.qtyNa ? '' : r.uom,
+                 qty: x.qtyNa ? null : r.qty, unit: x.na ? null : x.unit, total: x.na ? null : x.total };
+    });
+    const sheets = [{ name: 'Part Cost', title: 'Historical Part Cost', subtitle: sub, cols, rows, totals: true }];
+    if (S.view === 'pivot' && PIVOT) sheets.unshift(Object.assign(PIVOT.sheet('Pivot'), { title: 'Historical Part Cost – ' + pivotText(), subtitle: sub }));
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'Historical_Part_Cost_' + reportDate(F), sheets });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's pages (fb-doc). Without fb-doc on the server, the
+// plain printout below: JxBrowser won't print the report page itself, so it
+// is built in a new window and printed there.
+function printReport() {
+    if (PDF) {
+        if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+    const cols = visibleCols();
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Historical Part Cost</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:11pt;font-weight:700}h2{text-align:center;font-size:14pt;margin:2px 0}.sub{text-align:center;font-size:8.5pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{font-size:8pt;text-align:left;padding:3px 5px;border-bottom:1px solid #000}' +
+        'td{font-size:8pt;padding:2px 5px;vertical-align:top}.num-cell{text-align:right}.na{color:#111}' +
+        'tfoot td{font-weight:700;border-top:1.5px solid #000}a{color:#000;text-decoration:none}.pp-neg{color:#000}' +
+        '@page{size:Letter portrait;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>Historical Part Cost</h2><p class="sub">' +
+        esc([forText(F), methodOf(F).label, captureText()].filter(Boolean).join(' · ')) + '</p>' +
+        '<table><thead>' + headRow(cols, true) + '</thead><tbody>' + sortedRows().map(r => lineRow(cols, r, true)).join('') +
+        '</tbody><tfoot>' + footRow(cols) + '</tfoot></table>' +
+        '<p style="font-size:7.5pt;margin-top:8px">Printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters what everyone sees each time this report opens?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        _vendorMs = FBLib.Common.MultiSelect.create({ containerId: 'vendorMs', items: [], placeholder: 'All vendors', maxTags: 2, onClose: applySoon });
+
+        document.querySelectorAll('#fDate, #fMethod, #fShowVendor, #fInactive, #fZero, #fCreatedAfter')
+            .forEach(el => el.addEventListener('change', applySoon));
+        const fPart = document.getElementById('fPart');
+        fPart.addEventListener('change', applySoon);
+        fPart.addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        document.getElementById('resetFiltersBtn').onclick = () => { writeFilters(DEFAULT_FILTERS); applySoon(); };
+        document.getElementById('note').addEventListener('click', e => {
+            const b = e.target.closest('[data-goto]');
+            if (b) goToDate(b.dataset.goto);
+        });
+
+        // Column resize / sort / reorder, and the Pivot view (fb-lib).
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({ table: document.getElementById('rpt'), onSort: () => render(true), onReorder: () => render(true) });
+        if (FBLib.Pivot) PIVOT = FBLib.Pivot.mount(document.getElementById('pivotHost'), {
+            fields: PIVOT_FIELDS, rows: pivotRows,
+            defaults: { rowDim: 'vendor', colDim: '', measure: 'total', agg: 'sum' },
+            format: (fld, v) => (fld && fld.type === 'money' ? fmtMoney(v) : fld && fld.type === 'qty' ? fmtQty(v) : null)
+        });
+        else document.getElementById('viewSelWrap').style.display = 'none';
+        document.getElementById('viewSel').addEventListener('change', e => setView(e.target.value, true));
+        document.getElementById('resetColsBtn').onclick = () => { if (COLS) { COLS.reset(); render(false); } };
+        S.view = _resolve('view', 'table') === 'pivot' && PIVOT ? 'pivot' : 'table';
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: document.getElementById('appView'), toggleBefore: document.getElementById('exportBtn'),
+                page: { size: 'Letter', orientation: 'portrait' },
+                doc: docSpec, title: () => 'Historical Part Cost'
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        setView(S.view, false);
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('unpublishBtn').onclick = () => {
+            if (!confirm('Stop using company defaults for this report? Everyone goes back to their own last choices.')) return;
+            const ok = FBLib.Settings.clearCompany(['filters', 'opts']) !== false;
+            showToast(ok ? 'This report no longer has company defaults.' : 'That was not saved.', ok ? 'success' : 'error');
+        };
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        const wrap = document.getElementById('rptWrap');
+        wrap.addEventListener('scroll', () => { if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 400) appendChunk(); });
+        document.getElementById('rpt').addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (a) {
+                e.preventDefault();
+                try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+                catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+            }
+        });
+
+        await loadLookups();
+        writeFilters(savedFilters());
+        F = readFilters();          // drops saved picks that no longer exist
+        await loadAll();
+    } catch (e) {
+        console.error('[Historical Part Cost] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

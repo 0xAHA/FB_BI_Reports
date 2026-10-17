@@ -1,0 +1,1126 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   ABC Report (iReport port)
+  PATH:   iReport_Ports/Part/ABCReport.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard Part/ABCReport.jrxml ("Prints a list of
+  parts, their current ABC Code, and their Projected ABC Code. Cost values
+  are based on today's costs."). Same source, same rules, same columns and
+  options; only the presentation is interactive.
+
+    Source     Every ACTIVE part (any type), with its UOM, its usage in the
+               date range, its current code (part.abcCode) and four unit
+               costs: partcost.avgCost, part.stdCost, and the first / last
+               OPEN cost layer's orgTotalCost / orgQty (costlayer statusId
+               10, lowest / highest id) for FIFO / LIFO, blank when the part
+               has no open layer.
+    Usage      Qty Used = -SUM(inventorylog.changeQty) over the range's
+               event dates (whole days, both ends included) for type 20
+               (shp, sales shipments) and type 50 (csm, consumed by work
+               orders), per the two activity options. Base UOM.
+    % of Total The part's Qty Used / the usage of ALL parts in the range,
+               inactive parts included (the original's totalSum). So the
+               column can add up to less than 100%.
+    Projected  The original's variables, reproduced: parts in Qty Used
+               order (highest first); a running total of % of Total that
+               INCLUDES the part itself; A while it is under 80%, B under
+               95%, C from there. The thresholds are fixed in the jrxml;
+               Fishbowl stores none (no ABC sysproperty) and calls no
+               helper. A part that tips the running total over 80% is
+               already a B.
+    Groups     One group per run of the same projected code (the original's
+               group on $V{ABC}): A, B, C. Group header (ShowGroupHeader)
+               and group totals (ShowTotals): the sum of the parts' unit
+               costs and of their % of Total, as the original's footer.
+    Cost       Part Cost = the Costing method option's unit cost (Average,
+               Standard, FIFO or LIFO), at REPORT_DECIMAL_COST_PRECISION,
+               home currency symbol. The original's default "avg" matches
+               none of its choices, so its dialog selects the first one,
+               Average Cost: so does this.
+    Options    Date range (default This Month), Use sales activity, Use
+               manufacture activity (checked = types 20 / 50; unchecked
+               sends the original's placeholder type 1, which has no rows),
+               Costing method, Show group headers, Show totals, Show time
+               stamp (the PDF page footer's printed date).
+
+  Layout: the REPORT chrome (fb-styles §35): 56px header, push-down filter
+  panel that applies as you change it, collapsible group rows, sticky
+  footer (App view only: the original prints no grand total).
+  Table tools (fb-lib FBLib.RptCols / RowCap / Pivot): column headings sort
+  the parts within each code group (the groups keep the usage order the
+  codes come from); drag a heading to reorder, its edge to resize
+  (remembered per user). A Table / Pivot view selector: the part count,
+  Qty Used, % of Total, Part Cost or Usage Value (Qty Used x Part Cost) by
+  any two of current code, projected code, part and UOM, with drill-down;
+  Current x Projected (the default) shows how many parts move between
+  codes. The query fetches at most 10,000 parts, with Load all: the codes
+  of the parts shown are exact (each depends only on the parts above it
+  and on the all-parts total), the cut is the least-used tail, and group
+  totals then cover the parts shown.
+  Views: the header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+  report out as pages like the original: Letter portrait by default, the
+  company / title band on every page (the original's page header) with the
+  options under it, the column headings repeated, each code's group row
+  (with its totals when Show totals is on) carried over a page break as
+  "(continued)", "Totals:" rows after each group when group headers are
+  off, no grand total (the original has none), the printed date (Show time
+  stamp) and "Page X of Y". Columns fit the page and the font steps down
+  from the original's 9pt when they don't. The paper size and orientation,
+  and the view, are remembered per user. Print prints those pages in
+  either view.
+
+  Deliberate differences:
+    - Ties in Qty Used (every part with no usage, for one) are ordered by
+      part number. The original's ORDER BY 5 leaves them in no set order;
+      that only matters when tied parts straddle 80% or 95%.
+    - % of Total is 0 only when the all-parts total is 0. The original
+      tested TOTALQTY.intValue() == 0, so a total usage under one unit
+      (e.g. 0.5 kg) made every part 0% and A.
+    - The date range is applied as event date >= the first day and < the
+      day after the last (same rows as DATE(eventDate) BETWEEN, but it can
+      use the event-date index), and the per-part usage is grouped on
+      partId + 0 so MySQL reads the date range instead of walking the
+      partId index. Live, 2025 in full: 448 of 448 parts, the same qty,
+      costs, total and codes; 7.8 s -> 0.6 s.
+    - The company name and home currency come from their own lookups, not
+      joins on every row.
+    - Show time stamp hides only the printed date in the PDF footer; the
+      page numbers stay, as the original's.
+  Additions: collapsible groups; "Only parts whose code would change" and
+  a Cumulative % column (both off by default; neither changes the codes);
+  the projected code is marked where it differs from the current one;
+  Part links; Excel; Print.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-folder" content="Part">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="Active parts ranked by usage in a date range, with their current and projected ABC codes.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipABC',
+            name:  'ABC Report',
+            build: '2026.10.16-ce7417f'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ABC Report — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 420px; overflow: hidden; text-overflow: ellipsis; vertical-align: top; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table th.ctr-cell, .rpt-table td.ctr-cell { text-align: center; }
+        .rpt-table th { cursor: default; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        .abc-code { font-weight: 700; }
+        .abc-chg { display: inline-block; min-width: 20px; padding: 0 5px; border-radius: 4px; font-weight: 700;
+            background: var(--acc-orange-bg); color: var(--acc-orange-con); }
+        .abc-cur-none { color: var(--c-tertiary); }
+        tr.abc-gtot td { font-weight: 700; border-top: 1px solid var(--border); }
+        tr.abc-gtot td.abc-gtot-lbl { text-align: right; }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        .abc-note { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid var(--border);
+            background: #F4F8FA; color: #415157; flex-shrink: 0; }
+        .abc-note:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>ABC Report</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <div class="rpt-viewsel" id="viewSelWrap" title="Table: the report as the standard one lays it out. Pivot: parts, usage or cost by current and projected code (or part, UOM)">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 5h18M3 10h10M3 15h18M3 20h10" stroke-linecap="round"/></svg>
+            <select id="viewSel">
+                <option value="table">Table</option>
+                <option value="pivot">Pivot</option>
+            </select>
+        </div>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="split-btn" id="expandWrap">
+            <button id="expandBtn" class="hdr-btn" type="button" title="Show every group's parts">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+                Expand
+            </button>
+            <button id="collapseBtn" class="hdr-btn" type="button" title="Group rows only">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 12h14" stroke-linecap="round"/></svg>
+                Collapse
+            </button>
+        </span>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages: collapsed groups print as their group row">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Usage dates</div>
+            <div>
+                <div class="rpt-flabel">Quick range</div>
+                <select id="fRange"></select>
+            </div>
+            <div class="rpt-dates">
+                <input type="date" id="fFrom" aria-label="From">
+                <span class="rpt-fnote">→</span>
+                <input type="date" id="fTo" aria-label="To">
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Usage counts</div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fSales"> Sales activity (shipments)</label>
+            <label class="rpt-fcheck"><input type="checkbox" id="fMfg"> Manufacture activity (consumed by work orders)</label>
+            <div>
+                <div class="rpt-flabel">Costing method</div>
+                <select id="fMethod">
+                    <option value="avg">Average Cost</option>
+                    <option value="std">Standard Cost</option>
+                    <option value="fifo">FIFO Cost</option>
+                    <option value="lifo">LIFO Cost</option>
+                </select>
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Layout</div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fGroupHdr"> Show group headers</label>
+            <label class="rpt-fcheck"><input type="checkbox" id="fTotals"> Show totals</label>
+            <label class="rpt-fcheck"><input type="checkbox" id="fStamp"> Show time stamp (PDF / Print)</label>
+            <label class="rpt-fcheck"><input type="checkbox" id="fCum"> Cumulative % column</label>
+            <label class="rpt-fcheck"><input type="checkbox" id="fChanged"> Only parts whose code would change</label>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own sort">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters what everyone sees each time this report opens. Anyone can still change them while it is open.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+                <button type="button" class="ds-btn" id="unpublishBtn" title="Everyone goes back to their own last choices">Stop using them</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>Every active part with its <strong>current</strong> ABC code (from the part) beside the code its usage <strong>projects</strong>, how much of it was used in the date range, and its unit cost. It is the BI version of the standard <strong>ABC Report</strong> and reads the same data the same way.</p>
+                <p><strong>Qty Used</strong> is what was shipped on sales orders and/or consumed by work orders in the range (the two Usage options), in the part's own unit.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">How the projected code is worked out</div>
+                <ul>
+                    <li><strong>% of Total</strong> = the part's Qty Used ÷ the usage of all parts in the range (inactive parts included, so the column can add up to less than 100%).</li>
+                    <li>Parts are taken in Qty Used order, highest first, keeping a running total of % of Total that includes the part itself.</li>
+                    <li><strong>A</strong> while that running total is under 80%, <strong>B</strong> while it is under 95%, <strong>C</strong> from there. The part that takes the total past 80% is already a B. Turn on <strong>Cumulative %</strong> to see the running total.</li>
+                    <li>The thresholds are the standard report's own; Fishbowl has no setting for them. With no usage in the range every part comes out A, as in the standard report.</li>
+                    <li>Quantities in different units are added as they are, as the standard report does.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>Filter changes apply straight away. The costing method and the layout options only redraw.</li>
+                    <li>A projected code shown in colour differs from the part's current code; <strong>Only parts whose code would change</strong> lists just those.</li>
+                    <li>Click a group's row to show or hide its parts; <strong>Expand</strong> / <strong>Collapse</strong> do every group. With <strong>Show totals</strong> on, a group's row carries the sum of its parts' unit costs and of their % of Total, as the standard report's group footer.</li>
+                    <li>Click a column heading to sort the parts within each code group (again to reverse, a third time for the standard order). Drag a heading onto another to move the column; drag a heading's right edge to resize it. Your layout is remembered; <strong>Settings → Reset column layout</strong> undoes it.</li>
+                    <li>The <strong>Table / Pivot</strong> selector switches to a pivot: the number of parts, Qty Used, % of Total, Part Cost or Usage Value (Qty Used × Part Cost) by any two of current code, projected code, part and UOM. Current × Projected shows how many parts move from one code to another. Click a figure to see the parts behind it. Print, PDF and Excel follow the view on screen.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable pages, laid out like the standard report. In PDF view pick the paper size and orientation in the bar above the pages; they are remembered. <strong>Print</strong> prints those pages.</li>
+                    <li>A very large result shows its 10,000 most-used parts with a <strong>Load all</strong> button. Their codes are exact; the group totals then cover the parts shown.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="abc-note" id="abcNote"></div>
+<div class="rpt-app" id="appView">
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+</div>
+<div class="pivot-host" id="pivotHost" style="display:none"></div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+        if (!FBLib.RowCap) missing.push('FBLib.RowCap');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+// The original's checkbox parameters: "20,1" and "50,1" = the inventorylog
+// type sent when checked, and when unchecked (type 1, "undefined", has no
+// rows: it stands for "none").
+const TYPE_SALES = 20, TYPE_MFG = 50, TYPE_OFF = 1;
+// The original's projected-code thresholds (its ABC variable), on the
+// running % of Total.
+const LIMIT_A = 0.8, LIMIT_B = 0.95;
+const CODE_RULE = { A: 'running total under 80%', B: 'running total 80% to under 95%', C: 'running total 95% and over' };
+const METHODS = {
+    avg:  { label: 'Average Cost',  col: 'avg' },
+    std:  { label: 'Standard Cost', col: 'std' },
+    fifo: { label: 'FIFO Cost',     col: 'fifo' },
+    lifo: { label: 'LIFO Cost',     col: 'lifo' }
+};
+const DEFAULT_FILTERS = { range: 'thisMonth', from: '', to: '', sales: true, mfg: true, method: 'avg',
+                          groupHdr: true, totals: true, stamp: true, cum: false, changed: false };
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        company: { keys: ['filters', 'opts'], editors: true },   // every open starts from the company defaults
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const numOrNull = v => { if (v === null || v === undefined || v === '') return null; const n = parseFloat(v); return Number.isFinite(n) ? n : null; };
+const openLink = (module, number, title) => number
+    ? `<a class="fb-row-link" data-open="${esc(module)}" data-num="${esc(number)}"${title ? ` title="${esc(title)}"` : ''}>${esc(number)}</a>` : '';
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const cut = s => `<span title="${esc(s)}">${esc(s)}</span>`;
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const isYmd = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+
+// Costs and quantities at the system's report precision (the original's
+// REPORT_DECIMAL_COST / REPORT_DECIMAL_QTY patterns), home currency symbol;
+// percentages as its "#,##0.00 %".
+let COST_DP = 2, QTY_DP = 5;
+const locale = () => FBLib.Common.currency().locale;
+function fmtCost(v) {
+    if (v === null || v === undefined) return '';
+    const n = num(v), c = FBLib.Common.currency();
+    return (n < 0 ? '-' : '') + c.symbol + Math.abs(n).toLocaleString(c.locale, { minimumFractionDigits: COST_DP, maximumFractionDigits: COST_DP });
+}
+const fmtQty = v => num(v).toLocaleString(locale(), { maximumFractionDigits: QTY_DP });
+const fmtPct = v => (num(v) * 100).toLocaleString(locale(), { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' %';
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// ---- Date ranges (Fishbowl's "This Month" etc.) ----
+const RANGES = [
+    ['custom', 'Custom…'], ['all', 'All dates'], ['today', 'Today'], ['yesterday', 'Yesterday'], ['last7', 'Last 7 days'],
+    ['thisMonth', 'This month'], ['lastMonth', 'Last month'], ['thisQuarter', 'This quarter'], ['lastQuarter', 'Last quarter'],
+    ['thisYear', 'This year'], ['lastYear', 'Last year']
+];
+// A quick range as [from, to] ISO dates, or null for "All dates".
+function presetDates(key) {
+    const t = new Date(); t.setHours(0, 0, 0, 0);
+    const y = t.getFullYear(), m = t.getMonth(), d = t.getDate(), qm = Math.floor(m / 3) * 3;
+    const D = (yy, mm, dd) => new Date(yy, mm, dd);
+    const r = {
+        today: [t, t], yesterday: [D(y, m, d - 1), D(y, m, d - 1)], last7: [D(y, m, d - 6), t],
+        thisMonth: [D(y, m, 1), D(y, m + 1, 0)], lastMonth: [D(y, m - 1, 1), D(y, m, 0)],
+        thisQuarter: [D(y, qm, 1), D(y, qm + 3, 0)], lastQuarter: [D(y, qm - 3, 1), D(y, qm, 0)],
+        thisYear: [D(y, 0, 1), D(y, 11, 31)], lastYear: [D(y - 1, 0, 1), D(y - 1, 11, 31)]
+    }[key];
+    return r ? [ymd(r[0]), ymd(r[1])] : null;
+}
+// { start, endExcl, label } for the filter, or null for no date limit.
+function dateRange(f) {
+    let a = f.from, b = f.to;
+    if (f.range !== 'custom') { const p = presetDates(f.range); if (!p) return null; [a, b] = p; }
+    if (!isYmd(a) && !isYmd(b)) return null;
+    a = isYmd(a) ? a : '1900-01-01'; b = isYmd(b) ? b : '2999-12-31';
+    if (a > b) [a, b] = [b, a];
+    const after = new Date(b + 'T00:00:00'); after.setDate(after.getDate() + 1);
+    return { start: a, endExcl: ymd(after), label: FBLib.Common.formatDate(a) + ' – ' + FBLib.Common.formatDate(b) };
+}
+function rangeText(f) { const r = dateRange(f); return 'Date Range: ' + (r ? r.label : 'All'); }
+function usageText(f) {
+    const u = [f.sales ? 'sales' : '', f.mfg ? 'manufacture' : ''].filter(Boolean);
+    return u.length ? 'Usage: ' + u.join(' + ') + ' activity' : 'Usage: no activity types';
+}
+const methodOf = f => METHODS[f.method] || METHODS.avg;
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS — the panel applies as it changes (one short debounce). The
+//  dates and the two usage options re-query; the costing method and the
+//  layout options only redraw.
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _hydrating = false, _applyTimer = null;
+const S = { rows: [], total: 0, company: '', loadedAt: null, collapsed: new Set(), view: 'table', noCap: false, capped: false };
+const QUERY_KEYS = ['range', 'from', 'to', 'sales', 'mfg'];
+const CHECKS = { sales: 'fSales', mfg: 'fMfg', groupHdr: 'fGroupHdr', totals: 'fTotals', stamp: 'fStamp', cum: 'fCum', changed: 'fChanged' };
+
+function readFilters() {
+    const f = {
+        range: document.getElementById('fRange').value,
+        from: document.getElementById('fFrom').value,
+        to: document.getElementById('fTo').value,
+        method: document.getElementById('fMethod').value
+    };
+    Object.keys(CHECKS).forEach(k => { f[k] = document.getElementById(CHECKS[k]).checked; });
+    return f;
+}
+function writeFilters(f) {
+    _hydrating = true;
+    document.getElementById('fRange').value = RANGES.some(r => r[0] === f.range) ? f.range : DEFAULT_FILTERS.range;
+    const p = f.range === 'custom' ? [f.from, f.to] : (presetDates(f.range) || ['', '']);
+    document.getElementById('fFrom').value = p[0] || '';
+    document.getElementById('fTo').value = p[1] || '';
+    document.getElementById('fMethod').value = METHODS[f.method] ? f.method : 'avg';
+    Object.keys(CHECKS).forEach(k => { document.getElementById(CHECKS[k]).checked = f[k] === undefined ? DEFAULT_FILTERS[k] : !!f[k]; });
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const requery = QUERY_KEYS.some(k => JSON.stringify(next[k]) !== JSON.stringify(F[k]));
+        F = next;
+        remember();
+        if (requery) { S.noCap = false; loadAll(); } else render(false);
+    }, 250);
+}
+
+// ============================================================================
+//  SQL — the iReport query. Usage is summed over the event-date range for
+//  the checked inventorylog types: once for all parts (the % of Total
+//  denominator, inactive parts included) and once per part. See the header
+//  comment for the date test and the partId + 0 grouping.
+// ============================================================================
+function buildSQL(f) {
+    const types = [f.sales ? TYPE_SALES : TYPE_OFF, f.mfg ? TYPE_MFG : TYPE_OFF].join(', ');
+    const r = dateRange(f);
+    const when = r ? `\n                AND il.eventdate >= '${r.start} 00:00:00' AND il.eventdate < '${r.endExcl} 00:00:00'` : '';
+    // FIFO / LIFO: the first / last open cost layer's original unit cost.
+    const layer = dir => `(SELECT COALESCE(cl.orgtotalcost, 0) / cl.orgqty FROM costlayer cl
+                 WHERE cl.partid = part.id AND cl.statusid = 10 ORDER BY cl.id ${dir} LIMIT 1)`;
+    return `
+        SELECT part.id AS partid, part.num AS partnum, COALESCE(part.description, '') AS partdesc,
+               COALESCE(part.abccode, '') AS currentcode,
+               COALESCE(totqty.qty, 0) AS qty, COALESCE(totalsum.qty, 0) AS totalqty,
+               COALESCE(uom.code, '') AS uomcode,
+               COALESCE(partcost.avgcost, 0) AS avgcost, COALESCE(part.stdcost, 0) AS stdcost,
+               ${layer('ASC')} AS fifocost,
+               ${layer('DESC')} AS lifocost
+        FROM part
+        JOIN (SELECT SUM(il.changeqty) * -1 AS qty
+              FROM inventorylog il
+              WHERE il.typeid IN (${types})${when}) totalsum ON 1 = 1
+        JOIN uom ON uom.id = part.uomid
+        LEFT JOIN (SELECT il.partid + 0 AS partid, SUM(il.changeqty) * -1 AS qty
+                   FROM inventorylog il
+                   WHERE il.typeid IN (${types})${when}
+                   GROUP BY 1) totqty ON totqty.partid = part.id
+        LEFT JOIN partcost ON partcost.partid = part.id
+        WHERE part.activeflag = 1
+        ORDER BY COALESCE(totqty.qty, 0) DESC, part.num`;
+}
+
+// The original's variables, in its order: percent, the running
+// totalpercent (this part included), then ABC on that running total.
+function project(rows, total) {
+    let cum = 0, run = -1, prev = null;
+    rows.forEach(r => {
+        r.pct = total === 0 ? 0 : r.qty / total;
+        cum += r.pct;
+        r.cum = cum;
+        r.proj = cum < LIMIT_A ? 'A' : (cum < LIMIT_B ? 'B' : 'C');
+        if (r.proj !== prev) { run++; prev = r.proj; }
+        r.run = run;            // the original's group: a run of one code
+    });
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+let _loadToken = 0;
+
+async function loadLookups() {
+    const res = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('Report precision', `
+            SELECT syskey, sysvalue FROM sysproperties
+            WHERE syskey IN ('REPORT_DECIMAL_COST_PRECISION', 'REPORT_DECIMAL_QTY_PRECISION')`)
+    ]);
+    const ok = i => res[i].status === 'fulfilled' ? res[i].value : [];
+    S.company = (ok(0)[0] || {}).name || '';
+    ok(1).forEach(r => {
+        const n = parseInt(r.sysvalue, 10);
+        if (!Number.isInteger(n) || n < 0 || n > 9) return;
+        if (r.syskey === 'REPORT_DECIMAL_COST_PRECISION') COST_DP = n;
+        if (r.syskey === 'REPORT_DECIMAL_QTY_PRECISION') QTY_DP = n;
+    });
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    document.getElementById('banner').textContent = '';
+    document.getElementById('loading').classList.add('show');
+    setStatus('Loading…');
+    let rows;
+    const cap = S.noCap ? 0 : undefined;           // FBLib.RowCap: the 10,000 most-used parts unless Load all
+    try { rows = await q('ABC', FBLib.RowCap.sql(buildSQL(F), cap)); }
+    catch (e) {
+        if (tok !== _loadToken) return;
+        document.getElementById('loading').classList.remove('show');
+        document.getElementById('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        FBLib.RowCap.notice({ before: document.getElementById('appView'), capped: false });
+        S.rows = []; S.total = 0; S.loadedAt = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    if (tok !== _loadToken) return;
+    document.getElementById('loading').classList.remove('show');
+    // Each part's code depends only on the parts above it and on the
+    // all-parts total, so a cap keeps the codes shown exact: the cut is the
+    // least-used tail.
+    const capped = FBLib.RowCap.apply(rows, cap);
+    S.capped = capped.capped;
+    FBLib.RowCap.notice({ before: document.getElementById('appView'), capped: capped.capped, limit: capped.limit, what: 'parts',
+                          onLoadAll: () => { S.noCap = true; loadAll(); } });
+    S.total = capped.rows.length ? num(capped.rows[0].totalqty) : 0;
+    S.rows = capped.rows.map(r => ({
+        id: Number(r.partid), part: r.partnum || '', desc: r.partdesc || '', cur: String(r.currentcode || '').trim(),
+        qty: num(r.qty), uom: r.uomcode || '',
+        avg: num(r.avgcost), std: num(r.stdcost), fifo: numOrNull(r.fifocost), lifo: numOrNull(r.lifocost)
+    }));
+    project(S.rows, S.total);
+    S.collapsed = new Set();
+    S.loadedAt = new Date();
+    render();
+}
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+
+// ============================================================================
+//  MODEL + TABLE
+// ============================================================================
+const costOf = r => r[methodOf(F).col];
+const changed = r => r.cur.toUpperCase() !== r.proj;
+const shownRows = () => (F.changed ? S.rows.filter(changed) : S.rows);
+
+// The original's columns, in its order, then in the user's order
+// (FBLib.RptCols). Cumulative % is an optional addition.
+function cols() {
+    const base = [
+        { key: 'part', label: 'Part #',      w: 110 },
+        { key: 'desc', label: 'Description', w: 250 },
+        { key: 'cur',  label: 'Current',     w: 64, ctr: true, tip: 'The part\'s ABC code now' },
+        { key: 'proj', label: 'Projected',   w: 72, ctr: true, tip: 'The code this usage gives: A under 80% running total, B under 95%, then C' },
+        { key: 'qty',  label: 'Qty Used',    w: 90, num: true },
+        { key: 'uom',  label: 'UOM',         w: 50 },
+        { key: 'cost', label: 'Part Cost',   w: 90, num: true, tip: methodOf(F).label + ' per unit' },
+        { key: 'pct',  label: '% of Total',  w: 84, num: true, tip: 'Qty Used ÷ the usage of all parts in the range' }
+    ];
+    if (F.cum) base.push({ key: 'cum', label: 'Cumulative %', w: 96, num: true, tip: 'Running total of % of Total down the usage order, this part included' });
+    return COLS ? COLS.arrange(base) : base;
+}
+const cellCls = c => (c.num ? 'num-cell' : (c.ctr ? 'ctr-cell' : ''));
+const headRow = cs => '<tr>' + cs.map(c =>
+    `<th data-col="${c.key}" class="${cellCls(c)}" style="min-width:${c.w}px"${c.tip ? ` title="${esc(c.tip)}"` : ''}>${esc(c.label)}</th>`).join('') + '</tr>';
+const rowCells = (cs, cell) => cs.map(c => `<td class="${cellCls(c)}">${cell[c.key] ?? ''}</td>`).join('');
+// Heading-click sort (FBLib.RptCols): parts sort within their code group;
+// the groups keep the usage order their codes come from.
+const sortVal = (r, k) => ({ part: r.part, desc: r.desc, cur: r.cur, proj: r.proj, qty: r.qty, uom: r.uom,
+                             cost: costOf(r), pct: r.pct, cum: r.cum })[k];
+const sortLines = list => (COLS && COLS.sort() ? list.slice().sort((a, b) => COLS.compare(a, b, sortVal)) : list);
+// A group / total row: `identity` spans the first run of columns that carry
+// none of this row's figures, and each figure sits in its own column,
+// whatever order the user has put the columns in.
+function totalsCells(cs, identity, figs, labelCls) {
+    const has = c => figs[c.key] != null && figs[c.key] !== '';
+    let a = cs.findIndex(c => !has(c));
+    if (a < 0) a = 0;
+    let b = a + 1;
+    while (b < cs.length && !has(cs[b])) b++;
+    const cell = c => `<td class="${cellCls(c)}">${figs[c.key] ?? ''}</td>`;
+    return cs.slice(0, a).map(cell).join('') + `<td colspan="${b - a}"${labelCls ? ` class="${labelCls}"` : ''}>${identity}</td>` + cs.slice(b).map(cell).join('');
+}
+
+// Groups: runs of one projected code in the usage order (the original's
+// group), over the rows shown.
+function groups() {
+    const out = [];
+    shownRows().forEach(r => {
+        let g = out.length && out[out.length - 1].run === r.run ? out[out.length - 1] : null;
+        if (!g) { g = { key: r.proj + r.run, code: r.proj, run: r.run, rows: [], cost: 0, pct: 0 }; out.push(g); }
+        g.rows.push(r);
+        const c = costOf(r);
+        if (c !== null && c !== undefined) g.cost += c;     // the original's Sum skips a blank cost
+        g.pct += r.pct;
+    });
+    return out;
+}
+// The original's group footer: the sum of the unit costs and of % of Total.
+const groupFigs = g => ({ cost: esc(fmtCost(g.cost)), pct: esc(fmtPct(g.pct)) });
+
+function groupRow(cs, g, forPrint) {
+    const open = !S.collapsed.has(g.key);
+    const id = '<div class="rpt-grp-inner">' + (forPrint ? '' : `<span class="rpt-toggle">${open ? '▼' : '▶'}</span>`) +
+        `<span class="abc-code">${esc(g.code)}</span>` +
+        `<span class="rpt-grp-meta">${esc(plural(g.rows.length, 'part') + ' · ' + CODE_RULE[g.code])}</span></div>`;
+    return `<tr class="rpt-grp" data-grp="${esc(g.key)}">${totalsCells(cs, id, F.totals ? groupFigs(g) : {})}</tr>`;
+}
+// Group headers off, totals on: the original's footer row on its own.
+const gtotRow = (cs, g) => `<tr class="abc-gtot">${totalsCells(cs, 'Totals:', groupFigs(g), 'abc-gtot-lbl')}</tr>`;
+
+function lineRow(cs, r, forPrint) {
+    const projTip = changed(r) ? `Current ${r.cur || '(none)'} → projected ${r.proj}` : 'Unchanged';
+    return '<tr>' + rowCells(cs, {
+        part: openLink('Part', r.part, r.desc), desc: cut(r.desc),
+        cur: r.cur ? esc(r.cur) : (forPrint ? '' : '<span class="abc-cur-none">–</span>'),
+        proj: `<span class="${changed(r) ? 'abc-chg' : ''}" title="${esc(projTip)}">${esc(r.proj)}</span>`,
+        qty: esc(fmtQty(r.qty)), uom: esc(r.uom), cost: esc(fmtCost(costOf(r))),
+        pct: esc(fmtPct(r.pct)), cum: esc(fmtPct(r.cum))
+    }) + '</tr>';
+}
+function bodyRows(cs, forPrint) {
+    const out = [];
+    groups().forEach(g => {
+        if (F.groupHdr) {
+            out.push(groupRow(cs, g, forPrint));
+            if (S.collapsed.has(g.key)) return;
+        }
+        sortLines(g.rows).forEach(r => out.push(lineRow(cs, r, forPrint)));
+        if (!F.groupHdr && F.totals) out.push(gtotRow(cs, g));
+    });
+    return out;
+}
+// App view only (the original prints no grand total).
+function footRow(cs) {
+    const rows = shownRows();
+    const pct = rows.reduce((s, r) => s + r.pct, 0);
+    let label = 'Total — ' + plural(rows.length, 'part') + (F.changed ? ' whose code would change' : '');
+    if (S.capped) label += F.changed ? ' (of the ' + S.rows.length.toLocaleString() + ' most used)' : ' (the most used)';
+    return `<tr>${totalsCells(cs, esc(label), { pct: esc(fmtPct(pct)) })}</tr>`;
+}
+
+// Long reports paint in chunks as the user scrolls.
+const CHUNK = 600;
+let _paint = { html: [], shown: 0 };
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+function filterText() {
+    return [rangeText(F), usageText(F), 'Costing method: ' + methodOf(F).label,
+            F.changed ? 'Only parts whose code would change' : ''].filter(Boolean).join(' · ');
+}
+// The usage the percentages are of, and the codes' spread.
+function summaryText() {
+    if (!S.loadedAt) return '';
+    const n = { A: 0, B: 0, C: 0 }, moves = S.rows.filter(changed).length;
+    S.rows.forEach(r => { n[r.proj]++; });
+    return 'Usage ' + fmtQty(S.total) + ' · A ' + n.A.toLocaleString() + ' · B ' + n.B.toLocaleString() +
+        ' · C ' + n.C.toLocaleString() + ' · ' + plural(moves, 'change');
+}
+function noteText() {
+    if (!S.loadedAt || !S.rows.length) return '';
+    if (S.total !== 0) return '';
+    const why = !F.sales && !F.mfg ? 'Neither usage type is checked'
+        : 'No ' + (F.sales && F.mfg ? 'sales or manufacture' : (F.sales ? 'sales' : 'manufacture')) + ' usage in this date range';
+    return why + ', so every part is 0% and projected A, as the standard report shows it.';
+}
+
+function render(keepScroll) {
+    document.getElementById('abcNote').textContent = noteText();
+    document.getElementById('expandWrap').style.display = S.view === 'pivot' || !F.groupHdr ? 'none' : '';
+    if (S.view === 'pivot' && PIVOT) {
+        PIVOT.render();
+        setStatus([S.company, rangeText(F), 'pivot', summaryText()].filter(Boolean).join(' · '));
+        if (PDF) PDF.refresh();
+        return;
+    }
+    const tbl = document.getElementById('rpt');
+    const wrap = document.getElementById('rptWrap');
+    const top = wrap.scrollTop;
+    const cs = cols();
+    const rows = shownRows();
+    tbl.querySelector('thead').innerHTML = headRow(cs);
+    _paint = { html: bodyRows(cs, false), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    while (keepScroll && _paint.shown < _paint.html.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+    tbl.querySelector('tfoot').innerHTML = rows.length ? footRow(cs) : '';
+    tbl.style.display = rows.length ? '' : 'none';
+    document.getElementById('rptEmpty').textContent = rows.length || !S.loadedAt ? ''
+        : (S.rows.length ? 'No part\'s code would change.' : 'No active parts.');
+    wrap.scrollTop = keepScroll ? top : 0;
+    setStatus([S.company, rangeText(F), summaryText()].filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the pages as the standard ABC Report prints them:
+//  Letter portrait, the company / title on every page (the original's page
+//  header), 9pt lines, the group rows (with their totals) or the
+//  "Totals:" rows, no grand total (the original has none).
+// ============================================================================
+let PDF = null;
+const PDF_CSS =
+    '.fbdoc-rpt-tbl .ctr-cell{text-align:center}' +
+    '.fbdoc-rpt-tbl .abc-chg{color:inherit;font-weight:inherit;background:none;padding:0;min-width:0}' +
+    '.fbdoc-rpt-tbl .abc-code{font-weight:700}' +
+    '.fbdoc-rpt-tbl tr.abc-gtot td{font-weight:700;border-top:1pt solid #000;padding-top:2pt}' +
+    '.fbdoc-rpt-tbl tr.abc-gtot td.abc-gtot-lbl{text-align:right}';
+// Show time stamp off: the page footer keeps "Page X of Y" only.
+const NO_STAMP_CSS = '.fbdoc-rpt-foot>span:first-child{visibility:hidden}';
+function docSpec() {
+    if (!S.loadedAt) return null;
+    const css = PDF_CSS + (F.stamp ? '' : NO_STAMP_CSS);
+    if (S.view === 'pivot' && PIVOT) {
+        const p = PIVOT.pdfSpec();
+        return { company: S.company, title: 'ABC Report', titleEveryPage: true,
+                 subtitle: [filterText(), pivotText()],
+                 head: p.head, rows: p.rows, foot: p.foot, empty: 'No active parts.', css, fontPt: 9 };
+    }
+    const cs = cols();
+    return {
+        company: S.company, title: 'ABC Report', subtitle: filterText(), titleEveryPage: true,
+        head: headRow(cs), rows: bodyRows(cs, true), foot: '',
+        empty: S.rows.length ? 'No part\'s code would change.' : 'No active parts.', css, fontPt: 9
+    };
+}
+
+// ============================================================================
+//  PIVOT VIEW (FBLib.Pivot) — parts, Qty Used, % of Total, Part Cost or
+//  Usage Value by any two of current code, projected code, part and UOM.
+//  Current × Projected (the default) is the code-change matrix. The
+//  report's own grouping stays in the Table view.
+// ============================================================================
+let PIVOT = null, COLS = null;
+const CODE_ORDER = ['A', 'B', 'C'];
+const PIVOT_FIELDS = [
+    { key: 'cur', label: 'Current code' }, { key: 'proj', label: 'Projected code', order: CODE_ORDER },
+    { key: 'part', label: 'Part #' }, { key: 'desc', label: 'Description', dim: false }, { key: 'uom', label: 'UOM' },
+    { key: 'qty', label: 'Qty Used', type: 'qty' }, { key: 'pct', label: '% of Total', type: 'number' },
+    { key: 'cost', label: 'Part Cost', type: 'money' }, { key: 'value', label: 'Usage Value', type: 'money' }
+];
+const pivotRows = () => shownRows().map(r => {
+    const c = costOf(r);
+    return { cur: r.cur || '(none)', proj: r.proj, part: r.part, desc: r.desc, uom: r.uom, qty: r.qty, pct: r.pct,
+             cost: c, value: c === null || c === undefined ? null : r.qty * c };
+});
+function pivotText() {
+    const c = PIVOT.config(), lbl = k => (PIVOT_FIELDS.find(x => x.key === k) || {}).label || '';
+    const m = c.measure === '__count__' ? 'Parts'
+        : ({ sum: 'Total', count: 'Count of', avg: 'Average', min: 'Lowest', max: 'Highest' }[c.agg] + ' ' + lbl(c.measure));
+    return 'Pivot: ' + m + ' by ' + [lbl(c.rowDim), lbl(c.rowDim2)].filter(Boolean).join(' + ') + (c.colDim ? ' × ' + lbl(c.colDim) : '');
+}
+function setView(v, persist) {
+    S.view = v === 'pivot' && PIVOT ? 'pivot' : 'table';
+    document.getElementById('viewSel').value = S.view;
+    document.getElementById('rptWrap').style.display = S.view === 'pivot' ? 'none' : '';
+    document.getElementById('pivotHost').style.display = S.view === 'pivot' ? '' : 'none';
+    if (persist) _saveUserKeys({ view: S.view });
+    render(false);
+}
+
+function setAllOpen(open) {
+    S.collapsed = new Set(open ? [] : groups().map(g => g.key));
+    render(false);
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    const rows = shownRows();
+    if (!rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    const sub = [S.company, filterText(), summaryText()].filter(Boolean);
+    const sheet = {
+        name: 'ABC', title: 'ABC Report', subtitle: sub,
+        cols: [{ key: 'part', label: 'Part #', w: 120, type: 'text' }, { key: 'desc', label: 'Description', w: 260, type: 'text' },
+               { key: 'cur', label: 'Current', w: 60, type: 'text' }, { key: 'proj', label: 'Projected', w: 70, type: 'text' },
+               { key: 'qty', label: 'Qty Used', w: 90, type: 'qty', noTotal: true }, { key: 'uom', label: 'UOM', w: 50, type: 'text' },
+               { key: 'cost', label: 'Part Cost (' + methodOf(F).label + ')', w: 130, type: 'money', noTotal: true },
+               { key: 'pct', label: '% of Total', w: 80, type: 'percent', noTotal: true },
+               { key: 'cum', label: 'Cumulative %', w: 90, type: 'percent', noTotal: true }],
+        rows: rows.map(r => ({ part: r.part, desc: r.desc, cur: r.cur, proj: r.proj, qty: r.qty, uom: r.uom,
+                               cost: costOf(r), pct: r.pct, cum: r.cum })),
+        totals: false
+    };
+    const sheets = [sheet];
+    if (S.view === 'pivot' && PIVOT) sheets.unshift(Object.assign(PIVOT.sheet('Pivot'), { title: 'ABC Report – ' + pivotText(), subtitle: sub }));
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'ABC_Report_' + ymd(new Date()), sheets });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's pages (fb-doc). Without fb-doc on the server, the
+// plain printout below: JxBrowser won't print the report page itself, so it
+// is built in a new window and printed there. Collapsed groups print as
+// their group row.
+function printReport() {
+    if (PDF) {
+        if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    if (!shownRows().length) { showToast('Nothing to print.', 'warn'); return; }
+    const cs = cols();
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>ABC Report</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:11pt;font-weight:700}h2{text-align:center;font-size:14pt;margin:2px 0}.sub{text-align:center;font-size:8.5pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{font-size:8pt;text-align:left;padding:3px 5px;border-bottom:1px solid #000}' +
+        'td{font-size:8pt;padding:2px 5px;vertical-align:top}.num-cell{text-align:right}.ctr-cell{text-align:center}' +
+        'tr.rpt-grp td{font-weight:700;padding-top:7px;border-bottom:1px solid #999}.rpt-grp-meta{font-weight:400;color:#555;margin-left:8px}' +
+        'tr.abc-gtot td{font-weight:700;border-top:1px solid #000}.abc-gtot-lbl{text-align:right}' +
+        'tfoot td{font-weight:700;border-top:1px solid #000}a{color:#000;text-decoration:none}' +
+        '@page{size:Letter portrait;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>ABC Report</h2><p class="sub">' + esc(filterText()) + '</p>' +
+        '<table><thead>' + headRow(cs).replace(/ style="[^"]*"/g, '') + '</thead><tbody>' + bodyRows(cs, true).join('') +
+        '</tbody></table>' +
+        (F.stamp ? '<p style="font-size:7.5pt;margin-top:8px">Printed ' + esc(new Date().toLocaleString()) + '</p>' : '') + '</body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters what everyone sees each time this report opens?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        const fRange = document.getElementById('fRange');
+        fRange.innerHTML = RANGES.map(r => `<option value="${r[0]}">${esc(r[1])}</option>`).join('');
+        // A quick range fills the dates; editing a date makes the range Custom.
+        fRange.onchange = () => {
+            const p = presetDates(fRange.value);
+            if (fRange.value !== 'custom') {
+                document.getElementById('fFrom').value = p ? p[0] : '';
+                document.getElementById('fTo').value = p ? p[1] : '';
+            }
+            applySoon();
+        };
+        ['fFrom', 'fTo'].forEach(id => document.getElementById(id).addEventListener('change', () => { fRange.value = 'custom'; applySoon(); }));
+        ['fMethod'].concat(Object.values(CHECKS)).forEach(id => document.getElementById(id).addEventListener('change', applySoon));
+        document.getElementById('resetFiltersBtn').onclick = () => { writeFilters(DEFAULT_FILTERS); applySoon(); };
+
+        // Column resize / sort / reorder, and the Pivot view (fb-lib).
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({ table: document.getElementById('rpt'),
+                                                         onSort: () => render(true), onReorder: () => render(true) });
+        if (FBLib.Pivot) PIVOT = FBLib.Pivot.mount(document.getElementById('pivotHost'), {
+            fields: PIVOT_FIELDS, rows: pivotRows, countLabel: 'Parts',
+            defaults: { rowDim: 'cur', colDim: 'proj', measure: '__count__', agg: 'sum' },
+            format: (fld, v) => (fld && fld.key === 'pct' ? fmtPct(v) : fld && fld.type === 'qty' ? fmtQty(v)
+                                 : fld && fld.type === 'money' ? fmtCost(v) : null)
+        });
+        else document.getElementById('viewSelWrap').style.display = 'none';
+        document.getElementById('viewSel').addEventListener('change', e => setView(e.target.value, true));
+        document.getElementById('resetColsBtn').onclick = () => { if (COLS) { COLS.reset(); render(false); } };
+        S.view = _resolve('view', 'table') === 'pivot' && PIVOT ? 'pivot' : 'table';
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: document.getElementById('appView'), toggleBefore: document.getElementById('exportBtn'),
+                page: { size: 'Letter', orientation: 'portrait' },
+                doc: docSpec, title: () => 'ABC Report'
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        writeFilters(savedFilters());
+        F = readFilters();
+        setView(S.view, false);
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('expandBtn').onclick = () => setAllOpen(true);
+        document.getElementById('collapseBtn').onclick = () => setAllOpen(false);
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('unpublishBtn').onclick = () => {
+            if (!confirm('Stop using company defaults for this report? Everyone goes back to their own last choices.')) return;
+            const ok = FBLib.Settings.clearCompany(['filters', 'opts']) !== false;
+            showToast(ok ? 'This report no longer has company defaults.' : 'That was not saved.', ok ? 'success' : 'error');
+        };
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        const wrap = document.getElementById('rptWrap');
+        wrap.addEventListener('scroll', () => { if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 400) appendChunk(); });
+        document.getElementById('rpt').addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (a) {
+                e.preventDefault();
+                try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+                catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+                return;
+            }
+            const g = e.target.closest('tr.rpt-grp');
+            if (!g) return;
+            const key = g.dataset.grp;
+            if (S.collapsed.has(key)) S.collapsed.delete(key); else S.collapsed.add(key);
+            render(true);
+        });
+
+        await loadLookups();
+        await loadAll();
+    } catch (e) {
+        console.error('[ABC Report] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

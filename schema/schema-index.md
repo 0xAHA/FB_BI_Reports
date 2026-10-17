@@ -201,6 +201,116 @@ Load only the file(s) relevant to the report you are building.
 
 ---
 
+## Type ID Reference
+
+### `soitem.typeId` — Sales Order Item Type
+| ID | Label |
+|---|---|
+| 10 | Sale |
+| 11 | Misc. Sale |
+| 12 | Drop Ship |
+| 20 | Credit Return |
+| 21 | Misc. Credit |
+| 30 | Discount Percentage |
+| 31 | Discount Amount |
+| 40 | Subtotal |
+| 50 | Assoc. Price |
+| 60 | Shipping |
+| 70 | Tax |
+| 80 | Kit |
+| 90 | Note |
+
+- **Credit lines (20, 21).** `postsoitem.qty` is stored **positive**, while
+  `totalPrice`, `postedTotalCost` and `unitPrice` are negative. Flip qty with
+  `IF(typeId IN (20,21), qty * -1, qty)` when a signed quantity is needed.
+- **Margins report line set.** Fishbowl's standard Margins report
+  (`SalesOrder/marginsreport.jrxml`) includes 10, 11, 12, 20, 21, 30, 31, 50
+  and 80. Shipping (60) is an opt-in; tax (70), subtotals (40) and notes (90)
+  are never included.
+- **Margin % in that report.** Totals use
+  `(SUM(price) − SUM(cost)) / SUM(price)`, and show 0 when the total price is
+  ≤ 0. A line only gets a margin when its unit price is > 0. Never average
+  per-line margins.
+
+### `part.typeId` — Part Type (`parttype`)
+| ID | Label |
+|---|---|
+| 10 | Inventory |
+| 20 | Service |
+| 21 | Labor |
+| 22 | Overhead |
+| 30 | Non-Inventory |
+| 40 | Internal Use |
+| 50 | Capital Equipment |
+| 60 | Shipping |
+| 70 | Tax |
+| 80 | Misc |
+
+Only Inventory parts (10) hold stock and need a stock pick. Labour,
+non-inventory and similar parts still appear as WO pick lines with no
+stock: leave them out of pickability, and finish them without a source tag.
+
+### `woitem.typeId` — Work Order Item
+| ID | Meaning |
+|---|---|
+| 10 | Finished good (the part the WO makes) |
+| 20 | Raw good (consumed) |
+
+A WO usually has one finished-good row, but can have more: in demodb, 94 WOs
+have 118 type-10 rows. Quantities are `qtyTarget` / `qtyUsed` in
+`woitem.uomId`; convert to the part's stock UOM through `uomconversion`
+before comparing with tag quantities.
+
+### `parttracking.typeId` — Tracking Type (`parttrackingtype`)
+| ID | Label |
+|---|---|
+| 10 | Text (lot / batch) |
+| 20 | Date |
+| 30 | Expiration Date |
+| 40 | Serial Number |
+| 50 | Money |
+| 60 | Quantity |
+| 70 | Count |
+| 80 | Checkbox |
+
+Lot and date values carry over FIFO from the source tag. Serial numbers
+need an explicit choice.
+
+### `pick.num` prefixes
+`S` sales order, `P` purchase order, `T` transfer order, `W` work order
+(`W` + `wo.num`, e.g. `W20270:001`), `G` grouped pick. A WO line links to its
+pick through `pickitem.woItemId = woitem.id`, so use that rather than
+building `'W' + wo.num` — grouped picks don't follow the pattern.
+
+### `inventorylog.typeId` — Inventory Log Type (`inventorylogtype`)
+| ID | Name | Meaning |
+|---|---|---|
+| 10 | rcv | Receive |
+| 15 | can | Cancel a receipt |
+| 20 | shp | Ship |
+| 30 | xfr | Transfer |
+| 40 | yld | Yield (WO output) |
+| 50 | csm | Consume (WO input) |
+| 60 | adj | Generic adjust |
+| 64 | adj:inc | Adjust increase |
+| 65 | adj:dec | Adjust decrease |
+| 67 | adj:scp | Scrap |
+| 68 | adj:cyc | Cycle count (no qty change on the log row itself) |
+| 69 | adj:uom | UOM change |
+| 70 | adj:cog | COGS value adjust |
+| 71 | adj:lnd | Landed cost |
+| 72–74 | adj:trk / etrk / dtrk | Tracking change / enable / disable |
+| 80 | cm | Costing method change |
+| 90 | vd:Shp | Voided shipment |
+
+- **Inventory parts only.** `inventorylog` only has rows for Inventory parts
+  (`part.typeId = 10`). Usage of other part types comes from
+  `woitem.qtyUsed`.
+- **Type 40 duplicates.** Yield (40) can duplicate rows, so exclude it when
+  rebuilding opening balances.
+
+---
+
 ## Views
 
 Fishbowl defines 49 MySQL views documented in `schema-views.sql`. The application does not use them at runtime — they exist for custom reports only.

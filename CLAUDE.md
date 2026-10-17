@@ -2,6 +2,221 @@
 
 This guide covers every built-in JavaScript function available in Fishbowl BI reports. These functions connect directly to Fishbowl's data and client, enabling interactive, data-rich reports without needing backend changes.
 
+**Guides** (in `docs/`, index in `docs/README.md`): building an app or report
+(`building-apps.md`), porting a stock iReport (`porting-ireport.md`), the
+printable-document engine fb-doc (`fb-doc.md`), the App Builder's catalog
+(`app-builder-models.md`), the launch contract (`launch-context.md`), the
+dashboards (`dashboards-review.md`). **Skills** (`.claude/skills/`):
+`create-bi-app`, `port-ireport-report`, `add-printable-view`,
+`extend-app-builder-model`, `fishbowl-bi-save-error`. Every app must run
+standalone in the plain BI Reports viewer; report_btn (Apps menus, launch,
+document output) is an optional extra.
+
+---
+
+## Importable JSON exports — only when asked
+
+**Do not regenerate or commit JSON exports after editing a report.** Produce one
+only when the user asks for it specifically. The exports were a committed
+`Deployed/` folder regenerated after every edit; it was dropped because it was
+not earning its place.
+
+When one is requested:
+
+```
+node tools/deploy/build-deployed.js
+```
+
+- It rebuilds **every** export into `Deployed/` (no single-file mode); hand over
+  the one asked for. `Deployed/` is gitignored — never commit it.
+- Filenames are `<name>-<type>.json`; type is `Page` (.htm), `Script` (.js),
+  `Style` (.css).
+- The envelope is Jackson's `DefaultPrettyPrinter` output, **not**
+  `JSON.stringify`. `tools/deploy/fbwrap.js` owns it; don't hand-roll it.
+- **Names key the import.** A name matching a live record UPDATES it; a new name
+  CREATES a duplicate. The recovered live names live in `DEPLOYED_NAMES` in the
+  generator — do not "tidy" them. Say which case the requested export is.
+  `tools/deploy/README.md` has the full contract and the known caveats.
+
+---
+
+## Report identity & build stamps
+
+Every production report starts its `<head>` (right after `<meta charset>`) with
+its module association, its folder, its origin (system apps only), its
+description and an identity block:
+
+```html
+<meta charset="UTF-8">
+<meta name="fb-launch" content="SALES">
+<meta name="fb-folder" content="Dashboards">
+<meta name="fb-origin" content="system">
+<meta name="description" content="Dashboard tile: open sales orders.">
+<script>
+    window.FB_REPORT = {
+        key:   'cdx.bi.openSalesOrders',   // storage-key prefix
+        name:  'Open Sales Orders',        // Fishbowl record name (null = unpublished)
+        build: '2026.09.24-2a6c74c'        // @fb-build
+    };
+</script>
+```
+
+- **The `fb-launch` tag is the report's module association.** Its content is
+  module keys (`SO`, `PO`, `RECEIPT`, …) and/or client menu-group keys (`SALES`,
+  `PURCHASING`, `MATERIALS`, `MANUFACTURING`, `ACCOUNTING`, `SETUP`, `GENERAL`,
+  `REPORTING`, `INTEGRATIONS`). It only decides which modules' **Reports ›
+  Apps** menus list the report (report_btn); it is not a folder. Write the tag
+  exactly once in a page and never anywhere else: hosts read the first
+  `name="fb-launch"` they find, so not in comments, strings or inlined scripts.
+  `docs/launch-context.md` §1 and §3 have the keys.
+- **The `fb-folder` tag is the report's folder:** one name, no sub-folders.
+  It decides where the report sits in the App editor's Apps panel and the App
+  Library (the Report Launcher, renamed 2026-10-13), and nothing else. Use a
+  folder of Fishbowl's own report tree (Reporting › Reports › Company:
+  `Accounting`, `Customer`, `Inventory`, `Part`, `Product`, `Sales Order`,
+  `Purchase Order`, `Receiving`, `Picking`, `Ship`, `Work Order`,
+  `Manufacture Order`, …), so an iReport port sits where its stock report
+  lives; otherwise `Dashboards`, `Custom` (client work) or `Other`. A page
+  without the tag is *Unfiled*. The same write-once rule as `fb-launch`
+  applies; it goes on the line after the `fb-launch` tag. The Apps panel's
+  drag-and-drop and *Move to folder* rewrite it, or add it to pages without one.
+- **The `fb-origin` tag marks a system app:** `content="system"` for an app
+  that ships with Fishbowl. Today that means every iReport port, every
+  `Dashboards/` page (including Individual Pages) and the Paperwork POC
+  replicas. Anything else is custom, and needs no tag (`content="custom"`
+  says it explicitly, and is what a copy of a system app gets). The App
+  editor locks a system app's code, name, description, folder and Apps
+  menus, even for admin. Users duplicate it to change it, and Delete offers
+  to deactivate it instead; Active, Published, gadget and access stay
+  changeable. The Apps panel draws system apps black and custom ones green,
+  as Fishbowl's report tree does. The editor won't save a page newly marked
+  system (it offers to save it as custom), so system apps reach Fishbowl
+  only through this repo's deploy. The same write-once rule applies; it goes
+  on the line after the `fb-folder` tag. A new report is custom: leave the
+  tag out.
+- **The description** is one short sentence. Deploy and publish copy it into the
+  Fishbowl and SharePoint description wherever that is empty or only repeats the
+  name; a description written in Fishbowl is kept. The App Library shows it on
+  the tile and in full in the tile's hover tooltip.
+
+- **`key`** is the prefix of every key the report stores (settings, saved
+  views, shared payloads). Build them as `FB_REPORT.key + '.user.v1'` etc.,
+  never as a literal. `FBLib.Settings.init` defaults `userKey`/`masterKey` from
+  it. A user who copies a report in Fishbowl changes this one line so the copy
+  gets its own storage. Max 31 characters, because userproperties.userKey is
+  varchar(41) and the longest suffix is `.master.v1`. Keys shared on purpose
+  across reports (`cdx.bi.fbconn.v1`) or legacy migration sources stay literal.
+  `key: null` means the report stores nothing.
+- **`build`** is `<date content last changed>-<content hash>`, written by
+  `tools/stamp/stamp.js`. **Never edit it by hand.** The first line containing
+  `@fb-build` holds the stamp. fb-lib (`FBLib.BUILD`), fb-mfg (`FBMfg.BUILD`)
+  and fb-styles (`--fb-styles-build`) carry their own stamps, and fb-lib logs
+  both builds at init.
+- **Stamping runs automatically** from a Claude Code PostToolUse hook
+  (`.claude/settings.json`) and a git pre-commit hook (`tools/githooks`). To
+  enable the git hook once per clone, run
+  `git config core.hooksPath tools/githooks`. Manual commands:
+  `node tools/stamp/stamp.js` (all files), `--check` (verify only), `--list`.
+- **`name`** is the report's Fishbowl record name: a **plain name, no
+  `- Folder -` prefix** (prefixes were dropped on 2026-10-12; the folder is the
+  `fb-folder` tag). Publishing and deploying (below) find the report's
+  copies by it. `null` means the report isn't published or deployed anywhere.
+  Don't "tidy" an existing name: the name identifies the record, so renaming
+  creates a duplicate on the next import. When a rename is wanted, rename every
+  copy in place: `fbdeploy.js --rename <old> --to <new>` in Fishbowl and
+  `publish.js --rename <old> <file>` on SharePoint.
+- **New reports** start from a template in `Template/`: `List_Report_Template.htm`
+  (rows, groups, totals), `Record_Document_Template.htm` (one record) or
+  `Form_Tool_Template.htm` (a tool that writes); each has the block
+  (`docs/building-apps.md`, skill `create-bi-app`). **Ask the user what the
+  report should be named, which modules' Apps menus should list it (normally
+  none: only paperwork documents), and which folder it goes in** before
+  creating it. Set `name` to that, name the file after it, set the
+  `fb-folder` tag (and `fb-launch` only when asked) and write a one-line description. Give the report a unique key and leave `build` as `'UNSTAMPED'`;
+  the next write stamps it. Its first write also asks where it should be
+  deployed (see *Where an edit goes*).
+
+## Where an edit goes: SharePoint, Fishbowl, both or neither
+
+The after-edit hook (`tools/hooks/after-edit.js`, wired in
+`.claude/settings.json`) stamps the file, then can send it to two places:
+the shared SharePoint folder (`publish.js`, below) and the local Fishbowl
+server (`fbdeploy.js`, below). **Which ones is the user's decision, per file**,
+recorded in the gitignored `tools/deploy/targets.local.json` as `fishbowl`,
+`sharepoint`, `both` or `none`.
+
+- **Ask before the first deploy.** A file with no decision goes **nowhere**.
+  Its first edit makes the hook hand you the question. **Ask with
+  AskUserQuestion** whether every edit should go to Fishbowl, SharePoint,
+  both or neither, grouping any files that are waiting; the hook offers only
+  the targets configured on this machine. If SharePoint is picked for a
+  report that has no copy there yet, also ask which folder (the hook lists
+  them). Record the answer with
+  `node tools/deploy/targets.js <fishbowl|sharepoint|both|none> "<file>" [--folder "<folder>"]`;
+  it pushes the file to the chosen targets straight away.
+- **Ask again before a Fishbowl overwrite** (see below). `--force` never runs
+  without a yes for that file.
+- To change an answer, run `targets.js` again; `--list` shows them all. A
+  target needs a record name: `FB_REPORT.name` for a report, the fixed or file
+  name for `scripts/*`. A report with `name: null` is never asked about.
+
+## Publishing to the shared BI Reports folder
+
+Published reports live as Fishbowl JSON exports in the SharePoint
+"BI Reports" library (synced locally; the path is in the gitignored
+`tools/deploy/publish.local.json`). The owner arranges its folders.
+`tools/deploy/publish.js` **never picks a folder**:
+
+- it searches the folder **recursively** for a `<name>-<Type>.json` whose
+  record name equals the report's `FB_REPORT.name` (shared scripts use their
+  fixed names: `fb-lib`, `fb-mfg`, `fb-styles`);
+- a match is overwritten **in place** with the freshly wrapped source, and
+  keeps its published description. With no match, it creates the first copy
+  only in an existing sub-folder the user named (`--folder`, which
+  `targets.js` passes on); it never creates folders.
+- The hook publishes files whose target includes SharePoint, and reports each
+  publish in a one-line message. Edits made outside Claude Code publish with
+  `node tools/deploy/publish.js <file>` (`--all` skips files the user kept off
+  SharePoint; `--list`, `--folders`, `--dry`).
+- Publishing an edit means consultants can import it from that folder
+  straight away, so shared-asset order still matters: publish fb-styles, then
+  fb-lib, then the reports that depend on them.
+
+## Deploying to the local Fishbowl server
+
+`tools/deploy/fbdeploy.js` writes a source straight into the dev server's
+tables (`biscript`, plus `bireport` for a page) over REST, so the next time
+the report opens in the client it runs the new code. The server and login
+live in the gitignored `tools/deploy/fishbowl.local.json`; with no file it
+does nothing. The hook deploys files whose target includes Fishbowl, after
+the publish, and updates only records that already exist (the `targets.js`
+answer creates them).
+
+- **Ask again before an overwrite.** The hook overwrites a record only when
+  Fishbowl still holds exactly what the tool last wrote. Otherwise (edited in
+  the BI editor since, or never deployed from here) it leaves the record alone
+  and reports that confirmation is needed. **Ask the user**, and only on a yes
+  run `node tools/deploy/fbdeploy.js --force "<file>"`, which first backs the
+  Fishbowl copy up to `tools/deploy/backups/`. Never pass `--force` without a
+  yes for that file.
+- **The endpoint's limits.** It needs the sysproperty `FbPartnerApi = true`
+  (403 otherwise). It accepts SELECT, UPDATE and INSERT; **DELETE is
+  rejected**, so this tool can't remove a record or revoke access; do both in
+  the client. Its writes skip Fishbowl's `_aud` history, and the response
+  doesn't confirm them, so every write is read back and hash-compared.
+- **Access.** A page created this way has no `bireportaccess` rows, so only
+  admins see it. `--access "Sales,Warehouse"` (or `all`) adds View rows. That
+  grants permissions, so run it only when the user asks for it.
+- **Built pages** (source with `<!-- @inline-script … -->` markers and a
+  `build.js` beside it; none at present: the Paperwork POC's were archived on
+  2026-10-15 and its documents now include the shared `fb-doc`) ship their built `dist/` page,
+  and an edit to an inlined file such as `fb-doc.js` redeploys every opted-in
+  page built from it (`tools/deploy/built.js`). A variant that exists only in
+  `dist/` takes its target on the dist path.
+- Deploy shared assets in the same order as publishing: fb-styles, then fb-lib,
+  then the reports. Other commands: `--status` (repo vs Fishbowl), `--create`,
+  `--dry`. Setup and the full contract are in `tools/deploy/README.md`.
+
 ---
 
 ## What Is a BI Report?
@@ -56,6 +271,8 @@ Every report should start from this skeleton:
 - SQL queries are **read-only** — only `SELECT` is allowed
 - All built-in functions (listed below) are synchronous except `runQueryAsync`, which returns a `Promise`
 - The report runs in the context of the logged-in user — `getUser()`, `hasUserAccess()`, and `getLocationGroupList()` all reflect that user's account
+- **Async loads can overlap.** If a filter changes while a query is in flight, the older result can arrive last and paint over the newer one. Capture a token before each `await` and drop the result when a newer load has started (`ctx.stale()` in `Dashboards/Sales_Dashboard_v1.2.htm`'s `doRender` is the pattern).
+- **There are no browser dev tools in the client.** Debug through an in-page console (`FBLib.Common.mountDebugDrawer` / `debugLog`); a local run checks syntax and logic, not runtime behaviour.
 
 ---
 
@@ -203,7 +420,7 @@ const address = getCompanyAddress(1, true);
 Opens a Fishbowl module in the client and optionally navigates to a specific record.
 
 - `moduleName` — the internal module name (see table below — **these are not always the same as what you see in the client menu**)
-- `item` — an order number or identifier to navigate to (optional)
+- `item` — an order number or identifier to navigate to (optional; format varies by module — see notes below)
 
 The module names are internal identifiers. Some differ from the label shown in the Fishbowl client UI:
 
@@ -231,6 +448,31 @@ openModule("Part", "WIDGET-A");
 ```
 
 > This is great for making clickable links in a report that jump the user to the relevant record.
+
+**Opening Picks**
+
+Pass the pick number directly as the `item` argument:
+
+```js
+openModule("Picking", "S10010");
+openModule("Picking", "W1024:001");
+openModule("Picking", "T5");
+```
+
+**Opening Receipts**
+
+Receipts are looked up by the originating order, not by receipt ID. Pass a string whose first character is a one-letter order-type prefix and whose remaining characters are the order number:
+
+| Prefix | Order type |
+|---|---|
+| `S` | Sales Order |
+| `P` | Purchase Order |
+| `T` | Transfer Order |
+
+```js
+openModule("Receiving", "S10042");
+openModule("Receiving", "P5001");
+```
 
 ---
 
@@ -319,21 +561,31 @@ const report = getHighValueReport("part", 55);
 #### `getAutoPo(vendorId, locationGroupId, qbClassId, showVendorPartNumber, includeNoRopOul, alwaysManufacture, startDate, endDate)`
 Returns the Auto PO calculation data — the same data used by the Auto PO wizard. Returns a JSON string of an array.
 
-- Dates should be in `"YYYY-MM-DD"` format
+- **Dates must be `"YYYY-MM-DD HH:MM:SS"`.** The client parses them with
+  `yyyy-MM-dd HH:mm:ss` (`Util.parse(…, 4)` in `BiBrowser`). Any other string,
+  a bare `"YYYY-MM-DD"` included, fails to parse silently and the engine runs
+  with **no date range**. Send `"… 00:00:00"` for the start and `"… 23:59:59"`
+  for the end.
 - Any ID parameter can be `null` to include all
+- It always lists **every vendor's** parts: the stock Auto PO report's
+  "Only show default parts for vendor" option has no argument here, so a
+  report that needs it must filter the rows itself
+  (`iReport_Ports/PurchaseOrder/AutoPO.htm` does).
 - **Field names are `snake_case`** (e.g., `part_num`, `vendor_name`, `qty_suggested`, `last_cost`) — the data is serialized with `LOWER_CASE_WITH_UNDERSCORES` naming
 
 ```js
-const poData = JSON.parse(getAutoPo(null, 1, null, false, true, false, "2025-01-01", "2025-12-31"));
+const poData = JSON.parse(getAutoPo(null, 1, null, false, true, false, "2025-01-01 00:00:00", "2025-12-31 23:59:59"));
 ```
 
 ---
 
 #### `getAutoMo(startDate, endDate, isIncludeNoRop?, isIncludeConfigurable?, locationGroupId?, qbClassId?)`
 Returns the Auto MO calculation data. Returns a JSON string of an array. Field names are also `snake_case` for the same reason.
+Its dates follow the same rule as `getAutoPo`: `"YYYY-MM-DD HH:MM:SS"`, or the
+date is silently ignored.
 
 ```js
-const moData = JSON.parse(getAutoMo("2025-01-01", "2025-12-31", true, false, 1, -1));
+const moData = JSON.parse(getAutoMo("2025-01-01 00:00:00", "2025-12-31 23:59:59", true, false, 1, -1));
 ```
 
 ---
@@ -349,12 +601,81 @@ runPickStatusHelper(200);
 
 ---
 
+### REST API
+
+#### `runRestApiAsync(request)`
+Sends an async HTTP request to the Fishbowl Advanced REST API and returns the parsed response. This is the preferred way to read or write data through the REST layer from a BI report — it uses the same authenticated connection the client already has open.
+
+> **Requires the REST connection.** This function throws if the client is connected via the legacy EVE socket only (i.e., `FishbowlRestClient` is null). In practice this means the server must be running with REST enabled, which is the default for current installations.
+
+The `request` argument is an object with the following properties:
+
+| Property | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `path` | string | yes | — | API path, e.g. `"/api/sales-orders"` |
+| `method` | string | no | `"GET"` | HTTP verb: `"GET"`, `"POST"`, `"PUT"`, `"DELETE"` |
+| `queryParameters` | `[[key, value], ...]` | no | `[]` | Array of `[string, string]` pairs appended as query params |
+| `body` | string | no | `null` | Request body (JSON string for most endpoints) |
+| `contentType` | string | no | `"application/json"` | `Content-Type` header value |
+| `timeout` | number | no | `30000` | Timeout in milliseconds |
+
+Returns a parsed JavaScript object if the response body is valid JSON, or a raw string otherwise. On HTTP errors, the Promise rejects with an object containing `message` and `status` fields.
+
+```js
+// GET with query parameters
+const result = await runRestApiAsync({
+  path: '/api/sales-orders',
+  queryParameters: [['soNumber', 'SO-10042']]
+});
+console.log(result);
+
+// POST with a JSON body
+const created = await runRestApiAsync({
+  method: 'POST',
+  path: '/api/sales-orders',
+  body: JSON.stringify({ customerName: "Acme Corp", items: [] })
+});
+
+// Error handling
+try {
+  const data = await runRestApiAsync({ path: '/api/parts', queryParameters: [['num', 'WIDGET-A']] });
+} catch (err) {
+  console.error(err.message, err.status);
+}
+```
+
+> Call `runRestApiAsync({})` (missing `path`) to have the function throw a usage string explaining all parameters — handy during development.
+
+### REST API Reference Docs
+
+The full REST API documentation (available endpoints, request/response shapes, field definitions) is served at `http://localhost:2456/apidocs` when the Fishbowl server is running. The port may differ based on your server configuration — `2456` is the default.
+
+> **Note for AI assistants:** These docs are rendered by a JavaScript SPA and cannot be read by most AI tools. Fetching the URL only returns an empty HTML shell — the actual content never loads. To get AI help writing `runRestApiAsync` calls, **copy and paste the relevant endpoint documentation from that page directly into your prompt**. The AI can then use the exact paths, parameter names, and response shapes you provide.
+
+### Legacy API requests (writes REST doesn't cover)
+
+Some writes only exist as legacy API requests (`SaveWorkOrderRq`, `SavePickRq`,
+`ImportRq`, …). Reports reach them in two ways, both in production use:
+
+- **`runApiRequest(name, jsonString)`** — synchronous bridge over the client's
+  own session. Pass the un-enveloped request, e.g. `{"GetWorkOrderRq":{…}}`;
+  the result is a JSON string parsing to `{"GetWorkOrderRs":{"statusCode":1000,…}}`.
+  It **blocks the UI thread**.
+- **`runRestApiAsync({ method: 'POST', path: '/api/legacy/external/' + name, body: JSON.stringify({ [name]: payload }) })`**
+  — async. The response wraps the result in `FbiJson.FbiMsgsRs`.
+
+Either way, success is `statusCode === 1000` on the `…Rs` object. Check for
+an `ErrorRs` first, and surface its `statusMessage` / `Message` rather than a
+generic failure.
+
+---
+
 ### Persistent Storage
 
 These two pairs let your report save and load data between sessions.
 
 #### `saveReportData(data)` / `loadReportData()`
-Saves/loads arbitrary data tied to this specific report. Only works on saved reports (not the editor preview).
+Saves/loads arbitrary data tied to this specific report. Only works on saved reports (not the editor preview). Called in preview they raise a native dialog, "Save Report Error — Loading data is only available on reports", that `try/catch` cannot suppress. The project skill `.claude/skills/fishbowl-bi-save-error` walks through the fix (usually `FBLib.Settings` with `masterStorage: 'userProperties'` or `'none'`).
 
 ```js
 saveReportData(JSON.stringify({ lastFilter: "active" }));
@@ -396,6 +717,8 @@ const lg = loadSettings("myReport_locationGroup");
 | `getAutoPo` | Auto PO wizard data |
 | `getAutoMo` | Auto MO wizard data |
 | `runPickStatusHelper` | Recalculate pick status |
+| `runRestApiAsync` | Make async REST API calls to the Fishbowl server |
+| `runApiRequest` | Synchronous legacy API request (`SaveWorkOrderRq`, `ImportRq`, …) |
 | `saveReportData` / `loadReportData` | Persist data per report |
 | `saveSettings` / `loadSettings` | Persist settings per user |
 
@@ -451,6 +774,10 @@ Simple join views (no aggregation) use the MERGE algorithm and are safe to filte
 - **Transfer Orders use the table `xo`** — not `to`, which is a reserved SQL word.
 - **FK naming convention** — a field named `fooId` is almost always a FK to `foo.id`. e.g. `customerId` → `customer.id`, `locationGroupId` → `locationgroup.id`. Exceptions and the full pattern are documented in `schema-index.md`.
 - **Result column keys are always lowercase** — `row.statusid`, not `row.statusId`; `row.totalprice`, not `row.totalPrice`. This applies regardless of how you write column names or aliases in the SQL.
+- **Start every query with `SELECT`.** A bare top-level `WITH` is rejected; wrap it as `SELECT * FROM (WITH … SELECT …) AS t`. Prefer derived tables to CTEs anyway — CTEs can re-plan badly, and a recursive CTE roll-up has hung the Fishbowl client.
+- **Correlated `EXISTS (…)` over big tables can be slow** — a `JOIN (SELECT DISTINCT col FROM big …)` is often much faster.
+- **Scope `tag` scans to the parts you need** (`AND tag.partid IN (…)`): an unscoped tag aggregate took 1.7 s where the scoped one took 8 ms.
+- **`bit(1)` columns** (`activeFlag`, `defaultFlag`, `countedAsAvailable`, `trackingFlag`, …) come back from `runQuery` as the raw byte rendered as a one-character string, so neither `=== 1` nor truthiness works. Cast in SQL — `SELECT activeflag+0 AS activeflag` — or compare `v.charCodeAt(0) === 1`. Never compare against a literal control character: Fishbowl strips 0x00–0x1F from inline scripts when the report is saved.
 
 ---
 

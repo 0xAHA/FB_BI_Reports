@@ -1,0 +1,1213 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Dormant Customers (iReport port)
+  PATH:   iReport_Ports/Customer/DormantCustomers.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard Customer/DormantCustomers.jrxml ("Prints
+  a list of customers that have not purchased within the selected dormant
+  period"). Same source, same filters, same columns; only the presentation
+  is interactive.
+
+    Orders     Sales orders with status Estimate, Issued, In Progress,
+               Fulfilled or Closed Short (10, 20, 25, 60, 70). Voided,
+               Cancelled and Expired orders never count.
+    Last order The latest of the chosen SO date per customer: Date Issued
+               (default), Date Created, Date Scheduled (dateFirstShip) or
+               Date Completed. Orders without that date are ignored.
+    Dormant    Days Dormant = DATEDIFF(today, last order) on the server. A
+               customer is listed when it is between the Dormant Period
+               (default 90) and the Last Order Limit (default 365), inclusive.
+    Columns    Customer, Sales Rep (customer.defaultSalesmanId → username),
+               State/Province (the default Main Office address, typeId 50 →
+               state code), Last Ordered, Last SO#, Last Order Amount
+               (that SO's totalPrice), Days Dormant, Total Orders and Total
+               Spent (count and sum of totalPrice over every counted SO), and
+               an optional customer custom field. Every column can be off.
+    Filters    Customer groups, show inactive customers, sales reps,
+               states, customers, total orders > N, total spent > N (0 by
+               default, so customers whose orders total $0 or less are left
+               out, as in the original), custom field value (LIKE, % is the
+               wildcard, case-insensitive).
+    Sort       Sort by + Ascending/Descending, the original's nine choices
+               plus the custom field (default Days Dormant, ascending).
+               Ties fall back to the customer name. The query is ordered
+               the same way, so a capped result (below) is the first rows
+               in the chosen order.
+    Custom     Fishbowl fills a Custom Field parameter with
+    fields     json_unquote(json_extract(customer.customFields,'$."<id>".value'))
+               (LogicReport); this page builds the same expression from a
+               picker of the active Customer custom fields.
+
+  Layout: the REPORT chrome (fb-styles §35): 56px header, push-down filter
+  panel that applies as you change it, flat .rpt-table, sticky totals footer.
+  Table tools (fb-lib FBLib.RptCols / RowCap / Pivot): click a heading to
+  sort by it (again to reverse, a third time for the standard Days Dormant
+  ascending); it sets Sort by / Order, which stay the primary control and
+  move the heading's arrow in turn. Headings drag to reorder and resize
+  (remembered per user). A Table / Pivot view selector (customers counted,
+  or any figure totalled, by any two of sales rep, state, status, month of
+  last order and the custom field, with drill-down). One row per customer:
+  the query fetches at most 10,000 customers in the chosen sort, with Load
+  all; while capped, a sort change re-runs the query so the rows kept are
+  the first in the new order.
+  Views: the header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+  report out as pages like the original: Letter landscape by default, the
+  company / title / dormant-period lines on the first page only (the
+  original's title band), the column headings repeated on every page, the
+  rows in the chosen sort, the switched-on columns and the custom field
+  column, no totals (the original has none), "Page X of Y". Columns fit the
+  page and the font steps down from the original's 9pt when they don't. The
+  paper and the view are remembered per user. Print prints those pages in
+  either view.
+
+  Fixed while porting:
+    - Last SO# / Last Order Amount: the original found the last SO by joining
+      every SO of the customer on the date (any status), so a Voided,
+      Cancelled or Expired SO on the same date could be shown (12 customers
+      in the live data on Date Scheduled; e.g. OzHarvest, Voided 105354 and
+      Fulfilled 105395 on the same day). Only the counted statuses are
+      considered here.
+    - When two counted SOs share the last date (49 customers' last Date
+      Scheduled in the live data, 52 on Date Created, none on Date Issued),
+      the original's GROUP BY picked one at random. Here the highest SO id
+      (the most recently created) wins, every time.
+    - The original's query fails under ONLY_FULL_GROUP_BY (the server's
+      default sql_mode; Fishbowl's own JDBC sessions switch it off, so it
+      runs in the client). This one runs either way: it has no GROUP BY at
+      the top, and every join is one row per customer (a single derived
+      table for count / sum / last date, the main-office address picked by
+      lowest id).
+  Differences:
+    - Sales rep, state and customer are pick lists in place of the LIKE
+      boxes; "(No sales rep)" / "(No state)" / "(No group)" stand for the
+      original's COALESCE(…, '') / COALESCE(…, 0). State picks the states
+      present on customers' main-office addresses (the original matched the
+      state NAME against a fixed list).
+    - The custom field column is titled with the field's name when no title
+      is typed (the original: "Custom Field 1"). Date fields show as dates.
+    - Additions: click a header to sort (it sets Sort by / Order), column
+      reorder / resize, the Pivot view, record links, a totals footer
+      (customer count, total orders, total spent; the original has none),
+      Excel.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-folder" content="Customer">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="Customers with no purchases in the chosen dormant period.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipDormantCustomers',
+            name:  'Dormant Customer',
+            build: '2026.10.16-a86d4bb'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dormant Customers — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 380px; overflow: hidden; text-overflow: ellipsis; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table th { cursor: default; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        .tag-inactive { margin-left: 6px; font-size: 10px; font-weight: 600; color: #8A1E30; background: var(--acc-maroon-bg);
+            border-radius: 4px; padding: 0 5px; }
+        .rpt-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 14px; }
+        .rpt-num { width: 90px; }
+        .rpt-pair { display: flex; gap: 8px; align-items: flex-end; }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1 id="rptTitle">Dormant Customers</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <div class="rpt-viewsel" id="viewSelWrap" title="Table: the list as the standard report lays it out. Pivot: count the customers, or total any figure, by any two fields">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 5h18M3 10h10M3 15h18M3 20h10" stroke-linecap="round"/></svg>
+            <select id="viewSel">
+                <option value="table">Table</option>
+                <option value="pivot">Pivot</option>
+            </select>
+        </div>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook (the columns shown)">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages: the columns shown, in the chosen sort">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Dormant period</div>
+            <div class="rpt-pair">
+                <div>
+                    <div class="rpt-flabel">No orders in (days)</div>
+                    <input type="number" step="1" id="fDormant" class="rpt-num" title="The report looks back this many days from today">
+                </div>
+                <div>
+                    <div class="rpt-flabel">Last order within (days)</div>
+                    <input type="number" step="1" id="fLimit" class="rpt-num" title="Leaves out customers whose last order is older than this">
+                </div>
+            </div>
+            <div>
+                <div class="rpt-flabel">Last ordered is the SO's</div>
+                <select id="fBasis" title="The sales order date used to find each customer's last order"></select>
+            </div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fInactive"> Show inactive customers</label>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Customers</div>
+            <div>
+                <div class="rpt-flabel">Customer groups</div>
+                <div class="ms-container" id="grpMs">
+                    <div class="ms-trigger" id="grpMs-trigger"><span class="ms-placeholder" id="grpMs-placeholder">All groups</span></div>
+                    <div class="ms-dropdown hidden" id="grpMs-dropdown">
+                        <div class="ms-search"><input type="text" id="grpMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="grpMs-all">Select All</span><span id="grpMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="grpMs-list"></div>
+                    </div>
+                </div>
+            </div>
+            <div>
+                <div class="rpt-flabel">Customers</div>
+                <div class="ms-container" id="custMs">
+                    <div class="ms-trigger" id="custMs-trigger"><span class="ms-placeholder" id="custMs-placeholder">All customers</span></div>
+                    <div class="ms-dropdown hidden" id="custMs-dropdown">
+                        <div class="ms-search"><input type="text" id="custMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="custMs-all">Select All</span><span id="custMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="custMs-list"></div>
+                    </div>
+                </div>
+            </div>
+            <div>
+                <div class="rpt-flabel">Sales reps</div>
+                <div class="ms-container" id="repMs">
+                    <div class="ms-trigger" id="repMs-trigger"><span class="ms-placeholder" id="repMs-placeholder">All sales reps</span></div>
+                    <div class="ms-dropdown hidden" id="repMs-dropdown">
+                        <div class="ms-search"><input type="text" id="repMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="repMs-all">Select All</span><span id="repMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="repMs-list"></div>
+                    </div>
+                </div>
+            </div>
+            <div>
+                <div class="rpt-flabel">State / Province</div>
+                <div class="ms-container" id="stateMs">
+                    <div class="ms-trigger" id="stateMs-trigger"><span class="ms-placeholder" id="stateMs-placeholder">All states</span></div>
+                    <div class="ms-dropdown hidden" id="stateMs-dropdown">
+                        <div class="ms-search"><input type="text" id="stateMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="stateMs-all">Select All</span><span id="stateMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="stateMs-list"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Totals greater than</div>
+            <div class="rpt-pair">
+                <div>
+                    <div class="rpt-flabel">Total orders</div>
+                    <input type="number" step="1" id="fMinOrders" class="rpt-num">
+                </div>
+                <div>
+                    <div class="rpt-flabel">Total spent</div>
+                    <input type="number" step="1" id="fMinSpent" class="rpt-num">
+                </div>
+            </div>
+            <div class="rpt-fnote">0 (the default) leaves out customers<br>whose orders total $0 or less.</div>
+            <div class="rpt-fgroup-title" style="margin-top:6px">Sort</div>
+            <div class="rpt-pair">
+                <div>
+                    <div class="rpt-flabel">Sort by</div>
+                    <select id="fSort"></select>
+                </div>
+                <div>
+                    <div class="rpt-flabel">Order</div>
+                    <select id="fDir">
+                        <option value="asc">Ascending</option>
+                        <option value="desc">Descending</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Custom field</div>
+            <div>
+                <div class="rpt-flabel">Show field</div>
+                <select id="fCfShow"></select>
+            </div>
+            <div>
+                <div class="rpt-flabel">Column title</div>
+                <input type="text" id="fCfTitle" placeholder="The field's name">
+            </div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fCfOn"> Display field</label>
+            <div>
+                <div class="rpt-flabel">Filter by field</div>
+                <select id="fCfFilter"></select>
+            </div>
+            <div>
+                <div class="rpt-flabel">Value</div>
+                <input type="text" id="fCfData" placeholder="% is a wildcard" title="Matched with LIKE, ignoring case. Use % for wildcard searches. For a checkbox field, use true or false.">
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Columns</div>
+            <div class="rpt-cols" id="colChecks"></div>
+            <div>
+                <div class="rpt-flabel">Report title</div>
+                <input type="text" id="fTitle" placeholder="Dormant Customers">
+            </div>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths and the standard column order">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters what everyone sees each time this report opens. Anyone can still change them while it is open.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+                <button type="button" class="ds-btn" id="unpublishBtn" title="Everyone goes back to their own last choices">Stop using them</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>Customers who have <strong>not ordered</strong> for at least the dormant period, but whose last order is no older than the last-order limit. With the defaults: no order in the last 90 days, last order within 365 days. It is the BI version of the standard <strong>Dormant Customers</strong> report and reads the same data the same way.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Which orders count</div>
+                <ul>
+                    <li>Sales orders that are Estimate, Issued, In Progress, Fulfilled or Closed Short. Voided, Cancelled and Expired orders never count.</li>
+                    <li>The last order is the latest <strong>Date Issued</strong> by default; pick Date Created, Date Scheduled or Date Completed instead. Orders without that date are ignored, so on Date Completed an open order doesn't make a customer active.</li>
+                    <li><strong>Total Orders</strong> and <strong>Total Spent</strong> cover every counted order, of any date. Estimates are included, as in the standard report.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Columns</div>
+                <ul>
+                    <li><strong>Sales Rep</strong> is the customer's default salesperson; <strong>State</strong> is from its default Main Office address.</li>
+                    <li><strong>Last SO#</strong> is the order on the last date. If two share that date, the most recently created one is shown.</li>
+                    <li>A customer custom field can be shown as an extra column, and the list filtered on any field (% is a wildcard; for a checkbox field type true or false).</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>Filter changes apply straight away. Sorting and the column switches don't re-run the query.</li>
+                    <li>Click a column heading to sort by it; click again to reverse, a third time for the standard order (Days Dormant, ascending). It sets <em>Sort by</em> and <em>Order</em> in the filters. Drag a heading onto another to move the column; drag a heading's right edge to resize it. Your layout is remembered; <strong>Settings → Reset column layout</strong> undoes it.</li>
+                    <li>The <strong>Table / Pivot</strong> selector switches to a pivot: count the dormant customers, or total what they spent, by any two of sales rep, state, active / inactive, the month of their last order and the custom field. Click a figure to see the customers behind it. Print, PDF and Excel follow the view on screen.</li>
+                    <li>A very large result shows the first 10,000 customers in the chosen sort, with a <strong>Load all</strong> button; totals then cover the customers shown.</li>
+                    <li>Click a customer or SO number to open it in Fishbowl.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable pages, laid out like the standard report. In PDF view pick the paper size and orientation in the bar above the pages; they are remembered. <strong>Print</strong> prints those pages.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-app" id="appView">
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+</div>
+<div class="pivot-host" id="pivotHost" style="display:none"></div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Common || !FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const SO_STATUSES = [10, 20, 25, 60, 70];      // Estimate, Issued, In Progress, Fulfilled, Closed Short
+const MAIN_OFFICE = 50;                         // address.typeId
+const CF_DATE_TYPE = 2;                         // customfieldtype Date
+const DEFAULT_TITLE = 'Dormant Customers';
+// The original's "Last Ordered" choices, in its order.
+const BASES = [['datecompleted', 'Date Completed'], ['datecreated', 'Date Created'], ['datefirstship', 'Date Scheduled'], ['dateissued', 'Date Issued']];
+const BASIS_LABEL = Object.fromEntries(BASES);
+
+// The iReport version's columns, in its order. `total` = summed in the footer.
+// `print` = the original's heading, line breaks and all (printouts only).
+const COLS = [
+    { key: 'customer',   label: 'Customer',          w: 220 },
+    { key: 'salesrep',   label: 'Sales Rep',         w: 100 },
+    { key: 'state',      label: 'State/Province',    w: 90,  print: 'State/\nProvince' },
+    { key: 'lastdate',   label: 'Last Ordered',      w: 95 },
+    { key: 'lastso',     label: 'Last SO#',          w: 85 },
+    { key: 'lastamount', label: 'Last Order Amount', w: 120, num: true, print: 'Last Order\nAmount' },
+    { key: 'days',       label: 'Days Dormant',      w: 90,  num: true, print: 'Days\nDormant' },
+    { key: 'orders',     label: 'Total Orders',      w: 90,  num: true, total: true, print: 'Total\nOrders' },
+    { key: 'spent',      label: 'Total Spent',       w: 120, num: true, total: true, print: 'Total\nSpent' }
+];
+// The original's Sort by choices: a column key each, text or number.
+// Plus the custom field column (cf).
+const SORTS = {
+    customer: 'text', salesrep: 'text', state: 'text', lastdate: 'text', lastso: 'text',
+    lastamount: 'num', days: 'num', orders: 'num', spent: 'num', cf: 'text'
+};
+// The same orders in SQL, so a capped result is the first rows in that order.
+const SORT_SQL = {
+    customer: 'customer.name', salesrep: 'salesrep', state: 'state', lastdate: 'ordercount.lastorderdate', lastso: 'so.num',
+    lastamount: 'so.totalprice', days: 'daysdormant', orders: 'totalorders', spent: 'totalspent', cf: 'customercf1'
+};
+const DEFAULT_FILTERS = {
+    dormant: 90, limit: 365, basis: 'dateissued', inactive: false,
+    groups: [], custs: [], reps: [], states: [], minOrders: 0, minSpent: 0,
+    sort: 'days', dir: 'asc', cols: COLS.map(c => c.key),
+    cfShow: 0, cfTitle: '', cfOn: false, cfFilter: 0, cfData: '', title: ''
+};
+// Changing these re-runs the query; the rest only redraws.
+const QUERY_KEYS = ['dormant', 'limit', 'basis', 'inactive', 'groups', 'custs', 'reps', 'states', 'minOrders', 'minSpent', 'cfShow', 'cfFilter', 'cfData'];
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        company: { keys: ['filters', 'opts'], editors: true },   // every open starts from the company defaults
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const ints = a => (Array.isArray(a) ? a : []).map(Number).filter(n => Number.isInteger(n));
+const intOr = (v, d) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : d; };
+const numOr = (v, d) => { const n = parseFloat(v); return Number.isFinite(n) ? n : d; };
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const dstr = v => { const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v ?? '')); return m ? m[1] : ''; };
+const fmtDate = v => { const d = dstr(v); return d ? FBLib.Common.formatDate(d) : ''; };
+const fmtMoney = v => FBLib.Common.formatMoney(v);
+const fmtInt = v => Math.round(num(v)).toLocaleString();
+const openLink = (module, number, text) => number
+    ? `<a class="fb-row-link" data-open="${esc(module)}" data-num="${esc(number)}">${esc(text ?? number)}</a>` : '';
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const cut = s => `<span title="${esc(s)}">${esc(s)}</span>`;
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+
+// The original's title band, as one line.
+function periodText(f) {
+    return 'No orders in the last ' + f.dormant + ' days, last order not beyond ' + f.limit + ' days ago (by ' +
+        (BASIS_LABEL[f.basis] || 'Date Issued') + ')';
+}
+const reportTitle = f => (f.title || '').trim() || DEFAULT_TITLE;
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS — the panel applies as it changes (one short debounce). Sorting,
+//  columns, the custom-field title/display and the report title only redraw.
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _grpMs = null, _custMs = null, _repMs = null, _stateMs = null;
+let _hydrating = false, _applyTimer = null;
+const S = { rows: [], company: '', cfs: [], loadedAt: null, loadedCf: 0, view: 'table', noCap: false, capped: false };
+const $ = id => document.getElementById(id);
+
+function readFilters() {
+    return {
+        dormant: intOr($('fDormant').value, DEFAULT_FILTERS.dormant),
+        limit: intOr($('fLimit').value, DEFAULT_FILTERS.limit),
+        basis: $('fBasis').value || 'dateissued',
+        inactive: $('fInactive').checked,
+        groups: ints(_grpMs.getSelected()), custs: ints(_custMs.getSelected()),
+        reps: ints(_repMs.getSelected()), states: ints(_stateMs.getSelected()),
+        minOrders: intOr($('fMinOrders').value, 0),
+        minSpent: numOr($('fMinSpent').value, 0),
+        sort: $('fSort').value || 'days',
+        dir: $('fDir').value === 'desc' ? 'desc' : 'asc',
+        cols: [...document.querySelectorAll('#colChecks input[data-col]')].filter(c => c.checked).map(c => c.dataset.col),
+        cfShow: intOr($('fCfShow').value, 0),
+        cfTitle: $('fCfTitle').value.trim(),
+        cfOn: $('fCfOn').checked,
+        cfFilter: intOr($('fCfFilter').value, 0),
+        cfData: $('fCfData').value.trim(),
+        title: $('fTitle').value.trim()
+    };
+}
+function writeFilters(f) {
+    _hydrating = true;
+    $('fDormant').value = intOr(f.dormant, DEFAULT_FILTERS.dormant);
+    $('fLimit').value = intOr(f.limit, DEFAULT_FILTERS.limit);
+    $('fBasis').value = BASIS_LABEL[f.basis] ? f.basis : 'dateissued';
+    $('fInactive').checked = !!f.inactive;
+    _grpMs.setSelected(ints(f.groups)); _custMs.setSelected(ints(f.custs));
+    _repMs.setSelected(ints(f.reps)); _stateMs.setSelected(ints(f.states));
+    $('fMinOrders').value = intOr(f.minOrders, 0);
+    $('fMinSpent').value = numOr(f.minSpent, 0);
+    $('fSort').value = SORTS[f.sort] ? f.sort : 'days';
+    $('fDir').value = f.dir === 'desc' ? 'desc' : 'asc';
+    document.querySelectorAll('#colChecks input[data-col]').forEach(c => { c.checked = (f.cols || []).indexOf(c.dataset.col) !== -1; });
+    // A saved field that no longer exists falls back to "none" (the select has no such option).
+    $('fCfShow').value = String(intOr(f.cfShow, 0));
+    if (!$('fCfShow').value) $('fCfShow').value = '0';
+    $('fCfTitle').value = f.cfTitle || '';
+    $('fCfOn').checked = !!f.cfOn;
+    $('fCfFilter').value = String(intOr(f.cfFilter, 0));
+    if (!$('fCfFilter').value) $('fCfFilter').value = '0';
+    $('fCfData').value = f.cfData || '';
+    $('fTitle').value = f.title || '';
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const refilter = QUERY_KEYS.some(k => JSON.stringify(next[k]) !== JSON.stringify(F[k]));
+        // While capped, the rows kept depend on the sort: a new sort re-queries.
+        const resort = S.capped && (next.sort !== F.sort || next.dir !== F.dir);
+        F = next;
+        remember();
+        if (refilter) S.noCap = false;
+        if (refilter || resort) loadAll(); else render(false);
+    }, 250);
+}
+
+// ============================================================================
+//  SQL — the iReport subDataset query. The original's top-level GROUP BY
+//  customer.id is gone: each join below yields one row per customer.
+// ============================================================================
+// Fishbowl's own expansion of a Custom Field report parameter (LogicReport).
+const cfExpr = id => `json_unquote(json_extract(customer.customFields,'$."${Number(id)}".value'))`;
+const knownCf = id => S.cfs.some(c => c.id === id);
+
+function buildSQL(f) {
+    const dcol = BASIS_LABEL[f.basis] ? f.basis : 'dateissued';
+    const st = SO_STATUSES.join(',');
+    const w = [`DATEDIFF(CURRENT_DATE, ordercount.lastorderdate) BETWEEN ${intOr(f.dormant, 90)} AND ${intOr(f.limit, 365)}`];
+    if (!f.inactive) w.push('customer.activeflag = 1');
+    // Customer groups: the original's COALESCE(accountgroup.id, 0) IN (…); 0 = in no group.
+    const grp = ints(f.groups);
+    if (grp.length) {
+        const ors = [];
+        const real = grp.filter(g => g !== 0);
+        if (real.length) ors.push(`customer.accountid IN (SELECT agr.accountid FROM accountgrouprelation agr WHERE agr.groupid IN (${real.join(',')}))`);
+        if (grp.indexOf(0) !== -1) ors.push(`customer.accountid NOT IN (SELECT agr.accountid FROM accountgrouprelation agr
+                     JOIN accountgroup ag ON ag.id = agr.groupid WHERE agr.accountid IS NOT NULL)`);
+        w.push('(' + ors.join(' OR ') + ')');
+    }
+    if (f.reps.length) w.push(`COALESCE(sysuser.id, 0) IN (${ints(f.reps).join(',')})`);
+    if (f.states.length) w.push(`COALESCE(stateconst.id, 0) IN (${ints(f.states).join(',')})`);
+    if (f.custs.length) w.push(`customer.id IN (${ints(f.custs).join(',')})`);
+    w.push(`ordercount.total > ${intOr(f.minOrders, 0)}`);
+    w.push(`(ordercount.totalspent > ${numOr(f.minSpent, 0)} OR ordercount.totalspent IS NULL)`);
+    if (f.cfFilter && knownCf(f.cfFilter) && f.cfData)
+        w.push(`COALESCE(UPPER(${cfExpr(f.cfFilter)}), '') LIKE UPPER('${sqlStr(f.cfData)}')`);
+    const cf = f.cfShow && knownCf(f.cfShow) ? `,\n               COALESCE(${cfExpr(f.cfShow)}, '') AS customercf1` : '';
+    const sortKey = SORT_SQL[f.sort] && (f.sort !== 'cf' || cf) ? f.sort : 'customer';
+    const order = SORT_SQL[sortKey] + (f.dir === 'desc' ? ' DESC' : ' ASC') + (sortKey === 'customer' ? '' : ', customer.name');
+    return `
+        SELECT customer.id AS customerid, customer.name AS customer, customer.activeflag+0 AS active,
+               ordercount.lastorderdate, DATEDIFF(CURRENT_DATE, ordercount.lastorderdate) AS daysdormant,
+               so.num AS lastso, so.totalprice AS lastamount,
+               ordercount.total AS totalorders, ordercount.totalspent AS totalspent,
+               COALESCE(sysuser.username, '') AS salesrep,
+               COALESCE(stateconst.code, '') AS state, COALESCE(stateconst.name, '') AS statename${cf}
+        FROM customer
+        JOIN (SELECT so.customerid, MAX(so.${dcol}) AS lastorderdate, COUNT(so.id) AS total, SUM(so.totalprice) AS totalspent
+              FROM so WHERE so.statusid IN (${st}) GROUP BY so.customerid) AS ordercount ON ordercount.customerid = customer.id
+        JOIN so ON so.id = (SELECT MAX(lastso.id) FROM so AS lastso
+                            WHERE lastso.customerid = customer.id AND lastso.statusid IN (${st})
+                              AND lastso.${dcol} = ordercount.lastorderdate)
+        LEFT JOIN sysuser ON sysuser.id = customer.defaultsalesmanid
+        LEFT JOIN (SELECT address.accountid, MIN(address.id) AS id FROM address
+                   WHERE address.typeid = ${MAIN_OFFICE} AND address.defaultflag = 1
+                   GROUP BY address.accountid) AS mainaddr ON mainaddr.accountid = customer.accountid
+        LEFT JOIN address ON address.id = mainaddr.id
+        LEFT JOIN stateconst ON stateconst.id = address.stateid
+        WHERE ${w.join('\n          AND ')}
+        ORDER BY ${order}`;
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+let _loadToken = 0;
+
+async function loadLookups() {
+    const res = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('Customer groups', 'SELECT id, name FROM accountgroup ORDER BY name'),
+        q('Customers', 'SELECT id, name, activeflag+0 AS active FROM customer ORDER BY name'),
+        q('Sales reps', `
+            SELECT su.id, su.username, su.activeflag+0 AS active
+            FROM sysuser su
+            JOIN (SELECT DISTINCT defaultsalesmanid FROM customer WHERE defaultsalesmanid IS NOT NULL) c ON c.defaultsalesmanid = su.id
+            ORDER BY su.username`),
+        q('States', `
+            SELECT sc.id, sc.code, sc.name
+            FROM stateconst sc
+            JOIN (SELECT DISTINCT a.stateid FROM address a JOIN customer c ON c.accountid = a.accountid
+                  WHERE a.typeid = ${MAIN_OFFICE} AND a.defaultflag = 1 AND a.stateid IS NOT NULL) s ON s.stateid = sc.id
+            ORDER BY sc.name`),
+        q('Customer custom fields', `
+            SELECT cf.id, cf.name, cf.customfieldtypeid AS typeid
+            FROM customfield cf
+            JOIN tablereference tr ON tr.tableid = cf.tableid
+            WHERE LOWER(tr.tablerefname) = 'customer' AND cf.activeflag = 1
+            ORDER BY cf.sortorder, cf.name`)
+    ]);
+    const ok = i => res[i].status === 'fulfilled' ? res[i].value : [];
+    S.company = (ok(0)[0] || {}).name || '';
+    const tagInactive = r => Number(r.active) === 1 ? '' : ' (inactive)';
+    _grpMs.setItems([{ value: 0, label: '(No group)' }].concat(ok(1).map(r => ({ value: Number(r.id), label: String(r.name) }))));
+    _custMs.setItems(ok(2).map(r => ({ value: Number(r.id), label: r.name + tagInactive(r) })));
+    _repMs.setItems([{ value: 0, label: '(No sales rep)' }].concat(ok(3).map(r => ({ value: Number(r.id), label: r.username + tagInactive(r) }))));
+    _stateMs.setItems([{ value: 0, label: '(No state)' }].concat(ok(4).map(r => ({ value: Number(r.id), label: r.name + (r.code ? ' (' + r.code + ')' : '') }))));
+    S.cfs = ok(5).map(r => ({ id: Number(r.id), name: String(r.name), type: Number(r.typeid) }));
+    const opts = '<option value="0">(None)</option>' + S.cfs.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('');
+    $('fCfShow').innerHTML = opts;
+    $('fCfFilter').innerHTML = opts;
+    const failed = res.filter(x => x.status === 'rejected').map(x => x.reason && x.reason.message);
+    if (failed.length) $('banner').textContent = 'Some filter lists failed to load: ' + failed.join('; ');
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    const f = F;
+    $('banner').textContent = '';
+    $('loading').classList.add('show');
+    setStatus('Loading…');
+    let rows;
+    const cap = S.noCap ? 0 : undefined;           // FBLib.RowCap: the first 10,000 customers unless Load all
+    try { rows = await q('Dormant customers', FBLib.RowCap.sql(buildSQL(f), cap)); }
+    catch (e) {
+        if (tok !== _loadToken) return;
+        $('loading').classList.remove('show');
+        $('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        FBLib.RowCap.notice({ before: $('appView'), capped: false });
+        S.rows = []; S.loadedAt = null; S.capped = false;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    if (tok !== _loadToken) return;
+    $('loading').classList.remove('show');
+    const capped = FBLib.RowCap.apply(rows, cap);
+    rows = capped.rows;
+    S.capped = capped.capped;
+    FBLib.RowCap.notice({ before: $('appView'), capped: capped.capped, limit: capped.limit, what: 'customers',
+                          onLoadAll: () => { S.noCap = true; loadAll(); } });
+    S.rows = rows.map(r => ({
+        id: Number(r.customerid), customer: r.customer || '', active: Number(r.active) === 1,
+        salesrep: r.salesrep || '', state: r.state || '', statename: r.statename || '',
+        lastdate: dstr(r.lastorderdate), lastts: String(r.lastorderdate ?? ''), lastso: r.lastso || '', lastamount: num(r.lastamount),
+        days: Math.round(num(r.daysdormant)), orders: Math.round(num(r.totalorders)), spent: num(r.totalspent),
+        cf: r.customercf1 == null ? '' : String(r.customercf1)
+    }));
+    S.loadedCf = f.cfShow && knownCf(f.cfShow) ? f.cfShow : 0;
+    S.loadedAt = new Date();
+    render();
+}
+
+function setStatus(t) { $('statusLine').textContent = t; }
+
+// ============================================================================
+//  MODEL + TABLE
+// ============================================================================
+// The custom-field column, when one was loaded and Display field is on.
+function cfCol() {
+    if (!F.cfOn || !S.loadedCf) return null;
+    const def = S.cfs.find(c => c.id === S.loadedCf);
+    return { key: 'cf', label: F.cfTitle || (def ? def.name : 'Custom Field 1'), w: 140, date: !!def && def.type === CF_DATE_TYPE };
+}
+function visibleCols() {
+    const on = new Set(F.cols);
+    const cols = COLS.filter(c => on.has(c.key));
+    const cf = cfCol();
+    const all = cf ? cols.concat([cf]) : cols;
+    return RPTCOLS ? RPTCOLS.arrange(all) : all;      // the user's column order (FBLib.RptCols)
+}
+
+// Sorted copy of the rows: the chosen key, then the customer name. Last
+// Ordered sorts on the full date and time, as the original does.
+function sortedRows() {
+    const key = SORTS[F.sort] ? F.sort : 'days';
+    const sgn = F.dir === 'desc' ? -1 : 1;
+    const val = (r, k) => k === 'lastdate' ? r.lastts : r[k];
+    const byName = (a, b) => a.customer.localeCompare(b.customer, undefined, { numeric: true, sensitivity: 'base' });
+    return S.rows.slice().sort((a, b) => {
+        const d = SORTS[key] === 'num' ? a[key] - b[key]
+            : String(val(a, key)).localeCompare(String(val(b, key)), undefined, { numeric: true, sensitivity: 'base' });
+        return d ? d * sgn : byName(a, b);
+    });
+}
+
+// Headings carry data-col for FBLib.RptCols, which marks the sorted one.
+function headRow(cols, forPrint) {
+    return '<tr>' + cols.map(c => {
+        const label = forPrint && c.print ? c.print.split('\n').map(esc).join('<br>') : esc(c.label);
+        const tip = forPrint || !SORTS[c.key] ? '' : ` title="Sort by ${esc(c.label)}"`;
+        return `<th data-col="${c.key}" class="${c.num ? 'num-cell' : ''}"${tip} style="min-width:${c.w}px">${label}</th>`;
+    }).join('') + '</tr>';
+}
+function lineRow(cols, r, forPrint) {
+    const cell = {
+        customer: (forPrint ? esc(r.customer) : openLink('Customer', r.customer)) +
+            (r.active ? '' : '<span class="tag-inactive">inactive</span>'),
+        salesrep: esc(r.salesrep),
+        state: `<span title="${esc(r.statename)}">${esc(r.state)}</span>`,
+        lastdate: esc(fmtDate(r.lastdate)),
+        lastso: forPrint ? esc(r.lastso) : openLink('Sales Order', r.lastso),
+        lastamount: esc(fmtMoney(r.lastamount)),
+        days: esc(fmtInt(r.days)),
+        orders: esc(fmtInt(r.orders)),
+        spent: esc(fmtMoney(r.spent))
+    };
+    return '<tr>' + cols.map(c => {
+        const v = c.key === 'cf' ? cut(c.date ? (fmtDate(r.cf) || r.cf) : r.cf) : (cell[c.key] ?? '');
+        return `<td class="${c.num ? 'num-cell' : ''}">${v}</td>`;
+    }).join('') + '</tr>';
+}
+// One footer row: the customer count spans the columns before the first
+// totalled one; Total Orders and Total Spent sit in their own columns.
+// Whatever order the user has put the columns in (FBLib.RptCols): any
+// totalled columns moved to the front come first, the count spans the run
+// of other columns after them, and with only totalled columns on it leads
+// the first one.
+function footRow(cols) {
+    const orders = S.rows.reduce((s, r) => s + r.orders, 0), spent = S.rows.reduce((s, r) => s + r.spent, 0);
+    const label = esc(plural(S.rows.length, 'customer'));
+    const fig = { orders: esc(fmtInt(orders)), spent: esc(fmtMoney(spent)) };
+    const cell = c => `<td class="${c.num ? 'num-cell' : ''}">${fig[c.key] ?? ''}</td>`;
+    let i = 0;
+    while (i < cols.length && fig[cols[i].key] != null) i++;
+    let j = i;
+    while (j < cols.length && fig[cols[j].key] == null) j++;
+    if (j === i) return '<tr>' + cols.map((c, k) => k ? cell(c) : `<td class="num-cell">${label} · ${fig[c.key]}</td>`).join('') + '</tr>';
+    return '<tr>' + cols.slice(0, i).map(cell).join('') + `<td colspan="${j - i}">${label}</td>` + cols.slice(j).map(cell).join('') + '</tr>';
+}
+
+// Long reports paint in chunks as the user scrolls.
+const CHUNK = 600;
+let _paint = { html: [], shown: 0 };
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+function render(keepScroll) {
+    $('rptTitle').textContent = reportTitle(F);
+    // The heading arrow follows Sort by / Order (FBLib.RptCols).
+    if (RPTCOLS) {
+        const s = RPTCOLS.sort(), key = SORTS[F.sort] ? F.sort : 'days';
+        if (!s || s.key !== key || s.dir !== F.dir) RPTCOLS.setSort(key, F.dir);
+    }
+    if (S.view === 'pivot' && PIVOT) {
+        PIVOT.render();
+        setStatus([S.company, periodText(F), 'pivot', S.loadedAt ? plural(S.rows.length, 'customer') : ''].filter(Boolean).join(' · '));
+        if (PDF) PDF.refresh();
+        return;
+    }
+    const tbl = $('rpt');
+    const wrap = $('rptWrap');
+    const top = wrap.scrollTop;
+    const cols = visibleCols();
+    tbl.querySelector('thead').innerHTML = headRow(cols, false);
+    _paint = { html: sortedRows().map(r => lineRow(cols, r, false)), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    while (keepScroll && _paint.shown < _paint.html.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+    tbl.querySelector('tfoot').innerHTML = S.rows.length && cols.length ? footRow(cols) : '';
+    tbl.style.display = S.rows.length && cols.length ? '' : 'none';
+    $('rptEmpty').textContent = emptyText(cols);
+    wrap.scrollTop = keepScroll ? top : 0;
+    const parts = [S.company, periodText(F)];
+    if (S.loadedAt) parts.push(plural(S.rows.length, 'customer') + ' · loaded ' + S.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    setStatus(parts.filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+// Why nothing is listed ('' when rows are shown).
+function emptyText(cols) {
+    if (S.loadedAt && !S.rows.length) {
+        return 'No dormant customers match these filters.' +
+            (F.dormant > F.limit ? ' The dormant period is longer than the last-order limit, so nothing can match.' : '');
+    }
+    return S.rows.length && !cols.length ? 'Every column is switched off (Filters → Columns).' : '';
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the pages as the standard Dormant Customers prints
+//  them: Letter landscape, the title band (company, title, the two
+//  dormant-period lines) on the first page, no totals (the original has none).
+// ============================================================================
+let PDF = null;
+const PDF_CSS =
+    '.fbdoc-rpt-tbl .tag-inactive{background:none;color:inherit;font-size:.85em;font-weight:400;font-style:italic;padding:0;margin-left:4pt;border-radius:0}' +
+    '.fbdoc-rpt-tbl .tag-inactive::before{content:"("}.fbdoc-rpt-tbl .tag-inactive::after{content:")"}';
+// The original's title band: two lines under the title.
+const periodLines = f => [
+    'Showing customers with no orders in the last ' + f.dormant + ' days',
+    'and whose last order was not beyond ' + f.limit + ' days ago (last order by ' + (BASIS_LABEL[f.basis] || 'Date Issued') + ')'
+];
+function docSpec() {
+    if (!S.loadedAt) return null;
+    if (S.view === 'pivot' && PIVOT) {
+        const p = PIVOT.pdfSpec();
+        return {
+            company: S.company, title: reportTitle(F), subtitle: periodLines(F).concat([pivotText()]),
+            head: p.head, rows: S.rows.length ? p.rows : [], foot: S.rows.length ? p.foot : '',
+            empty: emptyText([]) || 'No dormant customers match these filters.', css: PDF_CSS, fontPt: 9
+        };
+    }
+    const cols = visibleCols();
+    return {
+        company: S.company, title: reportTitle(F), subtitle: periodLines(F),
+        head: headRow(cols, true), rows: cols.length ? sortedRows().map(r => lineRow(cols, r, true)) : [], foot: '',
+        empty: emptyText(cols) || 'No dormant customers match these filters.', css: PDF_CSS, fontPt: 9
+    };
+}
+
+// Heading click (FBLib.RptCols): sort by that column, again to reverse, a
+// third time back to the standard order (Days Dormant, ascending). Keeps
+// the Sort by / Order selects in step: they stay the primary control. While
+// capped, the rows kept depend on the sort, so it re-queries.
+function onHeadingSort(key, dir) {
+    if (!key || !SORTS[key]) { key = DEFAULT_FILTERS.sort; dir = DEFAULT_FILTERS.dir; RPTCOLS.setSort(key, dir); }
+    $('fSort').value = key;
+    $('fDir').value = dir;
+    F = Object.assign({}, F, { sort: key, dir });
+    remember();
+    if (S.capped) loadAll(); else render(true);
+}
+
+// ============================================================================
+//  PIVOT VIEW (FBLib.Pivot) — the dormant customers counted, or any figure
+//  totalled, by any two of sales rep, state, status, month of last order and
+//  the custom field. The list itself stays in the Table view.
+// ============================================================================
+let PIVOT = null, RPTCOLS = null;
+const PIVOT_FIELDS = [
+    { key: 'customer', label: 'Customer', dim: false }, { key: 'salesrep', label: 'Sales Rep' }, { key: 'state', label: 'State/Province' },
+    { key: 'status', label: 'Customer Status' }, { key: 'lastdate', label: 'Last Ordered', type: 'date' },
+    { key: 'lastso', label: 'Last SO#', dim: false }, { key: 'cf', label: 'Custom Field' },
+    { key: 'lastamount', label: 'Last Order Amount', type: 'money' }, { key: 'days', label: 'Days Dormant', type: 'number' },
+    { key: 'orders', label: 'Total Orders', type: 'number' }, { key: 'spent', label: 'Total Spent', type: 'money' }
+];
+const pivotRows = () => S.rows.map(r => ({
+    customer: r.customer, salesrep: r.salesrep, state: r.state, status: r.active ? 'Active' : 'Inactive', lastdate: r.lastdate,
+    lastso: r.lastso, cf: S.loadedCf ? r.cf : '', lastamount: r.lastamount, days: r.days, orders: r.orders, spent: r.spent
+}));
+function pivotText() {
+    const c = PIVOT.config(), cf = cfCol();
+    const lbl = k => (k === 'cf' && cf ? 'Custom Field (' + cf.label + ')' : (PIVOT_FIELDS.find(x => x.key === k) || {}).label || '');
+    const m = c.measure === '__count__' ? 'Customers'
+        : ({ sum: 'Total', count: 'Count of', avg: 'Average', min: 'Lowest', max: 'Highest' }[c.agg] + ' ' + lbl(c.measure));
+    return 'Pivot: ' + m + ' by ' + [lbl(c.rowDim), lbl(c.rowDim2)].filter(Boolean).join(' + ') + (c.colDim ? ' × ' + lbl(c.colDim) : '');
+}
+function setView(v, persist) {
+    S.view = v === 'pivot' && PIVOT ? 'pivot' : 'table';
+    $('viewSel').value = S.view;
+    $('rptWrap').style.display = S.view === 'pivot' ? 'none' : '';
+    $('pivotHost').style.display = S.view === 'pivot' ? '' : 'none';
+    if (persist) _saveUserKeys({ view: S.view });
+    render(false);
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    const type = { lastdate: 'date', lastamount: 'money', days: 'int', orders: 'int', spent: 'money' };
+    const cols = visibleCols().map(c => ({
+        key: c.key, label: c.label, w: c.w, type: type[c.key] || (c.date ? 'date' : 'text'),
+        noTotal: c.key === 'lastamount' || c.key === 'days'
+    }));
+    const rows = sortedRows().map(r => Object.assign({}, r, {
+        customer: r.customer + (r.active ? '' : ' (inactive)'),
+        lastdate: r.lastdate || null,
+        cf: cols.some(c => c.key === 'cf' && c.type === 'date') ? (dstr(r.cf) || null) : r.cf
+    }));
+    const sub = [S.company, periodText(F)].filter(Boolean);
+    const sheets = [{ name: 'Dormant Customers', title: reportTitle(F), subtitle: sub, cols, rows, totals: true }];
+    if (S.view === 'pivot' && PIVOT) sheets.unshift(Object.assign(PIVOT.sheet('Pivot'), { title: reportTitle(F) + ' – ' + pivotText(), subtitle: sub }));
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'Dormant_Customers_' + ymd(new Date()), sheets });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's pages (fb-doc). Without fb-doc on the server, the
+// plain printout below: JxBrowser won't print the report page itself, so it
+// is built in a new window and printed there. Letter landscape, as the
+// original.
+function printReport() {
+    if (PDF) {
+        if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+    const cols = visibleCols();
+    if (!cols.length) { showToast('Every column is switched off.', 'warn'); return; }
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' + esc(reportTitle(F)) + '</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:11pt;font-weight:700}h2{text-align:center;font-size:14pt;margin:2px 0}.sub{text-align:center;font-size:8.5pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{font-size:8pt;text-align:left;padding:3px 5px;border-bottom:1px solid #000;vertical-align:bottom}' +
+        'td{font-size:8pt;padding:2px 5px;vertical-align:top;border-bottom:.5px solid #ccc}.num-cell{text-align:right}' +
+        '.tag-inactive{font-size:7pt;color:#555;margin-left:4px}' +
+        'tfoot td{font-weight:700;border-top:1px solid #000;border-bottom:0}a{color:#000;text-decoration:none}' +
+        '@page{size:Letter landscape;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>' + esc(reportTitle(F)) + '</h2>' +
+        '<p class="sub">Showing customers with no orders in the last <strong>' + esc(F.dormant) + '</strong> days<br>and whose last order was not beyond ' +
+        esc(F.limit) + ' days ago (last order by ' + esc(BASIS_LABEL[F.basis] || 'Date Issued') + ')</p>' +
+        '<table><thead>' + headRow(cols, true).replace(/ style="[^"]*"/g, '') + '</thead><tbody>' +
+        sortedRows().map(r => lineRow(cols, r, true)).join('') + '</tbody><tfoot>' + footRow(cols) + '</tfoot></table>' +
+        '<p style="font-size:7.5pt;margin-top:8px">Printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters what everyone sees each time this report opens?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        const ms = (id, ph) => FBLib.Common.MultiSelect.create({ containerId: id, items: [], placeholder: ph, maxTags: 2, onClose: applySoon });
+        _grpMs = ms('grpMs', 'All groups');
+        _custMs = ms('custMs', 'All customers');
+        _repMs = ms('repMs', 'All sales reps');
+        _stateMs = ms('stateMs', 'All states');
+
+        $('fBasis').innerHTML = BASES.map(b => `<option value="${b[0]}">${esc(b[1])}</option>`).join('');
+        $('fSort').innerHTML = COLS.map(c => `<option value="${c.key}">${esc(c.label)}</option>`).join('') + '<option value="cf">Custom field</option>';
+        $('colChecks').innerHTML = COLS.map(c =>
+            `<label class="rpt-fcheck"><input type="checkbox" data-col="${c.key}"> ${esc(c.label)}</label>`).join('');
+        document.querySelectorAll('#fBasis, #fInactive, #fSort, #fDir, #fCfOn, #fCfFilter, #colChecks input[data-col]')
+            .forEach(el => el.addEventListener('change', applySoon));
+        // Picking a field to show switches Display field on.
+        $('fCfShow').addEventListener('change', () => { if ($('fCfShow').value !== '0') $('fCfOn').checked = true; applySoon(); });
+        ['fDormant', 'fLimit', 'fMinOrders', 'fMinSpent', 'fCfTitle', 'fCfData', 'fTitle'].forEach(id => {
+            $(id).addEventListener('change', applySoon);
+            $(id).addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        });
+        $('resetFiltersBtn').onclick = () => { writeFilters(DEFAULT_FILTERS); applySoon(); };
+
+        // Column resize / sort / reorder, and the Pivot view (fb-lib).
+        if (FBLib.RptCols) RPTCOLS = FBLib.RptCols.attach({
+            table: $('rpt'), sortable: k => !!SORTS[k], onSort: onHeadingSort, onReorder: () => render(true)
+        });
+        if (FBLib.Pivot) PIVOT = FBLib.Pivot.mount($('pivotHost'), {
+            fields: PIVOT_FIELDS, rows: pivotRows,
+            defaults: { rowDim: 'salesrep', colDim: 'lastdate', colBucket: 'month', measure: '__count__', agg: 'sum' },
+            format: (fld, v) => (fld && fld.type === 'money' ? fmtMoney(v)
+                : fld && fld.type === 'number' ? num(v).toLocaleString(undefined, { maximumFractionDigits: 1 }) : null)
+        });
+        else $('viewSelWrap').style.display = 'none';
+        $('viewSel').addEventListener('change', e => setView(e.target.value, true));
+        // Widths and order only: the sort is Sort by / Order's.
+        $('resetColsBtn').onclick = () => { if (RPTCOLS) { RPTCOLS.reset(); render(false); } };
+        S.view = _resolve('view', 'table') === 'pivot' && PIVOT ? 'pivot' : 'table';
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: $('appView'), toggleBefore: $('exportBtn'),
+                page: { size: 'Letter', orientation: 'landscape' },
+                doc: docSpec, title: () => reportTitle(F)
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        setView(S.view, false);
+        $('refreshBtn').onclick = () => loadAll();
+        $('exportBtn').onclick = exportWorkbook;
+        $('printBtn').onclick = printReport;
+        $('publishBtn').onclick = publishFilters;
+        document.getElementById('unpublishBtn').onclick = () => {
+            if (!confirm('Stop using company defaults for this report? Everyone goes back to their own last choices.')) return;
+            const ok = FBLib.Settings.clearCompany(['filters', 'opts']) !== false;
+            showToast(ok ? 'This report no longer has company defaults.' : 'That was not saved.', ok ? 'success' : 'error');
+        };
+        $('adminGroup').classList.toggle('hidden', !isAdmin());
+        $('setRemember').checked = !!_resolve('remember', true);
+        $('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        $('setShowDebug').checked = !!_resolve('showDebug', false);
+        $('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        const wrap = $('rptWrap');
+        wrap.addEventListener('scroll', () => { if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 400) appendChunk(); });
+        $('rpt').addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (a) {
+                e.preventDefault();
+                try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+                catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+            }
+        });
+
+        await loadLookups();
+        writeFilters(savedFilters());
+        F = readFilters();          // drops saved picks that no longer exist
+        await loadAll();
+    } catch (e) {
+        console.error('[Dormant Customers] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

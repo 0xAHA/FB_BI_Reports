@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  REPORT: Purchase Order Report  (PROOF OF CONCEPT)
+  PATH:   Other_NOT_FOR_PRODUCTION/Paperwork_POC/POReport.htm
+  --------------------------------------------------------------------------------
+  HTML replica of Fishbowl's standard PurchaseOrder/POReport.jrxml (with its
+  Common/subMemo.jrxml memo subreport), printed and saved as PDF from the BI
+  Report module's own Print / Save / Email buttons. The page IS the paper:
+  fb-doc.js lays the order out into fixed-size sheets (page header on every
+  sheet, item-table column header repeated, page footer "Page X of Y", the
+  PO Notice and totals pinned to the bottom of the last sheet).
+
+  Bands, as in the jrxml: page header (logo / company, title, Order # / Date,
+  barcode) on every sheet; Vendor / Ship To addresses, Notes, Memos, order-field
+  strip and PO custom-field strip once, before the items; the item table in the
+  edition's layout (US, CA or AU, picked by the QBVersion system property);
+  last-page footer with the PO Notice and the totals.
+
+  SOURCE vs BUILD
+    This file is the source. `node build.js POReport.htm` inlines fb-doc.js and
+    fb-doc-fonts.css into dist/POReport.htm. Paste the dist file into the BI
+    Script Editor (fb-lib and fb-styles are the deployed shared records).
+
+  SCREEN
+    The toolbar, record picker, Settings drawer, paper choice and launch handling
+    are FBDoc.app (fb-doc.js); this file supplies the document only.
+
+  FISHBOWL REPORT SETTINGS (Parameters button on the BI Report)
+    Purchase_Order  the order to print (Fishbowl's own PO picker); adopted once,
+                    after that each user's in-page pick stands
+    Page_setup      paper size / margins (default A4, Jasper margins)
+    The setting tokens are in the text/plain blocks at the top of <body>. They
+    are substituted by global text replacement: never repeat them anywhere else.
+
+  LAUNCH FROM THE PURCHASE ORDER MODULE (LAUNCH_CONTEXT.md)
+    The fb-launch meta tag in <head> (content PO) lists this report under
+    Reports > Apps in the Purchase Order module (report_btn plugin). Opened from
+    there, the host's window.FB_LAUNCH names the open order: it is printed
+    straight away and cannot be changed (the toolbar shows only Print and
+    Settings). Write that tag only once: the plugin reads the first one in the page.
+
+  OPTIONS
+    The stock report's saved options (reportparameter rows of POReport.jasper)
+    are read as the starting point, so a customer's existing setup carries over;
+    otherwise the jrxml defaults apply (multi-currency picks the vendor-currency
+    item columns and totals, as the stock report does). An admin can override
+    them in Settings and save for everyone (FBLib.Settings master).
+
+  DELIBERATE DEVIATIONS FROM THE JRXML
+    - One currency source: po.currencyId (the vendor's currency as fallback);
+      the jrxml reads only the vendor's current currency, which goes wrong once
+      a vendor's currency is changed after the PO was raised.
+    - The Vendor and Ship To boxes always print; the jrxml hides both when the
+      PO has no ship-to name (its print-when tests the ship-to name for both).
+    - No literal "null": blank Phone / Email / Fax / Account # / country lines
+      are left out instead of printing "Phone: null" or an empty "Fax:" line,
+      and the Number / Description " - " separator needs a number to show (the
+      jrxml tests the Fishbowl part number but prints the vendor part number).
+    - The item query LEFT JOINs the UOM (a line without one still prints); a PO
+      with no lines prints its header, addresses and zero totals (the jrxml
+      prints nothing but empty bands).
+    - Editions other than US / CA / AU use the CA layout and arithmetic; the
+      jrxml prints no item table at all for them and its SQL returns 0.00.
+    - Item columns refit to the page's content width (the description absorbs
+      the difference; the stock layout is 553pt in a 552pt column); order-field
+      strips with more than six columns share the width instead of running off.
+    - Date custom fields print in REPORT_DATE_FORMAT, not the raw timestamp.
+    - The US Total Qty footer row is added only when Show Total Qty is on (the
+      jrxml keeps an empty 14pt row otherwise).
+    - The currency glyph comes from the currency code (Intl), not Fishbowl's
+      CurrencySymbolConst table; "Currency Use Code" prints the ISO code.
+
+  STATUS: proof of concept. Desk-tested against demodb through the live-SQL
+  harness (tests/). Not client-tested.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <script>
+        window.FB_REPORT = {
+            key:   'cdx.bi.paperwork.po',
+            name:  'Purchase Order Report',
+            build: 'UNSTAMPED'    // @fb-build (Other_NOT_FOR_PRODUCTION is not stamped)
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="fb-launch" content="PO">
+    <meta name="fb-folder" content="Purchase Order">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="The purchase order document, ready to print or save as PDF.">
+    <title>Purchase Order Report</title>
+
+    <script>
+        {% Script fb-lib %}
+    </script>
+    <style>
+        {% Style fb-styles %}
+    </style>
+    <!-- @inline-style fb-doc-fonts.css -->
+    <!-- @inline-script fb-doc.js -->
+
+    <style>
+        /* ---------- the document (pt, black on white — paperwork, not dashboard) ---------- */
+        .po-doc { font-size: 9pt; color: #000; }
+        .po-abs { position: absolute; overflow: hidden; }
+        .po-hdrcell { background: #EAEAEA; font-weight: 700; border: 0.5pt solid #000; }
+        .po-box { border: 0.5pt solid #000; }
+        .po-title { font-size: 17pt; font-weight: 700; text-align: right; display: flex; align-items: flex-end; justify-content: flex-end; line-height: 1.1; }
+        .po-company { font-size: 14pt; font-weight: 700; line-height: 1.2; }
+        .po-caddr { font-size: 9pt; white-space: pre-wrap; line-height: 1.3; }
+        .po-center { display: flex; align-items: center; justify-content: center; text-align: center; }
+        .po-logo { display: flex; overflow: hidden; }
+        .po-logo img { max-width: 100%; max-height: 100%; object-fit: contain; }
+        .pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+        /* CustomerAddresses group: Vendor (+ contact / vendor SO line, GST/HST line) and Ship To */
+        .po-addresses { display: flex; align-items: flex-start; min-height: 98pt; padding-bottom: 5pt; font-size: 10pt; }
+        .po-addresses .col { display: flex; flex-direction: column; flex: none; }
+        .po-addresses .h { height: 17pt; padding: 0 3pt; display: flex; align-items: flex-end; font-size: 10pt; }
+        .po-addresses .b { min-height: 44pt; padding: 3pt; border-top: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.25; }
+        .po-addresses .l { min-height: 11pt; margin-top: 5pt; padding: 0 3pt; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.2; }
+
+        .po-notes { display: flex; font-size: 9pt; min-height: 19pt; padding-bottom: 5pt; }
+        .po-notes .lbl { font-weight: 700; flex: none; }
+        .po-notes .txt { padding-left: 3pt; white-space: pre-wrap; overflow-wrap: anywhere; flex: 1 1 auto; min-width: 0; }
+
+        /* order-field strip and PO custom-field strip (POinfo tables): 92pt columns, packed left */
+        .po-strip { padding-bottom: 10pt; }
+        .po-strip table { table-layout: fixed; border-collapse: collapse; }
+        .po-strip th { background: #EAEAEA; font-weight: 700; font-size: 10pt; border: 0.5pt solid #000; height: 14pt; padding: 0 2pt; text-align: center; vertical-align: middle; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+        .po-strip td { font-size: 10pt; border: 0.5pt solid #000; height: 14pt; padding: 0 3pt; text-align: center; vertical-align: middle; overflow-wrap: anywhere; }
+        .po-strip.cf td { vertical-align: top; }
+
+        /* item table (Item Info): grey 28pt header, 2pt white strip, 0.5pt rule; 1pt white column separators */
+        table.po-items th { background: #EAEAEA; box-shadow: inset 0 -2pt 0 #fff; font-weight: 700; font-size: 10pt; height: 30pt; vertical-align: bottom;
+                            padding: 0 3pt 2.5pt; border-bottom: 0.5pt solid #000; border-left: 1pt solid #fff; border-right: 1pt solid #fff;
+                            line-height: 1.15; overflow: hidden; overflow-wrap: anywhere; }
+        table.po-items th.nb { border-left-color: transparent; border-right-color: transparent; }
+        table.po-items td { font-size: 9pt; padding: 0.5pt 3pt 0; line-height: 12.5pt; height: 13pt; vertical-align: top;
+                            border-left: 1pt solid #fff; border-right: 1pt solid #fff; }
+        table.po-items td.m { padding-right: 5pt; }
+        table.po-items .c { text-align: center; } table.po-items .r { text-align: right; } table.po-items .l { text-align: left; }
+        table.po-items tbody.fbdoc-zebra td { background: #EAEAEA; }
+        table.po-items th.qh, table.po-items td.qc { padding: 0; }
+        table.po-items .qh .w, table.po-items .qc .w { display: flex; align-items: flex-end; }
+        table.po-items .qh .w { height: 100%; padding-bottom: 2.5pt; }
+        table.po-items .w .q { flex: 0 0 60.24%; min-width: 0; text-align: right; }
+        table.po-items .w .u { flex: 1 1 auto; min-width: 0; text-align: center; }
+        table.po-items td.qc .q { padding: 0.5pt 3pt 0 0; border-right: 1pt solid #fff; }
+        table.po-items td.qc .u { padding: 0.5pt 0 0; border-left: 1pt solid #fff; }
+        table.po-items.intl th.qh .q { text-align: center; }
+        table.po-items.intl td.qc .q { padding: 0.5pt 1pt 0; border: 0; }
+        table.po-items.intl td.qc .u { padding: 0.5pt 1pt 0; border: 0; text-align: left; }
+        table.po-items tr.tq td { height: 14pt; background: transparent !important; }
+        table.po-items tr.tq .q { margin-top: 1pt; border-top: 0.5pt solid #000; font-weight: 700; }
+        table.po-items .cont { font-style: italic; color: #333; }
+        /* Too many columns for the paper: one font step down (FBDoc.Columns.fit 'compact'). */
+        table.po-items.compact th { font-size: 7pt; line-height: 1.1; padding-left: 1.5pt; padding-right: 1.5pt; }
+        table.po-items.compact td { font-size: 7pt; line-height: 10pt; height: 10pt; padding-left: 1.5pt; padding-right: 1.5pt; }
+
+        /* memos (subMemo) */
+        .po-memotitle { font-size: 10pt; font-weight: 700; height: 14pt; display: flex; align-items: flex-end; }
+        table.po-memos th { background: #EAEAEA; font-weight: 700; font-size: 10pt; text-align: left; vertical-align: top; padding: 0 3pt; height: 14pt;
+                            border-bottom: 0.5pt solid #000; border-right: 1pt solid #fff; }
+        table.po-memos td { font-size: 9pt; padding: 0 0 0 3pt; line-height: 12.5pt; border-bottom: 0.25pt solid #CCCCCC; }
+        table.po-memos td.d { white-space: nowrap; overflow: hidden; }
+        .po-gap5 { height: 5pt; }
+
+        /* footers */
+        .po-foot { position: relative; height: 14pt; font-size: 9pt; white-space: nowrap; }
+        .po-foot .dt { position: absolute; left: 0; bottom: 0; overflow: hidden; }
+        .po-foot .pg { position: absolute; right: 0; bottom: 0; display: flex; }
+        .po-foot .pg .a { flex: 1 1 auto; text-align: right; padding-right: 4pt; }
+        .po-foot .pg .n { flex: none; text-align: left; }
+        .po-last { position: relative; height: 118pt; }
+        .po-last .msg { position: absolute; left: 0; top: 1pt; height: 95pt; font-size: 8pt; padding-right: 15pt; display: flex; flex-direction: column;
+                        justify-content: flex-end; white-space: pre-wrap; overflow: hidden; }
+        .po-last .tot { position: absolute; top: 54pt; }
+        .po-last .tot table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; }
+        .po-last .tot td, .po-last .tot th { font-size: 10pt; font-weight: 700; text-align: right; vertical-align: middle; height: 14pt; padding: 0 3pt;
+                                             white-space: nowrap; overflow: hidden; }
+        .po-last .tot th { background: #EAEAEA; border-bottom: 0.5pt solid #000; border-left: 1pt solid #fff; border-right: 1pt solid #fff; }
+        .po-last .tot tr.g td { background: #EAEAEA; }
+        .po-last .tot td.v { border-left: 1pt solid #fff; border-right: 1pt solid #fff; }
+        .po-last .tot .sp { background: transparent !important; border: 0 !important; }
+        .po-last .tot.us { padding-top: 1pt; }
+        .po-last .foot { position: absolute; left: 0; right: 0; top: 105pt; }
+        .po-last .foot .po-foot { height: 13pt; }
+    </style>
+</head>
+<body>
+
+<!-- Fishbowl report settings: each token exactly once, never elsewhere. -->
+<script type="text/plain" id="set-po">$PO{Purchase_Order|0|Order}</script>
+<script type="text/plain" id="set-print">$PRINT{Page_setup|A4|Print}</script>
+
+<script>
+// ============================================================================
+//  BAIL EARLY — needs the Fishbowl embedded browser, fb-lib and fb-doc.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2><p>Open this report from the Fishbowl client\'s BI module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+if (!window.FBLib || !window.FBDoc) {
+    document.body.insertAdjacentHTML('afterbegin', '<div style="background:#F0D7DD;color:#8A1E30;padding:10px 16px;font:13px sans-serif">' +
+        'Missing ' + (!window.FBLib ? 'fb-lib' : 'fb-doc') + '. Paste the BUILT file (dist/POReport.htm), not the source.</div>');
+    throw new Error('fb-lib / fb-doc missing');
+}
+
+// Shell access (FBDoc.app, created at the end of this script).
+function opt(name) { return APP.opt(name); }
+function label(key, dflt) { return APP.label(key, dflt); }
+function debugLog(m, t) { APP.debug(m, t); }
+
+var esc = FBDoc.esc;
+function num(v) { var n = parseFloat(v); return isNaN(n) ? 0 : n; }
+function round2(x) { return Math.sign(x) * Math.round(Math.abs(x) * 100 + 1e-7) / 100; }
+function has(v) { return v != null && String(v).trim() !== ''; }
+
+// ============================================================================
+//  OPTIONS — jrxml defaults (spec of POReport.jrxml §2b), stock presets, admin
+// ============================================================================
+var PO_REPORT_PATH = '../reports/PurchaseOrder/POReport.jasper';
+var PO_MEMO_TABLE = 397076832;     // memo.tableId of the po table (subMemo's tableID)
+
+function jrxmlDefaults(env) {
+    var MC = env.multiCurrency;
+    return {
+        cbLogoAlignment: 'left', ShowCompanyName: true, ShowCompanyAddress: true, ShowCountry: false, ShowStatus: false, ShowBarcode: true,
+        UseVendorNameInAddress: true, ShowBillToPhone: true, ShowBillToEmail: true, ShowBillToFax: true,
+        ShowVendorAccountNumber: false, ShowVendorContact: true,
+        ShowNotes: true, ShowMemos: false, ShowPOCustomFields: false,
+        ShowCfPO1: true, ShowCfPO2: true, ShowCfPO3: true, ShowCfPO4: true, ShowCfPO5: true, ShowCfPO6: true,
+        OrderBuyer: true, OrderPaymentTerms: true, OrderFOBPoint: true, OrderShippingTerms: true, OrderShipVia: true,
+        OrderShipService: false, OrderDateScheduled: true, OrderCurrency: false, OrderCurrencyRate: false,
+        'Item#': true, ItemType: true, ItemRevision: false, ItemFulfillmentDate: false, ItemNumberAndDescription: false,
+        ItemPart: true, ItemDescription: true, ItemUnitPrice: !MC, ItemCurrencyUnitCost: MC, ItemOtyOrdered: true,
+        ItemExtendedPrice: !MC, ItemCurrencyTotal: MC, ItemTaxCode: false, ItemTax: false, ItemCurrencyTax: false,
+        ShowCfItem1: false, ShowCfItem2: false, ShowCfItem3: false,
+        ShowPartNumber: false, ShowLineItemNotes: true, ShowOutsourceReturnAs: true, ShowTotalQty: false,
+        ShowTotals: true, ShowCurrencyTotals: true, ShowHomeCurrencyTotals: false,
+        'CustomField:PO1': -1, 'CustomField:PO2': -1, 'CustomField:PO3': -1, 'CustomField:PO4': -1, 'CustomField:PO5': -1, 'CustomField:PO6': -1,
+        'CustomField:Item1': -1, 'CustomField:Item2': -1, 'CustomField:Item3': -1
+    };
+}
+
+// The options shown in the Settings drawer (labels are the stock report's).
+var OPTION_GROUPS = [
+    ['Header', [['cbLogoAlignment', 'Logo position', ['left', 'top']], ['ShowCompanyName', 'Company name'], ['ShowCompanyAddress', 'Company address'],
+        ['ShowCountry', 'Show country'], ['ShowStatus', 'Order status'], ['ShowBarcode', 'Barcode']]],
+    ['Addresses', [['UseVendorNameInAddress', 'Vendor name (not remit-to name)'], ['ShowBillToPhone', 'Vendor phone'], ['ShowBillToEmail', 'Vendor email'],
+        ['ShowBillToFax', 'Vendor fax'], ['ShowVendorAccountNumber', 'Vendor account #'], ['ShowVendorContact', 'Contact / vendor SO #']]],
+    ['Sections', [['ShowNotes', 'Order notes'], ['ShowMemos', 'Memos'], ['ShowPOCustomFields', 'PO custom fields'],
+        ['ShowCfPO1', 'PO CF 1'], ['ShowCfPO2', 'PO CF 2'], ['ShowCfPO3', 'PO CF 3'], ['ShowCfPO4', 'PO CF 4'], ['ShowCfPO5', 'PO CF 5'], ['ShowCfPO6', 'PO CF 6']]],
+    ['Order fields', [['OrderBuyer', 'Buyer'], ['OrderPaymentTerms', 'Payment terms'], ['OrderFOBPoint', 'FOB point'], ['OrderShippingTerms', 'Shipping terms'],
+        ['OrderShipVia', 'Ship via'], ['OrderShipService', 'Service'], ['OrderDateScheduled', 'Date scheduled'], ['OrderCurrency', 'Order currency'],
+        ['OrderCurrencyRate', 'Currency rate']]],
+    ['Item columns', [['Item#', 'Item #'], ['ItemType', 'Type'], ['ItemRevision', 'Revision'], ['ItemFulfillmentDate', 'Fulfillment date'],
+        ['ItemNumberAndDescription', 'Number / Description'], ['ItemPart', 'Number (vendor part #)'], ['ItemDescription', 'Description'],
+        ['ItemUnitPrice', 'Unit cost (home)'], ['ItemCurrencyUnitCost', 'Unit cost (vendor currency)'], ['ItemOtyOrdered', 'Qty ordered / UOM'],
+        ['ItemExtendedPrice', 'Total cost (home)'], ['ItemCurrencyTotal', 'Total (vendor currency)'],
+        ['ItemTaxCode', 'Tax code (CA/AU)'], ['ItemTax', 'Tax (CA/AU)'], ['ItemCurrencyTax', 'Vendor-currency tax (CA/AU)'],
+        ['ShowCfItem1', 'Item CF 1'], ['ShowCfItem2', 'Item CF 2'], ['ShowCfItem3', 'Item CF 3']]],
+    ['Line items', [['ShowPartNumber', 'Fishbowl part # in ( )'], ['ShowLineItemNotes', 'Line notes'],
+        ['ShowOutsourceReturnAs', 'Out-sourced "Returning As" (Number / Description column)'], ['ShowTotalQty', 'Total qty (US)']]],
+    ['Totals', [['ShowTotals', 'Totals (single currency)'], ['ShowCurrencyTotals', 'Totals (vendor currency)'], ['ShowHomeCurrencyTotals', 'Home-currency column']]]
+];
+
+// ============================================================================
+//  DATA
+// ============================================================================
+// Configured custom-field columns only, each with a leading comma. Never select
+// a bare NULL: the server's MariaDB driver types it as a binary string, Fishbowl
+// then fails Class.forName("byte[]") and the whole query returns "An unknown
+// error has occurred". An omitted column simply reads as undefined (blank).
+function cfSelect(prefix, alias, count, keyBase) {
+    var out = '', params = [];
+    for (var i = 1; i <= count; i++) {
+        var id = parseInt(opt('CustomField:' + keyBase + i), 10);
+        if (id > 0) { out += ', CustomFieldById(' + alias + '.customFields, ?) AS ' + prefix + i; params.push(id); }
+    }
+    return { sql: out, params: params };
+}
+
+async function fetchModel(poId) {
+    var cfP = cfSelect('pocf', 'po', 6, 'PO');
+    var hdr = await FBDoc.q([
+        'SELECT po.id, po.num, po.statusId AS statusid, ps.name AS postatus, po.note, po.vendorId AS vendorid,',
+        '  po.vendorContact AS vendorcontact, po.vendorSO AS vendorso, po.buyer,',
+        '  po.dateIssued AS dateissued, po.dateLastModified AS datelastmodified, po.dateFirstShip AS datefirstship,',
+        '  po.locationGroupId AS lgid,',
+        '  po.shipToName AS shiptoname, po.shipToAddress AS shiptoaddress, po.shipToCity AS shiptocity, po.shipToZip AS shiptozip,',
+        '  ss.code AS shiptostate, sc.name AS shiptocountry,',
+        '  po.remitToName AS remittoname, po.remitAddress AS remittoaddress, po.remitCity AS remittocity, po.remitZip AS remittozip,',
+        '  rs.code AS remittostate, rc.name AS remittocountry, po.phone, po.email,',
+        '  (SELECT c.datus FROM contact c WHERE c.accountId = v.accountId AND c.typeId = 40 AND c.defaultFlag = 1 ORDER BY c.id LIMIT 1) AS fax,',
+        '  v.name AS vendorname, v.accountNum AS vendoraccountnumber,',
+        '  company.name AS company, company.abn AS abn,',
+        '  COALESCE(NULLIF(po.currencyRate, 0), 1) AS currencyrate, cur.code AS currencycode, hc.code AS homecurrencycode,',
+        '  COALESCE(po.totalTax, 0) AS totaltax,',
+        '  fob.name AS fobpoint, st.name AS shippingterms, pt.name AS paymentterms, car.name AS carriername, cs.name AS carrierservice' + cfP.sql,
+        'FROM po',
+        'JOIN vendor v ON v.id = po.vendorId',
+        'LEFT JOIN company ON company.id = 1',
+        'LEFT JOIN postatus ps ON ps.id = po.statusId',
+        'LEFT JOIN stateconst ss ON ss.id = po.shipToStateId',
+        'LEFT JOIN countryconst sc ON sc.id = po.shipToCountryId',
+        'LEFT JOIN stateconst rs ON rs.id = po.remitStateId',
+        'LEFT JOIN countryconst rc ON rc.id = po.remitCountryId',
+        'LEFT JOIN currency cur ON cur.id = COALESCE(po.currencyId, v.currencyId)',
+        'LEFT JOIN currency hc ON hc.homeCurrency = 1',
+        'LEFT JOIN fobpoint fob ON fob.id = po.fobPointId',
+        'LEFT JOIN shipterms st ON st.id = po.shipTermsId',
+        'LEFT JOIN paymentterms pt ON pt.id = po.paymentTermsId',
+        'LEFT JOIN carrier car ON car.id = po.carrierId',
+        'LEFT JOIN carrierservice cs ON cs.id = po.carrierServiceId',
+        'WHERE po.id = ?'
+    ].join('\n'), cfP.params.concat([poId]));
+    if (!hdr.length) throw new Error('Purchase order ' + poId + ' not found');
+    var h = hdr[0];
+
+    var cfI = cfSelect('itemcf', 'pi', 3, 'Item');
+    var lines = await FBDoc.q([
+        'SELECT pi.id AS itemid, pi.poLineItem AS lineno, pit.name AS itemtype, pi.typeId AS typeid,',
+        '  pi.partNum AS partnum, pi.vendorPartNum AS vendorpartnum, pi.description, pi.note,',
+        '  COALESCE(pi.qtyToFulfill, 0) AS qty, uom.code AS uomcode,',
+        '  COALESCE(pi.unitCost, 0) AS unitcost, COALESCE(pi.totalCost, 0) AS totalcost,',
+        '  pi.dateScheduledFulfillment AS datesched, tr.code AS taxcode, COALESCE(pi.taxRate, 0) AS taxrate, pi.revLevel AS revlevel,',
+        '  pi.outsourcedPartNumber AS ospartnum, pi.outsourcedPartDescription AS ospartdesc' + cfI.sql,
+        'FROM poitem pi',
+        'JOIN poitemtype pit ON pit.id = pi.typeId',
+        'LEFT JOIN uom ON uom.id = pi.uomId',
+        'LEFT JOIN taxrate tr ON tr.id = pi.taxId',
+        'WHERE pi.poId = ?',
+        'ORDER BY pi.poLineItem, pi.id'
+    ].join('\n'), cfI.params.concat([poId]));
+
+    var memos = opt('ShowMemos') ? await FBDoc.q(
+        'SELECT memo, userName AS username, dateCreated AS datecreated FROM memo WHERE tableId = ? AND recordId = ? ORDER BY id', [PO_MEMO_TABLE, poId]) : [];
+    var companyAddress = '';
+    try { companyAddress = typeof getCompanyAddress === 'function' ? String(getCompanyAddress(parseInt(h.lgid, 10), !!opt('ShowCountry')) || '') : ''; }
+    catch (e) { debugLog('getCompanyAddress failed: ' + e.message, 'warn'); }
+
+    return { h: h, lines: lines, memos: memos, companyAddress: companyAddress };
+}
+
+// ============================================================================
+//  CALCULATIONS — the Item Info SQL columns and variables of the jrxml (§4, §6.4)
+// ============================================================================
+// The edition picks the item table (AccountingModule: US / CA / AU). Any other
+// international edition takes the CA layout (the jrxml prints no table then).
+function editionOf(E) { return E.isUS ? 'US' : E.isAU ? 'AU' : 'CA'; }
+
+function compute(model) {
+    var h = model.h, E = APP.env, ED = editionOf(E), rate = num(h.currencyrate) || 1;
+    var sub = 0, tax = 0, homeSub = 0, totalQty = 0;
+    model.lines.forEach(function (l) {
+        var up = num(l.unitcost), q = num(l.qty), tc = num(l.totalcost), tr = num(l.taxrate);
+        l.curUnit = up / rate;                                              // CURRENCYUNITCOST
+        l.curTotal = ED === 'US' ? up / rate * q : up * q / rate;           // CURRENCYTOTALCOST
+        l.curTotalTax = q * up * tr / rate;                                 // CURRENCYTOTALTAX (unrounded)
+        l.curTaxTotal = ED === 'US' ? 0 : round2(q * up * tr / rate);       // CURRENCYTAXTOTAL (per line, 2dp)
+        l.usUnit = round2(up / rate) * rate;                                // USCURRENCYUNITCOST
+        l.usTotal = round2(up / rate * q) * rate;                           // USTOTALCOST
+        l.caUnit = rate === 1 ? l.curUnit : round2(l.curUnit) * rate;       // variable CAUnitCost
+        l.caTotal = rate === 1 ? l.curTotal : round2(l.curTotal) * rate;    // variable CATotalCost
+        l.taxAmount = ED === 'CA' ? l.curTaxTotal : tc * tr;                // variable taxAmount
+        sub += l.curTotal; tax += l.curTaxTotal; homeSub += tc; totalQty += q;
+    });
+    var homeTax = num(h.totaltax);                                          // po.totalTax, not a sum
+    return { ED: ED, rate: rate, sub: sub, tax: tax, total: sub + tax, homeSub: homeSub, homeTax: homeTax, homeTotal: homeSub + homeTax, totalQty: totalQty };
+}
+
+// ============================================================================
+//  DOCUMENT BUILD — bands + blocks for FBDoc.paginate
+// ============================================================================
+function buildDoc(model, geom) {
+    var h = model.h, E = APP.env, c = compute(model), ED = c.ED;
+    var K = geom.CWpt / 552;                       // jrxml x-positions scale to this page's content width
+    var X = function (x) { return (x * K).toFixed(2) + 'pt'; };
+    var MC = !!E.multiCurrency;
+    var curCode = has(h.currencycode) ? h.currencycode : null;      // the jrxml's SYMBOL != null
+    var curSym = FBDoc.fmt.currencySymbol(curCode || h.homecurrencycode, E.useCode);   // coaleseSymbol
+    var homeSym = FBDoc.fmt.currencySymbol(h.homecurrencycode, E.useCode);
+    var COST = E.cost, TOTAL = E.total;
+    var fmtCur = function (sym, v, pat) { return FBDoc.fmt.number(pat, v, { symbol: sym, rounding: 'halfUp' }); };   // getFormattedCurrency
+    var fmtRaw = function (v, pat) { return FBDoc.fmt.number(pat, v); };                                              // DecimalFormat pattern
+    var fmtD = function (v) { return FBDoc.fmt.date(E.date, v); };
+    var isDateCf = function (v) { return /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/.test(String(v || '')); };
+    var cfVal = function (v) { return v == null ? '' : (isDateCf(v) ? fmtD(v) : String(v)); };
+    var orderNo = (E.barcodeDI ? 'P' : '') + h.num;
+    var status = parseInt(h.statusid, 10);
+
+    // ---- title ----
+    var title = label('ReportTitle', null) ||
+        (status < 20 ? (E.isAU ? 'Request for Quote' : 'Bid Request') : 'Purchase Order');
+    APP.setTitle(title + ' ' + h.num);
+
+    // ---- page header (every sheet) ----
+    var companyAddr = (E.isAU ? '<b>ABN: </b>' + esc(h.abn || '') + '\n' : '') + esc(model.companyAddress);
+    var logo = E.logo ? '<img src="' + E.logo + '" alt="">' : '';
+    var align = String(opt('cbLogoAlignment') || 'left').toLowerCase();
+    var left = align === 'top'
+        ? '<div class="po-abs po-logo" style="left:0;top:0;width:' + X(356) + ';height:40pt;align-items:flex-end;justify-content:flex-start">' + logo + '</div>' +
+          (opt('ShowCompanyName') ? '<div class="po-abs po-company" style="left:0;top:40pt;width:' + X(358) + ';height:20pt;display:flex;align-items:center">' + esc(h.company) + '</div>' : '') +
+          (opt('ShowCompanyAddress') ? '<div class="po-abs po-caddr" style="left:0;top:60pt;width:' + X(358) + ';height:74pt;padding-bottom:3pt">' + companyAddr + '</div>' : '')
+        : align === 'left'
+        ? '<div class="po-abs po-logo" style="left:0;top:0;width:' + X(75) + ';height:134pt;align-items:center;justify-content:center">' + logo + '</div>' +
+          (opt('ShowCompanyName') ? '<div class="po-abs po-company" style="left:' + X(75) + ';top:33pt;width:' + X(283) + ';height:20pt;padding-left:3pt">' + esc(h.company) + '</div>' : '') +
+          (opt('ShowCompanyAddress') ? '<div class="po-abs po-caddr" style="left:' + X(75) + ';top:53pt;width:' + X(283) + ';height:81pt;padding-left:3pt">' + companyAddr + '</div>' : '')
+        : '';
+    var pageHeader =
+        '<div class="po-doc" style="position:relative;height:134pt">' + left +
+        '<div class="po-abs po-title" style="left:' + X(356) + ';top:0;width:' + X(196) + ';height:24pt">' + esc(title) + '</div>' +
+        (opt('ShowStatus') ? '<div class="po-abs" style="left:' + X(438) + ';top:21pt;width:' + X(100) + ';height:12pt;font-size:8pt;text-align:center;padding-left:3pt;line-height:12pt">(' + esc(h.postatus || '') + ')</div>' : '') +
+        '<div class="po-abs po-hdrcell po-center" style="left:' + X(358) + ';top:33pt;width:' + X(125) + ';height:17pt">' + esc(label('Order#', 'Order #')) + '</div>' +
+        '<div class="po-abs po-hdrcell po-center" style="left:' + X(483) + ';top:33pt;width:' + X(69) + ';height:17pt;border-left:0">' + esc(label('Date', 'Date')) + '</div>' +
+        '<div class="po-abs po-box po-center" style="left:' + X(358) + ';top:50pt;width:' + X(125) + ';height:17pt;font-size:10pt;font-weight:700;padding:0 3pt;border-top:0">' + esc(orderNo) + '</div>' +
+        '<div class="po-abs po-box po-center" style="left:' + X(483) + ';top:50pt;width:' + X(69) + ';height:17pt;font-size:10pt;border-top:0;border-left:0">' + esc(fmtD(h.dateissued || h.datelastmodified)) + '</div>' +
+        (opt('ShowBarcode') ? '<div class="po-abs po-center" style="left:' + X(359) + ';top:77pt;width:' + X(193) + ';height:47pt">' + FBDoc.code128.svg(orderNo, { module: 1, quiet: 0 }) + '</div>' : '') +
+        '</div>';
+
+    // ---- footers ----
+    var printed = FBDoc.fmt.printedAt();
+    var footLine = function (ctx, w1, w2) {
+        return '<div class="po-foot"><span class="dt" style="width:' + X(w1) + '">' + esc(printed) + '</span>' +
+            '<span class="pg" style="left:' + X(w1) + '"><span class="a">Page ' + ctx.pageNo + ' of</span> <span class="n" style="width:' + X(24) + '">' + ctx.pageCount + '</span></span></div>';
+    };
+    var pageFooter = function (ctx) { return '<div class="po-doc">' + footLine(ctx, 323) + '</div>'; };
+
+    var showTotals = MC ? (opt('ShowHomeCurrencyTotals') || opt('ShowCurrencyTotals')) : opt('ShowTotals');
+    var dual = opt('ShowHomeCurrencyTotals') && MC && !!curCode;
+    var both = dual && opt('ShowCurrencyTotals');
+    var taxRow = ED !== 'US';
+    var taxLabel = label('SalesTax', E.isAU ? 'GST:' : 'Sales Tax:');
+    var totLabel = label('Total', 'Total:');
+    var totalsHtml = '';
+    if (showTotals) {
+        var tw = function (w) { return '<col style="width:' + (w * K).toFixed(2) + 'pt">'; };
+        var vCur = function (v) { return '<td class="v">' + esc(fmtCur(curSym, v, TOTAL)) + '</td>'; };
+        var vHome = function (v) { return '<td class="v">' + esc(fmtCur(homeSym, v, TOTAL)) + '</td>'; };
+        var rows = [];
+        if (!dual) {
+            // (i) 45 spacer + 69 labels + 145 value (vendor currency, else home)
+            if (taxRow) rows.push('<tr><td class="sp"></td><td>' + esc(taxLabel) + '</td>' + vCur(c.tax) + '</tr>');
+            rows.push('<tr class="g"><td class="sp"></td><td>' + esc(totLabel) + '</td>' + vCur(c.total) + '</tr>');
+            totalsHtml = '<table><colgroup>' + tw(45) + tw(69) + tw(145) + '</colgroup><tbody>' + rows.join('') + '</tbody></table>';
+        } else if (!both) {
+            // (ii) 95 spacer + 69 labels + 95 home
+            if (taxRow) rows.push('<tr><td class="sp"></td><td>' + esc(taxLabel) + '</td>' + vHome(c.homeTax) + '</tr>');
+            rows.push('<tr class="g"><td class="sp"></td><td>' + esc(totLabel) + '</td>' + vHome(c.homeTotal) + '</tr>');
+            totalsHtml = '<table><colgroup>' + tw(95) + tw(69) + tw(95) + '</colgroup><thead><tr><td class="sp"></td><td class="sp"></td><th>' + esc(h.homecurrencycode || '') + '</th></tr></thead>' +
+                '<tbody>' + rows.join('') + '</tbody></table>';
+        } else {
+            // (iii) 69 labels + 95 vendor + 95 home
+            if (taxRow) rows.push('<tr><td>' + esc(taxLabel) + '</td>' + vCur(c.tax) + vHome(c.homeTax) + '</tr>');
+            rows.push('<tr class="g"><td>' + esc(totLabel) + '</td>' + vCur(c.total) + vHome(c.homeTotal) + '</tr>');
+            totalsHtml = '<table><colgroup>' + tw(69) + tw(95) + tw(95) + '</colgroup><thead><tr><td class="sp"></td><th>' + esc(curCode) + '</th><th>' + esc(h.homecurrencycode || '') + '</th></tr></thead>' +
+                '<tbody>' + rows.join('') + '</tbody></table>';
+        }
+    }
+    // PO Notice: "styled" markup — only <b>/<i>/<u>/<br> survive.
+    var notice = esc(E.notice).replace(/&lt;(\/?)(b|i|u|br)\s*\/?&gt;/gi, '<$1$2>');
+    var lastPageFooter = function (ctx) {
+        return '<div class="po-doc po-last">' +
+            '<div class="msg" style="width:' + X(293) + '">' + notice + '</div>' +
+            (totalsHtml ? '<div class="tot' + (taxRow || dual ? '' : ' us') + '" style="left:' + X(293) + ';width:' + X(259) + '">' + totalsHtml + '</div>' : '') +
+            '<div class="foot">' + footLine(ctx, 347) + '</div></div>';
+    };
+
+    var blocks = [], tables = {};
+
+    // ---- CustomerAddresses ----
+    var cityLine = function (city, state, zip) {
+        return (has(city) ? city + ', ' : '') + (has(state) ? state + '  ' : '') + (zip || '');
+    };
+    var vendorFirst = opt('UseVendorNameInAddress') ? (has(h.vendorname) ? h.vendorname : h.remittoname) : h.remittoname;
+    var vendorTxt = [vendorFirst, h.remittoaddress, cityLine(h.remittocity, h.remittostate, h.remittozip)]
+        .concat(opt('ShowCountry') ? [h.remittocountry] : [])
+        .concat(opt('ShowBillToPhone') && has(h.phone) ? ['Phone: ' + h.phone] : [])
+        .concat(opt('ShowBillToEmail') && has(h.email) ? ['Email: ' + h.email] : [])
+        .concat(opt('ShowBillToFax') && has(h.fax) ? ['Fax: ' + h.fax] : [])
+        .concat(opt('ShowVendorAccountNumber') && has(h.vendoraccountnumber) ? ['Account #: ' + h.vendoraccountnumber] : [])
+        .filter(has).join('\n');
+    var shipTxt = [h.shiptoname, h.shiptoaddress, cityLine(h.shiptocity, h.shiptostate, h.shiptozip)]
+        .concat(opt('ShowCountry') ? [h.shiptocountry] : []).filter(has).join('\n');
+    var contactTxt = [has(h.vendorcontact) ? 'Contact: ' + h.vendorcontact : '', has(h.vendorso) ? 'Sales Order Number: ' + h.vendorso : '']
+        .filter(Boolean).join('\n');
+    // The contact line is isRemoveLineWhenBlank: when it does not print, the band loses its 11pt.
+    var showContact = !!(opt('ShowVendorContact') && contactTxt);
+    blocks.push({ html:
+        '<div class="po-doc po-addresses"' + (showContact ? '' : ' style="min-height:87pt"') + '>' +
+        '<div class="col" style="width:' + X(271) + '">' +
+          '<div class="h po-hdrcell">' + esc(label('Vendor', 'Vendor:')) + '</div>' +
+          '<div class="b po-box">' + esc(vendorTxt) + '</div>' +
+          (showContact ? '<div class="l po-box">' + esc(contactTxt) + '</div>' : '') +
+          (E.isCaOrIntl ? '<div class="l po-box">' + esc('GST/HST: ' + (h.abn || '')) + '</div>' : '') +
+        '</div>' +
+        '<div class="col" style="width:' + X(271) + ';margin-left:' + X(10) + '">' +
+          '<div class="h po-hdrcell">' + esc(label('ShipTo', 'Ship To:')) + '</div>' +
+          '<div class="b po-box">' + esc(shipTxt) + '</div>' +
+        '</div></div>' });
+
+    // ---- Notes (splits across pages when long) ----
+    if (opt('ShowNotes') && has(h.note)) {
+        blocks.push({ split: true, html:
+            '<div class="po-doc po-notes"><div class="lbl" style="width:' + X(33) + '">Notes:</div>' +
+            '<div class="txt" data-fbdoc-split>' + esc(h.note) + '</div></div>' });
+    }
+
+    // ---- Memos (subMemo: title, repeated column header, rows) ----
+    if (opt('ShowMemos') && model.memos.length) {
+        blocks.push({ kwn: true, html: '<div class="po-doc po-memotitle">Memos</div>' });
+        var mw = [55 * K, 55 * K, geom.CWpt - 110 * K].map(function (x) { return Math.round(x * 100) / 100; });
+        tables.memo = { className: 'po-doc po-memos', colgroup: FBDoc.Columns.colgroup(mw), thead: '<thead><tr><th>Date</th><th>User</th><th>Memo</th></tr></thead>' };
+        model.memos.forEach(function (mm) {
+            blocks.push({ table: 'memo', split: true, html: '<tr><td class="d">' + esc(fmtD(mm.datecreated)) + '</td><td>' + esc(mm.username || '') + '</td>' +
+                '<td><div class="pre" data-fbdoc-split>' + esc(mm.memo || '') + '</div></td></tr>' });
+        });
+        blocks.push({ kwp: true, html: '<div class="po-gap5"></div>' });
+    }
+
+    // ---- Order-field strip (info group, POinfo table) ----
+    var strip = [
+        ['OrderBuyer', label('Buyer', 'Buyer'), h.buyer],
+        ['OrderPaymentTerms', label('PaymentTerms', 'Payment Terms'), h.paymentterms],
+        ['OrderFOBPoint', label('FOBPoint', 'FOB Point'), h.fobpoint],
+        ['OrderShippingTerms', label('ShippingTerms', 'Shipping Terms'), h.shippingterms],
+        ['OrderShipVia', label('ShipVia', 'Ship Via'), h.carriername],
+        ['OrderShipService', label('Service', 'Service'), h.carrierservice],
+        ['OrderDateScheduled', label('DateScheduled', 'Date Scheduled'), fmtD(h.datefirstship)],
+        ['OrderCurrency', label('OrderCurrency', 'Order Currency'), curCode || h.homecurrencycode],
+        ['OrderCurrencyRate', label('CurrencyRate', 'Currency Rate'), FBDoc.fmt.number(' #,##0.0#######', h.currencyrate)]
+    ].filter(function (s) { return opt(s[0]); });
+    if (strip.length) blocks.push({ html: stripHtml(strip, K, geom.CWpt, '') });
+
+    // ---- PO custom-field strip (CustomFields group) ----
+    if (opt('ShowPOCustomFields')) {
+        var cfs = [];
+        for (var n = 1; n <= 6; n++) if (opt('ShowCfPO' + n)) cfs.push(['', label('POcf' + n, 'Custom Field ' + n), cfVal(h['pocf' + n])]);
+        if (cfs.length) blocks.push({ html: stripHtml(cfs, K, geom.CWpt, ' cf') });
+    }
+
+    // ---- Line items (the edition's table) ----
+    var cols = itemColumns(ED, curCode);
+    var fit = FBDoc.Columns.fit(cols, geom.CWpt);
+    tables.items = {
+        className: 'po-doc po-items' + (ED !== 'US' ? ' intl' : '') + (fit.compact ? ' compact' : ''),
+        colgroup: FBDoc.Columns.colgroup(fit.widths),
+        thead: '<thead><tr>' + cols.map(function (col) {
+            if (col.key === 'qty') {
+                return '<th class="qh"><div class="w"><span class="q">' + esc(label('QtyOrdered', 'Qty Ordered')) + '</span><span class="u">' + esc(label('UOM', 'UOM')) + '</span></div></th>';
+            }
+            return '<th class="' + col.hAlign + (col.nb ? ' nb' : '') + '">' + esc(col.label) + '</th>';
+        }).join('') + '</tr></thead>'
+    };
+    var splitKey = cols.some(function (x) { return x.key === 'desc'; }) ? 'desc' : 'numdesc';
+    var homeUnit = function (l) { return ED === 'US' ? l.usUnit : ED === 'CA' ? l.caUnit : num(l.unitcost); };
+    var homeTotal = function (l) { return ED === 'US' ? l.usTotal : ED === 'CA' ? l.caTotal : num(l.totalcost); };
+
+    model.lines.forEach(function (l) {
+        var numTxt = (opt('ShowPartNumber') && has(l.partnum) ? '(' + l.partnum + ')  ' : '') + (l.vendorpartnum || '');
+        var desc = l.description || '';
+        var note = opt('ShowLineItemNotes') && has(l.note) ? '\n  ' + l.note : '';
+        var ret = opt('ShowOutsourceReturnAs') && has(l.ospartnum)
+            ? '\n   Returning As:\n   ' + l.ospartnum + (has(l.ospartdesc) ? ' - ' + l.ospartdesc : '') : '';
+        var numDesc = numTxt + (numTxt.trim() && desc.trim() ? ' - ' : '') + desc + ret + note;
+        var cells = cols.map(function (col) {
+            var k = col.key, v = '';
+            switch (k) {
+                case 'line': v = esc(l.lineno); break;
+                case 'type': v = esc(l.itemtype || ''); break;
+                case 'cf1': case 'cf2': case 'cf3': v = esc(cfVal(l['itemcf' + k.charAt(2)])); break;
+                case 'rev': v = esc(l.revlevel || ''); break;
+                case 'date': v = esc(fmtD(l.datesched)); break;
+                case 'numdesc': v = '<div class="pre"' + (splitKey === 'numdesc' ? ' data-fbdoc-split' : '') + '>' + esc(numDesc) + '</div>'; break;
+                case 'num': v = '<div class="pre">' + esc(numTxt) + '</div>'; break;
+                case 'desc': v = '<div class="pre" data-fbdoc-split>' + esc(desc + note) + '</div>'; break;
+                case 'unit': v = esc(MC ? fmtCur(homeSym, homeUnit(l), COST) : fmtRaw(num(l.unitcost), COST)); break;
+                case 'curUnit': v = esc(curCode ? fmtCur(curSym, l.curUnit, COST) : fmtCur(homeSym, num(l.unitcost), COST)); break;
+                case 'qty':
+                    return '<td class="qc"><div class="w"><span class="q">' + esc(FBDoc.fmt.number(E.qty, l.qty)) + '</span><span class="u">' + esc(l.uomcode || '') + '</span></div></td>';
+                case 'curTotal': v = esc(curCode ? fmtCur(curSym, l.curTotal, TOTAL) : fmtCur(homeSym, num(l.totalcost), COST)); break;
+                case 'total': v = esc(MC ? fmtCur(homeSym, homeTotal(l), COST) : fmtRaw(num(l.totalcost), COST)); break;
+                case 'taxCode': v = esc(l.taxcode || ''); break;
+                case 'tax': v = esc(MC ? fmtCur(homeSym, l.taxAmount, COST) : fmtRaw(l.taxAmount, COST)); break;
+                case 'curTax': v = esc(curCode ? fmtCur(curSym, l.curTotalTax, COST) : fmtCur(homeSym, l.taxAmount, COST)); break;
+            }
+            return '<td class="' + col.dAlign + (col.money ? ' m' : '') + '">' + v + '</td>';
+        });
+        blocks.push({ table: 'items', stripe: true, split: true, html: '<tr>' + cells.join('') + '</tr>' });
+    });
+
+    // US table footer: Total Qty under the Qty column.
+    if (ED === 'US' && opt('ShowTotalQty') && model.lines.length && cols.some(function (x) { return x.key === 'qty'; })) {
+        blocks.push({ table: 'items', kwp: true, html: '<tr class="tq">' + cols.map(function (col) {
+            return col.key === 'qty'
+                ? '<td class="qc"><div class="w"><span class="q">' + esc(FBDoc.fmt.number(E.qty, c.totalQty)) + '</span><span class="u"></span></div></td>'
+                : '<td></td>';
+        }).join('') + '</tr>' });
+    }
+
+    return { id: 'po-' + h.num, pageHeader: pageHeader, pageFooter: pageFooter, lastPageFooter: lastPageFooter, tables: tables, blocks: blocks };
+}
+
+// POinfo strip: 92pt columns packed from the left; more than fit share the width.
+// (A collapsed 0.5pt border sits half outside the table: keep 0.5pt in hand so
+// the right-hand border is not clipped at the content edge.)
+function stripHtml(cells, K, CW, cls) {
+    var w = Math.min(92 * K, (CW - 0.5) / cells.length);
+    var widths = cells.map(function () { return Math.floor(w * 100) / 100; });
+    var tot = widths.reduce(function (a, b) { return a + b; }, 0);
+    return '<div class="po-doc po-strip' + cls + '"><table style="width:' + tot.toFixed(2) + 'pt">' + FBDoc.Columns.colgroup(widths) +
+        '<thead><tr>' + cells.map(function (c) { return '<th title="' + esc(c[1]) + '">' + esc(c[1]) + '</th>'; }).join('') + '</tr></thead>' +
+        '<tbody><tr>' + cells.map(function (c) { return '<td>' + esc(c[2] == null ? '' : c[2]) + '</td>'; }).join('') + '</tr></tbody></table></div>';
+}
+
+// Visible item columns, in the jrxml's order for the edition (§6.4). basis = the
+// jrxml width; only the description columns flex (and the number a little).
+function itemColumns(ED, curCode) {
+    var cols = [];
+    var add = function (key, on, lbl, basis, min, flex, hAlign, dAlign, extra) {
+        if (on) cols.push(Object.assign({ key: key, label: lbl, basis: basis, min: min, flex: flex, hAlign: hAlign, dAlign: dAlign }, extra || {}));
+    };
+    var unitLbl = label('UnitCost', 'Unit Cost'), taxLbl = label('Tax', 'Tax');
+    var dflNum = label('Number', null) == null && label('Description', null) == null;
+    var numDescLbl = dflNum ? 'Number / Description' : label('Number', 'Number') + ' / ' + label('Description', 'Description');
+    var curTotLbl = ED === 'AU' ? (curCode ? curCode + ' ' : '') + label('ItemTotal', 'Total') : (curCode ? curCode + ' Total' : 'Total');
+    add('line', opt('Item#'), label('Item#', 'Item #'), 31, 31, 0, 'c', 'c');
+    add('type', opt('ItemType'), label('Type', 'Type'), 50, 46, 0, 'c', 'c');
+    add('cf1', opt('ShowCfItem1'), label('Itemcf1', 'Item CF 1'), 90, 48, 0, 'c', 'c', { nb: true });
+    add('rev', opt('ItemRevision'), label('Revision', 'Revision'), 50, 40, 0, 'c', 'c', { nb: ED !== 'US' });
+    add('date', opt('ItemFulfillmentDate'), label('FulfillmentDate', 'Fulfillment Date'), 70, 56, 0, 'c', 'c');
+    add('numdesc', opt('ItemNumberAndDescription'), numDescLbl, 245, 90, 1, 'l', 'l');
+    add('num', opt('ItemPart'), label('Number', 'Number'), 70, 56, 0.25, 'l', 'l');
+    add('desc', opt('ItemDescription'), label('Description', 'Description'), 175, 70, 1, 'l', 'l');
+    add('cf2', opt('ShowCfItem2'), label('Itemcf2', 'Item CF 2'), 90, 48, 0, 'c', 'c', { nb: true });
+    add('unit', opt('ItemUnitPrice'), unitLbl, 72, 58, 0, 'c', 'r', { money: true });
+    add('curUnit', opt('ItemCurrencyUnitCost'), curCode ? curCode + ' ' + unitLbl : unitLbl, 72, 58, 0, 'c', 'r', { money: true });
+    add('qty', opt('ItemOtyOrdered'), label('QtyOrdered', 'Qty Ordered'), 83, 76, 0, 'r', 'r');
+    if (ED === 'US') {
+        add('curTotal', opt('ItemCurrencyTotal'), curTotLbl, 72, 58, 0, 'c', 'r', { money: true });
+        add('total', opt('ItemExtendedPrice'), label('TotalCost', 'Total Cost'), 72, 58, 0, 'c', 'r', { money: true });
+    } else {
+        add('total', opt('ItemExtendedPrice'), label('TotalCost', 'Total Cost'), 72, 58, 0, 'c', 'r', { money: true });
+        add('curTotal', opt('ItemCurrencyTotal'), curTotLbl, 72, 58, 0, 'c', 'r', { money: true });
+        add('taxCode', opt('ItemTaxCode'), label('TaxCode', 'Tax Code'), 61, 40, 0, 'c', 'c');
+        add('tax', opt('ItemTax'), taxLbl, 90, 58, 0, 'c', 'r', { money: true });
+        add('curTax', opt('ItemCurrencyTax'), curCode ? curCode + ' ' + taxLbl : taxLbl, 90, 58, 0, 'c', 'r', { money: true });
+    }
+    add('cf3', opt('ShowCfItem3'), label('Itemcf3', 'Item CF 3'), 90, 48, 0, 'c', 'c', { nb: true });
+    return cols;
+}
+
+// ============================================================================
+//  ORDER PICKER — typeahead + browse with status / period filters (per user)
+// ============================================================================
+var PERIODS = [{ value: '30', label: '30 days' }, { value: '90', label: '90 days' }, { value: '365', label: '1 year' }, { value: 'all', label: 'All' }];
+function pickFilterSql(f) {
+    var where = [];
+    var st = ((f && f.status) || []).map(function (x) { return parseInt(x, 10); }).filter(function (n) { return !isNaN(n); });
+    if (st.length) where.push('po.statusId IN (' + st.join(',') + ')');
+    var days = parseInt(f && f.period, 10);
+    if (days > 0) where.push('po.dateCreated >= DATE_SUB(CURDATE(), INTERVAL ' + days + ' DAY)');
+    return where;
+}
+async function searchOrders(term, f) {
+    var where = pickFilterSql(f), params = [];
+    if (term) {
+        where.push('(po.num LIKE ? OR v.name LIKE ? OR po.vendorSO LIKE ?)');
+        params.push(term + '%', '%' + term + '%', '%' + term + '%');
+    }
+    var rows = await FBDoc.q(
+        'SELECT po.id, po.num, v.name AS vendor, st.name AS status, po.dateCreated AS datecreated, po.vendorSO AS vendorso, ' +
+        '(SELECT SUM(pi.totalCost) FROM poitem pi WHERE pi.poId = po.id) AS total ' +
+        'FROM po JOIN vendor v ON v.id = po.vendorId LEFT JOIN postatus st ON st.id = po.statusId ' +
+        (where.length ? 'WHERE ' + where.join(' AND ') + ' ' : '') +
+        'ORDER BY po.dateCreated DESC, po.id DESC LIMIT 60', params);
+    return rows.map(function (r) {
+        return { value: r.id, label: r.num, sub: r.vendor + (has(r.vendorso) ? ' · SO ' + r.vendorso : ''),
+                 meta: [r.status || '', FBDoc.fmt.date(APP.env ? APP.env.date : 'dd/MM/yyyy', r.datecreated),
+                        FBDoc.fmt.number(APP.env ? APP.env.total : '$ #,##0.00', r.total == null ? 0 : r.total, { rounding: 'halfUp' })] };
+    });
+}
+// ============================================================================
+//  THE APP — FBDoc.app runs the screen; this report supplies its document.
+// ============================================================================
+var APP = FBDoc.app({
+    title: 'Purchase Order',
+    record: { code: 'PO', table: 'po', numColumn: 'num', noun: 'purchase order', setting: 'set-po' },
+    sys: ['PO Notice', 'REPORT_DECIMAL_COST'],
+    env: function (env, s) { env.notice = s['PO Notice'] || ''; env.cost = s['REPORT_DECIMAL_COST'] || '$#,##0.00'; },
+    presets: function () { return [PO_REPORT_PATH]; },
+    defaults: function (env) { return jrxmlDefaults(env); },
+    options: OPTION_GROUPS,
+    optionsIntro: 'the stock Purchase Order report',
+    fetch: function (id) { return fetchModel(id); },
+    build: function (model, geom) { return buildDoc(model, geom); },
+    picker: {
+        placeholder: 'PO #, vendor or vendor SO…',
+        alias: 'po',
+        where: pickFilterSql,
+        search: function (term, f) { return searchOrders(term, f); },
+        filters: async function (saved) {
+            var statuses = [];
+            try { statuses = await FBDoc.q('SELECT id, name FROM postatus ORDER BY id'); } catch (e) { debugLog('postatus: ' + FBDoc.errText(e), 'warn'); }
+            return [
+                { key: 'status', label: 'Status', multi: true, value: saved.status || [],
+                  options: statuses.map(function (r) { return { value: String(r.id), label: r.name }; }) },
+                { key: 'period', label: 'Created', value: saved.period || '365', options: PERIODS }
+            ];
+        }
+    }
+});
+</script>
+
+</body>
+</html>

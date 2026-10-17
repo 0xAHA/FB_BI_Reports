@@ -1,0 +1,1389 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Production Demand (iReport port)
+  PATH:   iReport_Ports/ManufactureOrder/ProductionDemand.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard ManufactureOrder/ProductionDemand.jrxml
+  ("Shows inventory demand for finished goods with shortages in unfulfilled
+  work orders"). Same source, same rules, same columns and options; only the
+  presentation is interactive.
+
+    Source     One row per open work order (status < 40: Entered, Started)
+               whose finished-good line (woitem type 10) needs more than the
+               part's on-hand in the WO's location group: on-hand is every
+               tag of the part in that group, summed, as the original's
+               derived table. Needed is the line's qtyTarget: Fishbowl
+               consumes and yields at fulfilment, so on an open WO the
+               target is the outstanding demand (0 open lines have qtyUsed
+               on the live DB), and fulfilled WOs (40) never appear.
+    Columns    WO #, Customer (the SO customer of the finished-good line's
+               MO item, blank for stock), Part #, Machine (the BOM's custom
+               field named "Machine"), Schedule Date, Estimated Time (the
+               BOM's estimated duration, minutes, as "1d 2h 3m"; a BOM with
+               none shows 0m), Total Est. Time (that times the WO's
+               quantity), Needed + UOM, On Hand, Short (Needed - On Hand,
+               red).
+    Filters    Date created (Fishbowl's date range, "This month" by
+               default; the "to" day is included whole), location groups
+               (only the user's own, as Fishbowl passes them), customer,
+               part number and WO number (LIKE; % is a wildcard).
+               "Show raw goods" is the original's ShowRawGoods.
+    Grouping   Location Group, then Need Type: "Customer Needed" (an SO
+               customer) before "Stock Needed", then WO number, as the
+               original's ORDER BY.
+    Raw goods  With "Show raw goods", each WO lists its other lines (types
+               other than 10 / 31) under it: part, description, Needed in
+               the part's UOM, On Hand in the WO's group, and Short when
+               Needed is the larger (the original's "Raw Goods" table).
+    Summary    As the original's summary band: "Finished Goods Short" (the
+               rows above per part number and on-hand: Needed summed, On
+               Hand, Short) and, with raw goods shown, "Raw Goods Short"
+               (each listed WO's raw lines that are short on their own,
+               per part: Needed summed, On Hand averaged over the lines as
+               the original, Short).
+
+  Layout: the REPORT chrome (fb-styles §35): 56px header, push-down filter
+  panel that applies as you change it, collapsible location-group rows,
+  sticky footer; the two short summaries sit under the table.
+  Table tools (fb-lib FBLib.RptCols / RowCap / Pivot): column headings sort
+  the work orders within each need type (raw goods stay under their WO),
+  and the summaries' headings sort their parts; drag a heading to reorder,
+  its edge to resize (remembered per user). A Table / Pivot view selector:
+  Needed, On Hand, Short or the estimated hours by any two of location
+  group, need type, customer, part, machine, WO, UOM and schedule date
+  (day / week / month …), with drill-down. The query fetches at most 10,000
+  work orders, cut back to whole location groups, with Load all; the
+  summaries cover the work orders shown.
+  Views: the header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+  report out as pages like the original: Letter landscape by default, the
+  company / title / date range band on every page (the original's page
+  header), the column headings repeated, a location-group and need-type row
+  carried over a page break marked "(continued)", raw goods under their
+  work order (a work order whose raw goods run onto the next page is
+  repeated there "(continued)", with the raw-goods headings), Short in red
+  as the original prints it, and at the end the summary band with Raw Goods
+  Short and Finished Goods Short side by side as the original prints them,
+  their headings repeated on each page; no grand total (the original has
+  none), "Page X of Y". Columns fit the page and the font steps down from the
+  original's 10pt when they don't. The paper size and orientation, and the
+  view, are remembered per user. Print prints those pages in either view.
+
+  Deliberate differences:
+    - Every quantity is in the part's UOM. The finished-good Needed and the
+      Raw Goods Short summary convert each line's qtyTarget from the line's
+      UOM (uomconversion from line to part, else the exact inverse row),
+      as the original's own per-WO raw goods table already does (it reads
+      the direct row only). The original's Raw Goods Short summed line-UOM
+      quantities and compared them with base-UOM on-hand: on the live DB it
+      listed 12 raw parts as short that are not (FOOD094 needs 11.154 g
+      against 4.57 kg on hand). The finished-good lines of open WOs are all
+      in the part's UOM on the live DB (0 of 53), so the rows are the same.
+      A line with no conversion row either way is used as is, as the
+      original does, and its quantity is flagged (none on the live DB).
+    - Raw Goods Short covers the raw lines of the work orders listed (the
+      original's WO list) without applying the Part number and Customer
+      filters a second time to the raw lines themselves. The original did,
+      so either filter emptied the summary: a raw part never matches the
+      finished good's number, and raw lines carry no SO link (0 of
+      148,152 MO items on the live DB carry one at all).
+    - Machine is read from bom.customFields directly: the same JSON value
+      customfieldview returns (checked 1,066 of 1,066 values on a part
+      field), without joining that view, a UNION of 22 tables' custom
+      fields (MySQL estimates 6.5 million rows for the original's query).
+    - Speed: the tag roll-up is scoped to the parts and location groups in
+      play, and the finished-good join reads woitem by work order (the
+      server's stale table statistics sent it through the type index).
+      Same 42 rows and sums at all dates; 106 ms against 3,598 ms.
+    - Raw goods list in the work order's own line order (the original's
+      table had no ORDER BY).
+  Additions: collapsible location groups whose rows count their work orders
+  and total their Total Est. Time (as does each need type); a customer
+  multi-select with "No customer (stock)"; WO, Customer and Part links;
+  Excel; Print.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-folder" content="Manufacture Order">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="Open work orders whose finished good is short on hand, with the raw goods they need and short summaries by part.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipProdDemand',
+            name:  'Production Demand',
+            build: '2026.10.16-4a10cf3'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Production Demand — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 420px; overflow: hidden; text-overflow: ellipsis; vertical-align: top; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table th.ctr-cell, .rpt-table td.ctr-cell { text-align: center; }
+        .rpt-table th { cursor: default; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        .short { color: #CD0000; font-weight: 600; }
+        .uom-warn { color: #B26B00; font-weight: 700; margin-left: 3px; cursor: help; }
+        .need-cell { padding-left: 18px; }
+        .need-meta { font-weight: 400; color: var(--c-secondary); margin-left: 8px; font-size: 11px; }
+        /* Raw goods under a work order (the original's nested table). */
+        .rpt-table tr.rpt-minor td.rg-cell { padding-left: 34px; }
+        .rg-part { display: inline-block; min-width: 150px; padding-right: 10px; }
+        .rg-desc { color: var(--c-secondary); }
+        .rpt-table tr.pd-rg-head td { font-weight: 600; color: #415157; border-bottom: 1px solid #C9D2D6; padding-top: 2px; padding-bottom: 2px; }
+        .rpt-table tr.pd-rg-last td { border-bottom: 1px solid #9AA9AF; }
+        .rpt-table tr.pd-wo-raw td { border-top: 1px solid #9AA9AF; }
+        /* The summary band under the table. */
+        .pd-sumwrap { display: flex; flex-wrap: wrap; gap: 18px 28px; padding: 18px 20px 26px; align-items: flex-start; }
+        .pd-sumcard { flex: 0 1 520px; min-width: 300px; }
+        .pd-sumtitle { font-size: 13px; font-weight: 700; color: var(--menu-bg); margin: 0 0 6px; display: flex; gap: 8px; align-items: baseline; }
+        .pd-sumtitle span { font-size: 11px; font-weight: 400; color: var(--c-secondary); }
+        .pd-sumcard .rpt-table th { position: static; }
+        .pd-sumcard .rpt-empty { padding: 10px; text-align: left; }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>Production Demand</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <div class="rpt-viewsel" id="viewSelWrap" title="Table: the report as the standard one lays it out. Pivot: total Needed, On Hand, Short or the estimated hours by any two fields">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 5h18M3 10h10M3 15h18M3 20h10" stroke-linecap="round"/></svg>
+            <select id="viewSel">
+                <option value="table">Table</option>
+                <option value="pivot">Pivot</option>
+            </select>
+        </div>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="split-btn">
+            <button id="expandBtn" class="hdr-btn" type="button" title="Show every location group's work orders">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+                Expand
+            </button>
+            <button id="collapseBtn" class="hdr-btn" type="button" title="Location-group rows only">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 12h14" stroke-linecap="round"/></svg>
+                Collapse
+            </button>
+        </span>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages: collapsed groups print as their group row">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Work order created</div>
+            <div>
+                <div class="rpt-flabel">Quick range</div>
+                <select id="fRange"></select>
+            </div>
+            <div class="rpt-dates">
+                <input type="date" id="fFrom" aria-label="From">
+                <span class="rpt-fnote">→</span>
+                <input type="date" id="fTo" aria-label="To">
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Where &amp; for whom</div>
+            <div>
+                <div class="rpt-flabel">Location groups</div>
+                <div class="ms-container" id="lgMs">
+                    <div class="ms-trigger" id="lgMs-trigger"><span class="ms-placeholder" id="lgMs-placeholder">All my location groups</span></div>
+                    <div class="ms-dropdown hidden" id="lgMs-dropdown">
+                        <div class="ms-search"><input type="text" id="lgMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="lgMs-all">Select All</span><span id="lgMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="lgMs-list"></div>
+                    </div>
+                </div>
+            </div>
+            <div>
+                <div class="rpt-flabel">Customers</div>
+                <div class="ms-container" id="custMs">
+                    <div class="ms-trigger" id="custMs-trigger"><span class="ms-placeholder" id="custMs-placeholder">All customers and stock</span></div>
+                    <div class="ms-dropdown hidden" id="custMs-dropdown">
+                        <div class="ms-search"><input type="text" id="custMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="custMs-all">Select All</span><span id="custMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="custMs-list"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">What</div>
+            <div>
+                <div class="rpt-flabel">Part number (finished good)</div>
+                <input type="text" id="fPart" placeholder="All parts (% is a wildcard)">
+            </div>
+            <div>
+                <div class="rpt-flabel">WO number</div>
+                <input type="text" id="fWo" placeholder="All work orders (% is a wildcard)">
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Layout</div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fShowRaw"> Show raw goods</label>
+            <div class="rpt-fnote">Each work order's raw goods under it,<br>and the Raw Goods Short summary.</div>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own sort, in all three tables">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters what everyone sees each time this report opens. Anyone can still change them while it is open.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+                <button type="button" class="ds-btn" id="unpublishBtn" title="Everyone goes back to their own last choices">Stop using them</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>Open work orders (Entered or Started) whose finished good is short: the work order needs more than its location group has on hand. It is the BI version of the standard <strong>Production Demand</strong> report and reads the same data the same way.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">The figures</div>
+                <ul>
+                    <li><strong>Needed</strong> is the work order's quantity of the finished good, in the part's UOM. <strong>On Hand</strong> is all of that part's stock in the work order's location group. <strong>Short</strong> is the difference.</li>
+                    <li><strong>Customer Needed</strong> work orders were made for a sales order; <strong>Stock Needed</strong> ones were not.</li>
+                    <li><strong>Machine</strong> is the BOM's custom field named "Machine". <strong>Estimated Time</strong> is the BOM's estimated duration; <strong>Total Est. Time</strong> is that times the work order's quantity.</li>
+                    <li>At the end, <strong>Finished Goods Short</strong> totals the list by part. With <strong>Show raw goods</strong>, <strong>Raw Goods Short</strong> lists the raw goods those work orders need more of than is on hand.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>Filter changes apply straight away. The date range is when the work order was created; "This month" is the standard report's default.</li>
+                    <li><strong>Show raw goods</strong> lists each work order's raw goods under it, with what is short, and adds the Raw Goods Short summary.</li>
+                    <li>Click a location group's row to show or hide its work orders; <strong>Expand</strong> / <strong>Collapse</strong> do every group. Group rows count their work orders and total their Total Est. Time.</li>
+                    <li>Click a column heading to sort the work orders within each need type (again to reverse, a third time for the standard order); raw goods stay under their work order. The summaries' headings sort their parts. Drag a heading onto another to move the column; drag a heading's right edge to resize it. Your layout is remembered; <strong>Settings → Reset column layout</strong> undoes it.</li>
+                    <li>The <strong>Table / Pivot</strong> selector switches to a pivot: total Needed, On Hand, Short or the estimated hours by any two of location group, need type, customer, part, machine, work order, UOM and schedule date (by day, week, month…). Machine × week shows the hours booked on each machine. Click a figure to see the work orders behind it. Print, PDF and Excel follow the view on screen.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable pages, laid out like the standard report. In PDF view pick the paper size and orientation in the bar above the pages; they are remembered. <strong>Print</strong> prints those pages.</li>
+                    <li>A very large result shows its first 10,000 or so work orders (whole location groups) with a <strong>Load all</strong> button; the summaries then cover the work orders shown.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-app" id="appView">
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+    <div class="pd-sumwrap" id="sumWrap" style="display:none">
+        <div class="pd-sumcard" id="rgCard">
+            <div class="pd-sumtitle">Raw Goods Short <span id="rgMeta"></span></div>
+            <table class="rpt-table" id="rgTbl"><thead></thead><tbody></tbody></table>
+        </div>
+        <div class="pd-sumcard" id="fgCard">
+            <div class="pd-sumtitle">Finished Goods Short <span id="fgMeta"></span></div>
+            <table class="rpt-table" id="fgTbl"><thead></thead><tbody></tbody></table>
+        </div>
+    </div>
+</div>
+<div class="pivot-host" id="pivotHost" style="display:none"></div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Common || !FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const TITLE = 'Production Demand';
+const BOM_TABLE_ID = 1705436292;       // customfield.tableId of the BOM table (the original's cftableid)
+const MACHINE_FIELD = 'Machine';       // the BOM custom field the original prints
+const STOCK_ID = 0;                    // the customer filter's "No customer (stock)" item (the original's COALESCE(customer.id, 0))
+const RAW_BATCH = 400;                 // work orders per raw-goods query
+const DEFAULT_FILTERS = { range: 'thisMonth', from: '', to: '', lgs: [], custs: [], part: '', wo: '', showRaw: false };
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        company: { keys: ['filters', 'opts'], editors: true },   // every open starts from the company defaults
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const ints = a => (Array.isArray(a) ? a : []).map(Number).filter(n => Number.isInteger(n));
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const dstr = v => { const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v ?? '')); return m ? m[1] : ''; };
+const fmtDate = v => { const d = dstr(v); return d ? FBLib.Common.formatDate(d) : ''; };
+const fmtQty = v => FBLib.Common.formatQty(v);
+const openLink = (module, number, title) => number
+    ? `<a class="fb-row-link" data-open="${esc(module)}" data-num="${esc(number)}"${title ? ` title="${esc(title)}"` : ''}>${esc(number)}</a>` : '';
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const cut = s => `<span title="${esc(s)}">${esc(s)}</span>`;
+const collator = new Intl.Collator(undefined, { sensitivity: 'base' });
+
+// The original's duration text (minutes): "1d 2h 3m", each part only when
+// it is there, so 0 prints nothing; no duration at all prints "0m".
+function fmtDur(v) {
+    if (v === null || v === undefined || v === '' || !Number.isFinite(Number(v))) return '0m';
+    const t = Math.trunc(Number(v)), rem = t % 1440;
+    return ((t >= 1440 ? Math.trunc(t / 1440) + 'd ' : '') + (rem >= 60 ? Math.trunc(rem / 60) + 'h ' : '') + (rem % 60 >= 1 ? (rem % 60) + 'm' : '')).trim();
+}
+// A group's summed Total Est. Time: blank when nothing is booked.
+const fmtDurSum = v => (v > 0 ? fmtDur(v) : '');
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// ---- Date ranges (Fishbowl's "This Month" etc.) ----
+const RANGES = [
+    ['custom', 'Custom…'], ['all', 'All dates'], ['today', 'Today'], ['yesterday', 'Yesterday'], ['last7', 'Last 7 days'],
+    ['thisMonth', 'This month'], ['lastMonth', 'Last month'], ['thisQuarter', 'This quarter'], ['lastQuarter', 'Last quarter'],
+    ['thisYear', 'This year'], ['lastYear', 'Last year']
+];
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const isYmd = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+
+// A quick range as [from, to] ISO dates, or null for "All dates".
+function presetDates(key) {
+    const t = new Date(); t.setHours(0, 0, 0, 0);
+    const y = t.getFullYear(), m = t.getMonth(), d = t.getDate(), qm = Math.floor(m / 3) * 3;
+    const D = (yy, mm, dd) => new Date(yy, mm, dd);
+    const r = {
+        today: [t, t], yesterday: [D(y, m, d - 1), D(y, m, d - 1)], last7: [D(y, m, d - 6), t],
+        thisMonth: [D(y, m, 1), D(y, m + 1, 0)], lastMonth: [D(y, m - 1, 1), D(y, m, 0)],
+        thisQuarter: [D(y, qm, 1), D(y, qm + 3, 0)], lastQuarter: [D(y, qm - 3, 1), D(y, qm, 0)],
+        thisYear: [D(y, 0, 1), D(y, 11, 31)], lastYear: [D(y - 1, 0, 1), D(y - 1, 11, 31)]
+    }[key];
+    return r ? [ymd(r[0]), ymd(r[1])] : null;
+}
+// { start, endExcl, label } for the filter, or null for no date limit.
+// Fishbowl passes the day after the "to" date as the range's end, so the
+// whole "to" day is in.
+function dateRange(f) {
+    let a = f.from, b = f.to;
+    if (f.range !== 'custom') { const p = presetDates(f.range); if (!p) return null; [a, b] = p; }
+    if (!isYmd(a) && !isYmd(b)) return null;
+    a = isYmd(a) ? a : '1900-01-01'; b = isYmd(b) ? b : '2999-12-31';
+    if (a > b) [a, b] = [b, a];
+    const after = new Date(b + 'T00:00:00'); after.setDate(after.getDate() + 1);
+    return { start: a, endExcl: ymd(after), label: FBLib.Common.formatDate(a) + ' - ' + FBLib.Common.formatDate(b) };
+}
+function rangeText(f) { const r = dateRange(f); return 'Date Range: ' + (r ? r.label : 'All'); }
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS — the panel applies as it changes (one short debounce). "Show raw
+//  goods" only redraws (fetching the raw goods the first time); the rest
+//  re-query.
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _lgMs = null, _custMs = null;
+let _hydrating = false, _applyTimer = null;
+const S = { rows: [], raw: null, company: '', myLgs: [], lgNames: {}, custNames: {}, loadedAt: null,
+            collapsed: new Set(), view: 'table', noCap: false };
+const QUERY_KEYS = ['range', 'from', 'to', 'lgs', 'custs', 'part', 'wo'];
+
+function readFilters() {
+    return {
+        range: document.getElementById('fRange').value,
+        from: document.getElementById('fFrom').value,
+        to: document.getElementById('fTo').value,
+        lgs: ints(_lgMs.getSelected()), custs: ints(_custMs.getSelected()),
+        part: document.getElementById('fPart').value.trim(),
+        wo: document.getElementById('fWo').value.trim(),
+        showRaw: document.getElementById('fShowRaw').checked
+    };
+}
+function writeFilters(f) {
+    _hydrating = true;
+    document.getElementById('fRange').value = RANGES.some(r => r[0] === f.range) ? f.range : DEFAULT_FILTERS.range;
+    const p = f.range === 'custom' ? [f.from, f.to] : (presetDates(f.range) || ['', '']);
+    document.getElementById('fFrom').value = p[0] || '';
+    document.getElementById('fTo').value = p[1] || '';
+    _lgMs.setSelected(ints(f.lgs)); _custMs.setSelected(ints(f.custs));
+    document.getElementById('fPart').value = f.part || '';
+    document.getElementById('fWo').value = f.wo || '';
+    document.getElementById('fShowRaw').checked = !!f.showRaw;
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const requery = QUERY_KEYS.some(k => JSON.stringify(next[k]) !== JSON.stringify(F[k]));
+        F = next;
+        remember();
+        if (requery) { S.noCap = false; loadAll(); }
+        else if (F.showRaw && !S.raw) loadRaw(_loadToken).then(ok => { if (ok) render(true); });
+        else render(true);
+    }, 250);
+}
+
+// ============================================================================
+//  SQL — the iReport queries. The finished good's (and each raw line's)
+//  quantity is converted to the part's UOM; the tag roll-up is scoped to the
+//  parts and groups in play (same result: they are its group keys).
+// ============================================================================
+// A woitem line's qtyTarget in its part's UOM: the conversion row from the
+// line's UOM to the part's, else that row's exact inverse, else as is.
+const NEEDED = w => `CASE WHEN ${w}.uomid = part.uomid THEN ${w}.qtytarget
+                 WHEN d.id IS NOT NULL THEN ${w}.qtytarget * d.multiply / d.factor
+                 WHEN i.id IS NOT NULL THEN ${w}.qtytarget * i.factor / i.multiply
+                 ELSE ${w}.qtytarget END`;
+const NO_CONV = w => `COALESCE((${w}.uomid <> part.uomid AND d.id IS NULL AND i.id IS NULL) + 0, 0)`;
+const CONV_JOINS = w => `LEFT JOIN uom wu ON wu.id = ${w}.uomid
+        LEFT JOIN uomconversion d ON d.fromuomid = ${w}.uomid AND d.touomid = part.uomid
+        LEFT JOIN uomconversion i ON i.fromuomid = part.uomid AND i.touomid = ${w}.uomid`;
+const likeUpper = s => `UPPER('${sqlStr(String(s).replace(/\*/g, '%'))}')`;
+const myLgIn = f => (f.lgs.length ? f.lgs : S.myLgs).filter(id => S.myLgs.indexOf(id) !== -1).join(',') || '0';
+
+function buildSQL(f) {
+    const lgIn = myLgIn(f);
+    const r = dateRange(f);
+    // woitem.typeid + 0: read the lines by work order, not through the type index.
+    const w = ['wo.statusid < 40', `COALESCE(tag.qty, 0) - (${NEEDED('woitem')}) < 0`,
+               r ? `wo.datecreated BETWEEN '${r.start} 00:00:00' AND '${r.endExcl} 00:00:00'` : 'wo.datecreated IS NOT NULL',
+               `locationgroup.id IN (${lgIn})`];
+    if (f.part) w.push(`UPPER(part.num) LIKE ${likeUpper(f.part)}`);
+    if (f.wo) w.push(`UPPER(wo.num) LIKE ${likeUpper(f.wo)}`);
+    if (f.custs.length) w.push(`COALESCE(customer.id, 0) IN (${f.custs.join(',')})`);
+    return `
+        SELECT wo.id AS woid, wo.num AS wonum, COALESCE(customer.name, '') AS customer, (customer.name IS NOT NULL) + 0 AS hascust,
+               part.num AS partnum, part.description AS partdesc,
+               DATE_FORMAT(wo.datescheduled, '%Y-%m-%d %H:%i:%s') AS datescheduled,
+               ${NEEDED('woitem')} AS needed, ${NO_CONV('woitem')} AS nouomconv, COALESCE(wu.code, '') AS lineuom,
+               tag.qty AS onhandraw, COALESCE(tag.qty, 0) AS onhand,
+               locationgroup.id AS lgid, locationgroup.name AS lgname,
+               (SELECT NULLIF(JSON_UNQUOTE(JSON_EXTRACT(bom.customfields, CONCAT('$."', cf.id, '".value'))), '')
+                  FROM customfield cf WHERE cf.tableid = ${BOM_TABLE_ID} AND cf.name = '${sqlStr(MACHINE_FIELD)}'
+                  ORDER BY cf.id LIMIT 1) AS machine,
+               bom.estimatedduration AS estdur, uom.code AS partuom, wo.qtytarget AS woqty
+        FROM wo
+        JOIN woitem ON woitem.woid = wo.id AND woitem.typeid + 0 = 10
+        JOIN part ON part.id = woitem.partid
+        JOIN uom ON uom.id = part.uomid
+        ${CONV_JOINS('woitem')}
+        JOIN moitem ON moitem.id = woitem.moitemid
+        LEFT JOIN soitem ON soitem.id = moitem.soitemid
+        LEFT JOIN so ON so.id = soitem.soid
+        LEFT JOIN customer ON customer.id = so.customerid
+        JOIN locationgroup ON locationgroup.id = wo.locationgroupid
+        LEFT JOIN bom ON bom.id = moitem.bomid
+        LEFT JOIN (SELECT SUM(t.qty) AS qty, t.partid, l.locationgroupid
+                   FROM tag t JOIN location l ON l.id = t.locationid
+                   WHERE l.locationgroupid IN (${lgIn})
+                     AND t.partid IN (SELECT wi.partid FROM woitem wi JOIN wo w ON w.id = wi.woid
+                                      WHERE w.statusid < 40 AND wi.typeid + 0 = 10 AND w.locationgroupid IN (${lgIn}))
+                   GROUP BY t.partid, l.locationgroupid) tag ON tag.partid = part.id AND tag.locationgroupid = wo.locationgroupid
+        WHERE ${w.join('\n          AND ')}
+        ORDER BY locationgroup.name, COALESCE(customer.name, 'zzz'), wo.num`;
+}
+
+// The original's "Raw Goods" table for a batch of work orders: every line
+// but the finished good (10) and repair finished good (31), with the part's
+// on-hand in the WO's location group.
+function buildRawSQL(ids) {
+    const idIn = ints(ids).join(',') || '0';
+    return `
+        SELECT wi.woid, wi.id AS woitemid, part.num AS partnum, part.description AS partdesc,
+               ${NEEDED('wi')} AS needed, ${NO_CONV('wi')} AS nouomconv, COALESCE(wu.code, '') AS lineuom,
+               uom.code AS partuom, COALESCE(tag.qty, 0) AS onhand
+        FROM woitem wi
+        JOIN wo ON wo.id = wi.woid
+        JOIN part ON part.id = wi.partid
+        JOIN uom ON uom.id = part.uomid
+        ${CONV_JOINS('wi')}
+        LEFT JOIN (SELECT SUM(t.qty) AS qty, t.partid, l.locationgroupid
+                   FROM tag t JOIN location l ON l.id = t.locationid
+                   WHERE t.partid IN (SELECT x.partid FROM woitem x WHERE x.woid IN (${idIn}))
+                   GROUP BY t.partid, l.locationgroupid) tag ON tag.partid = wi.partid AND tag.locationgroupid = wo.locationgroupid
+        WHERE wi.woid IN (${idIn}) AND wi.typeid NOT IN (10, 31)
+        ORDER BY wi.woid, wi.sortid, wi.id`;
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+let _loadToken = 0;
+
+async function loadLookups() {
+    let myLgs = [];
+    try { myLgs = ints(typeof getLocationGroupList === 'function' ? getLocationGroupList() : []); } catch (_) {}
+    S.myLgs = myLgs;
+    const lgIn = myLgs.join(',') || '0';
+    const res = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('Location groups', `SELECT id, name, activeflag+0 AS active FROM locationgroup WHERE id IN (${lgIn}) ORDER BY name`),
+        q('Customers on open work orders', `
+            SELECT DISTINCT c.id AS custid, c.name AS custname
+            FROM wo
+            JOIN woitem wi ON wi.woid = wo.id AND wi.typeid + 0 = 10
+            JOIN moitem mi ON mi.id = wi.moitemid
+            JOIN soitem si ON si.id = mi.soitemid
+            JOIN so ON so.id = si.soid
+            JOIN customer c ON c.id = so.customerid
+            WHERE wo.statusid < 40
+            ORDER BY c.name`)
+    ]);
+    const ok = i => res[i].status === 'fulfilled' ? res[i].value : [];
+    S.company = (ok(0)[0] || {}).name || '';
+    ok(1).forEach(r => { S.lgNames[Number(r.id)] = r.name; });
+    _lgMs.setItems(ok(1).map(r => ({ value: Number(r.id), label: r.name + (Number(r.active) === 1 ? '' : ' (inactive)') })));
+    S.custNames = { [STOCK_ID]: 'No customer (stock)' };
+    ok(2).forEach(r => { S.custNames[Number(r.custid)] = r.custname; });
+    _custMs.setItems([{ value: STOCK_ID, label: 'No customer (stock)' }]
+        .concat(ok(2).map(r => ({ value: Number(r.custid), label: r.custname }))));
+    const failed = res.filter(x => x.status === 'rejected').map(x => x.reason && x.reason.message);
+    if (failed.length) document.getElementById('banner').textContent = 'Some filter lists failed to load: ' + failed.join('; ');
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    document.getElementById('banner').textContent = '';
+    document.getElementById('loading').classList.add('show');
+    setStatus('Loading…');
+    let rows;
+    const cap = S.noCap ? 0 : undefined;           // FBLib.RowCap: the first 10,000 work orders unless Load all
+    try { rows = await q('Production demand', FBLib.RowCap.sql(buildSQL(F), cap)); }
+    catch (e) {
+        if (tok !== _loadToken) return;
+        document.getElementById('loading').classList.remove('show');
+        document.getElementById('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        FBLib.RowCap.notice({ before: document.getElementById('appView'), capped: false });
+        S.rows = []; S.raw = null; S.loadedAt = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    if (tok !== _loadToken) return;
+    // Cut back to whole location groups, so every group row counts all of its work orders.
+    const capped = FBLib.RowCap.apply(rows, cap, { keyOf: r => r.lgname });
+    FBLib.RowCap.notice({ before: document.getElementById('appView'), capped: capped.capped, limit: capped.rows.length, what: 'work orders',
+                          onLoadAll: () => { S.noCap = true; loadAll(); } });
+    S.rows = capped.rows.map(r => {
+        const estdur = r.estdur === null || r.estdur === undefined || r.estdur === '' ? null : Math.trunc(num(r.estdur));
+        const needed = num(r.needed), onhand = num(r.onhand);
+        return {
+            woid: Number(r.woid), wo: r.wonum || '', customer: r.customer || '', hasCust: Number(r.hascust) === 1,
+            part: r.partnum || '', desc: r.partdesc || '', sched: String(r.datescheduled || ''),
+            needed, onhand, onhandRaw: r.onhandraw === null || r.onhandraw === undefined ? null : num(r.onhandraw),
+            short: needed - onhand, noConv: Number(r.nouomconv) === 1, lineUom: r.lineuom || '', uom: r.partuom || '',
+            lg: r.lgname || '', machine: r.machine == null ? '' : String(r.machine),
+            estdur, totaldur: estdur === null ? null : estdur * Math.trunc(num(r.woqty))
+        };
+    });
+    S.raw = null;
+    if (F.showRaw && !(await loadRaw(tok))) return;
+    if (tok !== _loadToken) return;
+    document.getElementById('loading').classList.remove('show');
+    S.collapsed = new Set();
+    S.loadedAt = new Date();
+    render();
+}
+
+// The raw goods of every work order shown, in batches. Returns false when a
+// newer load has started (or it failed: the banner says so).
+async function loadRaw(tok) {
+    const ids = S.rows.map(r => r.woid);
+    const out = new Map();
+    document.getElementById('loading').classList.add('show');
+    try {
+        for (let i = 0; i < ids.length; i += RAW_BATCH) {
+            const part = await q('Raw goods ' + (i / RAW_BATCH + 1), buildRawSQL(ids.slice(i, i + RAW_BATCH)));
+            if (tok !== _loadToken) return false;
+            part.forEach(r => {
+                const id = Number(r.woid);
+                if (!out.has(id)) out.set(id, []);
+                out.get(id).push({
+                    part: r.partnum || '', desc: r.partdesc || '', needed: num(r.needed), onhand: num(r.onhand),
+                    noConv: Number(r.nouomconv) === 1, lineUom: r.lineuom || '', uom: r.partuom || ''
+                });
+            });
+        }
+    } catch (e) {
+        if (tok !== _loadToken) return false;
+        document.getElementById('banner').textContent = 'The raw goods failed to load: ' + e.message + '. The debug console (Settings) has the SQL.';
+        out.clear();
+    } finally {
+        if (tok === _loadToken) document.getElementById('loading').classList.remove('show');
+    }
+    S.raw = out;
+    return true;
+}
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+
+// ============================================================================
+//  MODEL + TABLE
+// ============================================================================
+const showRaw = () => !!F.showRaw && !!S.raw;
+const rawOf = r => (S.raw && S.raw.get(r.woid)) || [];
+
+// The original's columns, in its order, then in the user's order
+// (FBLib.RptCols). Needed's UOM sits in its own column.
+function cols() {
+    const base = [
+        { key: 'wo',       label: 'WO #',            w: 80 },
+        { key: 'customer', label: 'Customer',        w: 140 },
+        { key: 'part',     label: 'Part #',          w: 120 },
+        { key: 'machine',  label: 'Machine',         w: 80, ctr: true, tip: 'The BOM\'s "' + MACHINE_FIELD + '" custom field' },
+        { key: 'sched',    label: 'Schedule Date',   w: 90, ctr: true },
+        { key: 'est',      label: 'Estimated Time',  w: 80, ctr: true, tip: 'The BOM\'s estimated duration' },
+        { key: 'total',    label: 'Total Est. Time', w: 90, ctr: true, tip: 'Estimated Time × the work order\'s quantity' },
+        { key: 'needed',   label: 'Needed',          w: 80, num: true, tip: 'In the part\'s UOM' },
+        { key: 'uom',      label: 'UOM',             w: 50 },
+        { key: 'onhand',   label: 'On Hand',         w: 80, num: true, tip: 'All of the part in the work order\'s location group' },
+        { key: 'short',    label: 'Short',           w: 80, num: true, tip: 'Needed - On Hand' }
+    ];
+    return COLS ? COLS.arrange(base) : base;
+}
+const cellClass = c => (c.num ? 'num-cell' : c.ctr ? 'ctr-cell nw' : '');
+const headRow = cs => '<tr>' + cs.map(c =>
+    `<th data-col="${c.key}" class="${cellClass(c)}" style="min-width:${c.w}px"${c.tip ? ` title="${esc(c.tip)}"` : ''}>${esc(c.label)}</th>`).join('') + '</tr>';
+const rowCells = (cs, cell) => cs.map(c => `<td class="${cellClass(c)}">${cell[c.key] ?? ''}</td>`).join('');
+// A quantity with no conversion to the part's UOM is shown as the line has it.
+const qtyHtml = (v, x) => esc(fmtQty(v)) + (x.noConv
+    ? `<span class="uom-warn" title="${esc('No UOM conversion from ' + x.lineUom + ' to ' + x.uom + ': this is the line\'s ' + x.lineUom + ' quantity, used as is (as the standard report does).')}">⚠</span>` : '');
+const shortHtml = v => `<span class="short">${esc(fmtQty(v))}</span>`;
+// Heading-click sort (FBLib.RptCols): work orders sort within their need
+// type; the groups keep the standard report's order.
+const sortVal = (r, k) => ({ wo: r.wo, customer: r.customer, part: r.part, machine: r.machine, sched: r.sched,
+                             est: r.estdur ?? -1, total: r.totaldur ?? -1, needed: r.needed, uom: r.uom,
+                             onhand: r.onhand, short: r.short })[k];
+const sortLines = list => (COLS && COLS.sort() ? list.slice().sort((a, b) => COLS.compare(a, b, sortVal)) : list);
+// A group / minor row: `identity` spans the first run of columns that carry
+// none of this row's figures, and each figure sits in its own column,
+// whatever order the user has put the columns in.
+function totalsCells(cs, identity, figs, labelClass) {
+    const has = c => figs[c.key] != null && figs[c.key] !== '';
+    let a = cs.findIndex(c => !has(c));
+    if (a < 0) a = 0;
+    let b = a + 1;
+    while (b < cs.length && !has(cs[b])) b++;
+    const cell = c => `<td class="${cellClass(c)}">${figs[c.key] ?? ''}</td>`;
+    return cs.slice(0, a).map(cell).join('') + `<td colspan="${b - a}"${labelClass ? ` class="${labelClass}"` : ''}>${identity}</td>` + cs.slice(b).map(cell).join('');
+}
+
+// Location groups, then need types, in query order (the original's groups:
+// a break whenever the value changes).
+function groups() {
+    const out = [];
+    S.rows.forEach(r => {
+        let g = out.length && out[out.length - 1].key === r.lg ? out[out.length - 1] : null;
+        if (!g) { g = { key: r.lg, rows: [], needs: [], total: 0 }; out.push(g); }
+        g.rows.push(r);
+        if (r.totaldur) g.total += r.totaldur;
+        const nk = r.hasCust ? 'A' : 'z';
+        let n = g.needs.length && g.needs[g.needs.length - 1].key === nk ? g.needs[g.needs.length - 1] : null;
+        if (!n) { n = { key: nk, label: r.hasCust ? 'Customer Needed' : 'Stock Needed', rows: [], total: 0 }; g.needs.push(n); }
+        n.rows.push(r);
+        if (r.totaldur) n.total += r.totaldur;
+    });
+    return out;
+}
+
+function groupRow(cs, g, forPrint) {
+    const open = !S.collapsed.has(g.key);
+    const id = '<div class="rpt-grp-inner">' + (forPrint ? '' : `<span class="rpt-toggle">${open ? '▼' : '▶'}</span>`) +
+        `<span>${esc(g.key)}</span><span class="rpt-grp-meta">${esc(plural(g.rows.length, 'work order'))}</span></div>`;
+    return `<tr class="rpt-grp" data-grp="${esc(g.key)}">${totalsCells(cs, id, { total: esc(fmtDurSum(g.total)) })}</tr>`;
+}
+function needRow(cs, n) {
+    return `<tr class="rpt-sub">${totalsCells(cs, `<span class="need-cell">${esc(n.label)}</span>` +
+        `<span class="need-meta">${esc(plural(n.rows.length, 'work order'))}</span>`, { total: esc(fmtDurSum(n.total)) })}</tr>`;
+}
+// With raw goods shown, the printed pages make each work order a heading
+// (level 3, its raw-goods heading level 4): a page break inside its raw
+// goods repeats the work order and the raw-goods headings "(continued)".
+function lineRow(cs, r, forPrint) {
+    const raw = showRaw() && rawOf(r).length, head = forPrint && showRaw();
+    const cls = [head ? 'rpt-sub pd-wo' : '', raw ? 'pd-wo-raw' : ''].filter(Boolean).join(' ');
+    return `<tr${cls ? ` class="${cls}"` : ''}${head ? ' data-pdf-level="3"' : ''}>` + rowCells(cs, {
+        wo: openLink('Work Order', r.wo), customer: r.customer ? openLink('Customer', r.customer) : '',
+        part: openLink('Part', r.part, r.desc), machine: cut(r.machine), sched: esc(fmtDate(r.sched)),
+        est: esc(fmtDur(r.estdur)), total: esc(fmtDur(r.totaldur)),
+        needed: qtyHtml(r.needed, r), uom: esc(r.uom), onhand: esc(fmtQty(r.onhand)), short: shortHtml(Math.abs(r.short))
+    }) + '</tr>';
+}
+// The original's nested "Raw Goods" table: a heading row, then each line.
+// Every figure cell is filled (a space when blank) so the part / description
+// span is the same on every row.
+function rawRows(cs, r, forPrint) {
+    const list = rawOf(r);
+    if (!list.length) return [];
+    const head = `<tr class="${forPrint ? 'rpt-sub' : 'rpt-minor'} pd-rg-head"${forPrint ? ' data-pdf-level="4"' : ''}>${totalsCells(cs, '<span class="rg-part">Part #</span><span>Description</span>',
+        { needed: 'Needed', uom: ' ', onhand: 'On Hand', short: 'Short' }, 'rg-cell')}</tr>`;
+    return [head].concat(list.map((l, i) => `<tr class="rpt-minor pd-rg${i === list.length - 1 ? ' pd-rg-last' : ''}">` + totalsCells(cs,
+        `<span class="rg-part">${openLink('Part', l.part, l.desc)}</span><span class="rg-desc">${esc(l.desc)}</span>`,
+        { needed: qtyHtml(l.needed, l), uom: esc(l.uom) || ' ', onhand: esc(fmtQty(l.onhand)),
+          short: l.needed > l.onhand ? shortHtml(l.needed - l.onhand) : ' ' }, 'rg-cell') + '</tr>'));
+}
+function bodyRows(cs, forPrint) {
+    const out = [];
+    groups().forEach(g => {
+        out.push(groupRow(cs, g, forPrint));
+        if (S.collapsed.has(g.key)) return;
+        g.needs.forEach(n => {
+            out.push(needRow(cs, n));
+            sortLines(n.rows).forEach(r => { out.push(lineRow(cs, r, forPrint)); if (showRaw()) rawRows(cs, r, forPrint).forEach(h => out.push(h)); });
+        });
+    });
+    return out;
+}
+function footRow(cs) {
+    const gs = groups(), total = S.rows.reduce((s, r) => s + (r.totaldur || 0), 0);
+    return `<tr>${totalsCells(cs, `Total — ${esc(plural(S.rows.length, 'work order'))} in ${esc(plural(gs.length, 'location group'))}`,
+        { total: esc(fmtDurSum(total)) })}</tr>`;
+}
+
+// ============================================================================
+//  SUMMARY BAND — the original's two summary tables, worked out from the rows
+//  above exactly as its sub-datasets select them.
+// ============================================================================
+// Finished Goods Short: the listed rows per part number and on-hand (its
+// GROUP BY part.num, tag.qty: no tags at all and tags summing to 0 are
+// separate), Needed summed.
+function fgSummary() {
+    const m = new Map();
+    S.rows.forEach(r => {
+        const k = r.part + '|' + (r.onhandRaw === null ? 'null' : r.onhandRaw);
+        let s = m.get(k);
+        if (!s) { s = { part: r.part, desc: r.desc, needed: 0, onhand: r.onhand, nul: r.onhandRaw === null }; m.set(k, s); }
+        s.needed += r.needed;
+    });
+    // Short as printed: the original's On Hand - Needed, unsigned (Math.abs).
+    return [...m.values()].map(s => Object.assign(s, { short: Math.abs(s.onhand - s.needed) }))
+        .sort((a, b) => collator.compare(a.part, b.part) || (a.nul === b.nul ? a.onhand - b.onhand : a.nul ? -1 : 1));
+}
+// Raw Goods Short: the raw lines of the listed work orders that are short on
+// their own, per part: Needed summed, On Hand averaged over those lines (the
+// original's SUM(on hand) / COUNT(lines)).
+function rgSummary() {
+    if (!showRaw()) return [];
+    const m = new Map();
+    S.rows.forEach(r => rawOf(r).forEach(l => {
+        if (!(l.onhand - l.needed < 0)) return;
+        let s = m.get(l.part);
+        if (!s) { s = { part: l.part, desc: l.desc, needed: 0, onSum: 0, n: 0 }; m.set(l.part, s); }
+        s.needed += l.needed; s.onSum += l.onhand; s.n++;
+    }));
+    return [...m.values()].map(s => ({ part: s.part, desc: s.desc, needed: s.needed, onhand: s.onSum / s.n, short: Math.abs(s.onSum / s.n - s.needed) }))
+        .sort((a, b) => collator.compare(a.part, b.part));
+}
+const SUM_BASE = [
+    { key: 'part',   label: 'Part Number', w: 130 },
+    { key: 'needed', label: 'Needed',      w: 80, num: true },
+    { key: 'onhand', label: 'On Hand',     w: 80, num: true },
+    { key: 'short',  label: 'Short',       w: 80, num: true }
+];
+const sumCols = api => (api ? api.arrange(SUM_BASE.slice()) : SUM_BASE.slice());
+const sumSorted = (api, list) => (api && api.sort() ? list.slice().sort((a, b) => api.compare(a, b, (r, k) => r[k])) : list);
+const sumCell = (c, s) => ({ part: openLink('Part', s.part, s.desc), needed: esc(fmtQty(s.needed)), onhand: esc(fmtQty(s.onhand)),
+                             short: shortHtml(s.short) })[c.key];
+function renderSummaries() {
+    const wrap = document.getElementById('sumWrap');
+    wrap.style.display = S.rows.length ? '' : 'none';
+    if (!S.rows.length) return;
+    const one = (api, tblId, metaId, list, empty) => {
+        const cs = sumCols(api), tbl = document.getElementById(tblId);
+        tbl.querySelector('thead').innerHTML = headRow(cs);
+        tbl.querySelector('tbody').innerHTML = list.length
+            ? sumSorted(api, list).map(s => '<tr>' + cs.map(c => `<td class="${cellClass(c)}">${sumCell(c, s)}</td>`).join('') + '</tr>').join('')
+            : `<tr><td colspan="${cs.length}" class="rpt-empty">${esc(empty)}</td></tr>`;
+        document.getElementById(metaId).textContent = plural(list.length, 'part');
+    };
+    document.getElementById('rgCard').style.display = showRaw() ? '' : 'none';
+    if (showRaw()) one(RGCOLS, 'rgTbl', 'rgMeta', rgSummary(), 'No raw goods are short.');
+    one(FGCOLS, 'fgTbl', 'fgMeta', fgSummary(), 'No finished goods are short.');
+}
+
+// Long reports paint in chunks as the user scrolls.
+const CHUNK = 600;
+let _paint = { html: [], shown: 0 };
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+function filterText() {
+    const lgs = F.lgs.length ? F.lgs.map(id => S.lgNames[id] || id).join(', ') : 'All my location groups';
+    return [lgs, F.custs.length ? F.custs.map(id => S.custNames[id] || id).join(', ') : '',
+            F.part ? 'Part ' + F.part : '', F.wo ? 'WO ' + F.wo : '', F.showRaw ? 'Raw goods shown' : '']
+        .filter(Boolean).join(' · ');
+}
+
+function render(keepScroll) {
+    if (S.view === 'pivot' && PIVOT) {
+        PIVOT.render();
+        setStatus([S.company, 'pivot', S.loadedAt ? plural(S.rows.length, 'work order') + ' short' : '', rangeText(F)].filter(Boolean).join(' · '));
+        if (PDF) PDF.refresh();
+        return;
+    }
+    const tbl = document.getElementById('rpt');
+    const wrap = document.getElementById('rptWrap');
+    const top = wrap.scrollTop;
+    const cs = cols();
+    tbl.querySelector('thead').innerHTML = headRow(cs);
+    _paint = { html: bodyRows(cs, false), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    while (keepScroll && _paint.shown < _paint.html.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+    tbl.querySelector('tfoot').innerHTML = S.rows.length ? footRow(cs) : '';
+    tbl.style.display = S.rows.length ? '' : 'none';
+    document.getElementById('rptEmpty').textContent = S.rows.length || !S.loadedAt ? '' : 'No open work orders are short for these filters.';
+    renderSummaries();
+    wrap.scrollTop = keepScroll ? top : 0;
+    const parts = [S.company];
+    if (S.loadedAt) parts.push(plural(S.rows.length, 'work order') + ' short', rangeText(F),
+        'loaded ' + S.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    setStatus(parts.filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the pages as the standard Production Demand prints
+//  them: Letter landscape, the company / title / date range on every page
+//  (the original's page header), raw goods under their work order, Short in
+//  red, no grand total (the original has none), then the summary band:
+//  Raw Goods Short and Finished Goods Short side by side, as the original's
+//  two tables at x 0 and 372 of its 732pt band.
+// ============================================================================
+let PDF = null;
+const PDF_CSS =
+    '.fbdoc-rpt-tbl .rpt-grp-inner>:first-child{white-space:nowrap}' +
+    '.fbdoc-rpt-tbl .ctr-cell{text-align:center}' +
+    '.fbdoc-rpt-tbl .short{color:#CD0000;font-weight:inherit}' +
+    '.fbdoc-rpt-tbl .uom-warn{color:inherit;margin-left:2pt}' +
+    '.fbdoc-rpt-tbl .need-cell{padding-left:8pt}' +
+    '.fbdoc-rpt-tbl .need-meta{font-size:.85em;font-weight:400;color:#444;margin-left:6pt}' +
+    // a work order printed as a heading (raw goods shown) keeps the line's look
+    '.fbdoc-rpt-tbl tr.rpt-sub.pd-wo td{font-weight:400;padding-top:1.5pt}' +
+    '.fbdoc-rpt-tbl tr.rpt-minor td{color:#000}' +
+    '.fbdoc-rpt-tbl td.rg-cell{padding-left:14pt}' +
+    '.fbdoc-rpt-tbl .rg-part{display:inline-block;min-width:150pt;padding-right:6pt}' +
+    '.fbdoc-rpt-tbl .rg-desc{color:inherit}' +
+    '.fbdoc-rpt-tbl tr.pd-wo-raw td{border-top:.75pt solid #000}' +
+    '.fbdoc-rpt-tbl tr.rpt-sub.pd-rg-head td{font-weight:700;border-bottom:.75pt solid #999;padding-top:2pt}' +
+    '.fbdoc-rpt-tbl tr.pd-rg-last td{border-bottom:.75pt solid #000;padding-bottom:3pt}' +
+    // the summary band
+    '.fbdoc-rpt-tbl th.pd-sh{padding-top:12pt}' +
+    '.fbdoc-rpt-tbl th.pd-gap{border-bottom:0}' +
+    '.fbdoc-rpt-tbl .pd-ptitle{padding-bottom:3pt}' +
+    '.fbdoc-rpt-tbl td.pd-none{font-style:italic}';
+// The summary band as one table: Raw Goods Short's columns (only when raw
+// goods are shown, as the original), a gap, Finished Goods Short's columns;
+// row i holds each summary's row i. Its headings, titled, repeat on every
+// page. Each summary keeps the user's column order and sort.
+function summarySection() {
+    const sides = [
+        showRaw() ? { title: 'Raw Goods Short', cs: sumCols(RGCOLS), rows: sumSorted(RGCOLS, rgSummary()), none: 'No raw goods are short.' } : null,
+        { title: 'Finished Goods Short', cs: sumCols(FGCOLS), rows: sumSorted(FGCOLS, fgSummary()), none: 'No finished goods are short.' }
+    ].filter(Boolean);
+    const gapTh = '<th class="pd-sh pd-gap" data-pdf-min="16"></th>';
+    const head = '<tr>' + sides.map(s => s.cs.map((c, i) =>
+        `<th class="pd-sh${c.num ? ' num-cell' : ''}">${i ? '' : `<div class="pd-ptitle">${esc(s.title)}</div>`}${esc(c.label)}</th>`).join('')).join(gapTh) + '</tr>';
+    const n = Math.max.apply(null, sides.map(s => Math.max(s.rows.length, 1)));
+    const rows = [];
+    for (let i = 0; i < n; i++) {
+        rows.push('<tr>' + sides.map(s => (s.rows[i]
+            ? s.cs.map(c => `<td class="${c.num ? 'num-cell' : ''}">${sumCell(c, s.rows[i])}</td>`).join('')
+            : !s.rows.length && !i ? `<td colspan="${s.cs.length}" class="pd-none">${esc(s.none)}</td>` : '<td></td>'.repeat(s.cs.length))).join('<td></td>') + '</tr>');
+    }
+    return { head, rows, foot: '' };
+}
+const printSubtitle = () => [rangeText(F), filterText()];
+function docSpec() {
+    if (!S.loadedAt) return null;
+    const base = { company: S.company, title: TITLE, titleEveryPage: true, empty: 'No open work orders are short for these filters.', css: PDF_CSS, fontPt: 10 };
+    if (S.view === 'pivot' && PIVOT) {
+        const p = PIVOT.pdfSpec();
+        return Object.assign(base, { subtitle: printSubtitle().concat(pivotText()), head: p.head, rows: p.rows, foot: p.foot });
+    }
+    const cs = cols();
+    if (!S.rows.length) return Object.assign(base, { subtitle: printSubtitle(), head: headRow(cs), rows: [], foot: '' });
+    return Object.assign(base, {
+        subtitle: printSubtitle(),
+        sections: [{ head: headRow(cs), rows: bodyRows(cs, true), foot: '' }, summarySection()]
+    });
+}
+
+// ============================================================================
+//  PIVOT VIEW (FBLib.Pivot) — Needed, On Hand, Short or the estimated hours
+//  by any two of location group, need type, customer, part, machine, WO,
+//  UOM and schedule date. Machine × week is the load on each machine; part ×
+//  week is when each shortage falls. The report's own grouping stays in the
+//  Table view.
+// ============================================================================
+let PIVOT = null, COLS = null, FGCOLS = null, RGCOLS = null;
+const PIVOT_FIELDS = [
+    { key: 'lg', label: 'Location Group' }, { key: 'need', label: 'Need Type' }, { key: 'customer', label: 'Customer' },
+    { key: 'part', label: 'Part #' }, { key: 'desc', label: 'Description', dim: false }, { key: 'machine', label: 'Machine' },
+    { key: 'wo', label: 'WO #' }, { key: 'uom', label: 'UOM' }, { key: 'sched', label: 'Schedule Date', type: 'date' },
+    { key: 'needed', label: 'Needed', type: 'qty' }, { key: 'onhand', label: 'On Hand', type: 'qty' }, { key: 'short', label: 'Short', type: 'qty' },
+    { key: 'esth', label: 'Estimated Time (h)', type: 'number' }, { key: 'totalh', label: 'Total Est. Time (h)', type: 'number' }
+];
+const pivotRows = () => S.rows.map(r => ({
+    lg: r.lg, need: r.hasCust ? 'Customer Needed' : 'Stock Needed', customer: r.customer || '(stock)', part: r.part, desc: r.desc,
+    machine: r.machine || '(none)', wo: r.wo, uom: r.uom, sched: r.sched,
+    needed: r.needed, onhand: r.onhand, short: Math.abs(r.short),
+    esth: r.estdur ? r.estdur / 60 : 0, totalh: r.totaldur ? r.totaldur / 60 : 0
+}));
+function pivotText() {
+    const c = PIVOT.config(), lbl = k => (PIVOT_FIELDS.find(x => x.key === k) || {}).label || '';
+    const m = c.measure === '__count__' ? 'Work order count'
+        : ({ sum: 'Total', count: 'Count of', avg: 'Average', min: 'Lowest', max: 'Highest' }[c.agg] + ' ' + lbl(c.measure)).replace(/^Total Total /, 'Total ');
+    return 'Pivot: ' + m + ' by ' + [lbl(c.rowDim), lbl(c.rowDim2)].filter(Boolean).join(' + ') + (c.colDim ? ' × ' + lbl(c.colDim) : '');
+}
+function setView(v, persist) {
+    S.view = v === 'pivot' && PIVOT ? 'pivot' : 'table';
+    document.getElementById('viewSel').value = S.view;
+    document.getElementById('rptWrap').style.display = S.view === 'pivot' ? 'none' : '';
+    document.getElementById('pivotHost').style.display = S.view === 'pivot' ? '' : 'none';
+    document.getElementById('expandBtn').parentNode.style.display = S.view === 'pivot' ? 'none' : '';
+    if (persist) _saveUserKeys({ view: S.view });
+    render(false);
+}
+
+function setAllOpen(open) {
+    S.collapsed = new Set(open ? [] : groups().map(g => g.key));
+    render(false);
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    const sub = [S.company, rangeText(F), filterText()].filter(Boolean);
+    const sheets = [{
+        name: 'Production Demand', title: TITLE, subtitle: sub,
+        cols: [{ key: 'lg', label: 'Location Group', w: 130, type: 'text' }, { key: 'need', label: 'Need Type', w: 110, type: 'text' },
+               { key: 'wo', label: 'WO #', w: 90, type: 'text' }, { key: 'customer', label: 'Customer', w: 160, type: 'text' },
+               { key: 'part', label: 'Part #', w: 120, type: 'text' }, { key: 'desc', label: 'Description', w: 260, type: 'text' },
+               { key: 'machine', label: 'Machine', w: 90, type: 'text' }, { key: 'sched', label: 'Schedule Date', w: 90, type: 'date' },
+               { key: 'est', label: 'Estimated Time', w: 90, type: 'text' }, { key: 'total', label: 'Total Est. Time', w: 90, type: 'text' },
+               { key: 'needed', label: 'Needed', w: 80, type: 'qty', noTotal: true }, { key: 'uom', label: 'UOM', w: 50, type: 'text' },
+               { key: 'onhand', label: 'On Hand', w: 80, type: 'qty', noTotal: true }, { key: 'short', label: 'Short', w: 80, type: 'qty', noTotal: true }],
+        rows: S.rows.map(r => ({ lg: r.lg, need: r.hasCust ? 'Customer Needed' : 'Stock Needed', wo: r.wo, customer: r.customer, part: r.part,
+            desc: r.desc, machine: r.machine, sched: dstr(r.sched) || null, est: fmtDur(r.estdur), total: fmtDur(r.totaldur),
+            needed: r.needed, uom: r.uom, onhand: r.onhand, short: Math.abs(r.short) })),
+        totals: false
+    }];
+    const sumSheet = (name, list) => ({ name, title: TITLE + ' – ' + name, subtitle: sub,
+        cols: [{ key: 'part', label: 'Part Number', w: 130, type: 'text' }, { key: 'desc', label: 'Description', w: 260, type: 'text' },
+               { key: 'needed', label: 'Needed', w: 80, type: 'qty', noTotal: true }, { key: 'onhand', label: 'On Hand', w: 80, type: 'qty', noTotal: true },
+               { key: 'short', label: 'Short', w: 80, type: 'qty', noTotal: true }],
+        rows: list.map(s => ({ part: s.part, desc: s.desc, needed: s.needed, onhand: s.onhand, short: s.short })), totals: false });
+    if (showRaw()) {
+        const raw = [];
+        S.rows.forEach(r => rawOf(r).forEach(l => raw.push({ lg: r.lg, wo: r.wo, fg: r.part, part: l.part, desc: l.desc, needed: l.needed,
+            uom: l.uom, onhand: l.onhand, short: l.needed > l.onhand ? l.needed - l.onhand : null })));
+        sheets.push({ name: 'Raw Goods', title: TITLE + ' – Raw Goods', subtitle: sub,
+            cols: [{ key: 'lg', label: 'Location Group', w: 130, type: 'text' }, { key: 'wo', label: 'WO #', w: 90, type: 'text' },
+                   { key: 'fg', label: 'Finished Good', w: 120, type: 'text' }, { key: 'part', label: 'Part #', w: 120, type: 'text' },
+                   { key: 'desc', label: 'Description', w: 260, type: 'text' }, { key: 'needed', label: 'Needed', w: 80, type: 'qty', noTotal: true },
+                   { key: 'uom', label: 'UOM', w: 50, type: 'text' }, { key: 'onhand', label: 'On Hand', w: 80, type: 'qty', noTotal: true },
+                   { key: 'short', label: 'Short', w: 80, type: 'qty', noTotal: true }],
+            rows: raw, totals: false });
+        sheets.push(sumSheet('Raw Goods Short', rgSummary()));
+    }
+    sheets.push(sumSheet('Finished Goods Short', fgSummary()));
+    if (S.view === 'pivot' && PIVOT) sheets.unshift(Object.assign(PIVOT.sheet('Pivot'), { title: TITLE + ' – ' + pivotText(), subtitle: sub }));
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'Production_Demand_' + ymd(new Date()), sheets });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's pages (fb-doc). Without fb-doc on the server, the
+// plain printout below: JxBrowser won't print the report page itself, so it
+// is built in a new window and printed there. Collapsed groups print as
+// their group row.
+function printReport() {
+    if (PDF) {
+        if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+    const cs = cols();
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' + TITLE + '</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:11pt;font-weight:700}h2{text-align:center;font-size:14pt;margin:2px 0}.sub{text-align:center;font-size:8.5pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{font-size:8pt;text-align:left;padding:3px 5px;border-bottom:1px solid #000}' +
+        'td{font-size:8pt;padding:2px 5px;vertical-align:top}.num-cell{text-align:right}.ctr-cell{text-align:center}.short{color:#CD0000}' +
+        'tr.rpt-grp td{font-weight:700;padding-top:7px;border-bottom:1px solid #999}.rpt-grp-meta,.need-meta{font-weight:400;color:#555;margin-left:8px}' +
+        'tr.rpt-sub td{font-weight:700;padding-top:4px}.need-cell{padding-left:12px}tr.rpt-minor td.rg-cell{padding-left:18px}.rg-part{display:inline-block;min-width:140px}' +
+        'tr.pd-rg-head td{font-weight:700;border-bottom:1px solid #999}tr.pd-wo-raw td{border-top:1px solid #000}tr.pd-wo td{font-weight:400;padding-top:2px}' +
+        'tfoot td{font-weight:700;border-top:1px solid #000}a{color:#000;text-decoration:none}.pd-sum{display:flex;gap:16px;margin-top:12px}.pd-sum>div{flex:1}' +
+        '@page{size:Letter landscape;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>' + TITLE + '</h2><p class="sub">' + printSubtitle().map(esc).join('<br>') + '</p>' +
+        '<table><thead>' + headRow(cs).replace(/ style="[^"]*"/g, '') + '</thead><tbody>' + bodyRows(cs, true).join('') +
+        '</tbody><tfoot>' + footRow(cs) + '</tfoot></table>' +
+        '<div class="pd-sum">' + (showRaw() ? '<div><b>Raw Goods Short</b>' + document.getElementById('rgTbl').outerHTML + '</div>' : '') +
+        '<div><b>Finished Goods Short</b>' + document.getElementById('fgTbl').outerHTML + '</div></div>' +
+        '<p style="font-size:7.5pt;margin-top:8px">Printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters what everyone sees each time this report opens?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        const ms = (id, ph) => FBLib.Common.MultiSelect.create({ containerId: id, items: [], placeholder: ph, maxTags: 2, onClose: applySoon });
+        _lgMs = ms('lgMs', 'All my location groups');
+        _custMs = ms('custMs', 'All customers and stock');
+
+        const fRange = document.getElementById('fRange');
+        fRange.innerHTML = RANGES.map(r => `<option value="${r[0]}">${esc(r[1])}</option>`).join('');
+        // A quick range fills the dates; editing a date makes the range Custom.
+        fRange.onchange = () => {
+            const p = presetDates(fRange.value);
+            if (fRange.value !== 'custom') {
+                document.getElementById('fFrom').value = p ? p[0] : '';
+                document.getElementById('fTo').value = p ? p[1] : '';
+            }
+            applySoon();
+        };
+        ['fFrom', 'fTo'].forEach(id => document.getElementById(id).addEventListener('change', () => { fRange.value = 'custom'; applySoon(); }));
+        ['fPart', 'fWo'].forEach(id => {
+            const el = document.getElementById(id);
+            el.addEventListener('change', applySoon);
+            el.addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        });
+        document.getElementById('fShowRaw').addEventListener('change', applySoon);
+        document.getElementById('resetFiltersBtn').onclick = () => { writeFilters(DEFAULT_FILTERS); applySoon(); };
+
+        // Column resize / sort / reorder (each table its own), and the Pivot view (fb-lib).
+        if (FBLib.RptCols) {
+            COLS = FBLib.RptCols.attach({ table: document.getElementById('rpt'), onSort: () => render(true), onReorder: () => render(true) });
+            FGCOLS = FBLib.RptCols.attach({ table: document.getElementById('fgTbl'), key: 'rptCols.fg', onSort: () => render(true), onReorder: () => render(true) });
+            RGCOLS = FBLib.RptCols.attach({ table: document.getElementById('rgTbl'), key: 'rptCols.rg', onSort: () => render(true), onReorder: () => render(true) });
+        }
+        if (FBLib.Pivot) PIVOT = FBLib.Pivot.mount(document.getElementById('pivotHost'), {
+            fields: PIVOT_FIELDS, rows: pivotRows, countLabel: 'Work order count',
+            defaults: { rowDim: 'part', colDim: 'sched', colBucket: 'week', measure: 'short', agg: 'sum' },
+            format: (fld, v) => (fld && fld.type === 'qty' ? fmtQty(v)
+                : fld && (fld.key === 'esth' || fld.key === 'totalh') ? (Math.round(v * 100) / 100).toLocaleString() : null)
+        });
+        else document.getElementById('viewSelWrap').style.display = 'none';
+        document.getElementById('viewSel').addEventListener('change', e => setView(e.target.value, true));
+        document.getElementById('resetColsBtn').onclick = () => { [COLS, FGCOLS, RGCOLS].forEach(c => { if (c) c.reset(); }); render(false); };
+        S.view = _resolve('view', 'table') === 'pivot' && PIVOT ? 'pivot' : 'table';
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: document.getElementById('appView'), toggleBefore: document.getElementById('exportBtn'),
+                page: { size: 'Letter', orientation: 'landscape' },
+                doc: docSpec, title: () => TITLE
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        setView(S.view, false);
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('expandBtn').onclick = () => setAllOpen(true);
+        document.getElementById('collapseBtn').onclick = () => setAllOpen(false);
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('unpublishBtn').onclick = () => {
+            if (!confirm('Stop using company defaults for this report? Everyone goes back to their own last choices.')) return;
+            const ok = FBLib.Settings.clearCompany(['filters', 'opts']) !== false;
+            showToast(ok ? 'This report no longer has company defaults.' : 'That was not saved.', ok ? 'success' : 'error');
+        };
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        const wrap = document.getElementById('rptWrap');
+        wrap.addEventListener('scroll', () => { if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 400) appendChunk(); });
+        wrap.addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (a) {
+                e.preventDefault();
+                try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+                catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+                return;
+            }
+            const g = e.target.closest('#rpt tr.rpt-grp');
+            if (!g) return;
+            const key = g.dataset.grp;
+            if (S.collapsed.has(key)) S.collapsed.delete(key); else S.collapsed.add(key);
+            render(true);
+        });
+
+        await loadLookups();
+        writeFilters(savedFilters());
+        F = readFilters();          // drops saved picks that no longer exist
+        await loadAll();
+    } catch (e) {
+        console.error('[Production Demand] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

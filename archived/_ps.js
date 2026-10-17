@@ -1,0 +1,10945 @@
+
+// ============================================
+// DEBUG MODE CONFIGURATION
+// ============================================
+// Check if debug mode should be enabled via Fishbowl property
+// Default to 'false' if property cannot be read or doesn't exist
+const BI_SHOW_DEBUG_PROP = (typeof getProperty === 'function' ? getProperty('BI_SHOW_DEBUG', 'false') : null) || 'false';
+const DEBUG_MODE = BI_SHOW_DEBUG_PROP === 'true' || BI_SHOW_DEBUG_PROP === true;
+
+// Get date format from Fishbowl settings
+const FB_DATE_FORMAT = typeof getProperty === 'function' ? getProperty('DateFormatShort', 'MM/dd/yyyy') : 'MM/dd/yyyy';
+// Convert Java SimpleDateFormat to moment.js format (dd -> DD, yyyy -> YYYY)
+const MOMENT_DATE_FORMAT = FB_DATE_FORMAT
+    .replace(/yyyy/g, 'YYYY')
+    .replace(/yy/g, 'YY')
+    .replace(/dd/g, 'DD');
+
+// ============================================
+// GLOBAL VARIABLES
+// ============================================
+let allWorkOrders = [];
+let filteredWorkOrders = [];
+let manufacturingOrders = [];
+let categories = [];
+let stagingDependencies = [];
+let conflicts = new Set();
+
+let viewMode = 'mo'; // 'mo', 'category', 'capacity'
+let currentCapacityWeek = null;
+let capacitySettings = { categories: [] };
+let collapsedMOs = new Set(); // Track which MOs are collapsed in MO view
+
+// Undo/Redo
+let undoStack = [];
+let redoStack = [];
+const MAX_UNDO_STACK = 50;
+
+// D3 Gantt Settings
+let ganttScale = 80; // pixels per day
+let ganttStartDate = null; // Will be initialized in DOMContentLoaded
+let ganttEndDate = null; // Will be initialized in DOMContentLoaded
+
+// Settings
+let allowSameDayStarts = false;
+let shiftDependentWOs = false; // When dragging a WO in gantt view, shift dependent WOs relatively
+let skipWeekends = false; // When dragging/resizing WOs in gantt view, skip weekends to land on weekdays
+let showArrows = true;
+let calendarColorMode = 'status'; // 'status' or 'category'
+let viewByMode = 'wo_num'; // 'wo_num' or 'bom_num' - controls label display in calendar and capacity tiles
+let showCompletedWOs = true; // Show completed WOs in capacity planning and calendar views
+let scrollToDateAfterRender = null; // Used to scroll to a specific date after render completes
+let activeStatusFilters = new Set(['10', '30', '40', 'conflict']); // Track current status filters (multi-select)
+
+// Debug Console
+let debugLogInitialized = false;
+
+// Standard WO Status Colors - used across all views for consistency
+const WO_STATUS_COLORS = {
+    10: { // Entered/Planned - Light Blue (Fishbowl blue based)
+        fill: '#CBE5FB',      // Light version of #2d9cdb
+        stroke: '#2d9cdb',    // Fishbowl blue
+        border: 'border-blue-400',
+        bg: 'bg-blue-100',
+        text: 'text-slate-900'
+    },
+    20: { // Issued
+        fill: '#F5E7DD',      // amber-100
+        stroke: '#F69133',    // amber-500
+        border: 'border-amber-400',
+        bg: 'bg-amber-100',
+        text: 'text-slate-900'
+    },
+    30: { // Started/In Progress - Light Orange
+        fill: '#F5E7DD',      // Light orange
+        stroke: '#F69133',    // Orange
+        border: 'border-orange-400',
+        bg: 'bg-orange-100',
+        text: 'text-slate-900'
+    },
+    40: { // Fulfilled/Completed - Light Green
+        fill: '#DBE8E1',      // green-100
+        stroke: '#1B7A46',    // green-500
+        border: 'border-green-400',
+        bg: 'bg-green-100',
+        text: 'text-slate-900'
+    },
+    50: { // Closed
+        fill: '#E3E3E3',      // gray-200
+        stroke: '#506872',    // gray-500
+        border: 'border-gray-400',
+        bg: 'bg-gray-200',
+        text: 'text-gray-700'
+    }
+};
+
+// ============================================
+// UTILITY FUNCTIONS
+// ============================================
+function formatDate(momentObj, includeTime = false) {
+    // Format a moment object according to the system date format setting
+    if (!momentObj || !momentObj.isValid()) return 'N/A';
+
+    if (includeTime) {
+        return momentObj.format(MOMENT_DATE_FORMAT + ' HH:mm');
+    } else {
+        return momentObj.format(MOMENT_DATE_FORMAT);
+    }
+}
+
+function debugLog(type, message, ...args) {
+    // Only log if DEBUG_MODE is enabled
+    if (!DEBUG_MODE) return;
+
+    const timestamp = moment().format('HH:mm:ss.SSS');
+    const prefix = `[${timestamp}] [${type.toUpperCase()}]`;
+    console.log(prefix, message, ...args);
+
+    // Add to UI debug console
+    const debugLogEl = document.getElementById('debugLog');
+    if (debugLogEl) {
+        // Clear placeholder message on first log
+        if (!debugLogInitialized) {
+            debugLogEl.innerHTML = '';
+            debugLogInitialized = true;
+        }
+
+        const colorMap = {
+            'success': 'text-emerald-400',
+            'error': 'text-red-400',
+            'warn': 'text-amber-400',
+            'info': 'text-blue-400'
+        };
+        const entry = document.createElement('div');
+        entry.className = `${colorMap[type] || 'text-slate-300'} py-0.5`;
+        const argsStr = args.length > 0 ? ' ' + args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ') : '';
+        entry.textContent = `${prefix} ${message}${argsStr}`;
+        debugLogEl.appendChild(entry);
+        debugLogEl.scrollTop = debugLogEl.scrollHeight; // Auto-scroll to bottom
+    }
+}
+
+// Diagnostic line — writes straight to the debug drawer whenever it is OPEN
+// (dsDebug on), independent of DEBUG_MODE/BI_SHOW_DEBUG. Used by the availability
+// engine to explain why a part stays short. Dormant when the console is closed
+// (the #debugLog element only exists once the drawer is mounted).
+function psDiag(msg) {
+    try {
+        const el = document.getElementById('debugLog');
+        if (!el) return;
+        if (!debugLogInitialized) { el.innerHTML = ''; debugLogInitialized = true; }
+        const div = document.createElement('div');
+        div.className = 'text-amber-300 py-0.5';
+        div.textContent = '[DIAG] ' + msg;
+        el.appendChild(div);
+        el.scrollTop = el.scrollHeight;
+    } catch (_) {}
+}
+
+// v1.1: update the sub-header status line (right of the report title).
+// Called from loadWorkOrders() and init so the "Initialising…"
+// placeholder gets replaced with something meaningful.
+function setStatus(msg) {
+    const el = document.getElementById('statusLine');
+    if (el) el.textContent = msg || '';
+}
+
+function showToast(message, type = 'info', duration = 3000) {
+    const container = document.querySelector('.toast-container');
+    const toast = document.createElement('div');
+    toast.className = `toast ${type}`;
+
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : 'ℹ';
+    toast.innerHTML = `
+        <div class="flex items-center gap-3">
+            <span class="text-lg">${icon}</span>
+            <span class="text-sm font-medium text-slate-700">${message}</span>
+        </div>
+    `;
+
+    container.appendChild(toast);
+
+    setTimeout(() => {
+        toast.style.opacity = '0';
+        setTimeout(() => toast.remove(), 300);
+    }, duration);
+}
+
+// Full-screen loading overlay — shown while the page boots + on every refresh
+// so the (synchronous, sometimes slow) query batch has visible feedback.
+function psShowLoading(msg) {
+    const o = document.getElementById('psLoadingOverlay');
+    if (!o) return;
+    const m = document.getElementById('psLoadingMsg');
+    if (m && msg) m.textContent = msg;
+    o.style.display = 'flex';
+}
+function psHideLoading() {
+    const o = document.getElementById('psLoadingOverlay');
+    if (o) o.style.display = 'none';
+}
+
+// Styled confirmation modal — a themed replacement for the browser's built-in
+// confirm() so destructive prompts (e.g. the MO un-issue/re-issue reschedule)
+// match the report chrome. Returns a Promise<boolean> (OK → true, Cancel /
+// backdrop / ESC → false) so callers can `await psConfirm(...)` exactly where
+// they used to test `confirm(...)`. opts: { title, message, confirmLabel,
+// cancelLabel, tone:'warn'|'danger'|'info' }. Sits above every drawer (z 10120)
+// and captures ESC/Enter so the global drawer-ESC handlers don't also fire.
+function psConfirm(opts) {
+    opts = opts || {};
+    const title = opts.title || 'Please confirm';
+    const message = opts.message || '';
+    const confirmLabel = opts.confirmLabel || 'Confirm';
+    const cancelLabel = opts.cancelLabel || 'Cancel';
+    const tone = opts.tone || 'warn';
+    return new Promise(resolve => {
+        const toneColor = tone === 'danger' ? 'var(--fb-negative)' : tone === 'info' ? 'var(--fb-blue)' : 'var(--fb-warning)';
+        const toneBg = tone === 'danger' ? psHexA('#C43046', .12) : tone === 'info' ? psHexA('#2d9cdb', .12) : psHexA('#F69133', .14);
+        const icon = tone === 'info'
+            ? '<circle cx="12" cy="12" r="9"/><path stroke-linecap="round" d="M12 11v5m0-8h.01"/>'
+            : '<path stroke-linecap="round" stroke-linejoin="round" d="M10.29 3.86 1.82 18a1.5 1.5 0 0 0 1.29 2.25h17.78A1.5 1.5 0 0 0 22.18 18L13.71 3.86a1.5 1.5 0 0 0-2.42 0z"/><path stroke-linecap="round" d="M12 9v4m0 4h.01"/>';
+        const scrim = document.createElement('div');
+        scrim.setAttribute('style', 'position:fixed;inset:0;z-index:10120;display:flex;align-items:center;justify-content:center;background:rgba(16,16,16,.45);backdrop-filter:blur(2px);padding:20px');
+        scrim.innerHTML =
+            '<div role="dialog" aria-modal="true" style="background:#fff;border-radius:var(--r-card);box-shadow:var(--sh3);max-width:440px;width:100%;overflow:hidden">' +
+              '<div style="display:flex;gap:14px;padding:20px 20px 4px">' +
+                '<div style="flex-shrink:0;width:40px;height:40px;border-radius:50%;background:' + toneBg + ';color:' + toneColor + ';display:flex;align-items:center;justify-content:center">' +
+                  '<svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">' + icon + '</svg></div>' +
+                '<div style="flex:1;min-width:0">' +
+                  '<h3 style="margin:0 0 6px;font-size:16px;font-weight:800;color:var(--c-primary)">' + psEsc(title) + '</h3>' +
+                  '<div style="font-size:13px;line-height:1.5;color:var(--c-secondary);white-space:pre-line">' + psEsc(message) + '</div>' +
+                '</div>' +
+              '</div>' +
+              '<div style="display:flex;gap:8px;justify-content:flex-end;padding:16px 20px 18px">' +
+                '<button type="button" class="ps-btn ps-confirm-cancel">' + psEsc(cancelLabel) + '</button>' +
+                '<button type="button" class="ps-btn primary ps-confirm-ok">' + psEsc(confirmLabel) + '</button>' +
+              '</div>' +
+            '</div>';
+        document.body.appendChild(scrim);
+        const okBtn = scrim.querySelector('.ps-confirm-ok');
+        const cancelBtn = scrim.querySelector('.ps-confirm-cancel');
+        let done = false;
+        function close(val) { if (done) return; done = true; document.removeEventListener('keydown', onKey, true); scrim.remove(); resolve(val); }
+        function onKey(e) {
+            if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(false); }
+            else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); close(true); }
+        }
+        okBtn.addEventListener('click', () => close(true));
+        cancelBtn.addEventListener('click', () => close(false));
+        scrim.addEventListener('mousedown', e => { if (e.target === scrim) close(false); });
+        document.addEventListener('keydown', onKey, true);
+        setTimeout(() => { try { okBtn.focus(); } catch (_) {} }, 30);
+    });
+}
+
+// Custom Tooltip Functions
+function showWOTooltip(event, content) {
+    const tooltip = document.getElementById('woTooltip');
+    tooltip.innerHTML = content;
+    tooltip.classList.add('show');
+
+    // Position tooltip near mouse, but keep it on screen
+    const x = event.pageX + 15;
+    const y = event.pageY + 15;
+    const tooltipWidth = 300; // max-width from CSS
+    const tooltipHeight = 200; // estimated max height
+
+    const adjustedX = (x + tooltipWidth > window.innerWidth) ? event.pageX - tooltipWidth - 15 : x;
+    const adjustedY = (y + tooltipHeight > window.innerHeight) ? event.pageY - tooltipHeight - 15 : y;
+
+    tooltip.style.left = `${adjustedX}px`;
+    tooltip.style.top = `${adjustedY}px`;
+}
+
+function hideWOTooltip() {
+    const tooltip = document.getElementById('woTooltip');
+    tooltip.classList.remove('show');
+}
+
+// ============================================
+// DRAWER OPEN/CLOSE — kept as shims so any legacy call site
+// (openOffcanvas('settingsOffcanvas') etc.) still works after the
+// v1.1 rename. Real work is delegated to FBLib.Common.
+// ============================================
+function openOffcanvas(id) {
+    const mapped = id === 'settingsOffcanvas' ? 'settingsOverlay'
+                 : id === 'instructionsOffcanvas' ? 'instructionsOverlay'
+                 : id;
+    if (window.FBLib && FBLib.Common) FBLib.Common.toggleDrawer(mapped);
+}
+
+function closeOffcanvas(id) {
+    const mapped = id === 'settingsOffcanvas' ? 'settingsOverlay'
+                 : id === 'instructionsOffcanvas' ? 'instructionsOverlay'
+                 : id;
+    if (window.FBLib && FBLib.Common) FBLib.Common.closeDrawer(mapped);
+}
+
+// The old modal overlay click-to-close is unused with fb-drawer (which
+// closes on ESC or explicit close-button click via fb-lib). Guard the
+// listener so it doesn't blow up if #modalOverlay is present but the
+// .offcanvas selector never matches anything.
+document.getElementById('modalOverlay').addEventListener('click', () => {
+    document.getElementById('modalOverlay').classList.remove('show');
+});
+
+function toggleSidebar() {
+    const sidebar = document.getElementById('sidebar');
+    sidebar.classList.toggle('sidebar-collapsed');
+    sidebar.classList.toggle('sidebar-expanded');
+
+    // Hide text when collapsed
+    const texts = sidebar.querySelectorAll('.sidebar-text');
+    const title = sidebar.querySelector('.sidebar-title');
+    const status = sidebar.querySelector('.sidebar-status');
+
+    if (sidebar.classList.contains('sidebar-collapsed')) {
+        texts.forEach(t => t.style.display = 'none');
+        title.style.display = 'none';
+        if (status) status.style.display = 'none';
+    } else {
+        texts.forEach(t => t.style.display = '');
+        title.style.display = '';
+        if (status) status.style.display = '';
+    }
+}
+
+// v1.1: Debug drawer is provided by fb-lib. The old
+// #debugConsoleContainer + toggle/chevron are gone. This function is
+// kept as a shim in case anything still references it — it simply
+// toggles the drawer via fb-lib.
+function toggleDebugConsole() {
+    if (window.FBLib && FBLib.Common && _debugApi) {
+        _debugApi.expand();
+    }
+}
+
+// Clear uses the same #debugLog element the fb-lib drawer mounts, so
+// no changes required beyond guarding the reference.
+function clearDebugLog() {
+    const debugLogEl = document.getElementById('debugLog');
+    if (debugLogEl) {
+        debugLogEl.innerHTML = '';
+        debugLogInitialized = false; // Reset flag so next log clears properly
+        debugLog('info', '═══ Debug console cleared by user ═══');
+    }
+}
+
+// ============================================
+// FB-LIB DEBUG DRAWER (mirrors Core_Dashboard_Template pattern)
+// ----
+// mountDebugDrawer() creates a fixed bottom drawer containing #debugLog.
+// applyDebugDrawer(show) shows/expands or hides it based on the user's
+// dsDebug preference. Because the drawer is fixed-position, body needs
+// bottom-padding equal to its current height — the observer sets a CSS
+// custom property --debug-drawer-h that the body reads.
+// ============================================
+let _debugApi = null;
+function applyDebugDrawer(showIt) {
+    if (!window.FBLib || !FBLib.Common) return;
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (showIt) { _debugApi.show(); _debugApi.expand(); }
+    else _debugApi.hide();
+    if (_debugApi.element) observeDebugDrawer(_debugApi.element);
+}
+function observeDebugDrawer(el) {
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible');
+        const open    = el.classList.contains('is-open');
+        const h = (visible && open) ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    if (typeof ResizeObserver === 'function') {
+        try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    }
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+
+// ============================================
+// v1.2 (Integrity Foods): BOM/MO/WO/Part custom-field discovery
+// ----
+// Reuses the PurchaseOrderSummary.htm pattern (tablereference ⋈ customfield) to
+// list active custom fields for the bom / mo / wo / part objects, and — like
+// psLoadMoCustomFields — their TYPE (customfieldtype) + dropdown options
+// (customlistitem) so the Custom-Field filters drawer can render a type-aware
+// control per field (multi-select for a list CF, text box for a text CF, from/to
+// for a date/number CF, yes/no for a checkbox CF). Each def carries the exact
+// CustomFieldByName() SQL expression the attributes query interpolates: a plain
+// column read for bom/mo/wo (their alias is joined in the query) or a correlated
+// subquery reading the finished good's Part CF for obj='part' (this is how the
+// customer's "Allergen" surfaces — a Part CF, not a hardcoded dimension). Capped
+// so a CF-heavy install across four objects can't bloat the attributes query.
+async function psLoadCfDefs() {
+    psCfDefs = [];
+    if (typeof runQueryAsync !== 'function') return psCfDefs;
+    const OBJ = { bom: 'BOM', mo: 'MO', wo: 'WO', part: 'Part' };
+    const CAP = 40;
+    try {
+        const rows = await runQueryAsync(
+            "SELECT tr.tableRefName AS obj, cf.name AS name, cf.listid AS listid, cft.name AS type_name " +
+            "FROM tablereference tr " +
+            "JOIN customfield cf ON cf.tableId = tr.tableId " +
+            "LEFT JOIN customfieldtype cft ON cft.id = cf.customfieldtypeid " +
+            "WHERE tr.tableRefName IN ('bom','mo','wo','part') AND cf.activeFlag = 1 " +
+            "ORDER BY tr.tableRefName, cf.sortOrder, cf.name");
+        const seen = new Set();
+        const listIds = new Set();
+        let dropped = 0;
+        rows.forEach(r => {
+            const obj = String(r.obj || '').toLowerCase();
+            const name = (r.name || '').trim();
+            if (!OBJ[obj] || !name) return;
+            const key = 'cf_' + obj + '_' + name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+            if (!key || seen.has(key)) return;
+            if (psCfDefs.length >= CAP) { dropped++; return; }
+            seen.add(key);
+            const typeName = String(r.type_name || '').toLowerCase();
+            const listid = (r.listid != null ? parseInt(r.listid, 10) : null);
+            let kind;
+            if (typeName.indexOf('date') >= 0) kind = 'date';
+            else if (typeName.indexOf('check') >= 0 || typeName.indexOf('bool') >= 0) kind = 'bool';
+            else if (/(number|integer|decimal|quantity|numeric)/.test(typeName)) kind = 'number';
+            else if (listid != null || typeName.indexOf('list') >= 0 || typeName.indexOf('drop') >= 0) kind = 'list';
+            else kind = 'text';
+            const escName = name.replace(/'/g, "''");
+            const expr = (obj === 'part')
+                ? "(SELECT CustomFieldByName(part.customFields, '" + escName + "') FROM woitem LEFT JOIN part ON woitem.partid = part.id WHERE woitem.woid = wo.id AND woitem.typeid = 10 LIMIT 1)"
+                : "CustomFieldByName(" + obj + ".customfields, '" + escName + "')";
+            if (listid != null) listIds.add(listid);
+            psCfDefs.push({
+                obj: obj, name: name, key: key, label: OBJ[obj] + ': ' + name, objLabel: OBJ[obj],
+                kind: kind, listid: listid, expr: expr, values: [], options: []
+            });
+        });
+        // Resolve dropdown-list options (customlistitem) so a list CF offers every
+        // valid option, not just the values seen in the current work-order set.
+        if (listIds.size) {
+            const optByList = new Map();
+            (await runQueryAsync("SELECT listid, name FROM customlistitem WHERE listid IN (" + Array.from(listIds).join(',') + ") ORDER BY name"))
+                .forEach(r => { const k = String(r.listid); if (!optByList.has(k)) optByList.set(k, []); optByList.get(k).push(r.name); });
+            psCfDefs.forEach(d => { if (d.listid != null) d.options = optByList.get(String(d.listid)) || []; });
+        }
+        if (dropped) debugLog('warn', 'Custom-field discovery capped at ' + CAP + ' (' + dropped + ' more not shown)');
+        else debugLog('success', 'Custom fields discovered (BOM/MO/WO/Part): ' + psCfDefs.length);
+    } catch (e) {
+        psCfDefs = [];
+        debugLog('warn', 'Custom-field discovery failed: ' + (e && e.message));
+    }
+    return psCfDefs;
+}
+
+// ============================================
+// DATA LOADING (Fishbowl API)
+// ============================================
+// Note: runQuery() and runApiRequest() are provided by Fishbowl as global functions
+// We call them directly without wrappers to avoid overwriting them
+// Public entry point. Shows the loading overlay, then runs the ASYNC query batch
+// (runQueryAsync). Because every query is awaited, the main thread is never
+// blocked — the spinner paints immediately and the UI stays responsive while
+// data loads (no requestAnimationFrame defer needed). Every caller (refresh
+// button, drawer saves, drag writeback) goes through here, so a manual refresh
+// re-runs the full query set + availability engine and repaints the active view.
+function loadWorkOrders(opts) {
+    opts = opts || {};
+    // The full-screen Loading overlay BLOCKS the page (z-index 10099 + pointer
+    // capture + backdrop blur), so it's only appropriate for the INITIAL page
+    // load. Every post-action refresh (calendar/capacity drag, drawer edit,
+    // MO/PO create, Finish, Plan apply, the manual Refresh button) runs in the
+    // BACKGROUND: the async query batch + availability engine re-run and the
+    // active view repaints when it resolves, but the overlay never shows so the
+    // user keeps working. The Gantt/MO-marker drags stay optimistic (no reload).
+    const background = opts.background !== false;   // default: background (no overlay)
+    if (!background) psShowLoading('Loading work orders…');
+    const btn = document.getElementById('refreshBtn');
+    if (btn) btn.style.opacity = '0.5';
+    // Fire-and-forget: the async impl clears the overlay + button state in finally.
+    _loadWorkOrdersImpl(background);
+}
+
+async function _loadWorkOrdersImpl(background) {
+    debugLog('info', 'Loading work orders from Fishbowl...');
+    setStatus('Loading work orders…');
+    document.getElementById('refreshBtn').style.opacity = '0.5';
+    // Background repaint: hold the Timeline's horizontal scroll steady so a
+    // post-action refresh doesn't yank the Gantt back to today when it repaints.
+    if (background) { const _sc = document.getElementById('ganttScroll'); if (_sc) psKeepScroll = _sc.scrollLeft; }
+
+    // A refresh (or first load) re-discovers everything: drop the lazily-cached
+    // MO custom-field defs + default-LG lookup so they re-query, and refresh the
+    // Fishbowl user groups + admin UI. The WO/dep/MO queries, all enrichment
+    // queries and the availability engine below always re-run.
+    psMoCfDefs = null;
+    psDefaultLgId = undefined;
+    try { psLoadUserGroups(); refreshAdminUi(); } catch (_) {}
+
+    // Check if Fishbowl API is available
+    if (typeof runQueryAsync !== 'function') {
+        const errorMsg = 'This file must be opened within Fishbowl to access work order data. The Fishbowl API (runQueryAsync) is not available.';
+        debugLog('error', errorMsg);
+        setStatus('Not running inside Fishbowl');
+        showToast(errorMsg, 'error', 10000);
+        document.getElementById('refreshBtn').style.opacity = '1';
+        psHideLoading();
+
+        // Show helpful message in UI
+        const debugLogEl = document.getElementById('debugLog');
+        if (debugLogEl) {
+            debugLogEl.innerHTML = `
+                <div class="text-amber-400 py-2">
+                    <strong>[ERROR]</strong> This application must run inside Fishbowl.
+                </div>
+                <div class="text-slate-300 py-1 text-sm">
+                    Please open this file through Fishbowl's Report module to access the database.
+                </div>
+            `;
+        }
+        return;
+    }
+
+    const woQuery = `
+        SELECT
+            mo.num AS mo_num,
+            mo.id AS mo_id,
+            mo.statusid AS mo_status,
+            wo.id AS wo_id,
+            wo.num AS wo_num,
+            wo.statusid AS wo_status,
+            CASE wo.statusid
+                WHEN 10 THEN 'Entered'
+                WHEN 30 THEN 'In Progress'
+                WHEN 40 THEN 'Fulfilled'
+                ELSE 'Unknown'
+            END AS wo_status_name,
+            moitem.description AS description,
+            COALESCE(bom.estimatedDuration, 0) * COALESCE(wo.qtyTarget, 0) AS estimated_duration,
+            COALESCE(wo.datescheduled, moitem.datescheduled) AS date_scheduled,
+            COALESCE(wo.datescheduledtostart, moitem.datescheduledtostart) AS date_scheduled_start,
+            wo.datefinished AS date_finished,
+            COALESCE(calcat.name, '') AS calendar_category,
+            COALESCE(calcat.color, 'CCCCCC') AS category_color,
+            COALESCE(calcat.id, 0) AS calcategory_id,
+            wo.qtyTarget AS qty_target,
+            wo.locationgroupid AS location_group_id,
+            lg.name AS site_name,
+            COALESCE(wo.locationid, (SELECT btl.locationid FROM bomtolocation btl WHERE btl.bomid = moitem.bomid AND btl.locationgroupid = wo.locationgroupid LIMIT 1)) AS resource_id,
+            (SELECT l2.name FROM location l2 WHERE l2.id = COALESCE(wo.locationid, (SELECT btl.locationid FROM bomtolocation btl WHERE btl.bomid = moitem.bomid AND btl.locationgroupid = wo.locationgroupid LIMIT 1))) AS resource_name,
+            COALESCE(bom.estimatedDuration, 0) AS bom_duration_minutes,
+            bom.num AS bom_num,
+            wo.userId AS user_id,
+            TRIM(CONCAT(COALESCE(su.firstName, ''), ' ', COALESCE(su.lastName, ''))) AS assigned_user,
+            COALESCE(su.initials, '') AS user_initials,
+            wo.priorityId AS priority_id,
+            COALESCE(pr.name, '') AS priority_name,
+            (SELECT part.num FROM woitem
+             LEFT JOIN part ON woitem.partid = part.id
+             WHERE woitem.woid = wo.id AND woitem.typeid = 10
+             LIMIT 1) AS part_num,
+            (SELECT SUM(
+                CASE
+                    WHEN bomitem.uomid = (SELECT id FROM uom WHERE name = 'Hour' LIMIT 1) THEN
+                        COALESCE(bomitem.quantity, 0)
+                    WHEN EXISTS (
+                        SELECT 1 FROM uomconversion
+                        WHERE fromuomid = bomitem.uomid
+                        AND touomid = (SELECT id FROM uom WHERE name = 'Hour' LIMIT 1)
+                    ) THEN
+                        COALESCE(bomitem.quantity, 0) * (
+                            SELECT (multiply / factor)
+                            FROM uomconversion
+                            WHERE fromuomid = bomitem.uomid
+                            AND touomid = (SELECT id FROM uom WHERE name = 'Hour' LIMIT 1)
+                            LIMIT 1
+                        )
+                    WHEN EXISTS (
+                        SELECT 1 FROM uomconversion
+                        WHERE fromuomid = (SELECT id FROM uom WHERE name = 'Hour' LIMIT 1)
+                        AND touomid = bomitem.uomid
+                    ) THEN
+                        COALESCE(bomitem.quantity, 0) / (
+                            SELECT (multiply / factor)
+                            FROM uomconversion
+                            WHERE fromuomid = (SELECT id FROM uom WHERE name = 'Hour' LIMIT 1)
+                            AND touomid = bomitem.uomid
+                            LIMIT 1
+                        )
+                    ELSE 0
+                END
+            )
+            FROM bomitem
+            INNER JOIN part ON bomitem.partid = part.id
+            WHERE bomitem.bomid = bom.id
+            AND part.typeid = 21) AS labor_hours_from_bom
+        FROM wo
+        LEFT JOIN moitem ON wo.moitemid = moitem.id
+        LEFT JOIN mo ON moitem.moid = mo.id
+        LEFT JOIN bom ON moitem.bomid = bom.id
+        LEFT JOIN calcategory AS calcat ON wo.calcategoryid = calcat.id
+        LEFT JOIN locationgroup lg ON lg.id = wo.locationgroupid
+        LEFT JOIN sysuser su ON su.id = wo.userId
+        LEFT JOIN priority pr ON pr.id = wo.priorityId
+        WHERE wo.num IS NOT NULL
+            AND wo.statusid IN (10, 30, 40)
+            AND moitem.typeid = 50
+            AND (mo.statusid NOT IN (60, 70, 80)
+                 OR COALESCE(wo.datefinished, moitem.datescheduled) >= DATE_SUB(CURDATE(), INTERVAL 180 DAY))
+        ORDER BY mo.num, wo.num
+    `;
+
+    const depQuery = `
+        SELECT DISTINCT
+            wo.id AS wo_id,
+            wo.num AS wo_num,
+            staging_wo.id AS staging_wo_id,
+            staging_wo.num AS staging_wo_num,
+            COALESCE(staging_wo.datescheduled, staging_moitem.datescheduled) AS staging_wo_finish,
+            COALESCE(wo.datescheduledtostart, current_moitem.datescheduledtostart) AS wo_start,
+            part.num AS part_num
+        FROM wo
+        LEFT JOIN moitem AS current_moitem ON wo.moitemid = current_moitem.id
+        LEFT JOIN mo AS current_mo ON current_moitem.moid = current_mo.id
+        LEFT JOIN woitem ON woitem.woid = wo.id AND woitem.typeid = 20
+        LEFT JOIN part ON woitem.partid = part.id
+        LEFT JOIN woitem AS staging_woitem ON staging_woitem.partid = part.id AND staging_woitem.typeid = 10
+        LEFT JOIN wo AS staging_wo ON staging_woitem.woid = staging_wo.id
+        LEFT JOIN moitem AS staging_moitem ON staging_wo.moitemid = staging_moitem.id
+        LEFT JOIN mo AS staging_mo ON staging_moitem.moid = staging_mo.id
+        WHERE wo.num IS NOT NULL
+            AND wo.statusid IN (10, 30, 40)
+            AND staging_wo.num IS NOT NULL
+            AND staging_wo.id != wo.id
+            AND current_mo.id = staging_mo.id
+            AND current_mo.statusid NOT IN (60, 70, 80)
+    `;
+
+    const moQuery = `
+        SELECT DISTINCT
+            mo.num AS mo_num,
+            mo.id AS mo_id,
+            mo.statusid AS mo_status,
+            mo.datescheduled AS mo_date_scheduled,
+            fg_part.num AS part_num,
+            moitem.description AS description,
+            moitem.qtytofulfill AS qty,
+            bom.num AS bom_num,
+            so.num AS so_num,
+            so.customerpo AS customer_po,
+            customer.name AS customer_name
+        FROM mo
+        LEFT JOIN moitem ON moitem.moid = mo.id
+            AND moitem.typeid = 50
+            AND moitem.parentid IS NULL
+        LEFT JOIN bom ON moitem.bomid = bom.id
+        LEFT JOIN moitem AS fg_moitem ON fg_moitem.parentid = moitem.id
+            AND fg_moitem.typeid = 10
+        LEFT JOIN part AS fg_part ON fg_moitem.partid = fg_part.id
+        LEFT JOIN soitem ON moitem.soitemid = soitem.id
+        LEFT JOIN so ON soitem.soid = so.id
+        LEFT JOIN customer ON so.customerid = customer.id
+        WHERE mo.id IN (
+                SELECT DISTINCT mo.id
+                FROM wo
+                LEFT JOIN moitem ON wo.moitemid = moitem.id
+                LEFT JOIN mo ON moitem.moid = mo.id
+                WHERE wo.num IS NOT NULL AND wo.statusid IN (10, 30, 40)
+                  AND (mo.statusid NOT IN (60, 70, 80)
+                       OR COALESCE(wo.datefinished, moitem.datescheduled) >= DATE_SUB(CURDATE(), INTERVAL 180 DAY))
+            )
+        ORDER BY mo.num
+    `;
+
+    try {
+        debugLog('info', 'Starting to load work orders...');
+
+        let usingMockData = false;
+
+        // The three primary queries are independent — run them concurrently.
+        // runQueryAsync resolves to an already-parsed array (no JSON.parse).
+        const [woResults, depResults, moResults] = await Promise.all([
+            runQueryAsync(woQuery),
+            runQueryAsync(depQuery),
+            runQueryAsync(moQuery)
+        ]);
+        allWorkOrders = processWorkOrdersWithHours(woResults);
+        debugLog('success', `Loaded ${allWorkOrders.length} work orders`);
+        stagingDependencies = depResults;
+        debugLog('success', `Loaded ${stagingDependencies.length} staging dependencies`);
+        manufacturingOrders = moResults;
+        debugLog('success', `Loaded ${manufacturingOrders.length} MO finished goods`);
+
+        // Ensure all MOs from allWorkOrders are represented; preserve all rows (multi-BOM MOs have multiple entries)
+        const uniqueMOs = [...new Set(allWorkOrders.map(wo => wo.mo_num))];
+        const presentMONums = new Set(manufacturingOrders.map(m => m.mo_num));
+        uniqueMOs.forEach(mo => {
+            if (!presentMONums.has(mo)) {
+                manufacturingOrders.push({ mo_num: mo });
+            }
+        });
+
+        const catMap = new Map();
+        allWorkOrders.forEach(wo => {
+            const catName = wo.calendar_category || wo.category_name || 'Uncategorized';
+            if (!catMap.has(catName)) {
+                catMap.set(catName, {
+                    id: wo.calcategory_id || 0,
+                    name: catName,
+                    color: wo.category_color ? '#' + wo.category_color : '#2d9cdb'
+                });
+            }
+        });
+        categories = Array.from(catMap.values());
+
+        // v1.2 (multi-assignee fix): a WO can have several assigned users via the
+        // woassignedusers table (woId ↔ userId, one row per assignment). wo.userId
+        // is only the PRIMARY assignee — so the User dimension, filter, grouping and
+        // load must union EVERY assigned user, not just the primary. Load the
+        // assignment rows and attach an id/name list to each WO.
+        const assignedByWo = new Map();   // wo_id → [{id,name,initials}]
+        try {
+            const auIds = allWorkOrders.map(w => w.wo_id).filter(v => v != null);
+            if (auIds.length) {
+                const auRows = await runQueryAsync(`
+                    SELECT wau.woid AS wo_id, wau.userid AS user_id,
+                           TRIM(CONCAT(COALESCE(su.firstName, ''), ' ', COALESCE(su.lastName, ''))) AS user_name,
+                           COALESCE(su.initials, '') AS user_initials
+                    FROM woassignedusers wau
+                    LEFT JOIN sysuser su ON su.id = wau.userid
+                    WHERE wau.woid IN (${auIds.join(',')})
+                `);
+                auRows.forEach(r => {
+                    if (!assignedByWo.has(r.wo_id)) assignedByWo.set(r.wo_id, []);
+                    assignedByWo.get(r.wo_id).push({
+                        id: (r.user_id != null ? parseInt(r.user_id, 10) : 0) || 0,
+                        name: (r.user_name || '').trim(),
+                        initials: (r.user_initials || '').trim()
+                    });
+                });
+                debugLog('success', `WO assigned users: ${auRows.length} assignment(s) across ${assignedByWo.size} WO(s)`);
+            }
+        } catch (e) {
+            debugLog('warn', 'woassignedusers load failed — falling back to wo.userId only: ' + (e && e.message));
+        }
+        // Attach the deduped assigned-user list to each WO. Fall back to the primary
+        // wo.userId when a WO has no explicit assignment rows; a WO with neither
+        // buckets under the synthetic Unassigned user (id 0).
+        allWorkOrders.forEach(wo => {
+            let list = (assignedByWo.get(wo.wo_id) || []).slice();
+            if (!list.length && wo.user_id) {
+                list = [{ id: parseInt(wo.user_id, 10) || 0, name: (wo.assigned_user || '').trim(), initials: (wo.user_initials || '').trim() }];
+            }
+            const seen = new Set(), uniq = [];
+            list.forEach(u => { const k = String(u.id); if (!seen.has(k)) { seen.add(k); uniq.push(u); } });
+            wo._assignedUsers = uniq;                                   // [{id,name,initials}]
+            wo._userIds = uniq.length ? uniq.map(u => String(u.id)) : ['0'];  // string ids for the filter
+        });
+
+        // Build the User dimension from the UNION of all assigned users (id 0 =
+        // Unassigned) so every assignee — primary or co-assigned — is filterable.
+        const userMap = new Map();
+        allWorkOrders.forEach(wo => {
+            const src = (wo._assignedUsers && wo._assignedUsers.length) ? wo._assignedUsers : [{ id: 0, name: '', initials: '' }];
+            src.forEach(u => {
+                const uid = u.id || 0;
+                if (!userMap.has(uid)) {
+                    const name = (u.name && u.name.trim()) ? u.name.trim() : (uid === 0 ? 'Unassigned' : ('User ' + uid));
+                    const initials = (u.initials && u.initials.trim())
+                        ? u.initials.trim().toUpperCase()
+                        : name.split(/\s+/).map(s => s[0]).join('').slice(0, 2).toUpperCase();
+                    userMap.set(uid, { id: uid, name, initials });
+                }
+            });
+        });
+        users = Array.from(userMap.values()).sort((a, b) => a.name.localeCompare(b.name));
+
+        // v1.2: priority dimension → filter-strip priority pills. Load the FULL
+        // priority table so EVERY priority is offered as a filter — even ones no
+        // currently-loaded WO uses (e.g. 2-High). Fall back to deriving the set
+        // from the loaded WOs only if the table query fails.
+        try {
+            const priRows = await runQueryAsync('SELECT id, name FROM priority ORDER BY name');
+            priorities = priRows.map(r => ({ id: r.id, name: (r.name || '').trim() })).filter(p => p.name);
+            debugLog('success', `Loaded ${priorities.length} priorities from the priority table`);
+        } catch (e) {
+            debugLog('warn', 'Priority table load failed — deriving from WOs: ' + (e && e.message));
+            const priMap = new Map();
+            allWorkOrders.forEach(wo => {
+                const pid = wo.priority_id;
+                const pname = (wo.priority_name || '').trim();
+                if (pid != null && pname && !priMap.has(String(pid))) {
+                    priMap.set(String(pid), { id: pid, name: pname });
+                }
+            });
+            priorities = Array.from(priMap.values()).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+        }
+
+        // v1.2 (Integrity Foods): active BOM/MO/WO/Part custom fields, loaded in ONE
+        // guarded query so an install without the CustomFieldByName UDF (or with no
+        // custom fields) still loads the schedule — CF values simply come back blank.
+        // Mirrors the material-shortage / pick-status guarded blocks. psLoadCfDefs()
+        // discovers the CF set + each field's type (reusing the PurchaseOrderSummary
+        // tablereference⋈customfield pattern). d.expr is a plain column read for
+        // bom/mo/wo and a finished-good Part correlated subquery for obj='part' —
+        // this is how the customer's "Allergen" surfaces: a Part CF, not hardcoded.
+        try {
+            await psLoadCfDefs();
+            const cfSel = psCfDefs.map(d => ', ' + d.expr + ' AS ' + d.key).join('');
+            const attrRows = await runQueryAsync(`
+                SELECT wo.id AS wo_id${cfSel}
+                FROM wo
+                LEFT JOIN moitem ON wo.moitemid = moitem.id
+                LEFT JOIN mo ON moitem.moid = mo.id
+                LEFT JOIN bom ON moitem.bomid = bom.id
+                WHERE wo.num IS NOT NULL AND wo.statusid IN (10, 30, 40) AND moitem.typeid = 50
+                  AND (mo.statusid NOT IN (60, 70, 80)
+                       OR COALESCE(wo.datefinished, moitem.datescheduled) >= DATE_SUB(CURDATE(), INTERVAL 180 DAY))
+            `);
+            const attrByWo = new Map();
+            attrRows.forEach(r => attrByWo.set(String(r.wo_id), r));
+            allWorkOrders.forEach(wo => {
+                const a = attrByWo.get(String(wo.wo_id)) || {};
+                wo._cf = {};
+                psCfDefs.forEach(d => { const v = a[d.key]; wo._cf[d.key] = (v != null ? String(v).trim() : ''); });
+            });
+            debugLog('success', `${psCfDefs.length} custom field(s) loaded`);
+        } catch (e) {
+            // UDF missing / discovery failed — disable CF dimensions cleanly.
+            psCfDefs = [];
+            allWorkOrders.forEach(wo => { wo._cf = wo._cf || {}; });
+            debugLog('warn', 'Custom-field load failed (feature disabled): ' + (e && e.message));
+        }
+
+        // v1.2: LG (location group) + Location (machine/resource) dimensions
+        // (filter dropdowns + Timeline grouping). LG = location group; Location =
+        // wo.locationId or the BOM's default location for the WO's LG
+        // (bomtolocation), resolved in woQuery.
+        const siteMap = new Map(), resMap = new Map();
+        allWorkOrders.forEach(wo => {
+            const sid = (wo.location_group_id != null ? String(wo.location_group_id) : '0');
+            if (!siteMap.has(sid)) siteMap.set(sid, { id: sid, name: (wo.site_name && String(wo.site_name).trim()) || ('LG ' + sid) });
+            const rid = (wo.resource_id != null && String(wo.resource_id).length) ? String(wo.resource_id) : '0';
+            wo._resourceId = rid;
+            if (!resMap.has(rid)) resMap.set(rid, { id: rid, name: (wo.resource_name && String(wo.resource_name).trim()) || 'Unassigned location' });
+        });
+        sites = Array.from(siteMap.values()).sort((a, b) => a.name.localeCompare(b.name));
+        resources = Array.from(resMap.values()).sort((a, b) => a.id === '0' ? 1 : b.id === '0' ? -1 : a.name.localeCompare(b.name));
+        // Per-CF distinct in-data values — the fallback option list for a list CF
+        // that has no customlistitem (the drawer prefers d.options when present).
+        psCfDefs.forEach(d => {
+            const vs = new Set();
+            allWorkOrders.forEach(wo => { const v = wo._cf && wo._cf[d.key]; if (v) vs.add(v); });
+            d.values = Array.from(vs).sort((a, b) => String(a).localeCompare(String(b)));
+        });
+
+        // v1.2: demand-driver flag — mark WOs whose finished good has a min/max
+        // reorder point in the WO's location group (partreorder). Combined with the
+        // MO's SO link (psMoForWO → so_num) this drives the demand-driver tag
+        // (SO / Min/Max / Manual). Guarded — a failure just omits the Min/Max tag.
+        try {
+            const woIds = allWorkOrders.map(w => w.wo_id).filter(v => v != null);
+            if (woIds.length) {
+                const roRows = await runQueryAsync(`
+                    SELECT DISTINCT wo.id AS wo_id
+                    FROM wo
+                    INNER JOIN woitem woi ON woi.woid = wo.id AND woi.typeid = 10
+                    INNER JOIN partreorder pr ON pr.partid = woi.partid
+                       AND pr.locationgroupid = wo.locationgroupid AND pr.reorderpoint > 0
+                    WHERE wo.id IN (${woIds.join(',')})`);
+                const roSet = new Set(roRows.map(r => String(r.wo_id)));
+                allWorkOrders.forEach(wo => { wo._reorder = roSet.has(String(wo.wo_id)); });
+                debugLog('success', `Reorder-driven WOs: ${roSet.size}`);
+            }
+        } catch (e) { debugLog('warn', 'Reorder flag query failed (Min/Max tag disabled): ' + (e && e.message)); }
+
+        // v1.2: material-shortage flag. One batched query returns the
+        // wo_ids that have at least one raw-material line (woitem
+        // typeid=20) whose still-needed qty (target − used) exceeds
+        // pickable on-hand of that part in the MO's location group.
+        // Wrapped in try/catch so a slow/failed availability scan never
+        // blocks the schedule from loading — WOs just render without
+        // the shortage flag. The availability subquery reproduces the
+        // qty-on-hand calc inline (avoids the TEMPTABLE quantity views).
+        try {
+            const shortageQuery = `
+                SELECT DISTINCT woi.woid AS wo_id
+                FROM woitem woi
+                INNER JOIN wo ON wo.id = woi.woid
+                INNER JOIN part wp ON wp.id = woi.partid
+                INNER JOIN moitem mi ON wo.moitemid = mi.id
+                INNER JOIN mo ON mi.moid = mo.id
+                LEFT JOIN (
+                    SELECT t.partid AS partid, l.locationgroupid AS lgid,
+                           SUM(GREATEST(t.qty - COALESCE(t.qtycommitted, 0), 0)) AS avail
+                    FROM tag t
+                    INNER JOIN location l ON l.id = t.locationid
+                    WHERE t.typeid IN (30, 40)
+                      AND l.countedasavailable = 1
+                      AND l.pickable = 1
+                    GROUP BY t.partid, l.locationgroupid
+                ) av ON av.partid = woi.partid AND av.lgid = mo.locationgroupid
+                WHERE woi.typeid = 20
+                  AND wp.typeid = 10
+                  AND wo.statusid IN (10, 30)
+                  AND mo.statusid NOT IN (60, 70, 80)
+                  AND GREATEST(COALESCE(woi.qtytarget, 0) - COALESCE(woi.qtyused, 0), 0) > COALESCE(av.avail, 0)
+            `;
+            const shortRows = await runQueryAsync(shortageQuery);
+            const shortSet = new Set(shortRows.map(r => r.wo_id));
+            allWorkOrders.forEach(wo => { wo._materialShort = shortSet.has(wo.wo_id); });
+            debugLog('success', `Material shortage: ${shortSet.size} WO(s) flagged`);
+        } catch (e) {
+            debugLog('warn', 'Material shortage query failed (flag disabled): ' + (e && e.message));
+        }
+
+        // v1.2: per-WO pick status. Picks link to a WO through
+        // pickitem.woItemId → woitem.woId (same path Work_Order_WIP uses).
+        // We take the MIN pick status across the WO's picks as the
+        // representative "how far along picking is" (least-done wins):
+        //   10 Entered · 20 Started · 30 Committed · 40 Finished.
+        // Also carry the pick count + numbers so the detail drawer can
+        // deep-link into the Picking module.
+        try {
+            const pickQuery = `
+                SELECT woi.woid AS wo_id,
+                       MIN(p.statusid) AS pick_status,
+                       COUNT(DISTINCT p.id) AS pick_count,
+                       GROUP_CONCAT(DISTINCT p.num ORDER BY p.num SEPARATOR ',') AS pick_nums
+                FROM pickitem pi
+                INNER JOIN woitem woi ON woi.id = pi.woitemid
+                INNER JOIN pick p ON p.id = pi.pickid
+                INNER JOIN wo ON wo.id = woi.woid
+                INNER JOIN moitem mi ON wo.moitemid = mi.id
+                INNER JOIN mo ON mi.moid = mo.id
+                WHERE wo.statusid IN (10, 30, 40)
+                  AND mo.statusid NOT IN (60, 70, 80)
+                GROUP BY woi.woid
+            `;
+            const pickRows = await runQueryAsync(pickQuery);
+            const pickMap = new Map();
+            pickRows.forEach(r => pickMap.set(String(r.wo_id), r));
+            allWorkOrders.forEach(wo => {
+                const p = pickMap.get(String(wo.wo_id));
+                wo._pickStatus = p ? parseInt(p.pick_status, 10) : null;
+                wo._pickCount = p ? parseInt(p.pick_count, 10) : 0;
+                wo._pickNums = (p && p.pick_nums) ? String(p.pick_nums).split(',') : [];
+            });
+            debugLog('success', `Pick status: ${pickRows.length} WO(s) have picks`);
+        } catch (e) {
+            debugLog('warn', 'Pick status query failed (pick flags disabled): ' + (e && e.message));
+        }
+
+        // v1.2: component availability (raw materials + incoming POs + staged
+        // BOM tree) → per-WO buildable date. Self-guarded; disables on failure.
+        await psLoadAvailability();
+
+        filteredWorkOrders = [...allWorkOrders];
+
+        // Calculate initial date range from work orders
+        if (allWorkOrders.length > 0) {
+            const allDates = allWorkOrders.flatMap(wo => [
+                moment(wo.date_scheduled_start),
+                moment(wo.date_scheduled)
+            ]);
+            const minDate = moment.min(allDates);
+            const maxDate = moment.max(allDates);
+
+            // 1 week padding before the earliest WO.
+            ganttStartDate = minDate.clone().subtract(1, 'week').startOf('isoWeek');
+            // Forward horizon: extend well past the last WO so the Timeline stays
+            // scrollable into empty future weeks (drag a WO forward, schedule ahead).
+            // Previously the track ended at maxDate + 1 week, so if nothing was booked
+            // more than ~a month out you couldn't scroll any further forward. Keep at
+            // least 3 months past today, or a week past the last WO if that's later.
+            const horizonEnd = moment().add(3, 'months');
+            ganttEndDate = moment.max(maxDate.clone().add(1, 'week'), horizonEnd).endOf('isoWeek');
+
+            debugLog('info', `Date range: ${ganttStartDate.format('YYYY-MM-DD')} to ${ganttEndDate.format('YYYY-MM-DD')}`);
+        }
+
+        // Initialize capacity planning settings
+        initializeCapacitySettings();
+
+        // Load saved settings from database AFTER categories are initialized
+        // (updateKPIs will be called by applySettings after settings are loaded)
+        const settingsLoaded = loadSettingsFromDatabase();
+
+        // If no settings were loaded, update KPIs with defaults
+        if (!settingsLoaded) {
+            updateKPIs();
+        }
+
+        if (!currentCapacityWeek) {
+            currentCapacityWeek = moment().startOf('isoWeek');
+        }
+
+        renderCurrentView();
+
+        // Show appropriate message based on data source
+        const statusTitle = document.getElementById('systemStatusTitle');
+        const statusText = document.getElementById('systemStatusText');
+
+        if (usingMockData) {
+            showToast(`⚠ Using MOCK DATA (${allWorkOrders.length} WOs) - Fishbowl not connected`, 'info', 5000);
+            setStatus(`Mock data — ${allWorkOrders.length} WOs`);
+            if (statusTitle) statusTitle.className = 'flex items-center gap-2 text-xs font-semibold mb-2 text-amber-400';
+            if (statusText) statusText.textContent = 'Mock Data Mode';
+        } else {
+            showToast(`✓ Loaded ${allWorkOrders.length} work orders from Fishbowl`, 'success');
+            setStatus(`${allWorkOrders.length} work orders · ${manufacturingOrders.length} MOs`);
+            if (statusTitle) statusTitle.className = 'flex items-center gap-2 text-xs font-semibold mb-2 text-emerald-400';
+            if (statusText) statusText.textContent = 'Fishbowl Connected';
+        }
+    } catch (error) {
+        debugLog('error', 'Failed to load work orders', error);
+        setStatus('Load failed — ' + (error && error.message));
+        showToast('Failed to load data: ' + error.message, 'error');
+    } finally {
+        document.getElementById('refreshBtn').style.opacity = '1';
+        psHideLoading();
+    }
+}
+
+// ============================================
+// DATA PROCESSING FUNCTIONS
+// ============================================
+function processWorkOrdersWithHours(workOrders) {
+    return workOrders.map(wo => {
+        const totalHours = calculateWOHours(wo);
+        const dailyHours = calculateDailyHours(wo, totalHours);
+
+        // Normalize category name
+        const category_name = wo.calendar_category || 'Uncategorized';
+
+        return {
+            ...wo,
+            category_name: category_name,
+            total_hours: totalHours,
+            daily_hours: dailyHours,
+            date_range_days: moment(wo.date_scheduled).diff(
+                moment(wo.date_scheduled_start),
+                'days'
+            ) + 1
+        };
+    });
+}
+
+function calculateWOHours(wo) {
+    let totalHours = 0;
+
+    // Priority 1: BOM estimated duration (convert minutes to hours)
+    if (wo.bom_duration_minutes && wo.bom_duration_minutes > 0) {
+        totalHours = (wo.bom_duration_minutes / 60) * wo.qty_target;
+        debugLog('info', `WO ${wo.wo_num}: Using BOM duration ${wo.bom_duration_minutes}min * ${wo.qty_target}qty = ${totalHours.toFixed(2)}hrs`);
+    }
+    // Priority 2: Labor hours from BOM parts (already in hours)
+    else if (wo.labor_hours_from_bom && wo.labor_hours_from_bom > 0) {
+        totalHours = wo.labor_hours_from_bom * wo.qty_target;
+        debugLog('info', `WO ${wo.wo_num}: Using labor parts ${wo.labor_hours_from_bom}hrs * ${wo.qty_target}qty = ${totalHours.toFixed(2)}hrs`);
+    }
+    // Priority 3: Default fallback (1 hour per day)
+    else {
+        const dateRange = moment(wo.date_scheduled).diff(
+            moment(wo.date_scheduled_start),
+            'days'
+        ) + 1;
+        totalHours = Math.max(1, dateRange) * 1; // 1 hour per day, minimum 1 hour
+        debugLog('warn', `WO ${wo.wo_num}: No BOM data found, using fallback ${totalHours}hrs (1hr/day * ${dateRange}days)`);
+    }
+
+    return Math.max(0, totalHours); // Ensure non-negative
+}
+
+function calculateDailyHours(wo, totalHours) {
+    const startDate = moment(wo.date_scheduled_start);
+    const endDate = moment(wo.date_scheduled);
+    const days = endDate.diff(startDate, 'days') + 1;
+
+    if (days <= 0) return [];
+
+    const hoursPerDay = totalHours / days;
+    const dailyHours = [];
+
+    for (let i = 0; i < days; i++) {
+        const currentDate = startDate.clone().add(i, 'days');
+        dailyHours.push({
+            date: currentDate.format('YYYY-MM-DD'),
+            hours: hoursPerDay
+        });
+    }
+
+    return dailyHours;
+}
+
+// ============================================
+// SAVE WO DATES
+// ============================================
+function scrollToWO(woNum) {
+    // Scroll to and highlight a specific WO in the gantt chart
+    const woBar = document.querySelector(`[data-wo-num="${woNum}"]`);
+
+    if (woBar) {
+        const ganttWrapper = document.getElementById('ganttWrapper');
+        if (!ganttWrapper) return;
+
+        // Get the WO bar position relative to the SVG
+        const barRect = woBar.getBoundingClientRect();
+        const wrapperRect = ganttWrapper.getBoundingClientRect();
+
+        // Calculate the scroll position to center the WO
+        const scrollTop = ganttWrapper.scrollTop + (barRect.top - wrapperRect.top) - (wrapperRect.height / 2) + (barRect.height / 2);
+        const scrollLeft = ganttWrapper.scrollLeft + (barRect.left - wrapperRect.left) - (wrapperRect.width / 2) + (barRect.width / 2);
+
+        // Smooth scroll to the WO
+        ganttWrapper.scrollTo({
+            top: scrollTop,
+            left: scrollLeft,
+            behavior: 'smooth'
+        });
+
+        // Briefly highlight the WO
+        const originalStroke = woBar.getAttribute('stroke');
+        const originalStrokeWidth = woBar.getAttribute('stroke-width');
+
+        woBar.setAttribute('stroke', '#F7C23A');
+        woBar.setAttribute('stroke-width', '4');
+
+        setTimeout(() => {
+            woBar.setAttribute('stroke', originalStroke || 'none');
+            woBar.setAttribute('stroke-width', originalStrokeWidth || '1');
+        }, 2000);
+
+        debugLog('info', `Scrolled to WO ${woNum}`);
+    } else {
+        debugLog('warn', `Could not find WO ${woNum} in gantt chart`);
+    }
+}
+
+async function saveWOCategory(woNum, newCategoryId) {
+    debugLog('info', `Saving WO ${woNum} category to ${newCategoryId}`);
+
+    try {
+        // Get the full WO record from Fishbowl
+        const woRequest = {
+            GetWorkOrderRq: {
+                WorkOrderNumber: woNum
+            }
+        };
+
+        const woResponse = JSON.parse(runApiRequest('GetWorkOrderRq', JSON.stringify(woRequest)));
+
+        if (woResponse.GetWorkOrderRs && woResponse.GetWorkOrderRs.statusCode === 1000 && woResponse.GetWorkOrderRs.WO) {
+            const wo = woResponse.GetWorkOrderRs.WO;
+
+            // Update the calendar category ID
+            wo.CalCategoryID = newCategoryId;
+
+            // Save the updated WO
+            const saveRequest = {
+                SaveWorkOrderRq: {
+                    WO: wo
+                }
+            };
+
+            const saveResponse = JSON.parse(runApiRequest('SaveWorkOrderRq', JSON.stringify(saveRequest)));
+
+            if (saveResponse.SaveWorkOrderRs && saveResponse.SaveWorkOrderRs.statusCode === 1000) {
+                debugLog('success', `WO ${woNum} category updated successfully`);
+                showToast(`WO ${woNum} category updated successfully`, 'success');
+                return true;
+            } else {
+                const errorMsg = saveResponse.SaveWorkOrderRs ? saveResponse.SaveWorkOrderRs.statusMessage : 'Unknown error';
+                throw new Error('Failed to save WO: ' + errorMsg);
+            }
+        } else {
+            const errorMsg = woResponse.GetWorkOrderRs ? woResponse.GetWorkOrderRs.statusMessage : 'Failed to retrieve WO';
+            throw new Error('Failed to get WO: ' + errorMsg);
+        }
+    } catch (error) {
+        debugLog('error', `Failed to save WO ${woNum} category`, error);
+        showToast(`Failed to save WO category: ${error.message}`, 'error', 5000);
+        return false;
+    }
+}
+
+async function saveWODates(woNum, newStartDate, newEndDate) {
+    debugLog('info', `Saving WO ${woNum} dates: ${newStartDate} to ${newEndDate}`);
+
+    try {
+        // Get the full WO record from Fishbowl
+        const woRequest = {
+            GetWorkOrderRq: {
+                WorkOrderNumber: woNum
+            }
+        };
+
+        const woResponse = JSON.parse(runApiRequest('GetWorkOrderRq', JSON.stringify(woRequest)));
+
+        if (woResponse.GetWorkOrderRs && woResponse.GetWorkOrderRs.statusCode === 1000 && woResponse.GetWorkOrderRs.WO) {
+            const wo = woResponse.GetWorkOrderRs.WO;
+
+            // Parse original dates to preserve time component
+            const originalStart = moment(wo.DateScheduledToStart);
+            const originalEnd = moment(wo.DateScheduled);
+
+            // Create new date moments, preserving original time
+            const newStartMoment = moment(newStartDate).hour(originalStart.hour()).minute(originalStart.minute()).second(originalStart.second());
+            const newEndMoment = moment(newEndDate).hour(originalEnd.hour()).minute(originalEnd.minute()).second(originalEnd.second());
+
+            // Ensure start time precedes finish time - especially critical on the same day.
+            // If start >= finish (e.g. same day with identical or crossed times), reset to 6am/6pm.
+            if (newStartMoment.isSameOrAfter(newEndMoment)) {
+                newStartMoment.hour(6).minute(0).second(0);
+                newEndMoment.hour(18).minute(0).second(0);
+                debugLog('warn', `WO ${woNum}: Start time >= finish time — defaulting to 06:00–18:00`);
+            }
+
+            // Update the dates with time preserved
+            wo.DateScheduledToStart = newStartMoment.format('YYYY-MM-DD[T]HH:mm:ss');
+            wo.DateScheduled = newEndMoment.format('YYYY-MM-DD[T]HH:mm:ss');
+
+            // Also update WO items if they exist
+            if (wo.WOItems && wo.WOItems.WOItem) {
+                const items = Array.isArray(wo.WOItems.WOItem) ? wo.WOItems.WOItem : [wo.WOItems.WOItem];
+                items.forEach(item => {
+                    if (item.DateScheduled) {
+                        const originalItemDate = moment(item.DateScheduled);
+                        const newItemMoment = moment(newStartDate).hour(originalItemDate.hour()).minute(originalItemDate.minute()).second(originalItemDate.second());
+                        item.DateScheduled = newItemMoment.format('YYYY-MM-DD[T]HH:mm:ss');
+                    }
+                });
+            }
+
+            // Save the updated WO
+            const saveRequest = {
+                SaveWorkOrderRq: {
+                    WO: wo
+                }
+            };
+
+            const saveResponse = JSON.parse(runApiRequest('SaveWorkOrderRq', JSON.stringify(saveRequest)));
+
+            if (saveResponse.SaveWorkOrderRs && saveResponse.SaveWorkOrderRs.statusCode === 1000) {
+                debugLog('success', `WO ${woNum} updated successfully`);
+                showToast(`WO ${woNum} dates updated successfully`, 'success');
+
+                // Save current scroll position
+                const ganttWrapper = document.getElementById('ganttWrapper');
+                const savedScrollLeft = ganttWrapper ? ganttWrapper.scrollLeft : 0;
+                const savedScrollTop = ganttWrapper ? ganttWrapper.scrollTop : 0;
+
+                // Set flag to skip auto-scroll on next render
+                window.skipAutoScroll = true;
+
+                // Reload data to reflect changes
+                loadWorkOrders();
+
+                // Restore scroll position after render
+                setTimeout(() => {
+                    if (ganttWrapper) {
+                        ganttWrapper.scrollLeft = savedScrollLeft;
+                        ganttWrapper.scrollTop = savedScrollTop;
+                    }
+                    window.skipAutoScroll = false;
+                }, 150);
+
+                return true;
+            } else {
+                const errorMsg = saveResponse.SaveWorkOrderRs ? saveResponse.SaveWorkOrderRs.statusMessage : 'Unknown error';
+                throw new Error('Failed to save WO: ' + errorMsg);
+            }
+        } else {
+            const errorMsg = woResponse.GetWorkOrderRs ? woResponse.GetWorkOrderRs.statusMessage : 'Failed to retrieve WO';
+            throw new Error('Failed to get WO: ' + errorMsg);
+        }
+    } catch (error) {
+        debugLog('error', `Failed to save WO ${woNum}`, error);
+        showToast(`Failed to save WO: ${error.message}`, 'error', 5000);
+        return false;
+    }
+}
+
+// ============================================
+// CONTEXT MENU (RIGHT-CLICK)
+// ============================================
+let _ctxWONum = null;
+let _ctxWO    = null; // Full WO object for category comparison
+
+function showWOContextMenu(event, wo) {
+    hideAllContextMenus();
+    _ctxWONum = wo.wo_num;
+    _ctxWO    = wo;
+
+    document.getElementById('woContextMenuTitle').textContent = `WO ${wo.wo_num}`;
+    document.getElementById('woContextMenuStart').value = moment(wo.date_scheduled_start).format('YYYY-MM-DD');
+    document.getElementById('woContextMenuEnd').value   = moment(wo.date_scheduled).format('YYYY-MM-DD');
+
+    // Populate category dropdown
+    const catSelect = document.getElementById('woContextMenuCategory');
+    catSelect.innerHTML = '';
+    const sortedCats = [...capacitySettings.categories].sort((a, b) => a.name.localeCompare(b.name));
+    sortedCats.forEach(cat => {
+        const opt = document.createElement('option');
+        opt.value = cat.id;
+        opt.textContent = cat.name;
+        if (cat.id === wo.calcategory_id) opt.selected = true;
+        catSelect.appendChild(opt);
+    });
+
+    _positionContextMenu('woContextMenu', event.clientX, event.clientY);
+    event.preventDefault();
+    event.stopPropagation();
+}
+
+function _positionContextMenu(menuId, x, y) {
+    const menu = document.getElementById(menuId);
+    menu.classList.add('show');
+
+    // Adjust so menu stays on screen
+    const menuWidth = 230;
+    const menuHeight = menu.offsetHeight || 160;
+    const winW = window.innerWidth;
+    const winH = window.innerHeight;
+
+    const left = (x + menuWidth > winW) ? winW - menuWidth - 8 : x;
+    const top  = (y + menuHeight > winH) ? winH - menuHeight - 8 : y;
+
+    menu.style.left = `${left}px`;
+    menu.style.top  = `${top}px`;
+}
+
+function hideAllContextMenus() {
+    document.querySelectorAll('.gantt-context-menu').forEach(m => m.classList.remove('show'));
+    _ctxWONum = null;
+    _ctxWO    = null;
+}
+
+async function applyWOContextMenu() {
+    const startDate    = document.getElementById('woContextMenuStart').value;
+    const endDate      = document.getElementById('woContextMenuEnd').value;
+    const newCatId     = parseInt(document.getElementById('woContextMenuCategory').value, 10);
+    const wo           = _ctxWO;
+    const woNum        = _ctxWONum;
+    hideAllContextMenus();
+
+    if (!woNum || !startDate || !endDate) return;
+
+    undoStack.push(captureState());
+    if (undoStack.length > MAX_UNDO_STACK) undoStack.shift();
+    redoStack = [];
+    updateUndoRedoButtons();
+
+    const datesChanged    = startDate !== moment(wo.date_scheduled_start).format('YYYY-MM-DD') ||
+                            endDate   !== moment(wo.date_scheduled).format('YYYY-MM-DD');
+    const categoryChanged = !isNaN(newCatId) && newCatId !== wo.calcategory_id;
+
+    if (datesChanged && categoryChanged) {
+        // Single API round-trip for both changes
+        await saveWODatesAndCategory(woNum, startDate, endDate, newCatId);
+    } else if (datesChanged) {
+        await saveWODates(woNum, startDate, endDate);
+    } else if (categoryChanged) {
+        await saveWOCategory(woNum, newCatId);
+        loadWorkOrders();
+    }
+}
+
+// Combined save — updates dates AND category in one Get/Save API call
+async function saveWODatesAndCategory(woNum, newStartDate, newEndDate, newCategoryId) {
+    debugLog('info', `Saving WO ${woNum} dates + category ${newCategoryId}`);
+
+    try {
+        const woRequest  = { GetWorkOrderRq: { WorkOrderNumber: woNum } };
+        const woResponse = JSON.parse(runApiRequest('GetWorkOrderRq', JSON.stringify(woRequest)));
+
+        if (woResponse.GetWorkOrderRs && woResponse.GetWorkOrderRs.statusCode === 1000 && woResponse.GetWorkOrderRs.WO) {
+            const wo = woResponse.GetWorkOrderRs.WO;
+
+            // Preserve time components
+            const originalStart   = moment(wo.DateScheduledToStart);
+            const originalEnd     = moment(wo.DateScheduled);
+            const newStartMoment  = moment(newStartDate).hour(originalStart.hour()).minute(originalStart.minute()).second(originalStart.second());
+            const newEndMoment    = moment(newEndDate).hour(originalEnd.hour()).minute(originalEnd.minute()).second(originalEnd.second());
+
+            // Enforce start < finish
+            if (newStartMoment.isSameOrAfter(newEndMoment)) {
+                newStartMoment.hour(6).minute(0).second(0);
+                newEndMoment.hour(18).minute(0).second(0);
+                debugLog('warn', `WO ${woNum}: Time conflict — defaulting to 06:00–18:00`);
+            }
+
+            wo.DateScheduledToStart = newStartMoment.format('YYYY-MM-DD[T]HH:mm:ss');
+            wo.DateScheduled        = newEndMoment.format('YYYY-MM-DD[T]HH:mm:ss');
+
+            if (wo.WOItems && wo.WOItems.WOItem) {
+                const items = Array.isArray(wo.WOItems.WOItem) ? wo.WOItems.WOItem : [wo.WOItems.WOItem];
+                items.forEach(item => {
+                    if (item.DateScheduled) {
+                        const orig = moment(item.DateScheduled);
+                        item.DateScheduled = moment(newStartDate).hour(orig.hour()).minute(orig.minute()).second(orig.second()).format('YYYY-MM-DD[T]HH:mm:ss');
+                    }
+                });
+            }
+
+            wo.CalCategoryID = newCategoryId;
+
+            const saveRequest  = { SaveWorkOrderRq: { WO: wo } };
+            const saveResponse = JSON.parse(runApiRequest('SaveWorkOrderRq', JSON.stringify(saveRequest)));
+
+            if (saveResponse.SaveWorkOrderRs && saveResponse.SaveWorkOrderRs.statusCode === 1000) {
+                debugLog('success', `WO ${woNum} dates + category updated`);
+                showToast(`WO ${woNum} updated`, 'success');
+                loadWorkOrders();
+                return true;
+            } else {
+                const errorMsg = saveResponse.SaveWorkOrderRs ? saveResponse.SaveWorkOrderRs.statusMessage : 'Unknown error';
+                throw new Error('Failed to save WO: ' + errorMsg);
+            }
+        } else {
+            const errorMsg = woResponse.GetWorkOrderRs ? woResponse.GetWorkOrderRs.statusMessage : 'Failed to retrieve WO';
+            throw new Error('Failed to get WO: ' + errorMsg);
+        }
+    } catch (error) {
+        debugLog('error', `Failed to save WO ${woNum} dates+category`, error);
+        showToast(`Failed to save WO: ${error.message}`, 'error', 5000);
+        return false;
+    }
+}
+
+function generateMockData() {
+    const statuses = [
+        { id: 10, name: 'Entered' },
+        { id: 30, name: 'In Progress' },
+        { id: 40, name: 'Fulfilled' }
+    ];
+
+    const categories = [
+        { name: 'Fabrication', color: '#2d9cdb' },
+        { name: 'Machining', color: '#1B7A46' },
+        { name: 'Assembly', color: '#F69133' },
+        { name: 'Quality Control', color: '#845EEB' }
+    ];
+
+    const mockWOs = [];
+    const today = moment();
+
+    for (let i = 1; i <= 20; i++) {
+        const mo = `MO-${1000 + Math.floor(i / 3)}`;
+        const cat = categories[i % categories.length];
+        const status = statuses[i % statuses.length];
+        const startOffset = Math.floor(i / 2) - 5;
+        const duration = 2 + (i % 4);
+
+        mockWOs.push({
+            wo_id: i,
+            wo_num: `WO-${2000 + i}`,
+            wo_status: status.id,
+            wo_status_name: status.name,
+            date_scheduled_start: today.clone().add(startOffset, 'days').format('YYYY-MM-DD[T]08:00:00'),
+            date_scheduled: today.clone().add(startOffset + duration, 'days').format('YYYY-MM-DD[T]17:00:00'),
+            date_finished: status.id === 40 ? today.clone().add(startOffset + duration - 1, 'days').format('YYYY-MM-DD[T]15:00:00') : null,
+            mo_num: mo,
+            mo_date_scheduled: today.clone().add(startOffset + duration + 2, 'days').format('YYYY-MM-DD[T]17:00:00'),
+            category_name: cat.name,
+            category_color: cat.color,
+            qty_target: 100
+        });
+    }
+
+    return mockWOs;
+}
+
+// ============================================
+// KPI DASHBOARD
+// ============================================
+function updateKPIs() {
+    const container = document.getElementById('kpiCards');
+
+    const startedWOs = filteredWorkOrders.filter(wo => wo.wo_status === 30).length;
+    const enteredWOs = filteredWorkOrders.filter(wo => wo.wo_status === 10).length;
+    const fulfilledWOs = filteredWorkOrders.filter(wo => wo.wo_status === 40).length;
+    const totalWOs = filteredWorkOrders.length;
+
+    // Calculate dependency conflicts (WOs that start before their dependencies are fulfilled)
+    let dependencyConflicts = 0;
+    let stagingConflicts = 0;
+    let sameDayConflicts = 0;
+    const stagingIssueMOs = new Map(); // Track conflict count per MO number
+
+    debugLog('info', `Checking ${stagingDependencies.length} staging dependencies, allowSameDayStarts=${allowSameDayStarts}`);
+
+    // Check staging dependencies
+    stagingDependencies.forEach(dep => {
+        const dependentWO = filteredWorkOrders.find(wo => wo.wo_id === dep.wo_id);
+        const stagingWO = filteredWorkOrders.find(wo => wo.wo_id === dep.staging_wo_id);
+
+        if (dependentWO && stagingWO) {
+            const dependentStart = moment(dependentWO.date_scheduled_start).startOf('day');
+            const stagingEnd = moment(stagingWO.date_scheduled).startOf('day');
+
+            // Conflict logic matching arrow rendering
+            let isConflict;
+            if (allowSameDayStarts) {
+                // Allow same-day: only conflict if staging finishes AFTER dependent starts
+                isConflict = stagingEnd.isAfter(dependentStart);
+            } else {
+                // Don't allow same-day: conflict if staging finishes on or after dependent starts
+                isConflict = stagingEnd.isSameOrAfter(dependentStart);
+            }
+
+            if (isConflict) {
+                stagingConflicts++;
+                dependencyConflicts++;
+                // Count conflicts per MO
+                const moNum = dependentWO.mo_num;
+                stagingIssueMOs.set(moNum, (stagingIssueMOs.get(moNum) || 0) + 1);
+                debugLog('warn', `Staging dependency conflict: ${stagingWO.wo_num} ends ${stagingEnd.format('YYYY-MM-DD')} vs ${dependentWO.wo_num} starts ${dependentStart.format('YYYY-MM-DD')}`);
+            }
+        }
+    });
+
+    // Also check same-day starts in same MO if setting is disabled
+    if (!allowSameDayStarts) {
+        const moGroups = {};
+        filteredWorkOrders.forEach(wo => {
+            if (!moGroups[wo.mo_num]) moGroups[wo.mo_num] = [];
+            moGroups[wo.mo_num].push(wo);
+        });
+
+        Object.values(moGroups).forEach(wos => {
+            if (wos.length > 1) {
+                const startDates = {};
+                wos.forEach(wo => {
+                    const startDate = moment(wo.date_scheduled_start).format('YYYY-MM-DD');
+                    if (startDates[startDate]) {
+                        sameDayConflicts++;
+                        dependencyConflicts++;
+                        const moNum = wo.mo_num;
+                        stagingIssueMOs.set(moNum, (stagingIssueMOs.get(moNum) || 0) + 1);
+                        debugLog('warn', `Same-day start conflict in MO: ${wo.wo_num} starts ${startDate}`);
+                    } else {
+                        startDates[startDate] = true;
+                    }
+                });
+            }
+        });
+    }
+
+    debugLog('info', `Dependency conflicts breakdown: ${stagingConflicts} from staging deps, ${sameDayConflicts} from same-day MO starts, total=${dependencyConflicts}`);
+
+    // Calculate capacity issues (count each category-day combination that exceeds capacity)
+    let capacityIssues = 0;
+    const daysToCheck = 90;
+    const today = moment();
+    const categoryDaysWithIssues = new Set();
+    const capacityIssueDetails = []; // Track category-date pairs with usage/capacity for tooltip
+
+    debugLog('info', `Checking capacity for ${capacitySettings.categories.length} categories over ${daysToCheck} days`);
+
+    for (let i = 0; i < daysToCheck; i++) {
+        const checkDay = today.clone().add(i, 'days');
+
+        capacitySettings.categories.forEach(cat => {
+            const dayOfWeek = checkDay.isoWeekday() - 1;
+            const capacity = cat.limits[dayOfWeek];
+
+            if (capacity > 0) {
+                const { usage } = getUsageForCategoryAndDay(cat.id, checkDay);
+
+                // Debug: Log when usage is significant
+                if (usage > 0) {
+                    debugLog('debug', `${checkDay.format('YYYY-MM-DD')} - Category ${cat.name}: usage=${usage.toFixed(2)}hrs, capacity=${capacity}hrs`);
+                }
+
+                // If this category exceeds capacity on this day, count it as a separate issue
+                if (usage > capacity) {
+                    const issueKey = `${cat.id}-${checkDay.format('YYYY-MM-DD')}`;
+                    if (!categoryDaysWithIssues.has(issueKey)) {
+                        categoryDaysWithIssues.add(issueKey);
+                        capacityIssues++;
+                        // Track details for tooltip
+                        capacityIssueDetails.push({
+                            category: cat.name,
+                            date: checkDay.format('YYYY-MM-DD'),
+                            usage: usage,
+                            capacity: capacity
+                        });
+                        debugLog('warn', `Capacity issue on ${checkDay.format('YYYY-MM-DD')}: ${cat.name} has ${usage.toFixed(2)}hrs usage but only ${capacity}hrs capacity`);
+                    }
+                }
+            }
+        });
+    }
+
+    debugLog('info', `Total capacity issues found: ${capacityIssues}`);
+    debugLog('info', `Total dependency conflicts found: ${dependencyConflicts}`);
+    debugLog('info', `KPI Summary - Dependency Conflicts: ${dependencyConflicts}, Capacity Issues: ${capacityIssues}`);
+
+    // Check for WOs with missing or low labor hours
+    const wosWithNoLabor = filteredWorkOrders.filter(wo => !wo.labor_hours_from_bom || parseFloat(wo.labor_hours_from_bom) === 0);
+    const wosWithLowLabor = filteredWorkOrders.filter(wo => {
+        const hours = parseFloat(wo.labor_hours_from_bom) || 0;
+        return hours > 0 && hours < 2; // Less than 2 hours total seems suspiciously low
+    });
+
+    if (wosWithNoLabor.length > 0) {
+        debugLog('warn', `⚠️ ${wosWithNoLabor.length} WO(s) have NO labor hours: ${wosWithNoLabor.map(wo => wo.wo_num).join(', ')}`);
+    }
+    if (wosWithLowLabor.length > 0) {
+        debugLog('warn', `⚠️ ${wosWithLowLabor.length} WO(s) have suspiciously LOW labor hours (<2hrs): ${wosWithLowLabor.map(wo => `${wo.wo_num}(${wo.labor_hours_from_bom}hrs)`).join(', ')}`);
+    }
+
+    const kpis = [
+        {
+            title: 'Entered WOs',
+            value: enteredWOs,
+            color: 'blue', // Match WO status 10 color (#2d9cdb)
+            icon: `<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>`
+        },
+        {
+            title: 'Started WOs',
+            value: startedWOs,
+            color: 'orange', // Match WO status 30 color (#F69133)
+            icon: `<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>`
+        },
+        {
+            title: 'Fulfilled WOs',
+            value: fulfilledWOs,
+            color: 'green', // Match WO status 40 color (#1B7A46)
+            icon: `<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>`
+        },
+        {
+            title: 'Total WOs',
+            value: totalWOs,
+            color: 'slate',
+            icon: `<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"></path>`
+        },
+        {
+            title: 'Staging Issues',
+            value: dependencyConflicts,
+            color: 'rose',
+            icon: `<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>`,
+            tooltipHTML: stagingIssueMOs.size > 0
+                ? '<div style="font-weight: 600; margin-bottom: 0.5rem;">MO Numbers with Conflicts:</div>' +
+                  '<div style="color: #ffffff;">' +
+                  Array.from(stagingIssueMOs.keys())
+                      .sort((a, b) => a - b)
+                      .map(moNum => `MO ${moNum}`)
+                      .join(', ') +
+                  '</div>'
+                : null
+        },
+        {
+            title: 'Capacity Issues',
+            value: capacityIssues,
+            color: 'amber', // Changed from orange to amber to avoid confusion with Started WOs
+            icon: `<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 17h8m0 0V9m0 8l-8-8-4 4-6-6"></path>`,
+            tooltipHTML: capacityIssueDetails.length > 0
+                ? '<div style="font-weight: 600; margin-bottom: 0.5rem;">Capacity Overages:</div>' +
+                  capacityIssueDetails
+                    .sort((a, b) => a.date.localeCompare(b.date) || a.category.localeCompare(b.category))
+                    .map(issue => {
+                        const dateStr = moment(issue.date).format('MMM DD');
+                        const usageStr = issue.usage ? `${issue.usage.toFixed(1)}h` : 'N/A';
+                        const capacityStr = issue.capacity ? `${issue.capacity}h` : 'N/A';
+                        return `<div><span class="wo-tooltip-label">${dateStr} - ${issue.category}:</span><span class="wo-tooltip-value">${usageStr}/${capacityStr}</span></div>`;
+                    })
+                    .join('')
+                : null
+        }
+    ];
+
+    const colorClasses = {
+        blue: 'bg-blue-100 text-blue-700',        // WO status 10 (Entered) - darker for visibility
+        orange: 'bg-orange-100 text-orange-700',  // WO status 30 (Started) - darker for visibility
+        green: 'bg-green-100 text-green-700',     // WO status 40 (Fulfilled) - darker for visibility
+        amber: 'bg-amber-100 text-amber-700',
+        slate: 'bg-slate-100 text-slate-700',
+        rose: 'bg-rose-100 text-rose-700'
+    };
+
+    container.innerHTML = kpis.map(kpi => `
+        <div class="kpi-tile bg-white rounded-md px-2 py-1.5 shadow-sm border border-slate-300 flex flex-col gap-1 flex-1 min-w-0">
+            <p class="text-slate-600 text-[10px] font-bold uppercase tracking-wide truncate">${kpi.title}</p>
+            <div class="flex items-center gap-1.5">
+                <div class="${colorClasses[kpi.color]} p-1 rounded flex-shrink-0">
+                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        ${kpi.icon}
+                    </svg>
+                </div>
+                <h3 class="text-lg font-bold text-slate-800">${kpi.value}</h3>
+            </div>
+        </div>
+    `).join('');
+
+    // Add event handlers for tooltips
+    kpis.forEach((kpi, index) => {
+        if (kpi.tooltipHTML) {
+            const tile = container.querySelectorAll('.kpi-tile')[index];
+            if (tile) {
+                tile.style.cursor = 'pointer';
+                tile.addEventListener('mouseover', (e) => showWOTooltip(e, kpi.tooltipHTML));
+                tile.addEventListener('mouseout', () => hideWOTooltip());
+                tile.addEventListener('mousemove', (e) => showWOTooltip(e, kpi.tooltipHTML));
+            }
+        }
+    });
+}
+
+// ============================================
+// v1.2 WORKSPACE — view management, filtering, tabs, new views
+// ============================================
+// psView drives the active tab; the legacy `viewMode` global is kept
+// for the Gantt's own grouping ('mo' | 'category' | 'user').
+let psView = 'dashboard';
+let psSearch = '';
+let psStatusFilter = new Set();   // empty = all; else set of '10'/'30'/'40'
+let psCatFilter = new Set();      // empty = all; else set of calcategory_id (string)
+let psPriorityFilter = new Set(); // empty = all; else set of priority_id (string)
+let psUserFilter = new Set();     // empty = all; else set of user_id (string; '0' = Unassigned)
+let psFlagFilter = new Set();     // empty = all; else subset of 'ready'|'late'|'conflict'|'short'
+let psSiteFilter = new Set();     // empty = all; else set of location_group_id (string) — labelled "LG"
+let psResourceFilter = new Set(); // empty = all; else set of location id (string; '0' = Unassigned) — labelled "Location"
+let psCfFilter = {};              // BOM/MO/WO/Part custom-field filters: cf key -> {values:Set,text,from,to,min,max,bool}
+let psTimelineGroup = 'mo';       // 'mo' | 'category' | 'user' | 'site' | 'resource'
+let psLoadDim = 'cat';            // 'cat' | 'user'  (User Load tab)
+let psDashLoadDim = 'cat';        // 'cat' | 'user'  (Dashboard load panel)
+let psDashCollapsed = {};         // Dashboard: collapsed panel keys (overdue|conflicts|load|shortages)
+let psDateRange = { key:'all', customStart:'', customEnd:'', start:null, end:null }; // GLOBAL date-range filter — control on the Dashboard, applied in applyActiveFilters to every view
+let psOpenDropdown = null;        // filter strip: which multi-select dropdown is open ('cat'|'pri'|null)
+let psDayW = 44;                  // current Gantt day-column width (set by renderGanttChart)
+let psKeepScroll = null;          // when set, the next Gantt render keeps this scrollLeft (drag/resize)
+let psFocusWO = null;             // when set, the next Gantt render scrolls to + highlights this wo_id (drawer "Timeline" button)
+let psShowFulfilled = false;      // Work Orders view only: include Fulfilled (status 40) WOs
+let psGroupKeys = [];             // group keys of the last Timeline render (for collapse-all)
+let psAvailReady = false;         // true once component-availability has been computed
+let psAvailExpanded = false;      // detail drawer: raw-goods list expanded?
+let psMakePartIds = new Set();    // partIds that are a BOM finished good (manufacturable) — Procurement tab make/buy split
+let psPartVendor = new Map();     // partId → { id, name } — default vendor (To Purchase grouping)
+let psMakeBom = new Map();        // partId → { bomId, bomNum } — default/first active BOM (To Manufacture → MO)
+let psProcureSel = new Set();     // partIds ticked in the To Manufacture list (Create MO selection)
+let psProcTab = 'buy';            // Procurement: active tab ('buy' | 'make')
+let psMoCfDefs = null;            // cached MO custom-field defs (lazy; null = not loaded)
+let psMoDraft = null;             // in-flight Create-MO drawer state
+let psPoDraft = null;             // in-flight Create-PO drawer state (per vendor)
+let psDefaultLgId;                // cached logged-in user's default LG id (undefined=unqueried, null=none)
+let users = [];                   // [{id,name,initials}] built in loadWorkOrders
+let priorities = [];              // [{id,name}] built in loadWorkOrders (priority filter pills)
+let sites = [];                   // [{id,name}] location groups (LG dimension)
+let resources = [];               // [{id,name}] manufacturing locations (Location dimension; '0' = Unassigned)
+let psCfDefs = [];                // [{obj,name,key,label,objLabel,kind,listid,expr,values,options}] active BOM/MO/WO/Part custom fields
+let psCfGroupOrder = ['bom','mo','wo','part']; // CF drawer: object-group display order (drag-reordered, persisted per user)
+let psCfGroupCollapsed = {};      // CF drawer: collapsed object groups (session-only)
+let psCfDragObj = null;           // CF drawer: obj key currently being drag-reordered
+let userGroups = [];              // [{id,name}] all Fishbowl user groups (admin Finish-WO gate picker)
+let currentUserGroupIds = new Set(); // group ids the logged-in user belongs to (Finish-WO gate)
+
+// Scroll the Timeline horizontally to a pixel offset within the track.
+function psTimelineScrollTo(px){ const sc=document.getElementById('ganttScroll'); if(sc) sc.scrollLeft=Math.max(0, px-160); }
+
+// Drawer "Timeline" button — jump to the Timeline and scroll to THIS WO's bar.
+// Expands the WO's group under the active grouping (so its row renders even if the
+// group was collapsed), flags the WO for the render's focus-scroll, then switches
+// view. The scroll + highlight happen at the end of renderGanttChart (psFocusWO).
+function psShowWOOnTimeline(woId){
+    const w = allWorkOrders.find(x=>String(x.wo_id)===String(woId));
+    if(!w) return;
+    // Group key for the current grouping (mirrors renderGanttChart's group keys).
+    // 'user' WOs can sit in several groups, so skip the expand there — the focus
+    // scroll still finds the bar in whichever group renders it.
+    let key=null;
+    if(psTimelineGroup==='mo') key='mo:'+w.mo_num;
+    else if(psTimelineGroup==='site') key='site:'+(w.site_name||('LG '+(w.location_group_id||0)));
+    else if(psTimelineGroup==='resource') key='resource:'+(w.resource_name||'Unassigned location');
+    else if(psTimelineGroup==='category') key='cat:'+(w.category_name||'Uncategorized');
+    if(key && collapsedMOs.has(key)){
+        collapsedMOs.delete(key);
+        try{ FBLib.Settings.setUserKey('collapsedMOs', Array.from(collapsedMOs)); FBLib.Settings.saveUser(); }catch(_){}
+    }
+    psFocusWO = woId;
+    psKeepScroll = null;   // don't let a stale drag-scroll override the focus
+    closeDetail();
+    setView('timeline');
+}
+
+const PS_VIEWS = [
+    { id: 'dashboard', name: 'Dashboard', container: 'dashboardView' },
+    { id: 'timeline',  name: 'Timeline',  container: 'ganttContainer' },
+    { id: 'board',     name: 'Board',     container: 'boardView' },
+    { id: 'table',     name: 'Work Orders', container: 'tableView' },
+    { id: 'calendar',  name: 'Calendar',  container: 'calendarView' },
+    { id: 'load',      name: 'User Load', container: 'capacityContainer' },
+    { id: 'planning',  name: 'Planning',  container: 'planningView' },
+    { id: 'materials', name: 'Materials', container: 'materialsView' },
+    { id: 'procure',   name: 'Procurement', container: 'procureView' },
+    { id: 'roster',    name: 'Rostering', container: 'rosterView', adminOnly: true }
+];
+// ── PER-CUSTOMER FEATURE GATING (licensing) ────────────────────────────────
+// Premium tabs are kept only for some customers. Flip a flag to false to
+// remove that tab EVERYWHERE at once (tab strip, view switch, restore,
+// dispatch, filter-strip control) — `psTabEnabled(id)` is the single gate all
+// of those consult. 'roster' additionally requires FBLib.Settings.isAdmin().
+// This is honour-system config for a client-side report, NOT a security
+// boundary (the source is visible to a customer admin).
+const PS_TABS_ENABLED = { materials: true, procure: true, planning: true, roster: true };
+function psTabEnabled(id) {
+    const v = PS_VIEWS.find(x => x.id === id);
+    if (!v) return false;
+    if (Object.prototype.hasOwnProperty.call(PS_TABS_ENABLED, id) && !PS_TABS_ENABLED[id]) return false;
+    if (v.adminOnly && !(window.FBLib && FBLib.Settings && FBLib.Settings.isAdmin())) return false;
+    return true;
+}
+const PS_VIEWICON = {
+    dashboard:'<path stroke-linecap="round" stroke-linejoin="round" d="M4 13h6V4H4zM14 21h6v-9h-6zM14 8h6V4h-6zM4 21h6v-4H4z"/>',
+    timeline:'<path stroke-linecap="round" stroke-linejoin="round" d="M4 6h12M4 12h16M4 18h9"/>',
+    board:'<path stroke-linecap="round" stroke-linejoin="round" d="M4 5h4v14H4zM10 5h4v9h-4zM16 5h4v6h-4z"/>',
+    table:'<path stroke-linecap="round" stroke-linejoin="round" d="M4 5h16v14H4zM4 10h16M4 15h16M10 5v14"/>',
+    calendar:'<path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16v14H4zM4 10h16M8 3v4M16 3v4"/>',
+    load:'<path stroke-linecap="round" stroke-linejoin="round" d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
+    materials:'<path stroke-linecap="round" stroke-linejoin="round" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/>',
+    procure:'<path stroke-linecap="round" stroke-linejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/>',
+    planning:'<path stroke-linecap="round" stroke-linejoin="round" d="M4 6h10M4 12h7M4 18h5"/><path stroke-linecap="round" stroke-linejoin="round" d="M16 8v10m0 0l3-3m-3 3l-3-3"/>',
+    roster:'<path stroke-linecap="round" stroke-linejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/>'
+};
+// WO status → canonical tone. Entered = not started (neutral), Started =
+// actively worked (active/blue), Fulfilled = done (success/green).
+const PS_STATUS = { 10:{name:'Entered',tone:'neutral'}, 30:{name:'Started',tone:'active'}, 40:{name:'Fulfilled',tone:'success'} };
+// Representative accent colour per tone — for the few non-pill uses (board
+// column headers, dots) that need a solid colour rather than the pill classes.
+const PS_TONE_ACCENT = { neutral:'#506872', active:'#2d9cdb', success:'#1B7A46', caution:'#B26A14', critical:'#C43046', blocked:'#845EEB' };
+// Padlock glyph for the Committed pick pill (stock reserved/locked to the WO).
+const PS_LOCK_SVG = '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path stroke-linecap="round" d="M8 11V7a4 4 0 018 0v4"/></svg>';
+// Sized padlock for inline use beside a date (availability ETA cell). PS_LOCK_SVG
+// is only sized by the .spill svg rule, so this standalone variant carries w/h.
+const PS_LOCK_SVG_SM = '<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="vertical-align:-2px;margin-right:3px"><rect x="5" y="11" width="14" height="10" rx="2"/><path stroke-linecap="round" d="M8 11V7a4 4 0 018 0v4"/></svg>';
+// Build a consolidated status pill. tone ∈ neutral|active|success|caution|critical|blocked.
+// opts: { dot:bool, icon:svgString, title:string }
+function psSpill(tone, label, opts){
+    opts = opts || {};
+    const dot = opts.dot ? '<span class="dot"></span>' : '';
+    const icon = opts.icon || '';
+    const ttl = opts.title ? ' title="'+psEsc(opts.title)+'"' : '';
+    return '<span class="spill '+tone+'"'+ttl+'>'+dot+icon+psEsc(label)+'</span>';
+}
+
+// ── small helpers ────────────────────────────────────────────
+function psEsc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function psHexA(hex,a){
+    let h=String(hex||'').replace('#','');
+    if(h.length===3) h=h.split('').map(c=>c+c).join('');
+    if(h.length!==6) return 'rgba(84,112,137,'+a+')';
+    const r=parseInt(h.substr(0,2),16),g=parseInt(h.substr(2,2),16),b=parseInt(h.substr(4,2),16);
+    return 'rgba('+r+','+g+','+b+','+a+')';
+}
+function psCatColor(wo){ const c=(wo&&wo.category_color)||''; if(!c) return '#506872'; return c.charAt(0)==='#'?c:('#'+c); }
+// Relative luminance (0..1) of a hex colour — drives contrast decisions.
+function psLum(hex){
+    let h=String(hex||'').replace('#',''); if(h.length===3) h=h.split('').map(c=>c+c).join('');
+    if(h.length!==6) return 1;
+    const r=parseInt(h.substr(0,2),16)/255, g=parseInt(h.substr(2,2),16)/255, b=parseInt(h.substr(4,2),16)/255;
+    return 0.2126*r+0.7152*g+0.0722*b;
+}
+// Readable black/white text for a solid colour background (calendar chips, bars).
+function psReadableText(hex){ return psLum(hex) > 0.6 ? '#101010' : '#ffffff'; }
+// "Ink" version of a category colour — darkened until it reads as text on a
+// light tinted background. Fixes pale categories (light yellow/green) whose
+// raw colour vanished on the .12 tint pill.
+function psInk(hex){
+    let h=String(hex||'').replace('#',''); if(h.length===3) h=h.split('').map(c=>c+c).join('');
+    if(h.length!==6) return '#506872';
+    let r=parseInt(h.substr(0,2),16), g=parseInt(h.substr(2,2),16), b=parseInt(h.substr(4,2),16);
+    let guard=0;
+    while(((0.2126*r+0.7152*g+0.0722*b)/255) > 0.5 && guard<14){ r=Math.round(r*0.8); g=Math.round(g*0.8); b=Math.round(b*0.8); guard++; }
+    return 'rgb('+r+','+g+','+b+')';
+}
+function psStatusMeta(id){ const s = PS_STATUS[id] || {name:'Status '+id, tone:'neutral'}; return { name:s.name, tone:s.tone, color: PS_TONE_ACCENT[s.tone] || '#506872' }; }
+function psFmtDate(s){ if(!s) return '—'; const m=moment(s); return m.isValid()? m.format('MMM D') : '—'; }
+function psFmtDateTime(s){ if(!s) return '—'; const m=moment(s); return m.isValid()? m.format('MMM D, YYYY · h:mm A') : '—'; }
+function psMoForWO(wo){ return manufacturingOrders.find(m=>m.mo_num===wo.mo_num && (m.customer_name||m.customer_po)) || manufacturingOrders.find(m=>m.mo_num===wo.mo_num) || {}; }
+function psCustomer(wo){ return psMoForWO(wo).customer_name || ''; }
+// Assigned users. A WO can carry several (woassignedusers) or none. psAssignedNames
+// returns the list of display names (['Unassigned'] when none); psUserName joins them
+// for single-line display. Grouping/filter/load use wo._userIds / _assignedUsers.
+function psAssignedNames(wo){
+    const list = (wo && wo._assignedUsers) || [];
+    const names = list.map(u => (u.name && u.name.trim()) ? u.name.trim() : (u.id ? ('User '+u.id) : 'Unassigned'));
+    return names.length ? names : ['Unassigned'];
+}
+function psUserName(wo){ return psAssignedNames(wo).join(', '); }
+function psPriority(wo){ return wo.priority_name || ''; }
+function psDue(wo){ const mo=psMoForWO(wo); return mo.mo_date_scheduled || wo.date_scheduled || null; }
+
+// Finished-good label for an MO's Timeline header. Mirrors Work_Order_WIP:
+// the MO's outputs are the typeid=10 children of its root typeid=50 moitem —
+// already loaded one-row-per-output in manufacturingOrders. Dedupe by part
+// number (summing qty), then show "PART ×QTY" for a single output or
+// "Multiple Finished Goods" when the MO builds more than one.
+function psFmtQty(q){ q = Number(q) || 0; return q % 1 === 0 ? String(q) : String(Math.round(q * 100) / 100); }
+function psMoFgLabel(moNum){
+    const byPart = new Map();
+    manufacturingOrders.forEach(m => {
+        if (m.mo_num !== moNum || !m.part_num) return;
+        byPart.set(m.part_num, (byPart.get(m.part_num) || 0) + (parseFloat(m.qty) || 0));
+    });
+    if (byPart.size === 0) return '';
+    if (byPart.size === 1) { const e = byPart.entries().next().value; return e[0] + (e[1] ? ' ×' + psFmtQty(e[1]) : ''); }
+    return 'Multiple Finished Goods';
+}
+
+// Blocked = a genuine scheduling conflict: the upstream (producer / staging) WO's
+// scheduled FINISH falls after the dependent WO's scheduled START — i.e. the part
+// this WO consumes isn't finished in time. Compared at day granularity, strictly
+// after (a producer finishing the same day the consumer starts is NOT a conflict).
+function psBlockedSet(){
+    const set = new Set();
+    stagingDependencies.forEach(dep=>{
+        const dependent = filteredWorkOrders.find(w=>w.wo_id===dep.wo_id);
+        const staging   = filteredWorkOrders.find(w=>w.wo_id===dep.staging_wo_id);
+        if(dependent && staging){
+            const dStart=moment(dependent.date_scheduled_start).startOf('day');
+            const sEnd=moment(staging.date_scheduled).startOf('day');
+            if(sEnd.isAfter(dStart)) set.add(dependent.wo_id);
+        }
+    });
+    return set;
+}
+function psIsLate(wo){ if(wo.wo_status===40) return false; const d=psDue(wo); return d && moment(d).isBefore(moment().startOf('day')); }
+// "Short" = the WO genuinely can't be built for lack of raw goods. Prefer the
+// full availability calc (which accounts for non-inventory/labor parts, committed
+// picks, incoming POs and staged production) so a "Buildable now" WO never shows
+// as short; fall back to the crude SQL flag only when availability didn't compute.
+// Finished WOs are never short — their material is already consumed.
+function psIsShort(wo){
+    if (wo.wo_status===40) return false;
+    if (psAvailReady && wo._av) return !!wo._av._unmet;
+    return !!wo._materialShort;
+}
+// "Ready to finish now" — not fulfilled, and either the pick is already committed
+// (stock staged to the WO) or every component is on hand now. Drives the "Ready"
+// flag-filter chip and mirrors when the Finish flow will actually succeed.
+function psReadyToFinish(wo){
+    if (wo.wo_status===40) return false;
+    if (wo._pickStatus!=null && wo._pickStatus>=30) return true;
+    if (psAvailReady && wo._av) return !!wo._av._buildableNow;
+    return false;
+}
+// MO complete (statusid 60 Fulfilled / 70 Closed / 80 Void). Its WOs are
+// historical — hidden unless "Show fulfilled" is on, and never shown on the
+// Timeline (they'd clutter the Gantt with completed manufacturing orders).
+function psMoFinished(wo){ const s = parseInt(wo && wo.mo_status, 10); return s === 60 || s === 70 || s === 80; }
+
+// Pick progress — derived from the WO's least-advanced pick status
+// (10 Entered · 20 Started · 30 Committed · 40 Finished). Committed or
+// finished reads as "Picked"; started as "In Picking".
+const PS_PICK = { 10:'Entered', 20:'Started', 30:'Committed', 40:'Finished' };
+function psPickInfo(wo){
+    const st = wo._pickStatus;
+    if (st == null)  return { label:'No pick',     tone:'neutral', lock:false };
+    if (st >= 40)    return { label:'Picked',      tone:'success', lock:false };
+    if (st >= 30)    return { label:'Committed',   tone:'active',  lock:true  };  // stock reserved/locked to this WO
+    if (st >= 20)    return { label:'In Picking',  tone:'active',  lock:false };
+    return             { label:'Pick pending', tone:'neutral', lock:false };
+}
+// Pick pill. showNone=false suppresses the neutral "No pick / pending" chip so
+// board cards aren't cluttered for WOs that have no pick generated yet.
+function psPickPill(wo, showNone){
+    const p = psPickInfo(wo);
+    if (p.tone === 'neutral' && !showNone) return '';
+    return psSpill(p.tone, p.label, { title:'Pick status', icon: p.lock ? PS_LOCK_SVG : '' });
+}
+// SVG glyphs shared by the flag pills.
+const PS_ICON_ALERT = '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path stroke-linecap="round" d="M12 8v4m0 4h.01"/></svg>';
+const PS_ICON_BOLT  = '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11z"/></svg>';
+const PS_ICON_BOX   = '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7"/></svg>';
+function psFlagsHTML(wo, blockedSet){
+    let out='';
+    if(psIsLate(wo)) out+=psSpill('critical','Late',{icon:PS_ICON_ALERT});
+    if(blockedSet && blockedSet.has(wo.wo_id)) out+=psSpill('blocked','Conflict',{icon:PS_ICON_BOLT, title:'Scheduling conflict — an upstream WO finishes after this one starts'});
+    if(psIsShort(wo)) out+=psSpill('caution','Short',{icon:PS_ICON_BOX});
+    return out;
+}
+function psPillHTML(status){ const s=psStatusMeta(status); return psSpill(s.tone, s.name, {dot:true}); }
+function psTagHTML(wo){ const c=psCatColor(wo); const ink=psInk(c); const n=wo.calendar_category||'Uncategorized'; return '<span class="tag" style="background:'+psHexA(c,.16)+';color:'+ink+'"><span class="dot" style="width:6px;height:6px;border-radius:50%;background:currentColor"></span>'+psEsc(n)+'</span>'; }
+// (Allergen is no longer a special-cased dimension — for the customer's use case
+//  it's simply a Part custom field, discovered generically by psLoadCfDefs and
+//  filterable via the Custom-Field filters drawer like any other Part CF.)
+// Demand driver — why this WO exists: linked Sales Order, min/max reorder, or
+// manual planning. SO link comes from the WO's MO (psMoForWO → so_num).
+function psDemandDriver(wo){
+    const mo=psMoForWO(wo);
+    if(mo && mo.so_num) return { label:'SO '+mo.so_num, tone:'active' };
+    if(wo && wo._reorder) return { label:'Min/Max', tone:'neutral' };
+    return { label:'Manual', tone:'neutral' };
+}
+function psDemandHTML(wo){ const d=psDemandDriver(wo); return psSpill(d.tone, d.label, { title:'Demand driver' }); }
+function psPriHTML(wo){ const p=psPriority(wo); if(!p) return ''; const c=/high|urgent/i.test(p)?'var(--fb-negative)':/med/i.test(p)?'var(--fb-warning)':'var(--c-tertiary)'; return '<span class="pri" style="color:'+c+'"><svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5 15l7-7 7 7"/></svg>'+psEsc(p)+'</span>'; }
+// Solid accent colour for a priority name — red for high/urgent, amber for
+// medium, slate for everything else. Used by the priority filter pills.
+function psPriorityColor(name){ return /high|urgent/i.test(name)?'#C43046':/med/i.test(name)?'#B26A14':'#506872'; }
+// Deterministic dot colour for a user — stable per name so the User filter
+// dropdown gives each person a distinct (if arbitrary) swatch; Unassigned reads
+// neutral grey.
+function psUserColor(name){
+    const s=String(name||'');
+    if(!s || /^unassigned$/i.test(s)) return '#8FA1A7';
+    let h=0; for(let i=0;i<s.length;i++){ h=(h*31 + s.charCodeAt(i))>>>0; }
+    return 'hsl('+(h%360)+',42%,45%)';
+}
+
+// ── unified filtering ────────────────────────────────────────
+function applyActiveFilters(){
+    let list = allWorkOrders;
+    // Fulfilled (status 40) WOs and WOs whose MO is complete are hidden by
+    // default; the "Show fulfilled" toggle (available in every view) opts them
+    // back in. The Timeline additionally NEVER shows finished-MO WOs.
+    if(!psShowFulfilled) list = list.filter(wo => wo.wo_status !== 40 && !psMoFinished(wo));
+    if(psView==='timeline') list = list.filter(wo => !psMoFinished(wo));
+    // Global date-range filter (control in the filter strip; narrows every view).
+    // Recompute the window each pass so 'today'-relative ranges stay current.
+    psComputeRange();
+    if(psDateRange.key!=='all' && psDateRange.start && psDateRange.end) list = list.filter(psInDateRange);
+    if(psStatusFilter.size) list = list.filter(wo=>psStatusFilter.has(String(wo.wo_status)));
+    if(psCatFilter.size)    list = list.filter(wo=>psCatFilter.has(String(wo.calcategory_id)));
+    if(psPriorityFilter.size) list = list.filter(wo=>psPriorityFilter.has(String(wo.priority_id)));
+    if(psUserFilter.size)    list = list.filter(wo=> (wo._userIds || [String(wo.user_id||0)]).some(id=>psUserFilter.has(id)));
+    if(psSiteFilter.size)    list = list.filter(wo=>psSiteFilter.has(String(wo.location_group_id!=null?wo.location_group_id:'0')));
+    if(psResourceFilter.size) list = list.filter(wo=>psResourceFilter.has(String(wo._resourceId||'0')));
+    // Custom-field filters (from the Custom-Field filters drawer): AND across
+    // fields; within a field the control's kind decides the match.
+    (psCfDefs||[]).forEach(function(d){
+        const st = psCfFilter[d.key]; if(!st) return;
+        const cv = wo => (wo._cf && wo._cf[d.key]) || '';
+        if(d.kind==='list'){ if(st.values && st.values.size) list = list.filter(wo => st.values.has(cv(wo))); }
+        else if(d.kind==='text'){ const q=(st.text||'').trim().toLowerCase(); if(q) list = list.filter(wo => String(cv(wo)).toLowerCase().indexOf(q)>=0); }
+        else if(d.kind==='date'){ if(st.from||st.to) list = list.filter(wo => { const v=cv(wo); if(!v) return false; const m=moment(String(v).slice(0,10)); if(!m.isValid()) return false; if(st.from && m.isBefore(moment(st.from),'day')) return false; if(st.to && m.isAfter(moment(st.to),'day')) return false; return true; }); }
+        else if(d.kind==='number'){ const hasMin=st.min!==''&&st.min!=null, hasMax=st.max!==''&&st.max!=null; if(hasMin||hasMax) list = list.filter(wo => { const raw=cv(wo); if(raw==='') return false; const n=parseFloat(raw); if(isNaN(n)) return false; if(hasMin && n<parseFloat(st.min)) return false; if(hasMax && n>parseFloat(st.max)) return false; return true; }); }
+        else if(d.kind==='bool'){ if(st.bool==='true'||st.bool==='false'){ const want=st.bool==='true'; list = list.filter(wo => { const v=String(cv(wo)).toLowerCase(); return (v==='true'||v==='yes'||v==='1')===want; }); } }
+    });
+    if(psFlagFilter.size){
+        // Blocked (conflict) set computed over ALL WOs so a conflict still matches
+        // even when the upstream WO is filtered out of the current list.
+        const blk = new Set();
+        stagingDependencies.forEach(dep=>{
+            const dependent = allWorkOrders.find(w=>w.wo_id===dep.wo_id);
+            const staging   = allWorkOrders.find(w=>w.wo_id===dep.staging_wo_id);
+            if(dependent && staging && moment(staging.date_scheduled).startOf('day').isAfter(moment(dependent.date_scheduled_start).startOf('day'))) blk.add(dependent.wo_id);
+        });
+        // AND-combined: a WO must carry EVERY selected flag (e.g. Ready + Late =
+        // ready-to-finish AND overdue), not merely one of them.
+        list = list.filter(wo=>{
+            if(psFlagFilter.has('ready')    && !psReadyToFinish(wo)) return false;
+            if(psFlagFilter.has('late')     && !psIsLate(wo))        return false;
+            if(psFlagFilter.has('conflict') && !blk.has(wo.wo_id))   return false;
+            if(psFlagFilter.has('short')    && !psIsShort(wo))       return false;
+            return true;
+        });
+    }
+    const q=(psSearch||'').toLowerCase().trim();
+    if(q) list = list.filter(wo=>{
+        const cfVals = wo._cf ? Object.keys(wo._cf).map(k=>wo._cf[k]) : [];
+        const hay=[wo.wo_num,wo.mo_num,wo.part_num,wo.description,wo.calendar_category,psUserName(wo),wo.priority_name,psCustomer(wo),wo.site_name,wo.resource_name].concat(cfVals).filter(Boolean).join(' ').toLowerCase();
+        return hay.indexOf(q)>=0;
+    });
+    filteredWorkOrders = list;
+}
+
+// ── shell rendering ──────────────────────────────────────────
+function psContainerId(v){ const e=PS_VIEWS.find(x=>x.id===v); return e?e.container:'dashboardView'; }
+function renderTabs(){
+    const el=document.getElementById('viewTabs'); if(!el) return;
+    const n=filteredWorkOrders.length;
+    const _pd=psProcureData();
+    const cnts={dashboard:'', timeline:n, board:n, table:n, calendar:n,
+                materials:filteredWorkOrders.filter(w=>w._av && (w._av._unmet||w._av._contended)).length,
+                procure:(_pd.buy.length+_pd.make.length),
+                load:(psLoadDim==='user'?users.length:(capacitySettings.categories||[]).length)};
+    el.innerHTML=PS_VIEWS.filter(v=>psTabEnabled(v.id)).map(v=>{
+        const c = (v.id==='dashboard'||v.id==='planning'||v.id==='roster') ? '' : '<span class="cnt">'+(cnts[v.id]||0)+'</span>';
+        return '<button class="tab'+(psView===v.id?' active':'')+'" onclick="setView(\''+v.id+'\')">'+
+            '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">'+PS_VIEWICON[v.id]+'</svg>'+v.name+c+'</button>';
+    }).join('');
+}
+function renderFilterbar(){
+    const el=document.getElementById('filterBar'); if(!el) return;
+    let chips='';
+    // Global date-range filter — leftmost so it reads as the primary scope. Its
+    // control lives here (not on the Dashboard) because the range narrows every view.
+    chips+=psDateDropdownHTML()+'<span class="filter-sep"></span>';
+    // Only the open statuses are opt-in chips (click to include). Fulfilled
+    // is not a chip — it's the Work Orders view's "Show fulfilled" option.
+    // Selected = solid status-colour fill (white text + dot); deselected = white.
+    ['10','30'].forEach(id=>{
+        const on=psStatusFilter.has(id);
+        // PS_STATUS entries only hold {name,tone}; the solid colour comes from the
+        // tone accent via psStatusMeta (Entered=slate, Started=blue) — otherwise the
+        // dot had no background and both chips looked empty/white.
+        const col=psStatusMeta(id).color;
+        const st=on ? 'background:'+col+';border-color:'+col+';color:#fff' : '';
+        chips+='<button class="fchip'+(on?' on':'')+'" style="'+st+'" onclick="psToggleStatus(\''+id+'\')">'+
+            '<span class="dot" style="width:7px;height:7px;border-radius:50%;background:'+(on?'#fff':col)+'"></span>'+PS_STATUS[id].name+'</button>';
+    });
+    // Dimension filters — ONE visual cluster (no internal separators, just the
+    // strip's flex gap) in a fixed order: Priority · LG · Location · Category ·
+    // User. These are multi-select dropdowns (not one pill each) so the strip
+    // stays compact. LG/Location only appear when there's more than one to choose
+    // from (a single-LG / single-location install gains nothing from the pill).
+    let dimChips='';
+    if(priorities && priorities.length)
+        dimChips+=psFilterDropdown('pri', priorities.map(pr=>({ id:pr.id, name:pr.name, color:psPriorityColor(pr.name) })));
+    if(sites && sites.length>1)
+        dimChips+=psFilterDropdown('site', sites.map(s=>({ id:s.id, name:s.name, color:'#506872' })));
+    if(resources && resources.length>1)
+        dimChips+=psFilterDropdown('resource', resources.map(r=>({ id:r.id, name:r.name, color:(r.id==='0'?'#8FA1A7':'#506872') })));
+    if(categories && categories.length)
+        dimChips+=psFilterDropdown('cat', categories.slice().sort((a,b)=>String(a.name).localeCompare(String(b.name)))
+            .map(cat=>({ id:cat.id, name:cat.name, color:psInk(cat.color||'#506872') })));
+    if(users && users.length)
+        dimChips+=psFilterDropdown('user', users.map(u=>({ id:u.id, name:u.name, color:psUserColor(u.name) })));
+    if(dimChips) chips+='<span class="filter-sep"></span>'+dimChips;
+    // Custom fields (BOM/MO/WO/Part) live in a dedicated filters drawer rather than
+    // one pill each — a single button opens it, badged with the active-filter count.
+    if(psCfDefs && psCfDefs.length){
+        const cfN=psCfActiveCount();
+        chips+='<span class="filter-sep"></span>'+
+            '<button class="fchip'+(cfN?' on':'')+'" id="cfFilterBtn" onclick="psOpenCfFilters()" title="Filter by BOM, MO, WO and Part custom fields">'+
+              '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 4h18l-7 8v6l-4 2v-8z"/></svg>'+
+              '<span class="cf-btn-label">'+(cfN?('Custom fields ('+cfN+')'):'Custom fields')+'</span></button>';
+    }
+    // Flag filters — narrow to WOs carrying a given status flag from the Flags
+    // column. "Ready" = ready to finish now (committed pick, or all components on
+    // hand). AND-combined: selecting Ready + Late shows only WOs that are BOTH
+    // (unlike the status/category/priority chip groups, which OR within a group).
+    [['ready','Ready','#1B7A46'],['late','Late','#C43046'],['conflict','Conflict','#845EEB'],['short','Short','#B26A14']].forEach(function(f){
+        if(f[0]==='ready') chips+='<span class="filter-sep"></span>';
+        const on=psFlagFilter.has(f[0]);
+        const st=on ? 'background:'+f[2]+';border-color:'+f[2]+';color:#fff' : '';
+        chips+='<button class="fchip'+(on?' on':'')+'" style="'+st+'" onclick="psToggleFlag(\''+f[0]+'\')">'+
+            '<span class="dot" style="width:7px;height:7px;border-radius:50%;background:'+(on?'#fff':f[2])+'"></span>'+f[1]+'</button>';
+    });
+    const hasFilter = psStatusFilter.size||psCatFilter.size||psUserFilter.size||psPriorityFilter.size||psSiteFilter.size||psResourceFilter.size||psCfActiveCount()||psFlagFilter.size||psSearch||(psDateRange&&psDateRange.key!=='all');
+    // Clear is always present so it's discoverable; it dims when nothing
+    // is active but still resets search + chips on click.
+    const clear = '<span class="filter-sep"></span><button class="fchip" onclick="psClearFilters()" style="color:'+(hasFilter?'var(--fb-negative)':'var(--c-tertiary)')+'"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></svg>Clear</button>';
+    // "Show fulfilled" — GLOBAL toggle (every view): reveals Fulfilled WOs + WOs
+    // whose MO is complete. The Timeline still hides finished-MO WOs regardless
+    // (see applyActiveFilters), so this only surfaces open-MO fulfilled WOs there.
+    let right='<button class="fchip'+(psShowFulfilled?' on':'')+'" onclick="psToggleFulfilled()" title="Show fulfilled WOs and completed MOs">'+
+        '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>Show fulfilled</button>';
+    if(psView==='timeline'){
+        right+='<span class="filter-sep"></span><span style="font-size:11px;font-weight:700;color:var(--c-tertiary);text-transform:uppercase;letter-spacing:.05em">Group</span>'+
+            '<div class="grpseg"><button class="'+(psTimelineGroup==='mo'?'active':'')+'" onclick="psSetGroup(\'mo\')">By MO</button>'+
+            '<button class="'+(psTimelineGroup==='site'?'active':'')+'" onclick="psSetGroup(\'site\')">By LG</button>'+
+            '<button class="'+(psTimelineGroup==='resource'?'active':'')+'" onclick="psSetGroup(\'resource\')">By Location</button>'+
+            '<button class="'+(psTimelineGroup==='category'?'active':'')+'" onclick="psSetGroup(\'category\')">By Category</button>'+
+            '<button class="'+(psTimelineGroup==='user'?'active':'')+'" onclick="psSetGroup(\'user\')">By User</button></div>';
+    } else if(psView==='load'){
+        right+='<span class="filter-sep"></span><span style="font-size:11px;font-weight:700;color:var(--c-tertiary);text-transform:uppercase;letter-spacing:.05em">Load by</span>'+
+            '<div class="grpseg"><button class="'+(psLoadDim==='cat'?'active':'')+'" onclick="psSetLoadDim(\'cat\')">Category</button>'+
+            '<button class="'+(psLoadDim==='user'?'active':'')+'" onclick="psSetLoadDim(\'user\')">User</button></div>';
+    } else if(psView==='table'){
+        // Collapsible grouping (mirrors the Timeline's Group control). "None" is the
+        // flat sortable table; the other dimensions add collapsible group headers.
+        right+='<span class="filter-sep"></span><span style="font-size:11px;font-weight:700;color:var(--c-tertiary);text-transform:uppercase;letter-spacing:.05em">Group</span>'+
+            '<div class="grpseg"><button class="'+(psTableGroup==='none'?'active':'')+'" onclick="psSetTableGroup(\'none\')">None</button>'+
+            '<button class="'+(psTableGroup==='mo'?'active':'')+'" onclick="psSetTableGroup(\'mo\')">By MO</button>'+
+            '<button class="'+(psTableGroup==='category'?'active':'')+'" onclick="psSetTableGroup(\'category\')">By Category</button>'+
+            '<button class="'+(psTableGroup==='site'?'active':'')+'" onclick="psSetTableGroup(\'site\')">By LG</button>'+
+            '<button class="'+(psTableGroup==='resource'?'active':'')+'" onclick="psSetTableGroup(\'resource\')">By Location</button>'+
+            '<button class="'+(psTableGroup==='user'?'active':'')+'" onclick="psSetTableGroup(\'user\')">By User</button></div>';
+    }
+    el.innerHTML = chips + clear + '<span class="spring"></span>' + right;
+    psSyncDropdowns();
+}
+function psToggleStatus(id){ if(psStatusFilter.has(id)) psStatusFilter.delete(id); else psStatusFilter.add(id); renderCurrentView(); }
+function psToggleCat(id){ id=String(id); if(psCatFilter.has(id)) psCatFilter.delete(id); else psCatFilter.add(id); renderCurrentView(); }
+function psTogglePriority(id){ id=String(id); if(psPriorityFilter.has(id)) psPriorityFilter.delete(id); else psPriorityFilter.add(id); renderCurrentView(); }
+function psToggleFlag(k){ if(psFlagFilter.has(k)) psFlagFilter.delete(k); else psFlagFilter.add(k); renderCurrentView(); }
+function psClearFilters(){ psStatusFilter.clear(); psCatFilter.clear(); psUserFilter.clear(); psPriorityFilter.clear(); psSiteFilter.clear(); psResourceFilter.clear(); psCfFilter={}; psFlagFilter.clear(); psSearch=''; psOpenDropdown=null; const si=document.getElementById('searchInput'); if(si) si.value='';
+    if(psDateRange){ psDateRange.key='all'; psComputeRange(); try{ FBLib.Settings.setUserKey('dashRangeKey','all'); FBLib.Settings.saveUser(); }catch(_){} }
+    renderCurrentView(); }
+function psSetGroup(g){ psTimelineGroup=g; viewMode=g; try{ FBLib.Settings.setUserKey('timelineGroupBy',g); FBLib.Settings.saveUser(); }catch(_){} renderCurrentView(); }
+function psSetLoadDim(d){ psLoadDim=d; try{ FBLib.Settings.setUserKey('loadDim',d); FBLib.Settings.saveUser(); }catch(_){} renderCurrentView(); }
+function psSetDashLoad(d){ psDashLoadDim=d; renderDashboard(); }
+function psToggleFulfilled(){ psShowFulfilled=!psShowFulfilled; renderCurrentView(); }
+
+// ── Category / User / Priority multi-select filter dropdowns ──
+// These filters are dropdowns (not one pill each) so the strip stays compact
+// when there are many categories/users. Selection lives in psCatFilter /
+// psUserFilter / psPriorityFilter (Sets of string ids) — applyActiveFilters
+// reads them exactly as it did the old chips. Toggling a checkbox does a
+// TARGETED DOM update (item class + button label) and re-renders only the
+// active view/tabs, so the dropdown stays open across multiple picks.
+// psDropSet/psDropBase map a strip dropdown key → its selection Set + label.
+// Keys: cat/user/pri/site/resource. (Custom fields have their own filters drawer.)
+function psDropSet(which){
+    if(which==='cat') return psCatFilter;
+    if(which==='user') return psUserFilter;
+    if(which==='pri') return psPriorityFilter;
+    if(which==='site') return psSiteFilter;
+    if(which==='resource') return psResourceFilter;
+    return new Set();
+}
+function psDropBase(which){
+    if(which==='cat') return 'Category';
+    if(which==='user') return 'User';
+    if(which==='pri') return 'Priority';
+    if(which==='site') return 'LG';
+    if(which==='resource') return 'Location';
+    return 'Field';
+}
+function psFilterDropdown(which, options){
+    const set = psDropSet(which);
+    const base = psDropBase(which);
+    const n = set.size, openNow = psOpenDropdown===which;
+    const items = options.map(o=>{
+        const id=String(o.id), on=set.has(id);
+        return '<label class="fdrop-item'+(on?' sel':'')+'" id="fdropitem-'+which+'-'+id+'">'+
+            '<input type="checkbox"'+(on?' checked':'')+' onchange="psDropToggle(\''+which+'\',\''+id+'\')">'+
+            '<span class="fdrop-dot" style="background:'+o.color+'"></span>'+
+            '<span class="fdrop-name">'+psEsc(o.name)+'</span></label>';
+    }).join('');
+    return '<div class="fdrop">'+
+        '<button type="button" class="fchip fdrop-btn'+(n?' on':'')+(openNow?' open':'')+'" id="fdropbtn-'+which+'" onclick="event.stopPropagation();psToggleDropdown(\''+which+'\')">'+
+          '<span class="fdrop-label">'+psEsc(n? base+' ('+n+')' : base)+'</span>'+
+          '<svg class="fdrop-caret" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 9l6 6 6-6"/></svg>'+
+        '</button>'+
+        '<div class="fdrop-panel" id="fdrop-'+which+'"'+(openNow?' style="display:block"':'')+'>'+
+          '<div class="fdrop-head"><span>'+base+'</span>'+(n?'<a onclick="event.stopPropagation();psClearDrop(\''+which+'\')">Clear</a>':'')+'</div>'+
+          '<div class="fdrop-list">'+(items||'<div class="fdrop-empty">None</div>')+'</div>'+
+        '</div>'+
+      '</div>';
+}
+// ── Custom-Field filters drawer (BOM/MO/WO/Part) ──────────────
+// A right slide-in panel (like the WO detail drawer) that lists every active
+// custom field grouped by object, each with a type-aware control:
+//   list   → multi-select checkbox list (options from customlistitem, else the
+//            distinct values seen in the data)
+//   text   → contains-match text box
+//   date   → from / to date range
+//   number → min / max range
+//   bool   → Any / Yes / No
+// State lives in psCfFilter[key]; the strip's "Custom fields" button badges the
+// active count. Kept out of the filter strip because a database can carry a large
+// number of CFs across four objects.
+function psCfState(key){ if(!psCfFilter[key]) psCfFilter[key]={ values:new Set(), text:'', from:'', to:'', min:'', max:'', bool:'' }; return psCfFilter[key]; }
+// Is a single CF filter active? (kind-aware — mirrors applyActiveFilters).
+function psCfDefActive(d){
+    const st=psCfFilter[d.key]; if(!st) return false;
+    if(d.kind==='list')   return !!(st.values && st.values.size);
+    if(d.kind==='text')   return !!((st.text||'').trim());
+    if(d.kind==='date')   return !!(st.from||st.to);
+    if(d.kind==='number') return (st.min!==''&&st.min!=null)||(st.max!==''&&st.max!=null);
+    if(d.kind==='bool')   return st.bool==='true'||st.bool==='false';
+    return false;
+}
+function psCfActiveCount(){ let n=0; (psCfDefs||[]).forEach(d=>{ if(psCfDefActive(d)) n++; }); return n; }
+function psUpdateCfButton(){ const btn=document.getElementById('cfFilterBtn'); if(!btn) return; const n=psCfActiveCount(); btn.classList.toggle('on', n>0); const lbl=btn.querySelector('.cf-btn-label'); if(lbl) lbl.textContent = n?('Custom fields ('+n+')'):'Custom fields'; }
+function psCfAfterChange(){ applyActiveFilters(); renderTabs(); renderActiveView(); psUpdateCfButton(); psCfUpdateGroupBadges(); }
+function psOpenCfFilters(){ psRenderCfDrawer(); const p=document.getElementById('cfPanel'), s=document.getElementById('cfScrim'); if(p) p.classList.add('on'); if(s) s.classList.add('on'); }
+function psCloseCfFilters(){ const p=document.getElementById('cfPanel'), s=document.getElementById('cfScrim'); if(p) p.classList.remove('on'); if(s) s.classList.remove('on'); }
+function psClearCfFilters(){ psCfFilter={}; psRenderCfDrawer(); applyActiveFilters(); renderTabs(); renderActiveView(); psUpdateCfButton(); }
+function psCfControlHTML(d){
+    const st=psCfState(d.key);
+    let control='';
+    if(d.kind==='list'){
+        const opts=(d.options && d.options.length) ? d.options : (d.values||[]);
+        const search = opts.length>10 ? '<input type="text" class="cf-search" placeholder="Filter options…" oninput="psCfListSearch(\''+d.key+'\',this.value)">' : '';
+        const items = opts.length
+            ? opts.map(v=>'<label class="cf-opt'+(st.values.has(v)?' sel':'')+'" data-val="'+psEsc(v)+'"><input type="checkbox"'+(st.values.has(v)?' checked':'')+' onchange="psCfListToggle(\''+d.key+'\',this)"><span>'+psEsc(v)+'</span></label>').join('')
+            : '<div class="cf-empty">No values in the current work orders.</div>';
+        control = search + '<div class="cf-ms" id="cfopts-'+d.key+'">'+items+'</div>';
+    } else if(d.kind==='text'){
+        control='<input type="text" class="cf-input" value="'+psEsc(st.text||'')+'" placeholder="Contains…" oninput="psCfSetText(\''+d.key+'\',this.value)">';
+    } else if(d.kind==='date'){
+        control='<div class="cf-range"><input type="date" class="cf-input" value="'+psEsc(st.from||'')+'" onchange="psCfSetDate(\''+d.key+'\',\'from\',this.value)"><span class="cf-dash">–</span><input type="date" class="cf-input" value="'+psEsc(st.to||'')+'" onchange="psCfSetDate(\''+d.key+'\',\'to\',this.value)"></div>';
+    } else if(d.kind==='number'){
+        control='<div class="cf-range"><input type="number" class="cf-input" value="'+psEsc(st.min!=null?st.min:'')+'" placeholder="Min" onchange="psCfSetNum(\''+d.key+'\',\'min\',this.value)"><span class="cf-dash">–</span><input type="number" class="cf-input" value="'+psEsc(st.max!=null?st.max:'')+'" placeholder="Max" onchange="psCfSetNum(\''+d.key+'\',\'max\',this.value)"></div>';
+    } else {
+        control='<select class="cf-input" onchange="psCfSetBool(\''+d.key+'\',this.value)">'+
+            [['','Any'],['true','Yes'],['false','No']].map(o=>'<option value="'+o[0]+'"'+(String(st.bool||'')===o[0]?' selected':'')+'>'+o[1]+'</option>').join('')+'</select>';
+    }
+    return '<div class="cf-row"><div class="cf-rowhead"><span class="cf-name">'+psEsc(d.name)+'</span><span class="cf-type">'+psEsc(d.kind)+'</span></div>'+control+'</div>';
+}
+function psRenderCfDrawer(){
+    const panel=document.getElementById('cfPanel'); if(!panel) return;
+    const n=psCfActiveCount();
+    const head='<div class="detail-head"><div class="top"><div class="detail-head-main">'+
+        '<h2>Custom Field Filters</h2>'+
+        '<div class="sub">Filter by BOM, MO, WO and Part custom fields</div>'+
+      '</div><div class="detail-actions">'+
+        '<button class="close-x" onclick="psCloseCfFilters()"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></svg></button>'+
+        (n?'<button class="ps-btn sm" onclick="psClearCfFilters()" title="Clear all custom-field filters">Clear ('+n+')</button>':'')+
+      '</div></div></div>';
+    let bodyHtml;
+    if(!psCfDefs || !psCfDefs.length){
+        bodyHtml='<div class="ps-empty" style="padding:44px 20px">No custom fields found for BOM, MO, WO or Part.</div>';
+    } else {
+        const LBL={bom:'BOM',mo:'MO',wo:'WO',part:'Part'};
+        const byObj={}; psCfDefs.forEach(d=>{ (byObj[d.obj]=byObj[d.obj]||[]).push(d); });
+        // Group order follows the user's saved (drag-reordered) sequence; render
+        // only objects that actually have fields.
+        const order=psCfEffectiveOrder().filter(o=>byObj[o] && byObj[o].length);
+        const hint=order.length>1 ? '<div class="cf-drawer-hint"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 8h16M4 16h16"/></svg>Drag a section header to reorder — your order is saved for next time.</div>' : '';
+        bodyHtml=hint+order.map(obj=>{
+            const defs=byObj[obj];
+            const col=!!psCfGroupCollapsed[obj];
+            const ga=defs.filter(psCfDefActive).length;
+            const badge=ga ? '<span class="cf-group-count on">'+ga+' active</span>' : '<span class="cf-group-count">'+defs.length+'</span>';
+            return '<div class="cf-group'+(col?' collapsed':'')+'" data-obj="'+obj+'">'+
+                '<div class="cf-group-head" draggable="true" onclick="psCfToggleGroup(\''+obj+'\')">'+
+                  '<span class="cf-drag" title="Drag to reorder">'+PS_CF_GRIP_SVG+'</span>'+
+                  '<span class="cf-group-chev"><svg fill="none" stroke="currentColor" stroke-width="2.4" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 9l6 6 6-6"/></svg></span>'+
+                  '<span class="cf-group-name">'+psEsc(LBL[obj]||obj)+'</span>'+
+                  badge+
+                '</div>'+
+                '<div class="cf-group-body"'+(col?' style="display:none"':'')+'>'+defs.map(psCfControlHTML).join('')+'</div>'+
+              '</div>';
+        }).join('');
+        if(!bodyHtml) bodyHtml='<div class="ps-empty" style="padding:44px 20px">No custom fields.</div>';
+    }
+    panel.innerHTML=head+'<div class="detail-body">'+bodyHtml+'</div>';
+    psWireCfDnd();
+}
+function psCfListToggle(key, el){ const st=psCfState(key); const item=el&&el.closest?el.closest('.cf-opt'):null; if(!item) return; const v=item.getAttribute('data-val')||''; if(st.values.has(v)) st.values.delete(v); else st.values.add(v); item.classList.toggle('sel', st.values.has(v)); psCfAfterChange(); }
+function psCfListSearch(key, q){ q=(q||'').toLowerCase(); const box=document.getElementById('cfopts-'+key); if(!box) return; box.querySelectorAll('.cf-opt').forEach(el=>{ const v=(el.getAttribute('data-val')||'').toLowerCase(); el.style.display=(!q||v.indexOf(q)>=0)?'':'none'; }); }
+function psCfSetText(key, v){ psCfState(key).text=v; psCfAfterChange(); }
+function psCfSetDate(key, which, v){ const st=psCfState(key); if(which==='from') st.from=v; else st.to=v; psCfAfterChange(); }
+function psCfSetNum(key, which, v){ const st=psCfState(key); if(which==='min') st.min=v; else st.max=v; psCfAfterChange(); }
+function psCfSetBool(key, v){ psCfState(key).bool=v; psCfAfterChange(); }
+// Canonical CF object keys + drag-handle glyph for the drawer's group cards.
+const PS_CF_OBJ_KEYS = ['bom','mo','wo','part'];
+const PS_CF_GRIP_SVG = '<svg fill="currentColor" viewBox="0 0 24 24"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>';
+// Effective object-group order: the user's saved order (valid keys only), with any
+// not-yet-ordered object appended so a newly-discovered object still appears.
+function psCfEffectiveOrder(){
+    const saved=Array.isArray(psCfGroupOrder)?psCfGroupOrder.filter(o=>PS_CF_OBJ_KEYS.indexOf(o)>=0):[];
+    const seen=new Set(saved);
+    return saved.concat(PS_CF_OBJ_KEYS.filter(o=>!seen.has(o)));
+}
+// Collapse / expand one object group (session-only) — targeted DOM toggle so it
+// doesn't disturb an in-progress input or re-wire the drag handlers.
+function psCfToggleGroup(obj){
+    psCfGroupCollapsed[obj]=!psCfGroupCollapsed[obj];
+    const card=document.querySelector('#cfPanel .cf-group[data-obj="'+obj+'"]'); if(!card) return;
+    const col=psCfGroupCollapsed[obj];
+    const body=card.querySelector('.cf-group-body'); if(body) body.style.display=col?'none':'';
+    card.classList.toggle('collapsed', col);
+}
+// Refresh the per-group active-filter badges without rebuilding the drawer
+// (so text/number inputs keep focus while typing).
+function psCfUpdateGroupBadges(){
+    const panel=document.getElementById('cfPanel'); if(!panel) return;
+    const byObj={}; (psCfDefs||[]).forEach(d=>{ (byObj[d.obj]=byObj[d.obj]||[]).push(d); });
+    panel.querySelectorAll('.cf-group').forEach(card=>{
+        const obj=card.getAttribute('data-obj'), defs=byObj[obj]||[];
+        const ga=defs.filter(psCfDefActive).length, badge=card.querySelector('.cf-group-count');
+        if(badge){ badge.textContent = ga?(ga+' active'):String(defs.length); badge.classList.toggle('on', ga>0); }
+    });
+}
+// Drag-and-drop reordering of the object groups. The group header is the drag
+// handle; dropping onto another group inserts before/after it (by pointer half),
+// then the new order is persisted per user so it survives across sessions.
+function psWireCfDnd(){
+    const panel=document.getElementById('cfPanel'); if(!panel) return;
+    panel.querySelectorAll('.cf-group').forEach(card=>{
+        const obj=card.getAttribute('data-obj');
+        const head=card.querySelector('.cf-group-head');
+        if(head){
+            head.addEventListener('dragstart', e=>{ psCfDragObj=obj; card.classList.add('dragging'); try{ e.dataTransfer.effectAllowed='move'; e.dataTransfer.setData('text/plain', obj); }catch(_){} });
+            head.addEventListener('dragend', ()=>{ psCfDragObj=null; panel.querySelectorAll('.cf-group').forEach(c=>c.classList.remove('dragging','dragover')); });
+        }
+        card.addEventListener('dragover', e=>{ if(!psCfDragObj||psCfDragObj===obj) return; e.preventDefault(); try{ e.dataTransfer.dropEffect='move'; }catch(_){} card.classList.add('dragover'); });
+        card.addEventListener('dragleave', ()=>{ card.classList.remove('dragover'); });
+        card.addEventListener('drop', e=>{ card.classList.remove('dragover'); if(!psCfDragObj||psCfDragObj===obj) return; e.preventDefault(); psCfDropReorder(psCfDragObj, obj, e, card); });
+    });
+}
+function psCfDropReorder(dragObj, targetObj, e, card){
+    const order=psCfEffectiveOrder().filter(o=>o!==dragObj);
+    const rect=card.getBoundingClientRect();
+    const after=(e.clientY-rect.top)>rect.height/2;
+    let idx=order.indexOf(targetObj);
+    if(idx<0) idx=order.length; else if(after) idx+=1;
+    order.splice(idx, 0, dragObj);
+    psCfGroupOrder=order;
+    try{ FBLib.Settings.setUserKey('cfGroupOrder', psCfGroupOrder); FBLib.Settings.saveUser(); }catch(_){}
+    psRenderCfDrawer();
+}
+// ESC closes the Custom-Field filters drawer when it's open.
+document.addEventListener('keydown', e=>{ if(e.key==='Escape'){ const p=document.getElementById('cfPanel'); if(p && p.classList.contains('on')) psCloseCfFilters(); } });
+function psToggleDropdown(which){ psOpenDropdown = (psOpenDropdown===which)?null:which; psSyncDropdowns(); }
+function psSyncDropdowns(){
+    const keys = ['cat','user','pri','site','resource','date'];
+    keys.forEach(function(w){
+        const panel=document.getElementById('fdrop-'+w), btn=document.getElementById('fdropbtn-'+w);
+        if(panel) panel.style.display = (psOpenDropdown===w) ? 'block' : 'none';
+        if(btn) btn.classList.toggle('open', psOpenDropdown===w);
+    });
+}
+function psDropToggle(which, id){
+    const set = psDropSet(which);
+    id=String(id);
+    if(set.has(id)) set.delete(id); else set.add(id);
+    const item=document.getElementById('fdropitem-'+which+'-'+id);
+    if(item) item.classList.toggle('sel', set.has(id));
+    psUpdateDropButton(which);
+    // Re-filter + repaint the active view/tabs WITHOUT rebuilding the filter
+    // strip, so the dropdown stays open (and scrolled) for the next pick.
+    applyActiveFilters(); renderTabs(); renderActiveView();
+}
+function psUpdateDropButton(which){
+    const set = psDropSet(which);
+    const base = psDropBase(which);
+    const btn=document.getElementById('fdropbtn-'+which);
+    if(!btn) return;
+    const n=set.size, lbl=btn.querySelector('.fdrop-label');
+    if(lbl) lbl.textContent = n? base+' ('+n+')' : base;
+    btn.classList.toggle('on', n>0);
+    // Add/remove the panel's Clear link to match the selection count.
+    const head=document.querySelector('#fdrop-'+which+' .fdrop-head');
+    if(head){
+        let a=head.querySelector('a');
+        if(n && !a){ a=document.createElement('a'); a.textContent='Clear'; a.setAttribute('onclick',"event.stopPropagation();psClearDrop('"+which+"')"); head.appendChild(a); }
+        else if(!n && a){ a.remove(); }
+    }
+}
+function psClearDrop(which){
+    const set = psDropSet(which);
+    set.clear();
+    document.querySelectorAll('#fdrop-'+which+' .fdrop-item').forEach(function(it){
+        it.classList.remove('sel');
+        const cb=it.querySelector('input'); if(cb) cb.checked=false;
+    });
+    psUpdateDropButton(which);
+    applyActiveFilters(); renderTabs(); renderActiveView();
+}
+
+// Dashboard: collapse/expand a panel by clicking its header bar, so the
+// panels above/below get more room. State is per-session (psDashCollapsed).
+function psToggleDashPanel(key){ psDashCollapsed[key]=!psDashCollapsed[key]; renderDashboard(); }
+
+function setView(v){
+    if(!psTabEnabled(v)) v = 'dashboard';   // premium/admin tab disabled or non-admin → fall back
+    psView = v;
+    psKeepScroll = null;   // drop any stale drag-scroll so a manual switch centres normally
+    if(v==='timeline') viewMode = psTimelineGroup;
+    // rail active state
+    const home=document.getElementById('railHome'), mfg=document.getElementById('railMfg');
+    if(home) home.classList.toggle('active', v==='dashboard');
+    if(mfg)  mfg.classList.toggle('active', v!=='dashboard');
+    // Full-bleed layout. FLUSH views drop the content padding so the table runs
+    // to the screen edges; FILL views additionally make the view host a
+    // flex-filled column so its single scroll region reaches the viewport bottom
+    // (its horizontal/vertical scrollbars pin there) instead of a fixed
+    // max-height box whose scrollbar fell below the fold. Timeline / Work Orders
+    // / Materials are single-table fills. Procurement stacks multiple vendor
+    // cards/tables, so it keeps the normal padded content flow (its tab bar,
+    // vendor names and Create-PO buttons stay inset, not jammed to the edge).
+    const FLUSH = { timeline:1, table:1, materials:1, planning:1 };
+    const FILL  = { timeline:1, table:1, materials:1, planning:1 };
+    const flush = !!FLUSH[v], fill = !!FILL[v];
+    const vcEl = document.getElementById('viewContent');
+    if(vcEl){
+        vcEl.style.padding = flush ? '0' : '20px 22px';
+        vcEl.style.display = fill ? 'flex' : '';
+        vcEl.style.flexDirection = fill ? 'column' : '';
+        vcEl.style.minHeight = fill ? '0' : '';
+    }
+    // show only the active container; a FILL view's host becomes a flex-fill column
+    PS_VIEWS.forEach(x=>{
+        const el=document.getElementById(x.container); if(!el) return;
+        if(x.id===v){
+            el.style.display = fill ? 'flex' : '';
+            el.style.flexDirection = fill ? 'column' : '';
+            el.style.flex = fill ? '1' : '';
+            el.style.minHeight = fill ? '0' : '';
+        } else {
+            el.style.display='none'; el.style.flex=''; el.style.minHeight=''; el.style.flexDirection='';
+        }
+    });
+    // the User Load heatmap is a load-only sibling of capacityContainer
+    const ulEl=document.getElementById('userLoadView'); if(ulEl && v!=='load') ulEl.style.display='none';
+    // flush padding for the timeline/load cards (they carry their own padding)
+    try{ FBLib.Settings.setUserKey('activeView', v); FBLib.Settings.saveUser(); }catch(_){}
+    applyActiveFilters();
+    renderTabs();
+    renderFilterbar();
+    renderActiveView();
+    const vc=document.getElementById('viewContent'); if(vc) vc.scrollTop=0;
+}
+
+// Render just the active view's body (assumes visibility already set).
+function renderActiveView(){
+    if(psView==='dashboard') renderDashboard();
+    else if(psView==='timeline') renderGanttChart();
+    else if(psView==='board') renderBoard();
+    else if(psView==='table') renderTable();
+    else if(psView==='calendar') renderCalendarView();
+    else if(psView==='materials') renderMaterials();
+    else if(psView==='procure') renderProcure();
+    else if(psView==='planning') renderPlanning();
+    else if(psView==='roster') renderRoster();
+    else if(psView==='load'){
+        // v1.2: the Load page is the vA-style heatmap for BOTH dimensions.
+        // The legacy interactive capacity table is retired from the UI;
+        // its per-category limits are still edited via the Capacity
+        // Settings modal and still drive the Category heatmap colours.
+        const capEl=document.getElementById('capacityContainer');
+        const ulEl=document.getElementById('userLoadView');
+        if(capEl) capEl.style.display='none';
+        if(ulEl) ulEl.style.display='';
+        if(!currentCapacityWeek) currentCapacityWeek=moment().startOf('isoWeek');
+        renderLoad();
+    }
+}
+
+// Legacy entry point — many callers (drags, settings, load) call this.
+// Re-renders the filter strip too so chip selection state + the
+// Group/Load-by segmented controls always reflect the current option.
+function renderCurrentView(){
+    applyActiveFilters();
+    renderTabs();
+    renderFilterbar();
+    renderActiveView();
+}
+
+// Back-compat shim for any residual switchView() callers.
+function switchView(mode){
+    if(mode==='mo'||mode==='category'||mode==='user'){ psTimelineGroup=mode; setView('timeline'); }
+    else if(mode==='capacity') setView('load');
+    else setView(mode);
+}
+
+// ============================================
+// v1.2 NEW VIEWS — Dashboard, Board, Table, Calendar, Detail drawer
+// ============================================
+function psEmptyState(msg){
+    return '<div class="ps-empty"><svg width="48" height="48" fill="none" stroke="var(--c-tertiary)" stroke-width="1.5" viewBox="0 0 24 24" style="margin-bottom:12px"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg><div>'+(msg||'No work orders match the current filters.')+'</div><button class="ps-btn" style="margin:14px auto 0" onclick="psClearFilters()">Reset filters</button></div>';
+}
+
+// ── Global date-range filter ─────────────────────────────────
+// The control lives in the shared filter strip (renderFilterbar) so it's
+// reachable + clearable from every view; the range is applied in
+// applyActiveFilters, narrowing all views. First-run default is 'all' (no
+// restriction) and the choice is remembered per user via FBLib.Settings.
+const PS_RANGES = [
+    { key:'all',       label:'All dates' },
+    { key:'today',     label:'Today' },
+    { key:'tomorrow',  label:'Tomorrow' },
+    { key:'week',      label:'This week' },
+    { key:'nextweek',  label:'Next week' },
+    { key:'month',     label:'This month' },
+    { key:'nextmonth', label:'Next month' },
+    { key:'custom',    label:'Custom range' }
+];
+// Compute the concrete [start,end] moment window for the active range key.
+function psComputeRange(){
+    const r = psDateRange; r.start = null; r.end = null;
+    const t = moment().startOf('day');
+    switch(r.key){
+        case 'today':     r.start=t.clone(); r.end=t.clone().endOf('day'); break;
+        case 'tomorrow':  r.start=t.clone().add(1,'day'); r.end=r.start.clone().endOf('day'); break;
+        case 'week':      r.start=t.clone().startOf('isoWeek'); r.end=r.start.clone().endOf('isoWeek'); break;
+        case 'nextweek':  r.start=t.clone().add(1,'week').startOf('isoWeek'); r.end=r.start.clone().endOf('isoWeek'); break;
+        case 'month':     r.start=t.clone().startOf('month'); r.end=r.start.clone().endOf('month'); break;
+        case 'nextmonth': r.start=t.clone().add(1,'month').startOf('month'); r.end=r.start.clone().endOf('month'); break;
+        case 'custom': {
+            const s=r.customStart?moment(r.customStart,'YYYY-MM-DD'):null;
+            const e=r.customEnd?moment(r.customEnd,'YYYY-MM-DD'):null;
+            r.start = (s&&s.isValid())?s.startOf('day'):null;
+            r.end   = (e&&e.isValid())?e.endOf('day'):(r.start?r.start.clone().endOf('day'):null);
+            break;
+        }
+        default: break;   // 'all' → no window
+    }
+    return r;
+}
+// Is a WO within the active range window? An open (unfinished) WO stays "live"
+// through today, so an overdue past WO still shows in today/future ranges.
+function psInDateRange(wo){
+    const r = psDateRange;
+    if(!r || r.key==='all' || !r.start || !r.end) return true;
+    let ws = moment(wo.date_scheduled_start).startOf('day');
+    let we = moment(wo.date_scheduled).endOf('day');
+    if(!ws.isValid()) ws = we.isValid() ? we.clone().startOf('day') : moment(0);
+    if(!we.isValid()) we = ws.clone().endOf('day');
+    if(wo.wo_status!==40){ const today=moment().endOf('day'); if(we.isBefore(today)) we=today; }
+    return ws.isSameOrBefore(r.end) && we.isSameOrAfter(r.start);
+}
+// Short human label for the active range (dropdown button + custom shows dates).
+function psRangeLabel(){
+    const r=psDateRange; if(!r || r.key==='all') return 'All dates';
+    if(r.key==='custom'){ psComputeRange(); return (r.start?r.start.format('MMM D'):'?')+' – '+(r.end?r.end.format('MMM D'):'?'); }
+    const e=PS_RANGES.find(x=>x.key===r.key); return e?e.label:'Range';
+}
+// Set the range key (persist + global re-render). Custom keeps/derives dates and
+// leaves the dropdown open so both date inputs can be entered.
+function psSetDateRange(key){
+    psDateRange.key = key;
+    if(key==='custom'){
+        const t=moment().startOf('day');
+        if(!psDateRange.customStart) psDateRange.customStart=t.format('YYYY-MM-DD');
+        if(!psDateRange.customEnd)   psDateRange.customEnd=t.clone().add(7,'days').format('YYYY-MM-DD');
+    }
+    psComputeRange();
+    psOpenDropdown = (key==='custom') ? 'date' : null;
+    try{ FBLib.Settings.setUserKey('dashRangeKey',psDateRange.key);
+         FBLib.Settings.setUserKey('dashRangeStart',psDateRange.customStart||'');
+         FBLib.Settings.setUserKey('dashRangeEnd',psDateRange.customEnd||'');
+         FBLib.Settings.saveUser(); }catch(_){}
+    renderCurrentView();
+}
+function psSetCustomRange(which,val){
+    if(which==='start') psDateRange.customStart=val; else psDateRange.customEnd=val;
+    psDateRange.key='custom'; psComputeRange(); psOpenDropdown='date';
+    try{ FBLib.Settings.setUserKey('dashRangeKey','custom');
+         FBLib.Settings.setUserKey('dashRangeStart',psDateRange.customStart||'');
+         FBLib.Settings.setUserKey('dashRangeEnd',psDateRange.customEnd||'');
+         FBLib.Settings.saveUser(); }catch(_){}
+    renderCurrentView();
+}
+// The filter-strip "Date range" dropdown (single-select presets + custom inputs),
+// built in the same .fdrop chrome as the Category/User/Priority dropdowns.
+function psDateDropdownHTML(){
+    const openNow = psOpenDropdown==='date';
+    const active  = psDateRange.key!=='all';
+    const label   = active ? psRangeLabel() : 'Date range';
+    const opts = PS_RANGES.map(function(x){
+        const on = psDateRange.key===x.key;
+        return '<label class="fdrop-item'+(on?' sel':'')+'" onclick="event.stopPropagation();psSetDateRange(\''+x.key+'\')">'+
+            '<span class="fdrop-dot hollow"></span>'+
+            '<span class="fdrop-name">'+x.label+'</span></label>';
+    }).join('');
+    // Custom-range inputs use fb-styles' .fdrop-daterange class (§26).
+    const custom = (psDateRange.key==='custom')
+        ? '<div class="fdrop-daterange">'+
+            '<input type="date" value="'+psEsc(psDateRange.customStart||'')+'" onclick="event.stopPropagation()" onchange="psSetCustomRange(\'start\',this.value)">'+
+            '<span class="arrow">–</span>'+
+            '<input type="date" value="'+psEsc(psDateRange.customEnd||'')+'" onclick="event.stopPropagation()" onchange="psSetCustomRange(\'end\',this.value)">'+
+          '</div>'
+        : '';
+    return '<div class="fdrop">'+
+        '<button type="button" class="fchip fdrop-btn'+(active?' on':'')+(openNow?' open':'')+'" id="fdropbtn-date" onclick="event.stopPropagation();psToggleDropdown(\'date\')">'+
+          '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>'+
+          '<span class="fdrop-label">'+psEsc(label)+'</span>'+
+          '<svg class="fdrop-caret" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 9l6 6 6-6"/></svg>'+
+        '</button>'+
+        '<div class="fdrop-panel" id="fdrop-date"'+(openNow?' style="display:block"':'')+'>'+
+          '<div class="fdrop-head"><span>Date range</span>'+(active?'<a onclick="event.stopPropagation();psSetDateRange(\'all\')">Clear</a>':'')+'</div>'+
+          '<div class="fdrop-list">'+opts+'</div>'+custom+
+        '</div>'+
+      '</div>';
+}
+
+function renderDashboard(){
+    const host=document.getElementById('dashboardView'); if(!host) return;
+    const list=filteredWorkOrders;
+    const blocked=psBlockedSet();
+    const overdue=list.filter(psIsLate);
+    const blockedList=list.filter(w=>blocked.has(w.wo_id));
+    const shortList=list.filter(psIsShort);
+    const openWOs=list.filter(w=>w.wo_status!==40);
+
+    // Range window for the Starting/Finishing panels + Load peak. When a global
+    // date range is active it IS the window; with 'All dates' fall back to a soft
+    // "next 14 days" look-ahead so those panels stay useful.
+    const r = psDateRange;
+    const hasRange = !!(r && r.key!=='all' && r.start && r.end);
+    const winStart = hasRange ? r.start.clone() : moment().startOf('day');
+    const winEnd   = hasRange ? r.end.clone()   : moment().startOf('day').add(14,'days').endOf('day');
+    const winLbl   = hasRange ? psRangeLabel() : 'next 14 days';
+    const inWin = d => { const m=moment(d); return m.isValid() && m.isSameOrAfter(winStart) && m.isSameOrBefore(winEnd); };
+    const starting  = list.filter(w=> w.wo_status!==40 && inWin(w.date_scheduled_start));
+    const finishing = list.filter(w=> w.wo_status!==40 && inWin(w.date_scheduled));
+
+    // Load — peak utilisation across the window (capped at 62 days), by Category
+    // or User (toggle in the panel head via psDashLoadDim).
+    const utilColor=p=> p>100?'var(--fb-negative)': p>85?'var(--fb-warning)':'var(--acc-teal)';
+    const userCapDash = Number(FBLib.Settings.resolve('userCapacityHours')) || 8;
+    const loadDays=[]; { let d=winStart.clone(); const cap=winStart.clone().add(62,'days'); const end=moment.min(winEnd,cap); while(d.isSameOrBefore(end)){ loadDays.push(d.clone()); d.add(1,'day'); } if(!loadDays.length) loadDays.push(moment().startOf('day')); }
+    const loadRows = (psDashLoadDim==='user'
+        ? users.map(u=>{
+            let peak=0;
+            loadDays.forEach(d=>{ const cap=(d.day()===0||d.day()===6)?0:userCapDash; if(cap>0){ const {usage}=getUsageForUserAndDay(u.id,d); peak=Math.max(peak, Math.round(usage/cap*100)); } });
+            return {name:u.name, peak};
+          })
+        : (capacitySettings.categories||[]).map(cat=>{
+            let peak=0;
+            loadDays.forEach(d=>{ const cap=cat.limits[d.isoWeekday()-1]; if(cap>0){ const {usage}=getUsageForCategoryAndDay(cat.id,d); peak=Math.max(peak, Math.round(usage/cap*100)); } });
+            return {name:cat.name, peak};
+          })
+    ).sort((a,b)=>b.peak-a.peak);
+    const bottleneck=loadRows.filter(u=>u.peak>100).length;
+
+    // Icon-chip KPI tiles (fb-styles §28): the chip carries the tone, the
+    // value stays neutral dark; sub trails the value ("16 past due").
+    const kpis=[
+        {lbl:'Open Work Orders', val:openWOs.length, sub:'of '+list.length+' in view', tone:'tone-blue',
+         icon:'<path d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2"/>'},
+        {lbl:'Starting', val:starting.length, sub:winLbl, tone:'tone-success',
+         icon:'<circle cx="12" cy="12" r="10"/><path d="M10 8l6 4-6 4V8z"/>'},
+        {lbl:'Finishing', val:finishing.length, sub:winLbl, tone:'tone-neutral',
+         icon:'<path d="M3 21v-4m0 0V5a2 2 0 012-2h6.5l1 1H21l-3 6 3 6h-8.5l-1-1H5a2 2 0 00-2 2z"/>'},
+        {lbl:'Overdue / Late', val:overdue.length, sub:'past due', tone:'tone-negative',
+         icon:'<circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3" stroke-linecap="round"/>'},
+        {lbl:'Scheduling Conflicts', val:blockedList.length, sub:'upstream late', tone:'tone-purple',
+         icon:'<path d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"/>'},
+        {lbl:'Material Shortages', val:shortList.length, sub:'raw goods short', tone:'tone-yellow',
+         icon:'<path d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/>'}
+    ];
+    const khtml=kpis.map(k=>'<div class="kpi-tile">'+
+        '<div class="kpi-chip '+k.tone+'"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">'+k.icon+'</svg></div>'+
+        '<div class="kpi-text"><div class="kpi-lbl">'+k.lbl+'</div>'+
+        '<div class="kpi-val">'+k.val+' <span class="kpi-sub">'+k.sub+'</span></div></div>'+
+        '</div>').join('');
+
+    const issueRows=(arr,meta)=> !arr.length
+        ? '<div class="ps-empty" style="padding:28px">Nothing here — all clear.</div>'
+        : '<div class="panel-scroll">'+arr.map(w=>'<div class="issue" onclick="openDetail('+w.wo_id+')">'+
+            '<span class="wo">'+psEsc(w.wo_num)+'</span>'+
+            '<div class="desc"><div class="t">'+psEsc(w.description||w.part_num||'')+'</div>'+
+            '<div class="m">MO '+psEsc(w.mo_num)+' · '+psEsc(psCustomer(w)||'—')+' · '+meta(w)+'</div></div>'+
+            psPillHTML(w.wo_status)+'</div>').join('')+'</div>';
+
+    // Load-panel head controls (Category/User toggle + bottleneck count). The
+    // grpseg buttons stopPropagation so toggling the dimension doesn't also
+    // collapse the panel.
+    const loadRight =
+        '<div style="display:flex;align-items:center;gap:8px">'+
+          '<div class="grpseg"><button class="'+(psDashLoadDim==='cat'?'active':'')+'" onclick="event.stopPropagation();psSetDashLoad(\'cat\')">Category</button>'+
+          '<button class="'+(psDashLoadDim==='user'?'active':'')+'" onclick="event.stopPropagation();psSetDashLoad(\'user\')">User</button></div>'+
+          '<span class="count '+(bottleneck?'warn':'info')+'">'+(bottleneck||'OK')+'</span>'+
+        '</div>';
+    const loadBody = loadRows.length
+        ? '<div class="panel-scroll">'+loadRows.map(u=>'<div class="util-row"><span class="name">'+psEsc(u.name)+'</span>'+
+            '<div class="util-bar"><div class="util-fill" style="width:'+Math.min(u.peak,100)+'%;background:'+utilColor(u.peak)+'"></div></div>'+
+            '<span class="pct" style="color:'+utilColor(u.peak)+'">'+u.peak+'%</span></div>').join('')+'</div>'
+        : '<div class="ps-empty" style="padding:28px">No '+(psDashLoadDim==='user'?'users':'capacity limits')+' to show.</div>';
+
+    // Flat grid — panels flow into up to 3 columns (auto-fit). The two
+    // range-driven panels (Starting / Finishing) lead.
+    host.innerHTML =
+      '<div class="kpis">'+khtml+'</div>'+
+      '<div class="dash-grid">'+
+        dashPanel('starting','Starting — '+winLbl,'<span class="count info">'+starting.length+'</span>', issueRows(starting, w=>'starts '+psFmtDate(w.date_scheduled_start)))+
+        dashPanel('finishing','Finishing — '+winLbl,'<span class="count info">'+finishing.length+'</span>', issueRows(finishing, w=>'finishes '+psFmtDate(w.date_scheduled)))+
+        dashPanel('overdue','Overdue &amp; Late','<span class="count">'+overdue.length+'</span>', issueRows(overdue, w=>'due '+psFmtDate(psDue(w))))+
+        dashPanel('conflicts','Scheduling Conflicts','<span class="count" style="background:var(--acc-magenta)">'+blockedList.length+'</span>', issueRows(blockedList, ()=> 'upstream finishes late'))+
+        dashPanel('load',(psDashLoadDim==='user'?'User':'Category')+' Load — '+winLbl+' peak', loadRight, loadBody)+
+        dashPanel('shortages','Material Shortages','<span class="count warn">'+shortList.length+'</span>', issueRows(shortList, ()=> 'raw goods short'))+
+      '</div>';
+}
+
+// Build one collapsible dashboard panel. Clicking the head bar folds/unfolds
+// the body (state in psDashCollapsed[key]); the chevron reflects the state.
+function dashPanel(key, title, rightHTML, bodyHTML){
+    const collapsed = !!psDashCollapsed[key];
+    const chev = collapsed
+        ? '<svg fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 6l6 6-6 6"/></svg>'
+        : '<svg fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 9l6 6 6-6"/></svg>';
+    return '<div class="panel">'+
+      '<div class="panel-head" onclick="psToggleDashPanel(\''+key+'\')">'+
+        '<h3><span class="panel-chev">'+chev+'</span>'+title+'</h3>'+
+        (rightHTML||'')+
+      '</div>'+
+      '<div class="panel-body"'+(collapsed?' style="display:none"':'')+'>'+bodyHTML+'</div>'+
+    '</div>';
+}
+
+function renderBoard(){
+    const host=document.getElementById('boardView'); if(!host) return;
+    const list=filteredWorkOrders;
+    if(!list.length){ host.innerHTML=psEmptyState(); return; }
+    const blocked=psBlockedSet();
+    const card=(w, pickAlways)=>{
+        const c=psCatColor(w);
+        const flags=psFlagsHTML(w,blocked)+psPickPill(w, !!pickAlways)+psDemandHTML(w);
+        // Product description leads (fallback to part #); part # shown as the mono sub.
+        return '<div class="card" style="border-left-color:'+c+'" onclick="openDetail('+w.wo_id+')">'+
+            '<div class="row1"><span class="wo">'+psEsc(w.wo_num)+'</span>'+psPriHTML(w)+'</div>'+
+            '<div class="part">'+psEsc(w.description||w.part_num||'—')+'</div>'+
+            '<div class="partd">'+psEsc(w.part_num||'')+(w.resource_name?' · '+psEsc(w.resource_name):'')+'</div>'+
+            '<div class="meta"><span style="display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap">'+psTagHTML(w)+'</span><span>Due '+psFmtDate(psDue(w))+'</span></div>'+
+            (flags?'<div class="flags">'+flags+'</div>':'')+
+        '</div>';
+    };
+    // Kanban lanes follow the WO lifecycle left→right:
+    //   • Entered       — WO status 10, no pick or a pick still pending (status 10)
+    //   • In Picking    — pick actively underway (status 20 Started / 30 Committed)
+    //                     on a WO that isn't fulfilled. NOT limited to WO status 10:
+    //                     a WO that's already Started but whose pick is still in
+    //                     progress appears here AND in Started (both the pick crew
+    //                     and production are working it).
+    //   • Pick Finished — pick fully picked (status 40 Finished) on a WO not yet
+    //                     started (status 10) — picked & staged, ready to build.
+    //                     Once the WO starts, a finished pick is done, so it shows
+    //                     in Started only.
+    //   • Started       — WO status 30.
+    //   • Fulfilled     — WO status 40 (only populated when "Show fulfilled" is on,
+    //                     but its lane is always shown so the lifecycle reads across).
+    // Lanes are NOT mutually exclusive: an in-progress pick on a started WO shows
+    // in both In Picking and Started (so a board card total can exceed the WO count).
+    const COLS=[
+        { title:'Entered',       accent:PS_TONE_ACCENT.neutral, pick:false, match:w=>w.wo_status===10 && !(w._pickStatus>=20) },
+        { title:'In Picking',    accent:'var(--acc-teal)',      pick:true,  match:w=>w.wo_status!==40 && w._pickStatus>=20 && w._pickStatus<40 },
+        { title:'Pick Finished', accent:'var(--acc-teal-con)',  pick:true,  match:w=>w.wo_status===10 && w._pickStatus>=40 },
+        { title:'Started',       accent:PS_TONE_ACCENT.active,  pick:false, match:w=>w.wo_status===30 },
+        { title:'Fulfilled',     accent:PS_TONE_ACCENT.success, pick:false, match:w=>w.wo_status===40 },
+    ];
+    host.innerHTML='<div class="board">'+COLS.map(col=>{
+        const items=list.filter(col.match);
+        const cards= items.length ? items.map(w=>card(w,col.pick)).join('')
+            : '<div class="ps-empty" style="padding:20px;font-size:12px">No work orders</div>';
+        return '<div class="board-col"><div class="col-head"><span class="accent" style="background:'+col.accent+'"></span>'+col.title+
+            '<span class="n">'+items.length+'</span></div><div class="col-body">'+cards+'</div></div>';
+    }).join('')+'</div>';
+}
+
+let psTableSort={key:'wo_num', dir:'asc'};
+let psTableGroup='none';          // Work Orders view grouping: none|mo|category|user|site|resource
+let psTableCollapsed=new Set();   // collapsed group keys (session-only; independent of the Timeline's collapsedMOs)
+// Group the Work Orders table rows for the active grouping. Returns
+// [{key,label,items,moNum?,moId?,due?,customer?,fg?}] sorted by label (MO by
+// number). 'user' replicates a WO under each assigned user (same model as the
+// Timeline + User Load), so a WO with two assignees appears in both groups.
+function psBuildTableGroups(list){
+    const g=psTableGroup, map=new Map();
+    const push=(key,meta,wo)=>{ if(!map.has(key)) map.set(key, Object.assign({key:key,items:[]},meta)); map.get(key).items.push(wo); };
+    list.forEach(w=>{
+        if(g==='mo'){ const rec=psMoForWO(w)||{}; push('mo:'+w.mo_num, {label:'MO '+w.mo_num, moNum:w.mo_num, moId:(rec.mo_id!=null?rec.mo_id:null), due:rec.mo_date_scheduled||null, customer:psCustomer(w), fg:psMoFgLabel(w.mo_num)}, w); }
+        else if(g==='category'){ push('cat:'+(w.calendar_category||'Uncategorized'), {label:w.calendar_category||'Uncategorized'}, w); }
+        else if(g==='site'){ const k=w.site_name||('LG '+(w.location_group_id||0)); push('site:'+k, {label:k}, w); }
+        else if(g==='resource'){ const k=w.resource_name||'Unassigned location'; push('resource:'+k, {label:k}, w); }
+        else if(g==='user'){ psAssignedNames(w).forEach(nm=> push('user:'+nm, {label:nm}, w)); }
+    });
+    return Array.from(map.values()).sort((a,b)=> String(a.label).localeCompare(String(b.label), undefined, {numeric:true}));
+}
+function renderTable(){
+    const host=document.getElementById('tableView'); if(!host) return;
+    const list=filteredWorkOrders.slice();
+    if(!list.length){ host.innerHTML=psEmptyState(); return; }
+    const blocked=psBlockedSet();
+    const val=(w,k)=>{
+        switch(k){
+            case 'wo_num': return w.wo_num||'';
+            case 'mo_num': return w.mo_num||'';
+            case 'part': return (w.part_num||'')+' '+(w.description||'');
+            case 'customer': return psCustomer(w);
+            case 'category': return w.calendar_category||'';
+            case 'site': return w.site_name||'';
+            case 'resource': return w.resource_name||'';
+            case 'user': return psUserName(w);
+            case 'status': return w.wo_status;
+            case 'sched': return moment(w.date_scheduled_start).valueOf()||0;
+            case 'due': { const d=psDue(w); return d?moment(d).valueOf():0; }
+            // Ready = earliest buildable date (wo._av._buildable). Unmet / unknown
+            // sort to the very end on ascending so "soonest buildable first" reads
+            // top-down and blocked WOs sink to the bottom.
+            case 'ready': {
+                if(!psAvailReady || !w._av || w._av._unmet) return Number.MAX_SAFE_INTEGER;
+                const b=w._av._buildable; return b?moment(b).valueOf():Number.MAX_SAFE_INTEGER;
+            }
+            case 'qty': return parseFloat(w.qty_target)||0;
+            case 'pick': return w._pickStatus==null?-1:w._pickStatus;
+        }
+        return '';
+    };
+    list.sort((a,b)=>{ const x=val(a,psTableSort.key), y=val(b,psTableSort.key);
+        let r = (typeof x==='number'&&typeof y==='number') ? x-y : String(x).localeCompare(String(y));
+        return psTableSort.dir==='asc'?r:-r; });
+    const cols=[['wo_num','WO #'],['mo_num','MO'],['part','Part'],['customer','Customer'],['category','Category'],['site','LG'],['resource','Location'],['user','User'],['status','Status'],['sched','Scheduled'],['due','Due'],['ready','Ready'],['qty','Qty','num'],['pick','Pick'],['flags','Flags']];
+    // Fixed column widths (percent) + table-layout:fixed so the columns DON'T
+    // resize when groups collapse/expand (a collapsed group leaves only the
+    // full-width colspan header row, which under auto-layout re-sized every
+    // column to the header text — the jitter the user saw when filtered to one MO).
+    const COLW={wo_num:6,mo_num:5,part:13,customer:7,category:6,site:5,resource:7,user:7,status:6,sched:10,due:5,ready:6,qty:4,pick:5,flags:8};
+    const colgroup='<colgroup>'+cols.map(c=>'<col style="width:'+(COLW[c[0]]||6)+'%">').join('')+'</colgroup>';
+    const grouped=psTableGroup!=='none';
+    // Collapse/expand-all state for the MO-column-header toggle (any grouping).
+    const grpKeys=grouped?psBuildTableGroups(list).map(g=>g.key):[];
+    const allCollapsed=grpKeys.length>0 && grpKeys.every(k=>psTableCollapsed.has(k));
+    const arrow=k=> psTableSort.key===k ? (psTableSort.dir==='asc'?' ▲':' ▼') : '';
+    const head=cols.map(c=>{
+        // MO header carries a +/- collapse-all button when grouping is active.
+        if(c[0]==='mo_num' && grouped){
+            const btn='<button class="grp-allbtn" onclick="event.stopPropagation();psTableToggleAllGroups()" title="'+(allCollapsed?'Expand all groups':'Collapse all groups')+'">'+(allCollapsed?'+':'−')+'</button>';
+            return '<th onclick="psSortTable(\'mo_num\')" style="cursor:pointer;white-space:nowrap">'+btn+c[1]+arrow('mo_num')+'</th>';
+        }
+        if(c[0]==='flags') return '<th>'+c[1]+'</th>';
+        return '<th onclick="psSortTable(\''+c[0]+'\')" style="cursor:pointer;'+(c[2]==='num'?'text-align:right':'')+'">'+c[1]+arrow(c[0])+'</th>';
+    }).join('');
+    // One WO row (shared by the flat + grouped renders). The whole list was
+    // already sorted above, so grouped rows keep the active sort within each group.
+    const rowHtml = w => {
+        const late=psIsLate(w);
+        // Ready cell — compact availability chip from the same engine as the drawer.
+        const ai=(psAvailReady && w._av)?psAvInfo(w):null;
+        let readyCell='<span style="color:var(--c-tertiary)">—</span>';
+        if(ai){
+            if(ai.state==='unmet')          readyCell=psSpill('critical','Unmet');
+            else if(ai.state==='contended') readyCell=psSpill('caution','Contested');
+            else if(ai.state==='done')      readyCell=psSpill('success','Fulfilled');
+            else if(ai.state==='now')       readyCell=psSpill('success','Now');
+            else if(ai.state==='overdue')   readyCell=psSpill('critical','Overdue');
+            else                            readyCell=psSpill('active', psFmtDate(w._av._buildable));
+        }
+        return '<tr onclick="openDetail('+w.wo_id+')">'+
+            '<td><span class="wo">'+psEsc(w.wo_num)+'</span></td>'+
+            '<td class="mono" style="font-size:12px">'+psEsc(w.mo_num)+'</td>'+
+            '<td><div style="font-weight:600">'+psEsc(w.part_num||'—')+'</div><div style="font-size:11.5px;color:var(--c-secondary)">'+psEsc(w.description||'')+'</div></td>'+
+            '<td>'+psEsc(psCustomer(w)||'—')+'</td>'+
+            '<td>'+psTagHTML(w)+'</td>'+
+            '<td>'+psEsc(w.site_name||'—')+'</td>'+
+            '<td>'+psEsc(w.resource_name||'—')+'</td>'+
+            '<td>'+psEsc(psUserName(w))+'</td>'+
+            '<td>'+psPillHTML(w.wo_status)+'</td>'+
+            '<td>'+psFmtDate(w.date_scheduled_start)+' → '+psFmtDate(w.date_scheduled)+'</td>'+
+            '<td style="'+(late?'color:var(--fb-negative);font-weight:700':'')+'">'+psFmtDate(psDue(w))+'</td>'+
+            '<td>'+readyCell+'</td>'+
+            '<td class="num">'+psEsc(w.qty_target!=null?w.qty_target:'')+'</td>'+
+            '<td>'+psPickPill(w,true)+'</td>'+
+            '<td><span class="rowflags">'+(psFlagsHTML(w,blocked)||'<span style="color:var(--acc-teal-con)">—</span>')+'</span></td>'+
+        '</tr>';
+    };
+    let bodyHtml;
+    if(psTableGroup==='none'){
+        bodyHtml = list.map(rowHtml).join('');
+    } else {
+        const today0 = moment().startOf('day');
+        bodyHtml = psBuildTableGroups(list).map(gr=>{
+            const collapsed = psTableCollapsed.has(gr.key);
+            const keyJs = String(gr.key).replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+            const chev = collapsed
+                ? '<svg fill="none" stroke="currentColor" stroke-width="2.4" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 6l6 6-6 6"/></svg>'
+                : '<svg fill="none" stroke="currentColor" stroke-width="2.4" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 9l6 6 6-6"/></svg>';
+            // MO groups carry customer + finished good + an editable MO due-date
+            // field (writes mo.dateScheduled via psTableSetMoDate). Groups whose MO
+            // id couldn't be resolved fall back to a read-only due date.
+            let extra='';
+            if(psTableGroup==='mo'){
+                // Due-date selector leads (before customer + finished good) so the
+                // editable field lines up down the column of group headers.
+                if(gr.moId!=null){
+                    const dval = gr.due?moment(gr.due).format('YYYY-MM-DD'):'';
+                    const lateDue = gr.due && moment(gr.due).startOf('day').isBefore(today0);
+                    const moNumJs = String(gr.moNum).replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+                    extra+='<span class="grp-due'+(lateDue?' late':'')+'" onclick="event.stopPropagation()" title="MO scheduled (due) date — changing it updates the manufacture order in Fishbowl">Due <input type="date" value="'+dval+'" onchange="psTableSetMoDate('+gr.moId+',\''+moNumJs+'\',this.value)"></span>';
+                } else if(gr.due){
+                    extra+='<span class="grp-meta">· Due '+psFmtDate(gr.due)+'</span>';
+                }
+                if(gr.customer) extra+='<span class="grp-meta">· '+psEsc(gr.customer)+'</span>';
+                if(gr.fg) extra+='<span class="grp-meta">· '+psEsc(gr.fg)+'</span>';
+            }
+            const headRow='<tr class="grp-head" onclick="psTableToggleGroup(\''+keyJs+'\')"><td colspan="'+cols.length+'">'+
+                '<span class="grp-line"><span class="grp-chev">'+chev+'</span>'+
+                '<span class="grp-name">'+psEsc(gr.label)+'</span>'+
+                '<span class="grp-count">'+gr.items.length+'</span>'+extra+'</span></td></tr>';
+            return headRow + (collapsed ? '' : gr.items.map(rowHtml).join(''));
+        }).join('');
+    }
+    host.innerHTML='<div class="tbl-wrap tbl-fill"><table style="table-layout:fixed">'+colgroup+'<thead><tr>'+head+'</tr></thead><tbody>'+bodyHtml+'</tbody></table></div>';
+}
+function psSortTable(k){ if(psTableSort.key===k) psTableSort.dir=psTableSort.dir==='asc'?'desc':'asc'; else {psTableSort.key=k;psTableSort.dir='asc';} renderTable(); }
+function psSetTableGroup(g){ psTableGroup=g; try{ FBLib.Settings.setUserKey('tableGroupBy',g); FBLib.Settings.saveUser(); }catch(_){} renderCurrentView(); }
+function psTableToggleGroup(key){ if(psTableCollapsed.has(key)) psTableCollapsed.delete(key); else psTableCollapsed.add(key); renderTable(); }
+// Collapse / expand EVERY group in the Work Orders table (MO-column-header +/-).
+// If all groups are already collapsed it expands them; otherwise it collapses all.
+function psTableToggleAllGroups(){
+    const keys=psBuildTableGroups(filteredWorkOrders).map(g=>g.key);
+    if(!keys.length) return;
+    const allCollapsed=keys.every(k=>psTableCollapsed.has(k));
+    keys.forEach(k=>{ if(allCollapsed) psTableCollapsed.delete(k); else psTableCollapsed.add(k); });
+    renderTable();
+}
+// Editable MO due-date field on an MO group header → write mo.dateScheduled.
+function psTableSetMoDate(moId, moNum, val){ if(!val) return; psApplyMoDate(moId, moNum, val); }
+
+// ── Procurement worklist (schedule-derived shortages) ────────
+// Aggregates the raw-good shortages the availability engine already found
+// (wo._av.parts where unmet, excluding staged sub-assemblies + non-inventory)
+// across the WOs currently in view, then splits them by psMakePartIds into
+// parts to BUY (no BOM → purchase order) vs parts to MAKE (has a BOM → needs
+// an MO/WO). Scoped to filteredWorkOrders so page filters/search narrow it
+// like every other tab. Short qty = Σ(need − availQty) over the unmet lines;
+// availQty was allocated FIFO so those shortfalls don't double-count.
+function psProcureData(){
+    const agg = new Map();
+    if(psAvailReady){
+        filteredWorkOrders.forEach(wo=>{
+            const av = wo._av;
+            if(!av || !av.parts) return;
+            av.parts.forEach(p=>{
+                if(p.staged || p.nonInv || !p.unmet) return;   // only genuine raw-good shortages
+                // "Short by" = qty that can't be sourced from ANY existing supply —
+                // on-hand, committed picks, incoming POs, AND scheduled MO/WO output —
+                // i.e. what still needs to be ordered/made. Use the engine's leftover
+                // `remaining` (p.shortfall) so already-scheduled production reduces the
+                // number immediately (not only once a WO is finished into on-hand).
+                // Fall back to need−available-now for older availability shapes.
+                const short = (p.shortfall != null)
+                    ? Math.max(0, Number(p.shortfall) || 0)
+                    : Math.max(0, (Number(p.need)||0) - (Number(p.availQty)||0));
+                if(short <= 1e-6) return;
+                const key = p.partNum || ('#'+p.partId);
+                let e = agg.get(key);
+                if(!e){
+                    const vd = psPartVendor.get(String(p.partId)), bm = psMakeBom.get(String(p.partId));
+                    e = { partNum:p.partNum||'', partId:p.partId, partDesc:p.partDesc||'', uom:p.uom||'',
+                          short:0, onhand:(p.onhand!=null?p.onhand:null), wos:[], woList:[], earliest:null,
+                          lgId:'', lgName:'', lgIds:new Set(),
+                          vendorId: vd?vd.id:null, vendorName: vd?(vd.name||''):'',
+                          lastCost: (vd&&vd.lastCost!=null)?vd.lastCost:null, vendorPartNum: vd?(vd.vendorPartNum||''):'',
+                          qtyMin: (vd&&vd.qtyMin!=null)?vd.qtyMin:null,
+                          bomNum: bm?(bm.bomNum||''):'' };
+                    agg.set(key, e);
+                }
+                e.short += short;
+                // Track the LG(s) this shortage sits in — supply (PO/MO) must be
+                // created in the SAME LG or the availability engine (which pools
+                // on-hand / incoming PO / WO-output per LG) can't match it to the
+                // demand. lgId is pinned to the earliest-needed WO's LG (the binding
+                // shortage); lgIds collects every contributing LG so the worklist can
+                // flag a part short across more than one LG.
+                const woLgId = (wo.location_group_id != null ? String(wo.location_group_id) : '');
+                const woLgName = wo.site_name || '';
+                if(woLgId) e.lgIds.add(woLgId);
+                if(!e.lgId && woLgId){ e.lgId = woLgId; e.lgName = woLgName; }
+                if(wo.wo_num && e.wos.indexOf(wo.wo_num) < 0){
+                    e.wos.push(wo.wo_num);
+                    e.woList.push({ woNum: wo.wo_num, woId: wo.wo_id, fg: wo.part_num || '', fgDesc: wo.description || '', qty: (Number(p.need) || 0), start: wo.date_scheduled_start || '' });
+                }
+                const st = wo.date_scheduled_start ? moment(wo.date_scheduled_start) : null;
+                if(st && st.isValid() && (!e.earliest || st.isBefore(e.earliest))){ e.earliest = st; if(woLgId){ e.lgId = woLgId; e.lgName = woLgName; } }
+            });
+        });
+    }
+    const all = Array.from(agg.values());
+    const isMake = r => psMakePartIds && psMakePartIds.has(String(r.partId));
+    // Sort most-urgent first (earliest need date), then part number.
+    const bySort = (a,b)=>{ const av=a.earliest?a.earliest.valueOf():Infinity, bv=b.earliest?b.earliest.valueOf():Infinity; return (av-bv) || String(a.partNum).localeCompare(String(b.partNum)); };
+    return { buy: all.filter(r=>!isMake(r)).sort(bySort), make: all.filter(isMake).sort(bySort) };
+}
+
+// ── Materials tab — at-risk work orders (read-only) ──────────
+// WO-centric complement to the part-centric Procurement tab: lists the work
+// orders whose raw goods are Unmet (genuine shortage) or Contested (stock exists
+// but earlier-scheduled WOs claim it), from the availability engine (wo._av).
+// Actions (Create PO/MO) stay on the Procurement tab; this surfaces "what
+// production is at risk" so the planner can react. Scoped to filteredWorkOrders.
+let psMatSort = { key:'avail', dir:'asc' };   // Materials tab: active column sort
+function psMatSortBy(k){ if(psMatSort.key===k) psMatSort.dir=(psMatSort.dir==='asc'?'desc':'asc'); else { psMatSort.key=k; psMatSort.dir='asc'; } renderMaterials(); }
+function renderMaterials(){
+    const host=document.getElementById('materialsView'); if(!host) return;
+    if(!psAvailReady){
+        host.innerHTML='<div class="ps-empty">Component availability hasn’t been computed, so at-risk work orders can’t be listed. Refresh, or enable the debug console for details.</div>';
+        return;
+    }
+    const list=filteredWorkOrders.filter(w=> w._av && (w._av._unmet || w._av._contended || w._av._overdue));
+    if(!list.length){
+        host.innerHTML='<div class="ps-empty"><svg width="48" height="48" fill="none" stroke="var(--acc-teal)" stroke-width="1.5" viewBox="0 0 24 24" style="margin-bottom:12px"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg><div>No at-risk work orders — every WO in view can be sourced from stock, committed picks or open POs.</div></div>';
+        return;
+    }
+    const unmetN=list.filter(w=>w._av._unmet).length;
+    const overdueN=list.filter(w=>!w._av._unmet && w._av._overdue).length;
+    const contN=list.length-unmetN-overdueN;
+    // Column sort (clickable headers). 'avail' asc = unmet → contested → buildable
+    // (the original at-risk ordering); every column ties-break by scheduled start.
+    const matVal=(w,k)=>{
+        switch(k){
+            case 'wo':      return w.wo_num||'';
+            case 'product': return (w.description||w.part_num||'');
+            case 'loc':     return (w.site_name||'')+' '+(w.resource_name||'');
+            case 'status':  return w.wo_status;
+            case 'sched':   return moment(w.date_scheduled_start).valueOf()||0;
+            case 'avail':   return w._av._unmet?0:(w._av._overdue?1:(w._av._contended?2:3));
+            case 'short':   return (w._av.parts||[]).filter(p=>!p.staged && !p.nonInv && p.unmet).length;
+        }
+        return '';
+    };
+    list.sort((a,b)=>{
+        const x=matVal(a,psMatSort.key), y=matVal(b,psMatSort.key);
+        let r=(typeof x==='number'&&typeof y==='number')?x-y:String(x).localeCompare(String(y));
+        if(r===0) r=(moment(a.date_scheduled_start).valueOf()||0)-(moment(b.date_scheduled_start).valueOf()||0);
+        return psMatSort.dir==='asc'?r:-r;
+    });
+    // Short raw-good part names for a WO (genuine unmet raw goods; not staged/non-inv).
+    const shortNames=w=>{
+        const ps=(w._av.parts||[]).filter(p=>!p.staged && !p.nonInv && p.unmet);
+        const names=ps.map(p=>p.partNum||('#'+p.partId));
+        const shown=names.slice(0,6).map(n=>'<a href="#" onclick="event.preventDefault();event.stopPropagation();openModule(\'Part\',\''+String(n).replace(/'/g,"\\'")+'\')" style="color:var(--link);text-decoration:none">'+psEsc(n)+'</a>').join(', ');
+        return shown + (names.length>6?(' <span style="color:var(--c-tertiary)">+'+(names.length-6)+' more</span>'):'') || '<span style="color:var(--c-tertiary)">—</span>';
+    };
+    const rows=list.map(w=>{
+        const ai=psAvInfo(w);
+        const chip = ai.state==='unmet' ? psSpill('critical','Raw goods unmet')
+                   : ai.state==='contended' ? psSpill('caution','Stock contested')
+                   : ai.state==='overdue' ? psSpill('critical','Supply overdue')
+                   : psSpill('active','Buildable '+psFmtDate(w._av._buildable));
+        return '<tr onclick="openDetail('+w.wo_id+')">'+
+            '<td><span class="wo">'+psEsc(w.wo_num)+'</span></td>'+
+            '<td><div style="font-weight:600">'+psEsc(w.description||w.part_num||'—')+'</div><div style="font-size:11.5px;color:var(--c-secondary)">'+psEsc(w.part_num||'')+'</div></td>'+
+            '<td>'+psEsc(w.site_name||'—')+(w.resource_name?'<div style="font-size:11.5px;color:var(--c-secondary)">'+psEsc(w.resource_name)+'</div>':'')+'</td>'+
+            '<td>'+psPillHTML(w.wo_status)+'</td>'+
+            '<td>'+psFmtDate(w.date_scheduled_start)+'</td>'+
+            '<td><span class="apstat" style="justify-content:flex-start">'+chip+'</span></td>'+
+            '<td class="proc-desccell" style="max-width:280px">'+shortNames(w)+'</td>'+
+        '</tr>';
+    }).join('');
+    const matCols=[['wo','WO'],['product','Product'],['loc','LG / Location'],['status','Status'],['sched','Scheduled'],['avail','Availability'],['short','Short raw goods']];
+    const matArrow=k=> psMatSort.key===k ? (psMatSort.dir==='asc'?' ▲':' ▼') : '';
+    const matHead=matCols.map(c=>'<th onclick="psMatSortBy(\''+c[0]+'\')" style="cursor:pointer;white-space:nowrap">'+c[1]+matArrow(c[0])+'</th>').join('');
+    host.innerHTML='<div class="pv-fill">'+
+        '<div class="proc-subhead" style="padding-top:14px">'+
+          '<span class="proc-subtitle" style="margin:0">'+unmetN+' work order'+(unmetN===1?'':'s')+' short of raw goods'+(overdueN?(' · '+overdueN+' waiting on overdue supply'):'')+(contN?(' · '+contN+' with contested stock'):'')+' — click a row for detail, or use Procurement to raise POs/MOs.</span>'+
+          '<span style="flex:1"></span>'+
+          '<button class="ps-btn sm" onclick="setView(\'procure\')" title="Go to the Procurement worklist">Procurement →</button>'+
+        '</div>'+
+        '<div class="tbl-wrap tbl-fill"><table><thead><tr>'+matHead+'</tr></thead><tbody>'+rows+'</tbody></table></div>'+
+      '</div>';
+}
+
+function renderProcure(){
+    const host=document.getElementById('procureView'); if(!host) return;
+    if(!psAvailReady){
+        host.innerHTML='<div class="ps-empty">Component availability hasn’t been computed, so shortages can’t be listed. Refresh, or enable the debug console for details.</div>';
+        return;
+    }
+    const { buy, make } = psProcureData();
+    if(!buy.length && !make.length){
+        host.innerHTML='<div class="ps-empty"><svg width="48" height="48" fill="none" stroke="var(--acc-teal)" stroke-width="1.5" viewBox="0 0 24 24" style="margin-bottom:12px"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg><div>No shortages — every work order in view can be sourced from stock, committed picks or open POs.</div></div>';
+        return;
+    }
+    // Drop selections for parts no longer short (e.g. after a reload/refilter).
+    const makeIds = new Set(make.map(r=>String(r.partId)));
+    Array.from(psProcureSel).forEach(id=>{ if(!makeIds.has(id)) psProcureSel.delete(id); });
+
+    const partLink = r => r.partNum
+        ? '<a href="#" onclick="event.preventDefault();event.stopPropagation();openModule(\'Part\',\''+String(r.partNum).replace(/'/g,"\\'")+'\')" style="color:var(--link);text-decoration:none;font-weight:700">'+psEsc(r.partNum)+'</a>'
+        : '—';
+    const shortCell = r => '<td class="num" style="color:var(--fb-negative);font-weight:700">'+psEsc(psFmtQty(r.short))+(r.uom?' '+psEsc(r.uom):'')+'</td>';
+    const ohCell    = r => '<td class="num">'+(r.onhand!=null?psEsc(psFmtQty(r.onhand)):'—')+'</td>';
+    const needCell  = r => '<td>'+(r.earliest?psFmtDate(r.earliest):'—')+'</td>';
+    // Description cell also surfaces the shortage's Location Group — so it's clear
+    // which LG a PO/MO must be created in (supply is matched to demand per-LG). An
+    // amber "+N more" flags a part short across more than one LG (needs supply in each).
+    const descCell  = r => {
+        const multi = r.lgIds && r.lgIds.size > 1;
+        const lgLine = r.lgName
+            ? '<div style="font-size:10.5px;color:'+(multi?'var(--fb-warning)':'var(--c-tertiary)')+'" title="'+(multi?'Short across multiple location groups — create supply in each':'Location group this shortage sits in — create the PO/MO here')+'"><svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="vertical-align:-1px;margin-right:2px"><path stroke-linecap="round" stroke-linejoin="round" d="M12 21s-6-5.686-6-10a6 6 0 1112 0c0 4.314-6 10-6 10z"/><circle cx="12" cy="11" r="2"/></svg>'+psEsc(r.lgName)+(multi?(' +'+(r.lgIds.size-1)+' more'):'')+'</div>'
+            : '';
+        return '<td class="proc-desccell" title="'+psEsc(r.partDesc||'')+'">'+(r.partDesc?psEsc(r.partDesc):'—')+lgLine+'</td>';
+    };
+    // Blocked work orders — the WOs held up by this part shortage, SORTED by
+    // scheduled start (earliest first). Each entry shows, in column order:
+    // scheduled start date · WO number (opens its detail drawer) · the finished
+    // good it produces · the quantity of THIS part that WO requires. Rendered as a
+    // CSS grid (not a nested <table>) so the four values line up column-wise down
+    // the cell. Shown on BOTH To Purchase and To Manufacture (replaces the old
+    // "Blocks" count). Capped to 5 rows; clicking the cell expands/collapses it.
+    const blockedCell = r => {
+        const items = (r.woList || []).slice().sort((a,b)=>{
+            const av = a.start ? moment(a.start).valueOf() : Infinity, bv = b.start ? moment(b.start).valueOf() : Infinity;
+            return (av - bv) || String(a.woNum).localeCompare(String(b.woNum));
+        });
+        if(!items.length) return '<td><span style="color:var(--c-tertiary)">—</span></td>';
+        const CAP = 5;
+        const uom = r.uom ? ' '+psEsc(r.uom) : '';
+        // Column order: scheduled start · WO# · finished good · qty.
+        const cells = items.map(it => {
+            const act = it.woId != null
+                ? 'openDetail('+it.woId+')'
+                : ('openModule(\'Work Order\',\''+String(it.woNum).replace(/'/g,"\\'")+'\')');
+            const ttl = it.fgDesc ? ' title="'+psEsc(it.fgDesc)+'"' : '';
+            return '<span class="bdate">'+psEsc(it.start?psFmtDate(it.start):'—')+'</span>'+
+                   '<a href="#" class="bwo" onclick="event.preventDefault();event.stopPropagation();'+act+'">'+psEsc(it.woNum)+'</a>'+
+                   '<span class="bfg"'+ttl+'>'+psEsc(it.fg||'—')+'</span>'+
+                   '<span class="bqty">'+psEsc(psFmtQty(it.qty))+uom+'</span>';
+        }).join('');
+        const over = items.length > CAP;
+        const grid = '<div class="proc-blk'+(over?' blk-cap':'')+'">'+cells+'</div>';
+        const more = over ? '<div class="blk-more">+'+(items.length-CAP)+' more — click to expand</div>' : '';
+        const attrs = over ? ' class="blk-toggle" onclick="psBlkToggle(this)" title="Click to expand / collapse"' : '';
+        return '<td'+attrs+'>'+grid+more+'</td>';
+    };
+
+    // ── To Purchase — grouped by default vendor (named vendors A→Z, then the
+    //    "no default vendor" bucket last). All vendor tables share ONE fixed
+    //    column layout (colgroup + table-layout:fixed) so columns line up
+    //    vendor-to-vendor. Each named vendor gets a Create PO button. ──
+    // Shared column widths so every vendor sub-table is uniform (Part · Description
+    // · Short by · On hand · Needed by · Blocked work orders).
+    const PROC_BUY_COLS = '<colgroup><col style="width:12%"><col style="width:20%"><col style="width:10%"><col style="width:9%"><col style="width:11%"><col style="width:38%"></colgroup>';
+    let buyHtml = '';
+    if(buy.length){
+        const groups = new Map();
+        buy.forEach(r=>{ const k=r.vendorName||'__NOVENDOR__'; if(!groups.has(k)) groups.set(k,[]); groups.get(k).push(r); });
+        const keys = Array.from(groups.keys()).sort((a,b)=> a==='__NOVENDOR__'?1 : b==='__NOVENDOR__'?-1 : a.localeCompare(b));
+        let buyBody = '';
+        keys.forEach(k=>{
+            const rows=groups.get(k), vlabel=(k==='__NOVENDOR__')?'No default vendor':k;
+            const body=rows.map(r=>'<tr>'+
+                '<td>'+partLink(r)+'</td>'+
+                descCell(r)+
+                shortCell(r)+ohCell(r)+needCell(r)+blockedCell(r)+
+            '</tr>').join('');
+            // Named vendors get a Create PO button in the group header; the
+            // "no default vendor" bucket can't (no vendor to raise a PO against).
+            const vkJs = String(k).replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+            const createBtn = (k==='__NOVENDOR__') ? '' :
+                '<button class="ps-btn primary sm" style="margin-left:auto;text-transform:none" onclick="psOpenCreatePo(\''+vkJs+'\')" title="Create a purchase order for this vendor"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 5v14M5 12h14"/></svg>Create PO</button>';
+            buyBody += '<div class="proc-vgrp"><div class="proc-vhead">'+psEsc(vlabel)+'<span class="proc-vcount">'+rows.length+'</span>'+createBtn+'</div>'+
+                '<div class="tbl-wrap proc-tbl"><table style="table-layout:fixed">'+PROC_BUY_COLS+'<thead><tr><th>Part</th><th>Description</th><th style="text-align:right">Short by</th><th style="text-align:right">On hand</th><th>Needed by</th><th>Blocked work orders</th></tr></thead><tbody>'+body+'</tbody></table></div></div>';
+        });
+        buyHtml = '<div class="proc-subtitle">Raw goods short of stock and open POs — grouped by default vendor.</div>'+buyBody;
+    }
+
+    // ── To Manufacture — tick parts, then Create MO (one MO, a config per part). ──
+    let makeHtml='';
+    if(make.length){
+        const selN = make.filter(r=>psProcureSel.has(String(r.partId))).length;
+        const allSel = selN>0 && selN===make.length;
+        const body=make.map(r=>{
+            const sel=psProcureSel.has(String(r.partId));
+            return '<tr'+(sel?' style="background:#DEEAF4"':'')+'>'+
+                '<td style="text-align:center"><input type="checkbox" '+(sel?'checked':'')+' onclick="event.stopPropagation();psProcureToggleSel(\''+String(r.partId)+'\')"></td>'+
+                '<td>'+partLink(r)+'</td>'+
+                descCell(r)+
+                '<td class="mono" style="font-size:12px">'+psEsc(r.bomNum||'—')+'</td>'+
+                shortCell(r)+ohCell(r)+needCell(r)+blockedCell(r)+
+            '</tr>';
+        }).join('');
+        // Uniform fixed layout (checkbox · Part · Description · BOM · Short by ·
+        // On hand · Needed by · Blocked work orders).
+        const PROC_MAKE_COLS = '<colgroup><col style="width:4%"><col style="width:12%"><col style="width:15%"><col style="width:9%"><col style="width:9%"><col style="width:8%"><col style="width:10%"><col style="width:33%"></colgroup>';
+        makeHtml = '<div class="proc-subhead">'+
+              '<span class="proc-subtitle" style="margin:0">Parts with a BOM — tick and create a manufacture order.</span>'+
+              '<span style="flex:1"></span>'+
+              '<button class="ps-btn primary sm" '+(selN?'':'disabled')+' style="text-transform:none" onclick="psOpenCreateMo()" title="Create one MO with a configuration per selected part"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 5v14M5 12h14"/></svg>Create MO'+(selN?' ('+selN+')':'')+'</button>'+
+            '</div>'+
+            '<div class="tbl-wrap proc-tbl"><table style="table-layout:fixed">'+PROC_MAKE_COLS+'<thead><tr>'+
+              '<th style="text-align:center"><input type="checkbox" '+(allSel?'checked':'')+' onclick="psProcureSelectAll(this.checked)" title="Select all"></th>'+
+              '<th>Part</th><th>Description</th><th>BOM</th><th style="text-align:right">Short by</th><th style="text-align:right">On hand</th><th>Needed by</th><th>Blocked work orders</th>'+
+            '</tr></thead><tbody>'+body+'</tbody></table></div>';
+    }
+
+    // Tab selection — honour the user's chosen tab unless it's empty, then fall
+    // back to the populated one (the all-empty case already returned above).
+    let tab = psProcTab;
+    if(tab==='buy'  && !buy.length  && make.length) tab='make';
+    if(tab==='make' && !make.length && buy.length)  tab='buy';
+    const tabBtn = (id,label,n,on)=>'<button class="proc-tab'+(on?' active':'')+'" onclick="psSetProcTab(\''+id+'\')">'+label+'<span class="proc-tabn">'+n+'</span></button>';
+    const tabBar = '<div class="proc-tabbar">'+tabBtn('buy','To Purchase',buy.length,tab==='buy')+tabBtn('make','To Manufacture',make.length,tab==='make')+'</div>';
+    host.innerHTML = '<div style="width:100%">'+tabBar+(tab==='buy'?buyHtml:makeHtml)+'</div>';
+}
+
+// Procurement — switch between the To Purchase / To Manufacture tabs.
+function psSetProcTab(t){ if(t==='buy'||t==='make'){ psProcTab=t; renderProcure(); } }
+
+// Blocked-work-orders cell: expand/collapse the 5-row cap on click. Pure DOM
+// toggle (no re-render); the WO links stopPropagation so clicking one opens the
+// drawer without also toggling the cell. Grid has 4 children per WO.
+function psBlkToggle(td){
+    const g = td.querySelector('.proc-blk'); if(!g) return;
+    const capped = g.classList.toggle('blk-cap');   // true = now capped again
+    const more = td.querySelector('.blk-more');
+    if(more){
+        const hidden = Math.max(0, Math.round(g.children.length/4) - 5);
+        more.textContent = capped ? ('+'+hidden+' more — click to expand') : 'Show fewer';
+    }
+}
+
+// Procurement — To-Manufacture selection + Create-MO drawer.
+function psProcureToggleSel(id){ id=String(id); if(psProcureSel.has(id)) psProcureSel.delete(id); else psProcureSel.add(id); renderProcure(); }
+function psProcureSelectAll(on){ const { make }=psProcureData(); psProcureSel.clear(); if(on) make.forEach(r=>psProcureSel.add(String(r.partId))); renderProcure(); }
+
+// Lazy-load MO custom-field definitions. The schema dump has no tableId→module
+// catalog, so infer the MO custom-field set from the names present on recent MO
+// customFields JSON, then read each field's type/list/required from customfield.
+// (Never-used MO CFs won't surface — acceptable; the section is optional.)
+function psLoadMoCustomFields(){
+    if(psMoCfDefs) return psMoCfDefs;
+    psMoCfDefs = [];
+    if(typeof runQuery!=='function') return psMoCfDefs;
+    try {
+        const names = new Set();
+        JSON.parse(runQuery("SELECT customFields FROM mo WHERE customFields IS NOT NULL AND customFields <> 'null' AND customFields <> '' ORDER BY id DESC LIMIT 200"))
+          .forEach(row=>{
+              const raw = row.customfields != null ? row.customfields : row.customFields;
+              try {
+                  const o = JSON.parse(raw||'null');
+                  if(Array.isArray(o)) o.forEach(e=>{ const nm=(e&&(e.name||e.Name))||''; if(nm) names.add(nm); });
+                  else if(o && typeof o==='object') Object.keys(o).forEach(k=>{ if(k) names.add(k); });
+              } catch(_){}
+          });
+        if(!names.size) return psMoCfDefs;
+        const inList = Array.from(names).map(n=>"'"+String(n).replace(/'/g,"''")+"'").join(',');
+        const defs = JSON.parse(runQuery(
+            "SELECT cf.name AS name, cf.required AS required, cf.listid AS listid, cf.sortorder AS sortorder, cft.name AS type_name "+
+            "FROM customfield cf LEFT JOIN customfieldtype cft ON cft.id = cf.customfieldtypeid "+
+            "WHERE cf.activeflag = 1 AND cf.name IN ("+inList+") ORDER BY cf.sortorder, cf.name"));
+        const listIds = [...new Set(defs.map(d=>d.listid).filter(v=>v!=null))];
+        const optByList = new Map();
+        if(listIds.length){
+            JSON.parse(runQuery("SELECT listid, name FROM customlistitem WHERE listid IN ("+listIds.join(',')+") ORDER BY name"))
+              .forEach(r=>{ const key=String(r.listid); if(!optByList.has(key)) optByList.set(key,[]); optByList.get(key).push(r.name); });
+        }
+        psMoCfDefs = defs.map(d=>({
+            name: d.name,
+            required: (d.required===1 || d.required===true || d.required==='1'),
+            type: String(d.type_name||'').toLowerCase(),
+            options: d.listid!=null ? (optByList.get(String(d.listid))||[]) : []
+        }));
+        debugLog('success', 'MO custom fields discovered: '+psMoCfDefs.length);
+    } catch(e){ debugLog('warn','MO custom-field discovery failed: '+(e&&e.message)); psMoCfDefs=[]; }
+    return psMoCfDefs;
+}
+
+// Resolve (and cache) the logged-in user's DEFAULT location group id. Fishbowl
+// stores the user↔LG assignments in usertolg (userId ↔ locationGroupId), with
+// defaultFlag marking the user's default. Returns null if none / not resolvable.
+// Used to preselect the LG in the Create-MO / Create-PO drawers.
+function psGetDefaultLg(){
+    if(psDefaultLgId !== undefined) return psDefaultLgId;
+    psDefaultLgId = null;
+    try {
+        if(typeof runQuery!=='function' || typeof getUser!=='function') return psDefaultLgId;
+        const u = JSON.parse(getUser() || '{}');
+        // Match usertolg by the user's numeric id when getUser() exposes one
+        // (it does — see Dashboard_Combined / Assembly_Disassembly) — that avoids
+        // the fragile userName→sysuser join. Fall back to a username subquery only
+        // when no id is present.
+        const uid = (u.id!=null && !isNaN(parseInt(u.id,10))) ? parseInt(u.id,10) : null;
+        const uname = (u.userName || '').trim();
+        if(uid==null && !uname) return psDefaultLgId;
+        const userClause = (uid!=null)
+            ? ('ul.userid = '+uid)
+            : ("ul.userid IN (SELECT id FROM sysuser WHERE username = '"+uname.replace(/'/g,"''")+"')");
+        // Fetch ALL the user's usertolg rows with the bit flag coerced to int
+        // (defaultflag+0) and pick in JS — a bare `defaultflag = 1` WHERE was
+        // returning nothing. Prefer the default-flagged LG; if the user has exactly
+        // one accessible LG, treat it as the default even when the flag is unset.
+        const rows = JSON.parse(runQuery(
+            "SELECT ul.locationgroupid AS lg, (ul.defaultflag + 0) AS df FROM usertolg ul "+
+            "WHERE "+userClause+" AND ul.locationgroupid IS NOT NULL "+
+            "ORDER BY (ul.defaultflag + 0) DESC, ul.id"));
+        const cand = (rows||[]).map(r=>({ lg:parseInt(r.lg,10), df:Number(r.df)||0 })).filter(r=>!isNaN(r.lg));
+        const flagged = cand.find(r=>r.df===1);
+        if(flagged) psDefaultLgId = flagged.lg;
+        else if(cand.length===1) psDefaultLgId = cand[0].lg;
+        debugLog('info', 'Default LG: '+(uid!=null?('uid '+uid):('user '+uname))+' candidates='+JSON.stringify(cand)+' → '+(psDefaultLgId!=null?psDefaultLgId:'none (drawer falls back to first LG)'));
+    } catch(e){ debugLog('warn','Default LG lookup failed: '+(e&&e.message)); }
+    return psDefaultLgId;
+}
+// Pick the initial LG for a drawer: the user's default LG when it's in the
+// accessible list, otherwise the first accessible LG.
+function psInitialLg(lgList){
+    const def = psGetDefaultLg();
+    if(def != null && lgList && lgList.some(l=>String(l.id)===String(def))) return def;
+    return (lgList && lgList.length) ? lgList[0].id : null;
+}
+
+// Open the Create-MO drawer for the ticked To-Manufacture parts.
+function psOpenCreateMo(){
+    const { make } = psProcureData();
+    const sel = make.filter(r=>psProcureSel.has(String(r.partId)));
+    if(!sel.length){ showToast('Tick at least one part to manufacture','info'); return; }
+    const built = sel.map(r=>{ const bm=psMakeBom.get(String(r.partId))||{}; return { partId:String(r.partId), partNum:r.partNum, bomId:bm.bomId||null, bomNum:bm.bomNum||'', qty:Math.max(1, Math.ceil(Number(r.short)||0)), needBy:(r.earliest?r.earliest.clone():null) }; });
+    const usable = built.filter(p=>p.bomId), noBom = built.filter(p=>!p.bomId).map(p=>p.partNum);
+    if(!usable.length){ showToast('Selected part(s) have no resolvable BOM — cannot create an MO','error',5000); return; }
+    let lgList=[];
+    try { const ids=(typeof getLocationGroupList==='function'?getLocationGroupList():[])||[];
+          lgList = JSON.parse(runQuery('SELECT id, name FROM locationgroup WHERE activeflag = 1'+(ids.length?(' AND id IN ('+ids.join(',')+')'):'')+' ORDER BY name')); }
+    catch(_){ lgList=[]; }
+    // Default MO scheduled finish = the day BEFORE the earliest required date, so
+    // the build completes the day before the consuming WO needs it (a one-day
+    // buffer). `earliest` is the earliest need-by across the selected parts; the
+    // draft date is earliest−1 day (clone so the source moment isn't mutated).
+    // Falls back to today when nothing carries a need-by.
+    let earliest=null; usable.forEach(p=>{ if(p.needBy && (!earliest||p.needBy.isBefore(earliest))) earliest=p.needBy; });
+    const moSchedDefault = (earliest ? earliest.clone().subtract(1,'day') : moment()).format('YYYY-MM-DD');
+    let moStatus0 = 'Issued';
+    try { const s = FBLib.Settings.resolve('moCreateStatus'); if (s === 'Entered' || s === 'Issued') moStatus0 = s; } catch(_){}
+    // Default the MO's LG to the LG the shortage sits in (earliest-needed selected
+    // part's lgId = the consuming WO's location_group_id, the SAME field the
+    // availability engine consumes on) so the produced WO's output lands in the
+    // pool the demand draws from. Fall back to the user's default LG only when the
+    // demand LG isn't accessible.
+    let moLg = psInitialLg(lgList);
+    const moEr = sel.slice().sort((a,b)=>{ const av=a.earliest?a.earliest.valueOf():Infinity, bv=b.earliest?b.earliest.valueOf():Infinity; return av-bv; })[0];
+    if(moEr && moEr.lgId && lgList.some(l=>String(l.id)===String(moEr.lgId))) moLg = String(moEr.lgId);
+    psMoDraft = {
+        parts: usable, noBom: noBom, lgList: lgList,
+        lgId: moLg,
+        dateScheduled: moSchedDefault,   // day before the earliest required date (one-day buffer)
+        moStatus: moStatus0,   // MO order status to create with: 'Issued' (live) | 'Entered' (suggestion)
+        note: '', cf: {}, status:'idle', error:null, result:null
+    };
+    psRenderMoDrawer();
+    const p=document.getElementById('moPanel'), s=document.getElementById('moScrim');
+    if(p) p.classList.add('on'); if(s) s.classList.add('on');
+}
+function psCloseMoDrawer(){ const p=document.getElementById('moPanel'), s=document.getElementById('moScrim'); if(p) p.classList.remove('on'); if(s) s.classList.remove('on'); psMoDraft=null; }
+function psMoField(f,v){ if(psMoDraft) psMoDraft[f]=v; }
+function psMoQty(pid,v){ if(!psMoDraft) return; const p=psMoDraft.parts.find(x=>String(x.partId)===String(pid)); if(p) p.qty=v; }
+function psMoCf(name,v){ if(psMoDraft){ psMoDraft.cf=psMoDraft.cf||{}; psMoDraft.cf[name]=v; } }
+
+function psRenderMoDrawer(){
+    const d=psMoDraft, panel=document.getElementById('moPanel'); if(!panel||!d) return;
+    const head='<div class="detail-head"><div class="top"><div class="detail-head-main">'+
+        '<h2>Create Manufacture Order</h2>'+
+        '<div class="sub">'+d.parts.length+' finished good'+(d.parts.length===1?'':'s')+' → one MO'+(d.parts.length===1?'':' with '+d.parts.length+' configurations')+'</div>'+
+      '</div><div class="detail-actions">'+
+        '<button class="close-x" onclick="psCloseMoDrawer()"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></svg></button>'+
+      '</div></div></div>';
+    if(d.status==='done'){
+        const num=(d.result && (d.result.number||d.result.num))||'';
+        const numJs=String(num).replace(/'/g,"\\'");
+        panel.innerHTML=head+'<div class="detail-body">'+
+            '<div class="pf-banner ok"><span class="pf-summary">'+psSpill('success','MO '+(num||'created')+' created')+'</span></div>'+
+            '<div class="dsec" style="display:flex;gap:8px">'+
+              (num?'<button class="ps-btn primary" onclick="openModule(\'Manufacture Order\',\''+numJs+'\')">Open MO '+psEsc(num)+'</button>':'')+
+              '<button class="ps-btn" onclick="psCloseMoDrawer()">Close</button></div></div>';
+        return;
+    }
+    const submitting = d.status==='submitting';
+    const partRows=d.parts.map(p=>'<tr><td><span class="pf-partn">'+psEsc(p.partNum)+'</span></td>'+
+        '<td class="mono" style="font-size:12px">'+psEsc(p.bomNum||('#'+p.bomId))+'</td>'+
+        '<td class="num"><input type="number" min="0" step="1" value="'+psEsc(String(p.qty))+'" onchange="psMoQty(\''+p.partId+'\',this.value)"></td></tr>').join('');
+    const lgOpts=(d.lgList||[]).map(l=>'<option value="'+l.id+'"'+(String(l.id)===String(d.lgId)?' selected':'')+'>'+psEsc(l.name)+'</option>').join('') || '<option value="">(no accessible location groups)</option>';
+    const cfs=psLoadMoCustomFields();
+    const cfHtml=cfs.map(c=>{
+        const nmJs=psEsc(String(c.name).replace(/\\/g,'\\\\').replace(/'/g,"\\'"));
+        const val=d.cf[c.name]!=null?String(d.cf[c.name]):'';
+        const lbl=psEsc(c.name)+(c.required?' <span style="color:var(--fb-negative)">*</span>':'');
+        let input;
+        if(c.options && c.options.length) input='<select onchange="psMoCf(\''+nmJs+'\',this.value)"><option value=""></option>'+c.options.map(o=>'<option'+(o===val?' selected':'')+'>'+psEsc(o)+'</option>').join('')+'</select>';
+        else if(c.type.indexOf('date')>=0) input='<input type="date" value="'+psEsc(val)+'" onchange="psMoCf(\''+nmJs+'\',this.value)">';
+        else if(c.type.indexOf('check')>=0||c.type.indexOf('bool')>=0) input='<span style="display:flex;align-items:center;gap:6px;height:34px"><input type="checkbox" '+(String(val).toLowerCase()==='true'?'checked':'')+' onchange="psMoCf(\''+nmJs+'\',this.checked?\'true\':\'false\')" style="height:16px;width:16px"><span style="font-weight:400;color:var(--c-primary)">Yes</span></span>';
+        else if(c.type.indexOf('number')>=0||c.type.indexOf('integer')>=0||c.type.indexOf('decimal')>=0||c.type.indexOf('quantity')>=0||c.type.indexOf('numeric')>=0) input='<input type="number" value="'+psEsc(val)+'" oninput="psMoCf(\''+nmJs+'\',this.value)">';
+        else input='<input type="text" value="'+psEsc(val)+'" oninput="psMoCf(\''+nmJs+'\',this.value)">';
+        return '<div class="mo-cf"><span class="mo-cf-lbl">'+lbl+'</span>'+input+'</div>';
+    }).join('');
+    panel.innerHTML=head+'<div class="detail-body">'+
+        (d.error?'<div class="pf-banner late"><span class="pf-summary">'+psSpill('critical', d.error)+'</span></div>':'')+
+        (d.noBom&&d.noBom.length?'<div class="alert-box" style="background:'+psHexA('#F7C23A',.16)+';color:var(--acc-yellow-con)"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M12 9v2m0 4h.01"/></svg>Skipped (no BOM): '+psEsc(d.noBom.join(', '))+'</div>':'')+
+        '<div class="dsec"><h4>Finished goods</h4><div class="pf-tablewrap"><table class="pf-table"><thead><tr><th>Part</th><th>BOM</th><th class="num">Qty</th></tr></thead><tbody>'+partRows+'</tbody></table></div></div>'+
+        '<div class="dsec"><h4>Order details</h4><div class="mo-form">'+
+          '<label><span>Location group</span><select onchange="psMoField(\'lgId\',this.value)">'+lgOpts+'</select></label>'+
+          '<label><span>Order status</span><select onchange="psMoField(\'moStatus\',this.value)">'+['Issued','Entered'].map(s=>'<option'+(s===(d.moStatus||'Issued')?' selected':'')+'>'+s+'</option>').join('')+'</select><span class="ds-toggle-help" style="margin-top:2px">Issued = live on the floor · Entered = suggestion (won\'t drive production until issued)</span></label>'+
+          '<label><span>Date scheduled</span><input type="date" value="'+psEsc(d.dateScheduled)+'" onchange="psMoField(\'dateScheduled\',this.value)"></label>'+
+          '<label><span>Note</span><textarea rows="2" oninput="psMoField(\'note\',this.value)">'+psEsc(d.note||'')+'</textarea></label>'+
+          cfHtml+
+        '</div></div>'+
+        '<div class="dsec" style="display:flex;gap:8px;justify-content:flex-end">'+
+          (submitting?'<button class="ps-btn primary" disabled>Creating…</button>':'<button class="ps-btn primary" onclick="psSubmitMo()">Create MO</button>')+
+          '<button class="ps-btn" onclick="psCloseMoDrawer()">Cancel</button>'+
+        '</div></div>';
+}
+
+async function psSubmitMo(){
+    const d=psMoDraft; if(!d || d.status==='submitting') return;
+    if(!d.lgId){ d.error='Choose a location group.'; psRenderMoDrawer(); return; }
+    const cfs=psLoadMoCustomFields();
+    const missing=cfs.filter(c=>c.required && !(d.cf[c.name]!=null && String(d.cf[c.name]).length)).map(c=>c.name);
+    if(missing.length){ d.error='Fill required custom field(s): '+missing.join(', '); psRenderMoDrawer(); return; }
+    const configs=d.parts.filter(p=>p.bomId && (parseFloat(p.qty)||0)>0).map(p=>({ bom:{ id:p.bomId }, quantity:String(parseFloat(p.qty)) }));
+    if(!configs.length){ d.error='Enter a quantity (>0) for at least one part.'; psRenderMoDrawer(); return; }
+    if(typeof runRestApiAsync!=='function'){ d.error='REST API unavailable — open this report inside Fishbowl with REST enabled to create MOs.'; psRenderMoDrawer(); return; }
+    // Create with the chosen order status: Issued (WOs live on the floor) or
+    // Entered (a suggestion that won't drive production until issued). Remember
+    // the choice per user for next time.
+    const moStatus = (d.moStatus === 'Entered') ? 'Entered' : 'Issued';
+    try { FBLib.Settings.setUserKey('moCreateStatus', moStatus); FBLib.Settings.saveUser(); } catch(_){}
+    const payload={ status:moStatus, locationGroup:{ id:d.lgId }, dateScheduled:d.dateScheduled+'T00:00:00', configurations:configs };
+    if(d.note && d.note.trim()) payload.note=d.note.trim();
+    const cfArr=cfs.map(c=>{ const v=d.cf[c.name]; return (v!=null && String(v).length)?{ name:c.name, value:String(v) }:null; }).filter(Boolean);
+    if(cfArr.length) payload.customFields=cfArr;
+    d.status='submitting'; d.error=null; psRenderMoDrawer();
+    try {
+        const res=await runRestApiAsync({ method:'POST', path:'/api/manufacture-orders', body:JSON.stringify(payload) });
+        d.status='done'; d.result=res; psRenderMoDrawer();
+        const num=(res && (res.number||res.num))||'';
+        showToast('MO '+(num||'created')+' created', 'success', 4000);
+        d.parts.forEach(p=>psProcureSel.delete(String(p.partId)));
+        // Refresh the Procurement tab (loadWorkOrders re-runs availability +
+        // re-renders the active view); belt-and-braces re-render in case the
+        // view didn't repaint.
+        if(typeof loadWorkOrders==='function') loadWorkOrders();
+        if(psView==='procure' && typeof renderProcure==='function') renderProcure();
+    } catch(err){
+        d.status='error';
+        d.error = 'MO create failed: '+((err && (err.message||err.status!=null)) ? (err.message||('HTTP '+err.status)) : 'unknown error');
+        psRenderMoDrawer();
+    }
+}
+
+// ── Create-PO drawer (Procurement → To Purchase, per vendor) ──
+// Mirrors the Create-MO flow: a confirmation drawer to review/adjust quantities
+// + unit costs, choose Bid Request vs Issued, then POST /api/purchase-orders.
+// Creating the PO does NOT notify the vendor — the drawer says so explicitly.
+function psPoMoney(v){
+    const n = Number(v) || 0;
+    try { if(window.FBLib && FBLib.Common && FBLib.Common.formatMoney) return FBLib.Common.formatMoney(n); } catch(_){}
+    return n.toFixed(2);
+}
+function psClosePoDrawer(){ const p=document.getElementById('poPanel'), s=document.getElementById('poScrim'); if(p) p.classList.remove('on'); if(s) s.classList.remove('on'); psPoDraft=null; }
+function psPoField(f,v){ if(psPoDraft) psPoDraft[f]=v; }
+// qty/cost use onchange (fires on blur) so a full re-render to refresh the line +
+// grand totals doesn't steal focus mid-typing.
+// A part is ordered in whole units when its UOM is Each (code "ea"/"each"); qty is
+// then constrained to integers. Other UOMs (kg, m, L, …) allow fractional qty.
+function psPoIsEach(p){ return /^(ea|each)$/i.test(String(p && p.uom || '').trim()); }
+function psPoQty(pid,v){ if(!psPoDraft) return; const p=psPoDraft.parts.find(x=>String(x.partId)===String(pid)); if(p){ if(psPoIsEach(p)){ let n=Math.round(parseFloat(v)||0); p.qty=String(Math.max(0,n)); } else p.qty=v; } psRenderPoDrawer(); }
+// Unit cost is currency — normalise to 2 decimal places on entry.
+function psPoCost(pid,v){ if(!psPoDraft) return; const p=psPoDraft.parts.find(x=>String(x.partId)===String(pid)); if(p){ const n=parseFloat(v); p.unitCost=(isFinite(n)&&n>=0)?n.toFixed(2):'0.00'; } psRenderPoDrawer(); }
+
+// Open the Create-PO drawer for one vendor group (all that vendor's shortage rows).
+function psOpenCreatePo(vendorKey){
+    const { buy } = psProcureData();
+    const groupRows = buy.filter(r => (r.vendorName||'__NOVENDOR__') === vendorKey);
+    if(!groupRows.length){ showToast('No parts to purchase for this vendor','info'); return; }
+    const vRow = groupRows.find(r=>r.vendorId!=null);
+    if(!vRow){ showToast('These parts have no vendor — cannot create a PO','error',5000); return; }
+    // Default order qty = the shortfall (rounded up), BUT bumped to the vendor's
+    // minimum order qty (vendorparts.qtyMin) when the MOQ is larger. moqApplied
+    // flags the rows where the MOQ raised the qty so the drawer can say so.
+    const parts = groupRows.map(r=>{
+        const shortCeil = Math.max(1, Math.ceil(Number(r.short)||0));
+        const moq = (r.qtyMin!=null && r.qtyMin>0) ? r.qtyMin : 0;
+        const moqApplied = moq > shortCeil;
+        return {
+            partId:String(r.partId), partNum:r.partNum, partDesc:r.partDesc||'', uom:r.uom||'',
+            vendorPartNum:r.vendorPartNum||'', qtyMin:moq, shortCeil:shortCeil, moqApplied:moqApplied,
+            qty:(moqApplied ? moq : shortCeil),
+            unitCost:(r.lastCost!=null ? r.lastCost : 0),
+            needBy:(r.earliest?r.earliest.clone():null)
+        };
+    });
+    let lgList=[];
+    try { const ids=(typeof getLocationGroupList==='function'?getLocationGroupList():[])||[];
+          lgList = JSON.parse(runQuery('SELECT id, name FROM locationgroup WHERE activeflag = 1'+(ids.length?(' AND id IN ('+ids.join(',')+')'):'')+' ORDER BY name')); }
+    catch(_){ lgList=[]; }
+    // Default scheduled date = the earliest line need-by across the group (falls
+    // back to today when no line has one). The user can override it in the drawer;
+    // it is applied to every poItem's dateScheduled on submit.
+    let schedDef=null; parts.forEach(p=>{ if(p.needBy && (!schedDef || p.needBy.isBefore(schedDef))) schedDef=p.needBy.clone(); });
+    // Default the PO's LG to the LG the shortage actually sits in (the earliest-
+    // needed row's lgId — which is the consuming WO's location_group_id, the SAME
+    // field the availability engine consumes on). This guarantees the incoming
+    // supply lands in the pool the demand draws from. Fall back to the user's
+    // default LG only when the demand LG isn't in the accessible list.
+    let poLg = psInitialLg(lgList);
+    const poEr = groupRows.slice().sort((a,b)=>{ const av=a.earliest?a.earliest.valueOf():Infinity, bv=b.earliest?b.earliest.valueOf():Infinity; return av-bv; })[0];
+    if(poEr && poEr.lgId && lgList.some(l=>String(l.id)===String(poEr.lgId))) poLg = String(poEr.lgId);
+    psPoDraft = {
+        vendorId: vRow.vendorId, vendorName: (vendorKey==='__NOVENDOR__'?'':vendorKey),
+        parts, lgList, lgId:poLg,
+        poStatus:'Issued',   // 'Bid Request' | 'Issued'
+        dateScheduled:(schedDef||moment()).format('YYYY-MM-DD'),
+        note:'',
+        state:'idle', error:null, result:null
+    };
+    psRenderPoDrawer();
+    const p=document.getElementById('poPanel'), s=document.getElementById('poScrim');
+    if(p) p.classList.add('on'); if(s) s.classList.add('on');
+}
+
+function psRenderPoDrawer(){
+    const d=psPoDraft, panel=document.getElementById('poPanel'); if(!panel||!d) return;
+    const head='<div class="detail-head"><div class="top"><div class="detail-head-main">'+
+        '<h2>Create Purchase Order</h2>'+
+        '<div class="sub">'+psEsc(d.vendorName||'Vendor')+' · '+d.parts.length+' line'+(d.parts.length===1?'':'s')+'</div>'+
+      '</div><div class="detail-actions">'+
+        '<button class="close-x" onclick="psClosePoDrawer()"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></svg></button>'+
+      '</div></div></div>';
+    // Reminder that PO creation does not email the vendor.
+    const sendNote='<div class="alert-box" style="background:'+psHexA('#2d9cdb',.10)+';color:var(--fb-blue-accent)"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>This creates the PO in Fishbowl only — you’ll still need to email or send it to the vendor manually.</div>';
+    if(d.state==='done'){
+        const num=(d.result && (d.result.number||d.result.num))||'';
+        const numJs=String(num).replace(/'/g,"\\'");
+        const st=(d.result && d.result.status) || d.poStatus;
+        panel.innerHTML=head+'<div class="detail-body">'+
+            '<div class="pf-banner ok"><span class="pf-summary">'+psSpill('success','PO '+(num||'created')+' created'+(st?(' · '+st):''))+'</span></div>'+
+            sendNote+
+            '<div class="dsec" style="display:flex;gap:8px">'+
+              (num?'<button class="ps-btn primary" onclick="openModule(\'Purchase Order\',\''+numJs+'\')">Open PO '+psEsc(num)+'</button>':'')+
+              '<button class="ps-btn" onclick="psClosePoDrawer()">Close</button></div></div>';
+        return;
+    }
+    const submitting = d.state==='submitting';
+    // Home-currency symbol for the unit-cost field (falls back to "$").
+    let poSym='$'; try{ const _loc=(typeof currencyLocale==='function')?currencyLocale():null; if(_loc&&_loc.symbol) poSym=_loc.symbol; }catch(_){}
+    let grand=0;
+    const partRows=d.parts.map(p=>{
+        const q=parseFloat(p.qty)||0, c=parseFloat(p.unitCost)||0, line=q*c; grand+=line;
+        // Each-UOM lines step by 1 (integers); other UOMs allow fractional qty.
+        const isEach = psPoIsEach(p);
+        // MOQ note under the qty input: amber "· set to MOQ" while the qty is at
+        // the (larger-than-shortfall) minimum, else a muted "MOQ N" reference.
+        const atMoq = p.qtyMin>0 && p.qtyMin>(p.shortCeil||0) && q===p.qtyMin;
+        const moqNote = (p.qtyMin>0)
+            ? '<div style="font-size:10px;margin-top:2px;color:'+(atMoq?'var(--fb-warning)':'var(--c-tertiary)')+'" title="Vendor minimum order quantity">MOQ '+psEsc(psFmtQty(p.qtyMin))+(atMoq?' · set to MOQ':'')+'</div>'
+            : '';
+        return '<tr><td><span class="pf-partn">'+psEsc(p.partNum)+'</span>'+(p.partDesc?'<div class="pf-desc">'+psEsc(p.partDesc)+'</div>':'')+'</td>'+
+            '<td class="mono" style="font-size:12px">'+psEsc(p.vendorPartNum||'—')+'</td>'+
+            '<td class="num"><input type="number" min="0" step="'+(isEach?'1':'0.001')+'" value="'+psEsc(String(p.qty))+'" onchange="psPoQty(\''+p.partId+'\',this.value)">'+moqNote+'</td>'+
+            '<td class="num"><span style="display:inline-flex;align-items:center;gap:3px;justify-content:flex-end"><span style="color:var(--c-tertiary)">'+psEsc(poSym)+'</span><input type="number" min="0" step="0.01" value="'+psEsc(Number(c).toFixed(2))+'" onchange="psPoCost(\''+p.partId+'\',this.value)"></span></td>'+
+            '<td class="num">'+psEsc(psPoMoney(line))+'</td></tr>';
+    }).join('');
+    const lgOpts=(d.lgList||[]).map(l=>'<option value="'+l.id+'"'+(String(l.id)===String(d.lgId)?' selected':'')+'>'+psEsc(l.name)+'</option>').join('') || '<option value="">(no accessible location groups)</option>';
+    const statusOpts=['Bid Request','Issued'].map(s=>'<option'+(s===d.poStatus?' selected':'')+'>'+s+'</option>').join('');
+    panel.innerHTML=head+'<div class="detail-body">'+
+        (d.error?'<div class="pf-banner late"><span class="pf-summary">'+psSpill('critical', d.error)+'</span></div>':'')+
+        sendNote+
+        '<div class="dsec"><h4>Line items</h4><div class="pf-tablewrap"><table class="pf-table"><thead><tr><th>Part</th><th>Vendor part #</th><th class="num">Qty</th><th class="num">Unit cost</th><th class="num">Line total</th></tr></thead><tbody>'+partRows+
+          '<tr><td colspan="4" class="num" style="font-weight:700">Total</td><td class="num" style="font-weight:700">'+psEsc(psPoMoney(grand))+'</td></tr>'+
+        '</tbody></table></div></div>'+
+        '<div class="dsec"><h4>Order details</h4><div class="mo-form">'+
+          '<label><span>Location group</span><select onchange="psPoField(\'lgId\',this.value)">'+lgOpts+'</select></label>'+
+          '<label><span>Scheduled date</span><input type="date" value="'+psEsc(d.dateScheduled||'')+'" onchange="psPoField(\'dateScheduled\',this.value)"></label>'+
+          '<label><span>Order status</span><select onchange="psPoField(\'poStatus\',this.value)">'+statusOpts+'</select></label>'+
+          '<label><span>Note</span><textarea rows="2" oninput="psPoField(\'note\',this.value)">'+psEsc(d.note||'')+'</textarea></label>'+
+        '</div></div>'+
+        '<div class="dsec" style="display:flex;gap:8px;justify-content:flex-end">'+
+          (submitting?'<button class="ps-btn primary" disabled>Creating…</button>':'<button class="ps-btn primary" onclick="psSubmitPo()">Create PO</button>')+
+          '<button class="ps-btn" onclick="psClosePoDrawer()">Cancel</button>'+
+        '</div></div>';
+}
+
+async function psSubmitPo(){
+    const d=psPoDraft; if(!d || d.state==='submitting') return;
+    if(!d.vendorId){ d.error='No vendor on this order.'; psRenderPoDrawer(); return; }
+    if(!d.lgId){ d.error='Choose a location group.'; psRenderPoDrawer(); return; }
+    // Payload shape follows the documented POST /api/purchase-orders create body
+    // (Fishbowl_Advanced_API_Tool "Create PO"): a poItem carries a numeric
+    // quantity + totalCost — the LINE total (qty × unit cost); there is NO unitCost
+    // field on create. part.name = the part number, type.id 10 = Purchase, and
+    // dateScheduled = the line's scheduled fulfillment date.
+    // The order-level scheduled date (chosen in the drawer) applies to every line;
+    // fall back to the line's own need-by only if it is somehow blank/invalid.
+    const orderSched=(d.dateScheduled && /^\d{4}-\d{2}-\d{2}$/.test(d.dateScheduled)) ? d.dateScheduled : null;
+    const items=d.parts.filter(p=>(parseFloat(p.qty)||0)>0).map(p=>{
+        const qty=parseFloat(p.qty)||0, unit=parseFloat(p.unitCost)||0;
+        const it={ part:{ id:parseInt(p.partId,10), name:p.partNum }, type:{ id:10 },
+                   quantity:qty, totalCost:Number((qty*unit).toFixed(4)) };
+        if(p.vendorPartNum) it.vendorPartNumber=p.vendorPartNum;
+        const sched = orderSched || (p.needBy ? p.needBy.format('YYYY-MM-DD') : null);
+        if(sched) it.dateScheduled=sched+'T00:00:00';
+        return it;
+    });
+    if(!items.length){ d.error='Enter a quantity (>0) for at least one line.'; psRenderPoDrawer(); return; }
+    if(typeof runRestApiAsync!=='function'){ d.error='REST API unavailable — open this report inside Fishbowl with REST enabled to create POs.'; psRenderPoDrawer(); return; }
+    const payload={ vendor:{ id:d.vendorId }, status:d.poStatus, locationGroup:{ id:d.lgId }, poItems:items };
+    if(d.note && d.note.trim()) payload.note=d.note.trim();
+    d.state='submitting'; d.error=null; psRenderPoDrawer();
+    try {
+        const res=await runRestApiAsync({ method:'POST', path:'/api/purchase-orders', body:JSON.stringify(payload) });
+        d.state='done'; d.result=res; psRenderPoDrawer();
+        const num=(res && (res.number||res.num))||'';
+        showToast('PO '+(num||'created')+' created', 'success', 4000);
+        // Refresh the Procurement tab so the now-covered parts drop off.
+        if(typeof loadWorkOrders==='function') loadWorkOrders();
+    } catch(err){
+        d.state='error';
+        d.error = 'PO create failed: '+((err && (err.message||err.status!=null)) ? (err.message||('HTTP '+err.status)) : 'unknown error');
+        psRenderPoDrawer();
+    }
+}
+
+// ESC closes the top procurement drawer (PO in front of MO) when open.
+document.addEventListener('keydown', e=>{
+    if(e.key!=='Escape') return;
+    const pp=document.getElementById('poPanel');
+    if(pp && pp.classList.contains('on')){ psClosePoDrawer(); return; }
+    const mp=document.getElementById('moPanel');
+    if(mp && mp.classList.contains('on')) psCloseMoDrawer();
+});
+
+let psCalMonth = null; // moment for the month shown in the Calendar tab
+function psCalPrev(){ psCalMonth=(psCalMonth||moment()).clone().subtract(1,'month'); renderCalendarView(); }
+function psCalNext(){ psCalMonth=(psCalMonth||moment()).clone().add(1,'month'); renderCalendarView(); }
+function psCalToday(){ psCalMonth=moment().startOf('month'); renderCalendarView(); }
+function renderCalendarView(){
+    const host=document.getElementById('calendarView'); if(!host) return;
+    const list=filteredWorkOrders;
+    if(!psCalMonth) psCalMonth=moment().startOf('month');
+    const first=psCalMonth.clone().startOf('month');
+    const dows=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+    const navBar='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;gap:12px;flex-wrap:wrap">'+
+        '<div style="display:flex;align-items:center;gap:8px">'+
+          '<button class="ps-btn icon" onclick="psCalPrev()" title="Previous month"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/></svg></button>'+
+          '<button class="ps-btn" onclick="psCalToday()">Today</button>'+
+          '<button class="ps-btn icon" onclick="psCalNext()" title="Next month"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg></button>'+
+          '<h3 style="font-size:17px;font-weight:800;margin:0 0 0 6px;color:var(--c-primary)">'+first.format('MMMM YYYY')+'</h3>'+
+        '</div>'+
+        '<div class="hint">Bars span each WO\'s scheduled window · click a chip for detail</div></div>';
+    if(!list.length){ host.innerHTML=navBar+psEmptyState(); return; }
+    const gridStart=first.clone().startOf('week');
+    let cells='';
+    for(let i=0;i<42;i++){
+        const d=gridStart.clone().add(i,'days');
+        const oth=d.month()!==first.month();
+        const today=d.isSame(moment(),'day');
+        const dayWOs=list.filter(w=> moment(w.date_scheduled_start).startOf('day').isSameOrBefore(d,'day') && moment(w.date_scheduled).startOf('day').isSameOrAfter(d,'day'));
+        const chips=dayWOs.slice(0,3).map(w=>{
+            const c=psCatColor(w); const late=psIsLate(w);
+            return '<span class="cal-chip" style="background:'+c+';color:'+psReadableText(c)+(late?';box-shadow:inset 0 0 0 2px var(--fb-negative)':'')+'" onclick="event.stopPropagation();openDetail('+w.wo_id+')">'+psEsc(w.wo_num)+' '+psEsc(w.part_num||'')+'</span>';
+        }).join('');
+        const more=dayWOs.length>3?'<span class="cal-more">+'+(dayWOs.length-3)+' more</span>':'';
+        cells+='<div class="cal-cell'+(oth?' oth':'')+(today?' today':'')+'"><div class="dn">'+d.date()+'</div>'+chips+more+'</div>';
+    }
+    host.innerHTML=navBar+
+        '<div class="cal"><div class="cal-head">'+dows.map(x=>'<div>'+x+'</div>').join('')+'</div>'+
+        '<div class="cal-grid">'+cells+'</div></div>';
+}
+
+// ── WO detail drawer ─────────────────────────────────────────
+function openDetail(woId){
+    const w=allWorkOrders.find(x=>String(x.wo_id)===String(woId)); if(!w) return;
+    const blocked=psBlockedSet();
+    const mo=psMoForWO(w);
+    let alerts='';
+    if(psIsLate(w)) alerts+='<div class="alert-box" style="background:#F0D7DD;color:var(--fb-negative)"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path stroke-linecap="round" d="M12 8v4m0 4h.01"/></svg>Due '+psFmtDate(psDue(w))+' — scheduled finish '+psFmtDate(w.date_scheduled)+' is at/after due.</div>';
+    if(blocked.has(w.wo_id)) alerts+='<div class="alert-box" style="background:'+psHexA('#845EEB',.12)+';color:var(--acc-magenta-con)"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11z"/></svg>Starts before an upstream WO is finished.</div>';
+    if(psIsShort(w)) alerts+='<div class="alert-box" style="background:'+psHexA('#F7C23A',.16)+';color:var(--acc-yellow-con)"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7"/></svg>Raw goods short — check purchasing.</div>';
+    const field=(k,v)=>'<div class="dfield"><div class="k">'+k+'</div><div class="v">'+v+'</div></div>';
+    const woNumJs = String(w.wo_num).replace(/'/g,"\\'");
+    const pk = psPickInfo(w);
+    const pickLinks = (w._pickNums && w._pickNums.length)
+        ? w._pickNums.map(n => '<a href="#" onclick="event.preventDefault();openModule(\'Picking\',\'' + String(n).replace(/'/g, "\\'") + '\')" style="color:var(--link);font-family:var(--mono)">' + psEsc(n) + '</a>').join(', ')
+        : '—';
+    // Material summary — mirror the availability engine's verdict so it never
+    // reads a flat "Available" for a WO that's only covered by overdue/incoming
+    // supply. Falls back to the crude short flag when availability isn't computed.
+    let matHtml;
+    {
+        const _mi = (psAvailReady && w._av) ? psAvInfo(w) : null;
+        if (_mi) {
+            const _mc = _mi.tone === 'critical' ? 'var(--fb-negative)'
+                      : _mi.tone === 'caution' ? 'var(--fb-warning)'
+                      : _mi.tone === 'success' ? 'var(--acc-teal-con)'
+                      : 'var(--fb-blue-accent)';
+            matHtml = '<span style="color:' + _mc + ';font-weight:700">' + psEsc(_mi.label) + '</span>';
+        } else {
+            matHtml = psIsShort(w)
+                ? '<span style="color:var(--fb-negative);font-weight:700">Raw goods short</span>'
+                : '<span style="color:var(--acc-teal-con);font-weight:700">Available</span>';
+        }
+    }
+    // Component Availability — collapsible. Finish eligibility + the default
+    // collapsed/expanded state are driven by availability:
+    //   • all components on hand (state 'now') → collapse the list, show Finish WO
+    //   • a component is Not Met (state 'unmet') → keep it open, HIDE Finish WO
+    //   • otherwise (future ETA / contended) → keep it open, still allow Finish
+    const ai = (psAvailReady && w._av) ? psAvInfo(w) : null;
+    const allAvailable = !!ai && (ai.state === 'now' || ai.state === 'done');
+    // Default state on a fresh WO: collapsed only when everything is available.
+    if (String(_avDetailWoId) !== String(woId)) psAvailExpanded = !allAvailable;
+    _avDetailWoId = woId;
+    // Finish WO — shown when the admin has enabled it AND the user may see it
+    // (no group restriction, the user is an admin, or the user is in the allowed
+    // group), and the WO isn't already fulfilled. Admins ALWAYS see it — being an
+    // admin overrides any user-group restriction. Availability is NOT used to hide
+    // the button: the finish drawer runs its own preflight and blocks/explains if
+    // the WO genuinely can't be finished, so a committed/pickable WO that the crude
+    // availability flag marked "unmet" (material already staged) still gets it.
+    const finishEnabled = !!FBLib.Settings.resolve('enableFinishWO');
+    const finishGroupId = FBLib.Settings.resolve('finishWOGroupId');
+    const finishGroupOk = !finishGroupId || FBLib.Settings.isAdmin() || currentUserGroupIds.has(String(finishGroupId));
+    const finishBtn = (finishEnabled && finishGroupOk && w.wo_status !== 40) ?
+        '<button class="ps-btn success sm" onclick="psFinishWO(' + w.wo_id + ')" title="Finish this work order in Fishbowl"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg>Finish WO</button>' : '';
+    let availSection = '';
+    if (psAvailReady && w._av) {
+        const chev = psAvailExpanded
+            ? '<svg fill="none" stroke="currentColor" stroke-width="2.4" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 9l6 6 6-6"/></svg>'
+            : '<svg fill="none" stroke="currentColor" stroke-width="2.4" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 6l6 6-6 6"/></svg>';
+        availSection =
+            '<div class="dsec"><h4 class="dsec-h">Raw Goods Availability' + finishBtn + '</h4>' +
+              '<div class="avail-head" onclick="psToggleAvail()">' +
+                '<span class="avail-chevron">' + chev + '</span>' +
+                psSpill(ai.tone, ai.label) +
+                '<span class="avail-note">indicative — may not match scheduled dates</span>' +
+              '</div>' +
+              (psAvailExpanded ? psAvailPartsHTML(w) : '') +
+            '</div>';
+    } else if (finishBtn) {
+        // No availability data computed — still surface the Finish WO action.
+        availSection = '<div class="dsec"><h4 class="dsec-h">Actions' + finishBtn + '</h4></div>';
+    }
+    // Shared values for the inline (pencil-toggle) editors in the Schedule +
+    // Production sections below.
+    const _ds = moment(w.date_scheduled_start), _de = moment(w.date_scheduled);
+    const startVal = _ds.isValid() ? _ds.format('YYYY-MM-DDTHH:mm') : '';
+    const endVal   = _de.isValid() ? _de.format('YYYY-MM-DDTHH:mm') : '';
+    const catOpts = (capacitySettings.categories || []).slice()
+        .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+        .map(c => '<option value="' + c.id + '"' + (String(c.id) === String(w.calcategory_id) ? ' selected' : '') + '>' + psEsc(c.name) + '</option>').join('');
+    // Small pencil button that toggles an inline section editor.
+    const pencilBtn = fn => '<button class="ps-edit" onclick="' + fn + '" title="Edit"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/></svg></button>';
+    document.getElementById('detailPanel').innerHTML=
+      '<div class="detail-head"><div class="top">'+
+        '<div class="detail-head-main">'+
+          '<span class="wo">'+psEsc(w.wo_num)+'</span>'+
+          '<h2>'+psEsc(w.description||w.part_num||w.wo_num)+'</h2>'+
+          '<div class="sub"><span class="mono">'+psEsc(w.part_num||'')+'</span> · MO '+psEsc(w.mo_num)+(psCustomer(w)?' · '+psEsc(psCustomer(w)):'')+'</div>'+
+          '<div style="display:flex;gap:8px;margin-top:12px;align-items:center;flex-wrap:wrap">'+psPillHTML(w.wo_status)+psTagHTML(w)+psPriHTML(w)+'</div>'+
+        '</div>'+
+        '<div class="detail-actions">'+
+          '<button class="close-x" onclick="closeDetail()"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></svg></button>'+
+          '<button class="ps-btn primary sm" onclick="openModule(\'Work Order\',\''+woNumJs+'\')" title="Open this WO in Fishbowl"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M14 5l7 7-7 7M3 12h18"/></svg>Open in Fishbowl</button>'+
+          '<button class="ps-btn sm" onclick="psShowWOOnTimeline('+w.wo_id+')" title="Show this WO on the Timeline"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h12M4 12h16M4 18h9"/></svg>Timeline</button>'+
+        '</div>'+
+      '</div></div>'+
+      '<div class="detail-body">'+
+        (alerts?'<div class="dsec">'+alerts+'</div>':'')+
+        '<div class="dsec"><h4 class="dsec-h">Schedule '+pencilBtn('psSchedEditToggle(true)')+'</h4>'+
+          '<div class="dgrid" id="psSchedView">'+
+            field('Scheduled Start',psFmtDateTime(w.date_scheduled_start))+field('Scheduled Finish',psFmtDateTime(w.date_scheduled))+
+            field('Due Date','<span style="color:'+(psIsLate(w)?'var(--fb-negative)':'inherit')+'">'+psFmtDate(psDue(w))+'</span>')+
+            field('Est. Labor',(w.total_hours!=null?Math.round(w.total_hours*10)/10+' h':'—'))+'</div>'+
+          '<div class="dedit" id="psSchedEdit" style="display:none;margin-top:10px">'+
+            '<label>Start<input type="datetime-local" id="psDrawerStart" value="'+startVal+'"></label>'+
+            '<label>Finish<input type="datetime-local" id="psDrawerEnd" value="'+endVal+'"></label>'+
+            '<div class="dedit-actions" style="grid-column:1 / -1">'+
+              '<button class="ps-btn primary" onclick="psApplySchedEdit('+w.wo_id+')">Apply</button>'+
+              '<button class="ps-btn" onclick="psSchedEditToggle(false)">Cancel</button>'+
+            '</div>'+
+          '</div></div>'+
+        '<div class="dsec"><h4 class="dsec-h">Production '+pencilBtn('psCatEditToggle(true)')+'</h4><div class="dgrid">'+
+          field('User',psEsc(psUserName(w)))+field('Quantity',psEsc(w.qty_target!=null?w.qty_target+' ea':'—'))+
+          field('LG',psEsc(w.site_name||'—'))+
+          field('Location',psEsc(w.resource_name||'—'))+
+          field('Customer PO','<span class="mono">'+psEsc(mo.customer_po||'—')+'</span>')+
+          field('BOM','<span class="mono">'+psEsc(w.bom_num||mo.bom_num||'—')+'</span>')+
+          field('Category',psTagHTML(w))+
+          field('Priority',psEsc(psPriority(w)||'—'))+
+          field('Demand',psDemandHTML(w))+
+          (psCfDefs||[]).filter(d=>w._cf && w._cf[d.key]).map(d=>field(d.label, psEsc(w._cf[d.key]))).join('')+
+        '</div>'+
+          '<div class="dedit" id="psCatEdit" style="display:none;margin-top:10px">'+
+            '<label>Category<select id="psDrawerCat" data-orig="'+psEsc(String(w.calcategory_id||0))+'">'+(catOpts||'<option value="0">Uncategorized</option>')+'</select></label>'+
+            '<div class="dedit-actions" style="grid-column:1 / -1">'+
+              '<button class="ps-btn primary" onclick="psApplyCatEdit('+w.wo_id+')">Apply</button>'+
+              '<button class="ps-btn" onclick="psCatEditToggle(false)">Cancel</button>'+
+            '</div>'+
+          '</div></div>'+
+        '<div class="dsec"><h4>Fulfillment</h4><div class="dgrid">'+
+          field('Pick status', psSpill(pk.tone, pk.label, { icon: pk.lock ? PS_LOCK_SVG : '' }))+
+          field('Pick #',pickLinks)+
+          field('Material',matHtml)+
+          field('WO status',psPillHTML(w.wo_status))+
+        '</div></div>'+
+        availSection+
+      '</div>';
+    document.getElementById('detailPanel').classList.add('on');
+    document.getElementById('detailScrim').classList.add('on');
+}
+function closeDetail(){
+    const p=document.getElementById('detailPanel'), s=document.getElementById('detailScrim');
+    if(p) p.classList.remove('on'); if(s) s.classList.remove('on');
+}
+// ESC closes the TOP drawer only. When a finish/tracking drawer is open,
+// PSFinish.escHandled() pops that stack tier and returns true so the detail
+// drawer stays put; otherwise fall through to the original closeDetail().
+document.addEventListener('keydown', e=>{
+    if(e.key!=='Escape') return;
+    if(window.PSFinish && PSFinish.escHandled && PSFinish.escHandled()) return;
+    closeDetail();
+});
+
+/* ============================================================
+   v1.2 WO FINISH — ported from Work_Order_WIP.htm
+   ------------------------------------------------------------
+   Everything the finish flow needs, wrapped in one IIFE so the
+   source's helper names (toNumber, deepClone, lc, dbg, CFG, …)
+   never collide with the scheduler's globals. Public surface:
+     PSFinish.open(woId)   — open the finish drawer for a WO
+     PSFinish.closeTop()   — pop the top drawer (scrim clicks)
+     PSFinish.escHandled() — ESC integration (returns bool)
+   Plus a handful of window.* handlers the drawer markup calls.
+
+   The Finisher engine (helpers, stock SQL, allocation, SavePick /
+   SaveWorkOrder payload builders, prepareFinish) is copied VERBATIM
+   from the proven source — do not rewrite it. The UI (finish drawer +
+   tracking drawer) is re-authored onto this report's drawer chrome.
+
+   woRow mapping (scheduler WO → source woRow shape):
+     wo_num          ← wo.wo_num
+     mo_num          ← wo.mo_num
+     pick_num        ← wo._pickNums[0]  (else 'W' + wo.wo_num)
+     locationgroupid ← wo.location_group_id
+     fg_part         ← wo.part_num
+     location_group  ← ''  (name unknown; resolveFgLocationId only
+                            needs locationgroupid + fg_part)
+     qty_target      ← wo.qty_target
+
+   Scrap is OUT OF SCOPE for this port (phase 2) — finish consumes
+   Used = target with no scrap rows.
+   ============================================================ */
+const PSFinish = (function () {
+    'use strict';
+
+    // Alias fb-lib helpers; the source engine leans on C.escSQL /
+    // C.formatQty and a DEBUG_MODE flag. All optional-guarded.
+    var C = (window.FBLib && FBLib.Common) || {};
+    // Wire the module's debug + qty format to the host's helpers.
+    function dbg(m, t) { try { debugLog(t || 'info', '[PSFinish] ' + m); } catch (_) {} }
+    function fmtQty(v) {
+        try { return psFmtQty(v); }
+        catch (_) { try { return C.formatQty(v); } catch (e) { var n = parseFloat(v); return isNaN(n) ? '' : String(n); } }
+    }
+    function fmtDate(v) { try { return C.formatDate(v); } catch (_) { return String(v || '').slice(0, 10); } }
+    function esc(s) { return psEsc(s); }
+
+    // ── Query helper (mirrors source qp; prefers runQueryAsync) ──
+    function norm(r) {
+        if (r == null) return [];
+        if (typeof r === 'string') { try { var p = JSON.parse(r); return Array.isArray(p) ? p : []; } catch (_) { return []; } }
+        return Array.isArray(r) ? r : [];
+    }
+    function qp(sql) {
+        if (typeof runQueryAsync === 'function') {
+            return runQueryAsync(sql).then(norm).catch(function (e) {
+                dbg('qp fallback sync: ' + e.message, 'warn');
+                return norm(runQuery(sql));
+            });
+        }
+        return Promise.resolve(norm(runQuery(sql)));
+    }
+
+    // ── FG serial parsers (verbatim) ────────────────────────────
+    function generateFgSerials(seed, count) {
+        var s = String(seed || '');
+        var m = s.match(/^(.*?)(\d+)$/);
+        var prefix, startNum, pad;
+        if (m) { prefix = m[1]; startNum = parseInt(m[2], 10); pad = m[2].length; }
+        else { prefix = s + (s ? '-' : ''); startNum = 1; pad = Math.max(3, String(count).length); }
+        var out = [];
+        for (var i = 0; i < count; i++) { out.push(prefix + String(startNum + i).padStart(pad, '0')); }
+        return out;
+    }
+    function parseFgSerials(text) {
+        return String(text || '').split(/[\r\n,]+/).map(function (s) { return s.trim(); }).filter(Boolean);
+    }
+    function effectiveUsedQty(line) {
+        if (!line) return 0;
+        var v = line.usedInput;
+        if (v == null || v === '') return Number(line.target) || 0;
+        var n = parseFloat(v);
+        return Number.isFinite(n) ? n : (Number(line.target) || 0);
+    }
+    // Scrapped is opt-in — blank falls back to 0 (nothing to scrap).
+    function effectiveScrapQty(line) {
+        if (!line) return 0;
+        var v = line.scrappedInput;
+        if (v == null || v === '') return 0;
+        var n = parseFloat(v);
+        return Number.isFinite(n) ? n : 0;
+    }
+
+    // ============================================================
+    // SCRAP ENGINE — ported from Work_Order_WIP.htm
+    // ------------------------------------------------------------
+    // When a raw-material line carries a non-zero Scrapped qty, Finish
+    // routes it through Fishbowl's Import API (ImportScrapData) via the
+    // synchronous runApiRequest bridge — resolve a location, allocate
+    // tags/serials FIFO, build a CSV, POST. The import is interleaved
+    // between the SavePickRq commit and the SaveWorkOrderRq so any
+    // failure surfaces before the WO is marked Fulfilled.
+    // Manual per-tag/serial scrap selection (WO_WIP's scrap modal) is
+    // NOT ported — allocation is always FIFO-auto.
+    // ============================================================
+    var _scrapImp = null;   // cached ImportScrapData header; reset per finish
+    function csvEsc(v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; }
+    function scrapParseCsvLine(line) {
+        var out = [], cur = '', inq = false;
+        for (var i = 0; i < line.length; i++) {
+            var ch = line[i];
+            if (inq) { if (ch === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else inq = false; } else cur += ch; }
+            else { if (ch === '"') inq = true; else if (ch === ',') { out.push(cur); cur = ''; } else cur += ch; }
+        }
+        out.push(cur);
+        return out.map(function (s) { return s.trim(); });
+    }
+    function extractImportHeader(r) {
+        var h = r && r.ImportHeaderRs && r.ImportHeaderRs.Header;
+        if (h == null) return null;
+        if (h && typeof h === 'object' && !Array.isArray(h)) h = h.Row;
+        if (typeof h === 'string') return scrapParseCsvLine(h);
+        if (Array.isArray(h)) {
+            if (h.length === 1 && typeof h[0] === 'string' && h[0].indexOf(',') >= 0) return scrapParseCsvLine(h[0]);
+            return h.map(function (x) { return String(x).replace(/^"|"$/g, '').trim(); });
+        }
+        return null;
+    }
+    function ensureScrapImportHeader() {
+        if (_scrapImp) return _scrapImp;
+        if (typeof runApiRequest !== 'function') throw new Error('Import API (runApiRequest) is not available — cannot scrap without it.');
+        var resp = runApiRequest('ImportHeaderRq', JSON.stringify({ ImportHeaderRq: { Type: 'ImportScrapData' } }));
+        var r = typeof resp === 'string' ? JSON.parse(resp) : resp;
+        var header = extractImportHeader(r);
+        if (!Array.isArray(header) || !header.length) throw new Error('Could not parse ImportScrapData header: ' + JSON.stringify(r));
+        function normHdr(s) { return String(s == null ? '' : s).toLowerCase().replace(/[^a-z0-9]/g, ''); }
+        function find(patterns) {
+            for (var k = 0; k < patterns.length; k++) {
+                var i = header.findIndex(function (h) { return patterns[k].test(normHdr(h)); });
+                if (i >= 0) return i;
+            }
+            return -1;
+        }
+        var partIdx = find([/^partnumber$/, /^partnum$/, /partnumber/]);
+        var locIdx  = find([/^location$/, /^locationname$/]);
+        var qtyIdx  = find([/^qty$/, /^quantity$/]);
+        var noteIdx = find([/^note$/]);
+        var dateIdx = find([/^date$/]);
+        if (partIdx < 0) throw new Error('No PartNumber column in ImportScrapData header: ' + header.join(', '));
+        if (locIdx  < 0) throw new Error('No Location column in ImportScrapData header: ' + header.join(', '));
+        if (qtyIdx  < 0) throw new Error('No Qty column in ImportScrapData header: ' + header.join(', '));
+        var trackingCols = [];
+        header.forEach(function (h, i) { if (/^tracking/.test(normHdr(h))) trackingCols.push({ i: i, name: h, norm: normHdr(h) }); });
+        _scrapImp = { header: header, partIdx: partIdx, locIdx: locIdx, qtyIdx: qtyIdx, noteIdx: noteIdx, dateIdx: dateIdx, trackingCols: trackingCols };
+        dbg('ImportScrapData header (' + header.length + ' cols, ' + trackingCols.length + ' tracking): ' + header.join(', '));
+        return _scrapImp;
+    }
+    function fillScrapTrackingCols(vals, imp, fields) {
+        if (!imp.trackingCols.length || !Array.isArray(fields)) return;
+        function normHdr(s) { return String(s == null ? '' : s).toLowerCase().replace(/[^a-z0-9]/g, ''); }
+        fields.forEach(function (f) {
+            var wantA = normHdr(f.abbr), wantN = normHdr(f.name);
+            var col = imp.trackingCols.find(function (c) { return (wantN && c.norm.indexOf(wantN) !== -1) || (wantA && c.norm.indexOf(wantA) !== -1); });
+            if (col && f.info != null && f.info !== '') {
+                var val = String(f.info);
+                if (/^\d{4}-\d{2}-\d{2}([ T]|$)/.test(val)) { try { val = C.formatDate(val); } catch (_) { val = val.slice(0, 10); } }
+                vals[col.i] = val;
+            }
+        });
+    }
+    // Resolve a scrap location for one line: prefer the part's default location
+    // in the WO's LG (if it has enough stock), else the oldest tag location with
+    // enough. Returns { locId, lgName, locName, availQty, source } or null.
+    async function resolveScrapLocation(line, lgId, scrapQty) {
+        var partId = line.partId || null;
+        if (line.defaultLocId && line.defaultLocName && line.defaultLocAvail >= scrapQty) {
+            return { locId: line.defaultLocId, lgName: line.defaultLgName, locName: line.defaultLocName, availQty: line.defaultLocAvail, source: 'default' };
+        }
+        if (!partId) return null;
+        var lgClause = lgId ? "AND l.locationgroupid = " + parseInt(lgId, 10) + " " : '';
+        var sql =
+            "SELECT * FROM (" +
+            "  SELECT l.id AS locid, l.name AS loc_name, lg.name AS lg_name, " +
+            "         SUM(GREATEST(t.qty - COALESCE(t.qtycommitted, 0), 0)) AS avail, MIN(t.datecreated) AS oldest " +
+            "  FROM tag t JOIN location l ON l.id = t.locationid JOIN locationgroup lg ON lg.id = l.locationgroupid " +
+            "  WHERE t.partid = " + parseInt(partId, 10) + " AND t.typeid IN (30, 40) " +
+            "    AND l.countedasavailable = 1 AND l.pickable = 1 " + lgClause +
+            "  GROUP BY l.id, l.name, lg.name HAVING avail >= " + Number(scrapQty).toFixed(6) + " " +
+            "  ORDER BY oldest, l.id LIMIT 1" +
+            ") AS wrapped";
+        try {
+            var rows = await qp(sql);
+            if (rows.length) return { locId: parseInt(rows[0].locid, 10) || 0, lgName: rows[0].lg_name || '', locName: rows[0].loc_name || '', availQty: parseFloat(rows[0].avail) || 0, source: 'fallback' };
+        } catch (e) { dbg('resolveScrapLocation query failed: ' + (e && e.message || e), 'warn'); }
+        return null;
+    }
+    function allocateScrapTags(partId, locId, qtyNeeded, isSerialTracked) {
+        return isSerialTracked ? allocateScrapSerials(partId, locId, qtyNeeded) : allocateScrapLots(partId, locId, qtyNeeded);
+    }
+    async function allocateScrapLots(partId, locId, qtyNeeded) {
+        var sql =
+            "SELECT * FROM (" +
+            "  SELECT t.id AS tag_id, t.num AS tag_num, GREATEST(t.qty - COALESCE(t.qtycommitted, 0), 0) AS avail, t.datecreated AS date_created, " +
+            "         ttv.parttrackingid AS ptid, ttv.name AS tname, ttv.abbr AS tabbr, ttv.info AS tinfo, ttv.infoformatted AS tfmt, ttv.sortorder AS tsort " +
+            "  FROM tag t LEFT JOIN tagtrackingview ttv ON ttv.tagid = t.id AND ttv.typeid <> 40 " +
+            "  WHERE t.partid = " + parseInt(partId, 10) + " AND t.locationid = " + parseInt(locId, 10) + " " +
+            "    AND t.typeid IN (30, 40) AND (t.qty - COALESCE(t.qtycommitted, 0)) > 0 " +
+            "  ORDER BY t.datecreated, t.id, ttv.sortorder" +
+            ") AS wrapped";
+        var rows;
+        try { rows = await qp(sql); } catch (e) { dbg('allocateScrapLots failed: ' + (e && e.message || e), 'warn'); return { allocations: [], covered: false }; }
+        var byTag = {}, order = [];
+        rows.forEach(function (r) {
+            var id = parseInt(r.tag_id, 10); if (!id) return;
+            if (!byTag[id]) { byTag[id] = { tagId: id, tagNum: r.tag_num == null ? '' : String(r.tag_num), avail: parseFloat(r.avail) || 0, fields: [] }; order.push(id); }
+            if (r.ptid != null && r.tabbr != null) {
+                var val = r.tfmt != null ? r.tfmt : (r.tinfo != null ? r.tinfo : '');
+                if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}[ T]/.test(val)) val = val.slice(0, 10);
+                byTag[id].fields.push({ name: r.tname || '', abbr: r.tabbr || '', info: val });
+            }
+        });
+        var remaining = Number(qtyNeeded) || 0, allocations = [];
+        for (var i = 0; i < order.length && remaining > 1e-9; i++) {
+            var tag = byTag[order[i]];
+            if (tag.avail <= 1e-9) continue;
+            var take = Math.min(tag.avail, remaining);
+            allocations.push({ kind: 'lot', tagId: tag.tagId, tagNum: tag.tagNum, qty: take, fields: tag.fields });
+            remaining -= take;
+        }
+        return { allocations: allocations, covered: remaining <= 1e-6 };
+    }
+    async function allocateScrapSerials(partId, locId, qtyNeeded) {
+        var lotSql =
+            "SELECT * FROM (" +
+            "  SELECT t.id AS tag_id, t.datecreated AS date_created, ttv.parttrackingid AS ptid, ttv.name AS tname, ttv.abbr AS tabbr, ttv.info AS tinfo, ttv.infoformatted AS tfmt, ttv.sortorder AS tsort " +
+            "  FROM tag t LEFT JOIN tagtrackingview ttv ON ttv.tagid = t.id AND ttv.typeid <> 40 " +
+            "  WHERE t.partid = " + parseInt(partId, 10) + " AND t.locationid = " + parseInt(locId, 10) + " " +
+            "    AND t.typeid IN (30, 40) AND (t.qty - COALESCE(t.qtycommitted, 0)) > 0 " +
+            "  ORDER BY t.datecreated, t.id, ttv.sortorder" +
+            ") AS wrapped_lots";
+        var serSql =
+            "SELECT * FROM (" +
+            "  SELECT t.id AS tag_id, t.datecreated AS date_created, s.id AS sid, tsv.parttrackingid AS ptid, tsv.name AS sname, tsv.abbr AS sabbr, tsv.serialnum AS sn, tsv.sortorder AS ssort " +
+            "  FROM tag t JOIN serial s ON s.tagid = t.id AND s.committedFlag = 0 JOIN tagserialview tsv ON tsv.serialid = s.id " +
+            "  WHERE t.partid = " + parseInt(partId, 10) + " AND t.locationid = " + parseInt(locId, 10) + " AND t.typeid IN (30, 40) " +
+            "  ORDER BY t.datecreated, t.id, s.id, tsv.sortorder" +
+            ") AS wrapped_serials";
+        var lotRows, serRows;
+        try { lotRows = await qp(lotSql); serRows = await qp(serSql); }
+        catch (e) { dbg('allocateScrapSerials failed: ' + (e && e.message || e), 'warn'); return { allocations: [], covered: false }; }
+        var tagLot = {};
+        lotRows.forEach(function (r) {
+            var id = parseInt(r.tag_id, 10); if (!id) return;
+            if (!tagLot[id]) tagLot[id] = { tagId: id, fields: [] };
+            if (r.ptid != null && r.tabbr != null) {
+                var val = r.tfmt != null ? r.tfmt : (r.tinfo != null ? r.tinfo : '');
+                if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}[ T]/.test(val)) val = val.slice(0, 10);
+                tagLot[id].fields.push({ name: r.tname || '', abbr: r.tabbr || '', info: val, ptid: parseInt(r.ptid, 10) });
+            }
+        });
+        var units = {}, unitOrder = [], serialFieldMap = {};
+        serRows.forEach(function (r) {
+            var sid = parseInt(r.sid, 10); if (!sid) return;
+            if (!units[sid]) { units[sid] = { sid: sid, tagId: parseInt(r.tag_id, 10) || 0, vals: {} }; unitOrder.push(sid); }
+            var ptid = parseInt(r.ptid, 10) || 0;
+            if (ptid) {
+                units[sid].vals[ptid] = r.sn == null ? '' : String(r.sn);
+                if (!serialFieldMap[ptid]) serialFieldMap[ptid] = { ptid: ptid, name: r.sname || '', abbr: r.sabbr || '', sort: r.ssort || 0 };
+            }
+        });
+        var serialFields = Object.keys(serialFieldMap).map(function (k) { return serialFieldMap[k]; }).sort(function (a, b) { return (a.sort || 0) - (b.sort || 0); });
+        var need = Math.max(0, Math.floor(Number(qtyNeeded) || 0));
+        if (need === 0) return { allocations: [], covered: true };
+        var taken = unitOrder.slice(0, need).map(function (sid) { return units[sid]; });
+        if (taken.length < need) return { allocations: [], covered: false };
+        function lotSig(unit) { var lot = tagLot[unit.tagId]; if (!lot) return '__none__'; return lot.fields.map(function (f) { return f.ptid + '=' + (f.info || ''); }).join('|'); }
+        var groupsBySig = {}, sigOrder = [];
+        taken.forEach(function (u) {
+            var sig = lotSig(u);
+            if (!groupsBySig[sig]) { var lot = tagLot[u.tagId]; groupsBySig[sig] = { kind: 'serial-group', qty: 0, fields: (lot && lot.fields) ? lot.fields.slice() : [], serialFields: serialFields.slice(), serials: [] }; sigOrder.push(sig); }
+            groupsBySig[sig].serials.push({ sid: u.sid, vals: serialFields.map(function (f) { return { ptid: f.ptid, name: f.name, abbr: f.abbr, value: u.vals[f.ptid] || '' }; }) });
+            groupsBySig[sig].qty++;
+        });
+        return { allocations: sigOrder.map(function (s) { return groupsBySig[s]; }), covered: true };
+    }
+    // Build the scrap plan: for every line with a scrap qty, resolve its location
+    // + FIFO-allocate tags/serials. Returns { rows, blockers }.
+    async function buildScrapPlan(fs, wo) {
+        var out = { rows: [], blockers: [] };
+        if (!fs || !fs.lines) return out;
+        var lgId = wo && wo.moLgId ? parseInt(wo.moLgId, 10) : 0;
+        var note = wo && wo.num ? 'WO ' + wo.num : '';
+        for (var i = 0; i < fs.lines.length; i++) {
+            var line = fs.lines[i];
+            if (line.isLabour) continue;
+            var qty = parseFloat(line.scrappedInput) || 0;
+            if (qty <= 0) continue;
+            if (line.isSerialTracked && Math.abs(qty - Math.floor(qty)) > 1e-9) {
+                out.blockers.push(line.partNum + ': serial-tracked scrap qty must be a whole number (got ' + fmtQty(qty) + ')');
+                continue;
+            }
+            var loc = await resolveScrapLocation(line, lgId, qty);
+            if (!loc || !loc.lgName || !loc.locName) {
+                out.blockers.push(line.partNum + ': no location in ' + (wo && wo.moLgName ? wo.moLgName : 'this LG') + ' has ' + fmtQty(qty) + ' available to scrap');
+                continue;
+            }
+            var alloc = await allocateScrapTags(line.partId, loc.locId, qty, !!line.isSerialTracked);
+            if (!alloc.allocations.length || !alloc.covered) {
+                var got = alloc.allocations.reduce(function (s, a) { return s + (a.qty || 0); }, 0);
+                out.blockers.push(line.partNum + ': stock moved during resolve — ' + (got > 0 ? 'only ' + fmtQty(got) + ' still available at ' + loc.lgName + '-' + loc.locName : 'no stock remaining at ' + loc.lgName + '-' + loc.locName));
+                continue;
+            }
+            alloc.allocations.forEach(function (a) {
+                out.rows.push({ partNum: line.partNum, location: loc.lgName + '-' + loc.locName, qty: a.qty, note: note, kind: a.kind, fields: a.fields, serialFields: a.serialFields, serials: a.serials, tagId: a.tagId, tagNum: a.tagNum });
+            });
+        }
+        return out;
+    }
+    // POST the scrap batch via ImportRq. Sync (runApiRequest); throws on non-1000.
+    function postScrapImport(scrapRows) {
+        if (!scrapRows || !scrapRows.length) return { ok: true, count: 0 };
+        var imp = ensureScrapImportHeader();
+        var today = (function () {
+            var d = new Date();
+            var iso = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+            try { return C.formatDate(iso); } catch (_) { return iso; }
+        })();
+        var lines = [ imp.header.map(csvEsc).join(',') ];
+        scrapRows.forEach(function (r) {
+            var item = imp.header.map(function () { return ''; });
+            item[imp.partIdx] = r.partNum;
+            item[imp.locIdx]  = r.location;
+            item[imp.qtyIdx]  = r.qty;
+            if (imp.noteIdx >= 0) item[imp.noteIdx] = r.note;
+            if (imp.dateIdx >= 0) item[imp.dateIdx] = today;
+            if (r.fields && r.fields.length) fillScrapTrackingCols(item, imp, r.fields);
+            lines.push(item.map(csvEsc).join(','));
+            if (r.kind === 'serial-group' && Array.isArray(r.serials) && r.serials.length) {
+                var sF = Array.isArray(r.serialFields) ? r.serialFields : [];
+                if (sF.length > 1) {
+                    var head = imp.header.map(function () { return ''; });
+                    sF.forEach(function (f, i) { head[i] = f.name || f.abbr || ''; });
+                    lines.push(head.map(csvEsc).join(','));
+                }
+                r.serials.forEach(function (u) {
+                    var srow = imp.header.map(function () { return ''; });
+                    (u.vals || []).forEach(function (v, i) { srow[i] = v.value == null ? '' : String(v.value); });
+                    lines.push(srow.map(csvEsc).join(','));
+                });
+            }
+        });
+        var payload = { ImportRq: { Type: 'ImportScrapData', Rows: { Row: lines } } };
+        window._lastScrapCsv = lines.slice();
+        dbg('Scrap CSV (' + lines.length + ' line' + (lines.length === 1 ? '' : 's') + '): ' + lines.join(' | '));
+        var resp = runApiRequest('ImportRq', JSON.stringify(payload));
+        var r = !resp ? null : (typeof resp === 'string' ? JSON.parse(resp) : resp);
+        var code = r && r.ImportRs ? Number(r.ImportRs.statusCode) : NaN;
+        if (code === 1000) return { ok: true, count: scrapRows.length };
+        var msg = (r && r.ImportRs && r.ImportRs.statusMessage) || (r && r.ErrorRs && r.ErrorRs.statusMessage) || ('Scrap import failed (status ' + code + '): ' + JSON.stringify(r));
+        var csvDump = lines.map(function (l, i) { return '[' + i + '] ' + l; }).join('\n');
+        throw new Error(msg + '\n\nCSV posted (' + lines.length + ' lines):\n' + csvDump);
+    }
+    // Inline hint under the Scrapped input — shows where FIFO will route it.
+    function scrapHintHtml(line) {
+        if (!line || line.isLabour) return '';
+        var qty = parseFloat(line.scrappedInput) || 0;
+        if (qty <= 0) return '';
+        if (line.defaultLocName && line.defaultLocAvail >= qty)
+            return '<div class="pf-scrap-hint ok">→ scrap from ' + esc(line.defaultLgName + '-' + line.defaultLocName) + '</div>';
+        if (line.defaultLocName)
+            return '<div class="pf-scrap-hint warn">→ ' + esc(line.defaultLgName + '-' + line.defaultLocName) + ' has ' + fmtQty(line.defaultLocAvail) + ' — Finish searches the LG</div>';
+        return '<div class="pf-scrap-hint warn">→ Finish picks the oldest tag location with enough stock</div>';
+    }
+
+    // ============================================================
+    // FINISHER ENGINE — copied VERBATIM from Work_Order_WIP.htm
+    // (constants + helpers + stock SQL + allocation + SavePick /
+    //  SaveWorkOrder builders + prepareFinish). Do not rewrite.
+    // ============================================================
+    var Finisher = (function () {
+        var ACTIONABLE_STATUSES  = new Set([5, 6, 10, 11, 20]);
+        var COMMITTED_STATUSES   = new Set([30, 40]);
+        var STOCK_DECIMALS       = 6;
+        var EPSILON              = 1e-9;
+        var FRACTION_SCALE       = 1000000;
+        var INVENTORY_PART_TYPE  = 10;
+        var TRACKING_TYPE_DATE   = new Set([20, 30]);
+        var TRACKING_TYPE_SERIAL = 40;
+
+        var CFG = {
+            mode: 'fifo', autoTracking: true, batchRule: 'wo', batchPrefix: '',
+            useByRule: 'blank', shelfDays: 0, noGroupTracked: false
+        };
+
+        function ensureArray(v) { return Array.isArray(v) ? v : (v == null ? [] : [v]); }
+        function deepClone(v) { return (typeof structuredClone === 'function') ? structuredClone(v) : JSON.parse(JSON.stringify(v)); }
+        function toNumber(v, f) { var n = Number(v); return Number.isFinite(n) ? n : f; }
+        function roundStock(v) { return Number(Math.max(0, toNumber(v, 0)).toFixed(STOCK_DECIMALS)); }
+        function sqlString(v) {
+            try { return "'" + C.escSQL(v) + "'"; }
+            catch (_) { return "'" + String(v == null ? '' : v).replace(/'/g, "''") + "'"; }
+        }
+        function toQuantityString(v) {
+            var n = Number(v);
+            if (!Number.isFinite(n)) return '0';
+            if (Number.isInteger(n)) return String(n);
+            return String(Number(n.toFixed(6)));
+        }
+        function pad2(n) { return String(n).padStart(2, '0'); }
+        function nowFishbowl() {
+            var d = new Date();
+            return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + 'T' +
+                   pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+        }
+        function todayCompact() { var d = new Date(); return '' + d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate()); }
+        function isoDatePlusDays(days) {
+            var d = new Date(); d.setDate(d.getDate() + toNumber(days, 0));
+            return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+        }
+        function errorMessage(e) {
+            if (e == null) return 'Unknown error';
+            if (typeof e === 'string') return e;
+            if (e.message) return String(e.message);
+            try { return JSON.stringify(e); } catch (x) { return String(e); }
+        }
+        function lc(row) { var out = {}; Object.keys(row || {}).forEach(function (k) { out[k.toLowerCase()] = row[k]; }); return out; }
+        function tryParseJsonArray(v) {
+            if (Array.isArray(v)) return v;
+            if (v == null) return [];
+            if (typeof v === 'object') return [v];
+            var t = String(v).trim();
+            if (!t || t.toLowerCase() === 'null') return [];
+            try { var p = JSON.parse(t); return Array.isArray(p) ? p : []; } catch (e) { return []; }
+        }
+
+        function responseNodeName(name) { return String(name).replace(/Rq$/, 'Rs'); }
+        function legacyMsgs(json) {
+            return (json && json.FbiJson && json.FbiJson.FbiMsgsRs) ? json.FbiJson.FbiMsgsRs
+                 : (json && json.FbiMsgsRs) ? json.FbiMsgsRs : json;
+        }
+        function summarizeLegacyError(json, rsName) {
+            var msgs = legacyMsgs(json);
+            var rs = msgs && msgs[rsName] ? msgs[rsName] : null;
+            var err = msgs && msgs.ErrorRs ? msgs.ErrorRs : null;
+            return {
+                envelopeStatus: msgs && msgs.statusCode != null ? msgs.statusCode : null,
+                responseStatus: rs && rs.statusCode != null ? rs.statusCode : null,
+                responseMessage: (rs && (rs.statusMessage || rs.message)) ||
+                                 (err && err.Message) ||
+                                 (msgs && (msgs.statusMessage || msgs.message)) ||
+                                 (json && json.message) || null,
+            };
+        }
+        function assertLegacyResponse(json, name) {
+            var rsName = responseNodeName(name);
+            var msgs = legacyMsgs(json);
+            var rs = msgs && msgs[rsName] ? msgs[rsName] : (json && json[rsName] ? json[rsName] : null);
+            var envelope = msgs && msgs.statusCode != null ? Number(msgs.statusCode) : 1000;
+            var response = rs && rs.statusCode != null ? Number(rs.statusCode) : 1000;
+            if (envelope !== 1000 || !rs || response !== 1000) {
+                throw new Error(rsName + ' failed: ' + JSON.stringify(summarizeLegacyError(json, rsName)));
+            }
+            return rs;
+        }
+        async function legacyRequest(name, payload) {
+            if (typeof runRestApiAsync !== 'function') {
+                throw new Error('runRestApiAsync is unavailable. Open this report inside Fishbowl with REST enabled.');
+            }
+            var body = {}; body[name] = payload;
+            dbg('Finisher ' + name + ' -> ' + JSON.stringify(payload).slice(0, 400), 'info');
+            var json = await runRestApiAsync({
+                method: 'POST', path: '/api/legacy/external/' + name,
+                body: JSON.stringify(body), contentType: 'application/json', timeout: 90000,
+            });
+            return assertLegacyResponse(json, name);
+        }
+        function isTargetTagQuantityError(e) {
+            var m = errorMessage(e);
+            return m.indexOf('"responseStatus":5102') >= 0 || m.indexOf('Not enough Quantity in Target Tag') >= 0;
+        }
+
+        // ── Tracking helpers ────────────────────────────────────
+        function normalizePartTracking(part) { return ensureArray(part && part.PartTrackingList && part.PartTrackingList.PartTracking); }
+        function isSerialPartTracking(pt) {
+            if (toNumber(pt && pt.TrackingTypeID, -1) === TRACKING_TYPE_SERIAL) return true;
+            return String((pt && pt.Name) || '').trim().toLowerCase().indexOf('serial') >= 0;
+        }
+        function isDatePartTracking(pt) { return TRACKING_TYPE_DATE.has(toNumber(pt && pt.TrackingTypeID, -1)); }
+        function normalizeFishbowlDateTime(value) {
+            var raw = String(value == null ? '' : value).trim();
+            var m = raw.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/);
+            if (m) return m[1] + 'T' + m[2];
+            m = raw.match(/^(\d{4}-\d{2}-\d{2})$/);
+            if (m) return m[1] + 'T00:00:00';
+            m = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+            if (m) return m[3] + '-' + pad2(m[2]) + '-' + pad2(m[1]) + 'T00:00:00';
+            return raw;
+        }
+
+        var STOCK_SQL_TEMPLATE = "\nSELECT * FROM\n(\nWITH tag_qty AS (\n  SELECT lg.id AS locationgroup_id, l.id AS location_id, l.name AS location_name, l.description AS location_description,\n    l.typeid AS location_type_id, l.sortorder AS location_sort_order, l.pickable AS location_pickable, l.receivable AS location_receivable,\n    l.countedAsAvailable AS location_counted_as_available, p.id AS part_id, p.typeid AS part_type_id, p.uomid AS partuom_id, p.trackingflag, t.trackingEncoding,\n    MIN(t.id) AS tag_id, MIN(t.num) AS tag_num, MIN(t.datecreated) AS tag_datecreated, SUM(t.qty - t.qtycommitted) AS qty_pickable\n  FROM tag t JOIN part p ON p.id = t.partid JOIN location l ON l.id = t.locationid JOIN locationgroup lg ON lg.id = l.locationgroupid\n  WHERE l.pickable = 1 AND l.countedAsAvailable = 1\n    AND lg.id = (SELECT locationgroupid FROM pick WHERE num = $picknum LIMIT 1)\n    AND p.id IN (SELECT DISTINCT pi.partid FROM pick p JOIN pickitem pi ON pi.pickid = p.id AND p.num = $picknum)\n  GROUP BY t.trackingEncoding, t.partID, t.locationID, lg.id, l.id, l.name, l.description, l.typeid, l.sortorder, l.pickable, l.receivable, l.countedAsAvailable, p.id, p.typeid, p.uomid, p.trackingflag\n  HAVING SUM(t.qty - t.qtycommitted) > 0\n),\npickable_stock AS (\n  SELECT tq.*, CASE WHEN tq.trackingflag = 0 THEN NULL ELSE JSON_ARRAYAGG(JSON_OBJECT('PartTrackingID', ttv.parttrackingid, 'Name', ttv.name, 'Abbr', ttv.abbr, 'TrackingTypeID', ttv.typeid, 'TrackingValue', ttv.infoformatted)) END AS tracking_json\n  FROM tag_qty tq LEFT JOIN tagtrackingview ttv ON ttv.tagid = tq.tag_id AND ttv.typeid <> 40\n  GROUP BY tq.locationgroup_id, tq.location_id, tq.location_name, tq.location_description, tq.location_type_id, tq.location_sort_order, tq.location_pickable, tq.location_receivable, tq.location_counted_as_available, tq.part_id, tq.part_type_id, tq.partuom_id, tq.trackingflag, tq.trackingEncoding, tq.tag_id, tq.tag_num, tq.tag_datecreated, tq.qty_pickable\n),\nserial_pool AS (\n  SELECT p.id AS part_id, l.id AS location_id, s.id AS serial_id, t.id AS serial_tag_id, sn.serialNum, sn.partTrackingId, pt.name AS tracking_name, pt.typeid AS tracking_type_id,\n    ROW_NUMBER() OVER (PARTITION BY p.id, l.id ORDER BY s.id) AS rn\n  FROM tag t JOIN part p ON p.id = t.partid JOIN location l ON l.id = t.locationid JOIN locationgroup lg ON lg.id = l.locationgroupid JOIN serial s ON s.tagid = t.id AND s.committedFlag = 0 JOIN serialnum sn ON sn.serialid = s.id LEFT JOIN parttracking pt ON pt.id = sn.parttrackingid\n  WHERE l.pickable = 1 AND l.countedAsAvailable = 1 AND lg.id = (SELECT locationgroupid FROM pick WHERE num = $picknum LIMIT 1) AND p.id IN (SELECT DISTINCT pi.partid FROM pick p2 JOIN pickitem pi ON pi.pickid = p2.id AND p2.num = $picknum)\n)\nSELECT pick.id AS pick_id, pick.num AS pick_num, pick.locationgroupid AS pick_locationgroup_id, pickitem.id AS pickitem_id, pickitem.statusid AS pickitem_status_id, pickitem.soitemid, pickitem.slotnum AS slotnumber, pickitem.uomid AS pickitem_uom_id,\n  part.num AS partnum, part.description, part.trackingflag, part.typeid AS part_type_id, pickitem.qty AS pickitem_qty,\n  ps.tag_id, ps.tag_num, ps.tag_datecreated, ps.location_id, ps.location_name, ps.location_description, ps.location_type_id, ps.location_sort_order, ps.location_pickable, ps.location_receivable, ps.location_counted_as_available,\n  ps.partuom_id AS stock_uom_id, COALESCE(uc.multiply / uc.factor, 1) AS uom_conversion, COALESCE(uc.multiply, 1) AS uom_conversion_multiply, COALESCE(uc.factor, 1) AS uom_conversion_factor,\n  ps.qty_pickable AS qty_available_stock_uom, ps.qty_pickable * COALESCE(uc.multiply / uc.factor, 1) AS qty_available_pick_uom, ps.tracking_json,\n  (SELECT JSON_ARRAYAGG(JSON_OBJECT('SerialID', sp.serial_id, 'TagID', sp.serial_tag_id, 'SerialNum', sp.serialNum, 'PartTrackingID', sp.partTrackingId, 'TrackingName', sp.tracking_name, 'TrackingTypeID', sp.tracking_type_id)) FROM serial_pool sp WHERE sp.part_id = pickitem.partid AND sp.location_id = ps.location_id AND sp.rn <= 1000) AS serial_json,\n  (SELECT l2.id FROM location l2 WHERE l2.locationgroupid = pick.locationgroupid AND l2.typeid = 20 LIMIT 1) AS dest_location_id,\n  (SELECT t2.id FROM tag t2 JOIN location l2 ON l2.id = t2.locationid WHERE l2.locationgroupid = pick.locationgroupid AND l2.typeid = 20 AND t2.typeid = 10 ORDER BY t2.id LIMIT 1) AS dest_tag_id\nFROM pick JOIN pickitem ON pickitem.pickid = pick.id JOIN part ON part.id = pickitem.partid\nLEFT JOIN pickable_stock ps ON ps.part_id = pickitem.partid\nLEFT JOIN uomconversion uc ON uc.toUomId = pickitem.uomid AND uc.fromuomid = ps.partuom_id\nWHERE pick.num = $picknum\nORDER BY pickitem.id, ps.tag_datecreated\n) AS wrapped_for_fishbowl_api";
+        function buildStockQuery(pickNum) { return STOCK_SQL_TEMPLATE.split('$picknum').join(sqlString(pickNum)); }
+        function normalizeStockRow(row) {
+            var next = lc(row);
+            ['locationgroup_id','location_id','location_type_id','location_sort_order','location_pickable','location_receivable','location_counted_as_available','part_id','part_type_id','partuom_id','trackingflag','tag_id','tag_num','pick_id','pick_locationgroup_id','pickitem_id','pickitem_status_id','soitemid','slotnumber','pickitem_uom_id','pickitem_qty','stock_uom_id','uom_conversion','uom_conversion_multiply','uom_conversion_factor','qty_available_stock_uom','qty_available_pick_uom','dest_location_id','dest_tag_id'].forEach(function (k) {
+                if (next[k] != null && next[k] !== '') { var n = Number(next[k]); if (Number.isFinite(n)) next[k] = n; }
+            });
+            next.tracking_json = tryParseJsonArray(next.tracking_json).map(function (it) {
+                if (!it || it.PartTrackingID == null) return null;
+                var v = it.TrackingValue == null ? '' : String(it.TrackingValue).trim();
+                if (!v) return null;
+                var c = Object.assign({}, it);
+                c.TrackingValue = isDatePartTracking(it) ? normalizeFishbowlDateTime(v) : v;
+                return c;
+            }).filter(Boolean);
+            next.serial_json = tryParseJsonArray(next.serial_json);
+            return next;
+        }
+
+        function normalizePickItems(pick) { return ensureArray(pick && pick.PickItems && pick.PickItems.PickItem); }
+        function isActionablePickItem(item) { return ACTIONABLE_STATUSES.has(toNumber(item && item.Status, -1)); }
+        function isCommittedPickItemStatus(s) { return COMMITTED_STATUSES.has(toNumber(s, -1)); }
+        function isNegativePickItemId(item) { return toNumber(item && item.PickItemID, 0) < 0; }
+        function isPickFinished(pick) { return toNumber(pick && pick.StatusID, -1) === 40; }
+        function isPartSerialized(part) {
+            if (part && part.SerializedFlag === true) return true;
+            if (String(part && part.SerializedFlag).toLowerCase() === 'true') return true;
+            return normalizePartTracking(part).some(isSerialPartTracking);
+        }
+
+        function gcd(a, b) { var l = Math.abs(a), r = Math.abs(b); while (r !== 0) { var n = l % r; l = r; r = n; } return l || 1; }
+        function deriveFraction(value) {
+            var n = toNumber(value, NaN);
+            if (!Number.isFinite(n) || n <= 0) return { multiply: 1, factor: 1 };
+            var scaled = Math.round(n * FRACTION_SCALE);
+            if (scaled <= 0) return { multiply: 1, factor: 1 };
+            var d = gcd(scaled, FRACTION_SCALE);
+            return { multiply: scaled / d, factor: FRACTION_SCALE / d };
+        }
+        function posInt(v, f) { var n = toNumber(v, NaN); return (Number.isInteger(n) && n > 0) ? n : f; }
+        function getConversionParts(row) {
+            var m = posInt(row && row.uom_conversion_multiply, null), f = posInt(row && row.uom_conversion_factor, null);
+            if (m != null && f != null) return { multiply: m, factor: f };
+            return deriveFraction(row && row.uom_conversion != null ? row.uom_conversion : 1);
+        }
+        function stockFromPickUnits(units, c) { var u = Math.max(0, Math.floor(toNumber(units, 0))); return u < 1 ? 0 : roundStock((u * c.factor) / c.multiply); }
+        function stockFromPickQty(q, c) { var s = Math.max(0, toNumber(q, 0)); return s <= 0 ? 0 : roundStock((s * c.factor) / c.multiply); }
+        function wholePickFromStock(stockQty, c) { var s = roundStock(stockQty); return Math.max(0, Math.floor((s * c.multiply) / c.factor + EPSILON)); }
+        function dateKey(v) { if (v == null || v === '') return Number.MAX_SAFE_INTEGER; var t = new Date(v).getTime(); return Number.isFinite(t) ? t : Number.MAX_SAFE_INTEGER; }
+        function poolKey(c) { var part = c && (c.part_id != null ? c.part_id : c.partnum); return String(part == null ? '?' : part) + '|' + String(c && c.tag_id); }
+        function buildPool(rows) {
+            var pool = new Map();
+            rows.forEach(function (r) {
+                if (r.tag_id == null) return;
+                var k = poolKey(r), q = roundStock(r.qty_available_stock_uom);
+                pool.set(k, Math.max(pool.has(k) ? roundStock(pool.get(k)) : 0, q));
+            });
+            return pool;
+        }
+        function commitToPool(allocs, pool) {
+            (allocs || []).forEach(function (a) {
+                var k = poolKey(a); var cur = roundStock(pool.get(k));
+                pool.set(k, roundStock(cur - toNumber(a.qty_to_commit_stock_uom, 0)));
+            });
+        }
+        function stripPrivate(c) { var r = {}; Object.keys(c || {}).forEach(function (k) { if (!k.startsWith('_')) r[k] = c[k]; }); return r; }
+        function compareCandidates(a, b, mode) {
+            if (a._dateKey !== b._dateKey) return mode === 'lifo' ? b._dateKey - a._dateKey : a._dateKey - b._dateKey;
+            var at = toNumber(a.tag_id, 0), bt = toNumber(b.tag_id, 0);
+            return mode === 'lifo' ? bt - at : at - bt;
+        }
+        function baseResult(item, row) {
+            return {
+                pick_id: toNumber(row && row.pick_id, 0),
+                pick_locationgroup_id: toNumber(row && row.pick_locationgroup_id, 0),
+                pickitem_id: toNumber(item && item.PickItemID, 0),
+                pickitem_status_id: toNumber(item && item.Status, -1),
+                partnum: String((item && item.Part && item.Part.Num) || (row && row.partnum) || ''),
+                allocations: [],
+            };
+        }
+        function failureResult(item, lineRows, reason) {
+            var row = lineRows[0] || {}, conv = getConversionParts(row);
+            var reqPick = Math.max(0, toNumber(item && item.Quantity, toNumber(row.pickitem_qty, 0)));
+            var r = baseResult(item, row);
+            r.requiredPickUom = reqPick; r.allocatedPickUom = 0; r.shortfallPickUom = reqPick;
+            r.requiredStockUom = stockFromPickQty(reqPick, conv); r.allocatedStockUom = 0;
+            r.fullyFulfilled = false; r.shortfallStockUom = r.requiredStockUom; r.failureReason = reason;
+            return r;
+        }
+        function autoFulfillResult(item, lineRows) {
+            var row = lineRows[0] || {};
+            var reqPick = Math.max(0, toNumber(item && item.Quantity, toNumber(row.pickitem_qty, 0)));
+            var r = baseResult(item, row);
+            r.requiredPickUom = reqPick; r.allocatedPickUom = reqPick; r.shortfallPickUom = 0;
+            r.requiredStockUom = reqPick; r.allocatedStockUom = reqPick;
+            r.fullyFulfilled = true; r.shortfallStockUom = 0; r.failureReason = null; r.autoFulfill = true;
+            return r;
+        }
+        function allocateRegular(item, lineRows, pool, mode) {
+            if (!lineRows.length) return failureResult(item, lineRows, 'NO_STOCK_THIS_LOCATION');
+            var row = lineRows[0], conv = getConversionParts(row);
+            var reqPick = Math.max(0, toNumber(item.Quantity, row.pickitem_qty || 0));
+            var reqStock = stockFromPickQty(reqPick, conv);
+            if (reqPick <= EPSILON) return failureResult(item, lineRows, 'SUB_MINIMUM');
+            var dedup = new Map();
+            lineRows.forEach(function (rw) {
+                if (rw.tag_id == null) return;
+                var k = poolKey(rw);
+                var availStock = roundStock(Math.min(roundStock(pool.get(k)), roundStock(rw.qty_available_stock_uom)));
+                if (availStock <= EPSILON) return;
+                if (!dedup.has(k) || availStock > dedup.get(k)._availStock + EPSILON) {
+                    dedup.set(k, Object.assign({}, rw, { _poolKey: k, _availStock: availStock, _dateKey: dateKey(rw.tag_datecreated) }));
+                }
+            });
+            var candidates = Array.from(dedup.values()).sort(function (a, b) { return compareCandidates(a, b, mode); });
+            var allocations = [], remaining = reqPick, allocPick = 0, allocStock = 0;
+            candidates.forEach(function (c) {
+                if (remaining <= EPSILON) return;
+                var availPick = roundStock(c._availStock * conv.multiply / conv.factor);
+                var takePick = roundStock(Math.min(remaining, availPick));
+                if (takePick <= EPSILON) return;
+                var takeStock = stockFromPickQty(takePick, conv);
+                if (takeStock > c._availStock + EPSILON) takeStock = c._availStock;
+                remaining = roundStock(remaining - takePick);
+                allocPick = roundStock(allocPick + takePick);
+                allocStock = roundStock(allocStock + takeStock);
+                allocations.push(Object.assign({}, stripPrivate(c), { qty_to_commit_stock_uom: takeStock, qty_to_commit_pick_uom: takePick }));
+            });
+            commitToPool(allocations, pool);
+            var r = baseResult(item, row);
+            r.requiredPickUom = reqPick; r.allocatedPickUom = allocPick; r.shortfallPickUom = Math.max(roundStock(reqPick - allocPick), 0);
+            r.requiredStockUom = reqStock; r.allocatedStockUom = allocStock; r.allocations = allocations;
+            r.fullyFulfilled = allocPick >= reqPick - EPSILON; r.shortfallStockUom = roundStock(reqStock - allocStock);
+            r.failureReason = r.fullyFulfilled ? null : (allocations.length ? 'INSUFFICIENT_STOCK' : 'NO_STOCK_THIS_LOCATION');
+            return r;
+        }
+        function serialKey(pickItemId, row, serial) {
+            return [pickItemId,
+                serial && serial.SerialID != null ? serial.SerialID : '',
+                serial && serial.TagID != null ? serial.TagID : (row && row.tag_id != null ? row.tag_id : ''),
+                serial && serial.SerialNum != null ? serial.SerialNum : ''].join('::');
+        }
+        function allocateSerialized(item, lineRows, pool, mode, selectedSerialKeys) {
+            if (!lineRows.length) return failureResult(item, lineRows, 'NO_STOCK_THIS_LOCATION');
+            var reqPick = Math.max(0, toNumber(item.Quantity, lineRows[0].pickitem_qty || 0));
+            var targetWhole = Math.max(0, Math.floor(reqPick + EPSILON));
+            var buckets = new Map();
+            lineRows.forEach(function (row) {
+                ensureArray(row.serial_json).forEach(function (serial) {
+                    var k = serialKey(item.PickItemID, row, serial);
+                    if (!selectedSerialKeys.has(k)) return;
+                    var bk = poolKey(row) + '|' + row.location_id;
+                    if (!buckets.has(bk)) buckets.set(bk, { row: row, serials: [] });
+                    buckets.get(bk).serials.push(serial);
+                });
+            });
+            var allocations = [], allocPick = 0, allocStock = 0;
+            buckets.forEach(function (b) {
+                var conv = getConversionParts(b.row), qty = b.serials.length;
+                if (qty < 1) return;
+                var st = stockFromPickUnits(qty, conv);
+                allocations.push(Object.assign({}, b.row, { serial_json: b.serials, qty_to_commit_stock_uom: st, qty_to_commit_pick_uom: qty }));
+                allocPick += qty; allocStock = roundStock(allocStock + st);
+            });
+            commitToPool(allocations, pool);
+            var row = lineRows[0], conv = getConversionParts(row), reqStock = stockFromPickQty(reqPick, conv);
+            var reason = null;
+            if (allocPick > targetWhole) reason = 'TOO_MANY_SERIALS';
+            else if (allocPick === 0) reason = 'SELECT_SERIALS';
+            else if (allocPick < reqPick) reason = 'PARTIAL_SERIAL_SELECTION';
+            var r = baseResult(item, row);
+            r.requiredPickUom = reqPick; r.allocatedPickUom = allocPick; r.shortfallPickUom = Math.max(reqPick - allocPick, 0);
+            r.requiredStockUom = reqStock; r.allocatedStockUom = allocStock; r.allocations = allocations;
+            r.fullyFulfilled = allocPick >= reqPick && allocPick <= targetWhole; r.shortfallStockUom = roundStock(reqStock - allocStock);
+            r.failureReason = reason; r.serialized = true;
+            return r;
+        }
+        function classifyPartType(item, lineRows) {
+            var t = lineRows.length ? toNumber(lineRows[0].part_type_id, INVENTORY_PART_TYPE) : INVENTORY_PART_TYPE;
+            return t;
+        }
+        function buildLineResults(pick, stockRows, mode, selectedSerialKeys) {
+            if (!pick) return [];
+            var rowsByItem = new Map();
+            stockRows.forEach(function (r) { if (!rowsByItem.has(r.pickitem_id)) rowsByItem.set(r.pickitem_id, []); rowsByItem.get(r.pickitem_id).push(r); });
+            var pool = buildPool(stockRows.filter(function (r) { return ACTIONABLE_STATUSES.has(toNumber(r.pickitem_status_id, -1)); }));
+            var items = normalizePickItems(pick).filter(isActionablePickItem).sort(function (a, b) {
+                var d = toNumber(a.Status, 999) - toNumber(b.Status, 999);
+                return d !== 0 ? d : toNumber(a.PickItemID, 0) - toNumber(b.PickItemID, 0);
+            });
+            return items.map(function (item) {
+                var rows = rowsByItem.get(toNumber(item.PickItemID, 0)) || [];
+                var partType = classifyPartType(item, rows);
+                if (partType !== INVENTORY_PART_TYPE) return autoFulfillResult(item, rows);
+                return isPartSerialized(item.Part) ? allocateSerialized(item, rows, pool, mode, selectedSerialKeys || new Set())
+                                                   : allocateRegular(item, rows, pool, mode);
+            });
+        }
+        function collectBlockers(lineResults) {
+            var msgs = [];
+            lineResults.forEach(function (l) {
+                if (l.fullyFulfilled) return;
+                if (l.failureReason === 'SELECT_SERIALS') msgs.push(l.partnum + ': serials must be selected');
+                else if (l.failureReason === 'PARTIAL_SERIAL_SELECTION') msgs.push(l.partnum + ': not enough serials selected');
+                else if (l.failureReason === 'TOO_MANY_SERIALS') msgs.push(l.partnum + ': too many serials selected');
+                else msgs.push(l.partnum + ': short ' + fmtQty(l.shortfallPickUom) + ' (only ' + fmtQty(l.allocatedPickUom) + ' of ' + fmtQty(l.requiredPickUom) + ')');
+            });
+            return msgs;
+        }
+
+        function findPartTracking(part, ti) {
+            var pts = normalizePartTracking(part);
+            return pts.find(function (pt) { return Number(pt.PartTrackingID) === Number(ti && ti.PartTrackingID); }) ||
+                   pts.find(function (pt) { return pt.Name === (ti && ti.Name); }) ||
+                   pts.find(function (pt) { return pt.Abbr === (ti && ti.Abbr); }) || null;
+        }
+        function buildTrackingBlock(part, trackingJson) {
+            if (!Array.isArray(trackingJson) || !trackingJson.length) return '';
+            var items = trackingJson.map(function (te) {
+                var pt = findPartTracking(part, te);
+                var raw = te && te.TrackingValue == null ? '' : String(te.TrackingValue).trim();
+                var val = isDatePartTracking(pt || te) ? normalizeFishbowlDateTime(raw) : raw;
+                if (!pt || !val) return null;
+                return { PartTracking: pt, TrackingValue: val };
+            }).filter(Boolean);
+            return items.length ? { TrackingItem: items } : '';
+        }
+        function findSerialPartTracking(part, entries) {
+            for (var i = 0; i < entries.length; i++) {
+                var c = findPartTracking(part, { PartTrackingID: entries[i].PartTrackingID, Name: entries[i].TrackingName });
+                if (c) return c;
+            }
+            return normalizePartTracking(part).find(isSerialPartTracking) || null;
+        }
+        function normalizeSerialEntries(serialJson) {
+            return tryParseJsonArray(serialJson).map(function (r) {
+                return { SerialNum: String((r && (r.SerialNum || r.Number)) || '').trim(),
+                         TagID: r && r.TagID, PartTrackingID: r && r.PartTrackingID, TrackingName: r && r.TrackingName };
+            }).filter(function (r) { return r.SerialNum; });
+        }
+        function serialBoxFor(partTracking, serialNum) {
+            return { Committed: false, SerialID: -1,
+                     SerialNumList: { SerialNum: [{ Number: serialNum, PartTracking: deepClone(partTracking), SerialID: -1, SerialNumID: -1 }] },
+                     TagID: -1 };
+        }
+        function buildSerialTrackingItem(part, allocation) {
+            var entries = normalizeSerialEntries(allocation && allocation.serial_json);
+            if (!entries.length) return null;
+            var pt = findSerialPartTracking(part, entries);
+            if (!pt) return null;
+            var required = Math.max(0, Math.floor(toNumber(allocation && allocation.qty_to_commit_pick_uom, 0)));
+            if (required < 1) return null;
+            var tagId = toNumber(allocation && allocation.tag_id, NaN);
+            var prioritized = entries;
+            if (Number.isFinite(tagId)) {
+                prioritized = entries.filter(function (e) { return toNumber(e.TagID, NaN) === tagId; })
+                    .concat(entries.filter(function (e) { return toNumber(e.TagID, NaN) !== tagId; }));
+            }
+            var selected = [], seen = new Set();
+            for (var i = 0; i < prioritized.length && selected.length < required; i++) {
+                if (seen.has(prioritized[i].SerialNum)) continue;
+                seen.add(prioritized[i].SerialNum); selected.push(prioritized[i]);
+            }
+            if (!selected.length) return null;
+            return { PartTracking: deepClone(pt),
+                     SerialBoxList: { SerialBox: selected.map(function (s) { return serialBoxFor(pt, s.SerialNum); }) },
+                     TrackingValue: '' };
+        }
+        function buildTrackingForAllocation(part, allocation) {
+            var base = buildTrackingBlock(part, allocation && allocation.tracking_json);
+            var baseItems = Array.isArray(base && base.TrackingItem) ? base.TrackingItem.slice() : [];
+            var serialItem = buildSerialTrackingItem(part, allocation);
+            if (!serialItem) return baseItems.length ? { TrackingItem: baseItems } : '';
+            var sid = toNumber(serialItem.PartTracking && serialItem.PartTracking.PartTrackingID, NaN);
+            var nonSerial = baseItems.filter(function (it) {
+                var pt = it && it.PartTracking, pid = toNumber(pt && pt.PartTrackingID, NaN);
+                if (Number.isFinite(sid) && pid === sid) return false;
+                return !isSerialPartTracking(pt);
+            });
+            return { TrackingItem: nonSerial.concat([serialItem]) };
+        }
+        function sanitizeTrackingBlock(part, tracking) {
+            var items = ensureArray(tracking && tracking.TrackingItem);
+            if (!items.length) return '';
+            var out = items.map(function (ti) {
+                if (!ti) return null;
+                var it = deepClone(ti);
+                var pt = it.PartTracking || findPartTracking(part, it);
+                if (it.SerialBoxList || isSerialPartTracking(pt)) return it;
+                var raw = it.TrackingValue == null ? '' : String(it.TrackingValue).trim();
+                var val = isDatePartTracking(pt) ? normalizeFishbowlDateTime(raw) : raw;
+                if (!val) return null;
+                it.TrackingValue = val; return it;
+            }).filter(Boolean);
+            return out.length ? { TrackingItem: out } : '';
+        }
+        function sanitizePreservedPickItem(item) { var n = deepClone(item); n.Tracking = sanitizeTrackingBlock(n.Part, n.Tracking); return n; }
+        function buildLocationForAllocation(base, a, lgId) {
+            var l = deepClone(base || {});
+            l.LocationID = a.location_id; l.Name = a.location_name || l.Name || ''; l.Description = a.location_description || l.Description || '';
+            l.TypeID = a.location_type_id || l.TypeID || 10; l.SortOrder = a.location_sort_order || l.SortOrder || 0;
+            l.Pickable = a.location_pickable == null ? (l.Pickable == null ? true : l.Pickable) : a.location_pickable;
+            l.Receivable = a.location_receivable == null ? (l.Receivable == null ? true : l.Receivable) : a.location_receivable;
+            l.CountedAsAvailable = a.location_counted_as_available == null ? (l.CountedAsAvailable == null ? true : l.CountedAsAvailable) : a.location_counted_as_available;
+            l.LocationGroupID = lgId || l.LocationGroupID || 0;
+            return l;
+        }
+        function buildSourceTag(base, part, location, a) {
+            var t = deepClone(base || {});
+            t.AccountID = t.AccountID == null ? -1 : t.AccountID;
+            t.TagID = a.tag_id; t.Num = a.tag_num != null ? String(a.tag_num) : String(a.tag_id == null ? '' : a.tag_id);
+            t.PartNum = (part && part.Num) || t.PartNum || '';
+            if (part && part.PartID != null) t.PartID = part.PartID;
+            t.Quantity = toQuantityString(a.qty_to_commit_pick_uom); t.QuantityCommitted = toQuantityString(a.qty_to_commit_pick_uom);
+            t.TypeID = 30; t.Location = deepClone(location || {});
+            return t;
+        }
+        function residualItem(orig, committed) {
+            var origQty = Number(orig.Quantity || 0), remaining = origQty - committed;
+            if (!Number.isFinite(remaining) || remaining <= 0) return null;
+            var item = deepClone(orig);
+            item.PickItemID = 0; item.Status = 5; item.Quantity = toQuantityString(remaining);
+            item.SourceTagID = 0; item.Tracking = '';
+            delete item.Location;
+            item.Tag = { AccountID: -1, QuantityCommitted: '0',
+                Location: { Active: true, CountedAsAvailable: true, Description: '', LocationGroupID: 0, LocationGroupName: '',
+                            LocationID: 0, Name: '', ParentID: 0, Pickable: true, Receivable: true, SortOrder: 0,
+                            TagID: -1, TagNumber: -1, TypeID: 0 },
+                PartNum: '', Quantity: '0', TypeID: 30 };
+            return item;
+        }
+        function splitPickItem(orig, pick, line, statusId, destMode) {
+            var items = [], allocs = line.allocations || [], committed = 0;
+            for (var i = 0; i < allocs.length; i++) {
+                var a = allocs[i], item = deepClone(orig);
+                var origId = toNumber(orig && orig.PickItemID, 0);
+                item.PickItemID = i === 0 ? (origId > 0 ? origId : 0) : 0;
+                item.Status = statusId; item.Quantity = toQuantityString(a.qty_to_commit_pick_uom);
+                committed += Number(a.qty_to_commit_pick_uom || 0);
+                item.Location = buildLocationForAllocation(orig.Location, a, pick.LocationGroupID);
+                item.Tracking = buildTrackingForAllocation(orig.Part, a);
+                item.Tag = buildSourceTag(item.Tag, item.Part, item.Location, a);
+                if (item.DestinationTag && item.DestinationTag.Tag) {
+                    item.DestinationTag.Tag.Num = destMode === 'new' ? '-1' : String(orig.DestinationTag.Tag.Num == null ? '' : orig.DestinationTag.Tag.Num);
+                    if (a.dest_location_id != null) { item.DestinationTag.Tag.Location = item.DestinationTag.Tag.Location || {}; item.DestinationTag.Tag.Location.LocationID = a.dest_location_id; }
+                    if (a.dest_tag_id != null) item.DestinationTag.Tag.TagID = a.dest_tag_id;
+                }
+                items.push(item);
+            }
+            if (statusId !== 40) { var res = residualItem(orig, committed); if (res) items.push(res); }
+            return items;
+        }
+        function buildStartSavePick(pick) {
+            var n = deepClone(pick);
+            normalizePickItems(n).forEach(function (it) { it.Status = 20; it.Tracking = sanitizeTrackingBlock(it.Part, it.Tracking); });
+            n.StatusID = 20;
+            return { Pick: n };
+        }
+        function buildCommitSavePick(pick, lineResults, options) {
+            var n = deepClone(pick), pickItems = normalizePickItems(n), lineMap = new Map();
+            lineResults.forEach(function (l) { lineMap.set(Number(l.pickitem_id), l); });
+            var includeUnallocated = options.statusId !== 40, out = [];
+            for (var i = 0; i < pickItems.length; i++) {
+                var item = pickItems[i], line = lineMap.get(Number(item.PickItemID));
+                if (line && line.autoFulfill) {
+                    var auto = sanitizePreservedPickItem(item); auto.Status = options.statusId; out.push(auto); continue;
+                }
+                if (!line || !line.allocations || !line.allocations.length) {
+                    var preserve = isCommittedPickItemStatus(item && item.Status);
+                    if (includeUnallocated || preserve) {
+                        if (isNegativePickItemId(item)) continue;
+                        var preserved = sanitizePreservedPickItem(item);
+                        if (options.statusId === 40 && toNumber(preserved.Status, -1) === 30) {
+                            preserved.Status = 40;
+                        }
+                        out.push(preserved);
+                    }
+                    continue;
+                }
+                Array.prototype.push.apply(out, splitPickItem(item, n, line, options.statusId, options.destinationTagNumMode));
+            }
+            n.PickItems = { PickItem: out };
+            if (options.statusId === 40) n.StatusID = 40;
+            return { Pick: n };
+        }
+        async function savePickWithRetry(pick, lineResults, payload) {
+            try { await legacyRequest('SavePickRq', payload); return; }
+            catch (e) {
+                if (!isTargetTagQuantityError(e)) throw e;
+                var retry = buildCommitSavePick(pick, lineResults, { statusId: 40, destinationTagNumMode: 'current' });
+                await legacyRequest('SavePickRq', retry);
+            }
+        }
+
+        function findFinishedGoodItem(wo) {
+            var items = ensureArray(wo && wo.WOItems && wo.WOItems.WOItem);
+            return items.find(function (wi) { return toNumber(wi.TypeID, -1) === 10; }) || null;
+        }
+        function planFgTracking(fgPart) {
+            var plan = { batch: '', useby: '', serials: [], required: [], hasSerial: false, hasDate: false, hasBatch: false };
+            var defs = normalizePartTracking(fgPart);
+            defs.forEach(function (def) {
+                if (isSerialPartTracking(def)) { plan.hasSerial = true; plan.required.push({ kind: 'serial', def: def }); }
+                else if (isDatePartTracking(def)) { plan.hasDate = true; plan.required.push({ kind: 'date', def: def }); }
+                else { plan.hasBatch = true; plan.required.push({ kind: 'text', def: def }); }
+            });
+            return plan;
+        }
+        function buildFgTrackingBlock(fgPart, fgDefs) {
+            var partDefs = normalizePartTracking(fgPart);
+            if (!Array.isArray(fgDefs) || !fgDefs.length) return '';
+            var items = [];
+            fgDefs.forEach(function (d) {
+                var pt = partDefs.find(function (p) { return Number(p.PartTrackingID) === Number(d.partTrackingId); });
+                if (!pt) return;
+                if (d.isSerial) {
+                    var arr = Array.isArray(d.value) ? d.value : [];
+                    if (!arr.length) return;
+                    items.push({
+                        PartTracking: deepClone(pt),
+                        SerialBoxList: { SerialBox: arr.map(function (s) { return serialBoxFor(pt, s); }) },
+                        TrackingValue: '',
+                    });
+                } else if (d.isDate) {
+                    if (!d.value) return;
+                    items.push({ PartTracking: deepClone(pt), TrackingValue: normalizeFishbowlDateTime(String(d.value)) });
+                } else {
+                    if (d.value == null || String(d.value) === '') return;
+                    items.push({ PartTracking: deepClone(pt), TrackingValue: String(d.value) });
+                }
+            });
+            return items.length ? { TrackingItem: items } : '';
+        }
+        function computeBatch(woRow) {
+            switch (CFG.batchRule) {
+                case 'mo':       return woRow.mo_num || woRow.wo_num;
+                case 'date':     return todayCompact();
+                case 'prefixwo': return (CFG.batchPrefix || '') + woRow.wo_num;
+                case 'blank':    return '';
+                default:         return woRow.wo_num;
+            }
+        }
+        function computeUseBy() {
+            if (CFG.useByRule === 'days') return isoDatePlusDays(CFG.shelfDays);
+            return '';
+        }
+        function buildCompleteWorkOrder(wo, fgDefs) {
+            var n = deepClone(wo), now = nowFishbowl();
+            n.DateScheduled = n.DateScheduled || now;
+            n.DateScheduledToStart = n.DateScheduledToStart || now;
+            n.StatusID = 40;
+            var items = ensureArray(n.WOItems && n.WOItems.WOItem);
+            items.forEach(function (wi) {
+                if (toNumber(wi.TypeID, -1) === 10) {
+                    var qty = wi.QtyTarget != null ? wi.QtyTarget : (wi.QtyToFulfill != null ? wi.QtyToFulfill : wi.QtyUsed);
+                    wi.QtyUsed = toQuantityString(qty);
+                    var tracking = buildFgTrackingBlock(wi.Part, fgDefs || []);
+                    if (tracking) wi.Tracking = tracking;
+                }
+            });
+            n.WOItems = { WOItem: items };
+            return { WO: n };
+        }
+
+        function fgExistingLocationId(fgItem) {
+            var loc = fgItem && (fgItem.Location || fgItem.DestinationLocation);
+            return loc ? toNumber(loc.LocationID, 0) : 0;
+        }
+        async function resolveFgLocationId(woRow, fgItem) {
+            var existing = fgExistingLocationId(fgItem);
+            if (existing > 0) return existing;
+            var lg = toNumber(woRow.locationgroupid, 0);
+            if (!lg || !woRow.fg_part) return 0;
+            var sql = 'SELECT * FROM (SELECT dl.locationId AS default_loc FROM defaultlocation dl JOIN part p ON p.id=dl.partId' +
+                      ' WHERE p.num=' + sqlString(woRow.fg_part) + ' AND dl.locationGroupId=' + lg + ' LIMIT 1) AS wrapped_for_fishbowl_api';
+            try {
+                var r = (await qp(sql)).map(lc)[0] || {};
+                return toNumber(r.default_loc, 0) || 0;
+            } catch (e) { dbg('resolveFgLocationId failed: ' + errorMessage(e), 'warn'); return 0; }
+        }
+        function noFgLocationMessage(woRow) {
+            return 'Finished good ' + (woRow.fg_part || 'this part') +
+                   ' has no default location in ' + (woRow.location_group || 'this location group') +
+                   ' — set a default location for the part in Fishbowl (Part → Locations) before finishing.';
+        }
+
+        async function applyUsedOverrides(pick, overrides) {
+            if (!Array.isArray(overrides) || !overrides.length) return;
+            var pickItems = normalizePickItems(pick);
+            if (!pickItems.length) return;
+            var pickitemIds = pickItems
+                .map(function (it) { return toNumber(it.PickItemID, 0); })
+                .filter(function (id) { return id > 0; });
+            if (!pickitemIds.length) return;
+            var rows = await qp(
+                "SELECT id AS pickitem_id, woItemId AS wo_item_id " +
+                "FROM pickitem WHERE id IN (" + pickitemIds.join(',') + ")"
+            );
+            var woByPickitem = {};
+            rows.forEach(function (r) { woByPickitem[r.pickitem_id] = r.wo_item_id; });
+            var overrideByWoItem = {};
+            overrides.forEach(function (o) { if (o.woItemId) overrideByWoItem[o.woItemId] = o; });
+            var blockers = [];
+            pickItems.forEach(function (item) {
+                var pid = toNumber(item.PickItemID, 0);
+                var woId = woByPickitem[pid];
+                if (!woId) return;
+                var ov = overrideByWoItem[woId];
+                if (!ov) return;
+                var oldQty = parseFloat(item.Quantity) || 0;
+                if (Math.abs(oldQty - ov.qty) < 1e-6) return;
+                if (isCommittedPickItemStatus(item.Status)) {
+                    blockers.push(ov.partNum + ': cannot change consumed qty — pick item already committed at ' + oldQty);
+                    return;
+                }
+                dbg('Override pickitem #' + pid + ' (' + ov.partNum + ') qty ' + oldQty + ' -> ' + ov.qty, 'info');
+                item.Quantity = toQuantityString(ov.qty);
+            });
+            if (blockers.length) throw new Error(blockers.join('; '));
+        }
+
+        // opts: { mode, selectedSerialKeys, fgDefs, usedOverrides, post, onStep }
+        async function prepareFinish(woRow, opts) {
+            opts = opts || {};
+            var mode = opts.mode || CFG.mode;
+            var selectedSerialKeys = opts.selectedSerialKeys || new Set();
+            var out = { ok: false, posted: false, woNum: woRow.wo_num, steps: [], payloads: {},
+                        error: null, lineResults: [], blockers: [], pick: null, stockRows: [] };
+            function step(label) { out.steps.push(label); if (typeof opts.onStep === 'function') { try { opts.onStep(label); } catch (_) {} } }
+            try {
+                var getPickRs = await legacyRequest('GetPickRq', { WoNum: woRow.wo_num });
+                var pick = getPickRs.Pick;
+                if (!pick) throw new Error('GetPickRs did not include a Pick for ' + woRow.wo_num + '.');
+                out.pick = pick;
+                step('Loaded pick ' + (pick.Num || woRow.pick_num || ''));
+                await applyUsedOverrides(pick, opts.usedOverrides);
+                var pickNum = pick.Num || woRow.pick_num;
+                var stockRows = (await qp(buildStockQuery(pickNum))).map(normalizeStockRow);
+                out.stockRows = stockRows;
+                var lineResults = buildLineResults(pick, stockRows, mode, selectedSerialKeys);
+                out.lineResults = lineResults;
+                var blockers = collectBlockers(lineResults);
+                out.blockers = blockers;
+                if (blockers.length) { out.error = blockers[0]; return out; }
+                var fgLocId = await resolveFgLocationId(woRow, null);
+                if (!fgLocId) { out.error = noFgLocationMessage(woRow); out.blockers = [out.error]; return out; }
+                var savePick = buildCommitSavePick(pick, lineResults, { statusId: 40, destinationTagNumMode: 'new' });
+                out.payloads.savePick = savePick;
+                var pickStatusId = toNumber(pick.StatusID, -1);
+                out.payloads.startPick = (pickStatusId >= 0 && pickStatusId < 20) ? buildStartSavePick(pick) : null;
+                out.ok = true;
+                if (!opts.post) return out;   // preview only
+                if (isPickFinished(pick)) {
+                    step('Pick already finished — skipped');
+                } else {
+                    if (out.payloads.startPick) { await legacyRequest('SavePickRq', out.payloads.startPick); step('Pick started'); }
+                    await savePickWithRetry(pick, lineResults, savePick);
+                    step('Pick finished');
+                }
+                // Scrap interleave — between the pick commit and the WO save so a
+                // scrap failure surfaces before the WO is marked Fulfilled. The
+                // pick is already committed at this point (irreversible via API),
+                // so a scrap failure leaves the WO recoverable but not atomic.
+                if (Array.isArray(opts.scrapRows) && opts.scrapRows.length && typeof opts.scrapImporter === 'function') {
+                    var scrapResult = opts.scrapImporter(opts.scrapRows);
+                    step('Scrapped ' + (scrapResult && scrapResult.count ? scrapResult.count : opts.scrapRows.length) +
+                         ' line' + (opts.scrapRows.length === 1 ? '' : 's'));
+                }
+                var getWoRs = await legacyRequest('GetWorkOrderRq', { WorkOrderNumber: woRow.wo_num });
+                var wo = getWoRs.WO || getWoRs.Wo || getWoRs.WorkOrder;
+                if (!wo) throw new Error('GetWorkOrderRs did not include a WO.');
+                var fgDefs = opts.fgDefs || [];
+                var saveWo = buildCompleteWorkOrder(wo, fgDefs);
+                out.payloads.saveWo = saveWo;
+                await legacyRequest('SaveWorkOrderRq', saveWo);
+                step('Work order completed');
+                out.posted = true;
+                return out;
+            } catch (e) {
+                out.ok = false; out.error = errorMessage(e);
+                dbg('prepareFinish ' + woRow.wo_num + ' failed: ' + out.error, 'error');
+                return out;
+            }
+        }
+
+        // Extract per-pickitem serial lines from a preview result.
+        function serialLinesFrom(result) {
+            if (!result || !result.pick) return [];
+            var pick = result.pick;
+            var stockRows = result.stockRows || [];
+            var pickItems = normalizePickItems(pick);
+            var rowsByItem = new Map();
+            stockRows.forEach(function (r) {
+                if (!rowsByItem.has(r.pickitem_id)) rowsByItem.set(r.pickitem_id, []);
+                rowsByItem.get(r.pickitem_id).push(r);
+            });
+            var out = [];
+            pickItems.forEach(function (item) {
+                if (!isPartSerialized(item.Part)) return;
+                var status = toNumber(item.Status, -1);
+                var pickitemId = toNumber(item.PickItemID, 0);
+                var partNum = (item.Part && item.Part.Num) || '';
+                var partDesc = (item.Part && item.Part.Description) || '';
+                var required = Math.max(0, Math.floor(toNumber(item.Quantity, 0)));
+                var committed = isCommittedPickItemStatus(status);
+                var candidates = [];
+                var seen = new Set();
+                if (committed) {
+                    var trackingItems = ensureArray(item.Tracking && item.Tracking.TrackingItem);
+                    trackingItems.forEach(function (ti) {
+                        var pt = ti.PartTracking;
+                        if (!isSerialPartTracking(pt)) return;
+                        var boxes = ensureArray(ti.SerialBoxList && ti.SerialBoxList.SerialBox);
+                        boxes.forEach(function (sb) {
+                            var nums = ensureArray(sb.SerialNumList && sb.SerialNumList.SerialNum);
+                            nums.forEach(function (sn) {
+                                var num = String((sn && sn.Number) || '').trim();
+                                if (!num || seen.has(num)) return;
+                                seen.add(num);
+                                candidates.push({
+                                    key: pickitemId + '::committed::' + toNumber(sb.SerialID, 0) + '::' + toNumber(sb.TagID, 0) + '::' + num,
+                                    serialNum: num, tagId: toNumber(sb.TagID, 0), tagNum: '',
+                                    serialId: toNumber(sb.SerialID, 0), partTrackingId: toNumber(pt && pt.PartTrackingID, 0),
+                                    trackingName: (pt && pt.Name) || '', trackingTypeId: TRACKING_TYPE_SERIAL, tagDateCreated: null,
+                                });
+                            });
+                        });
+                    });
+                } else {
+                    var rows = rowsByItem.get(pickitemId) || [];
+                    rows.forEach(function (row) {
+                        ensureArray(row.serial_json).forEach(function (s) {
+                            var num = String((s && s.SerialNum) || '').trim();
+                            if (!num || seen.has(num)) return;
+                            seen.add(num);
+                            candidates.push({
+                                key: serialKey(pickitemId, row, s),
+                                serialNum: num, tagId: toNumber(s.TagID != null ? s.TagID : row.tag_id, 0),
+                                tagNum: row.tag_num != null ? String(row.tag_num) : '',
+                                serialId: toNumber(s.SerialID, 0), partTrackingId: toNumber(s.PartTrackingID, 0),
+                                trackingName: (s.TrackingName) || '', trackingTypeId: toNumber(s.TrackingTypeID, TRACKING_TYPE_SERIAL),
+                                tagDateCreated: row.tag_datecreated || null,
+                            });
+                        });
+                    });
+                }
+                out.push({
+                    pickitemId: pickitemId, partNum: partNum, partDesc: partDesc,
+                    required: required, committed: committed, readOnly: committed,
+                    status: status, candidates: candidates,
+                });
+            });
+            return out;
+        }
+
+        return {
+            CFG: CFG,
+            prepareFinish: prepareFinish,
+            previewFinish: function (woRow, opts) { return prepareFinish(woRow, Object.assign({}, opts || {}, { post: false })); },
+            serialLinesFrom: serialLinesFrom,
+            generateFgSerials: generateFgSerials,
+        };
+    })();
+
+    // ============================================================
+    // DRAWER STACK MANAGER
+    // ------------------------------------------------------------
+    // Tracks which finish tiers are open so ESC / scrim-click /
+    // Back closes only the TOP one. The detail drawer is managed
+    // by the host's closeDetail(); this stack sits on top of it.
+    // ============================================================
+    var stack = [];   // e.g. ['finish', 'track']
+    function drawerEls(tier) {
+        if (tier === 'finish') return { panel: document.getElementById('finishPanel'), scrim: document.getElementById('finishScrim') };
+        if (tier === 'track')  return { panel: document.getElementById('trackPanel'),  scrim: document.getElementById('trackScrim') };
+        return { panel: null, scrim: null };
+    }
+    function showDrawer(tier) {
+        var e = drawerEls(tier);
+        if (e.panel) e.panel.classList.add('on');
+        if (e.scrim) e.scrim.classList.add('on');
+        if (stack.indexOf(tier) === -1) stack.push(tier);
+    }
+    function hideDrawer(tier) {
+        var e = drawerEls(tier);
+        if (e.panel) e.panel.classList.remove('on');
+        if (e.scrim) e.scrim.classList.remove('on');
+        var i = stack.indexOf(tier);
+        if (i !== -1) stack.splice(i, 1);
+    }
+    function closeTop() {
+        var tier = stack[stack.length - 1];
+        if (!tier) return false;
+        if (tier === 'track') { hideDrawer('track'); return true; }
+        if (tier === 'finish') { hideDrawer('finish'); active = null; return true; }
+        return false;
+    }
+    function escHandled() { return closeTop(); }
+
+    // ============================================================
+    // FINISH STATE + DATA LOAD
+    // ============================================================
+    // Per-open finish state (single active WO at a time — the drawer
+    // is modal-ish). Shape mirrors the source's state.finishState[id].
+    var active = null;   // { woId, woRow, wo, status, lines[], fg{}, preview, blockers[], steps[], lastError, serialLines[], serialSelection{} }
+
+    function autoApplyFgDefaults() {
+        try { return FBLib.Settings.resolve('finishAutoApplyFgDefaults') !== false; }
+        catch (_) { return true; }
+    }
+
+    // Build woRow (source shape) from a scheduler WO object.
+    function woRowFromScheduler(w) {
+        var pickNum = (w._pickNums && w._pickNums.length) ? w._pickNums[0] : ('W' + w.wo_num);
+        return {
+            wo_num: w.wo_num,
+            mo_num: w.mo_num,
+            pick_num: pickNum,
+            locationgroupid: w.location_group_id,
+            location_group: '',
+            fg_part: w.part_num,
+            qty_target: w.qty_target,
+        };
+    }
+
+    // FG serial count for the WO. The scheduler has no woitem-output
+    // qty loaded, so fall back to qty_target (single-output workflows).
+    function fgSerialQty(w) { return (w && w.qty_target) ? Number(w.qty_target) : 0; }
+
+    function fgTodayIso() {
+        var d = new Date();
+        return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    }
+    function fgDaysFromToday(n) {
+        var d = new Date(); d.setDate(d.getDate() + n);
+        return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    }
+
+    // Build the per-WO finish state from raw-material rows + FG tracking
+    // defs. Adapted from the source initFinishState (drops scrap fields).
+    function buildFinishState(w, rows, fgTracking) {
+        var lines = (rows || []).map(function (r, i) {
+            var target = parseFloat(r.qtytarget) || 0;
+            var used   = parseFloat(r.qtyused)   || 0;
+            var scrap  = parseFloat(r.qtyscrapped) || 0;
+            var partTypeId = parseInt(r.parttypeid, 10);
+            var isLabour = Number.isFinite(partTypeId) && partTypeId !== 10;
+            var pickedQty = parseFloat(r.pickedqty) || 0;
+            var usedDefault;
+            if (isLabour)           usedDefault = target;
+            else if (pickedQty > 0) usedDefault = pickedQty;
+            else if (used > 0)      usedDefault = used;
+            else                    usedDefault = null;
+            return {
+                idx: i, woitemId: r.id,
+                partId: parseInt(r.partid, 10) || 0,
+                partNum: r.partnum || '', partDesc: r.partdesc || '',
+                partTypeId: partTypeId, isLabour: isLabour,
+                uom: r.uomcode || '', target: target,
+                usedInput: usedDefault, dirty: false,
+                // Scrap is opt-in — start blank (null) unless the WO already has a
+                // qtyScrapped recorded; effectiveScrapQty() treats blank as 0.
+                scrappedInput: scrap > 0 ? scrap : null,
+                pickedQty: pickedQty,
+                pickedStatus: parseInt(r.pickedstatus, 10) || 0,
+                pendingQty: parseFloat(r.pendingqty) || 0,
+                availableQty: parseFloat(r.availableqty) || 0,
+                isSerialTracked: (parseInt(r.serial_tracked, 10) || 0) > 0,
+                hasTracking: (parseInt(r.has_tracking, 10) || 0) > 0,
+                // Scrap-location context — pre-resolved default location for the
+                // part in the WO's LG + qty available there (see linesSqlFor).
+                defaultLocId: parseInt(r.default_loc_id, 10) || 0,
+                defaultLocName: r.default_loc_name || '',
+                defaultLgName: r.default_lg_name || '',
+                defaultLocAvail: parseFloat(r.default_loc_avail) || 0,
+            };
+        });
+        var fgQty = Math.round(fgSerialQty(w));
+        var woNum = w && w.wo_num ? String(w.wo_num) : '';
+        var autoApply = autoApplyFgDefaults();
+        var defs = (fgTracking || []).map(function (t) {
+            var partTrackingId = parseInt(t.part_tracking_id, 10);
+            var typeId = parseInt(t.type_id, 10);
+            var isSerial = typeId === 40;
+            var isDate   = typeId === 20 || typeId === 30;
+            var rawNext  = t.next_value == null ? '' : String(t.next_value).trim();
+            var hasNextValue = rawNext.length > 0;
+            var displayName = t.name ||
+                (isSerial ? 'Serial number' : typeId === 30 ? 'Expiration date' : isDate ? 'Date' : 'Batch / lot #');
+            var mandatoryValue = null;
+            if (hasNextValue) {
+                if (isSerial) {
+                    mandatoryValue = (fgQty > 0) ? Finisher.generateFgSerials(rawNext, fgQty) : [];
+                } else if (isDate) {
+                    var days = parseInt(rawNext, 10);
+                    mandatoryValue = Number.isFinite(days) ? fgDaysFromToday(days) : rawNext;
+                } else { mandatoryValue = rawNext; }
+            }
+            var suggestion = null;
+            if (!hasNextValue) {
+                if (isSerial) { var seed = woNum ? woNum + '-001' : '001'; suggestion = (fgQty > 0) ? Finisher.generateFgSerials(seed, fgQty) : []; }
+                else if (isDate) { suggestion = fgTodayIso(); }
+                else { suggestion = woNum; }
+            }
+            var value, confirmed;
+            if (hasNextValue) { value = mandatoryValue; confirmed = true; }
+            else if (autoApply) { value = suggestion; confirmed = true; }
+            else { value = isSerial ? [] : ''; confirmed = false; }
+            var serialsText = '';
+            if (isSerial && Array.isArray(value) && value.length) serialsText = value.join('\n');
+            return {
+                partTrackingId: partTrackingId, typeId: typeId, name: displayName,
+                isSerial: isSerial, isDate: isDate, hasNextValue: hasNextValue, nextValue: rawNext,
+                mandatory: hasNextValue, value: value, serialsText: serialsText,
+                suggestion: suggestion, confirmed: confirmed,
+            };
+        });
+        return {
+            woId: w.wo_id, woRow: woRowFromScheduler(w), wo: w,
+            status: 'idle',
+            lines: lines,
+            fg: { defs: defs, fgQty: fgQty },
+            preview: null, blockers: [], steps: [], lastError: null,
+            preflightRun: false,
+            serialLines: [], serialSelection: {},
+        };
+    }
+
+    // SQL: raw-material lines + per-line pick / stock context. Adapted
+    // from the source loadSubDetail linesSql (scrap columns dropped).
+    function linesSqlFor(woId, lgId) {
+        return "SELECT woi.id AS id, woi.partid AS partid, " +
+            "       p.num AS partnum, p.description AS partdesc, p.typeid AS parttypeid, " +
+            "       u.code AS uomcode, woi.qtytarget AS qtytarget, woi.qtyused AS qtyused, woi.qtyscrapped AS qtyscrapped, " +
+            "       COALESCE(picked.qty, 0) AS pickedqty, COALESCE(picked.maxstat, 0) AS pickedstatus, " +
+            "       COALESCE(pending.qty, 0) AS pendingqty, COALESCE(avail.qty, 0) AS availableqty, " +
+            // Default scrap location for the part in the WO's LG + qty available AT
+            // that location — drives the inline scrap hint + FIFO scrap fallback.
+            "       dl.locationid AS default_loc_id, dl_loc.name AS default_loc_name, dl_lg.name AS default_lg_name, " +
+            "       COALESCE(dl_avail.qty, 0) AS default_loc_avail, " +
+            "       (SELECT COUNT(*) FROM parttotracking ptt JOIN parttracking pt ON pt.id = ptt.parttrackingid " +
+            "         WHERE ptt.partid = woi.partid AND pt.typeid = 40 AND pt.activeflag = 1) AS serial_tracked, " +
+            "       (SELECT COUNT(*) FROM parttotracking ptt JOIN parttracking pt ON pt.id = ptt.parttrackingid " +
+            "         WHERE ptt.partid = woi.partid AND pt.activeflag = 1) AS has_tracking " +
+            "FROM woitem woi " +
+            "LEFT JOIN part p ON p.id = woi.partid " +
+            "LEFT JOIN uom u ON u.id = woi.uomid " +
+            "LEFT JOIN (SELECT woitemid, SUM(qty) AS qty, MAX(statusid) AS maxstat FROM pickitem " +
+            "           WHERE statusid IN (30, 40) GROUP BY woitemid) picked ON picked.woitemid = woi.id " +
+            "LEFT JOIN (SELECT woitemid, SUM(qty) AS qty FROM pickitem " +
+            "           WHERE statusid IN (5, 6, 10, 11, 20) GROUP BY woitemid) pending ON pending.woitemid = woi.id " +
+            "LEFT JOIN (SELECT t.partid AS partid, SUM(GREATEST(t.qty - COALESCE(t.qtycommitted, 0), 0)) AS qty " +
+            "           FROM tag t JOIN location l ON l.id = t.locationid " +
+            "           WHERE l.locationgroupid = " + lgId + " AND t.typeid IN (30, 40) " +
+            "             AND l.countedasavailable = 1 AND l.pickable = 1 GROUP BY t.partid) avail ON avail.partid = woi.partid " +
+            "LEFT JOIN defaultlocation dl ON dl.partid = woi.partid AND dl.locationgroupid = " + lgId + " " +
+            "LEFT JOIN location dl_loc ON dl_loc.id = dl.locationid " +
+            "LEFT JOIN locationgroup dl_lg ON dl_lg.id = dl_loc.locationgroupid " +
+            "LEFT JOIN (SELECT t.partid AS partid, t.locationid AS locationid, " +
+            "                  SUM(GREATEST(t.qty - COALESCE(t.qtycommitted, 0), 0)) AS qty " +
+            "           FROM tag t WHERE t.typeid IN (30, 40) GROUP BY t.partid, t.locationid) dl_avail " +
+            "  ON dl_avail.partid = woi.partid AND dl_avail.locationid = dl.locationid " +
+            "WHERE woi.woid = " + woId + " AND woi.typeid = 20 ORDER BY woi.sortid";
+    }
+    function fgTrackSqlFor(woId) {
+        return "SELECT DISTINCT pt.id AS part_tracking_id, pt.typeid AS type_id, pt.name AS name, ptt.nextvalue AS next_value " +
+            "FROM woitem woi JOIN parttotracking ptt ON ptt.partid = woi.partid JOIN parttracking pt ON pt.id = ptt.parttrackingid " +
+            "WHERE woi.woid = " + woId + " AND woi.typeid = 10 AND pt.activeflag = 1 ORDER BY pt.id";
+    }
+
+    // ============================================================
+    // OPEN — load data, build state, render + slide in the drawer
+    // ============================================================
+    async function open(woId) {
+        var w = allWorkOrders.find(function (x) { return String(x.wo_id) === String(woId); });
+        if (!w) { showToast('Work order not found', 'error'); return; }
+        // Fresh finish drawer with a loading state.
+        active = { woId: woId, wo: w, status: 'loading', loading: true };
+        renderFinishDrawer();
+        showDrawer('finish');
+        var lgId = parseInt(w.location_group_id, 10) || 0;
+        try {
+            var results = await Promise.all([qp(linesSqlFor(woId, lgId)), qp(fgTrackSqlFor(woId))]);
+            var rows = results[0] || [], fgTracking = results[1] || [];
+            active = buildFinishState(w, rows, fgTracking);
+            active.rawRows = rows;
+            dbg('Finish drawer WO#' + woId + ' — ' + rows.length + ' raw line(s), ' + (fgTracking || []).length + ' FG def(s)');
+            renderFinishDrawer();
+            runPreflight();
+        } catch (err) {
+            dbg('Finish load failed: ' + (err && err.message || err), 'error');
+            active = { woId: woId, wo: w, status: 'error', lastError: 'Failed to load work order lines: ' + (err && err.message || err), lines: [], fg: { defs: [], fgQty: 0 }, blockers: [], steps: [], serialLines: [], serialSelection: {}, woRow: woRowFromScheduler(w) };
+            renderFinishDrawer();
+        }
+    }
+
+    function collectSelectedSerialKeys(fs) {
+        var out = new Set();
+        var sel = (fs && fs.serialSelection) || {};
+        Object.keys(sel).forEach(function (pid) { (sel[pid] || []).forEach(function (k) { out.add(k); }); });
+        return out;
+    }
+    function reconcileSerialSelection(fs) {
+        if (!fs || !fs.serialLines) return;
+        var next = {};
+        fs.serialLines.forEach(function (line) {
+            if (line.readOnly) return;
+            var candKeys = new Set(line.candidates.map(function (c) { return c.key; }));
+            var prior = fs.serialSelection[line.pickitemId] || [];
+            var pruned = prior.filter(function (k) { return candKeys.has(k); });
+            if (pruned.length) next[line.pickitemId] = pruned;
+        });
+        fs.serialSelection = next;
+    }
+
+    // Fire the preview (GetPick + stock query + allocation dry-run) so
+    // the banner + blockers populate before Finish is enabled.
+    function runPreflight() {
+        var fs = active;
+        if (!fs || fs.loading) return;
+        if (!fs.woRow || !fs.woRow.pick_num) {
+            fs.status = 'error';
+            fs.lastError = 'No pick is attached to this WO — generate a pick in Fishbowl first, then reload.';
+            fs.blockers = [fs.lastError];
+            fs.preflightRun = true;
+            renderFinishDrawer();
+            return;
+        }
+        if (fs.preflightRun && fs.status !== 'error') return;
+        fs.preflightRun = true;
+        fs.status = 'preflight';
+        renderFinishDrawer();
+        Finisher.previewFinish(fs.woRow, {
+            mode: Finisher.CFG.mode,
+            selectedSerialKeys: collectSelectedSerialKeys(fs),
+        }).then(function (result) {
+            if (active !== fs) return;   // drawer changed underneath us
+            fs.preview = result;
+            fs.blockers = result.blockers || [];
+            fs.lastError = result.error && !result.ok ? String(result.error) : null;
+            fs.serialLines = Finisher.serialLinesFrom(result) || [];
+            reconcileSerialSelection(fs);
+            fs.status = result.ok && !result.blockers.length ? 'ready' : 'error';
+            renderFinishDrawer();
+        }).catch(function (e) {
+            if (active !== fs) return;
+            fs.status = 'error';
+            fs.lastError = String(e && e.message || e);
+            renderFinishDrawer();
+        });
+    }
+
+    // ── FG-tracking validation (mirrors source onFinishClick gate) ──
+    function fgValidation(fs) {
+        var needN = Math.round((fs.fg && fs.fg.fgQty) || 0);
+        var unconfirmed = [], badCount = [];
+        ((fs.fg && fs.fg.defs) || []).forEach(function (def) {
+            if (def.mandatory) return;
+            if (!def.confirmed) { unconfirmed.push(def.name); return; }
+            if (def.isSerial) {
+                var arr = Array.isArray(def.value) ? def.value : parseFgSerials(def.serialsText || '');
+                if (needN && arr.length !== needN) badCount.push(def.name + ' (' + arr.length + '/' + needN + ')');
+            } else {
+                if (!def.value || !String(def.value).length) unconfirmed.push(def.name);
+            }
+        });
+        return { unconfirmed: unconfirmed, badCount: badCount, ok: !unconfirmed.length && !badCount.length };
+    }
+
+    // Recompute readiness after an operator edit that might resolve a
+    // blocker (FG confirm, serial selection). Mirrors source.
+    function recheckReadiness() {
+        var fs = active;
+        if (!fs) return;
+        var v = fgValidation(fs);
+        if (!v.ok) {
+            fs.status = 'error';
+            if (v.unconfirmed.length) fs.lastError = 'Confirm FG tracking: ' + v.unconfirmed.join(', ') + '.';
+            else fs.lastError = 'Serial count mismatch: ' + v.badCount.join('; ') + '.';
+            fs.blockers = [fs.lastError];
+            renderFinishDrawer();
+            return;
+        }
+        if (fs.preview && fs.preview.ok && !(fs.preview.blockers && fs.preview.blockers.length)) {
+            fs.status = 'ready'; fs.blockers = []; fs.lastError = null;
+            renderFinishDrawer();
+            return;
+        }
+        fs.preflightRun = false;
+        runPreflight();
+    }
+
+    // ============================================================
+    // RENDER — FINISH DRAWER
+    // ============================================================
+    function renderCount(text, qty) {
+        var n = parseFgSerials(text).length;
+        var need = qty ? Math.round(qty) : 0;
+        if (n === 0 && need > 0) return { cls: 'fail', txt: 'Empty — need ' + fmtQty(qty) };
+        if (need && n !== need) return { cls: 'warn', txt: n + ' entered · need ' + fmtQty(qty) };
+        return { cls: 'ok', txt: n + ' serial' + (n === 1 ? '' : 's') + ' ready' };
+    }
+
+    function bannerHtml(fs) {
+        if (fs.loading) return '<div class="pf-banner warn"><span class="pf-summary">' + psSpill('active', 'Loading…') + '</span></div>';
+        var pickStep, allocStep, tone, actionHtml, extra = '';
+        pickStep = psSpill('neutral', 'Pick ' + (fs.woRow && fs.woRow.pick_num || '—'));
+        var steps = (fs.steps && fs.steps.length)
+            ? '<span class="pf-steps">' + fs.steps.map(function (s) { return psSpill('success', s); }).join('') + '</span>'
+            : '';
+        if (fs.status === 'preflight') {
+            allocStep = psSpill('active', 'Checking stock…'); tone = 'warn';
+            actionHtml = '<button class="ps-btn primary sm" disabled>Finish WO</button>';
+        } else if (fs.status === 'submitting') {
+            allocStep = psSpill('active', 'Committing…'); tone = 'warn';
+            actionHtml = '<button class="ps-btn primary sm" disabled>Finishing…</button>';
+        } else if (fs.status === 'done') {
+            allocStep = psSpill('success', 'Fulfilled'); tone = 'ok';
+            actionHtml = '<button class="ps-btn sm" onclick="PSFinish.close()">Close</button>';
+        } else if (fs.status === 'error' || (fs.blockers && fs.blockers.length)) {
+            allocStep = psSpill('critical', 'Blocked'); tone = 'late';
+            actionHtml = '<button class="ps-btn primary sm" disabled title="Resolve blockers below">Finish WO</button>';
+            extra = blockerHtml(fs);
+        } else if (fs.status === 'ready') {
+            allocStep = psSpill('success', 'Stock allocated'); tone = 'ok';
+            actionHtml = '<button class="ps-btn primary sm" onclick="PSFinish.finish()">Finish WO</button>';
+        } else {
+            allocStep = psSpill('neutral', 'Not checked yet'); tone = 'warn';
+            actionHtml = '<button class="ps-btn primary sm" onclick="PSFinish.recheck()">Check stock</button>';
+        }
+        return '<div class="pf-banner ' + tone + '">' +
+            '<span class="pf-summary">' + pickStep + allocStep + steps + '</span>' +
+            '<span class="pf-actions">' + actionHtml + '</span>' +
+            '</div>' + extra;
+    }
+    function blockerHtml(fs) {
+        var items = (fs.blockers || []).slice();
+        if (!items.length && fs.lastError) items.push(fs.lastError);
+        if (!items.length) return '';
+        // Drop per-part shortage bullets — those show inline in the table.
+        var shortage = /: short \d/;
+        var filtered = items.filter(function (b) { return !shortage.test(String(b)); });
+        var count = items.length - filtered.length;
+        var lis = filtered.map(function (b) { return '<li>' + esc(String(b)) + '</li>'; });
+        if (count > 0) lis.push('<li>' + count + ' raw-material line' + (count === 1 ? '' : 's') + ' short of stock — see the table below.</li>');
+        return '<ul class="pf-blocker-list">' + lis.join('') + '</ul>';
+    }
+
+    function rawTableHtml(fs) {
+        var rows = fs.lines || [];
+        if (!rows.length) return '<div class="dsec"><h4>Raw materials</h4><div class="pf-ro" style="padding:8px 2px">No raw-material lines on this work order.</div></div>';
+        var editable = fs.status !== 'done' && fs.status !== 'submitting';
+        var allPicked = rows.length && rows.every(function (l) { return l.isLabour || l.pickedStatus >= 30; });
+        var pickHdr = allPicked ? 'Picked' : 'Pickable';
+        var body = rows.map(function (line, i) {
+            var target = line.target;
+            var usedRaw = (line.usedInput == null || line.usedInput === '') ? '' : line.usedInput;
+            var usedEff = effectiveUsedQty(line);
+            var scrapEff = effectiveScrapQty(line);
+            var pct = target > 0 ? Math.round(100 * (usedEff + scrapEff) / target) : 0;
+            var availTone = line.isLabour ? 'neutral'
+                : (line.availableQty >= (line.pendingQty > 0 ? line.pendingQty : target)) ? 'success'
+                : (line.availableQty > 0 ? 'caution' : 'critical');
+            var availLabel = line.isLabour ? 'Auto' : fmtQty(line.availableQty);
+            var usedCell = (editable && !line.isLabour)
+                ? '<input type="number" step="0.001" min="0" value="' + usedRaw + '" placeholder="' + fmtQty(target) + '" ' +
+                    'title="Leave blank to consume the target qty (' + fmtQty(target) + ')" ' +
+                    'oninput="PSFinish.lineDirty(this)" onchange="PSFinish.lineChange(' + i + ', this)">'
+                : (line.isLabour ? '<span class="pf-ro">' + fmtQty(target) + '</span>' : fmtQty(usedEff));
+            // Scrapped input — opt-in qty routed to a stock location via
+            // ImportScrapData at Finish. Labour lines can't be scrapped.
+            var scrapRaw = (line.scrappedInput == null || line.scrappedInput === '') ? '' : line.scrappedInput;
+            var scrapCell = (editable && !line.isLabour)
+                ? '<input type="number" step="0.001" min="0" value="' + scrapRaw + '" placeholder="0" ' +
+                    'title="Qty to scrap — routed to a stock location via ImportScrapData at Finish" ' +
+                    'oninput="PSFinish.lineDirty(this)" onchange="PSFinish.scrapChange(' + i + ', this)">' + scrapHintHtml(line)
+                : (line.isLabour ? '<span class="pf-ro">—</span>' : (scrapEff > 0 ? fmtQty(scrapEff) : '<span class="pf-ro">—</span>'));
+            var serialBtn = (!line.isLabour && line.isSerialTracked)
+                ? '<button class="ps-btn sm" style="margin-top:4px" onclick="PSFinish.openSourceSerials(' + i + ')">Select serials</button>'
+                : '';
+            var descLbl = line.isLabour ? ' <span class="pf-ro">(auto-fulfilled)</span>' : '';
+            return '<tr>' +
+                '<td><span class="pf-partn">' + esc(line.partNum) + '</span>' + descLbl +
+                    (line.partDesc ? '<div class="pf-desc">' + esc(line.partDesc) + '</div>' : '') + serialBtn + '</td>' +
+                '<td>' + esc(line.uom) + '</td>' +
+                '<td class="num">' + psSpill(availTone, availLabel) + '</td>' +
+                '<td class="num">' + fmtQty(target) + '</td>' +
+                '<td class="num">' + usedCell + '</td>' +
+                '<td class="num">' + scrapCell + '</td>' +
+                '<td class="num">' + pct + '%</td>' +
+                '</tr>';
+        }).join('');
+        return '<div class="dsec"><h4>Raw materials</h4><div class="pf-tablewrap"><table class="pf-table"><thead><tr>' +
+            '<th>Part</th><th>UOM</th><th class="num">' + pickHdr + '</th><th class="num">Target</th><th class="num">Used</th><th class="num">Scrap</th><th class="num">%</th>' +
+            '</tr></thead><tbody>' + body + '</tbody></table></div></div>';
+    }
+
+    function sourceSerialsHtml(fs) {
+        if (!fs.serialLines || !fs.serialLines.length) return '';
+        var rows = fs.serialLines.map(function (line, i) {
+            var sel = fs.serialSelection[line.pickitemId] || [];
+            var selCount = line.readOnly ? line.candidates.length : sel.length;
+            var required = line.required || 0;
+            var cls = line.readOnly ? 'ok' : (selCount === 0 ? 'fail' : (required && selCount === required ? 'ok' : 'warn'));
+            var txt = line.readOnly ? selCount + ' committed' : selCount + ' of ' + required + ' selected';
+            var btn = line.readOnly ? 'View serials' : 'Select serials';
+            return '<div class="pf-sr-row">' +
+                '<div class="pf-sr-part"><span class="pf-partn">' + esc(line.partNum) + '</span>' +
+                    (line.partDesc ? ' <span class="pf-ro">· ' + esc(line.partDesc) + '</span>' : '') + '</div>' +
+                '<span class="pf-sr-count ' + cls + '">' + txt + '</span>' +
+                '<button class="ps-btn sm" onclick="PSFinish.openSourceSerialsByPickitem(' + line.pickitemId + ')">' + btn + '</button>' +
+                '</div>';
+        }).join('');
+        return '<div class="dsec"><h4>Source serial numbers</h4><div class="pf-serial-rows">' + rows + '</div></div>';
+    }
+
+    function fgFieldHtml(fs, def, idx) {
+        var detail;
+        if (def.mandatory) detail = '<span class="spill neutral pf-fg-detail" title="Locked — Fishbowl nextValue = ' + esc(def.nextValue) + '">nextValue</span>';
+        else if (!def.confirmed) detail = '<button class="ps-btn sm pf-fg-detail" onclick="PSFinish.fgUseSuggestion(' + def.partTrackingId + ')">Use suggestion</button>';
+        else detail = '<span class="pf-fg-detail" style="color:#1B7A46;font-weight:600">✓ Confirmed</span>';
+        if (def.isSerial) {
+            var display = Array.isArray(def.value) ? def.value.join('\n') : '';
+            var ta = def.mandatory
+                ? '<textarea class="pf-serials" readonly>' + esc(display) + '</textarea>'
+                : '<textarea class="pf-serials" oninput="PSFinish.fgSerialsInput(' + def.partTrackingId + ', this.value)" ' +
+                    'placeholder="One serial per line — count must match qty">' + esc(def.serialsText || '') + '</textarea>';
+            var cnt = renderCount(def.mandatory ? display : (def.serialsText || ''), fs.fg.fgQty);
+            return '<div class="pf-fg-field">' +
+                '<label>' + esc(def.name) + ' <span class="pf-ro" style="font-weight:400">· ' + fmtQty(fs.fg.fgQty) + ' required</span>' +
+                    ' <span style="float:right">' + detail + '</span></label>' +
+                ta + '<div class="pf-count ' + cnt.cls + '">' + cnt.txt + '</div>' +
+                '<button class="ps-btn sm" style="margin-top:6px" onclick="PSFinish.openFgSerials(' + def.partTrackingId + ')">Select serials…</button>' +
+                '</div>';
+        }
+        var val = def.value == null ? '' : String(def.value);
+        var type = def.isDate ? 'date' : 'text';
+        var placeholder = def.mandatory ? '' : (def.suggestion ? 'Suggested: ' + def.suggestion : '');
+        var input = def.mandatory
+            ? '<input type="' + type + '" value="' + esc(val) + '" readonly>'
+            : '<input type="' + type + '" value="' + esc(val) + '" placeholder="' + esc(placeholder) + '" ' +
+                'oninput="PSFinish.fgTextInput(' + def.partTrackingId + ', this.value)">';
+        return '<div class="pf-fg-field"><label>' + esc(def.name) + '</label>' +
+            '<div class="pf-fg-row">' + input + detail + '</div></div>';
+    }
+
+    function fgSectionHtml(fs) {
+        if (!fs.fg || !fs.fg.defs || !fs.fg.defs.length) return '';
+        var fields = fs.fg.defs.map(function (def, i) { return fgFieldHtml(fs, def, i); }).join('');
+        return '<div class="dsec"><h4>Finished-good tracking</h4><div class="pf-fg">' + fields + '</div></div>';
+    }
+
+    function renderFinishDrawer() {
+        var fs = active;
+        var panel = document.getElementById('finishPanel');
+        if (!panel || !fs) return;
+        var w = fs.wo || {};
+        var qtyLbl = w.qty_target != null ? ' ×' + fmtQty(w.qty_target) : '';
+        var head =
+            '<div class="detail-head"><div class="top">' +
+              '<div class="detail-head-main">' +
+                '<span class="wo">' + esc(w.wo_num || '') + '</span>' +
+                '<h2>Finish Work Order</h2>' +
+                '<div class="sub"><span class="mono">' + esc(w.part_num || '') + '</span>' + qtyLbl +
+                  ' · MO ' + esc(w.mo_num || '') + '</div>' +
+              '</div>' +
+              '<div class="detail-actions">' +
+                '<button class="close-x" onclick="PSFinish.close()"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></svg></button>' +
+                '<button class="ps-btn sm" onclick="openModule(\'Work Order\',\'' + String(w.wo_num || '').replace(/'/g, "\\'") + '\')" title="Open in Fishbowl"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M14 5l7 7-7 7M3 12h18"/></svg>Open in Fishbowl</button>' +
+              '</div>' +
+            '</div></div>';
+        var body;
+        if (fs.loading) {
+            body = '<div class="detail-body">' + bannerHtml(fs) + '<div class="pf-ro" style="padding:10px 2px">Loading raw-material lines…</div></div>';
+        } else {
+            body = '<div class="detail-body">' +
+                bannerHtml(fs) +
+                rawTableHtml(fs) +
+                sourceSerialsHtml(fs) +
+                fgSectionHtml(fs) +
+                '<div class="dsec" style="display:flex;gap:8px;justify-content:flex-end">' +
+                  (fs.status === 'ready'
+                    ? '<button class="ps-btn primary" onclick="PSFinish.finish()">Finish WO</button>'
+                    : '<button class="ps-btn primary" disabled title="Resolve blockers above">Finish WO</button>') +
+                  '<button class="ps-btn" onclick="PSFinish.close()">Cancel</button>' +
+                '</div>' +
+            '</div>';
+        }
+        panel.innerHTML = head + body;
+    }
+
+    // ============================================================
+    // TRACKING DRAWER — serial/lot selection (tier 3)
+    // ============================================================
+    // Two modes:
+    //   • 'source' — pick candidate serials for one raw pickitem
+    //     (writes into active.serialSelection[pickitemId]).
+    //   • 'fg'     — edit FG serials for one tracking def (textarea +
+    //     candidate raws to pull from); writes def.value/serialsText.
+    var track = null;   // { mode, ... }
+
+    function openTrackSource(pickitemId) {
+        var fs = active;
+        if (!fs) return;
+        var line = (fs.serialLines || []).find(function (l) { return l.pickitemId === Number(pickitemId); });
+        if (!line) { showToast('No serial data for this line yet — run Check stock first', 'info'); return; }
+        var readOnly = !!line.readOnly;
+        track = {
+            mode: 'source', line: line, readOnly: readOnly,
+            candidates: (line.candidates || []).slice(),
+            filter: '',
+            selected: new Set(readOnly ? line.candidates.map(function (c) { return c.key; }) : (fs.serialSelection[pickitemId] || [])),
+        };
+        renderTrackDrawer();
+        showDrawer('track');
+    }
+
+    function openTrackFg(partTrackingId) {
+        var fs = active;
+        if (!fs) return;
+        var def = (fs.fg.defs || []).find(function (d) { return d.partTrackingId === Number(partTrackingId); });
+        if (!def || !def.isSerial) return;
+        // Candidate raws = the source serials the operator actually SELECTED in the
+        // raw-goods step (for an already-committed pick line, the serials Fishbowl
+        // committed) — NOT every available serial. c.key is the candidate's real
+        // key, which matches what serialSelection stores.
+        var raws = [];
+        (fs.serialLines || []).forEach(function (l) {
+            var selKeys = l.readOnly ? null : new Set(fs.serialSelection[l.pickitemId] || []);
+            (l.candidates || []).forEach(function (c) {
+                if (selKeys && !selKeys.has(c.key)) return;   // only operator-selected serials
+                raws.push({ partNum: l.partNum, serialNum: c.serialNum, key: l.pickitemId + '::' + c.serialNum });
+            });
+        });
+        track = {
+            mode: 'fg', def: def, readOnly: !!def.mandatory,
+            serialsText: def.mandatory ? (Array.isArray(def.value) ? def.value.join('\n') : '') : (def.serialsText || ''),
+            raws: raws, rawSelected: new Set(), filter: '',
+        };
+        renderTrackDrawer();
+        showDrawer('track');
+    }
+
+    function trackApply() {
+        var fs = active;
+        if (!track || !fs) return;
+        if (track.mode === 'source') {
+            if (!track.readOnly) {
+                fs.serialSelection[track.line.pickitemId] = Array.from(track.selected);
+                fs.preflightRun = false;
+            }
+            hideDrawer('track'); track = null;
+            renderFinishDrawer();
+            if (fs.status !== 'done') runPreflight();
+            return;
+        }
+        if (track.mode === 'fg') {
+            var def = track.def;
+            if (!def.mandatory) {
+                var arr = parseFgSerials(track.serialsText);
+                def.value = arr; def.serialsText = arr.join('\n'); def.confirmed = arr.length > 0;
+            }
+            hideDrawer('track'); track = null;
+            renderFinishDrawer();
+            recheckReadiness();
+            return;
+        }
+    }
+
+    function renderTrackDrawer() {
+        var panel = document.getElementById('trackPanel');
+        if (!panel || !track) return;
+        if (track.mode === 'source') { panel.innerHTML = renderTrackSource(); }
+        else { panel.innerHTML = renderTrackFg(); }
+    }
+
+    function trackHead(title, sub) {
+        return '<div class="detail-head"><div class="top">' +
+              '<div class="detail-head-main"><h2>' + esc(title) + '</h2>' +
+                '<div class="sub">' + esc(sub) + '</div></div>' +
+              '<div class="detail-actions">' +
+                '<button class="close-x" onclick="PSFinish.closeTop()"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></svg></button>' +
+              '</div></div></div>';
+    }
+
+    function renderTrackSource() {
+        var line = track.line, ro = track.readOnly;
+        var need = line.required || 0, have = track.selected.size;
+        var cntCls = ro ? 'ok' : (have === 0 ? 'fail' : (need && have === need ? 'ok' : 'warn'));
+        var cntTxt = ro ? line.candidates.length + ' committed' : have + ' / ' + need + ' selected';
+        var toolbar = ro ? '' :
+            '<div class="pf-tk-toolbar">' +
+              '<input type="text" placeholder="Filter serial…" oninput="PSFinish.trackFilter(this.value)">' +
+              '<a onclick="PSFinish.trackSelectAll()">Select all</a><span class="sep">·</span>' +
+              '<a onclick="PSFinish.trackClear()">Clear</a><span class="sep">·</span>' +
+              '<a onclick="PSFinish.trackFirstN()">First ' + need + '</a>' +
+            '</div>';
+        var f = (track.filter || '').trim().toLowerCase();
+        var items = track.candidates.map(function (c, i) { return { c: c, i: i }; })
+            .filter(function (o) { return !f || o.c.serialNum.toLowerCase().indexOf(f) !== -1; });
+        var list = items.length
+            ? items.map(function (o) {
+                var c = o.c, isSel = track.selected.has(c.key);
+                var meta = [];
+                if (c.tagNum) meta.push('Tag ' + c.tagNum); else if (c.tagId) meta.push('Tag #' + c.tagId);
+                if (c.tagDateCreated) meta.push(esc(fmtDate(c.tagDateCreated)));
+                return '<div class="pf-tk-item' + (isSel ? ' selected' : '') + (ro ? ' readonly' : '') + '" ' +
+                    (ro ? '' : 'onclick="PSFinish.trackToggle(' + o.i + ')"') + '>' +
+                    '<input type="checkbox"' + (isSel ? ' checked' : '') + (ro ? ' disabled' : '') + '>' +
+                    '<span class="pf-tk-sn">' + esc(c.serialNum) + '</span>' +
+                    '<span class="pf-tk-meta">' + meta.join(' · ') + '</span></div>';
+            }).join('')
+            : '<div class="pf-tk-empty">No serials match.</div>';
+        var foot = '<div class="dsec" style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:12px">' +
+            '<span class="pf-tk-count ' + cntCls + '">' + cntTxt + '</span>' +
+            '<div style="display:flex;gap:6px">' +
+              (ro ? '<button class="ps-btn primary" onclick="PSFinish.closeTop()">Close</button>'
+                  : '<button class="ps-btn primary" onclick="PSFinish.trackApply()">Apply</button>' +
+                    '<button class="ps-btn" onclick="PSFinish.closeTop()">Back</button>') +
+            '</div></div>';
+        return trackHead((ro ? 'Committed serials' : 'Select serials') + ' — ' + line.partNum,
+                         ro ? line.candidates.length + ' committed by Fishbowl' : 'Need ' + need + ' serial' + (need === 1 ? '' : 's') + ' from this location group') +
+            '<div class="detail-body" style="display:flex;flex-direction:column">' + toolbar +
+              '<div class="pf-tk-list">' + list + '</div>' + foot + '</div>';
+    }
+
+    function renderTrackFg() {
+        var def = track.def, ro = track.readOnly;
+        var needN = Math.round((active.fg && active.fg.fgQty) || 0);
+        var cnt = renderCount(track.serialsText, active.fg.fgQty);
+        var rawsToolbar = '';
+        var rawsList = '';
+        if (!ro && track.raws.length) {
+            var f = (track.filter || '').trim().toLowerCase();
+            var items = track.raws.map(function (c, i) { return { c: c, i: i }; })
+                .filter(function (o) { return !f || o.c.serialNum.toLowerCase().indexOf(f) !== -1 || (o.c.partNum || '').toLowerCase().indexOf(f) !== -1; });
+            rawsToolbar = '<div class="pf-tk-toolbar" style="margin-top:10px">' +
+                '<input type="text" placeholder="Filter picked raws…" oninput="PSFinish.trackFilter(this.value)">' +
+                '<a onclick="PSFinish.trackRawFirstN()">First ' + needN + '</a><span class="sep">·</span>' +
+                '<a onclick="PSFinish.trackRawAll()">Select all</a><span class="sep">·</span>' +
+                '<a onclick="PSFinish.trackRawClear()">Clear</a><span class="sep">·</span>' +
+                '<a onclick="PSFinish.trackRawUse()">Use selected →</a></div>' +
+                '<div class="pf-ro" style="font-size:11px;margin:2px 0 4px">' + track.rawSelected.size + ' of ' + track.raws.length + ' picked-raw serials selected</div>';
+            rawsList = '<div class="pf-tk-list" style="max-height:180px">' + (items.length
+                ? items.map(function (o) {
+                    var c = o.c, isSel = track.rawSelected.has(c.key);
+                    return '<div class="pf-tk-item' + (isSel ? ' selected' : '') + '" onclick="PSFinish.trackRawToggle(' + o.i + ')">' +
+                        '<input type="checkbox"' + (isSel ? ' checked' : '') + '>' +
+                        '<span class="pf-tk-sn">' + esc(c.serialNum) + '</span><span class="pf-tk-meta">' + esc(c.partNum) + '</span></div>';
+                }).join('')
+                : '<div class="pf-tk-empty">No serials match.</div>') + '</div>';
+        }
+        var ta = ro
+            ? '<textarea class="pf-serials" readonly style="min-height:150px">' + esc(track.serialsText) + '</textarea>'
+            : '<textarea class="pf-serials" style="min-height:150px" oninput="PSFinish.trackFgText(this.value)" placeholder="One serial per line — count must match qty">' + esc(track.serialsText) + '</textarea>';
+        var tools = ro ? '' :
+            '<div class="pf-tk-toolbar" style="margin-top:8px">' +
+              '<a onclick="PSFinish.trackFgFillWo()">Fill from WO sequence</a><span class="sep">·</span>' +
+              '<a onclick="PSFinish.trackFgClear()">Clear</a>' +
+            '</div>';
+        var foot = '<div class="dsec" style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:12px">' +
+            '<span class="pf-tk-count ' + cnt.cls + '">' + cnt.txt + '</span>' +
+            '<div style="display:flex;gap:6px">' +
+              (ro ? '<button class="ps-btn primary" onclick="PSFinish.closeTop()">Close</button>'
+                  : '<button class="ps-btn primary" onclick="PSFinish.trackApply()">Apply</button>' +
+                    '<button class="ps-btn" onclick="PSFinish.closeTop()">Back</button>') +
+            '</div></div>';
+        return trackHead('Finished-good serials — ' + def.name,
+                         'WO ' + (active.wo && active.wo.wo_num || '') + ' · qty ' + fmtQty(active.fg.fgQty)) +
+            '<div class="detail-body">' +
+              '<label class="pf-ro" style="display:block;font-weight:700;margin-bottom:4px">Serial numbers (' + needN + ' required)</label>' +
+              ta + '<div class="pf-count ' + cnt.cls + '" style="margin-top:2px">' + cnt.txt + '</div>' +
+              tools + rawsToolbar + rawsList + foot +
+            '</div>';
+    }
+
+    // ============================================================
+    // FINISH — commit
+    // ============================================================
+    async function finish() {
+        var fs = active;
+        if (!fs || fs.status === 'submitting') return;
+        var v = fgValidation(fs);
+        if (!v.ok) {
+            fs.status = 'error';
+            fs.lastError = v.unconfirmed.length
+                ? 'Confirm FG tracking first: ' + v.unconfirmed.join(', ') + '. Click "Use suggestion" beside each, or "Select serials".'
+                : 'Serial count mismatch: ' + v.badCount.join('; ') + '.';
+            fs.blockers = [fs.lastError];
+            renderFinishDrawer();
+            return;
+        }
+        var w = fs.wo;
+        // Build the scrap plan first (resolve each scrapped line's location +
+        // FIFO-allocate stock) so any problem blocks BEFORE we commit the pick.
+        var scrapWo = { num: w.wo_num, moLgId: fs.woRow.locationgroupid, moLgName: fs.woRow.location_group };
+        fs.status = 'preflight'; renderFinishDrawer();
+        var plan;
+        try { plan = await buildScrapPlan(fs, scrapWo); }
+        catch (e) {
+            if (active !== fs) return;
+            fs.status = 'error'; fs.lastError = 'Scrap plan build failed: ' + String(e && e.message || e); fs.blockers = [fs.lastError];
+            renderFinishDrawer(); return;
+        }
+        if (active !== fs) return;
+        if (plan.blockers.length) {
+            fs.status = 'error'; fs.lastError = 'Cannot scrap: ' + plan.blockers.join('; '); fs.blockers = plan.blockers.slice();
+            renderFinishDrawer(); return;
+        }
+        var scrapSummary = plan.rows.length
+            ? '\n\nAdditionally the following will be scrapped:\n' + plan.rows.map(function (r) { return r.partNum + ' ×' + fmtQty(r.qty) + ' @ ' + r.location; }).join('\n')
+            : '';
+        var prompt = 'Finish WO ' + w.wo_num + '?\n\nThis commits the pick and marks the WO Fulfilled. Cannot be undone from this report.' + scrapSummary;
+        if (!confirm(prompt)) { fs.status = 'ready'; renderFinishDrawer(); return; }
+        _scrapImp = null;   // fresh ImportScrapData header per finish
+        // Used-qty overrides — only where the operator's Used input
+        // diverges from what the pick would consume by default.
+        var usedOverrides = [];
+        (fs.lines || []).forEach(function (line) {
+            if (line.isLabour || !line.woitemId) return;
+            var raw = line.usedInput;
+            if (raw == null || raw === '') return;
+            var used = parseFloat(raw);
+            if (!Number.isFinite(used) || used < 0) return;
+            var expected = line.pendingQty > 0 ? line.pendingQty : line.pickedQty;
+            if (Math.abs(used - expected) > 1e-6) {
+                usedOverrides.push({ woItemId: line.woitemId, partNum: line.partNum, qty: used });
+            }
+        });
+        fs.status = 'submitting'; fs.steps = []; fs.lastError = null; fs.blockers = [];
+        renderFinishDrawer();
+        try {
+            var result = await Finisher.prepareFinish(fs.woRow, {
+                mode: Finisher.CFG.mode,
+                fgDefs: fs.fg.defs,
+                selectedSerialKeys: collectSelectedSerialKeys(fs),
+                usedOverrides: usedOverrides,
+                scrapRows: plan.rows,
+                scrapImporter: postScrapImport,
+                post: true,
+                onStep: function (label) { if (active === fs) { fs.steps.push(label); renderFinishDrawer(); } },
+            });
+            if (active !== fs) return;
+            if (result.ok && result.posted) {
+                fs.status = 'done'; fs.blockers = []; fs.lastError = null;
+                renderFinishDrawer();
+                showToast('WO ' + w.wo_num + ' finished', 'success');
+                setStatus('WO ' + w.wo_num + ' fulfilled.');
+                if (typeof loadWorkOrders === 'function') loadWorkOrders();
+                // Refresh the detail drawer sitting beneath the finish drawer so it
+                // reflects the now-Fulfilled WO — status pill flips to Fulfilled and
+                // the Finish WO button drops out. loadWorkOrders() re-queries
+                // allWorkOrders synchronously, so openDetail re-reads the updated WO.
+                try {
+                    var dp = document.getElementById('detailPanel');
+                    if (dp && dp.classList.contains('on') && String(_avDetailWoId) === String(fs.woId) && typeof openDetail === 'function') {
+                        openDetail(fs.woId);
+                    }
+                } catch (_) {}
+            } else {
+                fs.status = 'error';
+                fs.blockers = result.blockers || [];
+                fs.lastError = result.error ? String(result.error) : 'Finish did not complete.';
+                renderFinishDrawer();
+            }
+        } catch (e) {
+            if (active !== fs) return;
+            fs.status = 'error';
+            fs.lastError = String(e && e.message || e);
+            fs.blockers = [fs.lastError];
+            renderFinishDrawer();
+        }
+    }
+
+    function closeFinish() {
+        // Close any open tracking drawer first, then the finish drawer.
+        if (stack.indexOf('track') !== -1) { hideDrawer('track'); track = null; }
+        hideDrawer('finish');
+        active = null;
+    }
+
+    // ============================================================
+    // PUBLIC + window.* handlers used by the drawer markup
+    // ============================================================
+    // Raw-material line edits.
+    window.PSFinish = {
+        open: open,
+        close: closeFinish,
+        closeTop: closeTop,
+        escHandled: escHandled,
+        recheck: function () { if (active) { active.preflightRun = false; runPreflight(); } },
+        finish: finish,
+        lineDirty: function (input) { input.classList.add('dirty'); },
+        lineChange: function (idx, input) {
+            var fs = active; if (!fs || !fs.lines[idx]) return;
+            var raw = String(input.value == null ? '' : input.value).trim();
+            if (raw === '') fs.lines[idx].usedInput = null;
+            else { var n = parseFloat(raw); fs.lines[idx].usedInput = (!Number.isFinite(n) || n < 0) ? 0 : n; }
+            fs.lines[idx].dirty = true;
+            renderFinishDrawer();
+        },
+        // Scrapped-qty edit on a raw-material line. Blank = nothing to scrap.
+        scrapChange: function (idx, input) {
+            var fs = active; if (!fs || !fs.lines[idx]) return;
+            var raw = String(input.value == null ? '' : input.value).trim();
+            if (raw === '') fs.lines[idx].scrappedInput = null;
+            else { var n = parseFloat(raw); fs.lines[idx].scrappedInput = (!Number.isFinite(n) || n < 0) ? 0 : n; }
+            fs.lines[idx].dirty = true;
+            renderFinishDrawer();
+        },
+        // FG tracking field handlers.
+        fgTextInput: function (ptId, value) {
+            var fs = active; var def = (fs && fs.fg.defs || []).find(function (d) { return d.partTrackingId === Number(ptId); });
+            if (!def || def.mandatory) return;
+            def.value = value; def.confirmed = value != null && String(value).length > 0;
+            recheckReadiness();
+        },
+        fgSerialsInput: function (ptId, value) {
+            var fs = active; var def = (fs && fs.fg.defs || []).find(function (d) { return d.partTrackingId === Number(ptId); });
+            if (!def || def.mandatory || !def.isSerial) return;
+            def.serialsText = value; def.value = parseFgSerials(value); def.confirmed = def.value.length > 0;
+            recheckReadiness();
+        },
+        fgUseSuggestion: function (ptId) {
+            var fs = active; var def = (fs && fs.fg.defs || []).find(function (d) { return d.partTrackingId === Number(ptId); });
+            if (!def || def.mandatory) return;
+            if (def.isSerial) { var arr = Array.isArray(def.suggestion) ? def.suggestion.slice() : []; def.value = arr; def.serialsText = arr.join('\n'); }
+            else { def.value = def.suggestion == null ? '' : def.suggestion; }
+            def.confirmed = true;
+            renderFinishDrawer();
+            recheckReadiness();
+        },
+        // Source-serial tracking drawer.
+        openSourceSerials: function (lineIdx) {
+            var fs = active; if (!fs || !fs.lines[lineIdx]) return;
+            // Map raw line → its serial pickitem by partNum (serialLines
+            // are keyed by pickitem; a raw line's partNum identifies it).
+            var pn = fs.lines[lineIdx].partNum;
+            var sl = (fs.serialLines || []).find(function (l) { return l.partNum === pn; });
+            if (!sl) { showToast('Run Check stock first to load serial candidates', 'info'); return; }
+            openTrackSource(sl.pickitemId);
+        },
+        openSourceSerialsByPickitem: openTrackSource,
+        openFgSerials: openTrackFg,
+        trackApply: trackApply,
+        // Source-serial selection gestures.
+        trackFilter: function (v) { if (track) { track.filter = v; renderTrackDrawer(); } },
+        trackToggle: function (i) {
+            if (!track || track.mode !== 'source') return;
+            var key = track.candidates[i].key;
+            if (track.selected.has(key)) track.selected.delete(key); else track.selected.add(key);
+            renderTrackDrawer();
+        },
+        trackSelectAll: function () { if (track) { track.candidates.forEach(function (c) { track.selected.add(c.key); }); renderTrackDrawer(); } },
+        trackClear: function () { if (track) { track.selected.clear(); renderTrackDrawer(); } },
+        trackFirstN: function () {
+            if (!track) return;
+            track.selected.clear();
+            var need = track.line.required || 0;
+            for (var i = 0; i < track.candidates.length && track.selected.size < need; i++) track.selected.add(track.candidates[i].key);
+            renderTrackDrawer();
+        },
+        // FG-serial tracking-drawer gestures.
+        trackFgText: function (v) { if (track) { track.serialsText = v; renderTrackDrawer(); } },
+        trackFgFillWo: function () {
+            if (!track) return;
+            var needN = Math.round((active.fg && active.fg.fgQty) || 0);
+            var seed = (active.wo && active.wo.wo_num) ? String(active.wo.wo_num) + '-001' : '001';
+            track.serialsText = (needN > 0) ? Finisher.generateFgSerials(seed, needN).join('\n') : '';
+            renderTrackDrawer();
+        },
+        trackFgClear: function () { if (track) { track.serialsText = ''; renderTrackDrawer(); } },
+        trackRawToggle: function (i) {
+            if (!track) return;
+            var c = track.raws[i];
+            if (track.rawSelected.has(c.key)) track.rawSelected.delete(c.key); else track.rawSelected.add(c.key);
+            // FG mode: the picked raws ARE the FG serials — REBUILD the textarea
+            // from the current selection (replace, not append) so it never doubles
+            // up with the auto-suggested value and the count matches the qty.
+            if (track.mode === 'fg') {
+                track.serialsText = track.raws
+                    .filter(function (r) { return track.rawSelected.has(r.key); })
+                    .map(function (r) { return r.serialNum; })
+                    .join('\n');
+            }
+            renderTrackDrawer();
+        },
+        trackRawAll: function () { if (track) { track.raws.forEach(function (c) { track.rawSelected.add(c.key); }); renderTrackDrawer(); } },
+        trackRawClear: function () { if (track) { track.rawSelected.clear(); renderTrackDrawer(); } },
+        trackRawFirstN: function () {
+            if (!track) return;
+            track.rawSelected.clear();
+            var needN = Math.round((active.fg && active.fg.fgQty) || 0);
+            for (var i = 0; i < track.raws.length && track.rawSelected.size < needN; i++) track.rawSelected.add(track.raws[i].key);
+            renderTrackDrawer();
+        },
+        trackRawUse: function () {
+            if (!track) return;
+            var picked = track.raws.filter(function (c) { return track.rawSelected.has(c.key); }).map(function (c) { return c.serialNum; });
+            track.serialsText = picked.join('\n');
+            renderTrackDrawer();
+        },
+    };
+
+    return window.PSFinish;
+})();
+
+// "Finish WO" — opens the in-report finish drawer (v1.2 port from
+// Work_Order_WIP.htm). The drawer consumes raw materials + receives the
+// finished good with full lot/serial/date tracking and posts the finish
+// through Fishbowl. If the finish module can't initialise (no REST
+// transport), fall back to deep-linking into the Work Order module.
+function psFinishWO(woId){
+    const w = allWorkOrders.find(x=>String(x.wo_id)===String(woId));
+    if(!w) return;
+    if(window.PSFinish && typeof PSFinish.open === 'function' && typeof runRestApiAsync === 'function'){
+        try { PSFinish.open(woId); return; }
+        catch(err){ debugLog('error', 'PSFinish.open failed — falling back to deep-link', err); }
+    }
+    openModule('Work Order', w.wo_num);
+    showToast('Opening WO ' + w.wo_num + ' to finish', 'info', 2500);
+}
+
+// Inline Schedule editor — the pencil in the Schedule header swaps the read-only
+// start/finish for datetime inputs; Cancel restores the view (and resets inputs).
+function psSchedEditToggle(on){
+    const v=document.getElementById('psSchedView'), e=document.getElementById('psSchedEdit');
+    if(!v||!e) return;
+    if(!on){
+        const sEl=document.getElementById('psDrawerStart'), eEl=document.getElementById('psDrawerEnd');
+        if(sEl) sEl.value=sEl.defaultValue;
+        if(eEl) eEl.value=eEl.defaultValue;
+    }
+    v.style.display = on ? 'none' : '';
+    e.style.display = on ? '' : 'none';
+}
+
+// Inline Category editor — the pencil in the Production header reveals the
+// category selector; Cancel restores it to the WO's current value and hides it.
+function psCatEditToggle(on){
+    const e=document.getElementById('psCatEdit');
+    if(!e) return;
+    if(!on){
+        const cEl=document.getElementById('psDrawerCat'); if(cEl) cEl.value=cEl.getAttribute('data-orig')||'';
+    }
+    e.style.display = on ? '' : 'none';
+}
+
+// Apply just the start/finish timestamps from the Schedule editor.
+async function psApplySchedEdit(woId){
+    const w = allWorkOrders.find(x=>String(x.wo_id)===String(woId));
+    if(!w) return;
+    const sEl=document.getElementById('psDrawerStart'), eEl=document.getElementById('psDrawerEnd');
+    if(!sEl||!eEl) return;
+    const startVal=sEl.value, endVal=eEl.value;
+    if(!startVal||!endVal){ showToast('Enter both a start and finish date/time','error',3000); return; }
+    const ns=moment(startVal), ne=moment(endVal);
+    if(!ns.isValid()||!ne.isValid()){ showToast('Invalid date/time','error',3000); return; }
+    if(ns.isSameOrAfter(ne)){ showToast('Start must be before finish','error',3500); return; }
+    if(ns.isSame(moment(w.date_scheduled_start)) && ne.isSame(moment(w.date_scheduled))){ showToast('No changes to apply','info',1800); return; }
+    undoStack.push(captureState());
+    if(undoStack.length>MAX_UNDO_STACK) undoStack.shift();
+    redoStack=[]; updateUndoRedoButtons();
+    closeDetail();
+    await psSaveDrawerDatesCategory(w.wo_num, startVal, endVal, null);
+}
+
+// Apply the category from the Production editor.
+async function psApplyCatEdit(woId){
+    const w = allWorkOrders.find(x=>String(x.wo_id)===String(woId));
+    if(!w) return;
+    const cEl=document.getElementById('psDrawerCat');
+    const newCatId = cEl ? parseInt(cEl.value,10) : NaN;
+    const catChanged = !isNaN(newCatId) && newCatId !== (w.calcategory_id||0);
+    if(!catChanged){ showToast('No changes to apply','info',1800); return; }
+    undoStack.push(captureState());
+    if(undoStack.length>MAX_UNDO_STACK) undoStack.shift();
+    redoStack=[]; updateUndoRedoButtons();
+    closeDetail();
+    await psSaveDrawerCategory(w.wo_num, newCatId);
+}
+
+// Write the category to a WO in one Get/Save round-trip.
+async function psSaveDrawerCategory(woNum, newCatId){
+    debugLog('info', `Drawer save WO ${woNum}: cat ${newCatId}`);
+    try {
+        const woResp = JSON.parse(runApiRequest('GetWorkOrderRq', JSON.stringify({ GetWorkOrderRq:{ WorkOrderNumber: woNum } })));
+        if(woResp.GetWorkOrderRs && woResp.GetWorkOrderRs.statusCode===1000 && woResp.GetWorkOrderRs.WO){
+            const wo = woResp.GetWorkOrderRs.WO;
+            if(newCatId!=null && !isNaN(newCatId)) wo.CalCategoryID = newCatId;
+            const saveResp = JSON.parse(runApiRequest('SaveWorkOrderRq', JSON.stringify({ SaveWorkOrderRq:{ WO: wo } })));
+            if(saveResp.SaveWorkOrderRs && saveResp.SaveWorkOrderRs.statusCode===1000){
+                debugLog('success', `WO ${woNum} updated from drawer`);
+                showToast(`WO ${woNum} updated`, 'success');
+                loadWorkOrders();
+                return true;
+            }
+            throw new Error(saveResp.SaveWorkOrderRs ? saveResp.SaveWorkOrderRs.statusMessage : 'Save failed');
+        }
+        throw new Error(woResp.GetWorkOrderRs ? woResp.GetWorkOrderRs.statusMessage : 'Could not retrieve WO');
+    } catch(err){
+        debugLog('error', `Drawer category save WO ${woNum} failed`, err);
+        showToast('Failed to save WO: ' + (err && err.message), 'error', 5000);
+        return false;
+    }
+}
+
+// Write the exact start/finish TIMESTAMPS (from the datetime-local inputs) and,
+// optionally, the category, to a WO. Unlike saveWODates (which preserves the
+// record's original time), this writes the times the user picked.
+async function psSaveDrawerDatesCategory(woNum, startISO, endISO, newCategoryId){
+    debugLog('info', `Drawer save WO ${woNum}: ${startISO} → ${endISO}` + (newCategoryId!=null?` cat ${newCategoryId}`:''));
+    try {
+        const woResp = JSON.parse(runApiRequest('GetWorkOrderRq', JSON.stringify({ GetWorkOrderRq:{ WorkOrderNumber: woNum } })));
+        if(woResp.GetWorkOrderRs && woResp.GetWorkOrderRs.statusCode===1000 && woResp.GetWorkOrderRs.WO){
+            const wo = woResp.GetWorkOrderRs.WO;
+            let s = moment(startISO), e = moment(endISO);
+            if(s.isSameOrAfter(e)) e = s.clone().add(1,'hour');
+            wo.DateScheduledToStart = s.format('YYYY-MM-DD[T]HH:mm:ss');
+            wo.DateScheduled        = e.format('YYYY-MM-DD[T]HH:mm:ss');
+            if(wo.WOItems && wo.WOItems.WOItem){
+                const items = Array.isArray(wo.WOItems.WOItem) ? wo.WOItems.WOItem : [wo.WOItems.WOItem];
+                items.forEach(item => { if(item.DateScheduled) item.DateScheduled = s.format('YYYY-MM-DD[T]HH:mm:ss'); });
+            }
+            if(newCategoryId!=null && !isNaN(newCategoryId)) wo.CalCategoryID = newCategoryId;
+            const saveResp = JSON.parse(runApiRequest('SaveWorkOrderRq', JSON.stringify({ SaveWorkOrderRq:{ WO: wo } })));
+            if(saveResp.SaveWorkOrderRs && saveResp.SaveWorkOrderRs.statusCode===1000){
+                debugLog('success', `WO ${woNum} updated from drawer`);
+                showToast(`WO ${woNum} updated`, 'success');
+                loadWorkOrders();
+                return true;
+            }
+            throw new Error(saveResp.SaveWorkOrderRs ? saveResp.SaveWorkOrderRs.statusMessage : 'Save failed');
+        }
+        throw new Error(woResp.GetWorkOrderRs ? woResp.GetWorkOrderRs.statusMessage : 'Could not retrieve WO');
+    } catch(err){
+        debugLog('error', `Drawer save WO ${woNum} failed`, err);
+        showToast('Failed to save WO: ' + (err && err.message), 'error', 5000);
+        return false;
+    }
+}
+
+// ============================================
+// v1.2 COMPONENT AVAILABILITY
+// ----
+// Ported from PurchaseOrder/WO_Parts_Availability.htm and extended with the
+// staged-BOM tree walk. Per WO we compute a "buildable" date — the earliest
+// date every component is available — by:
+//   1. FIFO-allocating raw materials (woitem typeid=20) across all WOs in
+//      scheduled order, draining an MO-committed pool first (POs whose memo
+//      links to the WO's MO — the "express" incoming PO) then a shared
+//      general pool (on-hand + blanket/unmemo POs consumable by any WO).
+//   2. For components that are themselves produced by another WO in the plan
+//      (staging dependencies), availability = that producer WO's earliest
+//      FINISH, walked up the tree: raw availability → earliest start →
+//      +duration → earliest finish → drives the consumer WO.
+// The result is INDICATIVE and independent of the currently-scheduled dates.
+// All queries are wrapped so a failure just disables the feature.
+// ============================================
+async function psLoadAvailability() {
+    psAvailReady = false;
+    if (typeof runQueryAsync !== 'function' || !allWorkOrders.length) return;
+    try {
+        const woIdList = allWorkOrders.map(w => w.wo_id).filter(v => v != null);
+        if (!woIdList.length) return;
+        const lgIds = (typeof getLocationGroupList === 'function' ? getLocationGroupList() : []) || [];
+        const today = moment().format('YYYY-MM-DD');
+
+        // 1) Per-WO raw requirements (woitem typeid=20).
+        const reqRows = await runQueryAsync(`
+            SELECT woi.woid AS wo_id, woi.partid AS part_id, p.num AS part_num,
+                   p.description AS part_desc, p.typeid AS part_type,
+                   COALESCE(woi.qtytarget, 0) AS qty_target, COALESCE(woi.qtyused, 0) AS qty_used,
+                   uom.code AS uom_code
+            FROM woitem woi
+            INNER JOIN part p ON p.id = woi.partid
+            LEFT JOIN uom ON uom.id = woi.uomid
+            WHERE woi.typeid = 20 AND woi.woid IN (${woIdList.join(',')})
+        `);
+        const reqByWo = new Map(), partIds = new Set(), partType = new Map(), demandByPart = new Map();
+        reqRows.forEach(r => {
+            const pid = String(r.part_id);
+            if (!reqByWo.has(r.wo_id)) reqByWo.set(r.wo_id, []);
+            reqByWo.get(r.wo_id).push(r);
+            partIds.add(pid);
+            partType.set(pid, parseInt(r.part_type, 10));
+            const need = Math.max(0, (parseFloat(r.qty_target) || 0) - (parseFloat(r.qty_used) || 0));
+            demandByPart.set(pid, (demandByPart.get(pid) || 0) + need);
+        });
+        const partIdArr = [...partIds];
+
+        // Per required part: build BOM (To Manufacture split) + default vendor (To
+        // Purchase grouping). Resolved in SEPARATE, self-guarded queries so one
+        // failing never disables the other.
+        psMakePartIds = new Set(); psMakeBom = new Map(); psPartVendor = new Map();
+        if (partIdArr.length) {
+            // ── make vs buy ── A part is MANUFACTURABLE ("make") when it is the
+            //    FINISHED GOOD (bomitem typeid=10) of an active BOM. The finished-
+            //    good line references the part EITHER directly (bomitem.partid) OR
+            //    through a product wrapper (bomitem.productid → product.partid), so
+            //    both paths are checked — a product-wrapped FG was previously missed
+            //    and fell to "buy". Prefer the part's defaultBomId when it points to
+            //    an active BOM; otherwise the oldest active BOM the part is an FG of.
+            //    Its BOM feeds a Create-MO configuration; a part with no such BOM is
+            //    "buy" (needs a PO).
+            try {
+                (await runQueryAsync(`
+                    SELECT p.id AS part_id,
+                           COALESCE(
+                             (SELECT b0.id FROM bom b0 WHERE b0.id = p.defaultbomid AND b0.activeflag = 1),
+                             (SELECT MIN(bi.bomid) FROM bomitem bi
+                                JOIN bom b ON b.id = bi.bomid
+                                LEFT JOIN product pr ON pr.id = bi.productid
+                              WHERE bi.typeid = 10 AND b.activeflag = 1
+                                AND (bi.partid = p.id OR pr.partid = p.id))
+                           ) AS bom_id
+                    FROM part p
+                    WHERE p.id IN (${partIdArr.join(',')})
+                `)).forEach(r => {
+                    if (r.bom_id != null) { const pid = String(r.part_id); psMakePartIds.add(pid); psMakeBom.set(pid, { bomId: parseInt(r.bom_id, 10), bomNum: '' }); }
+                });
+                // Resolve BOM numbers for display in the make list / MO drawer.
+                const bomIds = [...new Set(Array.from(psMakeBom.values()).map(b => b.bomId))].filter(Boolean);
+                if (bomIds.length) {
+                    const numById = new Map();
+                    (await runQueryAsync(`SELECT id, num FROM bom WHERE id IN (${bomIds.join(',')})`))
+                        .forEach(r => numById.set(parseInt(r.id, 10), r.num || ''));
+                    psMakeBom.forEach(b => { b.bomNum = numById.get(b.bomId) || ''; });
+                }
+                debugLog('success', `Procurement classify: ${psMakePartIds.size} make / ${partIdArr.length - psMakePartIds.size} buy`);
+            } catch (e) { debugLog('warn', 'BOM classify failed (all shortages treated as buy): ' + (e && e.message)); }
+            // ── default vendor ── Fishbowl stores the part↔vendor relationship in
+            //    vendorparts (partid → vendorid); defaultFlag marks the preferred
+            //    vendor. There is NO part.defaultVendorId column. Take the default-
+            //    flagged row per part, else the lowest-id vendorparts row.
+            try {
+                (await runQueryAsync(`
+                    SELECT vp.partid AS part_id, vp.vendorid AS vendor_id, v.name AS vendor_name,
+                           vp.lastcost AS last_cost, vp.vendorpartnumber AS vendor_part_num,
+                           vp.qtymin AS qty_min
+                    FROM vendorparts vp
+                    JOIN vendor v ON v.id = vp.vendorid
+                    WHERE vp.partid IN (${partIdArr.join(',')})
+                    ORDER BY vp.partid, vp.defaultflag DESC, vp.id
+                `)).forEach(r => {
+                    const pid = String(r.part_id);
+                    if (!psPartVendor.has(pid)) psPartVendor.set(pid, {
+                        id: parseInt(r.vendor_id, 10), name: (r.vendor_name || '').trim(),
+                        lastCost: (r.last_cost != null ? parseFloat(r.last_cost) : null),
+                        vendorPartNum: (r.vendor_part_num || ''),
+                        qtyMin: (r.qty_min != null ? parseFloat(r.qty_min) : null)
+                    });
+                });
+                debugLog('success', `Default vendor resolved for ${psPartVendor.size} part(s)`);
+            } catch (e) { debugLog('warn', 'Vendor resolve failed (no vendor grouping): ' + (e && e.message)); }
+        }
+
+        // 2) Available-to-Pick per part + location group. Fishbowl's
+        //    "available to pick" = QtyOnHand − QtyCommitted − QtyNotAvailable
+        //    (open SO/PO/MO/TO *allocations* are demand, NOT committed stock, so
+        //    they are deliberately not subtracted). Computed directly per tag as
+        //    GREATEST(qty − qtyCommitted, 0) over tags that are:
+        //      • available   (location.countedAsAvailable = 1, not a shipping loc)
+        //      • uncommitted (qtyCommitted removes stock reserved by a committed pick)
+        //      • NOT staged to a WO (tag.woItemId IS NULL) — a Finished pickitem
+        //        pulls its material to a WIP tag with woItemId set; that stock is
+        //        secured to its WO (added back below via committedByWoPart) and must
+        //        NOT remain in the shared pool for other WOs.
+        //    Reproduced inline from tag + location (schema-index forbids querying
+        //    the TEMPTABLE QTYINVENTORY view with a WHERE). onhand (total physical,
+        //    QtyOnHand semantics) kept alongside for the drawer's display column.
+        const availByPartLg = new Map();   // pid -> Map(lg -> availableToPick)
+        const onhandByPartLg = new Map();  // pid -> Map(lg -> total on hand)
+        if (partIdArr.length) {
+            const lgF = lgIds.length ? ` AND l.locationgroupid IN (${lgIds.join(',')})` : '';
+            (await runQueryAsync(`
+                SELECT t.partid AS part_id, l.locationgroupid AS lgid,
+                       COALESCE(SUM(CASE WHEN t.typeid IN (30,40) THEN t.qty ELSE 0 END), 0) AS onhand,
+                       COALESCE(SUM(CASE WHEN t.typeid IN (30,40)
+                                          AND l.countedasavailable = 1 AND l.typeid <> 100
+                                          AND t.woitemid IS NULL
+                                     THEN GREATEST(t.qty - COALESCE(t.qtycommitted, 0), 0) ELSE 0 END), 0) AS availtopick
+                FROM tag t INNER JOIN location l ON l.id = t.locationid
+                WHERE t.partid IN (${partIdArr.join(',')})${lgF}
+                GROUP BY t.partid, l.locationgroupid
+            `)).forEach(r => {
+                const pid = String(r.part_id), lg = String(r.lgid);
+                if (!availByPartLg.has(pid)) availByPartLg.set(pid, new Map());
+                if (!onhandByPartLg.has(pid)) onhandByPartLg.set(pid, new Map());
+                availByPartLg.get(pid).set(lg, Math.max(0, parseFloat(r.availtopick) || 0));
+                onhandByPartLg.get(pid).set(lg, parseFloat(r.onhand) || 0);
+            });
+        }
+        const getAvail  = (pid, lg) => { const m = availByPartLg.get(pid);  return (m && m.get(String(lg))) || 0; };
+        const getOnhand = (pid, lg) => { const m = onhandByPartLg.get(pid); return (m && m.get(String(lg))) || 0; };
+
+        // 2b) Committed-to-this-WO from pickitem. Classified by the PICKITEM LINE
+        //     status (pit.statusid), NOT the pick header — a single picked line
+        //     goes Committed (30) / Finished (40) while the pick header can still
+        //     be Started (20). Convention matches Work_Order_WIP.htm: pit.statusid
+        //     30 = Committed, 40 = Finished — both mean the parts are pulled to a
+        //     tag and secured to this WO (staged as WIP; woitem.qtyUsed isn't
+        //     bumped until the WO itself consumes them, so `need` is still full and
+        //     the reservation must be added back). Committed/finished stock is netted
+        //     out of the shared pool above, so we add each WO's own reservation back
+        //     as guaranteed.
+        const committedByWoPart = new Map();  // "woid|pid" -> { qty, status }  (status: 40 Finished, 30 Committed)
+        if (woIdList.length) {
+            (await runQueryAsync(`
+                SELECT woi.woid AS wo_id, pit.partid AS part_id, COALESCE(SUM(pit.qty), 0) AS qty,
+                       MAX(pit.statusid) AS status
+                FROM pickitem pit
+                INNER JOIN woitem woi ON woi.id = pit.woitemid
+                WHERE woi.woid IN (${woIdList.join(',')})
+                  AND woi.typeid = 20
+                  AND pit.statusid IN (30, 40)
+                GROUP BY woi.woid, pit.partid
+            `)).forEach(r => committedByWoPart.set(r.wo_id + '|' + String(r.part_id), { qty: parseFloat(r.qty) || 0, status: parseInt(r.status, 10) || 0 }));
+        }
+
+        // 3) Incoming PO supply (open POs, outstanding qty), per part + delivery LG.
+        //    memo → source MO marks an express/committed PO; no memo = blanket supply.
+        const supplyByPartLg = new Map();   // "pid|lg" -> [{ ponum, vendor, outstanding, eta, linkedMoNum }]
+        if (partIdArr.length) {
+            (await runQueryAsync(`
+                SELECT po.num AS ponum, v.name AS vendor, pi.partid AS part_id, po.locationgroupid AS lgid,
+                       COALESCE(pi.qtytofulfill, 0) AS ordered, COALESCE(pi.qtyfulfilled, 0) AS fulfilled,
+                       pi.datescheduledfulfillment AS eta,
+                       (SELECT m.memo FROM memo m WHERE m.recordid = po.id
+                          AND m.memo LIKE 'Created from manufacture order number: %' LIMIT 1) AS momemo
+                FROM poitem pi INNER JOIN po ON po.id = pi.poid
+                LEFT JOIN vendor v ON v.id = po.vendorid
+                WHERE pi.partid IN (${partIdArr.join(',')})
+                  AND po.statusid BETWEEN 20 AND 55
+                  AND pi.qtytofulfill > pi.qtyfulfilled
+            `)).forEach(r => {
+                const key = String(r.part_id) + '|' + String(r.lgid);
+                if (!supplyByPartLg.has(key)) supplyByPartLg.set(key, []);
+                const mm = r.momemo ? String(r.momemo).match(/Created from manufacture order number:\s*(\d+)/) : null;
+                supplyByPartLg.get(key).push({
+                    ponum: r.ponum, vendor: r.vendor || '',
+                    outstanding: (parseFloat(r.ordered) || 0) - (parseFloat(r.fulfilled) || 0),
+                    eta: r.eta ? String(r.eta).substring(0, 10) : '',
+                    linkedMoNum: mm ? mm[1] : null
+                });
+            });
+        }
+
+        // Staged components: this WO consumes a part produced by another WO.
+        const stagedByWo = new Map();  // wo_id → Map(part_num → producer wo_id)
+        stagingDependencies.forEach(d => {
+            if (!stagedByWo.has(d.wo_id)) stagedByWo.set(d.wo_id, new Map());
+            if (d.part_num != null) stagedByWo.get(d.wo_id).set(String(d.part_num), d.staging_wo_id);
+        });
+
+        // Incoming WO finished-good production — a scheduled/in-progress WO that
+        // PRODUCES an inventory part is future supply of that part, available by the
+        // producer WO's scheduled finish in its location group (mirrors incoming-PO
+        // supply). This is what lets a freshly-created MO/WO raised to cover a
+        // shortage register as expected incoming stock on the next refresh. Excludes:
+        //   • Fulfilled WOs (status 40) — their output is already on hand and would
+        //     double-count availByPartLg;
+        //   • staging producers — their output is earmarked for an intra-MO staged
+        //     consumer, already resolved by the tree walk (would double-supply).
+        // Qty = wo.qty_target (planned output — indicative, like a PO's ETA/qty);
+        // only parts actually demanded as a raw good are pooled. Keyed "producedPartId|LG".
+        const stagingProducerIds = new Set(stagingDependencies.map(d => String(d.staging_wo_id)));
+        const numToPid = new Map();   // finished-good part_num → partId (from the demanded raw set)
+        reqRows.forEach(r => { if (r.part_num != null && !numToPid.has(String(r.part_num))) numToPid.set(String(r.part_num), String(r.part_id)); });
+        const woOutByPartLg = new Map();   // "pid|lg" -> [{date, qty, woNum}]
+        allWorkOrders.forEach(w => {
+            if (parseInt(w.wo_status, 10) === 40) return;               // already on hand
+            if (stagingProducerIds.has(String(w.wo_id))) return;        // earmarked to a staged sibling
+            const pnum = w.part_num; if (pnum == null || pnum === '') return;
+            const pid = numToPid.get(String(pnum)); if (!pid) return;   // only pool parts something needs
+            const qty = parseFloat(w.qty_target) || 0; if (qty <= 0) return;
+            const plg = (w.location_group_id != null ? String(w.location_group_id) : '');
+            const fin = w.date_scheduled ? String(w.date_scheduled).substring(0, 10) : today;
+            const key = pid + '|' + plg;
+            if (!woOutByPartLg.has(key)) woOutByPartLg.set(key, []);
+            woOutByPartLg.get(key).push({ date: (fin >= today ? fin : today), qty: qty, woNum: w.wo_num, orig: fin });
+        });
+
+        // FIFO pools keyed per part + location group.
+        const stockPool = new Map();   // "pid|lg"     -> [{date, qty}]  available-to-pick (now)
+        const stockInit = new Map();   // "pid|lg"     -> initial available-to-pick (contention test)
+        const poGenPool = new Map();   // "pid|lg"     -> [{date, qty}]  blanket POs (future)
+        const poMoPool  = new Map();   // "pid|lg|mo"  -> [{date, qty}]  MO-linked express POs
+        // Ledger of draws from shared now-stock, recorded in scheduled-start order
+        // per part+LG. Lets a later WO that comes up short name the earlier-scheduled
+        // WOs that claimed the stock — the signal that drives a reschedule decision.
+        const nowLedger = new Map();   // "pid|lg" -> [{ woNum, qty }]
+        const dsort = ev => ev.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+        function ensureStock(pid, lg) {
+            const key = pid + '|' + lg;
+            if (!stockPool.has(key)) {
+                const a = getAvail(pid, lg);
+                stockInit.set(key, a);
+                stockPool.set(key, a > 0 ? [{ date: today, qty: a }] : []);
+            }
+            return stockPool.get(key);
+        }
+        function ensurePoGen(pid, lg) {
+            const key = pid + '|' + lg;
+            if (!poGenPool.has(key)) {
+                const ev = [];
+                (supplyByPartLg.get(key) || []).forEach(s => {
+                    if (s.linkedMoNum != null) return;      // blanket/general only
+                    if (s.outstanding > 0) ev.push({ date: (s.eta && s.eta >= today ? s.eta : today), qty: s.outstanding, orig: (s.eta || '') });
+                });
+                dsort(ev); poGenPool.set(key, ev);
+            }
+            return poGenPool.get(key);
+        }
+        function ensurePoMo(pid, lg, monum) {
+            const key = pid + '|' + lg + '|' + monum;
+            if (!poMoPool.has(key)) {
+                const ev = [];
+                (supplyByPartLg.get(pid + '|' + lg) || []).forEach(s => {
+                    if (s.linkedMoNum !== monum) return;    // this MO's committed PO only
+                    if (s.outstanding > 0) ev.push({ date: (s.eta && s.eta >= today ? s.eta : today), qty: s.outstanding, orig: (s.eta || '') });
+                });
+                dsort(ev); poMoPool.set(key, ev);
+            }
+            return poMoPool.get(key);
+        }
+        // Incoming WO finished-good production pool (future ETA = producer WO's
+        // scheduled finish). Built from woOutByPartLg above.
+        const woOutPool = new Map();   // "pid|lg" -> [{date, qty}]
+        function ensureWoOut(pid, lg) {
+            const key = pid + '|' + lg;
+            if (!woOutPool.has(key)) {
+                const ev = (woOutByPartLg.get(key) || []).map(e => ({ date: e.date, qty: e.qty, orig: e.orig }));
+                dsort(ev); woOutPool.set(key, ev);
+            }
+            return woOutPool.get(key);
+        }
+        function consume(queue, remaining) {
+            let by = today, nowQty = 0, overdue = false;
+            while (remaining > 0 && queue.length) {
+                const e = queue[0], take = Math.min(remaining, e.qty);
+                e.qty -= take; remaining -= take;
+                if (e.date > by) by = e.date;
+                if (e.date <= today) nowQty += take;   // sourced from stock available right now
+                // Original (pre-clamp) ETA earlier than today = an OVERDUE incoming
+                // supply. Its `date` was clamped up to today, so flag it so the ETA
+                // can read "Overdue" rather than a misleading today's-date.
+                if (e.orig && e.orig < today) overdue = true;
+                if (e.qty <= 1e-6) queue.shift();
+            }
+            return { remaining, by, nowQty, overdue };
+        }
+
+        // Allocate raw (non-staged) parts in scheduled-start order. Each WO draws
+        // from its own location group's stock.
+        const woLg = new Map(allWorkOrders.map(w => [String(w.wo_id), String(w.location_group_id != null ? w.location_group_id : '')]));
+        const ordered = allWorkOrders.slice().sort((a, b) =>
+            (moment(a.date_scheduled_start).valueOf() || 0) - (moment(b.date_scheduled_start).valueOf() || 0));
+        ordered.forEach(wo => {
+            const lg = woLg.get(String(wo.wo_id)) || '';
+            const reqs = reqByWo.get(wo.wo_id) || [];
+            const staged = stagedByWo.get(wo.wo_id) || new Map();
+            // A FINISHED WO (status 40) or one under a completed MO (60/70/80) has NO
+            // live material demand — it's done. The report still LOADS such WOs (for
+            // the "Show fulfilled" history), and a finished WO can carry a
+            // qtyTarget − qtyUsed residual (e.g. built 29, only consumed 4) that is
+            // under-consumption on a closed record, NOT a shortage to buy/make. Force
+            // its need to 0 so it neither generates procurement demand nor drains the
+            // shared supply pools. (Supply already excludes status-40 producers from
+            // woOut; this closes the same gap on the demand side — without it, a
+            // finished WO's leftover target inflated the To-Purchase/To-Manufacture
+            // shortfall and made the worklist disagree with Fishbowl's own Allocated.)
+            const woClosed = parseInt(wo.wo_status, 10) === 40 || psMoFinished(wo);
+            const parts = []; let rawBy = today, rawUnmet = false, rawContended = false, rawNowOk = true, rawOverdue = false;
+            reqs.forEach(req => {
+                const pid = String(req.part_id);
+                const isInv = partType.get(pid) === 10;                        // only Inventory parts carry stock
+                const need = woClosed ? 0 : Math.max(0, (parseFloat(req.qty_target) || 0) - (parseFloat(req.qty_used) || 0));
+                const producerId = staged.get(String(req.part_num));
+                const oh = isInv ? getOnhand(pid, lg) : null;
+                const cRec = isInv ? committedByWoPart.get(wo.wo_id + '|' + pid) : null;
+                const committedQ = cRec ? cRec.qty : 0;
+                const committedStatus = cRec ? cRec.status : 0;   // 40 = Finished, 30 = Committed
+                if (producerId != null) {   // built by another WO — resolved in the tree walk
+                    parts.push({ partId: pid, partNum: req.part_num, partDesc: req.part_desc, need, uom: req.uom_code || '', onhand: null, availableBy: today, unmet: false, staged: true, producerId, nonInv: false, committed: false, committedQty: 0, committedStatus: 0, availQty: 0, contended: false, contendedBy: [] });
+                    return;
+                }
+                if (!isInv) {   // Non-inventory / Internal-use — never stocked, so never "unmet"; shows N/A
+                    parts.push({ partId: pid, partNum: req.part_num, partDesc: req.part_desc, need, uom: req.uom_code || '', onhand: null, availableBy: today, unmet: false, staged: false, nonInv: true, committed: false, committedQty: 0, committedStatus: 0, availQty: null, contended: false, contendedBy: [] });
+                    return;
+                }
+                if (need <= 0) {
+                    parts.push({ partId: pid, partNum: req.part_num, partDesc: req.part_desc, need: 0, uom: req.uom_code || '', onhand: oh, availableBy: today, unmet: false, staged: false, nonInv: false, committed: committedQ > 0, committedQty: committedQ, committedStatus, availQty: 0, contended: false, contendedBy: [] });
+                    return;
+                }
+                const stockKey = pid + '|' + lg;
+                // Earlier-scheduled WOs that already drew this part's shared stock
+                // (snapshot BEFORE this WO consumes, so it lists only prior claims).
+                const priorClaims = (nowLedger.get(stockKey) || []).slice();
+                ensureStock(pid, lg);
+                const poolInit = stockInit.get(stockKey) || 0;
+                let by = today, remaining = need, availNow = 0, stockDraw = 0, etaFromMoPo = false, etaFromWo = false, sawOverdue = false;
+                // 1) this WO's own committed-pick reservation (guaranteed, now)
+                const useCommitted = Math.min(remaining, committedQ);
+                remaining -= useCommitted; availNow += useCommitted;
+                // 2) shared available-to-pick stock (now, per-LG, FIFO by schedule)
+                if (remaining > 0) { const r = consume(ensureStock(pid, lg), remaining); if (r.by > by) by = r.by; remaining = r.remaining; availNow += r.nowQty; stockDraw += r.nowQty; }
+                // NOTE: steps 3–5 are INCOMING supply (open POs, planned WO output).
+                // They are NOT physically on hand — even an overdue PO whose ETA is
+                // clamped to today is still unreceived stock. So they set the ETA
+                // (`by`) but must NOT count toward availNow ("available to pick now")
+                // or the WO would show "Buildable now" with nothing on the shelf.
+                // 3) MO-linked express POs (future ETA) — flag the ETA as MO-secured
+                //    when this pool sets the binding (latest) date, so the drawer can
+                //    show a padlock explaining why the date isn't an earlier blanket PO.
+                if (remaining > 0 && wo.mo_num) { const r = consume(ensurePoMo(pid, lg, String(wo.mo_num)), remaining); if (r.by > by) { by = r.by; etaFromMoPo = true; } remaining = r.remaining; if (r.overdue) sawOverdue = true; }
+                // 4) blanket POs (future ETA) — a later blanket date supersedes the lock.
+                if (remaining > 0) { const r = consume(ensurePoGen(pid, lg), remaining); if (r.by > by) { by = r.by; etaFromMoPo = false; etaFromWo = false; } remaining = r.remaining; if (r.overdue) sawOverdue = true; }
+                // 5) incoming WO finished-good production (future ETA = producer WO's
+                //    scheduled finish) — e.g. a just-created MO raised to cover this
+                //    shortage now registers as expected incoming stock.
+                if (remaining > 0) { const r = consume(ensureWoOut(pid, lg), remaining); if (r.by > by) { by = r.by; etaFromMoPo = false; etaFromWo = true; } remaining = r.remaining; if (r.overdue) sawOverdue = true; }
+                // Record this WO's shared-stock draw so later WOs in the same LG see the claim.
+                if (stockDraw > 1e-6) {
+                    if (!nowLedger.has(stockKey)) nowLedger.set(stockKey, []);
+                    nowLedger.get(stockKey).push({ woNum: wo.wo_num, qty: stockDraw });
+                }
+                const committedFull = committedQ >= need - 1e-6;
+                // Contended = enough available-to-pick stock physically exists in this
+                // LG for the WO's uncommitted need, but earlier-scheduled WOs have first
+                // claim so its now-share fell short. Stock is on the shelf — a
+                // scheduling/priority change (not a PO) would secure it.
+                const neededFromShared = Math.max(0, need - useCommitted);
+                const contended = !committedFull && remaining > 1e-6 && poolInit >= neededFromShared - 1e-6 && priorClaims.length > 0;
+                let unmet = false;
+                if (remaining > 1e-6) {
+                    if (contended) { by = null; rawContended = true; }   // stock exists; ETA depends on resequencing
+                    else { unmet = true; rawUnmet = true; by = null; }   // genuine shortage — needs replenishment
+                }
+                // "Buildable now" requires this part to be fully on hand now
+                // (committed reservation + shared stock). Anything relying on an
+                // incoming PO / planned WO output — or contested stock — is not now.
+                if (availNow < need - 1e-6) rawNowOk = false;
+                // Overdue = covered ONLY by incoming supply whose ETA is in the past
+                // (clamped up to today). The binding date reads as today but really
+                // means "was due earlier and hasn't arrived" — surface it as Overdue.
+                const etaOverdue = !unmet && !contended && sawOverdue && by === today && availNow < need - 1e-6;
+                if (etaOverdue) rawOverdue = true;
+                parts.push({ partId: pid, partNum: req.part_num, partDesc: req.part_desc, need, uom: req.uom_code || '', onhand: oh, availableBy: by, unmet, staged: false, nonInv: false, committed: committedFull, committedQty: committedQ, committedStatus, availQty: availNow, shortfall: remaining, moPoEta: etaFromMoPo, woEta: etaFromWo, etaOverdue, contended, contendedBy: priorClaims });
+                if (by && by > rawBy) rawBy = by;
+            });
+            wo._av = { parts, rawBy: rawUnmet ? null : rawBy, rawUnmet, rawContended, rawNowOk, rawOverdue };
+        });
+
+        // Tree walk — fold each producer WO's earliest finish into its consumers.
+        const woById = new Map(allWorkOrders.map(w => [String(w.wo_id), w]));
+        const durDays = wo => { const d = moment(wo.date_scheduled).startOf('day').diff(moment(wo.date_scheduled_start).startOf('day'), 'days'); return (isNaN(d) || d < 0) ? 0 : d; };
+        const visiting = new Set(), done = new Set();
+        function calc(wo) {
+            const id = String(wo.wo_id);
+            const av = wo._av || (wo._av = { parts: [], rawBy: today, rawUnmet: false, rawNowOk: true, rawOverdue: false });
+            if (done.has(id) || visiting.has(id)) return av;
+            visiting.add(id);
+            let start = av.rawUnmet ? null : (av.rawBy || today);
+            let unmet = av.rawUnmet;
+            let contended = !!av.rawContended;
+            // "Now" = every raw good is on hand now AND every staged sub-assembly is
+            // itself buildable now. A staged producer that only finishes later (or an
+            // incoming PO on a raw good) means this WO is not buildable now.
+            let nowOk = (av.rawNowOk !== false);
+            (av.parts || []).forEach(p => {
+                if (p.staged && p.producerId != null) {
+                    const prod = woById.get(String(p.producerId));
+                    if (prod) {
+                        const pav = calc(prod);
+                        if (pav._unmet) { unmet = true; p.unmet = true; p.availableBy = null; nowOk = false; }
+                        else { p.availableBy = pav._finish; if (start != null && pav._finish && pav._finish > start) start = pav._finish; if (pav._contended) contended = true; if (!pav._buildableNow) nowOk = false; }
+                    }
+                }
+            });
+            if (unmet) start = null;
+            av._start = start;
+            av._unmet = unmet;
+            av._contended = contended && !unmet;   // stock exists but claimed by earlier WOs
+            av._finish = start ? moment(start, 'YYYY-MM-DD').add(durDays(wo), 'days').format('YYYY-MM-DD') : null;
+            av._buildable = start;
+            // Buildable now ONLY when nothing is pending (all raw goods on hand +
+            // staged producers built) — not merely because the binding date clamped
+            // to today from an overdue incoming PO / planned WO output.
+            av._buildableNow = !unmet && nowOk && !!start && start <= today;
+            // Overdue = not unmet/contested/now, but the binding raw-good supply is
+            // an overdue incoming PO / WO output (its ETA was in the past).
+            av._overdue = !!av.rawOverdue && !unmet && !av._contended && !av._buildableNow;
+            done.add(id); visiting.delete(id);
+            return av;
+        }
+        allWorkOrders.forEach(wo => calc(wo));
+
+        // ── Shortage diagnostics (only when the debug console is OPEN) ──────────
+        // For every part that stays UNMET, dump the exact supply picture: the demand
+        // LG, on-hand/avail, and each supply source found — flagging supply that
+        // exists only under a DIFFERENT LG key. Then list the actual recent POs for
+        // those parts with their status/LG/qty, so a PO stuck at Bid Request
+        // (status ≠ 20–55, excluded from supply) or created in another LG is
+        // immediately visible. This is the fastest way to see why a created PO/MO
+        // doesn't clear a shortage even though it looks right in the UI.
+        if (document.getElementById('debugLog')) {
+            try {
+                const unmetPids = new Set();
+                let shown = 0;
+                allWorkOrders.forEach(w => {
+                    const av = w._av; if (!av || !av._unmet) return;
+                    const lg = woLg.get(String(w.wo_id)) || '';
+                    (av.parts || []).forEach(p => {
+                        if (!p.unmet || p.staged || p.nonInv) return;
+                        const pid = String(p.partId); unmetPids.add(pid);
+                        if (shown >= 60) return; shown++;
+                        const key = pid + '|' + lg;
+                        const poHere = (supplyByPartLg.get(key) || []).map(s => 'PO' + s.ponum + '(out ' + psFmtQty(s.outstanding) + (s.linkedMoNum ? ',MO' + s.linkedMoNum : '') + ')').join(' ');
+                        const woHere = (woOutByPartLg.get(key) || []).map(s => s.woNum + '(' + psFmtQty(s.qty) + '@' + s.date + ')').join(' ');
+                        const poOther = [], woOther = [];
+                        supplyByPartLg.forEach((v, k) => { if (v.length && k.indexOf(pid + '|') === 0 && k !== key) poOther.push(k.split('|')[1]); });
+                        woOutByPartLg.forEach((v, k) => { if (v.length && k.indexOf(pid + '|') === 0 && k !== key) woOther.push(k.split('|')[1]); });
+                        psDiag('WO ' + w.wo_num + ' LG=' + lg + ' part ' + (p.partNum || pid) +
+                            ': need ' + psFmtQty(p.need) + ' onhand ' + psFmtQty(getOnhand(pid, lg)) + ' avail ' + psFmtQty(getAvail(pid, lg)) +
+                            ' | PO@LG=[' + (poHere || 'none') + ']' + (poOther.length ? ' PO@otherLG=[' + poOther.join(',') + ']' : '') +
+                            ' | WOout@LG=[' + (woHere || 'none') + ']' + (woOther.length ? ' WOout@otherLG=[' + woOther.join(',') + ']' : ''));
+                    });
+                });
+                if (unmetPids.size) {
+                    psDiag('— recent POs for the short parts (status must be 20–55 and toFulfill>fulfilled to count) —');
+                    (await runQueryAsync(
+                        'SELECT po.num AS ponum, po.statusid AS st, po.locationgroupid AS lg, pi.partid AS pid, ' +
+                        'COALESCE(pi.qtytofulfill,0) AS tof, COALESCE(pi.qtyfulfilled,0) AS ful ' +
+                        'FROM poitem pi JOIN po ON po.id = pi.poid ' +
+                        'WHERE pi.partid IN (' + Array.from(unmetPids).join(',') + ') ORDER BY po.id DESC LIMIT 60'))
+                        .forEach(r => {
+                            const stOk = Number(r.st) >= 20 && Number(r.st) <= 55;
+                            const qtyOk = Number(r.tof) > Number(r.ful);
+                            psDiag('  PO ' + r.ponum + ' part ' + r.pid + ' status=' + r.st + ' LG=' + r.lg + ' toFulfill=' + r.tof + ' fulfilled=' + r.ful +
+                                (stOk ? '' : ' <-- EXCLUDED: status not 20–55') + (qtyOk ? '' : ' <-- EXCLUDED: nothing outstanding'));
+                        });
+                }
+            } catch (dgErr) { psDiag('diagnostic dump failed: ' + (dgErr && dgErr.message)); }
+        }
+
+        psAvailReady = true;
+        debugLog('success', `Availability computed for ${allWorkOrders.length} WO(s)`);
+    } catch (e) {
+        psAvailReady = false;
+        debugLog('warn', 'Availability computation failed (feature disabled): ' + (e && e.message));
+    }
+}
+
+// Availability badge meta for a WO (null if not computed).
+function psAvInfo(wo) {
+    const av = wo && wo._av;
+    if (!psAvailReady || !av) return null;
+    // A fulfilled WO (status 40) or one under a completed MO is DONE — its material
+    // was already consumed. The availability engine zeroes a closed WO's demand
+    // (the woClosed guard), so every component reads as trivially available and the
+    // rules below would otherwise return a misleading green "Buildable now". Report
+    // it as "Fulfilled" instead, so the drawer's availability line matches the
+    // (correctly) hidden Finish WO button — which never shows for a status-40 WO.
+    if (parseInt(wo.wo_status, 10) === 40 || psMoFinished(wo)) return { label: 'Fulfilled', tone: 'success', state: 'done' };
+    if (av._unmet) return { label: 'Raw goods unmet', tone: 'critical', state: 'unmet' };
+    if (av._contended) return { label: 'Stock contested', tone: 'caution', state: 'contended' };
+    if (av._buildableNow) return { label: 'Buildable now', tone: 'success', state: 'now' };
+    // Covered only by overdue incoming supply — not on hand and past its ETA.
+    if (av._overdue) return { label: 'Supply overdue', tone: 'caution', state: 'overdue' };
+    return { label: 'Buildable ' + psFmtDate(av._buildable), tone: 'active', state: 'wait' };
+}
+function psProducerNum(id) { const w = allWorkOrders.find(x => String(x.wo_id) === String(id)); return w ? w.wo_num : ('#' + id); }
+function psToggleAvail() { psAvailExpanded = !psAvailExpanded; if (_avDetailWoId != null) openDetail(_avDetailWoId); }
+let _avDetailWoId = null;
+
+// Raw-goods detail table for the drawer's expandable availability section.
+function psAvailPartsHTML(w) {
+    const parts = (w._av && w._av.parts) || [];
+    if (!parts.length) return '<div class="hint" style="padding:8px 2px">No raw goods found.</div>';
+    const today = moment().format('YYYY-MM-DD');
+    const rows = parts.map(p => {
+        let st, eta;
+        if (p.staged) {
+            const pn = psProducerNum(p.producerId);
+            if (p.unmet) { st = psSpill('critical', 'Blocked · WO ' + pn); eta = '<span style="color:#8A1E30">—</span>'; }
+            else if (p.availableBy && p.availableBy <= today) { st = psSpill('success', 'Built · WO ' + pn); eta = '<span style="color:#1B7A46;font-weight:700">Now</span>'; }
+            else { st = psSpill('caution', 'WO ' + pn, { title: 'Produced by WO ' + pn }); eta = '<span style="color:#8A4E10;font-weight:700">' + psFmtDate(p.availableBy) + '</span>'; }
+        } else if (p.nonInv) { st = '<span style="color:#506872" title="Non-inventory raw good — not stocked">N/A</span>'; eta = '<span style="color:#506872">—</span>'; }
+        else {
+            // Available-to-pick now / needed as an X/Y figure, coloured with the
+            // pill tone palette: critical = none, caution = partial, success =
+            // full. Committed picks render in the active tone.
+            const X = p.availQty || 0, Y = p.need || 0;
+            let col;
+            if (p.committed) col = '#1e7bb4';       // active
+            else if (X >= Y) col = '#1B7A46';       // success
+            else if (X > 0) col = '#8A4E10';        // caution
+            else col = '#8A1E30';                   // critical
+            const ttl = p.committed ? ((p.committedStatus >= 40 ? 'Finished' : 'Committed') + ' — secured to this WO on a pick')
+                : (X >= Y ? 'Full quantity available to pick now'
+                : (p.contended ? 'Physically in stock, but earlier-scheduled WOs have first claim'
+                : (p.etaOverdue ? 'Covered only by an overdue PO / WO — was due before today and has not arrived'
+                : (p.availableBy ? ('Full quantity available by ' + psFmtDate(p.availableBy)) : 'Cannot be fully sourced from stock or open POs'))));
+            st = '<span style="font-weight:700;font-variant-numeric:tabular-nums;color:' + col + '" title="' + psEsc(ttl) + '">' +
+                 psEsc(psFmtQty(X)) + ' / ' + psEsc(psFmtQty(Y)) + '</span>';
+            // ETA / contention indicator.
+            if (p.committed) {
+                const isFinished = p.committedStatus >= 40;
+                const cLbl = isFinished ? 'Finished' : 'Committed';
+                // Only the Committed pill carries the padlock (stock reserved but not
+                // yet consumed); a Finished pick shows the label alone.
+                eta = psSpill('active', cLbl, { icon: isFinished ? '' : PS_LOCK_SVG, title: cLbl + ' — stock secured to this WO on a pick' });
+            } else if (p.contended) {
+                const claims = (p.contendedBy || []);
+                const list = claims.slice(0, 5).map(c => psEsc(c.woNum) + (c.qty ? ' ×' + psFmtQty(c.qty) : '')).join(', ');
+                const claimTtl = 'On hand now (' + psFmtQty(p.onhand) + '), but earlier-scheduled WOs claim it first: ' +
+                    (list || 'earlier WO') + (claims.length > 5 ? ', …' : '') + '. Reprioritise this WO to secure the stock.';
+                eta = psSpill('caution', 'In stock · earlier WO', { title: claimTtl });
+            } else if (X >= Y) {
+                eta = '<span style="color:#1B7A46;font-weight:700">Now</span>';
+            } else if (p.etaOverdue) {
+                // Binding supply is an overdue PO / WO output — its date was clamped
+                // to today, so show "Overdue" rather than a misleading today's-date.
+                eta = '<span class="spill critical" title="On an overdue purchase order / work order — was due before today and has not arrived">Overdue</span>';
+            } else if (p.availableBy) {
+                // Padlock when the binding date is an MO-linked (express) PO — signals
+                // the stock is reserved to this WO's MO, which is why an earlier blanket
+                // PO doesn't move the date up.
+                const lock = p.moPoEta ? PS_LOCK_SVG_SM : '';
+                const etaTtl = p.woEta
+                    ? 'Arriving from a scheduled work order (e.g. a created MO) finishing by this date'
+                    : p.moPoEta
+                    ? 'Reserved to this MO — arriving by this date on a PO raised for the MO, so an earlier blanket PO does not apply'
+                    : 'Full quantity available by this date via an incoming PO';
+                eta = '<span style="color:#8A4E10;font-weight:700" title="' + psEsc(etaTtl) + '">' + lock + psFmtDate(p.availableBy) + '</span>';
+            } else {
+                eta = '<span style="color:#8A1E30;font-weight:700" title="Cannot be fully sourced from stock or open POs">No ETA</span>';
+            }
+        }
+        const oh = p.nonInv ? 'N/A' : (p.onhand != null ? psFmtQty(p.onhand) : '—');
+        // Part number links to the Fishbowl Part module.
+        const apn = p.partNum
+            ? '<a href="#" onclick="event.preventDefault();openModule(\'Part\',\'' + String(p.partNum).replace(/'/g, "\\'") + '\')" style="color:var(--link);text-decoration:none">' + psEsc(p.partNum) + '</a>'
+            : '—';
+        return '<tr><td><div class="apn">' + apn + '</div>' +
+            (p.partDesc ? '<div class="apd" title="' + psEsc(p.partDesc) + '">' + psEsc(p.partDesc) + '</div>' : '') + '</td>' +
+            '<td class="num">' + psEsc(psFmtQty(p.need)) + (p.uom ? ' ' + psEsc(p.uom) : '') + '</td>' +
+            '<td class="num">' + oh + '</td>' +
+            '<td class="num"><div class="apstat">' + st + '</div></td>' +
+            '<td class="num"><div class="apstat">' + eta + '</div></td></tr>';
+    }).join('');
+    return '<div class="avail-parts"><table><thead><tr><th>Raw Good</th><th class="num">Need</th><th class="num">On hand</th><th class="num">Avail. now</th><th class="num">ETA</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+}
+
+// ============================================
+// WO PACKING FOR CATEGORY VIEW
+// ============================================
+function packWOsIntoLanes(wos) {
+    // Sort WOs by start date
+    const sortedWOs = [...wos].sort((a, b) =>
+        moment(a.date_scheduled_start).valueOf() - moment(b.date_scheduled_start).valueOf()
+    );
+
+    const lanes = [];
+
+    sortedWOs.forEach(wo => {
+        // Use full day spans for overlap detection (matching rendering logic)
+        const woStart = moment(wo.date_scheduled_start).startOf('day');
+        const woEnd = moment(wo.date_scheduled).endOf('day');
+
+        // Find first lane where this WO doesn't overlap
+        let placed = false;
+        for (let i = 0; i < lanes.length; i++) {
+            const lane = lanes[i];
+            const overlaps = lane.some(existingWO => {
+                const existingStart = moment(existingWO.date_scheduled_start).startOf('day');
+                const existingEnd = moment(existingWO.date_scheduled).endOf('day');
+                return woStart.isBefore(existingEnd) && woEnd.isAfter(existingStart);
+            });
+
+            if (!overlaps) {
+                lane.push(wo);
+                wo._lane = i; // Store lane index on WO object
+                placed = true;
+                break;
+            }
+        }
+
+        // If no suitable lane found, create new lane
+        if (!placed) {
+            wo._lane = lanes.length;
+            lanes.push([wo]);
+        }
+    });
+
+    return lanes.length; // Return number of lanes needed
+}
+
+// ============================================
+// TOPOLOGICAL SORT FOR WO ORDERING
+// ============================================
+function sortWOsByDependencies(wos) {
+    // Build dependency graph from staging relationships
+    // If WO A produces a part used in WO B, then A should come before B
+
+    const woMap = new Map(wos.map(wo => [wo.wo_id, wo]));
+    const dependencies = new Map(); // wo_id -> array of wo_ids it depends on
+    const dependents = new Map(); // wo_id -> array of wo_ids that depend on it
+
+    // Initialize maps
+    wos.forEach(wo => {
+        dependencies.set(wo.wo_id, []);
+        dependents.set(wo.wo_id, []);
+    });
+
+    // Build dependency graph from staging relationships
+    stagingDependencies.forEach(dep => {
+        // dep.staging_wo_id produces a part that dep.wo_id consumes
+        // So dep.wo_id depends on dep.staging_wo_id
+        if (woMap.has(dep.wo_id) && woMap.has(dep.staging_wo_id)) {
+            dependencies.get(dep.wo_id).push(dep.staging_wo_id);
+            dependents.get(dep.staging_wo_id).push(dep.wo_id);
+        }
+    });
+
+    // Topological sort using Kahn's algorithm
+    const sorted = [];
+    const inDegree = new Map();
+
+    wos.forEach(wo => {
+        inDegree.set(wo.wo_id, dependencies.get(wo.wo_id).length);
+    });
+
+    // Start with WOs that have no dependencies
+    const queue = wos.filter(wo => inDegree.get(wo.wo_id) === 0);
+
+    while (queue.length > 0) {
+        // Sort queue by WO number to maintain stable sort for WOs at same level
+        queue.sort((a, b) => a.wo_num.localeCompare(b.wo_num));
+
+        const wo = queue.shift();
+        sorted.push(wo);
+
+        // Reduce in-degree for dependent WOs
+        const deps = dependents.get(wo.wo_id) || [];
+        deps.forEach(depWoId => {
+            inDegree.set(depWoId, inDegree.get(depWoId) - 1);
+            if (inDegree.get(depWoId) === 0) {
+                queue.push(woMap.get(depWoId));
+            }
+        });
+    }
+
+    // If there are cycles or orphaned WOs, append them sorted by WO number
+    const remaining = wos.filter(wo => !sorted.includes(wo));
+    if (remaining.length > 0) {
+        remaining.sort((a, b) => a.wo_num.localeCompare(b.wo_num));
+        sorted.push(...remaining);
+    }
+
+    return sorted;
+}
+
+// ============================================
+// SKIP WEEKENDS HELPER
+// ============================================
+function applySkipWeekends(date) {
+    if (!skipWeekends) {
+        return date;
+    }
+
+    const m = moment(date);
+    const dayOfWeek = m.day();
+    const originalDate = m.format('YYYY-MM-DD');
+
+    // If Saturday (6), move to Monday (+2 days)
+    if (dayOfWeek === 6) {
+        const newDate = m.add(2, 'days').toDate();
+        debugLog('info', `Skip weekends: ${originalDate} (Sat) → ${moment(newDate).format('YYYY-MM-DD')} (Mon)`);
+        return newDate;
+    }
+    // If Sunday (0), move to Monday (+1 day)
+    if (dayOfWeek === 0) {
+        const newDate = m.add(1, 'day').toDate();
+        debugLog('info', `Skip weekends: ${originalDate} (Sun) → ${moment(newDate).format('YYYY-MM-DD')} (Mon)`);
+        return newDate;
+    }
+
+    return date;
+}
+
+function countWeekdaysInRange(startDate, endDate) {
+    // Count weekdays (Mon-Fri) in inclusive date range
+    let count = 0;
+    let current = startDate.clone();
+
+    while (current.isSameOrBefore(endDate)) {
+        const dayOfWeek = current.day();
+        // 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri
+        if (dayOfWeek >= 1 && dayOfWeek <= 5) {
+            count++;
+        }
+        current.add(1, 'day');
+    }
+
+    return count;
+}
+
+// ============================================
+// CUSTOM D3 GANTT CHART
+// ============================================
+// ============================================
+// TIMELINE / GANTT (v1.2 plain-DOM, vA "Workspace" style)
+// ----
+// Replaces the v1.1 D3 SVG Gantt. Reuses the report's real data +
+// writeback: dragging a bar snaps to a day and calls saveWODates()
+// (which reloads + re-renders). Grouping (MO / Category / User) comes
+// from the filter-strip segmented control (viewMode). Dependency
+// links draw from stagingDependencies when grouped by MO. The
+// function keeps its original name so every caller (renderActiveView,
+// zoomIn/zoomOut, prevWeek/nextWeek/goToToday, undo/redo, saveWODates
+// reload) keeps working unchanged.
+// ============================================
+function psToggleArrows() {
+    showArrows = !showArrows;
+    renderGanttChart();
+    try { saveSettingsToDatabase(); } catch (_) {}
+}
+
+// Collapse / expand a Timeline group (MO / category / user). State lives in
+// collapsedMOs (keyed by group id) and is persisted quietly to userproperties
+// — no toast, and the current scroll position is preserved through the re-render.
+function psToggleGroup(key) {
+    if (collapsedMOs.has(key)) collapsedMOs.delete(key);
+    else collapsedMOs.add(key);
+    const sc = document.getElementById('ganttScroll');
+    if (sc) psKeepScroll = sc.scrollLeft;
+    try { FBLib.Settings.setUserKey('collapsedMOs', Array.from(collapsedMOs)); FBLib.Settings.saveUser(); } catch (_) {}
+    renderGanttChart();
+}
+
+// Collapse / expand every group in the current Timeline view. If all groups
+// are already collapsed it expands them; otherwise it collapses all.
+function psToggleAllGroups() {
+    const keys = psGroupKeys || [];
+    if (!keys.length) return;
+    const allCollapsed = keys.every(k => collapsedMOs.has(k));
+    keys.forEach(k => { if (allCollapsed) collapsedMOs.delete(k); else collapsedMOs.add(k); });
+    const sc = document.getElementById('ganttScroll');
+    if (sc) psKeepScroll = sc.scrollLeft;
+    try { FBLib.Settings.setUserKey('collapsedMOs', Array.from(collapsedMOs)); FBLib.Settings.saveUser(); } catch (_) {}
+    renderGanttChart();
+}
+
+function renderGanttChart() {
+    const host = document.getElementById('ganttContainer');
+    if (!host) return;
+
+    // Status-filter parity (activeStatusFilters usually the full set now;
+    // the filter-strip chips already narrowed filteredWorkOrders).
+    let list = filteredWorkOrders;
+    if (activeStatusFilters.size > 0 && activeStatusFilters.size < 4) {
+        const conflictIds = new Set();
+        if (activeStatusFilters.has('conflict')) {
+            stagingDependencies.forEach(d => { conflictIds.add(d.wo_id); conflictIds.add(d.staging_wo_id); });
+        }
+        list = filteredWorkOrders.filter(w => activeStatusFilters.has(String(w.wo_status)) || conflictIds.has(w.wo_id));
+    }
+
+    const DAYW = Math.max(26, Math.min(70, ganttScale || 44));
+    psDayW = DAYW;
+    const LBL = 220;
+    let start = (ganttStartDate ? ganttStartDate.clone() : moment().startOf('isoWeek')).startOf('day');
+    const end = (ganttEndDate ? ganttEndDate.clone() : start.clone().add(28, 'days')).startOf('day');
+    // Render the full [start,end] span so the track always reaches the latest WO
+    // finish. The cap only guards a pathological span (e.g. a stray far-future WO
+    // date); when it trips we trim the PAST side (move start forward) and keep the
+    // end fixed — the far end must stay reachable. Trimming the future (the old
+    // 370-day clamp) capped the track at start+370d, which — with an old finished
+    // WO dragging start ~11 months back — dead-ended the timeline around today+1mo
+    // even though open WOs run out to the following January.
+    const MAXDAYS = 800;
+    let nDays = end.diff(start, 'days') + 1;
+    if (nDays < 7) nDays = 7;
+    if (nDays > MAXDAYS) { start = end.clone().subtract(MAXDAYS - 1, 'days'); nDays = MAXDAYS; }
+    const trackW = nDays * DAYW;
+    const days = [];
+    for (let i = 0; i < nDays; i++) days.push(start.clone().add(i, 'days'));
+
+    const toolbar =
+        '<div class="gantt-toolbar">' +
+          '<button class="ps-btn icon" onclick="prevWeek()" title="Previous week"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/></svg></button>' +
+          '<button class="ps-btn" onclick="goToToday()">Today</button>' +
+          '<button class="ps-btn icon" onclick="nextWeek()" title="Next week"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg></button>' +
+          '<span class="filter-sep"></span>' +
+          '<button class="ps-btn icon" onclick="zoomOut()" title="Zoom out"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5 12h14"/></svg></button>' +
+          '<button class="ps-btn icon" onclick="zoomIn()" title="Zoom in"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 5v14M5 12h14"/></svg></button>' +
+          '<span class="filter-sep"></span>' +
+          '<button class="ps-btn' + (showArrows ? ' primary' : '') + '" id="toggleArrowsBtn" onclick="psToggleArrows()" title="Toggle dependency arrows"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 7l5 5m0 0l-5 5m5-5H6"/></svg>Arrows</button>' +
+          '<span class="filter-sep"></span>' +
+          '<button class="ps-btn icon" id="undoBtn" onclick="undo()" title="Undo"' + (undoStack.length ? '' : ' disabled') + '><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"/></svg></button>' +
+          '<button class="ps-btn icon" id="redoBtn" onclick="redo()" title="Redo"' + (redoStack.length ? '' : ' disabled') + '><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 10h-10a8 8 0 00-8 8v2m18-10l-6-6m6 6l-6 6"/></svg></button>' +
+          '<span style="flex:1"></span>' +
+          '<span class="hint"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 7l4-4 4 4M8 17l4 4 4-4"/></svg>Drag a bar to reschedule</span>' +
+        '</div>';
+
+    if (!list.length) {
+        host.innerHTML = '<div class="gantt">' + toolbar + '<div class="ps-empty">No work orders match the current filters.</div></div>';
+        return;
+    }
+
+    // Master collapse-all state. Keys mirror the per-group keys built below,
+    // so the label-column header's "All" toggle can fold/unfold every group.
+    const _siteKey = w => 'site:' + (w.site_name || ('LG ' + (w.location_group_id || 0)));
+    const _resKey  = w => 'resource:' + (w.resource_name || 'Unassigned location');
+    const groupKeysAll = (viewMode === 'mo')
+        ? [...new Set(list.map(w => 'mo:' + w.mo_num))]
+        : (viewMode === 'user')
+            ? [...new Set(list.flatMap(w => psAssignedNames(w).map(nm => 'user:' + nm)))]
+            : (viewMode === 'site')
+                ? [...new Set(list.map(_siteKey))]
+                : (viewMode === 'resource')
+                    ? [...new Set(list.map(_resKey))]
+                    : [...new Set(list.map(w => 'cat:' + (w.category_name || 'Uncategorized')))];
+    psGroupKeys = groupKeysAll;
+    const allCollapsed = groupKeysAll.length > 0 && groupKeysAll.every(k => collapsedMOs.has(k));
+    const allChevron = allCollapsed
+        ? '<path stroke-linecap="round" stroke-linejoin="round" d="M9 6l6 6-6 6"/>'
+        : '<path stroke-linecap="round" stroke-linejoin="round" d="M6 9l6 6 6-6"/>';
+
+    // Month band — one cell per contiguous month in the window, width = its day
+    // count × DAYW. The label is sticky-left so it stays visible while scrolling
+    // through a wide month. Makes clear which month is on screen (the per-day
+    // header only prints the month on the 1st).
+    const monthSegs = [];
+    days.forEach(d => {
+        const key = d.format('YYYY-MM');
+        const last = monthSegs[monthSegs.length - 1];
+        if (last && last.key === key) last.count++;
+        else monthSegs.push({ key: key, label: d.format('MMMM YYYY'), count: 1 });
+    });
+    let monthRow = '<div class="g-monthrow"><div class="g-monthlabelhead"></div>';
+    monthSegs.forEach(seg => {
+        const w = seg.count * DAYW;
+        monthRow += '<div class="g-monthcell" style="width:' + w + 'px;min-width:' + w + 'px"><span>' + psEsc(seg.label) + '</span></div>';
+    });
+    monthRow += '</div>';
+
+    // Day header
+    let head = monthRow + '<div class="g-headrow"><div class="g-labelhead"><span>Work Order</span>' +
+        '<button class="ghall" onclick="psToggleAllGroups()" title="' + (allCollapsed ? 'Expand all' : 'Collapse all') + '">' +
+        '<svg fill="none" stroke="currentColor" stroke-width="2.4" viewBox="0 0 24 24">' + allChevron + '</svg>All</button></div>';
+    days.forEach((d, i) => {
+        const wknd = d.day() === 0 || d.day() === 6;
+        const today = d.isSame(moment(), 'day');
+        head += '<div class="g-daycol' + (wknd ? ' wknd' : '') + (today ? ' today' : '') + '" style="width:' + DAYW + 'px;min-width:' + DAYW + 'px">' +
+            '<div class="dow">' + d.format('dd').slice(0, 2) + '</div>' +
+            '<div class="dnum">' + d.date() + '</div>' +
+            '<div class="mon">' + ((d.date() === 1 || i === 0) ? d.format('MMM') : '') + '</div></div>';
+    });
+    head += '</div>';
+
+    // Grouping
+    let groups = [];
+    if (viewMode === 'mo') {
+        const mos = [...new Set(list.map(w => w.mo_num))].sort();
+        groups = mos.map(mo => {
+            const items = sortWOsByDependencies(list.filter(w => w.mo_num === mo));
+            const rec = (psMoForWO(items[0]) || {});
+            return { key: 'mo:' + mo, label: 'MO ' + mo, moNum: mo, tag: rec.customer_name || '', color: '#506872',
+                     moId: (rec.mo_id != null ? rec.mo_id : null), due: rec.mo_date_scheduled || null, items: items };
+        });
+    } else if (viewMode === 'user') {
+        // A WO can be assigned to several users — it appears under each user's group.
+        const byUser = new Map();
+        list.forEach(w => psAssignedNames(w).forEach(nm => { if (!byUser.has(nm)) byUser.set(nm, []); byUser.get(nm).push(w); }));
+        groups = [...byUser.keys()].sort().map(k => ({ key: 'user:' + k, label: k, tag: '', color: '#506872', items: byUser.get(k) }));
+    } else if (viewMode === 'site') {
+        // One lane per Site (location group).
+        const bySite = new Map();
+        list.forEach(w => { const k = (w.site_name || ('LG ' + (w.location_group_id || 0))); if (!bySite.has(k)) bySite.set(k, []); bySite.get(k).push(w); });
+        groups = [...bySite.keys()].sort().map(k => ({ key: 'site:' + k, label: k, tag: '', color: '#506872', items: bySite.get(k) }));
+    } else if (viewMode === 'resource') {
+        // One lane per Resource/machine; the header tag shows its Site (Site → Resource).
+        const byRes = new Map();
+        list.forEach(w => { const k = (w.resource_name || 'Unassigned location'); if (!byRes.has(k)) byRes.set(k, []); byRes.get(k).push(w); });
+        groups = [...byRes.keys()].sort().map(k => { const items = byRes.get(k); const site = (items[0] && items[0].site_name) || ''; return { key: 'resource:' + k, label: k, tag: site, color: '#506872', items: items }; });
+    } else {
+        const keys = [...new Set(list.map(w => w.category_name || 'Uncategorized'))].sort();
+        groups = keys.map(k => {
+            const items = list.filter(w => (w.category_name || 'Uncategorized') === k);
+            return { key: 'cat:' + k, label: k, tag: '', color: psInk(psCatColor(items[0])), items: items };
+        });
+    }
+
+    const blocked = psBlockedSet();
+    let body = '';
+    groups.forEach(g => {
+        // A single-click on the header scrolls to the group's EARLIEST WO start
+        // (the day before it, for lead-in context). Previously MO view jumped to
+        // the MO's scheduled finish date (mo_date_scheduled) — which sits forward
+        // of the WOs, so clicking never scrolled back far enough to reveal the
+        // MO's work. The earliest WO start is what the planner wants to see.
+        let minIdx = null;
+        g.items.forEach(w => { const i = moment(w.date_scheduled_start).startOf('day').diff(start, 'days'); if (minIdx === null || i < minIdx) minIdx = i; });
+        const targetIdx = (minIdx == null ? 0 : minIdx);
+        const scrollPx = Math.max(0, (targetIdx - 1) * DAYW);   // day before the earliest WO
+        const clickable = (viewMode === 'mo');
+        const collapsed = collapsedMOs.has(g.key);
+        const keyJs = psEsc(String(g.key).replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
+        // SVG chevron: pointing down when expanded, right when collapsed.
+        const chevron = collapsed
+            ? '<path stroke-linecap="round" stroke-linejoin="round" d="M9 6l6 6-6 6"/>'
+            : '<path stroke-linecap="round" stroke-linejoin="round" d="M6 9l6 6 6-6"/>';
+        const toggle = '<span class="ghtoggle" onclick="event.stopPropagation();psToggleGroup(\'' + keyJs + '\')" ' +
+            'title="' + (collapsed ? 'Expand' : 'Collapse') + '"><svg fill="none" stroke="currentColor" stroke-width="2.4" viewBox="0 0 24 24">' + chevron + '</svg></span>';
+        // MO finished good(s) — only meaningful when grouped by MO.
+        const fg = (viewMode === 'mo' && g.moNum != null) ? psMoFgLabel(g.moNum) : '';
+        // Draggable MO due-date marker (MO grouping only) — a diamond on the MO's
+        // scheduled date within the track; drag to reschedule (writes mo.dateScheduled).
+        // Only shown when the MO id is resolvable (needed to persist the change).
+        let markerHtml = '';
+        if (viewMode === 'mo' && g.due && g.moId != null) {
+            const dm = moment(g.due).startOf('day');
+            const di = dm.diff(start, 'days');
+            if (di >= 0 && di < nDays) {
+                const lateDue = dm.isBefore(moment().startOf('day'));
+                const mleft = LBL + di * DAYW + DAYW / 2;
+                const moNumJs = psEsc(String(g.moNum).replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
+                markerHtml = '<div class="g-modue' + (lateDue ? ' late' : '') + '" data-mo-id="' + g.moId + '" data-mo-num="' + moNumJs + '" style="left:' + mleft + 'px" title="MO ' + psEsc(g.moNum) + ' due ' + psFmtDate(g.due) + ' — drag to reschedule"></div>';
+            }
+        }
+        body += '<div class="g-grouphead' + (clickable ? ' clickable' : '') + '" style="width:' + (LBL + trackW) + 'px"' +
+            (clickable ? ' onclick="psTimelineScrollTo(' + scrollPx + ')" title="Scroll to the start of ' + psEsc(g.label) + '"' : '') + '>' +
+            '<span class="ghlabel">' +
+              toggle +
+              '<span class="gtag" style="background:' + g.color + '">' + psEsc(g.label) + '</span>' +
+              (g.tag ? '<span class="gc">· ' + psEsc(g.tag) + '</span>' : '') +
+              '<span class="gc">· ' + g.items.length + ' WO</span>' +
+              (fg ? '<span class="gc">· ' + psEsc(fg) + '</span>' : '') +
+            '</span>' + markerHtml + '</div>';
+        if (collapsed) return;   // header only — rows hidden
+        g.items.slice().sort((a, b) => moment(a.date_scheduled_start).valueOf() - moment(b.date_scheduled_start).valueOf()).forEach(w => {
+            const s = moment(w.date_scheduled_start).startOf('day');
+            const f = moment(w.date_scheduled).startOf('day');
+            const startIdx = s.diff(start, 'days');
+            let span = f.diff(s, 'days') + 1;
+            if (span < 1) span = 1;
+            let left = startIdx * DAYW;
+            let width = span * DAYW - 4;
+            if (left < 0) { width += left; left = 0; }
+            if (left > trackW) width = 0;
+            else if (left + width > trackW) width = trackW - left;
+            const barColor = psCatColor(w);
+            const txt = psReadableText(barColor);
+            const late = psIsLate(w);
+            const pct = w.wo_status === 40 ? 100 : (w.wo_status === 30 ? 50 : 0);
+            // Bar dot = availability signal: magenta = blocked by a dependency,
+            // red = components can't be met, amber = available only on a future
+            // date (or, if availability is off, the raw material-short flag).
+            const _av = w._av;
+            let dotColor = '';
+            let dotTitle = '';
+            if (blocked.has(w.wo_id)) { dotColor = 'var(--acc-magenta)'; dotTitle = 'Blocked by an upstream WO'; }
+            else if (psAvailReady && _av && _av._unmet) { dotColor = 'var(--fb-negative)'; dotTitle = 'Raw goods cannot be met'; }
+            else if (psAvailReady && _av && _av._contended) { dotColor = 'var(--fb-warning)'; dotTitle = 'Stock on hand but claimed by earlier-scheduled WOs — reprioritise to secure'; }
+            else if (psAvailReady && _av && !_av._buildableNow && _av._buildable) { dotColor = 'var(--acc-yellow)'; dotTitle = 'Buildable ' + psFmtDate(_av._buildable); }
+            else if (!psAvailReady && psIsShort(w)) { dotColor = 'var(--acc-yellow)'; dotTitle = 'Material short'; }
+            body += '<div class="g-row"><div class="g-rowlabel">' +
+                '<span class="wo" onclick="event.stopPropagation();openDetail(' + w.wo_id + ')">' + psEsc(w.wo_num) + '</span>' +
+                '<span class="pt" title="' + psEsc((w.description || '') + (w.part_num ? ' · ' + w.part_num : '')) + '">' + psEsc(w.description || w.part_num || '') + '</span></div>' +
+                '<div class="g-track" style="width:' + trackW + 'px">' +
+                (width > 0 ?
+                    '<div class="g-bar' + (late ? ' late' : '') + '" data-id="' + w.wo_id + '" data-wo-num="' + psEsc(w.wo_num) + '" ' +
+                    'style="left:' + left + 'px;width:' + Math.max(width, 6) + 'px;background:' + barColor + ';color:' + txt + '">' +
+                        '<div class="prog" style="width:' + pct + '%"></div>' +
+                        (dotColor ? '<div class="g-bardot" style="right:-4px;background:' + dotColor + ';border:2px solid #fff"></div>' : '') +
+                        '<span class="lbl">' + psEsc(w.wo_num) + '</span>' +
+                        '<div class="g-resize l"></div><div class="g-resize r"></div>' +
+                    '</div>' : '') +
+                '</div></div>';
+        });
+    });
+
+    const todayIdx = moment().startOf('day').diff(start, 'days');
+    const todayLine = (todayIdx >= 0 && todayIdx < nDays)
+        ? '<div class="g-today-line" style="left:' + (LBL + todayIdx * DAYW + DAYW / 2) + 'px"></div>'
+        : '';
+
+    host.innerHTML = '<div class="gantt">' + toolbar +
+        '<div class="gantt-scroll" id="ganttScroll"><div class="gantt-grid" style="width:' + (LBL + trackW) + 'px">' +
+            head +
+            '<div id="psGanttBody" style="position:relative">' +
+                '<svg id="psDepLayer" style="position:absolute;top:0;left:0;pointer-events:none;overflow:visible;z-index:3"></svg>' +
+                body + todayLine +
+            '</div>' +
+        '</div></div></div>';
+
+    if (typeof updateUndoRedoButtons === 'function') updateUndoRedoButtons();
+
+    // Drag-to-reschedule (move) + edge-resize. Both commit via
+    // psApplyWODrag → optimistic in-memory update + re-render that KEEPS
+    // the current scroll position + background quiet save (no full reload,
+    // so the bar you're editing stays in view).
+    document.querySelectorAll('#ganttContainer .g-bar').forEach(bar => {
+        const woId = bar.getAttribute('data-id');
+
+        // ── MOVE (grab body) — single click opens the drawer (which now hosts
+        //    the date/category editors); left-drag reschedules. ─────────────
+        let startX, origLeft, moved;
+        bar.addEventListener('mousedown', e => {
+            if (e.button !== 0) return;                            // left-drag only
+            if (e.target.classList.contains('g-resize')) return;  // resize handles below
+            e.preventDefault(); moved = false;
+            startX = e.clientX; origLeft = parseFloat(bar.style.left);
+            const barW = parseFloat(bar.style.width);
+            bar.classList.add('dragging');
+            function mv(ev) {
+                const dx = ev.clientX - startX;
+                if (Math.abs(dx) > 3) moved = true;
+                let snapped = Math.round((origLeft + dx) / DAYW) * DAYW;
+                snapped = Math.max(0, Math.min(snapped, trackW - barW));
+                bar.style.left = snapped + 'px';
+            }
+            function up() {
+                document.removeEventListener('mousemove', mv);
+                document.removeEventListener('mouseup', up);
+                bar.classList.remove('dragging');
+                bar._moved = moved;
+                if (moved) {
+                    const w = allWorkOrders.find(x => String(x.wo_id) === String(woId));
+                    if (!w) return;
+                    const newIdx = Math.round(parseFloat(bar.style.left) / DAYW);
+                    const s = moment(w.date_scheduled_start).startOf('day');
+                    const f = moment(w.date_scheduled).startOf('day');
+                    const span = f.diff(s, 'days');
+                    const newStart = start.clone().add(newIdx, 'days');
+                    const newEnd = newStart.clone().add(span, 'days');
+                    psApplyWODrag(w, newStart, newEnd);
+                }
+            }
+            document.addEventListener('mousemove', mv);
+            document.addEventListener('mouseup', up);
+        });
+        bar.addEventListener('click', () => {
+            if (bar._moved) { bar._moved = false; return; }
+            openDetail(woId);
+        });
+
+        // ── RESIZE (grab left/right edge) ────────────────────────
+        function wireResize(handle, isLeft) {
+            if (!handle) return;
+            handle.addEventListener('mousedown', e => {
+                if (e.button !== 0) return;   // left-drag only
+                e.preventDefault(); e.stopPropagation();
+                const sx = e.clientX, oL = parseFloat(bar.style.left), oW = parseFloat(bar.style.width);
+                bar.classList.add('dragging');
+                function mv(ev) {
+                    const dd = Math.round((ev.clientX - sx) / DAYW);
+                    if (isLeft) {
+                        let nl = oL + dd * DAYW, nw = oW - dd * DAYW;
+                        if (nw < DAYW - 4) { nw = DAYW - 4; nl = oL + oW - nw; }
+                        if (nl < 0) { nw += nl; nl = 0; }
+                        bar.style.left = nl + 'px'; bar.style.width = nw + 'px';
+                    } else {
+                        let nw = oW + dd * DAYW;
+                        if (nw < DAYW - 4) nw = DAYW - 4;
+                        if (oL + nw > trackW) nw = trackW - oL;
+                        bar.style.width = nw + 'px';
+                    }
+                }
+                function up(ev) {
+                    document.removeEventListener('mousemove', mv);
+                    document.removeEventListener('mouseup', up);
+                    bar.classList.remove('dragging');
+                    bar._moved = true;   // suppress the click→openDetail that follows
+                    const dd = Math.round((ev.clientX - sx) / DAYW);
+                    if (dd === 0) return;
+                    const w = allWorkOrders.find(x => String(x.wo_id) === String(woId));
+                    if (!w) return;
+                    const os = moment(w.date_scheduled_start).startOf('day');
+                    const oe = moment(w.date_scheduled).startOf('day');
+                    if (isLeft) {
+                        let ns = os.clone().add(dd, 'days');
+                        if (ns.isAfter(oe)) ns = oe.clone();
+                        psApplyWODrag(w, ns, oe);
+                    } else {
+                        let ne = oe.clone().add(dd, 'days');
+                        if (ne.isBefore(os)) ne = os.clone();
+                        psApplyWODrag(w, os, ne);
+                    }
+                }
+                document.addEventListener('mousemove', mv);
+                document.addEventListener('mouseup', up);
+            });
+        }
+        wireResize(bar.querySelector('.g-resize.l'), true);
+        wireResize(bar.querySelector('.g-resize.r'), false);
+    });
+
+    // MO due-date markers — drag horizontally to reschedule the MO (writes
+    // mo.dateScheduled via psApplyMoDate). Snaps to a day; a click with no drag
+    // opens the MO in Fishbowl. stopPropagation so it doesn't trigger the group
+    // header's scroll-to-start click.
+    document.querySelectorAll('#ganttContainer .g-modue').forEach(mk => {
+        const moId = mk.getAttribute('data-mo-id');
+        const moNum = mk.getAttribute('data-mo-num');
+        let sx, moved;
+        mk.addEventListener('mousedown', e => {
+            if (e.button !== 0) return;
+            e.preventDefault(); e.stopPropagation(); moved = false;
+            sx = e.clientX;
+            const origLeft = parseFloat(mk.style.left);
+            mk.classList.add('dragging');
+            function mv(ev) {
+                const dx = ev.clientX - sx;
+                if (Math.abs(dx) > 3) moved = true;
+                let di = Math.round((origLeft + dx - LBL - DAYW / 2) / DAYW);
+                di = Math.max(0, Math.min(di, nDays - 1));
+                mk.style.left = (LBL + di * DAYW + DAYW / 2) + 'px';
+            }
+            function up() {
+                document.removeEventListener('mousemove', mv);
+                document.removeEventListener('mouseup', up);
+                mk.classList.remove('dragging');
+                mk._moved = moved;
+                if (moved && moId) {
+                    const di = Math.round((parseFloat(mk.style.left) - LBL - DAYW / 2) / DAYW);
+                    const nd = start.clone().add(di, 'days');
+                    psApplyMoDate(parseInt(moId, 10), moNum, nd.format('YYYY-MM-DD'));
+                }
+            }
+            document.addEventListener('mousemove', mv);
+            document.addEventListener('mouseup', up);
+        });
+        mk.addEventListener('click', e => {
+            e.stopPropagation();
+            if (mk._moved) { mk._moved = false; return; }
+            if (typeof openModule === 'function') openModule('Manufacture Order', moNum);
+        });
+    });
+
+    // Dependency links (only meaningful grouped by MO).
+    requestAnimationFrame(() => psDrawDeps(start));
+
+    // Scroll positioning:
+    //   • after a drag/resize → keep the current scroll (psKeepScroll)
+    //   • when filtering/searching to a subset → scroll to the earliest match
+    //   • otherwise → centre on today
+    const sc = document.getElementById('ganttScroll');
+    // Focus a specific WO (drawer "Timeline" button). HORIZONTAL scroll is computed
+    // DETERMINISTICALLY from dates — start the view the day BEFORE the EARLIEST WO
+    // in the focused WO's group (so the whole MO's span reads from its start),
+    // rather than measuring the focused bar (which raced the dependency-arrow
+    // repaint — flaky — and landed mid-MO when a later WO was opened). VERTICAL
+    // scroll still measures the row (fixed 38px height → stable) to centre it.
+    // psFocusWO is cleared unconditionally; if the bar didn't render (WO filtered
+    // out of the Timeline set) fall through to the normal scroll-to-today.
+    const focusId = psFocusWO; psFocusWO = null;
+    const focusBar = (sc && focusId != null) ? sc.querySelector('.g-bar[data-id="' + focusId + '"]') : null;
+    if (sc && focusBar) {
+        const fw = allWorkOrders.find(x => String(x.wo_id) === String(focusId));
+        // Peers = the WOs sharing the focused WO's group box under the ACTIVE
+        // grouping; the view scrolls to the day before their earliest start.
+        let peers;
+        if (viewMode === 'mo') peers = list.filter(x => fw && x.mo_num === fw.mo_num);
+        else if (viewMode === 'site') { const k = (fw.site_name || ('LG ' + (fw.location_group_id || 0))); peers = list.filter(x => (x.site_name || ('LG ' + (x.location_group_id || 0))) === k); }
+        else if (viewMode === 'resource') { const k = (fw.resource_name || 'Unassigned location'); peers = list.filter(x => (x.resource_name || 'Unassigned location') === k); }
+        else if (viewMode === 'category') { const k = (fw.category_name || 'Uncategorized'); peers = list.filter(x => (x.category_name || 'Uncategorized') === k); }
+        else peers = fw ? [fw] : [];
+        if (!peers.length && fw) peers = [fw];
+        let minIdx = null;
+        peers.forEach(x => { const i = moment(x.date_scheduled_start).startOf('day').diff(start, 'days'); if (minIdx === null || i < minIdx) minIdx = i; });
+        const targetLeft = Math.max(0, ((minIdx == null ? 0 : minIdx) - 1) * DAYW);   // day BEFORE the group's earliest WO
+        const applyFocus = () => {
+            const s2 = document.getElementById('ganttScroll'); if (!s2) return;
+            s2.scrollLeft = targetLeft;   // computed — re-asserted across both rAFs
+            const el = s2.querySelector('.g-bar[data-id="' + focusId + '"]');
+            if (!el) return;
+            const cr = s2.getBoundingClientRect(), br = el.getBoundingClientRect();
+            // Vertical only — centre the focused WO's row (clears the sticky header).
+            s2.scrollTop = Math.max(0, s2.scrollTop + (br.top - cr.top) - Math.max(0, (cr.height / 2) - (br.height / 2)));
+            el.style.transition = 'box-shadow .2s';
+            el.style.boxShadow = '0 0 0 3px #F7C23A, var(--sh2)';
+            setTimeout(() => { try { el.style.boxShadow = ''; } catch (_) {} }, 2000);
+        };
+        requestAnimationFrame(() => { applyFocus(); requestAnimationFrame(applyFocus); });
+        return;   // skip the default scroll-to-today below
+    }
+    if (sc) {
+        let targetScroll = null;
+        if (psKeepScroll != null) {
+            targetScroll = psKeepScroll;
+            psKeepScroll = null;
+        } else {
+            const anyFilter = !!(psSearch || psStatusFilter.size || psCatFilter.size || psUserFilter.size || psPriorityFilter.size);
+            if (anyFilter && list.length) {
+                let minStart = null;
+                list.forEach(w => { const i = moment(w.date_scheduled_start).startOf('day').diff(start, 'days'); if (minStart === null || i < minStart) minStart = i; });
+                if (minStart != null) targetScroll = Math.max(0, minStart * DAYW - 160);
+            } else if (todayIdx >= 0 && todayIdx < nDays) {
+                targetScroll = Math.max(0, todayIdx * DAYW - 160);
+            }
+        }
+        if (targetScroll != null) {
+            sc.scrollLeft = targetScroll;
+            // Re-assert after the dependency-arrow paint + layout settle — those
+            // can otherwise reset scrollLeft to 0 right after we set it.
+            requestAnimationFrame(() => { const s2 = document.getElementById('ganttScroll'); if (s2) s2.scrollLeft = targetScroll; });
+        }
+    }
+}
+
+// Apply a WO drag/resize: capture undo, optimistically update the WO's
+// dates in memory, re-render the Gantt WITHOUT moving the scroll (so the
+// edited bar stays in view), then persist in the background via a quiet
+// save (no full data reload). Redraws lanes + dependency arrows too.
+function psApplyWODrag(wo, newStartDay, newEndDay) {
+    undoStack.push(captureState());
+    if (undoStack.length > MAX_UNDO_STACK) undoStack.shift();
+    redoStack = [];
+    const origStart = moment(wo.date_scheduled_start), origEnd = moment(wo.date_scheduled);
+    const ns = newStartDay.clone().hour(origStart.hour() || 6).minute(origStart.minute()).second(origStart.second() || 0);
+    const ne = newEndDay.clone().hour(origEnd.hour() || 18).minute(origEnd.minute()).second(origEnd.second() || 0);
+    if (ns.isSameOrAfter(ne)) { ns.hour(6).minute(0).second(0); ne.hour(18).minute(0).second(0); }
+    wo.date_scheduled_start = ns.format('YYYY-MM-DD[T]HH:mm:ss');
+    wo.date_scheduled = ne.format('YYYY-MM-DD[T]HH:mm:ss');
+    const sc = document.getElementById('ganttScroll');
+    psKeepScroll = sc ? sc.scrollLeft : null;
+    renderGanttChart();
+    if (typeof updateUndoRedoButtons === 'function') updateUndoRedoButtons();
+    // Persist after paint so the UI feels instant.
+    setTimeout(() => psSaveWODatesQuiet(wo.wo_num, newStartDay.format('YYYY-MM-DD'), newEndDay.format('YYYY-MM-DD')), 0);
+}
+
+// Save WO dates WITHOUT reloading all data (the Timeline updates itself
+// optimistically). On failure, fall back to a full reload to resync.
+function psSaveWODatesQuiet(woNum, newStartDate, newEndDate) {
+    try {
+        const woResponse = JSON.parse(runApiRequest('GetWorkOrderRq', JSON.stringify({ GetWorkOrderRq: { WorkOrderNumber: woNum } })));
+        if (woResponse.GetWorkOrderRs && woResponse.GetWorkOrderRs.statusCode === 1000 && woResponse.GetWorkOrderRs.WO) {
+            const wo = woResponse.GetWorkOrderRs.WO;
+            const os = moment(wo.DateScheduledToStart), oe = moment(wo.DateScheduled);
+            const ns = moment(newStartDate).hour(os.hour()).minute(os.minute()).second(os.second());
+            const ne = moment(newEndDate).hour(oe.hour()).minute(oe.minute()).second(oe.second());
+            if (ns.isSameOrAfter(ne)) { ns.hour(6).minute(0).second(0); ne.hour(18).minute(0).second(0); }
+            wo.DateScheduledToStart = ns.format('YYYY-MM-DD[T]HH:mm:ss');
+            wo.DateScheduled = ne.format('YYYY-MM-DD[T]HH:mm:ss');
+            if (wo.WOItems && wo.WOItems.WOItem) {
+                const items = Array.isArray(wo.WOItems.WOItem) ? wo.WOItems.WOItem : [wo.WOItems.WOItem];
+                items.forEach(item => {
+                    if (item.DateScheduled) {
+                        const od = moment(item.DateScheduled);
+                        item.DateScheduled = moment(newStartDate).hour(od.hour()).minute(od.minute()).second(od.second()).format('YYYY-MM-DD[T]HH:mm:ss');
+                    }
+                });
+            }
+            const saveResponse = JSON.parse(runApiRequest('SaveWorkOrderRq', JSON.stringify({ SaveWorkOrderRq: { WO: wo } })));
+            if (saveResponse.SaveWorkOrderRs && saveResponse.SaveWorkOrderRs.statusCode === 1000) {
+                debugLog('success', `WO ${woNum} rescheduled (quiet)`);
+                showToast(`WO ${woNum} rescheduled`, 'success', 2000);
+                return true;
+            }
+            throw new Error(saveResponse.SaveWorkOrderRs ? saveResponse.SaveWorkOrderRs.statusMessage : 'Save failed');
+        }
+        throw new Error(woResponse.GetWorkOrderRs ? woResponse.GetWorkOrderRs.statusMessage : 'Could not retrieve WO');
+    } catch (error) {
+        debugLog('error', `Quiet save WO ${woNum} failed`, error);
+        showToast('Save failed: ' + (error && error.message) + ' — reloading', 'error', 5000);
+        // Preserve scroll across the resync reload so the view doesn't jump.
+        const sc = document.getElementById('ganttScroll');
+        if (sc) psKeepScroll = sc.scrollLeft;
+        loadWorkOrders();
+        return false;
+    }
+}
+
+// ============================================
+// MO SCHEDULED (DUE) DATE WRITE  (UN-ISSUE → SET DATE → RE-ISSUE → RESTORE)
+// ----
+// Single shared writer for the MO's dateScheduled — the "due date" surfaced by
+// psDue() and edited from the Timeline MO-header marker (drag) + the Work Orders
+// table MO group header (date field).
+//
+// ⚠ WHY THIS IS A REBUILD, NOT A SIMPLE FIELD WRITE.
+//   POST /api/manufacture-orders/:id treats the body as a FULL REPLACE, and
+//   updating an ISSUED MO REGENERATES its work orders regardless of what you
+//   send — confirmed twice on the user's install:
+//     • a partial body ({id,dateScheduled}) cleared the unsent fields and deleted
+//       the MO;
+//     • even a full read-modify-write POST updated the header date but still
+//       deleted + recreated the WOs (losing their hand-scheduled dates), and it
+//       refused entirely when a WO under the MO was already finished ("void the
+//       pick for the underlying work order").
+//   So the only reliable path — the one the user asked for — is Fishbowl's own
+//   life-cycle: UN-ISSUE (Issued→Entered, which deletes the WOs) → change the
+//   scheduled date while Entered → RE-ISSUE (Entered→Issued, which recreates the
+//   WOs off the new date) → RESTORE each recreated WO's hand-scheduled dates.
+//
+// ⛔ HARD PRE-GATE. Un-issuing destroys the WOs; that is only non-destructive
+//   while EVERY WO is still Entered (status 10) — no picks, no WIP, no progress.
+//   A finished WO (status 40) can't be un-issued at all (its pick is committed),
+//   and a started WO (status 30) would lose its progress. So psMoWoState() reads
+//   ALL WOs under the MO (any status, direct from the DB — the report only loads
+//   10/30/40) and this write REFUSES unless every one is Entered, naming the
+//   finished/in-progress work orders and pointing the user at the MO module.
+//
+//   NOT client-verified: the un-issue/re-issue REST transitions and the WO
+//   recreate-then-restore behaviour must be tested on a DISPOSABLE MO first,
+//   given the prior data loss. Returns 'ok' | 'blocked' | 'cancelled' | 'failed'.
+
+// Read every WO under an MO (any status — the report only loads 10/30/40) plus
+// each WO's scheduled dates + finished-good part, so the caller can (a) gate on
+// WO status and (b) restore hand-scheduled dates after the re-issue recreates
+// them. Returns { editable, wos:[{woNum,statusId,partNum,start,finish}], blockers }.
+async function psMoWoState(moId) {
+    if (typeof runQueryAsync !== 'function') throw new Error('runQueryAsync unavailable');
+    const rows = await runQueryAsync(
+        "SELECT wo.num AS wo_num, wo.statusid AS status_id, " +
+        "       wo.datescheduledtostart AS dss, wo.datescheduled AS ds, " +
+        "       (SELECT p.num FROM woitem wi LEFT JOIN part p ON p.id = wi.partid " +
+        "         WHERE wi.woid = wo.id AND wi.typeid = 10 LIMIT 1) AS part_num " +
+        "FROM wo INNER JOIN moitem ON wo.moitemid = moitem.id " +
+        "WHERE moitem.moid = " + parseInt(moId, 10));
+    const wos = (rows || []).map(r => ({
+        woNum: r.wo_num, statusId: parseInt(r.status_id, 10),
+        partNum: r.part_num || '', start: r.dss, finish: r.ds
+    }));
+    // Safe to rebuild only when EVERY WO is still Entered (status 10).
+    const blockers = wos.filter(w => w.statusId !== 10);
+    return { editable: wos.length > 0 && blockers.length === 0, wos, blockers };
+}
+
+// Restore one recreated WO's scheduled dates via the legacy Get/Save path (quiet,
+// no toast, time-of-day preserved from the recreated record). Returns bool.
+function psRestoreWoDatesQuiet(woNum, startISO, finishISO) {
+    try {
+        const resp = JSON.parse(runApiRequest('GetWorkOrderRq', JSON.stringify({ GetWorkOrderRq: { WorkOrderNumber: woNum } })));
+        const rs = resp.GetWorkOrderRs;
+        if (!(rs && rs.statusCode === 1000 && rs.WO)) return false;
+        const wo = rs.WO;
+        const s = moment(startISO), e = moment(finishISO);
+        if (!s.isValid() || !e.isValid()) return false;
+        wo.DateScheduledToStart = s.format('YYYY-MM-DD[T]HH:mm:ss');
+        wo.DateScheduled = e.format('YYYY-MM-DD[T]HH:mm:ss');
+        if (wo.WOItems && wo.WOItems.WOItem) {
+            const items = Array.isArray(wo.WOItems.WOItem) ? wo.WOItems.WOItem : [wo.WOItems.WOItem];
+            items.forEach(it => { if (it.DateScheduled) it.DateScheduled = s.format('YYYY-MM-DD[T]HH:mm:ss'); });
+        }
+        const sr = JSON.parse(runApiRequest('SaveWorkOrderRq', JSON.stringify({ SaveWorkOrderRq: { WO: wo } })));
+        return !!(sr.SaveWorkOrderRs && sr.SaveWorkOrderRs.statusCode === 1000);
+    } catch (_) { return false; }
+}
+
+async function psSaveMoDate(moId, moNum, newDate) {
+    if (moId == null) { showToast('MO id unknown — cannot update the scheduled date', 'error'); return 'blocked'; }
+    if (typeof runRestApiAsync !== 'function') { showToast('REST API unavailable — open this report inside Fishbowl with REST enabled to reschedule MOs', 'error', 5000); return 'blocked'; }
+    const idNum = parseInt(moId, 10);
+    const STLBL = { 10: 'Entered', 20: 'Issued', 30: 'In Progress', 40: 'Fulfilled', 50: 'Closed' };
+
+    // 0) PRE-GATE — read all WOs under the MO and refuse if any has left Entered.
+    let state;
+    try { state = await psMoWoState(idNum); }
+    catch (err) {
+        debugLog('error', 'MO ' + (moNum || idNum) + ' WO-state read failed: ' + (err && err.message));
+        showToast('Could not read MO ' + (moNum || idNum) + '’s work orders — no change made.', 'error', 6000);
+        return 'blocked';
+    }
+    if (!state.editable) {
+        const bad = state.blockers.map(w => w.woNum + ' (' + (STLBL[w.statusId] || ('status ' + w.statusId)) + ')');
+        const anyFinished = state.blockers.some(w => w.statusId >= 40);
+        const why = anyFinished
+            ? 'it has a finished work order (its pick is committed and can’t be un-issued)'
+            : 'work has already started on it';
+        debugLog('info', 'MO ' + (moNum || idNum) + ' date change blocked — ' + bad.join(', '));
+        showToast('MO ' + (moNum || idNum) + ' date can’t be changed here — ' + why + ' [' + bad.slice(0, 5).join(', ') + (bad.length > 5 ? ', …' : '') + ']. Change the scheduled date in the Manufacture Order module instead.', 'error', 10000);
+        return 'blocked';
+    }
+
+    // 1) READ the full MO object (needed to POST the un-issue/re-issue transitions).
+    let full;
+    try { full = await runRestApiAsync({ method: 'GET', path: '/api/manufacture-orders/' + idNum }); }
+    catch (err) {
+        debugLog('error', 'MO ' + (moNum || idNum) + ' GET failed: ' + (err && (err.message || err.status)));
+        showToast('Could not read MO ' + (moNum || idNum) + ' — no change made.', 'error', 6000);
+        return 'blocked';
+    }
+    const gotId = full && (full.id != null ? full.id : (full.mo && full.mo.id));
+    if (!full || typeof full !== 'object' || gotId == null || String(gotId) !== String(idNum) || !Array.isArray(full.configurations)) {
+        debugLog('error', 'MO ' + (moNum || idNum) + ' GET returned an unexpected shape — aborting: ' + (typeof full === 'string' ? full.slice(0, 200) : JSON.stringify(full).slice(0, 300)));
+        showToast('MO ' + (moNum || idNum) + ' came back in an unexpected shape — no change made. Edit its date in the Manufacture Order module instead.', 'error', 7000);
+        return 'blocked';
+    }
+
+    // 2) CONFIRM — this rebuilds the WOs. Spell out what happens (styled modal).
+    const n = state.wos.length;
+    const okAy = await psConfirm({
+        title: 'Reschedule MO ' + (moNum || idNum) + '?',
+        message: 'Change the scheduled date to ' + psFmtDate(newDate) + '.\n\n' +
+            'This un-issues and re-issues the MO: its ' + n + ' work order' + (n === 1 ? '' : 's') +
+            ' will be recreated and their scheduled dates restored. Only do this while no work has started.\n\n' +
+            'If it fails part-way, the MO may be left un-issued (Entered) — check it in Fishbowl.',
+        confirmLabel: 'Reschedule MO',
+        cancelLabel: 'Cancel',
+        tone: 'warn'
+    });
+    if (!okAy) return 'cancelled';
+
+    // Capture each WO's scheduled dates by finished-good part, to restore after the
+    // re-issue (recreated WOs may carry new numbers — match on the part they build).
+    const dateByPart = new Map();
+    state.wos.forEach(w => { if (w.partNum && !dateByPart.has(w.partNum)) dateByPart.set(w.partNum, { start: w.start, finish: w.finish }); });
+
+    const iso = newDate + 'T00:00:00';
+    try {
+        // 3) UN-ISSUE + set the new scheduled date (status -> Entered). Full object.
+        const unissue = Object.assign({}, full, { status: 'Entered', dateScheduled: iso });
+        await runRestApiAsync({ method: 'POST', path: '/api/manufacture-orders/' + idNum, body: JSON.stringify(unissue) });
+        debugLog('info', 'MO ' + (moNum || idNum) + ' un-issued + dated ' + newDate);
+        // 4) RE-ISSUE (status -> Issued). Recreates the WOs off the new date.
+        const reissue = Object.assign({}, full, { status: 'Issued', dateScheduled: iso });
+        const res = await runRestApiAsync({ method: 'POST', path: '/api/manufacture-orders/' + idNum, body: JSON.stringify(reissue) });
+        debugLog('success', 'MO ' + (moNum || idNum) + ' re-issued');
+        // 5) RESTORE each recreated WO's hand-scheduled dates (best-effort, by part).
+        let restored = 0, tried = 0;
+        try {
+            const newRows = await runQueryAsync(
+                "SELECT wo.num AS wo_num, " +
+                "(SELECT p.num FROM woitem wi LEFT JOIN part p ON p.id = wi.partid WHERE wi.woid = wo.id AND wi.typeid = 10 LIMIT 1) AS part_num " +
+                "FROM wo INNER JOIN moitem ON wo.moitemid = moitem.id WHERE moitem.moid = " + idNum);
+            (newRows || []).forEach(r => {
+                const cap = r.part_num ? dateByPart.get(r.part_num) : null;
+                if (cap && cap.start && cap.finish) { tried++; if (psRestoreWoDatesQuiet(r.wo_num, cap.start, cap.finish)) restored++; }
+            });
+        } catch (rErr) { debugLog('warn', 'WO date restore failed: ' + (rErr && rErr.message)); }
+        const num = (res && (res.number || res.num)) || moNum || '';
+        debugLog('success', 'MO ' + num + ' rescheduled to ' + newDate + ' (' + restored + '/' + tried + ' WO date(s) restored)');
+        showToast('MO ' + num + ' rescheduled to ' + psFmtDate(newDate) + (tried ? (' · ' + restored + '/' + tried + ' WO date' + (tried === 1 ? '' : 's') + ' restored') : ''), 'success', 4500);
+        return 'ok';
+    } catch (err) {
+        const msg = (err && (err.message || err.status != null)) ? (err.message || ('HTTP ' + err.status)) : 'unknown error';
+        debugLog('error', 'MO ' + (moNum || idNum) + ' reschedule failed mid-way: ' + msg);
+        showToast('MO ' + (moNum || idNum) + ' reschedule failed part-way: ' + msg + ' — check the MO in Fishbowl; it may be left un-issued (Entered) and need re-issuing.', 'error', 10000);
+        return 'failed';
+    }
+}
+
+// Apply an MO date change. Because the write now un-issues/re-issues the MO
+// (a destructive rebuild — see psSaveMoDate) there is NO optimistic UI: an
+// optimistic date flash would be misleading when the change is blocked or
+// cancelled. Run the guarded flow, then reload only when the MO state actually
+// changed ('ok' = success, 'failed' = changed mid-way) so the view resyncs to
+// the recreated WOs. 'blocked'/'cancelled' left nothing changed → no reload.
+// Hold the Timeline scroll steady across the resync.
+function psApplyMoDate(moId, moNum, newDate) {
+    psSaveMoDate(moId, moNum, newDate).then(result => {
+        if (result === 'ok' || result === 'failed') {
+            const sc = document.getElementById('ganttScroll');
+            if (sc) psKeepScroll = sc.scrollLeft;
+            if (typeof loadWorkOrders === 'function') loadWorkOrders();
+        }
+    });
+}
+
+// Draw finish->start dependency links between WO bars (MO grouping only).
+function psDrawDeps(windowStart) {
+    const svg = document.getElementById('psDepLayer');
+    if (!svg) return;
+    if (!showArrows || viewMode !== 'mo') { svg.innerHTML = ''; return; }
+    const gridBody = document.getElementById('psGanttBody');
+    if (!gridBody) return;
+    const gr = gridBody.getBoundingClientRect();
+    svg.setAttribute('width', gridBody.scrollWidth);
+    svg.setAttribute('height', gridBody.scrollHeight);
+    const pos = {};
+    gridBody.querySelectorAll('.g-bar').forEach(b => {
+        const r = b.getBoundingClientRect();
+        pos[String(b.getAttribute('data-id'))] = { x1: r.left - gr.left, x2: r.right - gr.left, yc: r.top - gr.top + r.height / 2 };
+    });
+    const blocked = psBlockedSet();
+    let paths = '';
+    stagingDependencies.forEach(dep => {
+        const a = pos[String(dep.staging_wo_id)];
+        const b = pos[String(dep.wo_id)];
+        if (!a || !b) return;
+        const conflict = blocked.has(dep.wo_id);
+        const color = conflict ? '#845EEB' : '#8FA1A7';
+        const sx = a.x2, sy = a.yc, ex = b.x1, ey = b.yc;
+        const d = 'M' + sx + ',' + sy + ' C ' + (sx + 22) + ',' + sy + ' ' + (ex - 22) + ',' + ey + ' ' + (ex - 7) + ',' + ey;
+        const dash = conflict ? ' stroke-dasharray="4 3"' : '';
+        paths += '<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="1.6"' + dash + ' opacity="0.9"/>';
+        paths += '<path d="M' + ex + ',' + ey + ' l-7,-3.6 v7.2 z" fill="' + color + '"/>';
+        paths += '<circle cx="' + sx + '" cy="' + sy + '" r="2.4" fill="' + color + '"/>';
+    });
+    svg.innerHTML = paths;
+}
+
+// ============================================
+// STICKY LABELS (CATEGORY AND MO VIEWS)
+// ============================================
+function setupStickyLabels(groups, yScale) {
+    const wrapper = document.getElementById('ganttWrapper');
+    const overlay = document.getElementById('categoryLabelsOverlay');
+
+    // Remove existing scroll listener to avoid duplicates
+    const existingListener = wrapper._categoryScrollListener;
+    if (existingListener) {
+        wrapper.removeEventListener('scroll', existingListener);
+    }
+
+    // Scroll handler to keep labels fixed on the left during horizontal scroll
+    const scrollHandler = () => {
+        const scrollLeft = wrapper.scrollLeft;
+        // Update overlay position to compensate for horizontal scroll
+        overlay.style.left = `${scrollLeft}px`;
+    };
+
+    // Attach scroll listener
+    wrapper.addEventListener('scroll', scrollHandler);
+    wrapper._categoryScrollListener = scrollHandler;
+
+    // Initial call to position labels correctly
+    scrollHandler();
+}
+
+// ============================================
+// PAN AND ZOOM
+// ============================================
+function setupGanttPanZoom() {
+    const wrapper = document.getElementById('ganttWrapper');
+
+    // Pan (click and drag to scroll)
+    let isPanning = false;
+    let startX = 0;
+    let startY = 0;
+    let scrollLeft = 0;
+    let scrollTop = 0;
+
+    wrapper.addEventListener('mousedown', (e) => {
+        // Don't pan if clicking on a WO bar or resize handle
+        if (e.target.closest('.wo-bar') || e.target.classList.contains('resize-handle-left') || e.target.classList.contains('resize-handle-right')) {
+            return;
+        }
+
+        isPanning = true;
+        startX = e.pageX - wrapper.offsetLeft;
+        startY = e.pageY - wrapper.offsetTop;
+        scrollLeft = wrapper.scrollLeft;
+        scrollTop = wrapper.scrollTop;
+        wrapper.style.cursor = 'grabbing';
+    });
+
+    wrapper.addEventListener('mouseleave', () => {
+        isPanning = false;
+        wrapper.style.cursor = 'default';
+    });
+
+    wrapper.addEventListener('mouseup', () => {
+        isPanning = false;
+        wrapper.style.cursor = 'default';
+    });
+
+    wrapper.addEventListener('mousemove', (e) => {
+        if (!isPanning) return;
+        e.preventDefault();
+
+        const x = e.pageX - wrapper.offsetLeft;
+        const y = e.pageY - wrapper.offsetTop;
+        const walkX = (x - startX) * 2; // Scroll speed
+        const walkY = (y - startY) * 2;
+
+        wrapper.scrollLeft = scrollLeft - walkX;
+        wrapper.scrollTop = scrollTop - walkY;
+    });
+
+}
+
+// ============================================
+// ZOOM CONTROLS
+// ============================================
+function zoomIn() {
+    ganttScale = Math.min(200, ganttScale + 20);
+    renderGanttChart();
+    saveSettingsToDatabase();  // Auto-save zoom level
+}
+
+function zoomOut() {
+    ganttScale = Math.max(40, ganttScale - 20);
+    renderGanttChart();
+    saveSettingsToDatabase();  // Auto-save zoom level
+}
+
+// ============================================
+// DATE NAVIGATION
+// ============================================
+// v1.2: the Timeline renders the full data-range window, so prev/next
+// simply scroll the track by a week (the old date-window shuffle got
+// cancelled by the render's scroll-to-today and appeared to do nothing).
+function prevWeek() {
+    const sc = document.getElementById('ganttScroll');
+    if (sc) sc.scrollLeft -= 7 * (psDayW || 44);
+}
+
+function nextWeek() {
+    const sc = document.getElementById('ganttScroll');
+    if (sc) sc.scrollLeft += 7 * (psDayW || 44);
+}
+
+function goToToday() {
+    if (!ganttStartDate) return;
+    const idx = moment().startOf('day').diff(ganttStartDate.clone().startOf('day'), 'days');
+    psTimelineScrollTo(idx * (psDayW || 44));
+}
+
+function setTimeRange(days) {
+    // Adjust zoom scale to fit specified days in viewport
+    // Viewport width is roughly 1200px (common container width)
+    const viewportWidth = document.getElementById('ganttWrapper').clientWidth || 1200;
+    const margin = 200; // left margin for labels
+    const availableWidth = viewportWidth - margin;
+
+    // Calculate scale to fit days in available width
+    ganttScale = Math.max(40, Math.min(200, availableWidth / days));
+
+    renderGanttChart();
+    debugLog('info', `Zoom adjusted to fit ${days} days (scale: ${ganttScale.toFixed(1)}px/day)`);
+}
+
+// ============================================
+// TOGGLE SETTINGS
+// ============================================
+function toggleArrows() {
+    showArrows = !showArrows;
+    const btn = document.getElementById('toggleArrowsBtn');
+    if (showArrows) {
+        btn.querySelector('svg').classList.remove('text-slate-400');
+        btn.querySelector('svg').classList.add('text-emerald-600');
+    } else {
+        btn.querySelector('svg').classList.remove('text-emerald-600');
+        btn.querySelector('svg').classList.add('text-slate-400');
+    }
+    renderGanttChart();
+    debugLog('info', `Dependency arrows ${showArrows ? 'enabled' : 'disabled'}`);
+}
+
+// ============================================
+// CAPACITY PLANNING VIEW
+// ============================================
+function buildCapacityTable(weekStart) {
+    debugLog('info', 'Building capacity table...');
+    // Placeholder - will implement full capacity table
+    const container = document.getElementById('capacityTable');
+    container.innerHTML = `
+        <thead>
+            <tr class="bg-slate-50">
+                <th class="p-4 text-left font-semibold text-slate-700">Category</th>
+                ${[0,1,2,3,4,5,6].map(day => `
+                    <th class="p-4 text-center font-semibold text-slate-700">
+                        ${weekStart.clone().add(day, 'days').format('ddd D')}
+                    </th>
+                `).join('')}
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td colspan="8" class="p-8 text-center text-slate-400">
+                    Capacity planning table coming soon...
+                </td>
+            </tr>
+        </tbody>
+    `;
+
+    const display = document.getElementById('capacityWeekDisplay');
+    display.textContent = `${weekStart.format('MMM D')} - ${weekStart.clone().add(6, 'days').format('MMM D, YYYY')}`;
+}
+
+// ============================================
+// UNDO/REDO
+// ============================================
+function undo() {
+    if (undoStack.length === 0) return;
+    const state = undoStack.pop();
+    redoStack.push(captureState());
+    restoreState(state);
+    updateUndoRedoButtons();
+}
+
+function redo() {
+    if (redoStack.length === 0) return;
+    const state = redoStack.pop();
+    undoStack.push(captureState());
+    restoreState(state);
+    updateUndoRedoButtons();
+}
+
+function captureState() {
+    return JSON.stringify(allWorkOrders);
+}
+
+function restoreState(state) {
+    // Diff the state we're about to restore against the current one so undo/redo
+    // write the reverted values back to Fishbowl (not just the on-screen UI).
+    const prevMap = new Map(allWorkOrders.map(w => [String(w.wo_id), w]));
+    const next = JSON.parse(state);
+    const changed = [];
+    next.forEach(w => {
+        const p = prevMap.get(String(w.wo_id));
+        if (!p) return;
+        const dateChanged = p.date_scheduled_start !== w.date_scheduled_start || p.date_scheduled !== w.date_scheduled;
+        const catChanged = (p.calcategory_id || 0) !== (w.calcategory_id || 0);
+        if (dateChanged || catChanged) changed.push({ wo: w, dateChanged, catChanged });
+    });
+    allWorkOrders = next;
+    filteredWorkOrders = [...allWorkOrders];
+    // Keep the Timeline scroll steady through the re-render.
+    const sc = document.getElementById('ganttScroll');
+    if (sc) psKeepScroll = sc.scrollLeft;
+    renderCurrentView();
+    // Persist each reverted WO after paint (date save first, then category so
+    // both land on the same record without racing).
+    changed.forEach(({ wo, dateChanged, catChanged }) => {
+        setTimeout(() => {
+            if (dateChanged) psSaveWODatesQuiet(wo.wo_num, moment(wo.date_scheduled_start).format('YYYY-MM-DD'), moment(wo.date_scheduled).format('YYYY-MM-DD'));
+            if (catChanged) saveWOCategory(wo.wo_num, wo.calcategory_id);
+        }, 0);
+    });
+    if (changed.length) showToast(changed.length + ' WO' + (changed.length > 1 ? 's' : '') + ' restored', 'info', 2000);
+}
+
+function updateUndoRedoButtons() {
+    // The undo/redo buttons only exist while the Timeline is rendered.
+    const u = document.getElementById('undoBtn');
+    const r = document.getElementById('redoBtn');
+    if (u) u.disabled = undoStack.length === 0;
+    if (r) r.disabled = redoStack.length === 0;
+}
+
+// ============================================
+// SETTINGS PERSISTENCE
+// ============================================
+function gatherSettings() {
+    // Compile all settings into a single object
+    // Only save capacity limits (not category names/colors which come from DB)
+    const categoryLimits = {};
+    capacitySettings.categories.forEach(cat => {
+        categoryLimits[cat.id] = cat.limits;
+    });
+
+    return {
+        version: '1.0',
+        categoryLimits: categoryLimits, // Map of category_id -> limits array
+        ganttScale: ganttScale,
+        showArrows: showArrows,
+        allowSameDayStarts: allowSameDayStarts,
+        shiftDependentWOs: shiftDependentWOs,
+        skipWeekends: skipWeekends,
+        calendarColorMode: calendarColorMode,
+        viewByMode: viewByMode,
+        showCompletedWOs: showCompletedWOs,
+        calendarExpanded: calendarExpanded,
+        collapsedMOs: Array.from(collapsedMOs), // Convert Set to Array for JSON
+        savedAt: new Date().toISOString()
+    };
+}
+
+function applySettings(settings) {
+    // Apply loaded settings to global variables
+    if (!settings || !settings.version) {
+        debugLog('warn', 'Invalid settings object, using defaults');
+        return false;
+    }
+
+    try {
+        // Apply category limits to existing categories (don't replace category metadata)
+        if (settings.categoryLimits && typeof settings.categoryLimits === 'object') {
+            capacitySettings.categories.forEach(cat => {
+                if (settings.categoryLimits[cat.id]) {
+                    cat.limits = settings.categoryLimits[cat.id];
+                }
+            });
+        }
+
+        if (typeof settings.ganttScale === 'number') {
+            ganttScale = settings.ganttScale;
+        }
+        if (typeof settings.showArrows === 'boolean') {
+            showArrows = settings.showArrows;
+            // Update UI checkbox
+            const showArrowsCheckbox = document.getElementById('showArrowsToggle');
+            if (showArrowsCheckbox) showArrowsCheckbox.checked = showArrows;
+        }
+        if (typeof settings.allowSameDayStarts === 'boolean') {
+            allowSameDayStarts = settings.allowSameDayStarts;
+            // Update UI checkbox
+            const sameDayStartsCheckbox = document.getElementById('sameDayStartsToggle');
+            if (sameDayStartsCheckbox) sameDayStartsCheckbox.checked = allowSameDayStarts;
+        }
+        if (typeof settings.shiftDependentWOs === 'boolean') {
+            shiftDependentWOs = settings.shiftDependentWOs;
+            // Update UI checkbox
+            const shiftDependentWOsCheckbox = document.getElementById('shiftDependentWOsToggle');
+            if (shiftDependentWOsCheckbox) shiftDependentWOsCheckbox.checked = shiftDependentWOs;
+        }
+        if (typeof settings.skipWeekends === 'boolean') {
+            skipWeekends = settings.skipWeekends;
+            // Update UI checkbox
+            const skipWeekendsCheckbox = document.getElementById('skipWeekendsToggle');
+            if (skipWeekendsCheckbox) skipWeekendsCheckbox.checked = skipWeekends;
+        }
+        if (settings.calendarColorMode && (settings.calendarColorMode === 'status' || settings.calendarColorMode === 'category')) {
+            calendarColorMode = settings.calendarColorMode;
+            // Update UI select
+            const calendarColorModeSelect = document.getElementById('calendarColorModeSelect');
+            if (calendarColorModeSelect) calendarColorModeSelect.value = calendarColorMode;
+        }
+        if (settings.viewByMode && (settings.viewByMode === 'wo_num' || settings.viewByMode === 'bom_num')) {
+            viewByMode = settings.viewByMode;
+            // Update UI select
+            const viewByModeSelect = document.getElementById('viewByModeSelect');
+            if (viewByModeSelect) viewByModeSelect.value = viewByMode;
+        }
+        if (typeof settings.showCompletedWOs === 'boolean') {
+            showCompletedWOs = settings.showCompletedWOs;
+            // Update UI checkbox
+            const showCompletedWOsCheckbox = document.getElementById('showCompletedWOsToggle');
+            if (showCompletedWOsCheckbox) showCompletedWOsCheckbox.checked = showCompletedWOs;
+        }
+        if (typeof settings.calendarExpanded === 'boolean') {
+            calendarExpanded = settings.calendarExpanded;
+        }
+        if (Array.isArray(settings.collapsedMOs)) {
+            collapsedMOs = new Set(settings.collapsedMOs);
+        }
+
+        // Sync UI checkboxes with current global variable values
+        // This ensures UI reflects state even if some settings weren't in the saved JSON
+        const showArrowsCheckbox = document.getElementById('showArrowsToggle');
+        if (showArrowsCheckbox) showArrowsCheckbox.checked = showArrows;
+
+        const sameDayStartsCheckbox = document.getElementById('sameDayStartsToggle');
+        if (sameDayStartsCheckbox) sameDayStartsCheckbox.checked = allowSameDayStarts;
+
+        const shiftDependentWOsCheckbox = document.getElementById('shiftDependentWOsToggle');
+        if (shiftDependentWOsCheckbox) shiftDependentWOsCheckbox.checked = shiftDependentWOs;
+
+        const skipWeekendsCheckbox = document.getElementById('skipWeekendsToggle');
+        if (skipWeekendsCheckbox) skipWeekendsCheckbox.checked = skipWeekends;
+
+        debugLog('success', `Settings loaded from ${settings.savedAt || 'unknown date'}`);
+
+        // Update KPIs after settings are loaded (especially capacity limits)
+        updateKPIs();
+
+        return true;
+    } catch (error) {
+        debugLog('error', 'Error applying settings:', error);
+        return false;
+    }
+}
+
+// ============================================
+// v1.1 SETTINGS SAVE / LOAD
+// ----
+// Both functions keep their original names so the ~10 call sites
+// scattered through the report (auto-save on toggle change, on zoom,
+// on collapse, etc.) don't need to be touched.
+//
+// The transport is now FBLib.Settings — which under the hood uses
+// Fishbowl's `saveSettings(key, value)` / `loadSettings(key)` bridge
+// (per-user JSON payload in userproperties). This retires the
+// ImportPart-of-a-fake-part flow that was fragile under required
+// Part custom fields.
+// ============================================
+function saveSettingsToDatabase() {
+    try {
+        const s = gatherSettings();
+        // Persist every recognised setting individually via
+        // setUserKey — that keeps the JSON payload flat and lets
+        // FBLib.Settings.resolve(k) return the right value on the
+        // next load. `savedAt` is written last so we can surface it
+        // in the toast for confirmation.
+        ['allowSameDayStarts','shiftDependentWOs','skipWeekends',
+         'showArrows','showCompletedWOs','calendarColorMode',
+         'viewByMode','calendarExpanded','ganttScale',
+         'collapsedMOs','categoryLimits'].forEach(function (k) {
+            if (s[k] !== undefined) FBLib.Settings.setUserKey(k, s[k]);
+        });
+        FBLib.Settings.setUserKey('savedAt', s.savedAt);
+        const ok = FBLib.Settings.saveUser();
+        if (!ok) {
+            debugLog('warn', 'saveSettings blocked (admin lock or bridge missing)');
+            showToast('Settings not saved — locked or bridge unavailable', 'error');
+            return false;
+        }
+        const saveTimestamp = new Date().toLocaleString();
+        debugLog('success', `✅ Settings saved at ${saveTimestamp}`);
+        showToast(`Settings saved at ${saveTimestamp}`, 'success', 3000);
+        return true;
+    } catch (error) {
+        debugLog('error', 'Error saving settings:', error);
+        showToast('Error saving settings: ' + (error && error.message), 'error');
+        return false;
+    }
+}
+
+function loadSettingsFromDatabase() {
+    // Primary source is the FBLib.Settings user payload (populated
+    // either from a prior saveUser() OR the one-shot legacy
+    // migration in initSettings()). Reconstruct a settings object
+    // in the same shape gatherSettings() emits, then hand it to
+    // applySettings() so we reuse the existing UI-sync path.
+    try {
+        const eff = FBLib.Settings.effective ? FBLib.Settings.effective()
+                                             : FBLib.Settings.getUser();
+        if (!eff || Object.keys(eff).length === 0) {
+            debugLog('info', 'No saved settings for this user');
+            return false;
+        }
+        const settings = {
+            version: '1.1',
+            categoryLimits:     eff.categoryLimits     || {},
+            ganttScale:         eff.ganttScale,
+            showArrows:         eff.showArrows,
+            allowSameDayStarts: eff.allowSameDayStarts,
+            shiftDependentWOs:  eff.shiftDependentWOs,
+            skipWeekends:       eff.skipWeekends,
+            calendarColorMode:  eff.calendarColorMode,
+            viewByMode:         eff.viewByMode,
+            showCompletedWOs:   eff.showCompletedWOs,
+            calendarExpanded:   eff.calendarExpanded,
+            collapsedMOs:       eff.collapsedMOs || [],
+            savedAt:            eff.savedAt || 'userproperties'
+        };
+        debugLog('success', `✅ Settings loaded from userproperties (saved at ${settings.savedAt})`);
+        return applySettings(settings);
+    } catch (error) {
+        debugLog('warn', 'Could not load settings from userproperties:', error);
+        return false;
+    }
+}
+
+// Legacy read-only bridge — used ONCE by initSettings() to migrate
+// pre-v1.1 users. Never called on the save path.
+function loadLegacyFakePartSettings() {
+    try {
+        if (typeof runQuery !== 'function') return null;
+        const selectQuery =
+            "SELECT details FROM part WHERE num = '_settingsCapacityPlanner' LIMIT 1";
+        const result = JSON.parse(runQuery(selectQuery));
+        if (!result || !result.length || !result[0].details) return null;
+        const settingsJson = atob(result[0].details);
+        return JSON.parse(settingsJson);
+    } catch (_) {
+        return null;
+    }
+}
+
+// Reset button in the settings drawer — restores the in-memory
+// globals to their defaults and clears the userproperties payload.
+function resetSettingsToDefaults() {
+    if (!confirm('Reset your personal settings to defaults?')) return;
+    try { FBLib.Settings.clearUser(); } catch (_) {}
+    allowSameDayStarts = false;
+    shiftDependentWOs  = false;
+    skipWeekends       = false;
+    showArrows         = true;
+    showCompletedWOs   = true;
+    calendarColorMode  = 'status';
+    viewByMode         = 'wo_num';
+    calendarExpanded   = false;
+    ganttScale         = 80;
+    collapsedMOs       = new Set();
+    // Sync UI checkboxes
+    const sync = (id, val) => { const el = document.getElementById(id); if (el) el.checked = !!val; };
+    sync('sameDayStartsToggle',     allowSameDayStarts);
+    sync('shiftDependentWOsToggle', shiftDependentWOs);
+    sync('skipWeekendsToggle',      skipWeekends);
+    sync('showArrowsToggle',        showArrows);
+    sync('showCompletedWOsToggle',  showCompletedWOs);
+    const dvSel = document.getElementById('defaultViewSelect'); if (dvSel) dvSel.value = 'last';
+    // Re-render so the reset propagates through the visible views
+    if (typeof renderCurrentView === 'function') renderCurrentView();
+    showToast('Settings reset to defaults', 'success');
+}
+window.resetSettingsToDefaults = resetSettingsToDefaults;
+
+// ============================================
+// ADMIN CONTROLS (mirrors Core_Dashboard_Template pattern)
+// ----
+// publishDefaults — write the current settings as the org-wide
+//   master payload via FBLib.Settings.publishMaster(). This becomes
+//   the default for any user who hasn't set their own values.
+//   Only fires when the caller is admin.
+// toggleUserEditing — write MASTER._userEditingAllowed=false so
+//   non-admins see the drawer read-only. FBLib.Settings.saveUser()
+//   silently no-ops for non-admins once this is set, and the
+//   #dsLockBadge appears at the top of the drawer.
+// refreshAdminUi — show/hide #dsAdminSection + #dsLockBadge based
+//   on isAdmin() and userEditingAllowed(). Called after init and
+//   after any lock toggle.
+// ============================================
+function publishDefaults() {
+    if (!FBLib.Settings.isAdmin()) return;
+    if (!confirm('Publish current settings as the default for all users?')) return;
+    try {
+        // Publish the schedule/display settings + capacity limits.
+        // Per-user positional state (ganttScale, calendarExpanded,
+        // collapsedMOs) is intentionally NOT published — those are
+        // personal view state, not org policy.
+        FBLib.Settings.publishMaster({
+            allowSameDayStarts: allowSameDayStarts,
+            shiftDependentWOs:  shiftDependentWOs,
+            skipWeekends:       skipWeekends,
+            showArrows:         showArrows,
+            showCompletedWOs:   showCompletedWOs,
+            calendarColorMode:  calendarColorMode,
+            viewByMode:         viewByMode,
+            categoryLimits:     gatherSettings().categoryLimits,
+            // Preserve the admin-only Finish WO settings — publishMaster REPLACES
+            // the whole master payload, so carry the current values through.
+            enableFinishWO:     !!FBLib.Settings.resolve('enableFinishWO'),
+            finishWOGroupId:    FBLib.Settings.resolve('finishWOGroupId') || '',
+            // Likewise carry the org roster/capacity model (owned by the
+            // Rostering tab) so publishing display defaults never wipes it.
+            rosterConfig:       FBLib.Settings.resolve('rosterConfig')
+        });
+        debugLog('success', 'Defaults published for all users');
+        showToast('Defaults published for all users', 'success');
+    } catch (e) {
+        debugLog('error', 'publishDefaults: ' + e.message);
+        showToast('Publish failed: ' + e.message, 'error');
+    }
+}
+window.publishDefaults = publishDefaults;
+
+function toggleUserEditing() {
+    if (!FBLib.Settings.isAdmin()) return;
+    try {
+        var allowed = FBLib.Settings.userEditingAllowed();
+        FBLib.Settings.setLock(allowed);   // setLock(true) = lock; setLock(false) = unlock
+        refreshAdminUi();
+        showToast(allowed ? 'User editing locked' : 'User editing unlocked', 'info');
+    } catch (e) {
+        debugLog('error', 'toggleUserEditing: ' + e.message);
+    }
+}
+window.toggleUserEditing = toggleUserEditing;
+
+// Admin-only: enable/disable the drawer "Finish WO" button org-wide. The flag
+// lives in the master (report-data) payload so every user can read it via
+// resolve('enableFinishWO') but only an admin can change it. publishMaster
+// REPLACES the master object, so we merge onto the current master to keep the
+// other published settings (categoryLimits, display toggles, lock state) intact.
+function setFinishWOEnabled(on) {
+    if (!FBLib.Settings.isAdmin()) { showToast('Only an admin can change this', 'error'); return; }
+    try {
+        const master = Object.assign({}, FBLib.Settings.getMaster());
+        master.enableFinishWO = !!on;
+        const ok = FBLib.Settings.publishMaster(master);
+        if (!ok) { showToast('Could not save — admin only', 'error'); return; }
+        debugLog('success', 'Finish WO button ' + (on ? 'enabled' : 'disabled') + ' for all users');
+        showToast(on ? 'Finish WO button enabled for all users' : 'Finish WO button disabled', 'success');
+        // Refresh an open drawer so the button appears/disappears immediately.
+        if (_avDetailWoId != null && document.getElementById('detailPanel').classList.contains('on')) openDetail(_avDetailWoId);
+    } catch (e) {
+        debugLog('error', 'setFinishWOEnabled: ' + (e && e.message));
+        showToast('Failed to update setting: ' + (e && e.message), 'error');
+    }
+}
+window.setFinishWOEnabled = setFinishWOEnabled;
+
+// Load all Fishbowl user groups (for the admin Finish-WO group picker) + the
+// logged-in user's group memberships (for the gate). usergroup(id,name) +
+// usergrouprel(groupId,userId) — see schema-setup.sql. Self-guarded: on any
+// failure the picker is empty and membership is empty (fail-closed — a set
+// group restriction then shows the button to nobody).
+function psLoadUserGroups() {
+    userGroups = [];
+    currentUserGroupIds = new Set();
+    if (typeof runQuery !== 'function') return;
+    try {
+        const rows = JSON.parse(runQuery('SELECT id, name FROM usergroup ORDER BY name'));
+        userGroups = rows.map(r => ({ id: r.id, name: (r.name || '').trim() })).filter(g => g.name);
+        debugLog('success', `Loaded ${userGroups.length} user group(s)`);
+    } catch (e) {
+        debugLog('warn', 'User group load failed: ' + (e && e.message));
+    }
+    try {
+        let uname = '';
+        if (typeof getUser === 'function') { const u = JSON.parse(getUser() || '{}'); uname = (u.userName || '').trim(); }
+        if (uname) {
+            const esc = uname.replace(/'/g, "''");
+            const rows = JSON.parse(runQuery(
+                "SELECT gr.groupid AS group_id FROM usergrouprel gr INNER JOIN sysuser su ON su.id = gr.userid WHERE su.username = '" + esc + "'"));
+            currentUserGroupIds = new Set(rows.map(r => String(r.group_id)));
+            debugLog('info', `Current user is in group(s): [${Array.from(currentUserGroupIds).join(', ') || 'none'}]`);
+        }
+    } catch (e) {
+        debugLog('warn', 'User group membership load failed: ' + (e && e.message));
+    }
+}
+
+// Admin-only: restrict the Finish WO button to a user group (or '' for all users).
+// Stored in the master payload (merge-then-publish so other master settings stay).
+function setFinishWOGroup(groupId) {
+    if (!FBLib.Settings.isAdmin()) { showToast('Only an admin can change this', 'error'); return; }
+    try {
+        const master = Object.assign({}, FBLib.Settings.getMaster());
+        master.finishWOGroupId = groupId ? String(groupId) : '';
+        const ok = FBLib.Settings.publishMaster(master);
+        if (!ok) { showToast('Could not save — admin only', 'error'); return; }
+        const grp = groupId ? (userGroups.find(g => String(g.id) === String(groupId)) || {}).name : 'All users';
+        debugLog('success', 'Finish WO visibility restricted to: ' + (grp || groupId));
+        showToast('Finish WO visible to: ' + (grp || groupId), 'success');
+        if (_avDetailWoId != null && document.getElementById('detailPanel').classList.contains('on')) openDetail(_avDetailWoId);
+    } catch (e) {
+        debugLog('error', 'setFinishWOGroup: ' + (e && e.message));
+        showToast('Failed to update setting: ' + (e && e.message), 'error');
+    }
+}
+window.setFinishWOGroup = setFinishWOGroup;
+
+function refreshAdminUi() {
+    if (!window.FBLib || !FBLib.Settings) return;
+    var isAdmin = FBLib.Settings.isAdmin();
+    var adminSec = document.getElementById('dsAdminSection');
+    if (adminSec) adminSec.style.display = isAdmin ? 'block' : 'none';
+    var allowed = FBLib.Settings.userEditingAllowed();
+    var badge = document.getElementById('dsLockBadge');
+    if (badge) badge.style.display = (!allowed && !isAdmin) ? 'block' : 'none';
+    var lockBtn = document.getElementById('dsLockBtn');
+    if (lockBtn) lockBtn.textContent = allowed ? 'Lock user editing' : 'Unlock user editing';
+    var enFinish = document.getElementById('dsEnableFinishWO');
+    if (enFinish) enFinish.checked = !!FBLib.Settings.resolve('enableFinishWO');
+    var grpSel = document.getElementById('dsFinishWOGroup');
+    if (grpSel) {
+        var curGrp = FBLib.Settings.resolve('finishWOGroupId') || '';
+        grpSel.innerHTML = '<option value="">All users</option>' +
+            userGroups.map(function (g) {
+                return '<option value="' + g.id + '"' + (String(g.id) === String(curGrp) ? ' selected' : '') + '>' + psEsc(g.name) + '</option>';
+            }).join('');
+    }
+}
+window.refreshAdminUi = refreshAdminUi;
+
+// ============================================
+// EVENT LISTENERS INITIALIZATION
+// ============================================
+function initializeEventListeners() {
+    debugLog('info', 'Initializing event listeners...');
+
+    // Close context menus when clicking outside
+    document.addEventListener('click', (e) => {
+        if (!e.target.closest('.gantt-context-menu')) {
+            hideAllContextMenus();
+        }
+    });
+
+    // Close an open Category/Priority filter dropdown when clicking outside it.
+    // (The trigger button + panel controls stopPropagation, so this only fires
+    // for genuine outside clicks.)
+    document.addEventListener('click', (e) => {
+        if (psOpenDropdown && !e.target.closest('.fdrop')) { psOpenDropdown = null; psSyncDropdowns(); }
+    });
+
+    // Close context menus on Escape key
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') hideAllContextMenus();
+    });
+
+    // FILTERS
+    const searchInput = document.getElementById('searchInput');
+    if (searchInput) {
+        searchInput.addEventListener('input', (e) => {
+            psSearch = e.target.value || '';
+            applyActiveFilters();
+            updateKPIs();
+            renderCurrentView();  // re-renders the active view with the filtered set
+        });
+        debugLog('info', '✓ searchInput event listener attached');
+    }
+
+    // SETTINGS
+    const sameDayStartsToggle = document.getElementById('sameDayStartsToggle');
+    if (sameDayStartsToggle) {
+        sameDayStartsToggle.addEventListener('change', (e) => {
+            allowSameDayStarts = e.target.checked;
+            saveSettingsToDatabase();  // Auto-save when toggled
+        });
+        debugLog('info', '✓ sameDayStartsToggle event listener attached');
+    }
+
+    const shiftDependentWOsToggle = document.getElementById('shiftDependentWOsToggle');
+    if (shiftDependentWOsToggle) {
+        shiftDependentWOsToggle.addEventListener('change', (e) => {
+            shiftDependentWOs = e.target.checked;
+            saveSettingsToDatabase();  // Auto-save when toggled
+        });
+        debugLog('info', '✓ shiftDependentWOsToggle event listener attached');
+    }
+
+    const skipWeekendsToggle = document.getElementById('skipWeekendsToggle');
+    if (skipWeekendsToggle) {
+        skipWeekendsToggle.addEventListener('change', (e) => {
+            skipWeekends = e.target.checked;
+            saveSettingsToDatabase();  // Auto-save when toggled
+        });
+        debugLog('info', '✓ skipWeekendsToggle event listener attached');
+    }
+
+    // Status filter multi-select dropdown
+    const statusFilterButton = document.getElementById('statusFilterButton');
+    const statusFilterDropdown = document.getElementById('statusFilterDropdown');
+    const statusFilterLabel = document.getElementById('statusFilterLabel');
+    const statusFilterCheckboxes = document.querySelectorAll('.status-filter-checkbox');
+
+    if (statusFilterButton && statusFilterDropdown) {
+        // Toggle dropdown
+        statusFilterButton.addEventListener('click', (e) => {
+            e.stopPropagation();
+            statusFilterDropdown.classList.toggle('hidden');
+        });
+
+        // Close dropdown when clicking outside
+        document.addEventListener('click', (e) => {
+            if (!statusFilterDropdown.contains(e.target) && !statusFilterButton.contains(e.target)) {
+                statusFilterDropdown.classList.add('hidden');
+            }
+        });
+
+        // Handle checkbox changes
+        statusFilterCheckboxes.forEach(checkbox => {
+            checkbox.addEventListener('change', () => {
+                const value = checkbox.value;
+                if (checkbox.checked) {
+                    activeStatusFilters.add(value);
+                } else {
+                    activeStatusFilters.delete(value);
+                }
+
+                // Update label
+                const checkedCount = document.querySelectorAll('.status-filter-checkbox:checked').length;
+                if (checkedCount === 4) {
+                    statusFilterLabel.textContent = 'All Status';
+                } else if (checkedCount === 0) {
+                    statusFilterLabel.textContent = 'None';
+                } else {
+                    statusFilterLabel.textContent = `${checkedCount} Selected`;
+                }
+
+                debugLog('info', `Status filters: ${Array.from(activeStatusFilters).join(', ')}`);
+                renderGanttChart();
+            });
+        });
+
+        debugLog('info', '✓ statusFilter multi-select event listeners attached');
+    }
+
+    const showArrowsToggle = document.getElementById('showArrowsToggle');
+    if (showArrowsToggle) {
+        showArrowsToggle.addEventListener('change', (e) => {
+            showArrows = e.target.checked;
+            renderGanttChart();
+            saveSettingsToDatabase();  // Auto-save when toggled
+        });
+        debugLog('info', '✓ showArrowsToggle event listener attached');
+    } else {
+        debugLog('warn', '✗ showArrowsToggle element not found');
+    }
+
+    const showCompletedWOsToggle = document.getElementById('showCompletedWOsToggle');
+    if (showCompletedWOsToggle) {
+        showCompletedWOsToggle.addEventListener('change', (e) => {
+            showCompletedWOs = e.target.checked;
+            renderCurrentView();  // Re-render capacity planning and calendar
+            saveSettingsToDatabase();  // Auto-save when toggled
+        });
+        debugLog('info', '✓ showCompletedWOsToggle event listener attached');
+    } else {
+        debugLog('warn', '✗ showCompletedWOsToggle element not found');
+    }
+
+    // Re-fit the User Load heatmap to the panel width on resize (debounced).
+    // renderLoad() reads the live clientWidth, so a re-render after the window
+    // settles recomputes how many day columns fit.
+    let _loadResizeTimer = null;
+    window.addEventListener('resize', () => {
+        if (psView !== 'load') return;
+        clearTimeout(_loadResizeTimer);
+        _loadResizeTimer = setTimeout(() => { if (psView === 'load') renderLoad(); }, 180);
+    });
+
+    debugLog('success', 'Event listeners initialization complete');
+}
+
+// ============================================
+// CAPACITY PLANNING
+// ============================================
+
+function initializeCapacitySettings() {
+    // Extract unique categories from work orders
+    const uniqueCategories = new Map();
+
+    filteredWorkOrders.forEach(wo => {
+        if (wo.calcategory_id && !uniqueCategories.has(wo.calcategory_id)) {
+            uniqueCategories.set(wo.calcategory_id, {
+                id: wo.calcategory_id,
+                name: wo.calendar_category || 'Uncategorized',
+                color: '#' + (wo.category_color || 'CCCCCC'),
+                limits: [8, 8, 8, 8, 8, 0, 0] // Default: 8hrs Mon-Fri, 0hrs weekends
+            });
+        }
+    });
+
+    // Add uncategorized if needed
+    if (!uniqueCategories.has(0)) {
+        uniqueCategories.set(0, {
+            id: 0,
+            name: 'Uncategorized',
+            color: '#CCCCCC',
+            limits: [8, 8, 8, 8, 8, 0, 0]
+        });
+    }
+
+    capacitySettings.categories = Array.from(uniqueCategories.values());
+    debugLog('info', `Initialized ${capacitySettings.categories.length} categories for capacity planning`);
+}
+
+function getCapacity(categoryId, dayOfWeek) {
+    const cat = capacitySettings.categories.find(c => c.id === categoryId);
+    return cat ? cat.limits[dayOfWeek] : 0;
+}
+
+function setCapacity(categoryId, dayOfWeek, hours) {
+    const cat = capacitySettings.categories.find(c => c.id === categoryId);
+    if (cat) {
+        cat.limits[dayOfWeek] = hours;
+    }
+}
+
+function buildCapacityTable(weekStart) {
+    const table = document.getElementById('capacityTable');
+    if (!table) return;
+
+    table.innerHTML = '';
+
+    // Ensure weekStart is always a Monday
+    if (weekStart.isoWeekday() !== 1) {
+        weekStart = weekStart.clone().isoWeekday(1);
+        currentCapacityWeek = weekStart;
+    }
+
+    // Show 1 week (7 days) - aligns with monthly calendar above
+    const numWeeks = 1;
+    const numDays = 7;
+    const viewEnd = weekStart.clone().add(numDays, 'days');
+
+    // Update week display to show full date range
+    const weekDisplay = document.getElementById('capacityWeekDisplay');
+    if (weekDisplay) {
+        weekDisplay.textContent = `${weekStart.format('MMM D')} - ${viewEnd.clone().subtract(1, 'day').format('MMM D, YYYY')}`;
+    }
+
+    // Build header
+    const thead = document.createElement('thead');
+    const headerRow = document.createElement('tr');
+    headerRow.innerHTML = `<th class="sticky left-0 bg-slate-100 z-10 px-2 py-2 text-center text-sm font-bold text-slate-700 border-b-2 border-r-2 border-slate-300 w-20">
+        <svg class="w-5 h-5 mx-auto text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"></path>
+        </svg>
+    </th>`;
+
+    const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    for (let day = 0; day < numDays; day++) {
+        const currentDay = weekStart.clone().add(day, 'days');
+        const dayOfWeek = day % 7;
+        const isWeekend = dayOfWeek >= 5;
+        const isToday = currentDay.isSame(moment(), 'day');
+        const isWeekStart = dayOfWeek === 0;
+
+        headerRow.innerHTML += `
+            <th class="px-3 py-3 text-center text-xs font-bold ${isWeekend ? 'bg-amber-100' : 'bg-slate-100'} ${isToday ? 'bg-indigo-100 border-l-2 border-r-2 border-indigo-500' : 'border-l border-slate-300'} border-b-2 border-slate-400 min-w-[120px]">
+                <div${isToday ? ' class="text-indigo-700 font-extrabold"' : ''}>${dayNames[dayOfWeek]}</div>
+                <div class="text-slate-500 font-normal">${currentDay.format('D MMM')}</div>
+            </th>
+        `;
+    }
+    thead.appendChild(headerRow);
+    table.appendChild(thead);
+
+    // Build body with categories (sorted alphabetically by name)
+    const tbody = document.createElement('tbody');
+
+    const sortedCategories = [...capacitySettings.categories].sort((a, b) =>
+        a.name.localeCompare(b.name)
+    );
+
+    sortedCategories.forEach(category => {
+        // Category name row
+        const row = document.createElement('tr');
+        row.className = 'border-b-2 border-slate-300 group';
+
+        // Category name cell spanning both WO row and stats row
+        const categoryCell = document.createElement('td');
+        categoryCell.rowSpan = 2; // Span both the WO tile row and stats row
+        categoryCell.className = 'sticky left-0 bg-white z-10 px-2 py-2 border-r-2 border-slate-300 w-20';
+        categoryCell.style.writingMode = 'vertical-rl';
+        categoryCell.style.textOrientation = 'mixed';
+
+        // Truncate long category names and add title attribute for full text
+        const maxLength = 30;
+        const displayName = category.name.length > maxLength ? category.name.substring(0, maxLength) + '...' : category.name;
+
+        categoryCell.innerHTML = `
+            <div class="flex flex-col items-center justify-center h-full gap-2">
+                <span class="text-sm font-semibold text-slate-700" title="${category.name}" style="hyphens: auto; word-wrap: break-word;">${displayName}</span>
+                <div class="w-3 h-3 rounded-full flex-shrink-0" style="background-color: ${category.color}"></div>
+            </div>
+        `;
+
+        row.appendChild(categoryCell);
+
+        // SVG cell spanning all days for WO bars
+        const svgCell = document.createElement('td');
+        svgCell.colSpan = numDays;
+        svgCell.className = 'p-0 relative border-b border-slate-300';
+
+        // Get all WOs for this category in this view
+        const categoryWOs = getWOsForCategory(category.id, weekStart, numWeeks);
+
+        // Create SVG container for WO bars
+        const svgId = `capacity-svg-${category.id}`;
+        const svgHeight = categoryWOs.lanes > 0 ? categoryWOs.lanes * 40 + 10 : 50;
+        svgCell.innerHTML = `<svg id="${svgId}" width="100%" height="${svgHeight}"></svg>`;
+
+        row.appendChild(svgCell);
+        tbody.appendChild(row);
+
+        // Create separate row for stat cells
+        const statsRow = document.createElement('tr');
+        statsRow.className = 'border-b-2 border-slate-300';
+
+        // No category cell needed here - it spans from the row above
+
+        // Individual stat cells to match header structure
+        for (let day = 0; day < numDays; day++) {
+            const dayOfWeek = day % 7;
+            const capacity = category.limits[dayOfWeek];
+            const isWeekend = dayOfWeek >= 5;
+            const currentDay = weekStart.clone().add(day, 'days');
+            const isToday = currentDay.isSame(moment(), 'day');
+            const { usage } = getUsageForCategoryAndDay(category.id, currentDay);
+            const percentage = capacity > 0 ? (usage / capacity) * 100 : 0;
+            const isOverCapacity = usage > capacity;
+
+            const statCell = document.createElement('td');
+            // Match header border styling exactly
+            statCell.className = `px-3 py-2 text-center border-t-2 border-slate-400 ${isWeekend ? 'bg-amber-100' : 'bg-slate-50'} ${isToday ? 'bg-indigo-100 border-l-2 border-r-2 border-indigo-500' : 'border-l border-slate-300'} ${isOverCapacity ? 'ring-2 ring-inset ring-red-600' : ''}`;
+            statCell.innerHTML = `
+                <div class="text-xs font-semibold ${isOverCapacity ? 'text-red-600' : 'text-slate-600'}">${usage.toFixed(2)}h / ${capacity}h</div>
+                <div class="w-full bg-slate-200 rounded-full h-1.5 mt-1">
+                    <div class="h-1.5 rounded-full ${isOverCapacity ? 'bg-red-500' : 'bg-green-500'}" style="width: ${Math.min(percentage, 100)}%"></div>
+                </div>
+            `;
+            statsRow.appendChild(statCell);
+        }
+        tbody.appendChild(statsRow);
+    });
+
+    table.appendChild(tbody);
+
+    // Render WO bars after browser finishes laying out the table
+    // Use requestAnimationFrame to ensure table layout is complete
+    requestAnimationFrame(() => {
+        const sortedCategories = [...capacitySettings.categories].sort((a, b) =>
+            a.name.localeCompare(b.name)
+        );
+        sortedCategories.forEach(category => {
+            renderCapacityWOs(category, weekStart, numWeeks);
+        });
+        debugLog('info', `Capacity table built for week ${weekStart.format('MMM D, YYYY')}`);
+    });
+}
+
+function getWOsForCategory(categoryId, weekStart, numWeeks = 1) {
+    const viewEnd = weekStart.clone().add(numWeeks * 7, 'days');
+    const wos = [];
+
+    filteredWorkOrders.forEach(wo => {
+        // Filter out completed WOs if setting is disabled
+        if (!showCompletedWOs && wo.wo_status === 40) return;
+
+        // Match category
+        if (wo.calcategory_id !== categoryId) return;
+
+        const woStart = moment(wo.date_scheduled_start);
+        const woEnd = moment(wo.date_scheduled);
+
+        // Check if WO overlaps with this view
+        if (woStart.isBefore(viewEnd) && woEnd.isAfter(weekStart)) {
+            wos.push(wo);
+        }
+    });
+
+    // Pack WOs into lanes
+    const lanes = packWOsIntoLanes(wos);
+
+    return { wos, lanes };
+}
+
+function getUsageForCategoryAndDay(categoryId, currentDay) {
+    const checkDay = currentDay.clone().startOf('day');
+
+    let usage = 0;
+    let matchedWOs = 0;
+    let wosWithNoLabor = 0;
+
+    filteredWorkOrders.forEach(wo => {
+        // Filter out completed WOs if setting is disabled
+        if (!showCompletedWOs && wo.wo_status === 40) return;
+
+        // Match category
+        if (wo.calcategory_id !== categoryId) return;
+
+        // Use startOf('day') for both dates to match tile rendering logic
+        const woStart = moment(wo.date_scheduled_start).startOf('day');
+        let woEnd = moment(wo.date_scheduled).startOf('day');
+
+        // For completed WOs, use date_finished if available and earlier than date_scheduled
+        // This prevents completed WOs from inflating capacity in future days
+        if (wo.wo_status === 40 && wo.date_finished) {
+            const dateFinished = moment(wo.date_finished).startOf('day');
+            // Use the earlier of date_finished or date_scheduled
+            woEnd = moment.min(woEnd, dateFinished);
+        }
+
+        // Check if this day falls within the WO date range (inclusive)
+        if (checkDay.isSameOrAfter(woStart) && checkDay.isSameOrBefore(woEnd)) {
+            // If skip weekends is enabled and this is a weekend day, skip it
+            if (skipWeekends) {
+                const dayOfWeek = checkDay.day();
+                if (dayOfWeek === 0 || dayOfWeek === 6) {
+                    // Weekend day - don't count any hours
+                    return;
+                }
+            }
+
+            // Calculate hours for this day
+            const laborHoursPerUnit = parseFloat(wo.labor_hours_from_bom) || 0;
+            const qtyTarget = parseFloat(wo.qty_target) || 1;
+            const totalHours = laborHoursPerUnit * qtyTarget;
+
+            // Calculate days to divide hours across
+            let daysInWO;
+            if (skipWeekends) {
+                // Count only weekdays
+                daysInWO = countWeekdaysInRange(woStart, woEnd);
+            } else {
+                // Count all days (inclusive)
+                daysInWO = woEnd.diff(woStart, 'days') + 1;
+            }
+
+            const hoursPerDay = daysInWO > 0 ? totalHours / daysInWO : 0;
+
+            if (totalHours > 0) {
+                matchedWOs++;
+                const dayType = skipWeekends ? 'weekdays' : 'days';
+                debugLog('debug', `  WO ${wo.wo_num}: ${totalHours}hrs / ${daysInWO}${dayType} = ${hoursPerDay.toFixed(2)}hrs/day (${woStart.format('YYYY-MM-DD')} to ${woEnd.format('YYYY-MM-DD')})`);
+            } else {
+                wosWithNoLabor++;
+                debugLog('warn', `  WO ${wo.wo_num} has NO labor hours (labor_hours_from_bom = ${wo.labor_hours_from_bom})`);
+            }
+
+            usage += hoursPerDay;
+        }
+    });
+
+    if (matchedWOs > 0) {
+        debugLog('debug', `  Total: ${matchedWOs} WOs matched for category ${categoryId} on ${checkDay.format('YYYY-MM-DD')}`);
+    }
+
+    if (wosWithNoLabor > 0) {
+        debugLog('warn', `  ⚠️ ${wosWithNoLabor} WO(s) have no labor hours and contribute 0 to capacity!`);
+    }
+
+    return { usage };
+}
+
+// v1.2: per-USER daily labour usage — mirrors getUsageForCategoryAndDay
+// but attributes hours to the WO's assigned user (wo.user_id; 0 =
+// Unassigned). Used by the User Load heatmap.
+function getUsageForUserAndDay(userId, currentDay) {
+    const checkDay = currentDay.clone().startOf('day');
+    let usage = 0;
+    filteredWorkOrders.forEach(wo => {
+        if (!showCompletedWOs && wo.wo_status === 40) return;
+        // A WO counts toward EVERY assigned user's load (co-assignees are both
+        // committed to it). Unassigned WOs (id 0) count only under Unassigned.
+        const ids = wo._userIds || [String(wo.user_id || 0)];
+        if (!ids.includes(String(userId))) return;
+        const woStart = moment(wo.date_scheduled_start).startOf('day');
+        let woEnd = moment(wo.date_scheduled).startOf('day');
+        if (wo.wo_status === 40 && wo.date_finished) {
+            woEnd = moment.min(woEnd, moment(wo.date_finished).startOf('day'));
+        }
+        if (checkDay.isSameOrAfter(woStart) && checkDay.isSameOrBefore(woEnd)) {
+            if (skipWeekends && (checkDay.day() === 0 || checkDay.day() === 6)) return;
+            const totalHours = (parseFloat(wo.labor_hours_from_bom) || 0) * (parseFloat(wo.qty_target) || 1);
+            const daysInWO = skipWeekends ? countWeekdaysInRange(woStart, woEnd) : (woEnd.diff(woStart, 'days') + 1);
+            usage += daysInWO > 0 ? totalHours / daysInWO : 0;
+        }
+    });
+    return { usage };
+}
+
+// v1.2: read-only User Load heatmap (rows = users, cols = a width-fitted window
+// starting on the current week's Monday). Cell = scheduled labour hours ÷
+// per-user daily capacity. The Category dimension keeps the richer interactive
+// capacity view; this is the "User" side of the Load toggle.
+// Load-page navigation — currentCapacityWeek is the leftmost (Monday) column;
+// the window shows as many days as fit the page width (see renderLoad). Nav
+// shifts that anchor by ±1 week / ±1 month, always snapping to a Monday.
+function psLoadShift(n, unit){ currentCapacityWeek=(currentCapacityWeek||moment().startOf('isoWeek')).clone().add(n, unit).startOf('isoWeek'); renderLoad(); }
+function psLoadToday(){ currentCapacityWeek=moment().startOf('isoWeek'); renderLoad(); }
+
+// v1.2: unified capacity heatmap — Category OR User dimension (vA style).
+// ── ROSTER CAPACITY MODEL (rosterConfig) ───────────────────────────────────
+// Single source for per-user daily capacity + company closures. Feeds the User
+// Load heatmap AND the Planning tab's capacity-aware suggestions. rosterConfig
+// is admin-published to master (see renderRoster); resolve() returns the
+// company default for everyone when unset. workDays is Mon..Sun (isoWeekday 1..7).
+function rosterCfg(){
+    const c = FBLib.Settings.resolve('rosterConfig') || {};
+    const biz = c.business || {};
+    return {
+        business: {
+            start: biz.start || '08:00', end: biz.end || '16:30',
+            hoursPerDay: (biz.hoursPerDay != null ? Number(biz.hoursPerDay) : 8),
+            workDays: (Array.isArray(biz.workDays) && biz.workDays.length === 7) ? biz.workDays : [1,1,1,1,1,0,0]
+        },
+        holidays: Array.isArray(c.holidays) ? c.holidays : [],
+        users: c.users || {}
+    };
+}
+// Does one holiday/closure entry cover a given day? Handles single dates and
+// ranges, and annually-recurring entries (matched on MM-DD, incl. year-wrap
+// ranges such as 12-27 → 01-02).
+function psHolidayMatches(h, dayM){
+    if (!h) return false;
+    const ds = dayM.format('YYYY-MM-DD'), md = dayM.format('MM-DD');
+    if (h.start && h.end) {
+        if (h.recur) { const s = h.start.slice(5), e = h.end.slice(5); return s <= e ? (md >= s && md <= e) : (md >= s || md <= e); }
+        return ds >= h.start && ds <= h.end;
+    }
+    if (h.recur) return !!h.date && h.date.slice(5) === md;
+    return h.date === ds;
+}
+// True if the day falls on any company holiday date or closure range.
+function rosterIsClosed(dayM){
+    return rosterCfg().holidays.some(h => psHolidayMatches(h, dayM));
+}
+// Per-user hours available on a day: 0 on a closure or a non-work day, else the
+// user's per-day override hours (or a legacy scalar override, or the business
+// default). Per-user overrides: users[id] = { workDays?[7], hours?[7] }; a null
+// hours[i] inherits the business default.
+function rosterUserCap(userId, dayM){
+    if (rosterIsClosed(dayM)) return 0;
+    const cfg = rosterCfg();
+    const u = cfg.users[String(userId)] || {};
+    const i = dayM.isoWeekday() - 1;
+    const wd = (Array.isArray(u.workDays) && u.workDays.length === 7) ? u.workDays : cfg.business.workDays;
+    if (!wd[i]) return 0;
+    let h;
+    if (Array.isArray(u.hours) && u.hours[i] != null && u.hours[i] !== '') h = Number(u.hours[i]);
+    else if (u.hoursPerDay != null) h = Number(u.hoursPerDay);   // legacy scalar override
+    else h = cfg.business.hoursPerDay;
+    return h || 0;
+}
+// Category (work-centre) daily cap = existing per-weekday limits, forced to 0
+// on a company closure so holidays zero BOTH dimensions.
+function rosterCategoryCap(limits, dayM){
+    if (rosterIsClosed(dayM)) return 0;
+    return (limits && limits[dayM.isoWeekday() - 1]) || 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PLANNING TAB  (premium — PS_TABS_ENABLED.planning)
+// What-if reschedule engine: for each open WO, suggest the earliest date that is
+// both MATERIAL-ready (from the availability engine's wo._av._buildable, incl.
+// incoming PO/WO ETAs + producer-WO cascade) AND has labour CAPACITY free —
+// checking every assigned user AND the WO's calendar category against the roster
+// caps (rosterUserCap / rosterCategoryCap), using the tighter of the two.
+// "Push, but allow override": the suggestion defaults to the capacity-pushed
+// date; the user may pull it back to material-ready, keeping an ⚠ overload flag.
+// Nothing is written until Apply, which calls the same Get/Save WO path the rest
+// of the report uses. SELF-CONTAINED: flip PS_TABS_ENABLED.planning (and remove
+// the PS_VIEWS 'planning' entry) to strip; this whole block can then be deleted.
+// ═══════════════════════════════════════════════════════════════════════════
+let psPlan = {};                      // wo_id -> { start, finish, reason, over, manual }
+const PS_PLAN_HORIZON = 180;          // max days to push a start looking for capacity
+
+function psPlanBaseStart(wo)  { return moment(wo.date_scheduled_start).startOf('day'); }
+function psPlanBaseFinish(wo) { return moment(wo.date_scheduled).startOf('day'); }
+function psPlanEffStart(wo)   { const p = psPlan[wo.wo_id]; return p ? moment(p.start).startOf('day')  : psPlanBaseStart(wo); }
+function psPlanEffFinish(wo)  { const p = psPlan[wo.wo_id]; return p ? moment(p.finish).startOf('day') : psPlanBaseFinish(wo); }
+
+// A day that carries labour load — mirrors the heatmap's spread (weekends only
+// excluded when skipWeekends is on) and additionally drops company closures.
+function psPlanCountable(dayM) {
+    if (rosterIsClosed(dayM)) return false;
+    if (skipWeekends && (dayM.day() === 0 || dayM.day() === 6)) return false;
+    return true;
+}
+function psPlanCatLimits(catId) {
+    const c = (capacitySettings.categories || []).find(x => x.id === catId);
+    return c ? c.limits : null;
+}
+function psPlanEligible() {
+    return filteredWorkOrders.filter(w => (showCompletedWOs || w.wo_status !== 40));
+}
+
+// Scenario labour usage keyed by resource+day, over EFFECTIVE (planned or
+// baseline) dates. excludeWoId drops the WO being (re)placed so it is not
+// counted against itself.
+function psPlanBuildUsage(excludeWoId) {
+    const U = new Map(), C = new Map();
+    filteredWorkOrders.forEach(wo => {
+        if (wo.wo_id === excludeWoId) return;
+        if (!showCompletedWOs && wo.wo_status === 40) return;
+        const totalHours = (parseFloat(wo.labor_hours_from_bom) || 0) * (parseFloat(wo.qty_target) || 1);
+        if (totalHours <= 0) return;
+        const s = psPlanEffStart(wo), f = psPlanEffFinish(wo);
+        let cd = 0, d = s.clone();
+        while (d.isSameOrBefore(f, 'day')) { if (psPlanCountable(d)) cd++; d.add(1, 'day'); }
+        cd = Math.max(1, cd);
+        const hpd = totalHours / cd;
+        const cat = wo.calcategory_id || 0;
+        const ids = (wo._userIds || ['0']).filter(id => id && id !== '0');
+        d = s.clone();
+        while (d.isSameOrBefore(f, 'day')) {
+            if (psPlanCountable(d)) {
+                const ymd = d.format('YYYY-MM-DD');
+                C.set(cat + '|' + ymd, (C.get(cat + '|' + ymd) || 0) + hpd);
+                ids.forEach(uid => U.set(uid + '|' + ymd, (U.get(uid + '|' + ymd) || 0) + hpd));
+            }
+            d.add(1, 'day');
+        }
+    });
+    return { U, C };
+}
+
+// Earliest date this WO's material is ready, honouring incoming supply
+// (wo._av._buildable) and any producer WO already moved in this scenario.
+function psPlanMatReady(wo) {
+    const today = moment().startOf('day');
+    let byProducer = false, prodFinish = null;
+    stagingDependencies.forEach(dep => {
+        if (dep.wo_id === wo.wo_id) {
+            const p = psPlan[dep.staging_wo_id];
+            if (p) { const pf = moment(p.finish).startOf('day'); if (!prodFinish || pf.isAfter(prodFinish)) prodFinish = pf; }
+        }
+    });
+    const producerReady = () => { const pr = prodFinish.clone(); if (!allowSameDayStarts) pr.add(1, 'day'); return pr; };
+    if (psAvailReady && wo._av && wo._av._unmet) {
+        if (prodFinish) { byProducer = true; return { date: moment.max(producerReady(), today), blocked: false, byProducer }; }
+        return { date: null, blocked: true, byProducer: false };
+    }
+    const base = (psAvailReady && wo._av && wo._av._buildable) ? moment(wo._av._buildable).startOf('day') : psPlanBaseStart(wo);
+    let r = moment.max(base, today);
+    if (prodFinish) { const pr = producerReady(); if (pr.isAfter(r)) { r = pr; byProducer = true; } }
+    return { date: r, blocked: false, byProducer };
+}
+
+// Does the WO fit within every relevant resource's remaining capacity across its
+// span? Tighter-of user AND category. Unassigned WOs skip the user dimension;
+// uncapped categories (limit 0) skip the category dimension.
+function psPlanCapFits(wo, sM, fM, usage) {
+    const EPS = 1e-6;
+    const totalHours = (parseFloat(wo.labor_hours_from_bom) || 0) * (parseFloat(wo.qty_target) || 1);
+    if (totalHours <= 0) return true;
+    let cd = 0, d = sM.clone();
+    while (d.isSameOrBefore(fM, 'day')) { if (psPlanCountable(d)) cd++; d.add(1, 'day'); }
+    cd = Math.max(1, cd);
+    const hpd = totalHours / cd;
+    const catLimits = psPlanCatLimits(wo.calcategory_id || 0);
+    const ids = (wo._userIds || ['0']).filter(id => id && id !== '0');
+    d = sM.clone();
+    while (d.isSameOrBefore(fM, 'day')) {
+        if (psPlanCountable(d)) {
+            const ymd = d.format('YYYY-MM-DD');
+            const catCap = rosterCategoryCap(catLimits, d);
+            if (catCap > 0) {
+                const used = usage.C.get((wo.calcategory_id || 0) + '|' + ymd) || 0;
+                if (used + hpd > catCap + EPS) return false;
+            }
+            for (const uid of ids) {
+                const uc = rosterUserCap(uid, d);
+                if (uc <= 0) return false;                       // assignee not working that day
+                const used = usage.U.get(uid + '|' + ymd) || 0;
+                if (used + hpd > uc + EPS) return false;
+            }
+        }
+        d.add(1, 'day');
+    }
+    return true;
+}
+
+// Core suggestion: push from material-ready to the first capacity-clear start.
+function psPlanComputeSuggestion(wo, usage) {
+    const baseStart = psPlanBaseStart(wo), baseFinish = psPlanBaseFinish(wo);
+    const span = Math.max(0, baseFinish.diff(baseStart, 'days'));
+    const mr = psPlanMatReady(wo);
+    if (mr.blocked) return { blocked: true, reason: 'Material not available', start: baseStart.format('YYYY-MM-DD'), finish: baseFinish.format('YYYY-MM-DD'), over: false };
+    let s = mr.date.clone();
+    while (!psPlanCountable(s)) s.add(1, 'day');
+    const horizonEnd = mr.date.clone().add(PS_PLAN_HORIZON, 'days');
+    let placed = null;
+    while (s.isSameOrBefore(horizonEnd, 'day')) {
+        const f = s.clone().add(span, 'days');
+        if (psPlanCapFits(wo, s, f, usage)) { placed = { s: s.clone(), f }; break; }
+        s.add(1, 'day'); while (!psPlanCountable(s)) s.add(1, 'day');
+    }
+    let over = false, start, finish, pushedForCap = false;
+    if (placed) { start = placed.s; finish = placed.f; pushedForCap = start.isAfter(mr.date, 'day'); }
+    else { start = mr.date.clone(); while (!psPlanCountable(start)) start.add(1, 'day'); finish = start.clone().add(span, 'days'); over = true; }
+    let reason;
+    if (over)               reason = 'No capacity within ' + PS_PLAN_HORIZON + 'd';
+    else if (pushedForCap)  reason = 'Pushed for capacity';
+    else if (start.isBefore(baseStart, 'day')) reason = 'Pulled to material-ready';
+    else if (start.isAfter(baseStart, 'day'))  reason = 'Moved to material-ready';
+    else                    reason = 'On schedule';
+    if (mr.byProducer) reason += ' · after producer WO';
+    return { blocked: false, start: start.format('YYYY-MM-DD'), finish: finish.format('YYYY-MM-DD'), over, reason };
+}
+
+function psPlanFindWo(woId) {
+    return filteredWorkOrders.find(w => w.wo_id === woId) ||
+           allWorkOrders.find(w => String(w.wo_id) === String(woId));
+}
+function psPlanOne(woId) {
+    const wo = psPlanFindWo(woId); if (!wo) return;
+    const s = psPlanComputeSuggestion(wo, psPlanBuildUsage(woId));
+    if (s.blocked) { showToast('WO ' + wo.wo_num + ': material not available — see Procurement', 'error'); return; }
+    psPlan[wo.wo_id] = { start: s.start, finish: s.finish, reason: s.reason, over: s.over, manual: false };
+    renderPlanning();
+}
+function psPlanAll() {
+    const ordered = sortWOsByDependencies(psPlanEligible());   // producers first, so cascade sees them
+    let n = 0;
+    ordered.forEach(wo => {
+        const s = psPlanComputeSuggestion(wo, psPlanBuildUsage(wo.wo_id));
+        if (s.blocked) return;
+        psPlan[wo.wo_id] = { start: s.start, finish: s.finish, reason: s.reason, over: s.over, manual: false };
+        n++;
+    });
+    renderPlanning();
+    showToast('Planned ' + n + ' work order(s)', 'success');
+}
+function psPlanRevert(woId)  { delete psPlan[woId]; renderPlanning(); }
+function psPlanRevertAll()   { psPlan = {}; renderPlanning(); }
+function psPlanManual(woId, val) {
+    if (!val) return;
+    const wo = psPlanFindWo(woId); if (!wo) return;
+    const span = Math.max(0, psPlanBaseFinish(wo).diff(psPlanBaseStart(wo), 'days'));
+    const s = moment(val).startOf('day'), f = s.clone().add(span, 'days');
+    const over = !psPlanCapFits(wo, s, f, psPlanBuildUsage(woId));
+    psPlan[wo.wo_id] = { start: s.format('YYYY-MM-DD'), finish: f.format('YYYY-MM-DD'), reason: 'Manual override', over, manual: true };
+    renderPlanning();
+}
+function psPlanOpenWO(woId) { const wo = psPlanFindWo(woId); if (wo && typeof openModule === 'function') openModule('Work Order', wo.wo_num); }
+window.psPlanOne = psPlanOne; window.psPlanAll = psPlanAll; window.psPlanRevert = psPlanRevert;
+window.psPlanRevertAll = psPlanRevertAll; window.psPlanManual = psPlanManual; window.psPlanOpenWO = psPlanOpenWO;
+
+// Apply — one Get/Save per changed WO (proven date-preservation logic from
+// saveWODates, but without a reload per call); a single loadWorkOrders() at the end.
+async function psPlanApplyOne(wo, startISO, finishISO) {
+    try {
+        const woResp = JSON.parse(runApiRequest('GetWorkOrderRq', JSON.stringify({ GetWorkOrderRq: { WorkOrderNumber: wo.wo_num } })));
+        const rs = woResp.GetWorkOrderRs;
+        if (!(rs && rs.statusCode === 1000 && rs.WO)) { debugLog('error', 'Plan apply: GetWorkOrder failed for ' + wo.wo_num); return false; }
+        const w = rs.WO;
+        const os = moment(w.DateScheduledToStart), oe = moment(w.DateScheduled);
+        const ns = moment(startISO).hour(os.isValid() ? os.hour() : 6).minute(os.isValid() ? os.minute() : 0).second(0);
+        const ne = moment(finishISO).hour(oe.isValid() ? oe.hour() : 18).minute(oe.isValid() ? oe.minute() : 0).second(0);
+        if (ns.isSameOrAfter(ne)) { ns.hour(6).minute(0).second(0); ne.hour(18).minute(0).second(0); }
+        w.DateScheduledToStart = ns.format('YYYY-MM-DD[T]HH:mm:ss');
+        w.DateScheduled = ne.format('YYYY-MM-DD[T]HH:mm:ss');
+        if (w.WOItems && w.WOItems.WOItem) {
+            const items = Array.isArray(w.WOItems.WOItem) ? w.WOItems.WOItem : [w.WOItems.WOItem];
+            items.forEach(it => { if (it.DateScheduled) { const od = moment(it.DateScheduled); it.DateScheduled = moment(startISO).hour(od.hour()).minute(od.minute()).second(od.second()).format('YYYY-MM-DD[T]HH:mm:ss'); } });
+        }
+        const sr = JSON.parse(runApiRequest('SaveWorkOrderRq', JSON.stringify({ SaveWorkOrderRq: { WO: w } })));
+        if (sr.SaveWorkOrderRs && sr.SaveWorkOrderRs.statusCode === 1000) { debugLog('success', 'Plan applied WO ' + wo.wo_num); return true; }
+        debugLog('error', 'Plan apply: save failed for ' + wo.wo_num + ' (status ' + (sr.SaveWorkOrderRs && sr.SaveWorkOrderRs.statusCode) + ')');
+        return false;
+    } catch (e) { debugLog('error', 'psPlanApplyOne ' + wo.wo_num + ': ' + (e && e.message)); return false; }
+}
+async function psPlanApply() {
+    const changes = Object.keys(psPlan).map(id => {
+        const wo = allWorkOrders.find(w => String(w.wo_id) === String(id)); if (!wo) return null;
+        const p = psPlan[id];
+        if (p.start === psPlanBaseStart(wo).format('YYYY-MM-DD')) return null;   // unchanged
+        return { wo, start: p.start, finish: p.finish };
+    }).filter(Boolean);
+    if (!changes.length) { showToast('No date changes to apply', 'info'); return; }
+    let ok = 0, fail = 0;
+    for (const c of changes) { if (await psPlanApplyOne(c.wo, c.start, c.finish)) ok++; else fail++; }
+    showToast('Applied ' + ok + ' change(s)' + (fail ? ', ' + fail + ' failed' : ''), fail ? 'error' : 'success');
+    psPlan = {};
+    loadWorkOrders();
+}
+window.psPlanApply = psPlanApply;
+
+function renderPlanning() {
+    const host = document.getElementById('planningView'); if (!host) return;
+    if (!psAvailReady) { host.innerHTML = psEmptyState('Computing material availability… reopen Planning in a moment.'); return; }
+    const list = psPlanEligible();
+    if (!list.length) { host.innerHTML = psEmptyState('No work orders in the current filter to plan.'); return; }
+
+    const changeCount = Object.keys(psPlan).filter(id => {
+        const wo = allWorkOrders.find(w => String(w.wo_id) === String(id));
+        return wo && psPlan[id].start !== psPlanBaseStart(wo).format('YYYY-MM-DD');
+    }).length;
+
+    // Same full-bleed FILL layout as the Materials tab: a .pv-fill column with a
+    // fixed .proc-subhead (title + actions) above a .tbl-wrap.tbl-fill table that
+    // scrolls to the viewport bottom with a sticky navy header.
+    const toolbar =
+        '<div class="proc-subhead" style="padding-top:14px">' +
+            '<div>' +
+                '<h2 style="margin:0;font-size:17px;font-weight:800;color:var(--c-primary)">Planning</h2>' +
+                '<span class="proc-subtitle" style="display:block;margin:2px 0 0">Suggested reschedule to earliest material-ready + capacity-clear date (user &amp; category — the tighter wins; co-assignees each carry the full hours). Edit a suggested date to override — ⚠ marks a date that exceeds capacity. Nothing is saved until you Apply.</span>' +
+            '</div>' +
+            '<span style="flex:1"></span>' +
+            '<button class="ps-btn sm" onclick="psPlanAll()">Plan all recommended</button>' +
+            '<button class="ps-btn sm" onclick="psPlanRevertAll()">Revert all</button>' +
+            '<button class="ps-btn primary sm" onclick="psPlanApply()"' + (changeCount ? '' : ' disabled style="opacity:.5;cursor:default"') + '>Apply ' + changeCount + ' change' + (changeCount === 1 ? '' : 's') + '</button>' +
+        '</div>';
+
+    // Uses the shared .tbl-wrap dashboard table tier (fb-styles §30) so the
+    // header, fonts, padding, borders and row hover match the Work Orders table.
+    const head =
+        '<tr>' +
+            '<th>Work order</th>' +
+            '<th>Category / assignee</th>' +
+            '<th>Current</th>' +
+            '<th>Material ready</th>' +
+            '<th>Suggested</th>' +
+            '<th>Delta</th>' +
+            '<th>Reason</th>' +
+            '<th></th>' +
+        '</tr>';
+
+    // Blocked (unmet material) first, then planned, then the rest — each by start date.
+    const rows = list.slice().sort((a, b) => {
+        const ab = (psAvailReady && a._av && a._av._unmet) ? 0 : 1;
+        const bb = (psAvailReady && b._av && b._av._unmet) ? 0 : 1;
+        if (ab !== bb) return ab - bb;
+        return psPlanBaseStart(a).valueOf() - psPlanBaseStart(b).valueOf();
+    }).map(wo => {
+        const p = psPlan[wo.wo_id];
+        const bs = psPlanBaseStart(wo), bf = psPlanBaseFinish(wo);
+        const mr = psPlanMatReady(wo);
+        const blocked = mr.blocked;
+        const assignee = psUserName(wo) || 'Unassigned';
+
+        const curCell = psFmtDate(wo.date_scheduled_start) + ' → ' + psFmtDate(wo.date_scheduled);
+        const matCell = blocked
+            ? '<span class="spill critical">Not available</span>'
+            : psFmtDate(mr.date.format('YYYY-MM-DD')) + (mr.byProducer ? ' <span class="hint">(producer)</span>' : '');
+
+        let sugCell, deltaCell, reasonCell, planBtn;
+        if (p) {
+            const over = p.over;
+            sugCell = '<input type="date" value="' + p.start + '" onchange="psPlanManual(' + wo.wo_id + ',this.value)" ' +
+                'style="height:28px;border:1px solid var(--border-strong);border-radius:6px;padding:0 6px;font-size:12px">' +
+                ' <span class="hint">→ ' + psFmtDate(p.finish) + '</span>' +
+                (over ? ' <span class="spill critical" title="Exceeds a resource\'s capacity">⚠ overload</span>' : '');
+            const dd = moment(p.start).startOf('day').diff(bs, 'days');
+            deltaCell = dd === 0
+                ? '<span class="hint">0</span>'
+                : (dd > 0
+                    ? '<span class="spill caution">▶ ' + dd + 'd</span>'
+                    : '<span class="spill active">◀ ' + Math.abs(dd) + 'd</span>');
+            reasonCell = psEsc(p.reason);
+            planBtn = '<button class="ps-btn sm" onclick="psPlanRevert(' + wo.wo_id + ')">Revert</button>';
+        } else {
+            sugCell = '<span class="hint">—</span>';
+            deltaCell = '';
+            reasonCell = blocked ? '<span class="spill critical">Material not available</span>' : '<span class="hint">not planned</span>';
+            planBtn = blocked
+                ? (psTabEnabled('procure') ? '<button class="ps-btn sm" onclick="setView(\'procure\')">Procurement</button>' : '')
+                : '<button class="ps-btn sm" onclick="psPlanOne(' + wo.wo_id + ')">Plan</button>';
+        }
+
+        return '<tr>' +
+            '<td><a class="wo" href="#" onclick="psPlanOpenWO(' + wo.wo_id + ');return false">' + psEsc(wo.wo_num) + '</a>' +
+                '<div class="hint" style="display:block;margin-top:3px">' + psEsc(wo.part_num || '') + '</div></td>' +
+            '<td>' + psTagHTML(wo) + '<div class="hint" style="display:block;margin-top:4px">' + psEsc(assignee) + '</div></td>' +
+            '<td>' + curCell + '</td>' +
+            '<td>' + matCell + '</td>' +
+            '<td>' + sugCell + '</td>' +
+            '<td>' + deltaCell + '</td>' +
+            '<td style="white-space:normal">' + reasonCell + '</td>' +
+            '<td style="text-align:right">' + planBtn + '</td>' +
+        '</tr>';
+    }).join('');
+
+    host.innerHTML = '<div class="pv-fill">' + toolbar +
+        '<div class="tbl-wrap tbl-fill"><table><thead>' + head + '</thead><tbody>' + rows + '</tbody></table></div>' +
+      '</div>';
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ROSTERING TAB  (premium · admin-only — PS_TABS_ENABLED.roster)
+// Admin editor for the org-wide roster/capacity model (rosterConfig, published
+// to master). Owns: business defaults (shift start/end, default hours/day,
+// work-days), a company holiday/closure calendar, and sparse per-user overrides.
+// Feeds rosterUserCap()/rosterCategoryCap() → User Load heatmap + Planning maths.
+// SELF-CONTAINED: to strip this feature for a customer, flip PS_TABS_ENABLED.roster
+// (and remove the PS_VIEWS 'roster' entry); this whole fenced block can be deleted
+// with no dangling references except the rosterCfg()/rosterUserCap() helpers above
+// (which the heatmap/planner still need and default safely without a config).
+// ═══════════════════════════════════════════════════════════════════════════
+let psRosterDraft = null;      // in-memory edit copy of rosterConfig (null = clean)
+let psRosterUsersAll = null;   // cache: [{id,name}] of all active users
+let psRosterCalMonth = null;   // moment anchor for the holiday calendar
+const PS_DOW = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const PS_ROSTER_CW = 'grid-template-columns:repeat(7,46px);gap:6px';   // per-user day grid alignment
+
+// One aligned day column: a work-day checkbox stacked over its hours field. The
+// number is disabled+zeroed when the day is off, and defaults to `def` (the
+// company or per-user default) until a manual per-day override is entered.
+function psRosterUserGrid(uid, wd, hoursArr, def) {
+    return '<div style="display:grid;' + PS_ROSTER_CW + '">' + PS_DOW.map((n, i) => {
+        const on = !!wd[i];
+        const hv = on ? ((hoursArr && hoursArr[i] != null && hoursArr[i] !== '') ? hoursArr[i] : def) : 0;
+        return '<div style="display:flex;flex-direction:column;align-items:center;gap:4px">' +
+            '<input type="checkbox" ' + (on ? 'checked' : '') + ' onchange="psRosterUserDay(\'' + uid + '\',' + i + ',this.checked)">' +
+            '<input type="number" min="0" max="24" step="0.25" value="' + hv + '" ' + (on ? '' : 'disabled') +
+                ' onchange="psRosterUserDayHours(\'' + uid + '\',' + i + ',this.value)" ' +
+                'style="width:42px;height:24px;border:1px solid var(--border-strong);border-radius:5px;padding:0 3px;font-size:11px;text-align:center' +
+                (on ? '' : ';background:var(--bg-2);color:var(--c-tertiary)') + '"></div>';
+    }).join('') + '</div>';
+}
+
+function psRosterLoadUsers() {
+    if (psRosterUsersAll) return psRosterUsersAll;
+    let rows = [];
+    try {
+        rows = JSON.parse(runQuery(
+            "SELECT id, COALESCE(NULLIF(TRIM(CONCAT(COALESCE(firstName,''),' ',COALESCE(lastName,''))),''), userName) AS name " +
+            "FROM sysuser WHERE activeFlag = 1 ORDER BY name")) || [];
+    } catch (e) { debugLog('error', 'psRosterLoadUsers: ' + (e && e.message)); rows = []; }
+    psRosterUsersAll = rows.filter(r => r.id != null)
+        .map(r => ({ id: String(r.id), name: (r.name || ('User ' + r.id)).trim() || ('User ' + r.id) }));
+    return psRosterUsersAll;
+}
+
+// Take (or refresh) a deep edit copy of the currently-resolved rosterConfig.
+function psRosterEnsureDraft() {
+    if (psRosterDraft) return;
+    const c = rosterCfg();
+    psRosterDraft = {
+        business: {
+            start: c.business.start, end: c.business.end,
+            hoursPerDay: c.business.hoursPerDay, workDays: c.business.workDays.slice()
+        },
+        holidays: c.holidays.map(h => Object.assign({}, h)),
+        users: JSON.parse(JSON.stringify(c.users || {}))
+    };
+}
+
+// Mon..Sun work-day checkbox row. handlerTpl uses the token IDX for the index.
+function psRosterDowChecks(workDays, handlerTpl, small) {
+    const sz = small ? '9px' : '10px';
+    return '<div style="display:flex;gap:6px;margin-top:' + (small ? '0' : '4px') + '">' +
+        PS_DOW.map((n, i) =>
+            '<label style="display:flex;flex-direction:column;align-items:center;font-size:' + sz + ';color:var(--c-secondary);gap:2px">' +
+            (small ? n[0] : n) +
+            '<input type="checkbox" ' + (workDays[i] ? 'checked' : '') + ' onchange="' +
+            handlerTpl.replace('IDX', i) + '"></label>').join('') + '</div>';
+}
+
+// Month grid for the holiday calendar — closures shaded red, non-work-days grey,
+// click a day to toggle a single-day closure.
+function psRosterCalHtml() {
+    const d = psRosterDraft;
+    const anchor = (psRosterCalMonth || moment()).clone().startOf('month');
+    const gridStart = anchor.clone().startOf('isoWeek');
+    const header = PS_DOW.map(n =>
+        '<div style="text-align:center;font-size:10px;font-weight:700;color:var(--c-tertiary)">' + n + '</div>').join('');
+    let body = '';
+    for (let i = 0; i < 42; i++) {
+        const dt = gridStart.clone().add(i, 'days');
+        const ds = dt.format('YYYY-MM-DD');
+        const inMonth = dt.month() === anchor.month();
+        const closed = d.holidays.some(h => psHolidayMatches(h, dt));
+        const isWork = !!d.business.workDays[dt.isoWeekday() - 1];
+        const bg = closed ? '#F0D7DD' : (!isWork ? 'var(--bg-2)' : 'var(--surface, #fff)');
+        const fg = closed ? '#8A1E30' : (inMonth ? 'var(--c-primary)' : 'var(--c-tertiary)');
+        body += '<div title="' + ds + (closed ? ' — closure' : '') + '" onclick="psRosterToggleDay(\'' + ds + '\')" ' +
+            'style="text-align:center;padding:8px 0;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;' +
+            'background:' + bg + ';color:' + fg + ';opacity:' + (inMonth ? 1 : 0.45) + '">' + dt.date() + '</div>';
+    }
+    return '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">' +
+            '<button class="ps-btn sm" onclick="psRosterCalShift(-1)">&lsaquo;</button>' +
+            '<strong style="font-size:13px;color:var(--c-primary)">' + anchor.format('MMMM YYYY') + '</strong>' +
+            '<button class="ps-btn sm" onclick="psRosterCalShift(1)">&rsaquo;</button>' +
+        '</div>' +
+        '<div style="display:grid;grid-template-columns:repeat(7,1fr);gap:4px;max-width:420px">' + header + body + '</div>';
+}
+
+function renderRoster() {
+    const host = document.getElementById('rosterView');
+    if (!host) return;
+    if (!(FBLib.Settings && FBLib.Settings.isAdmin())) {
+        host.innerHTML = psEmptyState('Rostering is available to Fishbowl administrators only.');
+        return;
+    }
+    psRosterEnsureDraft();
+    const d = psRosterDraft;
+    const users = psRosterLoadUsers();
+    const cardOpen = '<div style="background:var(--surface,#fff);border:1px solid var(--border);border-radius:12px;padding:18px 20px;margin-bottom:16px">';
+    const lbl = 'display:flex;flex-direction:column;font-size:12px;font-weight:600;color:var(--c-secondary);gap:4px';
+    const inp = 'height:30px;border:1px solid var(--border-strong);border-radius:6px;padding:0 8px;font-size:13px';
+
+    // ── Business defaults ──────────────────────────────────────────────────
+    const biz =
+        cardOpen +
+        '<h3 style="margin:0 0 12px;font-size:15px;font-weight:800;color:var(--c-primary)">Business defaults</h3>' +
+        '<div style="display:flex;gap:20px;flex-wrap:wrap;align-items:flex-end">' +
+            '<label style="' + lbl + '">Day start<input type="time" value="' + psEsc(d.business.start) + '" style="' + inp + '" onchange="psRosterBiz(\'start\',this.value)"></label>' +
+            '<label style="' + lbl + '">Day end<input type="time" value="' + psEsc(d.business.end) + '" style="' + inp + '" onchange="psRosterBiz(\'end\',this.value)"></label>' +
+            '<label style="' + lbl + '">Hours / day<input type="number" min="0" max="24" step="0.25" value="' + d.business.hoursPerDay + '" style="' + inp + ';width:90px" onchange="psRosterBiz(\'hoursPerDay\',this.value)"></label>' +
+            '<div style="' + lbl + '">Work days' + psRosterDowChecks(d.business.workDays, "psRosterBizDay(IDX,this.checked)") + '</div>' +
+        '</div>' +
+        '<div class="hint" style="margin-top:10px">Applies to every user unless overridden below. Hours/day is the labour capacity used by the User Load heatmap and Planning suggestions.</div>' +
+        '</div>';
+
+    // ── Holiday / closure calendar ─────────────────────────────────────────
+    const holList = d.holidays.length
+        ? d.holidays.map((h, idx) => {
+            // Show closure dates in the install's locale short-date format
+            // (MOMENT_DATE_FORMAT) rather than the stored ISO YYYY-MM-DD.
+            const fmtD = s => { const m = moment(s, 'YYYY-MM-DD'); return m.isValid() ? formatDate(m) : (s || ''); };
+            const range = h.start && h.end ? (fmtD(h.start) + '  →  ' + fmtD(h.end)) : fmtD(h.date);
+            return '<div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--bg-2)">' +
+                '<span style="font-family:monospace;font-size:12px;color:#8A1E30;white-space:nowrap">' + psEsc(range) + (h.recur ? ' ↻' : '') + '</span>' +
+                '<input value="' + psEsc(h.name || '') + '" placeholder="Name" onchange="psRosterHolName(' + idx + ',this.value)" ' +
+                'style="flex:1;min-width:80px;height:26px;border:1px solid var(--border-strong);border-radius:6px;padding:0 8px;font-size:12px">' +
+                '<label style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--c-secondary);white-space:nowrap" title="Repeat every year">' +
+                '<input type="checkbox" ' + (h.recur ? 'checked' : '') + ' onchange="psRosterHolRecur(' + idx + ',this.checked)">Annual</label>' +
+                '<button class="ps-btn sm" onclick="psRosterRemoveHoliday(' + idx + ')">Remove</button></div>';
+        }).join('')
+        : '<div style="color:var(--c-tertiary);font-size:12px;padding:6px 0">No holidays or closures yet — click a day, or add a range below.</div>';
+
+    const hol =
+        cardOpen +
+        '<h3 style="margin:0 0 12px;font-size:15px;font-weight:800;color:var(--c-primary)">Holidays &amp; closures</h3>' +
+        '<div style="display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start">' +
+            '<div style="flex:0 0 auto">' + psRosterCalHtml() + '</div>' +
+            '<div style="flex:1;min-width:260px">' +
+                '<div style="max-height:220px;overflow:auto">' + holList + '</div>' +
+                '<div style="display:flex;gap:8px;align-items:flex-end;margin-top:12px;flex-wrap:wrap">' +
+                    '<label style="' + lbl + '">From<input type="date" id="rosHolStart" style="' + inp + '"></label>' +
+                    '<label style="' + lbl + '">To (optional)<input type="date" id="rosHolEnd" style="' + inp + '"></label>' +
+                    '<label style="' + lbl + ';flex:1;min-width:120px">Name<input type="text" id="rosHolName" placeholder="e.g. Christmas" style="' + inp + '"></label>' +
+                    '<label style="display:flex;align-items:center;gap:5px;font-size:12px;font-weight:600;color:var(--c-secondary);height:30px" title="Repeat every year"><input type="checkbox" id="rosHolRecur">Annual</label>' +
+                    '<button class="ps-btn primary" onclick="psRosterAddHoliday()">Add</button>' +
+                '</div>' +
+            '</div>' +
+        '</div>' +
+        '<div class="hint" style="margin-top:10px">Closures set capacity to zero for <strong>every</strong> user and category on those days.</div>' +
+        '</div>';
+
+    // ── Per-user overrides ─────────────────────────────────────────────────
+    const userRows = users.map(u => {
+        const ov = d.users[u.id] || {};
+        const wd = (Array.isArray(ov.workDays) && ov.workDays.length === 7) ? ov.workDays : d.business.workDays;
+        const hoursArr = Array.isArray(ov.hours) ? ov.hours : null;
+        const uDef = (ov.hoursPerDay != null) ? ov.hoursPerDay : d.business.hoursPerDay;
+        const custom = !!d.users[u.id];
+        return '<tr style="border-bottom:1px solid var(--bg-2)">' +
+            '<td style="padding:6px 8px;font-size:13px;vertical-align:middle;white-space:nowrap">' + psEsc(u.name) + (custom ? ' <span class="hint" style="color:var(--acc-teal-con)">• custom</span>' : '') + '</td>' +
+            '<td style="padding:6px 8px">' + psRosterUserGrid(u.id, wd, hoursArr, uDef) + '</td>' +
+            '<td style="padding:6px 8px;text-align:right;vertical-align:middle">' + (custom
+                ? '<button class="ps-btn sm" onclick="psRosterUserReset(\'' + u.id + '\')">Reset</button>'
+                : '<span style="font-size:11px;color:var(--c-tertiary)">inherits</span>') + '</td>' +
+        '</tr>';
+    }).join('');
+
+    const gridHead = '<div style="display:grid;' + PS_ROSTER_CW + ';margin-top:4px">' +
+        PS_DOW.map(n => '<div style="text-align:center;font-size:10px;font-weight:700;color:var(--c-tertiary)">' + n + '</div>').join('') + '</div>';
+
+    const usersCard =
+        cardOpen +
+        '<h3 style="margin:0 0 4px;font-size:15px;font-weight:800;color:var(--c-primary)">Per-user overrides</h3>' +
+        '<div class="hint" style="margin-bottom:10px">Untick a day to make it non-working (its hours zero automatically); edit an hours field to override the company default for that day. Blank/default rows inherit the business settings. ' + users.length + ' active user' + (users.length === 1 ? '' : 's') + '.</div>' +
+        '<div style="max-height:340px;overflow:auto"><table style="width:100%;border-collapse:collapse">' +
+            '<thead><tr style="text-align:left;border-bottom:2px solid var(--border)">' +
+                '<th style="padding:6px 8px;font-size:12px;color:var(--c-secondary);vertical-align:bottom">User</th>' +
+                '<th style="padding:6px 8px;font-size:12px;color:var(--c-secondary)">Work day / hours' + gridHead + '</th>' +
+                '<th></th>' +
+            '</tr></thead><tbody>' + userRows + '</tbody></table></div>' +
+        '</div>';
+
+    // ── Toolbar (Save / Discard) ───────────────────────────────────────────
+    const toolbar =
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;gap:12px;flex-wrap:wrap">' +
+            '<div>' +
+                '<h2 style="margin:0;font-size:19px;font-weight:800;color:var(--c-primary)">Rostering</h2>' +
+                '<div class="hint">Org-wide capacity model — changes apply to all users when published.</div>' +
+            '</div>' +
+            '<div style="display:flex;gap:8px">' +
+                '<button class="ps-btn" onclick="psRosterCancel()">Discard changes</button>' +
+                '<button class="ps-btn primary" onclick="psRosterSave()">Publish for all users</button>' +
+            '</div>' +
+        '</div>';
+
+    host.innerHTML = toolbar + biz + hol + usersCard;
+}
+
+// ── Rostering handlers (all mutate psRosterDraft; publish is admin-gated) ────
+function psRosterBiz(k, v) {
+    if (!psRosterDraft) return;
+    if (k === 'hoursPerDay') v = Math.max(0, Math.min(24, Number(v) || 0));
+    psRosterDraft.business[k] = v;
+}
+function psRosterBizDay(i, on) { if (psRosterDraft) { psRosterDraft.business.workDays[i] = on ? 1 : 0; renderRoster(); } }
+
+function psRosterToggleDay(ds) {
+    if (!psRosterDraft) return;
+    const i = psRosterDraft.holidays.findIndex(h => h && h.date === ds);
+    if (i >= 0) psRosterDraft.holidays.splice(i, 1);
+    else psRosterDraft.holidays.push({ date: ds, name: 'Closure' });
+    psRosterSortHolidays();
+    renderRoster();
+}
+function psRosterAddHoliday() {
+    if (!psRosterDraft) return;
+    const s = (document.getElementById('rosHolStart') || {}).value || '';
+    const e = (document.getElementById('rosHolEnd') || {}).value || '';
+    const n = ((document.getElementById('rosHolName') || {}).value || '').trim() || 'Closure';
+    const rec = !!((document.getElementById('rosHolRecur') || {}).checked);
+    if (!s) { showToast('Pick a start date', 'error'); return; }
+    if (e && e > s) psRosterDraft.holidays.push({ start: s, end: e, name: n, recur: rec });
+    else psRosterDraft.holidays.push({ date: s, name: n, recur: rec });
+    psRosterSortHolidays();
+    renderRoster();
+}
+function psRosterHolRecur(idx, on) { if (psRosterDraft && psRosterDraft.holidays[idx]) { psRosterDraft.holidays[idx].recur = !!on; renderRoster(); } }
+function psRosterSortHolidays() {
+    psRosterDraft.holidays.sort((a, b) => ((a.date || a.start) || '').localeCompare((b.date || b.start) || ''));
+}
+function psRosterHolName(idx, v) { if (psRosterDraft && psRosterDraft.holidays[idx]) psRosterDraft.holidays[idx].name = v; }
+function psRosterRemoveHoliday(idx) { if (psRosterDraft) { psRosterDraft.holidays.splice(idx, 1); renderRoster(); } }
+function psRosterCalShift(delta) { psRosterCalMonth = (psRosterCalMonth || moment()).clone().add(delta, 'month'); renderRoster(); }
+
+function psRosterUserDay(uid, i, on) {
+    if (!psRosterDraft) return;
+    const u = psRosterDraft.users[uid] || (psRosterDraft.users[uid] = {});
+    if (!Array.isArray(u.workDays)) u.workDays = psRosterDraft.business.workDays.slice();
+    u.workDays[i] = on ? 1 : 0;
+    if (!on && Array.isArray(u.hours)) u.hours[i] = null;   // a non-working day carries no hours
+    psRosterCleanUser(uid);
+    renderRoster();
+}
+function psRosterUserDayHours(uid, i, val) {
+    if (!psRosterDraft) return;
+    const u = psRosterDraft.users[uid] || (psRosterDraft.users[uid] = {});
+    if (!Array.isArray(u.hours)) u.hours = new Array(7).fill(null);
+    u.hours[i] = (val === '' || val == null) ? null : Math.max(0, Math.min(24, Number(val) || 0));
+    psRosterCleanUser(uid);   // deliberately no re-render — keeps input focus while typing
+}
+function psRosterUserReset(uid) { if (psRosterDraft) { delete psRosterDraft.users[uid]; renderRoster(); } }
+function psRosterCleanUser(uid) {
+    const u = psRosterDraft.users[uid];
+    if (!u) return;
+    // Collapse an all-inherit hours array and a work-day array equal to the
+    // business default, then drop the whole entry when nothing custom remains.
+    if (Array.isArray(u.hours) && u.hours.every(x => x == null || x === '')) delete u.hours;
+    if (Array.isArray(u.workDays)) {
+        const b = psRosterDraft.business.workDays;
+        if (u.workDays.every((v, i) => (v ? 1 : 0) === (b[i] ? 1 : 0))) delete u.workDays;
+    }
+    if (u.hoursPerDay == null && !Array.isArray(u.hours) && !Array.isArray(u.workDays)) delete psRosterDraft.users[uid];
+}
+
+function psRosterSave() {
+    if (!FBLib.Settings.isAdmin()) { showToast('Only an admin can save the roster', 'error'); return; }
+    if (!psRosterDraft) return;
+    try {
+        // Merge-then-publish: publishMaster REPLACES the whole master payload, so
+        // carry the current master forward and set only rosterConfig.
+        const master = Object.assign({}, FBLib.Settings.getMaster());
+        master.rosterConfig = psRosterDraft;
+        const ok = FBLib.Settings.publishMaster(master);
+        if (!ok) { showToast('Could not save — admin only', 'error'); return; }
+        debugLog('success', 'rosterConfig published for all users');
+        showToast('Roster published for all users', 'success');
+        psRosterDraft = null;
+        renderRoster();
+        // Refresh capacity-dependent views so new hours/holidays show immediately.
+        if (typeof renderLoad === 'function' && psView === 'load') renderLoad();
+    } catch (e) {
+        debugLog('error', 'psRosterSave: ' + (e && e.message));
+        showToast('Failed to publish roster: ' + (e && e.message), 'error');
+    }
+}
+function psRosterCancel() {
+    psRosterDraft = null;
+    renderRoster();
+    showToast('Changes discarded', 'info');
+}
+
+function renderLoad() {
+    const host = document.getElementById('userLoadView');
+    if (!host) return;
+    const isUser = (psLoadDim === 'user');
+    // Window starts on the current (or navigated-to) week's Monday and shows as
+    // many day columns as fit the panel width — no leading Friday, no fixed
+    // 3-week cap. Column geometry mirrors the .heat CSS (label col min 170px,
+    // each day cell 54px + 1px border). clientWidth is read live so a resized
+    // panel re-fits on the next render; fall back to the viewport when it's 0.
+    const CELL_W = 55, LABEL_W = 170;
+    const avail = Math.max(320, ((host.clientWidth || document.documentElement.clientWidth || 1200) - LABEL_W - 12));
+    let nDays = Math.max(7, Math.min(70, Math.floor(avail / CELL_W)));
+    const start = (currentCapacityWeek ? currentCapacityWeek.clone() : moment().startOf('isoWeek')).startOf('isoWeek');
+    const days = [];
+    for (let i = 0; i < nDays; i++) days.push(start.clone().add(i, 'days'));
+    const rangeLbl = start.format('MMM D') + ' – ' + start.clone().add(nDays - 1, 'days').format('MMM D');
+
+    function cellColor(pct) {
+        if (pct === 0)    return { bg: 'var(--bg-1)', fg: 'var(--c-tertiary)' };
+        if (pct <= 70)    return { bg: '#DBE8E1', fg: 'var(--acc-teal-con)' };
+        if (pct <= 90)    return { bg: '#C3D9CE', fg: 'var(--acc-teal-con)' };
+        if (pct <= 100)   return { bg: '#FBEDC4', fg: 'var(--acc-yellow-con)' };
+        if (pct <= 125)   return { bg: '#F5E7DD', fg: 'var(--fb-warning)' };
+        return { bg: '#F0D7DD', fg: 'var(--fb-negative)' };
+    }
+
+    // Toolbar — month/week nav (−1M · −1W · Today · +1W · +1M) + range label +
+    // (Category) capacity-settings button.
+    const toolbar =
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;gap:12px;flex-wrap:wrap">' +
+          '<div style="display:flex;align-items:center;gap:6px">' +
+            '<button class="ps-btn" onclick="psLoadShift(-1,\'month\')" title="Back one month">&laquo; 1M</button>' +
+            '<button class="ps-btn" onclick="psLoadShift(-1,\'week\')" title="Back one week">&lsaquo; 1W</button>' +
+            '<button class="ps-btn" onclick="psLoadToday()">Today</button>' +
+            '<button class="ps-btn" onclick="psLoadShift(1,\'week\')" title="Forward one week">1W &rsaquo;</button>' +
+            '<button class="ps-btn" onclick="psLoadShift(1,\'month\')" title="Forward one month">1M &raquo;</button>' +
+            '<h3 style="font-size:17px;font-weight:800;margin:0 0 0 8px;color:var(--c-primary)">' + (isUser ? 'Team' : 'Category') + ' Capacity</h3>' +
+            '<span style="font-size:13px;font-weight:600;color:var(--c-secondary);margin-left:2px">' + psEsc(rangeLbl) + '</span>' +
+          '</div>' +
+          '<div style="display:flex;align-items:center;gap:10px">' +
+            '<span class="hint">Hours scheduled ÷ ' + (isUser ? 'roster hours/day per user' : 'daily capacity') + '</span>' +
+            (!isUser ? '<button class="ps-btn" onclick="openCapacitySettingsModal()"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path stroke-linecap="round" stroke-linejoin="round" d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>Capacity settings</button>' : '') +
+          '</div>' +
+        '</div>';
+
+    const rowsData = isUser ? users : (capacitySettings.categories || []);
+    if (!rowsData.length) {
+        host.innerHTML = toolbar + psEmptyState(isUser ? 'No users are assigned to work orders in view.' : 'No categories to display.');
+        return;
+    }
+
+    const head = '<tr><th class="wc">' + (isUser ? 'User' : 'Category') + '</th>' + days.map(d => {
+        const wknd = d.day() === 0 || d.day() === 6;
+        const today = d.isSame(moment(), 'day');
+        return '<th class="' + (wknd ? 'wknd' : '') + '" style="' + (today ? 'background:#164A5F' : '') + '">' +
+            '<div>' + d.format('dd').slice(0, 2) + '</div><div style="font-size:12px">' + d.date() + '</div></th>';
+    }).join('') + '</tr>';
+
+    const rows = rowsData.map(r => {
+        const cells = days.map(d => {
+            const wknd = d.day() === 0 || d.day() === 6;
+            let dayCap, usage;
+            if (isUser) {
+                dayCap = rosterUserCap(r.id, d);
+                usage = getUsageForUserAndDay(r.id, d).usage;
+            } else {
+                dayCap = rosterCategoryCap(r.limits, d);
+                usage = getUsageForCategoryAndDay(r.id, d).usage;
+            }
+            const pct = dayCap > 0 ? Math.round(usage / dayCap * 100) : 0;
+            const c = cellColor(pct);
+            return '<td class="cell" style="background:' + c.bg + ';color:' + c.fg + '" title="' +
+                psEsc(r.name) + ' — ' + d.format('MMM D') + ': ' + (Math.round(usage * 10) / 10) + 'h / ' + dayCap + 'h">' +
+                (pct ? pct + '%' : '') + (pct > 100 ? '<div class="cap-cap">' + Math.round(usage) + 'h</div>' : '') + '</td>';
+        }).join('');
+        const label = isUser
+            ? ('<span class="avatar">' + psEsc(r.initials || '–') + '</span>' + psEsc(r.name))
+            : ('<span style="width:10px;height:10px;border-radius:50%;flex-shrink:0;background:' + psInk(r.color) + '"></span>' + psEsc(r.name));
+        return '<tr><td class="wc"><span style="display:inline-flex;align-items:center;gap:8px">' + label + '</span></td>' + cells + '</tr>';
+    }).join('');
+
+    host.innerHTML = toolbar +
+        '<div class="heat"><table>' + head + rows + '</table></div>' +
+        '<div class="heat-legend"><span style="font-weight:700;color:var(--c-primary)">Utilization</span>' +
+          '<span class="sw"><span class="box" style="background:#DBE8E1"></span>Under 70%</span>' +
+          '<span class="sw"><span class="box" style="background:#FBEDC4"></span>90–100%</span>' +
+          '<span class="sw"><span class="box" style="background:#F5E7DD"></span>100–125%</span>' +
+          '<span class="sw"><span class="box" style="background:#F0D7DD"></span>Over 125% (bottleneck)</span></div>';
+}
+
+function renderCapacityWOs(category, weekStart, numWeeks = 1) {
+    const svgId = `capacity-svg-${category.id}`;
+    const svg = d3.select(`#${svgId}`);
+    if (svg.empty()) return;
+
+    svg.selectAll('*').remove();
+
+    const viewEnd = weekStart.clone().add(numWeeks * 7, 'days');
+
+    const svgNode = svg.node();
+    const height = parseInt(svg.attr('height'));
+    const numDays = numWeeks * 7;
+
+    // Read actual column positions from table headers after they're rendered
+    const table = document.getElementById('capacityTable');
+    const headerCells = table.querySelectorAll('thead th');
+
+    // Get the SVG's bounding rectangle
+    const svgRect = svgNode.getBoundingClientRect();
+
+    // Build arrays of column positions and widths
+    const dayPositions = [];
+    const dayWidths = [];
+
+    // Skip first header (category column) and read day columns
+    for (let i = 1; i < headerCells.length && i <= numDays; i++) {
+        const cell = headerCells[i];
+        const cellRect = cell.getBoundingClientRect();
+        // Calculate position relative to SVG's left edge
+        const relativeLeft = cellRect.left - svgRect.left;
+        dayPositions.push(relativeLeft);
+        dayWidths.push(cellRect.width);
+    }
+
+    // Set SVG width to match the total width of all day columns
+    const totalWidth = dayPositions.length > 0
+        ? (dayPositions[dayPositions.length - 1] + dayWidths[dayWidths.length - 1])
+        : numDays * 120;
+    svg.attr('width', totalWidth);
+
+    // Create xScale based on actual column positions
+    const xScale = (date) => {
+        const dayIndex = moment(date).diff(weekStart, 'days');
+        if (dayIndex < 0 || dayPositions.length === 0) return dayPositions[0] || 0;
+        if (dayIndex >= dayPositions.length) return dayPositions[dayPositions.length - 1] + dayWidths[dayWidths.length - 1];
+        return dayPositions[dayIndex];
+    };
+
+    // Draw day dividers and weekend backgrounds
+    for (let day = 0; day < dayPositions.length; day++) {
+        const dayOfWeek = day % 7;
+        const isWeekend = dayOfWeek >= 5;
+        const dayStart = weekStart.clone().add(day, 'days');
+        const x = dayPositions[day];
+        const dayWidth = dayWidths[day];
+
+        const isToday = dayStart.isSame(moment(), 'day');
+
+        if (isWeekend) {
+            svg.append('rect')
+                .attr('x', x)
+                .attr('y', 0)
+                .attr('width', dayWidth)
+                .attr('height', height)
+                .attr('fill', '#FBF4EC')
+                .attr('opacity', 0.5);
+        }
+
+        // Today indicator - indigo background
+        if (isToday) {
+            svg.append('rect')
+                .attr('x', x)
+                .attr('y', 0)
+                .attr('width', dayWidth)
+                .attr('height', height)
+                .attr('fill', '#DEEAF4') // indigo-50
+                .attr('opacity', 0.8);
+        }
+
+        // Day divider - no special Monday border, today gets indigo borders
+        svg.append('line')
+            .attr('x1', x)
+            .attr('x2', x)
+            .attr('y1', 0)
+            .attr('y2', height)
+            .attr('stroke', isToday ? '#4FB0E4' : '#E3E3E3') // indigo-400 for today
+            .attr('stroke-width', isToday ? 2 : 1);
+
+        // Right border for today column
+        if (isToday) {
+            svg.append('line')
+                .attr('x1', x + dayWidth)
+                .attr('x2', x + dayWidth)
+                .attr('y1', 0)
+                .attr('y2', height)
+                .attr('stroke', '#4FB0E4') // indigo-400
+                .attr('stroke-width', 2);
+        }
+    }
+
+    // Get WOs for this category
+    const { wos } = getWOsForCategory(category.id, weekStart, numWeeks);
+    if (wos.length === 0) return;
+
+    // Render each WO
+    wos.forEach(wo => {
+        // Use start of day for start and end of day for finish to ignore time component
+        const woStart = moment(wo.date_scheduled_start).startOf('day');
+        let woEnd = moment(wo.date_scheduled).endOf('day');
+
+        // For completed WOs, use date_finished if available and earlier than date_scheduled
+        // This ensures visual representation matches capacity calculations
+        if (wo.wo_status === 40 && wo.date_finished) {
+            const dateFinished = moment(wo.date_finished).endOf('day');
+            // Use the earlier of date_finished or date_scheduled
+            woEnd = moment.min(woEnd, dateFinished);
+        }
+
+        // Clamp to visible view
+        const visibleStart = moment.max(woStart, weekStart);
+        const visibleEnd = moment.min(woEnd, viewEnd);
+
+        const x = xScale(visibleStart.toDate());
+
+        // For end position, we need the RIGHT edge of the day, not the left edge
+        const endDayIndex = moment(visibleEnd).diff(weekStart, 'days');
+        const xEnd = (endDayIndex >= 0 && endDayIndex < dayPositions.length)
+            ? dayPositions[endDayIndex] + dayWidths[endDayIndex]
+            : xScale(visibleEnd.toDate());
+        const barWidth = xEnd - x;
+
+        // Add padding so tiles don't touch cell edges
+        const horizontalPadding = 4;
+        const paddedX = x + horizontalPadding;
+        const paddedWidth = Math.max(0, barWidth - (horizontalPadding * 2));
+
+        const lane = wo._lane || 0;
+        const y = 10 + (lane * 40);
+        const barHeight = 35; // Keep larger for capacity view (has 2 lines of text)
+
+        // Calculate total hours and hours per day
+        const laborHoursPerUnit = parseFloat(wo.labor_hours_from_bom) || 0;
+        const qtyTarget = parseFloat(wo.qty_target) || 1;
+        const totalHours = laborHoursPerUnit * qtyTarget;
+
+        // Calculate days to divide hours across
+        let daysInWO;
+        if (skipWeekends) {
+            // Count only weekdays
+            daysInWO = countWeekdaysInRange(woStart, woEnd);
+        } else {
+            // Count all days
+            daysInWO = Math.ceil(woEnd.diff(woStart, 'days', true)) || 1;
+        }
+
+        const hoursPerDay = daysInWO > 0 ? totalHours / daysInWO : 0;
+
+        // Status colors
+        // Use standard color scheme
+        const colors = WO_STATUS_COLORS[wo.wo_status] || WO_STATUS_COLORS[10];
+        const barColor = colors.fill;
+        const borderColor = colors.stroke;
+
+        // WO bar background (with padding)
+        const bar = svg.append('rect')
+            .attr('x', paddedX)
+            .attr('y', y)
+            .attr('width', paddedWidth)
+            .attr('height', barHeight)
+            .attr('fill', barColor)
+            .attr('stroke', borderColor)
+            .attr('stroke-width', 2)
+            .attr('rx', 4)
+            .attr('class', 'wo-bar')
+            .attr('data-wo-id', wo.wo_id)
+            .attr('data-wo-num', wo.wo_num);
+
+        // Custom CSS tooltip
+        const descriptionInfo = wo.description ? wo.description : '';
+        const capacityTooltipHTML = `
+            <div><span class="wo-tooltip-label">WO:</span><span class="wo-tooltip-value">${wo.wo_num}</span></div>
+            <div><span class="wo-tooltip-label">BOM:</span><span class="wo-tooltip-value">${wo.bom_num || 'N/A'}</span></div>
+            <div><span class="wo-tooltip-label">Finished Good:</span><span class="wo-tooltip-value">${wo.part_num || 'N/A'} x ${wo.qty_target || '?'}</span></div>
+            ${descriptionInfo ? `<div><span class="wo-tooltip-label">Description:</span><span class="wo-tooltip-value">${descriptionInfo}</span></div>` : ''}
+            <div><span class="wo-tooltip-label">Total Hours:</span><span class="wo-tooltip-value">${totalHours.toFixed(2)}h</span></div>
+            <div><span class="wo-tooltip-label">Hours per Day:</span><span class="wo-tooltip-value">${hoursPerDay.toFixed(2)}h</span></div>
+        `;
+
+        bar.on('mouseover', function(event) {
+            showWOTooltip(event, capacityTooltipHTML);
+        }).on('mouseout', function() {
+            hideWOTooltip();
+        }).on('mousemove', function(event) {
+            showWOTooltip(event, capacityTooltipHTML);
+        });
+
+        // Double-click to open WO in Fishbowl
+        bar.on('dblclick', function() {
+            debugLog('info', `Opening WO ${wo.wo_num} in Fishbowl...`);
+            try {
+                if (typeof openModule === 'function') {
+                    openModule('Work Order', wo.wo_num);
+                    showToast(`Opening WO ${wo.wo_num}`, 'info');
+                } else {
+                    debugLog('warn', 'openModule function not available in Fishbowl');
+                    showToast('Cannot open WO - not running in Fishbowl', 'error');
+                }
+            } catch (error) {
+                debugLog('error', 'Error opening WO:', error);
+                showToast('Error opening WO: ' + error.message, 'error');
+            }
+        });
+
+        // Right-click to set WO dates and category via pickers
+        bar.on('contextmenu', function(event) {
+            hideWOTooltip();
+            showWOContextMenu(event, wo);
+        });
+
+        // Add drag behavior
+        const woId = wo.wo_id;
+        let dragStartX = paddedX;
+        let dragStartY = y;
+        let isDragging = false;
+        let totalDragDistance = 0;
+        let associatedTexts = []; // Store text elements that belong to this WO
+        let dragOverlay = null; // Overlay element for cross-category dragging
+
+        const dragBehavior = d3.drag()
+            .on('start', function(event) {
+                dragStartX = parseFloat(d3.select(this).attr('x'));
+                dragStartY = parseFloat(d3.select(this).attr('y'));
+                isDragging = false;
+                totalDragDistance = 0;
+                hideWOTooltip();
+
+                // Find and store all text elements that belong to this WO
+                associatedTexts = [];
+                svg.selectAll('text').each(function() {
+                    const text = d3.select(this);
+                    const textX = parseFloat(text.attr('x'));
+                    const textY = parseFloat(text.attr('y'));
+
+                    // Check if this text belongs to this WO by initial position
+                    // Label text is at (paddedX + 6, y + barHeight/2 - 4)
+                    if (Math.abs(textX - (dragStartX + 6)) < 5 &&
+                        Math.abs(textY - (dragStartY + barHeight / 2 - 4)) < 5) {
+                        associatedTexts.push({
+                            element: text,
+                            offsetX: textX - dragStartX,
+                            offsetY: textY - dragStartY
+                        });
+                    }
+                    // Daily hours text is centered in each day column
+                    else if (textY >= dragStartY + barHeight / 2 &&
+                             textY <= dragStartY + barHeight &&
+                             text.attr('text-anchor') === 'middle') {
+                        // Check if it's roughly within the WO's horizontal span
+                        const woStartX = dragStartX;
+                        const woEndX = dragStartX + parseFloat(d3.select('.wo-bar[data-wo-id="' + woId + '"]').attr('width'));
+                        if (textX >= woStartX - 20 && textX <= woEndX + 20) {
+                            associatedTexts.push({
+                                element: text,
+                                offsetX: textX - dragStartX,
+                                offsetY: textY - dragStartY
+                            });
+                        }
+                    }
+                });
+            })
+            .on('drag', function(event) {
+                // Track total drag distance
+                totalDragDistance += Math.abs(event.dx) + Math.abs(event.dy);
+
+                // Only start visual dragging if we've moved more than 5 pixels
+                if (totalDragDistance > 5) {
+                    if (!isDragging) {
+                        // First time exceeding threshold - apply drag styling
+                        isDragging = true;
+                        const draggedBar = d3.select(this);
+
+                        // Hide the original bar and text
+                        draggedBar.attr('opacity', 0.3);
+                        associatedTexts.forEach(t => t.element.attr('opacity', 0.3));
+
+                        // Create a drag overlay that sits above everything
+                        const barRect = this.getBoundingClientRect();
+                        dragOverlay = document.createElement('div');
+                        dragOverlay.style.position = 'fixed';
+                        dragOverlay.style.left = barRect.left + 'px';
+                        dragOverlay.style.top = barRect.top + 'px';
+                        dragOverlay.style.width = barRect.width + 'px';
+                        dragOverlay.style.height = barHeight + 'px';
+                        dragOverlay.style.backgroundColor = barColor;
+                        dragOverlay.style.border = `2px solid ${borderColor}`;
+                        dragOverlay.style.borderRadius = '4px';
+                        dragOverlay.style.opacity = '0.7';
+                        dragOverlay.style.pointerEvents = 'none';
+                        dragOverlay.style.zIndex = '10000';
+                        dragOverlay.style.boxShadow = '0 4px 6px rgba(0,0,0,0.2)';
+                        dragOverlay.innerHTML = `<div style="padding: 4px 6px; font-size: 11px; font-weight: 600; color: #101010;">${labelText}</div>`;
+                        document.body.appendChild(dragOverlay);
+                    }
+
+                    // Update overlay position to follow mouse
+                    if (dragOverlay) {
+                        const currentLeft = parseFloat(dragOverlay.style.left);
+                        const currentTop = parseFloat(dragOverlay.style.top);
+                        dragOverlay.style.left = (currentLeft + event.dx) + 'px';
+                        dragOverlay.style.top = (currentTop + event.dy) + 'px';
+                    }
+
+                    // Still move the original bar (hidden) for position tracking
+                    const newX = parseFloat(d3.select(this).attr('x')) + event.dx;
+                    const newY = parseFloat(d3.select(this).attr('y')) + event.dy;
+                    d3.select(this).attr('x', newX).attr('y', newY);
+
+                    // Move associated text elements
+                    associatedTexts.forEach(textInfo => {
+                        textInfo.element
+                            .attr('x', newX + textInfo.offsetX)
+                            .attr('y', newY + textInfo.offsetY);
+                    });
+                }
+            })
+            .on('end', function(event) {
+                // Remove drag overlay
+                if (dragOverlay) {
+                    dragOverlay.remove();
+                    dragOverlay = null;
+                }
+
+                // Reset styling
+                d3.select(this)
+                    .attr('opacity', 1)
+                    .attr('stroke-width', 2);
+
+                // Reset text opacity
+                associatedTexts.forEach(t => t.element.attr('opacity', 1));
+
+                // If we never started dragging, it was just a click - do nothing
+                if (!isDragging) {
+                    return;
+                }
+
+                // Get the final position
+                const finalX = parseFloat(d3.select(this).attr('x'));
+                const finalY = parseFloat(d3.select(this).attr('y'));
+
+                // Calculate which day based on X position
+                let targetDay = null;
+                for (let i = 0; i < dayPositions.length; i++) {
+                    const dayX = dayPositions[i];
+                    const dayW = dayWidths[i];
+                    if (finalX >= dayX && finalX < dayX + dayW) {
+                        targetDay = weekStart.clone().add(i, 'days');
+                        break;
+                    }
+                }
+
+                // Calculate which category based on Y position
+                // Only check for category change if Y movement was significant
+                const draggedY = finalY - dragStartY;
+                const draggedX = finalX - dragStartX;
+                let targetCategory = null;
+
+                // Only detect category change if vertical movement is significant (>30px)
+                // AND greater than horizontal movement (primarily vertical drag)
+                if (Math.abs(draggedY) > 30 && Math.abs(draggedY) > Math.abs(draggedX)) {
+                    debugLog('info', `Category drag detected: Y=${draggedY.toFixed(1)}px, X=${draggedX.toFixed(1)}px`);
+                    const table = document.getElementById('capacityTable');
+                    const tbody = table.querySelector('tbody');
+                    const categoryRows = tbody.querySelectorAll('tr:nth-child(odd)'); // Odd rows are category WO rows
+
+                    // Get sorted categories to match table row order (categories are sorted alphabetically in buildCapacityTable)
+                    const sortedCategories = [...capacitySettings.categories].sort((a, b) =>
+                        a.name.localeCompare(b.name)
+                    );
+
+                    categoryRows.forEach((row, idx) => {
+                        const svgCell = row.querySelector('td:last-child');
+                        if (svgCell) {
+                            const svgElement = svgCell.querySelector('svg');
+                            if (svgElement) {
+                                const rect = svgElement.getBoundingClientRect();
+                                const mouseY = event.sourceEvent.clientY;
+                                if (mouseY >= rect.top && mouseY <= rect.bottom) {
+                                    // Use sortedCategories instead of capacitySettings.categories to match table order
+                                    const detectedCategory = sortedCategories[idx];
+                                    debugLog('info', `Mouse over category ${idx}: ${detectedCategory?.name} (ID: ${detectedCategory?.id}), WO current category: ${wo.calcategory_id}`);
+                                    // Only set if different from current category
+                                    if (detectedCategory && detectedCategory.id !== wo.calcategory_id) {
+                                        targetCategory = detectedCategory;
+                                        debugLog('success', `Target category set to: ${targetCategory.name} (ID: ${targetCategory.id})`);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+
+                // Only process drop if something actually changed
+                let hasChanges = false;
+                let categoryChanged = false;
+
+                // Check if category actually changed
+                if (targetCategory) {
+                    categoryChanged = true;
+                    hasChanges = true;
+                }
+
+                // Check if day changed (only if we found a valid target day)
+                if (targetDay) {
+                    const originalStart = moment(wo.date_scheduled_start).startOf('day');
+                    if (!targetDay.isSame(originalStart, 'day')) {
+                        hasChanges = true;
+                    }
+                }
+
+                // Handle the drop only if there are actual changes
+                if (hasChanges) {
+                    handleCapacityWODrop(wo, targetDay, categoryChanged ? targetCategory : null, weekStart);
+                } else {
+                    // No changes - snap back to original position
+                    renderCurrentView();
+                }
+            });
+
+        bar.call(dragBehavior);
+
+        // WO label - show WO number or BOM number (based on viewByMode) and total hours
+        const woLabel = getWOLabel(wo, 17); // Truncate to 17 chars for capacity tiles
+        const labelText = viewByMode === 'bom_num'
+            ? `${woLabel} (${totalHours.toFixed(2)}h)`
+            : `WO ${woLabel} (${totalHours.toFixed(2)}h)`;
+        svg.append('text')
+            .attr('x', paddedX + 6)
+            .attr('y', y + barHeight / 2 - 4)
+            .attr('font-size', '11px')
+            .attr('font-weight', '600')
+            .attr('fill', '#101010') // Fishbowl dark text
+            .attr('pointer-events', 'none')
+            .text(labelText);
+
+        // Daily breakdown - show hours per day aligned under each day
+        // Since we're using full days now, each day gets equal hours
+        let currentDay = visibleStart.clone().startOf('day');
+        const breakdown = [];
+        while (currentDay.isBefore(visibleEnd)) {
+            const dayEnd = currentDay.clone().add(1, 'day');
+
+            // Check if this day overlaps with the WO
+            if (currentDay.isBefore(woEnd) && dayEnd.isAfter(woStart)) {
+                const dayIndex = currentDay.diff(weekStart, 'days');
+                if (dayIndex >= 0 && dayIndex < dayPositions.length) {
+                    const dayX = dayPositions[dayIndex];
+                    const dayWidth = dayWidths[dayIndex];
+
+                    // Calculate the visible portion of this day within the WO bar (with padding)
+                    const visibleDayStart = Math.max(dayX, paddedX);
+                    const visibleDayEnd = Math.min(dayX + dayWidth, paddedX + paddedWidth);
+                    const visibleDayWidth = visibleDayEnd - visibleDayStart;
+
+                    // Only show hours if there's enough space (at least 30px)
+                    if (visibleDayWidth >= 30) {
+                        // Center the hours text within the visible portion
+                        svg.append('text')
+                            .attr('x', visibleDayStart + visibleDayWidth / 2)
+                            .attr('y', y + barHeight / 2 + 10)
+                            .attr('font-size', '9px')
+                            .attr('fill', '#506872')
+                            .attr('text-anchor', 'middle')
+                            .attr('pointer-events', 'none')
+                            .text(`${hoursPerDay.toFixed(2)}h`);
+                    }
+                }
+            }
+
+            currentDay.add(1, 'day');
+        }
+
+        // TODO: Add drag and resize handlers
+    });
+}
+
+function openCapacitySettingsModal() {
+    const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+    const modalHtml = `
+        <div class="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center" id="capacityModal" onclick="if(event.target===this) closeCapacityModal()">
+            <div class="bg-white rounded-lg shadow-xl max-w-4xl w-full m-4 max-h-[90vh] overflow-auto">
+                <div class="sticky top-0 bg-white flex items-center justify-between p-4 border-b border-slate-200">
+                    <h3 class="text-lg font-bold text-slate-800">Capacity Settings</h3>
+                    <button onclick="closeCapacityModal()" class="p-1 hover:bg-slate-100 rounded">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                        </svg>
+                    </button>
+                </div>
+                <div class="p-4">
+                    <table class="w-full border-collapse">
+                        <thead>
+                            <tr>
+                                <th class="border border-slate-300 bg-slate-50 px-3 py-2 text-left text-sm font-bold text-slate-700">Category</th>
+                                ${dayNames.map(day => `<th class="border border-slate-300 bg-slate-50 px-3 py-2 text-center text-sm font-bold text-slate-700">${day}</th>`).join('')}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${capacitySettings.categories.map((category, catIdx) => `
+                                <tr>
+                                    <td class="border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 bg-slate-50">
+                                        <div class="flex items-center gap-2">
+                                            <div class="w-3 h-3 rounded-full flex-shrink-0" style="background-color: ${category.color}"></div>
+                                            ${category.name}
+                                        </div>
+                                    </td>
+                                    ${dayNames.map((day, dayIdx) => `
+                                        <td class="border border-slate-300 px-2 py-2 text-center">
+                                            <input type="number"
+                                                   class="capacity-input w-full px-2 py-1 border border-slate-300 rounded text-sm text-center"
+                                                   data-category="${catIdx}"
+                                                   data-day="${dayIdx}"
+                                                   value="${category.limits[dayIdx]}"
+                                                   min="0"
+                                                   max="24"
+                                                   step="0.5">
+                                        </td>
+                                    `).join('')}
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+                <div class="sticky bottom-0 bg-white flex items-center justify-end gap-2 p-4 border-t border-slate-200">
+                    <button onclick="closeCapacityModal()" class="px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 rounded-lg">
+                        Cancel
+                    </button>
+                    <button onclick="saveAllCapacitySettings()" class="px-4 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg">
+                        Save All
+                    </button>
+                </div>
+            </div>
+        </div>
+    `;
+
+    document.body.insertAdjacentHTML('beforeend', modalHtml);
+}
+
+function closeCapacityModal() {
+    debugLog('info', 'closeCapacityModal called');
+    const modal = document.getElementById('capacityModal');
+    if (!modal) {
+        debugLog('warn', 'Modal not found');
+        return;
+    }
+
+    // Save any changed settings before closing
+    const inputs = modal.querySelectorAll('.capacity-input');
+    debugLog('info', `Found ${inputs.length} capacity inputs`);
+    let hasChanges = false;
+
+    inputs.forEach(input => {
+        const categoryIndex = parseInt(input.dataset.category);
+        const dayIndex = parseInt(input.dataset.day);
+        const hours = parseFloat(input.value);
+
+        if (!isNaN(categoryIndex) && !isNaN(dayIndex) && !isNaN(hours)) {
+            const category = capacitySettings.categories[categoryIndex];
+            if (category) {
+                debugLog('info', `Setting capacity for category ${category.id}, day ${dayIndex}: ${hours} hours`);
+                setCapacity(category.id, dayIndex, hours);
+                hasChanges = true;
+            }
+        }
+    });
+
+    debugLog('info', `hasChanges: ${hasChanges}`);
+    modal.remove();
+
+    // Rebuild capacity table and save settings
+    if (hasChanges) {
+        debugLog('info', 'Capacity settings updated, saving to database...');
+        saveSettingsToDatabase();
+
+        // Refresh KPIs + the visible Load heatmap to reflect new limits.
+        updateKPIs();
+        if (typeof renderLoad === 'function' && psView === 'load') renderLoad();
+        debugLog('info', 'KPIs refreshed with updated capacity settings');
+    } else {
+        debugLog('info', 'No changes detected, skipping save');
+    }
+}
+
+function saveAllCapacitySettings() {
+    // This function is kept for the "Save" button, but it just calls closeCapacityModal now
+    closeCapacityModal();
+}
+
+function changeCapacityWeek(direction) {
+    if (!currentCapacityWeek) {
+        currentCapacityWeek = moment().startOf('isoWeek');
+    }
+
+    // Add/subtract weeks and ensure we snap to Monday
+    currentCapacityWeek = currentCapacityWeek.clone().add(direction, 'weeks').startOf('isoWeek');
+    buildCapacityTable(currentCapacityWeek);
+}
+
+function goToCapacityToday() {
+    // Snap to current week's Monday
+    currentCapacityWeek = moment().startOf('isoWeek');
+    buildCapacityTable(currentCapacityWeek);
+    showToast('Jumped to current week', 'info');
+}
+
+// ============================================
+// MONTHLY CALENDAR VIEW
+// ============================================
+let currentCalendarMonth = moment();
+let calendarExpanded = false;
+
+function toggleMonthCalendar() {
+    calendarExpanded = !calendarExpanded;
+    const content = document.getElementById('monthCalendarContent');
+    const chevron = document.getElementById('calendarChevron');
+
+    if (calendarExpanded) {
+        content.style.display = 'block';
+        chevron.style.transform = 'rotate(180deg)';
+        buildMonthCalendar();
+    } else {
+        content.style.display = 'none';
+        chevron.style.transform = 'rotate(0deg)';
+    }
+    saveSettingsToDatabase();  // Auto-save calendar expanded state
+}
+
+function changeCalendarMonth(direction) {
+    currentCalendarMonth = currentCalendarMonth.clone().add(direction, 'months');
+    buildMonthCalendar();
+}
+
+function goToCalendarToday() {
+    currentCalendarMonth = moment();
+    buildMonthCalendar();
+    debugLog('info', 'Jumped to current month in calendar');
+}
+
+function toggleCalendarColorMode() {
+    const select = document.getElementById('calendarColorModeSelect');
+    calendarColorMode = select.value;
+    buildMonthCalendar();
+    saveSettingsToDatabase();
+    debugLog('info', `Calendar color mode changed to: ${calendarColorMode}`);
+}
+
+function toggleViewByMode() {
+    const select = document.getElementById('viewByModeSelect');
+    viewByMode = select.value;
+    buildMonthCalendar();
+    buildCapacityTable(currentCapacityWeek);
+    saveSettingsToDatabase();
+    debugLog('info', `View by mode changed to: ${viewByMode}`);
+}
+
+function getWOLabel(wo, maxLength = null) {
+    if (viewByMode === 'bom_num') {
+        const bomNum = wo.bom_num || 'N/A';
+        const qty = wo.qty_target || '?';
+        let label = `${bomNum} x${qty}`;
+        // Truncate if needed
+        if (maxLength && label.length > maxLength) {
+            label = label.substring(0, maxLength - 1) + '…';
+        }
+        return label;
+    } else {
+        // Default: WO number
+        return wo.wo_num;
+    }
+}
+
+function scrollCapacityToWeek(weekStart) {
+    // Update capacity view to show this week
+    currentCapacityWeek = weekStart.clone().startOf('isoWeek');
+    buildCapacityTable(currentCapacityWeek);
+
+    // Scroll the capacity table into view smoothly
+    const capacityTable = document.getElementById('capacityTable');
+    if (capacityTable) {
+        capacityTable.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+}
+
+async function handleCalendarWODrop(dragData, dropDateStr) {
+    // Find the WO in allWorkOrders
+    const wo = allWorkOrders.find(w => w.wo_id === dragData.wo_id);
+    if (!wo) {
+        debugLog('error', `WO ${dragData.wo_num} not found in allWorkOrders`);
+        return;
+    }
+
+    // Calculate the date shift
+    const originalStart = moment(dragData.originalStart);
+    const originalEnd = moment(dragData.originalEnd);
+    const dropDate = moment(dropDateStr);
+    const daysDiff = dropDate.diff(originalStart, 'days');
+
+    if (daysDiff === 0) {
+        debugLog('info', `WO ${dragData.wo_num} dropped on same date, no change needed`);
+        return;
+    }
+
+    // Calculate new dates
+    const newStart = originalStart.clone().add(daysDiff, 'days');
+    const newEnd = originalEnd.clone().add(daysDiff, 'days');
+
+    debugLog('info', `Moving WO ${dragData.wo_num} by ${daysDiff} days: ${originalStart.format('YYYY-MM-DD')} → ${newStart.format('YYYY-MM-DD')}`);
+
+    // Save to database using the async function
+    await saveWODates(dragData.wo_num, newStart.format('YYYY-MM-DD'), newEnd.format('YYYY-MM-DD'));
+}
+
+async function handleCapacityWODrop(wo, targetDay, targetCategory, currentWeekStart) {
+    debugLog('info', `handleCapacityWODrop called for WO ${wo.wo_num}, targetCategory: ${targetCategory ? targetCategory.name + ' (ID: ' + targetCategory.id + ')' : 'null'}`);
+
+    let hasChanges = false;
+    const changes = [];
+    let newStart, newEnd;
+
+    // Handle date change
+    if (targetDay) {
+        const originalStart = moment(wo.date_scheduled_start);
+        const originalEnd = moment(wo.date_scheduled);
+        const daysDiff = targetDay.diff(originalStart.startOf('day'), 'days');
+
+        if (daysDiff !== 0) {
+            newStart = originalStart.clone().add(daysDiff, 'days');
+            newEnd = originalEnd.clone().add(daysDiff, 'days');
+
+            changes.push(`date: ${originalStart.format('YYYY-MM-DD')} → ${newStart.format('YYYY-MM-DD')}`);
+            hasChanges = true;
+        }
+    }
+
+    // Handle category change
+    let categoryChanged = false;
+    if (targetCategory && targetCategory.id !== wo.calcategory_id) {
+        const oldCategoryName = wo.calendar_category || 'Uncategorized';
+        changes.push(`category: ${oldCategoryName} → ${targetCategory.name}`);
+        categoryChanged = true;
+        hasChanges = true;
+        debugLog('info', `Category change detected: ${oldCategoryName} (ID: ${wo.calcategory_id}) → ${targetCategory.name} (ID: ${targetCategory.id})`);
+    } else if (targetCategory) {
+        debugLog('info', `No category change - target ${targetCategory.id} is same as current ${wo.calcategory_id}`);
+    }
+
+    if (hasChanges) {
+        debugLog('info', `Moving WO ${wo.wo_num}: ${changes.join(', ')}`);
+
+        // Save date changes first if any
+        if (newStart && newEnd) {
+            debugLog('info', `Calling saveWODates for WO ${wo.wo_num}`);
+            await saveWODates(wo.wo_num, newStart.format('YYYY-MM-DD'), newEnd.format('YYYY-MM-DD'));
+        }
+
+        // Then save category change if any
+        if (categoryChanged) {
+            debugLog('info', `Calling saveWOCategory for WO ${wo.wo_num} with category ID ${targetCategory.id}`);
+            await saveWOCategory(wo.wo_num, targetCategory.id);
+        }
+
+        // Reload work orders to reflect changes
+        debugLog('info', `Reloading work orders after WO ${wo.wo_num} changes`);
+        loadWorkOrders();
+    } else {
+        debugLog('info', `WO ${wo.wo_num} dropped with no changes`);
+        renderCurrentView(); // Still refresh to snap back to original position
+    }
+}
+
+function buildMonthCalendar() {
+    const container = document.getElementById('monthCalendar');
+    if (!container) return;
+
+    container.innerHTML = '';
+
+    const monthStart = currentCalendarMonth.clone().startOf('month');
+    const monthEnd = currentCalendarMonth.clone().endOf('month');
+
+    // Update month display
+    const monthDisplay = document.getElementById('calendarMonthDisplay');
+    if (monthDisplay) {
+        monthDisplay.textContent = monthStart.format('MMMM YYYY');
+    }
+
+    // Calculate calendar grid (start from Monday of first week)
+    const calendarStart = monthStart.clone().startOf('isoWeek');
+    const calendarEnd = monthEnd.clone().endOf('isoWeek');
+    const totalDays = calendarEnd.diff(calendarStart, 'days') + 1;
+    const numWeeks = Math.ceil(totalDays / 7);
+
+    // Pre-calculate max lanes per week row for dynamic height
+    const maxLanesPerWeek = new Array(numWeeks).fill(0);
+
+    // Get all WOs for this month and pack them
+    const calendarEndForWOs = calendarStart.clone().add(totalDays, 'days');
+    const wosInMonth = [];
+    filteredWorkOrders.forEach(wo => {
+        const woStart = moment(wo.date_scheduled_start).startOf('day');
+        const woEnd = moment(wo.date_scheduled).endOf('day');
+        if (woStart.isBefore(calendarEndForWOs) && woEnd.isAfter(calendarStart)) {
+            wosInMonth.push(wo);
+        }
+    });
+    packWOsIntoLanes(wosInMonth);
+
+    // Calculate max lanes for each week
+    wosInMonth.forEach(wo => {
+        const woStart = moment(wo.date_scheduled_start).startOf('day');
+        const woEnd = moment(wo.date_scheduled).endOf('day');
+        const startDayIndex = Math.max(0, woStart.diff(calendarStart, 'days'));
+        const endDayIndex = Math.min(totalDays - 1, woEnd.diff(calendarStart, 'days'));
+
+        if (startDayIndex < totalDays && endDayIndex >= 0) {
+            const startRow = Math.floor(startDayIndex / 7);
+            const endRow = Math.floor(endDayIndex / 7);
+
+            // Only count single-row WOs for now
+            if (startRow === endRow && startRow < numWeeks) {
+                const lane = wo._lane || 0;
+                maxLanesPerWeek[startRow] = Math.max(maxLanesPerWeek[startRow], lane + 1);
+            }
+        }
+    });
+
+    // Create table structure
+    const table = document.createElement('table');
+    table.className = 'w-full border-collapse';
+
+    // Header row with day names
+    const thead = document.createElement('thead');
+    const headerRow = document.createElement('tr');
+    const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    dayNames.forEach(day => {
+        const th = document.createElement('th');
+        th.className = 'px-2 py-2 text-xs font-bold text-slate-700 border border-slate-300 bg-slate-100';
+        th.textContent = day;
+        headerRow.appendChild(th);
+    });
+    thead.appendChild(headerRow);
+    table.appendChild(thead);
+
+    // Body with weeks and days
+    const tbody = document.createElement('tbody');
+    let currentDay = calendarStart.clone();
+
+    for (let week = 0; week < numWeeks; week++) {
+        const row = document.createElement('tr');
+
+        // Calculate dynamic height: 24px for header + 24px per lane, minimum 80px
+        const numLanes = maxLanesPerWeek[week] || 0;
+        const dynamicHeight = Math.max(80, 24 + (numLanes * 24) + 10); // +10px bottom padding
+
+        for (let day = 0; day < 7; day++) {
+            const cell = document.createElement('td');
+            cell.className = 'border border-slate-300 p-0 align-top relative cursor-pointer hover:bg-slate-100 transition-colors';
+            cell.style.height = `${dynamicHeight}px`;
+            cell.style.minWidth = '100px';
+
+            const isCurrentMonth = currentDay.month() === monthStart.month();
+            const isToday = currentDay.isSame(moment(), 'day');
+            const isWeekend = day >= 5;
+
+            // Calculate capacity for this day
+            let totalCapacity = 0;
+            let totalUsage = 0;
+            capacitySettings.categories.forEach(cat => {
+                const dayOfWeek = day;
+                const capacity = cat.limits[dayOfWeek];
+                const { usage } = getUsageForCategoryAndDay(cat.id, currentDay.clone());
+                totalCapacity += capacity;
+                totalUsage += usage;
+            });
+            const isOverCapacity = totalUsage > totalCapacity;
+
+            cell.innerHTML = `
+                <div class="p-1 ${isCurrentMonth ? '' : 'opacity-40'} ${isWeekend ? 'bg-amber-50' : 'bg-white'} h-full">
+                    <div class="flex items-start justify-between gap-1">
+                        <div class="flex items-center gap-1">
+                            <span class="text-xs font-semibold ${isToday ? 'bg-indigo-500 text-white rounded-full px-2 py-0.5' : 'text-slate-600'}">${currentDay.format('D')}</span>
+                            <span class="text-xs text-slate-500">${totalUsage.toFixed(0)}/${totalCapacity}h</span>
+                        </div>
+                        ${isOverCapacity ? '<span class="text-xs text-red-600 font-bold">!</span>' : ''}
+                    </div>
+                </div>
+            `;
+
+            // Add click handler for day
+            const clickDay = currentDay.clone();
+            cell.addEventListener('click', () => {
+                const weekStart = clickDay.clone().startOf('isoWeek');
+                scrollCapacityToWeek(weekStart);
+            });
+
+            // Add drop zone handlers for drag and drop
+            cell.setAttribute('data-calendar-date', clickDay.format('YYYY-MM-DD'));
+
+            cell.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'move';
+                cell.style.backgroundColor = '#DEEAF4'; // indigo-100
+            });
+
+            cell.addEventListener('dragleave', (e) => {
+                if (isWeekend) {
+                    cell.style.backgroundColor = '';
+                } else {
+                    cell.querySelector('div').style.backgroundColor = isCurrentMonth ? '#ffffff' : '';
+                }
+            });
+
+            cell.addEventListener('drop', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+
+                // Reset background
+                if (isWeekend) {
+                    cell.style.backgroundColor = '';
+                } else {
+                    cell.querySelector('div').style.backgroundColor = isCurrentMonth ? '#ffffff' : '';
+                }
+
+                try {
+                    const dragData = JSON.parse(e.dataTransfer.getData('text/plain'));
+                    const dropDate = clickDay.format('YYYY-MM-DD');
+                    handleCalendarWODrop(dragData, dropDate);
+                } catch (error) {
+                    debugLog('error', 'Error handling calendar WO drop:', error);
+                }
+            });
+
+            // Add red border if over capacity
+            if (isOverCapacity) {
+                cell.style.borderColor = '#C43046';
+                cell.style.borderWidth = '2px';
+            }
+
+            row.appendChild(cell);
+            currentDay.add(1, 'day');
+        }
+
+        tbody.appendChild(row);
+    }
+
+    table.appendChild(tbody);
+    container.appendChild(table);
+
+    // Now render WO overlays
+    renderCalendarWOs(table, calendarStart);
+}
+
+function renderCalendarWOs(table, calendarStart) {
+    const tbody = table.querySelector('tbody');
+    const rows = tbody.querySelectorAll('tr');
+
+    // Get all WOs that overlap with this month
+    const totalDays = rows.length * 7;
+    const calendarEnd = calendarStart.clone().add(totalDays, 'days');
+    const wosInMonth = [];
+
+    filteredWorkOrders.forEach(wo => {
+        // Filter out completed WOs if setting is disabled
+        if (!showCompletedWOs && wo.wo_status === 40) return;
+
+        const woStart = moment(wo.date_scheduled_start).startOf('day');
+        let woEnd = moment(wo.date_scheduled).endOf('day');
+
+        // For completed WOs, use date_finished if available and earlier than date_scheduled
+        if (wo.wo_status === 40 && wo.date_finished) {
+            const dateFinished = moment(wo.date_finished).endOf('day');
+            woEnd = moment.min(woEnd, dateFinished);
+        }
+
+        if (woStart.isBefore(calendarEnd) && woEnd.isAfter(calendarStart)) {
+            wosInMonth.push(wo);
+        }
+    });
+
+    // Pack WOs into rows to avoid overlap
+    packWOsIntoLanes(wosInMonth);
+
+    // Render each WO as positioned within cells
+    wosInMonth.forEach((wo) => {
+        const woStart = moment(wo.date_scheduled_start).startOf('day');
+        let woEnd = moment(wo.date_scheduled).endOf('day');
+
+        // For completed WOs, use date_finished if available and earlier than date_scheduled
+        if (wo.wo_status === 40 && wo.date_finished) {
+            const dateFinished = moment(wo.date_finished).endOf('day');
+            woEnd = moment.min(woEnd, dateFinished);
+        }
+
+        // Calculate which days this WO spans
+        const startDayIndex = Math.max(0, woStart.diff(calendarStart, 'days'));
+        const endDayIndex = Math.min(totalDays - 1, woEnd.diff(calendarStart, 'days'));
+
+        if (startDayIndex >= totalDays || endDayIndex < 0) return;
+
+        // Find which row and columns
+        const startRow = Math.floor(startDayIndex / 7);
+        const startCol = startDayIndex % 7;
+        const endRow = Math.floor(endDayIndex / 7);
+        const endCol = endDayIndex % 7;
+
+        // For now, only render WOs that fit within a single row
+        if (startRow !== endRow) return; // Skip multi-row WOs for simplicity
+
+        const row = rows[startRow];
+        if (!row) return;
+
+        const cells = row.querySelectorAll('td');
+        const startCell = cells[startCol];
+        const endCell = cells[endCol];
+
+        if (!startCell || !endCell) return;
+
+        // Create WO bar as absolute positioned element within the row
+        const woBar = document.createElement('div');
+        woBar.className = 'absolute rounded px-1 py-0.5 text-xs font-medium cursor-move hover:opacity-80 transition-opacity border';
+        woBar.draggable = true;
+        woBar.setAttribute('data-wo-id', wo.wo_id);
+        woBar.setAttribute('data-wo-num', wo.wo_num);
+        woBar.setAttribute('data-wo-start', wo.date_scheduled_start);
+        woBar.setAttribute('data-wo-end', wo.date_scheduled);
+
+        // Calculate position based on cell positions within the row
+        const rowWidth = row.offsetWidth;
+        const cellWidth = rowWidth / 7;
+        const horizontalPadding = 4;
+        const left = (startCol * cellWidth) + horizontalPadding;
+        const width = ((endCol - startCol + 1) * cellWidth) - (horizontalPadding * 2);
+        const top = 24 + ((wo._lane || 0) * 24);
+
+        woBar.style.left = `${left}px`;
+        woBar.style.top = `${top}px`;
+        woBar.style.width = `${width}px`;
+        woBar.style.height = '20px';
+        woBar.style.zIndex = '10';
+
+        // Color by status or category based on setting
+        if (calendarColorMode === 'category' && wo.category_color) {
+            // Use category color (add # prefix if not present)
+            const categoryColor = wo.category_color.startsWith('#') ? wo.category_color : '#' + wo.category_color;
+            woBar.style.backgroundColor = categoryColor + '40'; // Add transparency (40 = 25% opacity in hex)
+            woBar.style.borderColor = categoryColor;
+            woBar.style.color = '#101010'; // Fishbowl dark text
+            woBar.className += ' border-2';
+        } else {
+            // Use status color (default)
+            const colors = WO_STATUS_COLORS[wo.wo_status] || WO_STATUS_COLORS[10];
+            woBar.className += ` ${colors.bg} ${colors.border} ${colors.text}`;
+        }
+        // Use view mode setting to determine label
+        const woLabel = getWOLabel(wo, 12); // Truncate to 12 chars for calendar tiles
+        woBar.textContent = viewByMode === 'bom_num' ? woLabel : `WO ${woLabel}`;
+
+        // Custom CSS tooltip
+        const laborHoursPerUnit = parseFloat(wo.labor_hours_from_bom) || 0;
+        const qtyTarget = parseFloat(wo.qty_target) || 1;
+        const totalHours = laborHoursPerUnit * qtyTarget;
+        const statusName = wo.wo_status === 10 ? 'Entered' : wo.wo_status === 30 ? 'Started' : wo.wo_status === 40 ? 'Fulfilled' : 'Unknown';
+        const calendarTooltipHTML = `
+            <div><span class="wo-tooltip-label">WO:</span><span class="wo-tooltip-value">${wo.wo_num}</span></div>
+            <div><span class="wo-tooltip-label">MO:</span><span class="wo-tooltip-value">${wo.mo_num}</span></div>
+            <div><span class="wo-tooltip-label">Category:</span><span class="wo-tooltip-value">${wo.category_name || 'Uncategorized'}</span></div>
+            <div><span class="wo-tooltip-label">BOM:</span><span class="wo-tooltip-value">${wo.bom_num || 'N/A'}</span></div>
+            <div><span class="wo-tooltip-label">Finished Good:</span><span class="wo-tooltip-value">${wo.part_num || 'N/A'} x ${wo.qty_target || '?'}</span></div>
+            <div><span class="wo-tooltip-label">Status:</span><span class="wo-tooltip-value">${statusName}</span></div>
+            <div><span class="wo-tooltip-label">Hours:</span><span class="wo-tooltip-value">${totalHours.toFixed(2)}h</span></div>
+            <div><span class="wo-tooltip-label">Start:</span><span class="wo-tooltip-value">${formatDate(woStart)}</span></div>
+            <div><span class="wo-tooltip-label">Finish:</span><span class="wo-tooltip-value">${formatDate(woEnd)}</span></div>
+        `;
+
+        woBar.addEventListener('mouseover', (e) => {
+            showWOTooltip(e, calendarTooltipHTML);
+        });
+        woBar.addEventListener('mouseout', () => {
+            hideWOTooltip();
+        });
+        woBar.addEventListener('mousemove', (e) => {
+            showWOTooltip(e, calendarTooltipHTML);
+        });
+
+        // Drag and drop handlers
+        woBar.addEventListener('dragstart', (e) => {
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', JSON.stringify({
+                wo_id: wo.wo_id,
+                wo_num: wo.wo_num,
+                originalStart: wo.date_scheduled_start,
+                originalEnd: wo.date_scheduled
+            }));
+            woBar.style.opacity = '0.5';
+        });
+
+        woBar.addEventListener('dragend', (e) => {
+            woBar.style.opacity = '1';
+        });
+
+        // Click handler - scroll to week
+        woBar.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const weekStart = woStart.clone().startOf('isoWeek');
+            scrollCapacityToWeek(weekStart);
+        });
+
+        // Right-click to set WO dates and category via pickers
+        woBar.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            hideWOTooltip();
+            showWOContextMenu(e, wo);
+        });
+
+        // Append to the row (not tbody) with relative positioning
+        row.style.position = 'relative';
+        row.appendChild(woBar);
+    });
+}
+
+// ============================================
+// INITIALIZATION
+// ============================================
+window.addEventListener('DOMContentLoaded', () => {
+    // Initialize date ranges now that moment.js is loaded
+    if (typeof moment === 'undefined') {
+        console.error('moment.js is not loaded!');
+        return;
+    }
+
+    // Runtime guard — fb-lib is required for the v1.1 chrome. If it
+    // isn't loaded (unsaved script on the server, or opened outside
+    // Fishbowl), surface a clear message rather than silently failing.
+    if (!window.FBLib || !FBLib.Common || !FBLib.Settings) {
+        document.body.innerHTML =
+          '<div style="padding:40px;font-family:sans-serif;color:#A32439;">' +
+          '<h2>fb-lib not loaded</h2><p>This report needs the saved Script <code>fb-lib</code> to be present on this Fishbowl server. ' +
+          'Ask an admin to deploy <code>scripts/fb-lib.js</code> as a Script named <code>fb-lib</code>.</p></div>';
+        return;
+    }
+
+    ganttStartDate = moment().startOf('isoWeek');
+    ganttEndDate = moment().startOf('isoWeek').add(14, 'days');
+
+    // ── Init FBLib.Settings (userproperties-backed persistence). See
+    // v1.1 header comment for the migration model. `defaults` mirrors
+    // the current in-memory globals so `resolve(key)` always returns
+    // a sensible value even before saveUser() has ever been called.
+    initSettings();
+
+    // Load user groups + the logged-in user's memberships up front so the admin
+    // Finish-WO group picker (refreshAdminUi) and the button gate can use them.
+    psLoadUserGroups();
+
+    // ── Register the drop-down drawers with fb-lib so they get
+    // mutual-exclusion + ESC-to-close + trigger-button active state.
+    FBLib.Common.registerDrawer({ id: 'settingsOverlay',     triggerId: 'setBtn'  });
+    FBLib.Common.registerDrawer({ id: 'instructionsOverlay', triggerId: 'helpBtn' });
+
+    // Show / hide the admin section + lock badge based on the
+    // logged-in user's role. Called once here because isAdmin() +
+    // MASTER._userEditingAllowed are set at Settings.init() time
+    // and don't change without a page reload.
+    refreshAdminUi();
+
+    // ── Mount the fb-lib debug drawer. Disabled by default — only
+    // opens when the user has ticked "Show debug console" in
+    // Settings (dsDebug=true saved in userproperties). The legacy
+    // BI_SHOW_DEBUG server property still gates debugLog() output
+    // for admin console diagnostics, but no longer forces the
+    // drawer open — surface it explicitly via the settings toggle.
+    // The drawer supplies the #debugLog element that debugLog(...)
+    // targets, so once the user opens it, existing debug calls
+    // populate as expected.
+    const debugPref = !!FBLib.Settings.resolve('dsDebug');
+    applyDebugDrawer(debugPref);
+    const dsDebugEl = document.getElementById('dsDebug');
+    if (dsDebugEl) {
+        dsDebugEl.checked = debugPref;
+        dsDebugEl.addEventListener('change', () => {
+            const on = dsDebugEl.checked;
+            FBLib.Settings.setUserKey('dsDebug', on);
+            FBLib.Settings.saveUser();
+            applyDebugDrawer(on);
+        });
+    }
+
+    // Admin-only: "Enable Finish WO button" toggle in the Settings ▸ Admin
+    // section. Its change handler publishes to the master payload (admin-gated
+    // inside setFinishWOEnabled). Initial checked state is synced by
+    // refreshAdminUi(); the whole admin section is hidden for non-admins.
+    const dsFinishEl = document.getElementById('dsEnableFinishWO');
+    if (dsFinishEl) {
+        dsFinishEl.checked = !!FBLib.Settings.resolve('enableFinishWO');
+        dsFinishEl.addEventListener('change', () => setFinishWOEnabled(dsFinishEl.checked));
+    }
+
+    // Default-tab selector — sets which view the report opens on next time.
+    // 'last' keeps the existing remember-last-view behaviour.
+    const defViewEl = document.getElementById('defaultViewSelect');
+    if (defViewEl) {
+        defViewEl.value = FBLib.Settings.resolve('defaultView') || 'last';
+        defViewEl.addEventListener('change', () => {
+            const val = defViewEl.value || 'last';
+            FBLib.Settings.setUserKey('defaultView', val);
+            FBLib.Settings.saveUser();
+            showToast(val === 'last' ? 'Report will open on your last used view' : 'Default tab set — opens on ' + val, 'success', 2500);
+        });
+    }
+
+    debugLog('info', 'Application starting (v1.2)...');
+    if (DEBUG_MODE) {
+        debugLog('info', 'Debug mode enabled via BI_SHOW_DEBUG property');
+    }
+
+    // v1.2: hydrate the workspace shell (persisted view/group prefs +
+    // rail avatar + tabs) before loading data.
+    initShell();
+
+    // Initialize event listeners for UI controls
+    initializeEventListeners();
+
+    // Load work orders (settings will be loaded after categories are initialized).
+    // Initial load ONLY: show the blocking overlay (nothing to interact with yet);
+    // every later refresh runs in the background (see loadWorkOrders).
+    loadWorkOrders({ background: false });
+
+    // v1.2: reveal the persisted active view now that data is loaded.
+    setView(psView);
+});
+
+// v1.2: hydrate the app-shell — restore persisted view + grouping,
+// paint the rail avatar from the logged-in user, and render the tabs.
+function initShell(){
+    try {
+        // Opening tab: an explicit default pins a specific view; 'last' (the
+        // default) falls back to the last-used view tracked by setView().
+        const dv = FBLib.Settings.resolve('defaultView') || 'last';
+        if (dv !== 'last' && PS_VIEWS.some(x => x.id === dv) && psTabEnabled(dv)) {
+            psView = dv;
+        } else {
+            const v = FBLib.Settings.resolve('activeView');
+            if (v && PS_VIEWS.some(x => x.id === v) && psTabEnabled(v)) psView = v;
+        }
+        psTimelineGroup = FBLib.Settings.resolve('timelineGroupBy') || 'mo';
+        psTableGroup = FBLib.Settings.resolve('tableGroupBy') || 'none';
+        psLoadDim = FBLib.Settings.resolve('loadDim') || 'cat';
+        viewMode = psTimelineGroup;
+        // Restore the remembered global date range.
+        psDateRange.key = FBLib.Settings.resolve('dashRangeKey') || 'all';
+        psDateRange.customStart = FBLib.Settings.resolve('dashRangeStart') || '';
+        psDateRange.customEnd = FBLib.Settings.resolve('dashRangeEnd') || '';
+        psComputeRange();
+        // Restore the CF filters drawer's object-group order (drag-reordered per user).
+        const _cfo = FBLib.Settings.resolve('cfGroupOrder');
+        if (Array.isArray(_cfo)) { const _k = _cfo.filter(o => PS_CF_OBJ_KEYS.indexOf(o) >= 0); if (_k.length) psCfGroupOrder = _k; }
+    } catch (_) {}
+    try {
+        if (typeof getUser === 'function') {
+            const u = JSON.parse(getUser() || '{}');
+            const initials = ((u.firstName || ' ').charAt(0) || '') + ((u.lastName || ' ').charAt(0) || '');
+            const av = document.getElementById('railAvatar');
+            if (av && initials.trim()) {
+                av.textContent = initials.toUpperCase();
+                av.title = ((u.firstName || '') + ' ' + (u.lastName || '')).trim();
+            }
+        }
+    } catch (_) {}
+    renderTabs();
+}
+
+// ============================================
+// v1.1 SETTINGS INIT + MIGRATION
+// ============================================
+// Wires FBLib.Settings.init() with defaults that mirror this report's
+// in-memory globals. On very first load, if no userproperties settings
+// exist for this user AND the legacy _settingsCapacityPlanner fake
+// part is still present, we hydrate FBLib.Settings from it and save
+// forward — so users don't lose their prefs when they open v1.1 for
+// the first time. Subsequent loads read from userproperties only.
+function initSettings() {
+    FBLib.Settings.init({
+        userKey:   'cdx.bi.productionsched.user.v1',
+        masterKey: 'cdx.bi.productionsched.master.v1',
+        defaults: {
+            v: 1,
+            allowSameDayStarts: false,
+            shiftDependentWOs:  false,
+            skipWeekends:       false,
+            showArrows:         true,
+            showCompletedWOs:   true,
+            calendarColorMode:  'status',
+            viewByMode:         'wo_num',
+            calendarExpanded:   false,
+            ganttScale:         80,
+            collapsedMOs:       [],
+            categoryLimits:     {},
+            dsDebug:            false,
+            // v1.2 workspace prefs (additive — old saved payloads still resolve).
+            activeView:         'dashboard',   // dashboard|timeline|board|table|calendar|load — last-used view
+            defaultView:        'last',        // which tab the report opens on: 'last' (remember) or a specific view id
+            timelineGroupBy:    'mo',          // mo|site|resource|category|user
+            tableGroupBy:       'none',        // Work Orders table grouping: none|mo|category|site|resource|user
+            loadDim:            'cat',         // cat|user
+            userCapacityHours:  8,             // legacy flat per-user daily capacity (User Load) — superseded by rosterConfig.business.hoursPerDay
+            // Admin-only, master-published ROSTER / capacity model. Feeds the User
+            // Load heatmap AND the Planning tab's capacity-aware suggestions.
+            //   business = company defaults; users = sparse per-user overrides;
+            //   holidays = company closures (single {date} or {start,end} range).
+            rosterConfig: {
+                business: { start:'08:00', end:'16:30', hoursPerDay:8, workDays:[1,1,1,1,1,0,0] }, // Mon..Sun (1=work day)
+                holidays: [],   // [{date:'YYYY-MM-DD', name} | {start:'YYYY-MM-DD', end:'YYYY-MM-DD', name}]
+                users:    {}     // { '<userId>': { hoursPerDay?:Number, workDays?:[7] } } — blank inherits business
+            },
+            moCreateStatus:     'Issued',      // Create-MO default order status: Issued (live) | Entered (suggestion)
+            cfGroupOrder:       ['bom','mo','wo','part'], // CF filters drawer: object-group display order (drag-reorder, persisted)
+            // GLOBAL date-range filter (remembered per user; first-run 'all' = no
+            // restriction so behaviour is unchanged until a range is chosen).
+            dashRangeKey:       'all',         // all|today|tomorrow|week|nextweek|month|nextmonth|custom
+            dashRangeStart:     '',            // custom range start (YYYY-MM-DD)
+            dashRangeEnd:       '',            // custom range end (YYYY-MM-DD)
+            // v1.2 WO Finish (user-level): when true, non-mandatory FG
+            // tracking defs are pre-confirmed with their suggested value
+            // so the operator isn't gated on confirming each field.
+            finishAutoApplyFgDefaults: true,
+            // Admin-only, master-published: gate the drawer "Finish WO" button.
+            // Off by default — only an admin can turn it on (Settings ▸ Admin),
+            // and it persists to the master (report-data) payload for all users.
+            enableFinishWO:     false,
+            // Admin-only, master-published: restrict the Finish WO button to a
+            // single user group. '' = all users (no restriction). Only applies
+            // when enableFinishWO is on.
+            finishWOGroupId:    '',
+        }
+    });
+
+    // If the user has never saved v1.1 settings, one-shot migrate
+    // from the legacy fake-part row.
+    const hasUserPrefs = Object.keys(FBLib.Settings.getUser() || {}).length > 0;
+    if (!hasUserPrefs) {
+        try {
+            const legacy = loadLegacyFakePartSettings();
+            if (legacy) {
+                // Copy each recognised key into the FBLib user payload
+                // and save forward. gatherSettings() reads the live
+                // globals — but at this point we haven't applied
+                // anything yet, so we push straight from the legacy
+                // object.
+                ['allowSameDayStarts','shiftDependentWOs','skipWeekends',
+                 'showArrows','showCompletedWOs','calendarColorMode',
+                 'viewByMode','calendarExpanded','ganttScale',
+                 'collapsedMOs','categoryLimits'].forEach(function (k) {
+                    if (legacy[k] !== undefined) FBLib.Settings.setUserKey(k, legacy[k]);
+                });
+                FBLib.Settings.saveUser();
+                console.info('[v1.1 migration] Legacy fake-part settings copied to userproperties. Future saves skip the fake-part write.');
+            }
+        } catch (e) {
+            console.warn('[v1.1 migration] Legacy fake-part read failed:', e && e.message);
+        }
+    }
+}

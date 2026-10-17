@@ -1,0 +1,1151 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Cycle Count List (iReport port)
+  PATH:   iReport_Ports/Inventory/CycleCountList.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard Inventory/CycleCountList.jrxml and its
+  subreport subSerialList.jrxml ("a list of all parts and current quantities
+  organized by location group and location, with a blank line to write in
+  the actual quantities": a Physical Inventory Worksheet). Same source, same
+  rules, same columns and grouping; only the presentation is interactive.
+
+    Source     tag, summed per part + location + tracking combination
+               (trackingEncoding), every tag type with a part, for inventory
+               parts (part.typeId 10). Qty is in the part's own UOM.
+    Filters    Location groups (the user's own, getLocationGroupList),
+               location, part number (LIKE), ABC code, include inactive
+               parts.
+    Zero qty   Do Not Show / Show In Default Locations (parts with a
+               defaultlocation row in a chosen location and no tag there,
+               qty 0) / Show As 'Not In Inventory' (parts with no tag in the
+               chosen locations, in a last group of that name). As the
+               original's three UNION parts.
+    Tracking   Each line's non-serial tracking (Lot, Use By, …) as
+               "Abbr: value", from the line's newest tag.
+    Serials    "Show serial numbers" lists the line's serial numbers
+               (tagserialview, the subSerialList subreport) as rows under it,
+               for lines with qty > 0.
+    Show qty   Off = a blind count: the Qty and UOM columns are left off,
+               on screen and on paper, as the original's ShowQty.
+    Grouping   Location group → location → part, ordered as the original
+               (location group, location, part number). The original has no
+               totals; group rows carry line counts only.
+    Print      The count sheet: the original's columns with a blank Count
+               line per row, under location-group and location headings.
+               Optionally a new page for each location group or location.
+
+  Layout: the REPORT chrome (fb-styles §35): 56px header, push-down filter
+  panel that applies as you change it, collapsible group rows, sticky
+  footer.
+  Table tools (fb-lib FBLib.RptCols / RowCap): column headings sort the
+  lines within each location (the location groups and locations keep the
+  original's order, serial numbers stay under their line), drag to reorder
+  and resize (remembered per user). Count (a blank line) and Tracking (a
+  stack of values) don't sort; a blind count ignores a sort on the hidden
+  Qty / UOM, which would give the quantities away. The query fetches at
+  most 10,000 lines, cut back to whole locations (a count sheet must never
+  end part-way through a location), with Load all. No pivot: the report is
+  a sheet to write counts on, and its only figure is a quantity in each
+  part's own UOM that a blind count must hide.
+  Views: the header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+  count sheet out as pages like the original: Letter portrait by default,
+  the company / title band on every page (the original's page header), the
+  column headings repeated, location-group headings (double rule) and
+  location headings, a group carried over a page break marked
+  "(continued)", a blank Count line on every row (never narrower than the
+  original's 120pt line, for handwriting), tracking stacked one per line,
+  serial numbers indented under their line, the optional new page per
+  location group or location, no Qty / UOM in a blind count, a "Counted by
+  / Date" line after the last row, "Page X of Y". Columns fit the page and
+  the font steps down from the original's 10pt when they don't. The paper
+  size and orientation, and the view, are remembered per user. Print prints
+  those pages in either view.
+
+  Deliberate differences:
+    - Tracking is read from the tracking tables (trackingtext / date /
+      decimal / integer + parttracking), formatted as tagtrackingview
+      formats it. The original joins tagtrackingview, a TEMPTABLE view that
+      materialises every tag's tracking, and that fails outright under
+      ONLY_FULL_GROUP_BY (the server's default mode; Fishbowl's own JDBC
+      sessions switch it off, so the original runs in the client). This
+      port runs either way.
+    - The tag roll-up is limited to the chosen location groups inside its
+      derived table (a speed-up; identical result: 563 lines,
+      qty 1,655,320.9138 on the live database for both).
+    - Location is a multi-select (the original takes one or all).
+    - The "Not In Inventory" group sorts last by a flag, not by the
+      original's 'zzz' location-group name; it has no empty location
+      heading.
+    - ABC code "All" adds no condition, so a part with no ABC code is no
+      longer dropped by the original's LIKE on NULL.
+    - Part, Description and Tracking are separate columns (the original
+      prints "Part - Description" with tracking lines beneath). The blank
+      column is headed "Count" (the original heads it "Qty" only when
+      quantities are hidden).
+    - Lines for the same part in one location are ordered by tag (the
+      original leaves them unordered).
+  Additions: record links, collapsible groups, Excel, print page breaks.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-folder" content="Inventory">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="Physical inventory worksheet: parts and quantities by location, with space for the counted quantity.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipCycleCountList',
+            name:  'Cycle Count List',
+            build: '2026.10.16-2e8900d'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cycle Count List — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table th { cursor: default; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        .rpt-table tr.rpt-sub { cursor: pointer; }
+        .rpt-table tr.rpt-sub .rpt-grp-inner { padding-left: 14px; }
+        .rpt-table tr.rpt-minor td.sn-cell { padding-left: 26px; }
+        .cnt-line { display: block; min-width: 110px; height: 14px; border-bottom: 1px solid #8A9AA1; }
+        .trk { color: var(--c-secondary); }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>Cycle Count List</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="split-btn">
+            <button id="expandBtn" class="hdr-btn" type="button" title="Show every location group's lines">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+                Expand
+            </button>
+            <button id="collapseBtn" class="hdr-btn" type="button" title="Location group headings only">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 12h14" stroke-linecap="round"/></svg>
+                Collapse
+            </button>
+        </span>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download the count sheet as an Excel workbook">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages (the count sheet): collapsed groups print as their heading only">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Where</div>
+            <div>
+                <div class="rpt-flabel">Location groups</div>
+                <div class="ms-container" id="lgMs">
+                    <div class="ms-trigger" id="lgMs-trigger"><span class="ms-placeholder" id="lgMs-placeholder">All my location groups</span></div>
+                    <div class="ms-dropdown hidden" id="lgMs-dropdown">
+                        <div class="ms-search"><input type="text" id="lgMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="lgMs-all">Select All</span><span id="lgMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="lgMs-list"></div>
+                    </div>
+                </div>
+            </div>
+            <div>
+                <div class="rpt-flabel">Locations</div>
+                <div class="ms-container" id="locMs">
+                    <div class="ms-trigger" id="locMs-trigger"><span class="ms-placeholder" id="locMs-placeholder">All locations</span></div>
+                    <div class="ms-dropdown hidden" id="locMs-dropdown">
+                        <div class="ms-search"><input type="text" id="locMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="locMs-all">Select All</span><span id="locMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="locMs-list"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Parts</div>
+            <div>
+                <div class="rpt-flabel">Part number</div>
+                <input type="text" id="fPart" placeholder="All parts (% is a wildcard)">
+            </div>
+            <div>
+                <div class="rpt-flabel">ABC code</div>
+                <select id="fAbc">
+                    <option value="%">All</option>
+                    <option value="N">None</option>
+                    <option value="A">A</option>
+                    <option value="B">B</option>
+                    <option value="C">C</option>
+                </select>
+            </div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fInactive"> Show inactive parts</label>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Count sheet</div>
+            <div>
+                <div class="rpt-flabel">Zero quantity items</div>
+                <select id="fZero">
+                    <option value="no">Do Not Show</option>
+                    <option value="defaultloc">Show In Default Locations</option>
+                    <option value="show">Show As 'Not In Inventory'</option>
+                </select>
+            </div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fShowQty"> Show quantities on hand</label>
+            <label class="rpt-fcheck"><input type="checkbox" id="fSerials"> Show serial numbers</label>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Printing</div>
+            <div>
+                <div class="rpt-flabel">Start a new page for each</div>
+                <select id="fPageBreak">
+                    <option value="none">Nothing (one continuous list)</option>
+                    <option value="lg">Location group</option>
+                    <option value="loc">Location</option>
+                </select>
+            </div>
+            <div class="rpt-fnote">Untick <strong>Show quantities on hand</strong><br>for a blind count.</div>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own sort">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters what everyone sees each time this report opens. Anyone can still change them while it is open.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+                <button type="button" class="ds-btn" id="unpublishBtn" title="Everyone goes back to their own last choices">Stop using them</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>Every inventory part on hand, by location group and location, with a blank <strong>Count</strong> line to write in what you actually count. It is the BI version of the standard <strong>Cycle Count List</strong> (the Physical Inventory Worksheet) and reads the same data the same way.</p>
+                <p>A part with stock under several lots, use-by dates or other tracking has one line per combination, with its tracking shown.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Options</div>
+                <ul>
+                    <li><strong>Zero quantity items</strong>: <em>Show In Default Locations</em> adds parts with none on hand in their default location (qty 0), so a count can confirm the zero. <em>Show As 'Not In Inventory'</em> lists parts with none on hand anywhere you picked, in a last group.</li>
+                    <li><strong>Show quantities on hand</strong> off gives a blind count: no Qty or UOM column.</li>
+                    <li><strong>Show serial numbers</strong> lists each serial number under its line.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>Filter changes apply straight away.</li>
+                    <li>Click a location group or location to show or hide its lines; <strong>Expand</strong> / <strong>Collapse</strong> do every location group.</li>
+                    <li>Click a column heading to sort the lines within each location (again to reverse, a third time for the standard order); serial numbers stay under their line. Count and Tracking don't sort, and a blind count ignores a sort on quantity. Drag a heading onto another to move the column (the printed sheet follows); drag a heading's right edge to resize it. Your layout is remembered; <strong>Settings → Reset column layout</strong> undoes it.</li>
+                    <li>A very large count shows its first 10,000 lines, cut back to whole locations, with a <strong>Load all</strong> button. Every location listed is complete; pick location groups or locations to count the rest.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable pages, laid out like the standard report. In PDF view pick the paper size and orientation in the bar above the pages; they are remembered. <strong>Print</strong> prints those pages.</li>
+                    <li><strong>Print</strong> gives the count sheet. Under <em>Printing</em> in the filters you can start a new page for each location group or location, one per counter.</li>
+                    <li>Quantities are in each part's own unit of measure.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Common || !FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const NOT_IN_INV = 'Not In Inventory';       // the original's last group
+const ZERO_LABEL = { no: 'Do Not Show', defaultloc: 'Show In Default Locations', show: "Show As 'Not In Inventory'" };
+const ABC_OK = ['%', 'N', 'A', 'B', 'C'];
+const BREAK_OK = ['none', 'lg', 'loc'];
+const TRACK_CHUNK = 1000;                    // tag ids per tracking query
+// The original's columns, in its order (the user may rearrange them:
+// visibleCols()).
+const COL_DEFS = [
+    { key: 'part',     label: 'Part',        w: 130, pw: 15 },     // pw = print width share
+    { key: 'desc',     label: 'Description', w: 280, pw: 32 },
+    { key: 'tracking', label: 'Tracking',    w: 200, pw: 20 },
+    { key: 'qty',      label: 'Qty',         w: 90,  pw: 8, num: true, onHand: true },
+    { key: 'uom',      label: 'UOM',         w: 50,  pw: 7, onHand: true },
+    { key: 'count',    label: 'Count',       w: 150, pw: 18, pdfMin: 120 }   // pdfMin: pt, the original's line
+];
+const DEFAULT_FILTERS = {
+    lgs: [], locs: [], part: '', abc: '%', inactive: false, zero: 'no',
+    showQty: true, serials: false, pageBreak: 'none'
+};
+// Changing one of these re-queries; the rest only redraw.
+const QUERY_KEYS = ['lgs', 'locs', 'part', 'abc', 'inactive', 'zero', 'serials'];
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        company: { keys: ['filters', 'opts'], editors: true },   // every open starts from the company defaults
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const ints = a => (Array.isArray(a) ? a : []).map(Number).filter(n => Number.isInteger(n));
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const dstr = v => { const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v ?? '')); return m ? m[1] : ''; };
+const fmtDate = v => { const d = dstr(v); return d ? FBLib.Common.formatDate(d) : ''; };
+const fmtMoney = v => FBLib.Common.formatMoney(v);
+const fmtQty = v => FBLib.Common.formatQty(v);
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const openLink = (module, number, title) => number
+    ? `<a class="fb-row-link" data-open="${esc(module)}" data-num="${esc(number)}"${title ? ` title="${esc(title)}"` : ''}>${esc(number)}</a>` : '';
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const cut = s => `<span title="${esc(s)}">${esc(s)}</span>`;
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS — the panel applies as it changes (one short debounce).
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _lgMs = null, _locMs = null;
+let _hydrating = false, _applyTimer = null;
+const S = { rows: [], company: '', myLgs: [], lgNames: {}, locNames: {}, loadedAt: null, collapsed: new Set(), noCap: false };
+
+function readFilters() {
+    return {
+        lgs: ints(_lgMs.getSelected()), locs: ints(_locMs.getSelected()),
+        part: document.getElementById('fPart').value.trim(),
+        abc: document.getElementById('fAbc').value,
+        inactive: document.getElementById('fInactive').checked,
+        zero: document.getElementById('fZero').value,
+        showQty: document.getElementById('fShowQty').checked,
+        serials: document.getElementById('fSerials').checked,
+        pageBreak: document.getElementById('fPageBreak').value
+    };
+}
+function writeFilters(f) {
+    _hydrating = true;
+    _lgMs.setSelected(ints(f.lgs)); _locMs.setSelected(ints(f.locs));
+    document.getElementById('fPart').value = f.part || '';
+    document.getElementById('fAbc').value = ABC_OK.indexOf(f.abc) !== -1 ? f.abc : '%';
+    document.getElementById('fInactive').checked = !!f.inactive;
+    document.getElementById('fZero').value = ZERO_LABEL[f.zero] ? f.zero : 'no';
+    document.getElementById('fShowQty').checked = f.showQty !== false;
+    document.getElementById('fSerials').checked = !!f.serials;
+    document.getElementById('fPageBreak').value = BREAK_OK.indexOf(f.pageBreak) !== -1 ? f.pageBreak : 'none';
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const requery = QUERY_KEYS.some(k => JSON.stringify(next[k]) !== JSON.stringify(F[k]));
+        F = next;
+        remember();
+        if (requery) { S.noCap = false; loadAll(); } else render(false);
+    }, 250);
+}
+
+// The chosen location groups, never outside the user's own.
+const chosenLgs = f => (f.lgs.length ? f.lgs : S.myLgs).filter(id => S.myLgs.indexOf(id) !== -1);
+function scopeText(f) {
+    const lgs = chosenLgs(f);
+    let t = f.lgs.length ? lgs.map(id => S.lgNames[id] || id).join(', ') : 'All my location groups';
+    if (f.locs.length) t += ' · ' + plural(f.locs.length, 'location');
+    return t;
+}
+
+// ============================================================================
+//  SQL — the iReport query's three UNION parts. Part 2 / 3 join in only for
+//  their Zero quantity option, as the original's "$P{cbZeroQuantityItems} =
+//  'defaultloc' / 'show'" conditions do.
+// ============================================================================
+function partWhere(f) {
+    const w = ['part.typeid = 10', 'part.activeflag+0 IN (' + (f.inactive ? '0, 1' : '1') + ')'];
+    if (f.abc !== '%' && ABC_OK.indexOf(f.abc) !== -1) w.push(`UPPER(part.abccode) LIKE '${f.abc}'`);
+    if (f.part) w.push(`UPPER(part.num) LIKE UPPER('${sqlStr(f.part.replace(/\*/g, '%'))}')`);
+    return w;
+}
+function buildSQL(f) {
+    const lgIn = chosenLgs(f).join(',') || '0';
+    const locAnd = f.locs.length ? ' AND location.id IN (' + f.locs.join(',') + ')' : '';
+    const pw = partWhere(f).join(' AND ');
+    // In inventory: tags summed per tracking combination + part + location.
+    let sql = `
+        SELECT 1 AS grp, lg.name AS lg, location.name AS location, tag.qty, part.num AS partnum,
+               part.description, uom.code AS uom, tag.trackingencoding, location.id AS locationid,
+               part.id AS partid, tag.id AS tagid
+        FROM part
+        JOIN (SELECT MAX(t.id) AS id, COALESCE(SUM(t.qty), 0) AS qty, t.partid, t.locationid, t.trackingencoding
+              FROM tag t
+              WHERE t.partid > 0 AND t.locationid IN (SELECT l.id FROM location l WHERE l.locationgroupid IN (${lgIn}))
+              GROUP BY t.trackingencoding, t.partid, t.locationid) tag ON part.id = tag.partid
+        JOIN location ON tag.locationid = location.id${locAnd}
+        JOIN locationgroup lg ON location.locationgroupid = lg.id
+        JOIN uom ON part.uomid = uom.id
+        WHERE lg.id IN (${lgIn}) AND ${pw}`;
+    // Not in inventory, listed in their default location.
+    if (f.zero === 'defaultloc') sql += `
+        UNION ALL
+        SELECT 1, lg.name, location.name, 0, part.num, part.description, uom.code, '', location.id, part.id, 0
+        FROM part
+        JOIN defaultlocation dl ON part.id = dl.partid
+        JOIN location ON dl.locationid = location.id${locAnd}
+        JOIN locationgroup lg ON location.locationgroupid = lg.id
+        JOIN uom ON part.uomid = uom.id
+        LEFT JOIN tag ON location.id = tag.locationid AND tag.partid = part.id
+        WHERE tag.id IS NULL AND lg.id IN (${lgIn}) AND ${pw}`;
+    // Not in inventory anywhere chosen: the "Not In Inventory" group.
+    if (f.zero === 'show') sql += `
+        UNION ALL
+        SELECT 2, '', '', 0, part.num, part.description, uom.code, '', 0, part.id, 0
+        FROM part
+        JOIN uom ON part.uomid = uom.id
+        LEFT JOIN (SELECT MAX(tag.id) AS maxtagid, tag.partid
+                   FROM tag JOIN location ON tag.locationid = location.id
+                   WHERE location.locationgroupid IN (${lgIn})${locAnd}
+                   GROUP BY tag.partid) tg ON part.id = tg.partid
+        WHERE tg.maxtagid IS NULL AND ${pw}`;
+    return sql + `
+        ORDER BY grp, lg, location, partnum, tagid`;
+}
+
+// Non-serial tracking of the given tags, from the tracking tables
+// (tagtrackingview's own sources; see the header for why not the view).
+function trackingSQL(ids) {
+    const inList = ids.join(',');
+    return `
+        SELECT x.tagid, pt.abbr, pt.typeid, x.info
+        FROM (SELECT tt.tagid, tt.parttrackingid, tt.info FROM trackingtext tt WHERE tt.tagid IN (${inList})
+              UNION ALL SELECT td.tagid, td.parttrackingid, DATE_FORMAT(td.info, '%Y-%m-%d') FROM trackingdate td WHERE td.tagid IN (${inList})
+              UNION ALL SELECT tc.tagid, tc.parttrackingid, CAST(tc.info AS CHAR) FROM trackingdecimal tc WHERE tc.tagid IN (${inList})
+              UNION ALL SELECT ti.tagid, ti.parttrackingid, CAST(ti.info AS CHAR) FROM trackinginteger ti WHERE ti.tagid IN (${inList})) x
+        JOIN parttracking pt ON pt.id = x.parttrackingid
+        WHERE pt.typeid <> 40
+        ORDER BY x.tagid, pt.sortorder`;
+}
+
+// subSerialList: serial numbers per part + location + tracking combination.
+// locIds: when the count list was capped, the locations it lists (whole).
+function serialSQL(f, locIds) {
+    const lgIn = chosenLgs(f).join(',') || '0';
+    const locAnd = (f.locs.length ? ' AND location.id IN (' + f.locs.join(',') + ')' : '') +
+        (locIds ? ' AND location.id IN (' + (locIds.join(',') || '0') + ')' : '');
+    return `
+        SELECT tag.partid, tag.locationid, tag.trackingencoding, tsv.abbr AS abbr, tsv.serialnum AS serialnum
+        FROM tagserialview tsv
+        JOIN tag ON tag.id = tsv.tagid
+        JOIN location ON location.id = tag.locationid${locAnd}
+        JOIN part ON part.id = tag.partid
+        WHERE location.locationgroupid IN (${lgIn}) AND ${partWhere(f).join(' AND ')}
+        ORDER BY tag.partid, tag.locationid, tsv.serialid, tsv.sortorder`;
+}
+
+// A tracking value as tagtrackingview's INFOFORMATTED shows it.
+function trackValue(typeId, info) {
+    const t = Number(typeId);
+    if (t === 20 || t === 30) return fmtDate(info) || String(info ?? '');
+    if (t === 50) return fmtMoney(num(info));
+    if (t === 60) return String(Math.round(num(info) * 1e5) / 1e5);
+    if (t === 70) return String(Math.round(num(info)));
+    if (t === 80) return num(info) === 0 ? 'False' : 'True';
+    return String(info ?? '');
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+let _loadToken = 0;
+
+async function loadLookups() {
+    let myLgs = [];
+    try { myLgs = ints(typeof getLocationGroupList === 'function' ? getLocationGroupList() : []); } catch (_) {}
+    S.myLgs = myLgs;
+    const lgIn = myLgs.join(',') || '0';
+    const res = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('Location groups', `SELECT id, name, activeflag+0 AS active FROM locationgroup WHERE id IN (${lgIn}) ORDER BY name`),
+        q('Locations', `
+            SELECT l.id, l.name, lg.name AS lgname, l.activeflag+0 AS active
+            FROM location l
+            JOIN locationgroup lg ON lg.id = l.locationgroupid
+            WHERE l.locationgroupid IN (${lgIn})
+            ORDER BY lg.name, l.name`)
+    ]);
+    const ok = i => res[i].status === 'fulfilled' ? res[i].value : [];
+    S.company = (ok(0)[0] || {}).name || '';
+    ok(1).forEach(r => { S.lgNames[Number(r.id)] = r.name; });
+    _lgMs.setItems(ok(1).map(r => ({ value: Number(r.id), label: r.name + (Number(r.active) === 1 ? '' : ' (inactive)') })));
+    _locMs.setItems(ok(2).map(r => ({ value: Number(r.id), label: r.name + (Number(r.active) === 1 ? '' : ' (inactive)'), sub: r.lgname })));
+    const failed = res.filter(x => x.status === 'rejected').map(x => x.reason && x.reason.message);
+    if (failed.length) document.getElementById('banner').textContent = 'Some filter lists failed to load: ' + failed.join('; ');
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    const f = F;
+    document.getElementById('banner').textContent = '';
+    document.getElementById('loading').classList.add('show');
+    setStatus('Loading…');
+    let rows, trk = [], serials = [], capped = null;
+    const warn = [];
+    const cap = S.noCap ? 0 : undefined;           // FBLib.RowCap: the first 10,000 lines unless Load all
+    try {
+        rows = await q('Count list', FBLib.RowCap.sql(buildSQL(f), cap));
+        if (tok !== _loadToken) return;
+        const c = FBLib.RowCap.apply(rows, cap);
+        if (c.capped) {
+            // Whole locations only: a count sheet must never end part-way
+            // through a location (a counter would take it as fully listed).
+            // Drop the location the cap cut into, unless it is the only one.
+            const locKey = r => r.grp + '|' + (r.lg || '') + '|' + (r.location || '');
+            const cut = locKey(rows[c.limit]);
+            let n = c.rows.length;
+            while (n > 0 && locKey(c.rows[n - 1]) === cut) n--;
+            rows = n > 0 ? c.rows.slice(0, n) : c.rows;
+            const last = rows[rows.length - 1];
+            capped = { limit: rows.length, last: Number(last.grp) === 2 ? NOT_IN_INV : (last.lg || '') + ' · ' + (last.location || '') };
+        } else rows = c.rows;
+        // Tracking for the tracked lines, by their newest tag.
+        const ids = [...new Set(rows.filter(r => num(r.tagid) > 0 && r.trackingencoding).map(r => Number(r.tagid)))];
+        for (let i = 0; i < ids.length; i += TRACK_CHUNK) {
+            try { trk = trk.concat(await q('Tracking', trackingSQL(ids.slice(i, i + TRACK_CHUNK)))); }
+            catch (e) { warn.push('Tracking could not be read: ' + e.message); break; }
+            if (tok !== _loadToken) return;
+        }
+        if (f.serials && rows.length) {
+            // Capped: only the serial numbers of the locations listed.
+            const locIds = capped ? [...new Set(rows.filter(r => Number(r.grp) === 1 && num(r.locationid) > 0).map(r => Number(r.locationid)))] : null;
+            try { serials = await q('Serial numbers', serialSQL(f, locIds)); }
+            catch (e) { warn.push('Serial numbers could not be read: ' + e.message); }
+        }
+    } catch (e) {
+        if (tok !== _loadToken) return;
+        document.getElementById('loading').classList.remove('show');
+        document.getElementById('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        capNotice(null);
+        S.rows = []; S.loadedAt = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    if (tok !== _loadToken) return;
+    document.getElementById('loading').classList.remove('show');
+    if (warn.length) document.getElementById('banner').textContent = warn.join(' ');
+    capNotice(capped);
+
+    const byTag = new Map();
+    trk.forEach(t => {
+        const k = Number(t.tagid);
+        if (!byTag.has(k)) byTag.set(k, []);
+        byTag.get(k).push({ abbr: t.abbr || '', value: trackValue(t.typeid, t.info) });
+    });
+    const bySerialKey = new Map();
+    serials.forEach(s => {
+        const k = s.partid + '|' + s.locationid + '|' + (s.trackingencoding || '');
+        if (!bySerialKey.has(k)) bySerialKey.set(k, []);
+        bySerialKey.get(k).push({ abbr: s.abbr || '', value: s.serialnum || '' });
+    });
+    S.rows = rows.map(r => {
+        const qty = num(r.qty), nii = Number(r.grp) === 2;
+        const skey = r.partid + '|' + r.locationid + '|' + (r.trackingencoding || '');
+        return {
+            nii, lg: nii ? NOT_IN_INV : (r.lg || ''), location: nii ? '' : (r.location || ''),
+            part: r.partnum || '', desc: r.description || '', uom: r.uom || '', qty,
+            tracking: byTag.get(Number(r.tagid)) || [],
+            // The subreport prints only for lines with stock.
+            serials: f.serials && qty > 0 ? (bySerialKey.get(skey) || []) : []
+        };
+    });
+    S.collapsed = new Set();
+    S.loadedAt = new Date();
+    render();
+}
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+
+// The row cap's notice (FBLib.RowCap), saying where the sheet stops: every
+// location listed is complete.
+function capNotice(capped) {
+    const before = document.getElementById('rptWrap');
+    FBLib.RowCap.notice({ before, capped: !!capped, limit: capped ? capped.limit : 0, what: 'lines',
+                          onLoadAll: () => { S.noCap = true; loadAll(); } });
+    const span = capped && before.parentNode.querySelector(':scope > .rowcap-note > span');
+    if (span) span.innerHTML = `Showing the first <strong>${esc(capped.limit.toLocaleString())}</strong> lines, up to the end of ` +
+        `<strong>${esc(capped.last)}</strong>: more match these filters. Every location listed is complete. Pick location groups or locations for the rest, or`;
+}
+
+// ============================================================================
+//  MODEL + TABLE — location group → location → lines (→ serial numbers).
+// ============================================================================
+let COLS = null;            // FBLib.RptCols: resize / sort / reorder (attached in init)
+function groups() {
+    const out = [];
+    S.rows.forEach(r => {
+        let g = out[out.length - 1];
+        if (!g || g.name !== r.lg || g.nii !== r.nii) { g = { name: r.lg, nii: r.nii, key: 'g|' + (r.nii ? '~' : r.lg), locs: [], n: 0 }; out.push(g); }
+        let l = g.locs[g.locs.length - 1];
+        if (!l || l.name !== r.location) { l = { name: r.location, key: 'l|' + g.key + '|' + r.location, rows: [] }; g.locs.push(l); }
+        l.rows.push(r);
+        g.n++;
+    });
+    return out;
+}
+// The shown columns (no Qty / UOM in a blind count), in the user's order
+// (FBLib.RptCols).
+function visibleCols() {
+    const vis = COL_DEFS.filter(c => !c.onHand || F.showQty);
+    return COLS ? COLS.arrange(vis) : vis;
+}
+// data-pdf-min: the PDF view never makes that column narrower (pt).
+const headRow = cols => '<tr>' + cols.map(c => `<th data-col="${c.key}" class="${c.num ? 'num-cell' : ''}" style="min-width:${c.w}px"` +
+    (c.pdfMin ? ` data-pdf-min="${c.pdfMin}"` : '') + `>${esc(c.label)}</th>`).join('') + '</tr>';
+// Heading-click sort (FBLib.RptCols): lines sort within their location (the
+// location groups and locations keep the original's order; serial numbers
+// stay under their line). Count (blank) and Tracking (a stack) don't sort,
+// and a blind count ignores a sort on the hidden Qty / UOM: ordering by
+// quantity would give the quantities away.
+const UNSORTABLE = ['count', 'tracking'];
+const sortVal = (r, k) => (k === 'qty' ? r.qty : r[k]);
+function sortLines(list) {
+    const s = COLS && COLS.sort();
+    if (!s || UNSORTABLE.indexOf(s.key) !== -1) return list;
+    const def = COL_DEFS.find(c => c.key === s.key);
+    if (def && def.onHand && !F.showQty) return list;
+    return list.slice().sort((a, b) => COLS.compare(a, b, sortVal));
+}
+const trackText = (r, sep) => r.tracking.map(t => (t.abbr ? esc(t.abbr) + ': ' : '') + esc(t.value)).join(sep);
+
+// brk: the heading starts a new page in the PDF view (data-pdf-break).
+function lgRow(cols, g, forPrint, brk) {
+    const open = !S.collapsed.has(g.key);
+    const meta = g.nii ? plural(g.n, 'part') : plural(g.locs.length, 'location') + ' · ' + plural(g.n, 'line');
+    return `<tr class="rpt-grp" data-grp="${esc(g.key)}"${brk ? ' data-pdf-break' : ''}><td colspan="${cols.length}"><div class="rpt-grp-inner">` +
+        (forPrint ? '' : `<span class="rpt-toggle">${open ? '▼' : '▶'}</span>`) +
+        `<span>${esc(g.name)}</span><span class="rpt-grp-meta">${esc(meta)}</span></div></td></tr>`;
+}
+function locRow(cols, l, forPrint, brk) {
+    const open = !S.collapsed.has(l.key);
+    return `<tr class="rpt-sub" data-grp="${esc(l.key)}"${brk ? ' data-pdf-break' : ''}><td colspan="${cols.length}"><div class="rpt-grp-inner">` +
+        (forPrint ? '' : `<span class="rpt-toggle">${open ? '▼' : '▶'}</span>`) +
+        `<span>${esc(l.name)}</span><span class="rpt-grp-meta">${esc(plural(l.rows.length, 'line'))}</span></div></td></tr>`;
+}
+function lineRows(cols, r, forPrint) {
+    const cell = {
+        part: forPrint ? esc(r.part) : openLink('Part', r.part, r.desc),
+        desc: forPrint ? esc(r.desc) : cut(r.desc),
+        tracking: `<span class="trk">${trackText(r, forPrint ? '<br>' : ' · ')}</span>`,
+        qty: esc(fmtQty(r.qty)), uom: esc(r.uom), count: '<span class="cnt-line"></span>'
+    };
+    const out = ['<tr class="cc-line">' + cols.map(c => `<td class="${c.num ? 'num-cell' : ''}${c.key === 'count' ? ' cnt-cell' : ''}">${cell[c.key] ?? ''}</td>`).join('') + '</tr>'];
+    // subSerialList: one row per serial number, under the line.
+    r.serials.forEach(s => out.push(`<tr class="rpt-minor"><td></td><td colspan="${cols.length - 1}" class="sn-cell">` +
+        (s.abbr ? '<b>' + esc(s.abbr) + ':</b> ' : '') + esc(s.value) + '</td></tr>'));
+    return out;
+}
+// Printing → "Start a new page for each": every location group heading
+// breaks the page (both options), and with Location every location after a
+// group's first too (the first stays with its group heading).
+function groupBody(cols, g, forPrint, onlyLoc) {
+    const brk = forPrint && F.pageBreak !== 'none';
+    const out = [lgRow(cols, g, forPrint, brk)];
+    if (S.collapsed.has(g.key)) return out;
+    let n = 0;
+    g.locs.forEach(l => {
+        if (onlyLoc && l !== onlyLoc) return;
+        if (!g.nii) out.push(locRow(cols, l, forPrint, brk && F.pageBreak === 'loc' && n++ > 0));
+        if (g.nii || !S.collapsed.has(l.key)) sortLines(l.rows).forEach(r => out.push(...lineRows(cols, r, forPrint)));
+    });
+    return out;
+}
+function bodyRows(cols, forPrint) {
+    const out = [];
+    groups().forEach(g => out.push(...groupBody(cols, g, forPrint)));
+    return out;
+}
+function footRow(cols) {
+    const gs = groups();
+    const locs = gs.filter(g => !g.nii).reduce((s, g) => s + g.locs.length, 0);
+    const parts = new Set(S.rows.map(r => r.part)).size;
+    return `<tr><td colspan="${cols.length}">Total — ${esc(plural(S.rows.length, 'line'))} · ${esc(plural(parts, 'part'))} · ` +
+        `${esc(plural(locs, 'location'))}</td></tr>`;
+}
+
+// Long reports paint in chunks as the user scrolls.
+const CHUNK = 600;
+let _paint = { html: [], shown: 0 };
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+function render(keepScroll) {
+    const tbl = document.getElementById('rpt');
+    const wrap = document.getElementById('rptWrap');
+    const top = wrap.scrollTop;
+    const cols = visibleCols();
+    tbl.querySelector('thead').innerHTML = headRow(cols);
+    _paint = { html: bodyRows(cols, false), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    while (keepScroll && _paint.shown < _paint.html.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+    tbl.querySelector('tfoot').innerHTML = S.rows.length ? footRow(cols) : '';
+    tbl.style.display = S.rows.length ? '' : 'none';
+    document.getElementById('rptEmpty').textContent = S.rows.length || !S.loadedAt ? '' : 'Nothing on hand matches these filters.';
+    wrap.scrollTop = keepScroll ? top : 0;
+    const parts = [S.company, scopeText(F)];
+    if (S.loadedAt) parts.push(plural(S.rows.length, 'line') + (F.showQty ? '' : ' (blind count)') + ' · loaded ' +
+        S.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    setStatus(parts.filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the count sheet as the standard Cycle Count List
+//  prints it: Letter portrait, the company / title on every page (the
+//  original's page header), location-group headings over a double rule,
+//  location headings indented over a grey rule, a blank Count line per
+//  row, tracking stacked, optional page breaks (data-pdf-break), and a
+//  "Counted by / Date" line after the last row.
+// ============================================================================
+let PDF = null;
+const PDF_CSS =
+    '.fbdoc-rpt-tbl tr.rpt-grp td{font-size:var(--fbdoc-th);border-bottom:2.25pt double #000}' +
+    '.fbdoc-rpt-tbl tr.rpt-sub td{padding-left:8pt;border-bottom:.75pt solid #999}' +
+    '.fbdoc-rpt-tbl tr.cc-line td{padding-top:5pt}' +
+    '.fbdoc-rpt-tbl tr.cc-line td:first-child{padding-left:12pt}' +
+    '.fbdoc-rpt-tbl .trk{color:inherit}' +
+    '.fbdoc-rpt-tbl .cnt-line{min-width:0;height:1.3em;border-bottom:.75pt solid #000}' +
+    '.fbdoc-rpt-tbl td.sn-cell{padding-left:12pt}' +
+    '.fbdoc-rpt-tbl tbody.fbdoc-total tr.cc-sign td{font-weight:400;border-top:0;padding-top:20pt}' +
+    '.fbdoc-rpt-tbl .cc-blank{display:inline-block;width:180pt;margin:0 24pt 0 4pt;border-bottom:.75pt solid #000}' +
+    '.fbdoc-rpt-tbl .cc-blank.cc-blank-s{width:100pt}';
+// The counter's sign-off, after the last row (the plain printout's footer).
+const signRow = cols => `<tr class="cc-sign"><td colspan="${cols.length}">Counted by<span class="cc-blank"></span>` +
+    'Date<span class="cc-blank cc-blank-s"></span></td></tr>';
+function docSpec() {
+    if (!S.loadedAt) return null;
+    const cols = visibleCols();
+    return {
+        company: S.company, title: 'Cycle Count List', subtitle: scopeText(F) + (F.showQty ? '' : ' · blind count'), titleEveryPage: true,
+        head: headRow(cols), rows: bodyRows(cols, true), foot: S.rows.length ? signRow(cols) : '',
+        empty: 'Nothing on hand matches these filters.', css: PDF_CSS, fontPt: 10
+    };
+}
+
+function setAllOpen(open) {
+    S.collapsed = new Set(open ? [] : groups().map(g => g.key));
+    render(false);
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    // Location group and location first, then the sheet's columns in the
+    // user's order; the lines in the order shown (sorted within locations).
+    const xw = { part: 130, desc: 280, tracking: 200, qty: 90, uom: 60, count: 110 };
+    const cols = [
+        { key: 'lg', label: 'Location Group', w: 140, type: 'text' }, { key: 'location', label: 'Location', w: 120, type: 'text' }
+    ].concat(visibleCols().map(c => ({ key: c.key, label: c.label, w: xw[c.key] || c.w, type: c.key === 'qty' ? 'qty' : 'text' })))
+     .concat(F.serials ? [{ key: 'serials', label: 'Serial Numbers', w: 260, type: 'text' }] : []);
+    const shown = [].concat(...groups().map(g => [].concat(...g.locs.map(l => sortLines(l.rows)))));
+    const rows = shown.map(r => ({
+        lg: r.lg, location: r.location, part: r.part, desc: r.desc, qty: r.qty, uom: r.uom, count: '',
+        tracking: r.tracking.map(t => (t.abbr ? t.abbr + ': ' : '') + t.value).join('; '),
+        serials: r.serials.map(s => s.value).join(', ')
+    }));
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'Cycle_Count_List_' + ymd(new Date()), sheets: [{
+            name: 'Count Sheet', title: 'Cycle Count List', subtitle: [S.company, scopeText(F)].filter(Boolean), cols, rows, totals: false
+        }] });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's pages (fb-doc). Without fb-doc on the server, the
+// plain count sheet below: JxBrowser won't print the report page itself, so
+// it is built in a new window and printed there, as the original lays it
+// out: headings by location group and location, a blank Count line per row,
+// optionally a new page per location group or location. Collapsed groups
+// print as headings.
+function printReport() {
+    if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+    if (PDF) { PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000)); return; }
+    printPlain();
+}
+function printPlain() {
+    if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+    const cols = visibleCols();
+    // Fixed widths, so every page-break section lines up with the others.
+    const pwSum = cols.reduce((t, c) => t + c.pw, 0);
+    const colgroup = '<colgroup>' + cols.map(c => `<col style="width:${(c.pw * 100 / pwSum).toFixed(1)}%">`).join('') + '</colgroup>';
+    const thead = colgroup + '<thead>' + headRow(cols).replace(/ style="[^"]*"/g, '') + '</thead>';
+    const sections = [];
+    const gs = groups();
+    if (F.pageBreak === 'lg') gs.forEach(g => sections.push(groupBody(cols, g, true)));
+    else if (F.pageBreak === 'loc') gs.forEach(g => {
+        if (g.nii || S.collapsed.has(g.key)) sections.push(groupBody(cols, g, true));
+        else g.locs.forEach(l => sections.push(groupBody(cols, g, true, l)));
+    });
+    else sections.push(bodyRows(cols, true));
+    const tables = sections.map((rows, i) => `<table${i ? ' class="pb"' : ''}>${thead}<tbody>${rows.join('')}</tbody></table>`).join('');
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Cycle Count List</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:9pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:12pt;font-weight:700}h2{text-align:center;font-size:15pt;margin:2px 0}.sub{text-align:center;font-size:8.5pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%;table-layout:fixed}table.pb{break-before:page}td{overflow-wrap:anywhere}' +
+        'th{font-size:9.5pt;text-align:left;padding:3px 5px;border-bottom:1px solid #000}th.num-cell{text-align:right}' +
+        'td{font-size:9pt;padding:3px 5px;vertical-align:bottom}.num-cell{text-align:right}' +
+        'tr.cc-line td{height:20px}tr.cc-line,tr.rpt-minor{break-inside:avoid}' +
+        '.cnt-line{display:block;height:14px;border-bottom:1px solid #000}' +
+        'tr.rpt-grp td{font-weight:700;font-size:10.5pt;padding-top:9px;border-bottom:3px double #000}' +
+        'tr.rpt-sub td{font-weight:700;padding-top:6px;padding-left:10px;border-bottom:1px solid #999}' +
+        'tr.rpt-grp,tr.rpt-sub{break-after:avoid}.rpt-grp-meta{font-weight:400;font-size:8pt;color:#555;margin-left:8px}' +
+        'tr.rpt-minor td{font-size:8.5pt;padding-top:0;padding-bottom:1px}td.sn-cell{padding-left:30px}' +
+        '.trk{color:#333;font-size:8.5pt}a{color:#000;text-decoration:none}@page{size:Letter portrait;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>Cycle Count List</h2><p class="sub">' + esc(scopeText(F)) +
+        (F.showQty ? '' : ' · blind count') + '</p>' + tables +
+        '<p style="font-size:7.5pt;margin-top:10px">Printed ' + esc(new Date().toLocaleString()) +
+        '&nbsp;&nbsp;&nbsp;Counted by: ______________________&nbsp;&nbsp;&nbsp;Date: ____________</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters what everyone sees each time this report opens?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        const ms = (id, ph) => FBLib.Common.MultiSelect.create({ containerId: id, items: [], placeholder: ph, maxTags: 2, onClose: applySoon });
+        _lgMs = ms('lgMs', 'All my location groups');
+        _locMs = ms('locMs', 'All locations');
+
+        document.querySelectorAll('#fAbc, #fInactive, #fZero, #fShowQty, #fSerials, #fPageBreak')
+            .forEach(el => el.addEventListener('change', applySoon));
+        const fPart = document.getElementById('fPart');
+        fPart.addEventListener('change', applySoon);
+        fPart.addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        document.getElementById('resetFiltersBtn').onclick = () => { writeFilters(DEFAULT_FILTERS); applySoon(); };
+
+        // Column resize / sort / reorder (fb-lib). Count and Tracking don't sort.
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({
+            table: document.getElementById('rpt'), sortable: k => UNSORTABLE.indexOf(k) === -1,
+            onSort: () => render(true), onReorder: () => render(true)
+        });
+        document.getElementById('resetColsBtn').onclick = () => { if (COLS) { COLS.reset(); render(false); } };
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: document.getElementById('rptWrap'), toggleBefore: document.getElementById('exportBtn'),
+                page: { size: 'Letter', orientation: 'portrait' },
+                doc: docSpec, title: () => 'Cycle Count List'
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('expandBtn').onclick = () => setAllOpen(true);
+        document.getElementById('collapseBtn').onclick = () => setAllOpen(false);
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('unpublishBtn').onclick = () => {
+            if (!confirm('Stop using company defaults for this report? Everyone goes back to their own last choices.')) return;
+            const ok = FBLib.Settings.clearCompany(['filters', 'opts']) !== false;
+            showToast(ok ? 'This report no longer has company defaults.' : 'That was not saved.', ok ? 'success' : 'error');
+        };
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        const wrap = document.getElementById('rptWrap');
+        wrap.addEventListener('scroll', () => { if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 400) appendChunk(); });
+        document.getElementById('rpt').addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (a) {
+                e.preventDefault();
+                try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+                catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+                return;
+            }
+            const g = e.target.closest('tr.rpt-grp, tr.rpt-sub');
+            if (!g) return;
+            const key = g.dataset.grp;
+            if (S.collapsed.has(key)) S.collapsed.delete(key); else S.collapsed.add(key);
+            render(true);
+        });
+
+        await loadLookups();
+        writeFilters(savedFilters());
+        F = readFilters();          // drops saved picks that no longer exist
+        await loadAll();
+    } catch (e) {
+        console.error('[Cycle Count List] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

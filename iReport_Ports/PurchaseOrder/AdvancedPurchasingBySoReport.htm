@@ -1,0 +1,1369 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Advanced Purchasing By Sales Order (iReport port)
+  PATH:   iReport_Ports/PurchaseOrder/AdvancedPurchasingBySoReport.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard PurchaseOrder/AdvancedPurchasingBySoReport
+  .jrxml: what each sales order needs, part by part, against the stock at
+  the order's location group, and by when to order what is short. Same
+  source, same rows, same columns and options; only the presentation is
+  interactive (and the faults listed below are fixed).
+
+    Source     One row per sales order line whose product is an
+               Inventory part (part.typeId 10): so -> soitem -> product
+               -> part, the part's default vendor (vendorparts.defaultFlag
+               = 1) and its lead time (0 when none). The stock figures are
+               the original's: On Hand, Total Allocated, On Order, Drop
+               Ship and Not Available from the qtyonhand / qtyallocated /
+               qtyonorder / qtydropship / qtynotavailable views, for the
+               part at the SO's location group. They run in 0.3 s on the
+               live DB (582 lines, May 2026), so the views are kept.
+    Short      The original's rule. Available = On Hand - Total Allocated
+               - Not Available + Drop Ship. An estimate's lines are not in
+               Total Allocated yet, so their Qty Needed is taken off too:
+               Short = Available - Qty Needed (estimates) / Available
+               (every other status), shown (red) only when below zero.
+    Order Date When to order: a date minus the default vendor's lead
+               time (days); red when the line still needs stock that
+               the stock at the location group doesn't cover (see the
+               fixes).
+    Filters    Date Created range (the original's dateRange, default This
+               month, "BETWEEN start AND DATE_SUB(day after end, 1
+               second)"), SO number (LIKE, % is a wildcard; blank = every
+               SO, the original's "%"), and the original's six SO status
+               boxes: Estimate (off), Issued, In Progress, Fulfilled,
+               Closed Short, Voided (on).
+    Grouping   One group per sales order, in SO id order (the original has
+               no ORDER BY; its groups came in that order on the live DB),
+               its lines in line-number order. The group heading carries
+               the original's SO #, Date Created, Estimated Time and the
+               SO's scheduled date.
+    Totals     None: the original has no group or report totals.
+    Checked    Live, May 2026 by Date Created, the default statuses: 582
+               lines on 144 SOs both ways; On Hand 345,152, Allocated
+               340,656, On Order 854,698, Not Available 38,439 both ways.
+
+  Layout: the REPORT chrome (fb-styles §35): 56px header, push-down filter
+  panel that applies as you change it, collapsible SO group rows, sticky
+  footer.
+  Table tools (fb-lib FBLib.RptCols / RowCap / Pivot): column headings sort
+  the lines within each group; the groups keep the report's order. Drag a
+  heading to reorder, its edge to resize (remembered per user). A Table /
+  Pivot view selector: Qty Needed, Line Qty or the line count by any two of
+  default vendor, part, SO #, customer, SO status, location group, the
+  buy state (Short / Covered / Nothing left) and the created, scheduled and
+  order dates, with drill-down. The query fetches at most 10,000 lines, cut
+  back to whole sales orders, with Load all.
+  Views: the header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+  report out as pages like the original: Letter landscape by default, the
+  title band on the first page (the original's title band), the column
+  headings repeated, an SO row carried over a page break marked
+  "(continued)", Short and a short line's Order Date in red, no totals (the
+  original has none), "Page X of Y". Columns fit the page and the font
+  steps down from the original's 10pt when they don't. The paper size and
+  orientation, and the view, are remembered per user. Print prints those
+  pages in either view.
+
+  Deliberate differences (each is a row in the review register):
+    - Qty Needed is what the line still needs, in the part's UOM:
+      qtyToFulfill - qtyFulfilled (never below 0), converted from the
+      line's UOM by the uomconversion row (qty * multiply / factor; else
+      the exact inverse row; else unknown, flagged, never 1:1). Nothing is
+      needed for a closed line (Fulfilled, Closed Short, Voided,
+      Cancelled, Historical), a line of a Fulfilled / Closed Short /
+      Voided SO, or a credit return. The original prints qtyToFulfill in
+      the line's UOM: the full ordered quantity of a fulfilled or voided
+      order, and the quantity of a credit return, compared with stock in
+      another unit. May 2026 live: 457 of 582 lines differ, Qty Needed
+      38,813 there, 7,467 here. "Line Qty" (optional column) shows that
+      figure, converted.
+    - Order Date counts back from the line's scheduled date
+      (soitem.dateScheduledFulfillment, else the SO's): when to order to
+      have the stock by then. The original counts back from the SO's
+      Date Created, a date before the order existed. "Order date from"
+      in Filters switches back to Date Created.
+    - Order Date is red when the line still needs stock and Available,
+      less whatever of that need Total Allocated doesn't already hold (an
+      estimate's, a line awaiting build), is below zero. The original reds
+      it when Available - Qty Needed < 0 for every line, counting an issued
+      line's need twice (qtyallocatedso already holds it) and flagging
+      closed lines: May 2026 live, 354 red lines there, 77 here.
+    - The group heading's "Date Created" shows the SO's Date Created (the
+      original shows Date Issued under that label), and the date the
+      original labels "Date Fulfilled" (so.dateFirstShip, the SO's
+      scheduled date) is labelled Date Scheduled.
+    - Estimated Time is the whole days, hours and minutes from Date
+      Created to the SO's scheduled date. The original subtracts the
+      day-of-month, hour and minute fields separately (negative across a
+      month or day boundary) from the first line's date.
+    - SOs and lines are listed in SO id and line order; the original
+      leaves the order to the database.
+    - Location groups: only the user's own (getLocationGroupList()); the
+      original lists every SO.
+  Additions: location group filter; "Group by Part" (the purchase list:
+  each part at each location group with its total need, stock, Short and
+  earliest order date, its SO lines under it); "Only lines still to
+  fulfil"; optional Description, UOM (on), Line Qty, Available and Date
+  Scheduled columns; customer, status and Date Issued on the SO row;
+  SO / Part / Vendor links; Excel; Print.
+  No launch handling: opened from a purchasing module's Apps menu, the
+  report starts with the user's own filters.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-folder" content="Purchase Order">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="What each sales order still needs, part by part, against stock at its location group, and when to order what is short.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipAdvPurchSO',
+            name:  'Advanced Purchasing By Sales Order',
+            build: '2026.10.16-8214d4e'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced Purchasing By Sales Order — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 420px; overflow: hidden; text-overflow: ellipsis; vertical-align: top; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table th { cursor: default; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        .neg { color: var(--fb-negative); font-weight: 600; }
+        .muted { color: var(--c-tertiary); }
+        .warn { color: var(--acc-orange-con); }
+        .ln-tag { font-size: 10.5px; font-weight: 500; color: var(--c-secondary); margin-left: 6px; }
+        .grp-field { font-weight: 400; color: var(--c-secondary); margin-left: 14px; white-space: nowrap; }
+        .grp-field b { font-weight: 600; color: var(--c-primary); }
+        .grp-desc { font-weight: 400; color: var(--c-secondary); }
+        .status-checks { display: grid; grid-auto-flow: column; grid-template-columns: repeat(2, auto); grid-template-rows: repeat(3, auto); gap: 2px 16px; }
+        .col-checks { display: grid; grid-template-columns: repeat(2, auto); gap: 2px 16px; }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>Advanced Purchasing By Sales Order</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <div class="rpt-viewsel" id="viewSelWrap" title="Table: the report as the standard one lays it out (or grouped by part). Pivot: Qty Needed or the line count by any two fields">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 5h18M3 10h10M3 15h18M3 20h10" stroke-linecap="round"/></svg>
+            <select id="viewSel">
+                <option value="table">Table</option>
+                <option value="pivot">Pivot</option>
+            </select>
+        </div>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="split-btn">
+            <button id="expandBtn" class="hdr-btn" type="button" title="Show every group's lines">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+                Expand
+            </button>
+            <button id="collapseBtn" class="hdr-btn" type="button" title="Group rows only">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 12h14" stroke-linecap="round"/></svg>
+                Collapse
+            </button>
+        </span>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages: collapsed groups print as their group row">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Date Created</div>
+            <div>
+                <div class="rpt-flabel">Quick range</div>
+                <select id="fRange"></select>
+            </div>
+            <div class="rpt-dates">
+                <input type="date" id="fFrom" aria-label="From">
+                <span class="rpt-fnote">→</span>
+                <input type="date" id="fTo" aria-label="To">
+            </div>
+            <div>
+                <div class="rpt-flabel">Location groups</div>
+                <div class="ms-container" id="lgMs">
+                    <div class="ms-trigger" id="lgMs-trigger"><span class="ms-placeholder" id="lgMs-placeholder">All my location groups</span></div>
+                    <div class="ms-dropdown hidden" id="lgMs-dropdown">
+                        <div class="ms-search"><input type="text" id="lgMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="lgMs-all">Select All</span><span id="lgMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="lgMs-list"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Sales orders</div>
+            <div>
+                <div class="rpt-flabel">SO number</div>
+                <input type="text" id="fSoNum" placeholder="All SOs (% is a wildcard)">
+            </div>
+            <div>
+                <div class="rpt-flabel">SO status</div>
+                <div class="status-checks" id="statusChecks"></div>
+            </div>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Layout</div>
+            <div>
+                <div class="rpt-flabel">Group by</div>
+                <select id="fGroupBy">
+                    <option value="so">Sales Order</option>
+                    <option value="part">Part (purchase list)</option>
+                </select>
+            </div>
+            <div>
+                <div class="rpt-flabel">Order date from</div>
+                <select id="fOrderFrom">
+                    <option value="sched">Date Scheduled − lead time</option>
+                    <option value="created">Date Created − lead time (standard)</option>
+                </select>
+            </div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fOpenOnly"> Only lines still to fulfil</label>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Extra columns</div>
+            <div class="col-checks">
+                <label class="rpt-fcheck"><input type="checkbox" data-xcol="desc"> Description</label>
+                <label class="rpt-fcheck"><input type="checkbox" data-xcol="uom"> UOM</label>
+                <label class="rpt-fcheck"><input type="checkbox" data-xcol="lineQty"> Line Qty</label>
+                <label class="rpt-fcheck"><input type="checkbox" data-xcol="avail"> Available</label>
+                <label class="rpt-fcheck"><input type="checkbox" data-xcol="sched"> Date Scheduled</label>
+            </div>
+            <div class="rpt-fnote">Line Qty: the line's ordered quantity (the<br>standard report's Qty Needed), in the part's UOM.</div>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own sort">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters what everyone sees each time this report opens. Anyone can still change them while it is open.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+                <button type="button" class="ds-btn" id="unpublishBtn" title="Everyone goes back to their own last choices">Stop using them</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>Every sales order line for an inventory part, with the stock of that part at the order's location group: what is on hand, what all open orders have allocated, what is on order, and whether the part is <strong>short</strong>. It is the BI version of the standard <strong>Advanced Purchasing By Sales Order</strong> report.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">The figures</div>
+                <ul>
+                    <li><strong>Qty Needed</strong>: what the line still has to ship, in the part's unit (UOM). A fulfilled, closed, voided or cancelled line, and a credit return, need nothing.</li>
+                    <li><strong>Available</strong> = On Hand − Total Allocated − Not Available + Drop Ship. <strong>Short</strong> shows it (red) when it is below zero. An estimate isn't allocated yet, so its own Qty Needed is taken off too.</li>
+                    <li><strong>Order Date</strong> = the line's scheduled date − the default vendor's lead time: order by then to have the stock in time. Red when the line still needs stock that the stock at the location group doesn't cover. <em>Order date from</em> switches to the standard report's Date Created − lead time.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>Filter changes apply straight away. <strong>SO number</strong> takes % as a wildcard; blank lists every SO. The date range is on the SO's Date Created (standard default <em>This month</em>).</li>
+                    <li><strong>Group by Part</strong> turns the report into a purchase list: each part at each location group with its total need, stock, Short and earliest order date, and the sales order lines under it.</li>
+                    <li>Click a group's row to show or hide its lines; <strong>Expand</strong> / <strong>Collapse</strong> do every group.</li>
+                    <li>Click a column heading to sort the lines within each group (again to reverse, a third time for the standard order). Drag a heading onto another to move the column; drag a heading's right edge to resize it. Your layout is remembered; <strong>Settings → Reset column layout</strong> undoes it.</li>
+                    <li>The <strong>Table / Pivot</strong> selector switches to a pivot: Qty Needed, Line Qty or the number of lines by any two of default vendor, part, SO #, customer, SO status, location group, buy state and the dates. It opens on default vendor + part × buy state (Short / Covered / Nothing left): what is short, by vendor. Pick <strong>Order Date</strong> (by month or week) for when to order it. Click a figure to see the lines behind it. Print, PDF and Excel follow the view on screen.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable pages, laid out like the standard report. In PDF view pick the paper size and orientation in the bar above the pages; they are remembered. <strong>Print</strong> prints those pages.</li>
+                    <li>A very large result shows its first 10,000 or so lines (whole sales orders) with a <strong>Load all</strong> button.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-app" id="appView">
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+</div>
+<div class="pivot-host" id="pivotHost" style="display:none"></div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Common || !FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.RowCap) missing.push('FBLib.RowCap');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const TITLE = 'Advanced Purchasing By Sales Order';
+// The original's six SO status boxes (ckEstimate … ckVoided): id, fallback
+// name, ticked by default. The names come from sostatus when it can be read.
+const SO_STATUS_BOXES = [[10, 'Estimate', false], [20, 'Issued', true], [25, 'In Progress', true],
+                         [60, 'Fulfilled', true], [70, 'Closed Short', true], [80, 'Voided', true]];
+const OPEN_SO = [10, 20, 25];                         // an SO whose lines can still need stock
+const OPEN_LINE = [10, 11, 12, 14, 20, 30, 40];       // soitemstatus: Entered … Picked (not Fulfilled / Closed Short / Voided / Cancelled / Historical)
+const CREDIT_TYPES = [20, 21];                        // soitemtype Credit Return / Misc. Credit: stock coming back, never needed
+// What qtyallocatedso counts (Total Allocated already holds these lines' need).
+const ALLOC_SO = [20, 25], ALLOC_LINE = [10, 14, 20, 30, 40], ALLOC_TYPE = [10, 12];
+const LINE_TYPE_TAG = { 12: 'drop ship', 20: 'credit return', 21: 'misc. credit' };
+const GROUP_LABEL = { so: 'Sales Order', part: 'Part' };
+const XCOLS = ['desc', 'uom', 'lineQty', 'avail', 'sched'];
+const DEFAULT_FILTERS = { range: 'thisMonth', from: '', to: '', soNum: '', statuses: [20, 25, 60, 70, 80], lgs: [],
+                          groupBy: 'so', orderFrom: 'sched', openOnly: false, xcols: ['uom'] };
+const QUERY_KEYS = ['range', 'from', 'to', 'soNum', 'statuses', 'lgs'];
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        company: { keys: ['filters', 'opts'], editors: true },   // every open starts from the company defaults
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const ints = a => (Array.isArray(a) ? a : []).map(Number).filter(n => Number.isInteger(n));
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const dstr = v => { const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v ?? '')); return m ? m[1] : ''; };
+const fmtDate = v => { const d = dstr(v); return d ? FBLib.Common.formatDate(d) : ''; };
+const fmtQty = v => FBLib.Common.formatQty(v);
+const openLink = (module, number, title, label) => number
+    ? `<a class="fb-row-link" data-open="${esc(module)}" data-num="${esc(number)}"${title ? ` title="${esc(title)}"` : ''}>${esc(label || number)}</a>` : '';
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const cut = s => `<span title="${esc(s)}">${esc(s)}</span>`;
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// ---- Date ranges (Fishbowl's "This Month" etc.) ----
+const RANGES = [
+    ['custom', 'Custom…'], ['all', 'All dates'], ['today', 'Today'], ['yesterday', 'Yesterday'], ['last7', 'Last 7 days'],
+    ['thisMonth', 'This month'], ['lastMonth', 'Last month'], ['thisQuarter', 'This quarter'], ['lastQuarter', 'Last quarter'],
+    ['thisYear', 'This year'], ['lastYear', 'Last year']
+];
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const isYmd = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+
+// A quick range as [from, to] ISO dates, or null for "All dates".
+function presetDates(key) {
+    const t = new Date(); t.setHours(0, 0, 0, 0);
+    const y = t.getFullYear(), m = t.getMonth(), d = t.getDate(), qm = Math.floor(m / 3) * 3;
+    const D = (yy, mm, dd) => new Date(yy, mm, dd);
+    const r = {
+        today: [t, t], yesterday: [D(y, m, d - 1), D(y, m, d - 1)], last7: [D(y, m, d - 6), t],
+        thisMonth: [D(y, m, 1), D(y, m + 1, 0)], lastMonth: [D(y, m - 1, 1), D(y, m, 0)],
+        thisQuarter: [D(y, qm, 1), D(y, qm + 3, 0)], lastQuarter: [D(y, qm - 3, 1), D(y, qm, 0)],
+        thisYear: [D(y, 0, 1), D(y, 11, 31)], lastYear: [D(y - 1, 0, 1), D(y - 1, 11, 31)]
+    }[key];
+    return r ? [ymd(r[0]), ymd(r[1])] : null;
+}
+// { start, endExcl, label } (Fishbowl's dateRange1 / dateRange2: the day
+// after the last day), or null for no date limit.
+function dateRange(f) {
+    let a = f.from, b = f.to;
+    if (f.range !== 'custom') { const p = presetDates(f.range); if (!p) return null; [a, b] = p; }
+    if (!isYmd(a) && !isYmd(b)) return null;
+    a = isYmd(a) ? a : '1900-01-01'; b = isYmd(b) ? b : '2999-12-31';
+    if (a > b) [a, b] = [b, a];
+    const after = new Date(b + 'T00:00:00'); after.setDate(after.getDate() + 1);
+    return { start: a, endExcl: ymd(after), label: FBLib.Common.formatDate(a) + ' – ' + FBLib.Common.formatDate(b) };
+}
+function rangeText(f) { const r = dateRange(f); return 'Date Created: ' + (r ? r.label : 'All'); }
+// The SO number as the original's LIKE pattern ("*" works as "%" too);
+// '' when it matches every SO.
+const soLike = s => { const t = String(s || '').trim().replace(/\*/g, '%'); return /^%*$/.test(t) ? '' : t; };
+
+// Calendar arithmetic on a 'YYYY-MM-DD…' value, in UTC so a daylight-saving
+// change can't shift the day: the date `days` days earlier, as 'YYYY-MM-DD'.
+function daysBefore(v, days) {
+    const d = dstr(v);
+    if (!d) return '';
+    const t = new Date(d + 'T00:00:00Z');
+    t.setUTCDate(t.getUTCDate() - Math.round(num(days)));
+    return t.toISOString().slice(0, 10);
+}
+// Whole days / hours / minutes from a to b ('YYYY-MM-DD HH:MM:SS' each), as
+// "2d 4h 30m"; '' when either is missing.
+function spanText(a, b) {
+    const p = v => { const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2})/.exec(String(v || '')) || /^(\d{4}-\d{2}-\d{2})$/.exec(String(v || ''));
+                     return m ? Date.parse(m[1] + 'T' + (m[2] || '00') + ':' + (m[3] || '00') + ':00Z') : NaN; };
+    const ta = p(a), tb = p(b);
+    if (!Number.isFinite(ta) || !Number.isFinite(tb)) return '';
+    return minutesText(Math.round((tb - ta) / 60000));
+}
+// Minutes as "1d 4h 30m" (the original's days / hours / minutes fields,
+// whole numbers); "0m" for none.
+function minutesText(mins) {
+    const sign = mins < 0 ? '−' : '';
+    let m = Math.abs(Math.trunc(mins));
+    const d = Math.floor(m / 1440); m -= d * 1440;
+    const h = Math.floor(m / 60); m -= h * 60;
+    return sign + ([d ? d + 'd' : '', h ? h + 'h' : '', m ? m + 'm' : ''].filter(Boolean).join(' ') || '0m');
+}
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  UOM CONVERSION — the stored FROM -> TO row (qty * multiply / factor), else
+//  the exact inverse of a stored TO -> FROM row. Never chained, never 1:1:
+//  no row = unknown (the line is flagged).
+// ============================================================================
+let _uom = {};
+function loadUomMap(rows) {
+    const map = {};
+    rows.forEach(r => {
+        const f = parseInt(r.fromuomid, 10), t = parseInt(r.touomid, 10), m = num(r.multiply), d = num(r.factor);
+        if (f && t && f !== t && m > 0 && d > 0) map[f + '>' + t] = { num: m, den: d };
+    });
+    Object.keys(map).forEach(k => {
+        const [f, t] = k.split('>');
+        if (!map[t + '>' + f]) map[t + '>' + f] = { num: map[k].den, den: map[k].num };
+    });
+    _uom = map;
+}
+const uomConv = (fromId, toId) => {
+    fromId = parseInt(fromId, 10); toId = parseInt(toId, 10);
+    if (!fromId || !toId) return null;
+    return fromId === toId ? { num: 1, den: 1 } : (_uom[fromId + '>' + toId] || null);
+};
+const convQty = (qty, c) => (c ? num(qty) * c.num / c.den : null);
+
+// ============================================================================
+//  FILTERS — the panel applies as it changes (one short debounce). Dates,
+//  SO number, statuses and location groups re-query; the layout options
+//  only redraw.
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _lgMs = null;
+let _hydrating = false, _applyTimer = null;
+const S = { rows: [], company: '', soStatusName: {}, myLgs: [], lgNames: {}, loadedAt: null,
+            collapsed: new Set(), view: 'table', noCap: false };
+const statusBoxes = () => [...document.querySelectorAll('#statusChecks input[data-status]')];
+const xcolBoxes = () => [...document.querySelectorAll('input[data-xcol]')];
+
+function readFilters() {
+    return {
+        range: document.getElementById('fRange').value,
+        from: document.getElementById('fFrom').value,
+        to: document.getElementById('fTo').value,
+        soNum: document.getElementById('fSoNum').value.trim(),
+        statuses: statusBoxes().filter(b => b.checked).map(b => Number(b.dataset.status)),
+        lgs: ints(_lgMs.getSelected()),
+        groupBy: document.getElementById('fGroupBy').value,
+        orderFrom: document.getElementById('fOrderFrom').value,
+        openOnly: document.getElementById('fOpenOnly').checked,
+        xcols: xcolBoxes().filter(b => b.checked).map(b => b.dataset.xcol)
+    };
+}
+function writeFilters(f) {
+    _hydrating = true;
+    document.getElementById('fRange').value = RANGES.some(r => r[0] === f.range) ? f.range : DEFAULT_FILTERS.range;
+    const p = f.range === 'custom' ? [f.from, f.to] : (presetDates(document.getElementById('fRange').value) || ['', '']);
+    document.getElementById('fFrom').value = p[0] || '';
+    document.getElementById('fTo').value = p[1] || '';
+    document.getElementById('fSoNum').value = f.soNum || '';
+    const st = ints(f.statuses);
+    statusBoxes().forEach(b => { b.checked = st.indexOf(Number(b.dataset.status)) !== -1; });
+    _lgMs.setSelected(ints(f.lgs));
+    document.getElementById('fGroupBy').value = GROUP_LABEL[f.groupBy] ? f.groupBy : 'so';
+    document.getElementById('fOrderFrom').value = f.orderFrom === 'created' ? 'created' : 'sched';
+    document.getElementById('fOpenOnly').checked = !!f.openOnly;
+    const xc = Array.isArray(f.xcols) ? f.xcols : DEFAULT_FILTERS.xcols;
+    xcolBoxes().forEach(b => { b.checked = xc.indexOf(b.dataset.xcol) !== -1; });
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const requery = QUERY_KEYS.some(k => JSON.stringify(next[k]) !== JSON.stringify(F[k]));
+        const regroup = next.groupBy !== F.groupBy;
+        F = next;
+        remember();
+        if (requery) { S.noCap = false; loadAll(); return; }
+        derive();
+        if (regroup) S.collapsed = new Set();
+        render(!regroup);
+    }, 250);
+}
+const xcol = k => (F.xcols || []).indexOf(k) !== -1;
+function statusText(f) {
+    const on = SO_STATUS_BOXES.filter(s => ints(f.statuses).indexOf(s[0]) !== -1).map(s => S.soStatusName[s[0]] || s[1]);
+    if (!on.length) return 'No SO status';
+    return 'SO status: ' + on.join(', ');
+}
+function filterText(f) {
+    const lgs = f.lgs.length ? 'Location groups: ' + f.lgs.map(id => S.lgNames[id] || id).join(', ') : '';
+    return [rangeText(f), statusText(f), soLike(f.soNum) ? 'SO # ' + f.soNum : '', lgs,
+            f.openOnly ? 'Only lines still to fulfil' : ''].filter(Boolean).join(' · ');
+}
+const orderFromText = () => (F.orderFrom === 'created' ? 'Order Date = Date Created − Lead Time (the standard report)'
+                                                         : 'Order Date = Date Scheduled − Lead Time');
+
+// ============================================================================
+//  SQL — the iReport query, its parameters bound inline, with the line's
+//  quantities, units and dates the fixes need. The stock figures are the
+//  original's correlated view sub-queries, unchanged.
+// ============================================================================
+const viewQty = view => `COALESCE((SELECT SUM(${view}.qty) FROM ${view}
+                 WHERE ${view}.partid = part.id AND ${view}.locationgroupid = so.locationgroupid), 0)`;
+const DT = col => `DATE_FORMAT(${col}, '%Y-%m-%d %H:%i:%s')`;
+
+function lgScope(f) {
+    return (f.lgs.length ? f.lgs : S.myLgs).filter(id => S.myLgs.indexOf(id) !== -1);
+}
+function buildSQL(f) {
+    const statuses = ints(f.statuses).filter(s => SO_STATUS_BOXES.some(b => b[0] === s));
+    const w = ['part.typeid = 10'];
+    const r = dateRange(f);
+    // The original's own range test; All dates still needs the date (BETWEEN never matches NULL).
+    w.push(r ? `so.datecreated BETWEEN '${r.start} 00:00:00' AND DATE_SUB('${r.endExcl} 00:00:00', INTERVAL 1 SECOND)` : 'so.datecreated IS NOT NULL');
+    const like = soLike(f.soNum);
+    if (like) w.push(`so.num LIKE '${sqlStr(like)}'`);
+    w.push(statuses.length ? 'so.statusid IN (' + statuses.join(', ') + ')' : '1 = 2');
+    w.push('so.locationgroupid IN (' + (lgScope(f).join(', ') || '0') + ')');
+    return `
+        SELECT so.id AS soid, so.num AS sonum, so.statusid AS sostatusid, COALESCE(customer.name, '') AS customer,
+               ${DT('so.datecreated')} AS datecreated, ${DT('so.dateissued')} AS dateissued, ${DT('so.datefirstship')} AS datefirstship,
+               so.locationgroupid AS lgid, COALESCE(lg.name, '') AS lgname,
+               soitem.id AS soitemid, soitem.solineitem AS line, soitem.typeid AS itemtype, soitem.statusid AS itemstatus,
+               soitem.qtytofulfill AS qtytofulfill, COALESCE(soitem.qtyfulfilled, 0) AS qtyfulfilled,
+               COALESCE(soitem.uomid, 0) AS lineuomid, COALESCE(lu.code, '') AS lineuom,
+               ${DT('COALESCE(soitem.datescheduledfulfillment, so.datefirstship)')} AS datesched,
+               part.id AS partid, part.num AS partnum, COALESCE(part.description, '') AS partdesc,
+               part.uomid AS partuomid, COALESCE(pu.code, '') AS partuom,
+               ${viewQty('qtyonhand')} AS qtyonhand,
+               ${viewQty('qtyallocated')} AS allocated,
+               ${viewQty('qtyonorder')} AS onorder,
+               ${viewQty('qtydropship')} AS dropship,
+               ${viewQty('qtynotavailable')} AS qtynotavailable,
+               COALESCE(vendor.name, '') AS defaultvendor, COALESCE(vendorparts.leadtime, 0) AS leadtime
+        FROM so
+            INNER JOIN soitem ON soitem.soid = so.id
+            INNER JOIN product ON product.id = soitem.productid
+            INNER JOIN part ON part.id = product.partid
+            LEFT OUTER JOIN vendorparts ON part.id = vendorparts.partid AND vendorparts.defaultflag = 1
+            LEFT OUTER JOIN vendor ON vendor.id = vendorparts.vendorid
+            LEFT OUTER JOIN customer ON customer.id = so.customerid
+            LEFT OUTER JOIN locationgroup lg ON lg.id = so.locationgroupid
+            LEFT OUTER JOIN uom lu ON lu.id = soitem.uomid
+            LEFT OUTER JOIN uom pu ON pu.id = part.uomid
+        WHERE ${w.join('\n          AND ')}
+        ORDER BY so.id, soitem.solineitem, soitem.id`;
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+let _loadToken = 0;
+
+async function loadLookups() {
+    let myLgs = [];
+    try { myLgs = ints(typeof getLocationGroupList === 'function' ? getLocationGroupList() : []); } catch (_) {}
+    S.myLgs = myLgs;
+    const res = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('SO statuses', 'SELECT id, name FROM sostatus ORDER BY id'),
+        q('Location groups', `SELECT id, name, activeflag+0 AS active FROM locationgroup WHERE id IN (${myLgs.join(',') || '0'}) ORDER BY name`)
+    ]);
+    const ok = i => res[i].status === 'fulfilled' ? res[i].value : [];
+    S.company = (ok(0)[0] || {}).name || '';
+    ok(1).forEach(r => { S.soStatusName[Number(r.id)] = String(r.name || ''); });
+    const host = document.getElementById('statusChecks');
+    host.innerHTML = SO_STATUS_BOXES.map(s =>
+        `<label class="rpt-fcheck"><input type="checkbox" data-status="${s[0]}"> ${esc(S.soStatusName[s[0]] || s[1])}</label>`).join('');
+    statusBoxes().forEach(b => b.addEventListener('change', applySoon));
+    ok(2).forEach(r => { S.lgNames[Number(r.id)] = r.name; });
+    _lgMs.setItems(ok(2).map(r => ({ value: Number(r.id), label: r.name + (Number(r.active) === 1 ? '' : ' (inactive)') })));
+    const failed = res.filter(x => x.status === 'rejected').map(x => x.reason && x.reason.message);
+    if (failed.length) document.getElementById('banner').textContent = 'Some lookups failed to load: ' + failed.join('; ');
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    document.getElementById('banner').textContent = '';
+    document.getElementById('loading').classList.add('show');
+    setStatus('Loading…');
+    let rows, conv;
+    const cap = S.noCap ? 0 : undefined;           // FBLib.RowCap: the first 10,000 lines unless Load all
+    try {
+        [rows, conv] = await Promise.all([
+            q('SO lines', FBLib.RowCap.sql(buildSQL(F), cap)),
+            q('UOM conversions', 'SELECT fromuomid, touomid, multiply, factor FROM uomconversion')
+        ]);
+    } catch (e) {
+        if (tok !== _loadToken) return;
+        document.getElementById('loading').classList.remove('show');
+        document.getElementById('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        FBLib.RowCap.notice({ before: document.getElementById('appView'), capped: false });
+        S.rows = []; S.loadedAt = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    if (tok !== _loadToken) return;
+    document.getElementById('loading').classList.remove('show');
+    loadUomMap(conv);
+    // Cut back to whole sales orders: every SO shown lists all its lines.
+    const capped = FBLib.RowCap.apply(rows, cap, { keyOf: r => String(r.soid) });
+    FBLib.RowCap.notice({ before: document.getElementById('appView'), capped: capped.capped, limit: capped.limit, what: 'lines',
+                          onLoadAll: () => { S.noCap = true; loadAll(); } });
+    S.rows = capped.rows.map(r => ({
+        soId: Number(r.soid), so: String(r.sonum || ''), soStatusId: Number(r.sostatusid), customer: r.customer || '',
+        created: String(r.datecreated || ''), issued: String(r.dateissued || ''), firstShip: String(r.datefirstship || ''),
+        lgId: Number(r.lgid), lg: r.lgname || '',
+        line: Number(r.line), itemType: Number(r.itemtype), itemStatus: Number(r.itemstatus),
+        qtyToFulfill: num(r.qtytofulfill), qtyFulfilled: num(r.qtyfulfilled), lineUomId: Number(r.lineuomid), lineUom: r.lineuom || '',
+        sched: String(r.datesched || ''),
+        partId: Number(r.partid), part: String(r.partnum || ''), desc: r.partdesc || '', partUomId: Number(r.partuomid), uom: r.partuom || '',
+        onhand: num(r.qtyonhand), alloc: num(r.allocated), onorder: num(r.onorder), dropship: num(r.dropship), notavail: num(r.qtynotavailable),
+        vendor: r.defaultvendor || '', lead: Math.round(num(r.leadtime))
+    }));
+    derive();
+    S.collapsed = new Set();
+    S.loadedAt = new Date();
+    render();
+}
+
+// The line's figures (see the header comment for each rule). Re-run when
+// the order-date option changes.
+function derive() {
+    S.rows.forEach(r => {
+        const c = uomConv(r.lineUomId, r.partUomId);
+        r.convKnown = !!c;
+        r.convNote = c ? '' : `No UOM conversion from ${r.lineUom || 'the line UOM'} to ${r.uom || 'the part UOM'}: shown in the line's UOM`;
+        r.isOpen = OPEN_SO.indexOf(r.soStatusId) !== -1 && OPEN_LINE.indexOf(r.itemStatus) !== -1 && CREDIT_TYPES.indexOf(r.itemType) === -1;
+        r.remainingLine = Math.max(r.qtyToFulfill - r.qtyFulfilled, 0);
+        r.need = r.isOpen ? convQty(r.remainingLine, c) : 0;              // null = unknown unit
+        r.lineQty = convQty(r.qtyToFulfill, c);
+        r.avail = r.onhand - r.alloc - r.notavail + r.dropship;
+        // The original's Short: an estimate's need isn't in Total Allocated yet.
+        r.unalloc = r.soStatusId === 10 ? (r.need || 0) : 0;
+        r.shortBase = r.avail - r.unalloc;
+        r.short = r.shortBase < 0 ? r.shortBase : null;
+        // Red Order Date: the line still needs stock and Available, less the
+        // part of that need Total Allocated doesn't already hold (qtyallocatedso
+        // counts Issued / In Progress SOs' Sale and Drop Ship lines that are
+        // Entered, Built, Picking, Partial or Picked), is below zero.
+        r.inAlloc = ALLOC_SO.indexOf(r.soStatusId) !== -1 && ALLOC_LINE.indexOf(r.itemStatus) !== -1 && ALLOC_TYPE.indexOf(r.itemType) !== -1;
+        r.notAlloc = r.inAlloc ? 0 : (r.need || 0);
+        r.flag = (r.need || 0) > 0 && r.avail - r.notAlloc < 0;
+        r.orderDate = daysBefore(F.orderFrom === 'created' ? r.created : r.sched, r.lead);
+        r.buy = !r.isOpen || r.need === 0 ? 'Nothing left' : r.flag ? 'Short' : 'Covered';
+    });
+}
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+
+// ============================================================================
+//  MODEL + TABLE
+// ============================================================================
+const byPart = () => F.groupBy === 'part';
+const visRows = () => (F.openOnly ? S.rows.filter(r => r.need !== 0) : S.rows);
+
+// The original's columns, in its order, plus the optional ones; then in the
+// user's order (FBLib.RptCols). Grouped by part the line's identity is its
+// sales order, and the part's stock figures sit on the part's row.
+function cols() {
+    const first = byPart()
+        ? [{ key: 'so', label: 'SO #', w: 170 }]
+        : [{ key: 'part', label: 'Part #', w: 130 }].concat(xcol('desc') ? [{ key: 'desc', label: 'Description', w: 220 }] : []);
+    const base = first.concat(
+        [{ key: 'need', label: 'Qty Needed', w: 86, num: true, tip: "What the line still needs, in the part's UOM" }],
+        xcol('uom') ? [{ key: 'uom', label: 'UOM', w: 50 }] : [],
+        xcol('lineQty') ? [{ key: 'lineQty', label: 'Line Qty', w: 76, num: true, tip: "The line's ordered quantity in the part's UOM (the standard report's Qty Needed)" }] : [],
+        [{ key: 'onhand', label: 'On Hand', w: 76, num: true },
+         { key: 'alloc', label: 'Total Allocated', w: 96, num: true }],
+        xcol('avail') ? [{ key: 'avail', label: 'Available', w: 80, num: true, tip: 'On Hand − Total Allocated − Not Available + Drop Ship' }] : [],
+        [{ key: 'short', label: 'Short', w: 70, num: true },
+         { key: 'onorder', label: 'On Order', w: 76, num: true },
+         { key: 'vendor', label: 'Default Vendor', w: 150 },
+         { key: 'lead', label: 'Lead Time', w: 66, num: true, tip: "The default vendor's lead time, days" }],
+        xcol('sched') ? [{ key: 'sched', label: 'Date Scheduled', w: 92, num: true, tip: "The line's scheduled fulfilment date (else the SO's)" }] : [],
+        [{ key: 'orderDate', label: 'Order Date', w: 86, num: true, tip: orderFromText() }]
+    );
+    return COLS ? COLS.arrange(base) : base;
+}
+const headRow = cs => '<tr>' + cs.map(c =>
+    `<th data-col="${c.key}" class="${c.num ? 'num-cell' : ''}" style="min-width:${c.w}px"${c.tip ? ` title="${esc(c.tip)}"` : ''}>${esc(c.label)}</th>`).join('') + '</tr>';
+const rowCells = (cs, cell) => cs.map(c => `<td class="${c.num ? 'num-cell' : ''}">${cell[c.key] ?? ''}</td>`).join('');
+// Heading-click sort (FBLib.RptCols): lines sort within their group; the
+// groups keep the report's order.
+const sortVal = (r, k) => ({ part: r.part, desc: r.desc, so: r.so, need: r.need ?? -1, uom: r.uom, lineQty: r.lineQty ?? -1,
+    onhand: r.onhand, alloc: r.alloc, avail: r.avail, short: r.short ?? 0, onorder: r.onorder, vendor: r.vendor, lead: r.lead,
+    sched: r.sched, orderDate: r.orderDate })[k];
+const sortLines = list => (COLS && COLS.sort() ? list.slice().sort((a, b) => COLS.compare(a, b, sortVal)) : list);
+// A group / total row: `identity` spans the first run of columns that carry
+// none of this row's figures, and each figure sits in its own column,
+// whatever order the user has put the columns in.
+function totalsCells(cs, identity, figs) {
+    const has = c => figs[c.key] != null && figs[c.key] !== '';
+    let a = cs.findIndex(c => !has(c));
+    if (a < 0) a = 0;
+    let b = a + 1;
+    while (b < cs.length && !has(cs[b])) b++;
+    const cell = c => `<td class="${c.num ? 'num-cell' : ''}">${figs[c.key] ?? ''}</td>`;
+    return cs.slice(0, a).map(cell).join('') + `<td colspan="${b - a}">${identity}</td>` + cs.slice(b).map(cell).join('');
+}
+
+// Cells shared by both layouts.
+const qtyHtml = v => esc(fmtQty(v));
+const shortHtml = v => (v == null ? '' : `<span class="neg">${esc(fmtQty(v))}</span>`);
+const orderDateHtml = (d, flag) => (d ? `<span class="${flag ? 'neg' : ''}" title="${esc(orderFromText())}">${esc(fmtDate(d))}</span>` : '');
+function needHtml(r) {
+    if (r.need === null) return `<span class="warn" title="${esc(r.convNote)}">${esc(fmtQty(r.remainingLine))} ${esc(r.lineUom)} ⚠</span>`;
+    if (!r.isOpen) return `<span class="muted" title="${esc(closedWhy(r))}">${esc(fmtQty(0))}</span>`;
+    return esc(fmtQty(r.need));
+}
+function closedWhy(r) {
+    if (CREDIT_TYPES.indexOf(r.itemType) !== -1) return 'A credit return: stock comes back, nothing is needed';
+    if (OPEN_SO.indexOf(r.soStatusId) === -1) return 'The sales order is ' + (S.soStatusName[r.soStatusId] || 'closed') + ': nothing is needed';
+    return 'The line is closed: nothing is needed';
+}
+const lineQtyHtml = r => (r.lineQty === null ? `<span class="warn" title="${esc(r.convNote)}">${esc(fmtQty(r.qtyToFulfill))} ${esc(r.lineUom)} ⚠</span>` : qtyHtml(r.lineQty));
+const tagHtml = r => (LINE_TYPE_TAG[r.itemType] ? `<span class="ln-tag">${esc(LINE_TYPE_TAG[r.itemType])}</span>` : '');
+
+// Groups in the report's order: sales orders as queried, or parts (part
+// number, then location group) with each part's lines in SO order.
+function groups() {
+    const out = [], idx = {};
+    visRows().forEach(r => {
+        const key = byPart() ? r.partId + '|' + r.lgId : String(r.soId);
+        let g = idx[key];
+        if (!g) { g = idx[key] = { key, rows: [], first: r }; out.push(g); }
+        g.rows.push(r);
+    });
+    if (byPart()) {
+        out.sort((a, b) => a.first.part.localeCompare(b.first.part, undefined, { numeric: true }) || a.first.lg.localeCompare(b.first.lg));
+        out.forEach(g => {
+            const f = g.first;
+            g.need = g.rows.reduce((s, r) => s + (r.need || 0), 0);
+            g.unknown = g.rows.some(r => r.need === null);
+            g.lineQty = g.rows.reduce((s, r) => s + (r.lineQty || 0), 0);
+            g.unalloc = g.rows.reduce((s, r) => s + r.unalloc, 0);
+            g.shortBase = f.avail - g.unalloc;
+            g.short = g.shortBase < 0 ? g.shortBase : null;
+            g.flag = g.need > 0 && f.avail - g.rows.reduce((s, r) => s + r.notAlloc, 0) < 0;
+            const dated = g.rows.filter(r => (r.need || 0) > 0 && r.orderDate).map(r => r.orderDate).sort();
+            g.orderDate = dated[0] || '';
+        });
+    }
+    return out;
+}
+
+// An SO row: the original's group heading (SO #, Date Created, Estimated
+// Time, the scheduled date), then the SO's status, customer and Date Issued.
+function soGroupRow(cs, g, forPrint) {
+    const r = g.first, open = !S.collapsed.has(g.key);
+    const fld = (label, v, tip) => (v ? `<span class="grp-field"${tip ? ` title="${esc(tip)}"` : ''}>${esc(label)}: <b>${esc(v)}</b></span>` : '');
+    const span = spanText(r.created, r.firstShip || g.rows.map(x => x.sched).filter(Boolean).sort()[0]);
+    const meta = [S.soStatusName[r.soStatusId] || '', r.customer, r.issued ? 'Issued ' + fmtDate(r.issued) : '', r.lg,
+                  plural(g.rows.length, 'line')].filter(Boolean).join(' · ');
+    const id = '<div class="rpt-grp-inner">' + (forPrint ? '' : `<span class="rpt-toggle">${open ? '▼' : '▶'}</span>`) +
+        '<span>SO #: ' + openLink('Sales Order', r.so) + '</span>' +
+        fld('Date Created', fmtDate(r.created)) + fld('Estimated Time', span, 'From Date Created to the date the SO is scheduled') +
+        fld('Date Scheduled', fmtDate(r.firstShip)) +
+        `<span class="rpt-grp-meta">${esc(meta)}</span></div>`;
+    return `<tr class="rpt-grp" data-grp="${esc(g.key)}">${totalsCells(cs, id, {})}</tr>`;
+}
+// A part row (Group by Part): the part at one location group, its total
+// need and its stock figures (one part, one UOM).
+function partGroupRow(cs, g, forPrint) {
+    const f = g.first, open = !S.collapsed.has(g.key);
+    const id = '<div class="rpt-grp-inner">' + (forPrint ? '' : `<span class="rpt-toggle">${open ? '▼' : '▶'}</span>`) +
+        openLink('Part', f.part, f.desc) +
+        `<span class="rpt-grp-meta">${esc([f.lg, plural(g.rows.length, 'line')].join(' · '))}</span>` +
+        (f.desc ? `<span class="grp-desc"> – ${esc(f.desc)}</span>` : '') + '</div>';
+    const figs = {
+        need: g.unknown ? `<span class="warn" title="Some lines have no UOM conversion and aren't counted">${qtyHtml(g.need)} ⚠</span>` : qtyHtml(g.need),
+        uom: esc(f.uom), lineQty: qtyHtml(g.lineQty),
+        onhand: qtyHtml(f.onhand), alloc: qtyHtml(f.alloc), avail: qtyHtml(f.avail), short: shortHtml(g.short),
+        onorder: qtyHtml(f.onorder), vendor: f.vendor ? openLink('Vendor', f.vendor) : '', lead: esc(String(f.lead)),
+        orderDate: orderDateHtml(g.orderDate, g.flag)
+    };
+    return `<tr class="rpt-grp" data-grp="${esc(g.key)}">${totalsCells(cs, id, figs)}</tr>`;
+}
+function lineRow(cs, r) {
+    const partLayout = byPart();
+    return '<tr>' + rowCells(cs, {
+        part: openLink('Part', r.part, r.desc) + tagHtml(r), desc: cut(r.desc),
+        so: openLink('Sales Order', r.so) + (r.customer ? `<span class="ln-tag">${esc(r.customer)}</span>` : '') + tagHtml(r),
+        need: needHtml(r), uom: esc(r.uom), lineQty: lineQtyHtml(r),
+        onhand: partLayout ? '' : qtyHtml(r.onhand), alloc: partLayout ? '' : qtyHtml(r.alloc),
+        avail: partLayout ? '' : qtyHtml(r.avail),
+        short: partLayout ? (r.soStatusId === 10 && r.need ? `<span class="muted" title="An estimate: its need is taken off Available">est.</span>` : '') : shortHtml(r.short),
+        onorder: partLayout ? '' : qtyHtml(r.onorder), vendor: partLayout ? '' : (r.vendor ? openLink('Vendor', r.vendor) : ''),
+        lead: partLayout ? '' : esc(String(r.lead)), sched: esc(fmtDate(r.sched)),
+        orderDate: orderDateHtml(r.orderDate, r.flag)
+    }) + '</tr>';
+}
+function bodyRows(cs, forPrint) {
+    const out = [];
+    groups().forEach(g => {
+        out.push(byPart() ? partGroupRow(cs, g, forPrint) : soGroupRow(cs, g, forPrint));
+        if (S.collapsed.has(g.key)) return;
+        sortLines(g.rows).forEach(r => out.push(lineRow(cs, r)));
+    });
+    return out;
+}
+function lineSummary() {
+    const rows = visRows(), gs = groups();
+    const short = rows.filter(r => r.flag).length;
+    return plural(rows.length, 'line') + ' on ' + plural(byPart() ? new Set(rows.map(r => r.soId)).size : gs.length, 'sales order') +
+        (byPart() ? ', ' + plural(gs.length, 'part') : '') + ' · ' + plural(short, 'line') + ' short';
+}
+function footRow(cs) {
+    return `<tr>${totalsCells(cs, 'Total — ' + esc(lineSummary()), {})}</tr>`;
+}
+function emptyText() {
+    if (!ints(F.statuses).length) return 'Every SO status is switched off. Turn one on in Filters.';
+    if (S.rows.length && F.openOnly) return 'No line still has something to fulfil. Untick "Only lines still to fulfil" to see them all.';
+    return 'No sales order lines match these filters.' + (dateRange(F) ? ' The date range is on Date Created: try All dates.' : '');
+}
+
+// Long reports paint in chunks as the user scrolls.
+const CHUNK = 600;
+let _paint = { html: [], shown: 0 };
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+function statusSummary() {
+    if (!S.loadedAt) return '';
+    return lineSummary() + ' · ' + rangeText(F);
+}
+
+function render(keepScroll) {
+    if (S.view === 'pivot' && PIVOT) {
+        PIVOT.render();
+        setStatus([S.company, 'pivot', statusSummary()].filter(Boolean).join(' · '));
+        if (PDF) PDF.refresh();
+        return;
+    }
+    const tbl = document.getElementById('rpt');
+    const wrap = document.getElementById('rptWrap');
+    const top = wrap.scrollTop;
+    const cs = cols();
+    const any = visRows().length > 0;
+    tbl.querySelector('thead').innerHTML = headRow(cs);
+    _paint = { html: bodyRows(cs, false), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    while (keepScroll && _paint.shown < _paint.html.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+    tbl.querySelector('tfoot').innerHTML = any ? footRow(cs) : '';
+    tbl.style.display = any ? '' : 'none';
+    document.getElementById('rptEmpty').textContent = any || !S.loadedAt ? '' : emptyText();
+    wrap.scrollTop = keepScroll ? top : 0;
+    setStatus([S.company, statusSummary()].filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the pages as the standard report prints them: Letter
+//  landscape, the title band on the first page, each SO's heading (SO #,
+//  Date Created, Estimated Time, Date Scheduled) over its lines, Short and a
+//  short line's Order Date in red, no totals (the original has none).
+// ============================================================================
+let PDF = null;
+// The SO heading keeps each "label: value" on one line and wraps between
+// them; the screen's grey and link colours print black, the original's red
+// stays red.
+const PDF_CSS =
+    '.fbdoc-rpt-tbl .rpt-grp-inner{overflow-wrap:break-word}' +
+    '.fbdoc-rpt-tbl .rpt-grp-inner>:first-child{white-space:nowrap}' +
+    '.fbdoc-rpt-tbl .grp-field{color:inherit;font-weight:700;margin-left:12pt}' +
+    '.fbdoc-rpt-tbl .grp-field b{font-weight:400}' +
+    '.fbdoc-rpt-tbl .grp-desc,.fbdoc-rpt-tbl .muted,.fbdoc-rpt-tbl .ln-tag{color:inherit;font-weight:400}' +
+    '.fbdoc-rpt-tbl .ln-tag{font-size:.85em}' +
+    '.fbdoc-rpt-tbl .neg{color:#FF0000;font-weight:inherit}' +
+    '.fbdoc-rpt-tbl .warn{color:inherit}';
+function docSpec() {
+    if (!S.loadedAt) return null;
+    if (S.view === 'pivot' && PIVOT) {
+        const p = PIVOT.pdfSpec();
+        return { company: S.company, title: TITLE, titleEveryPage: false, subtitle: [filterText(F), pivotText()],
+                 head: p.head, rows: p.rows, foot: p.foot, empty: emptyText(), css: PDF_CSS, fontPt: 10 };
+    }
+    const cs = cols();
+    return {
+        company: S.company, title: TITLE, titleEveryPage: false,
+        subtitle: [filterText(F), (byPart() ? 'Grouped by part · ' : '') + orderFromText()],
+        head: headRow(cs), rows: bodyRows(cs, true), foot: '',
+        empty: emptyText(), css: PDF_CSS, fontPt: 10
+    };
+}
+
+// ============================================================================
+//  PIVOT VIEW (FBLib.Pivot) — Qty Needed, Line Qty or the line count by any
+//  two of vendor, part, SO, customer, SO status, location group, buy state
+//  and the dates. Vendor + part × order date is the buying calendar.
+// ============================================================================
+let PIVOT = null, COLS = null;
+const BUY_ORDER = ['Short', 'Covered', 'Nothing left'];
+const PIVOT_FIELDS = [
+    { key: 'vendor', label: 'Default Vendor' }, { key: 'part', label: 'Part #' }, { key: 'desc', label: 'Description', dim: false },
+    { key: 'so', label: 'SO #' }, { key: 'customer', label: 'Customer' }, { key: 'soStatus', label: 'SO Status' },
+    { key: 'lg', label: 'Location Group' }, { key: 'buy', label: 'Buy state', order: BUY_ORDER }, { key: 'uom', label: 'UOM' },
+    { key: 'created', label: 'Date Created', type: 'date' }, { key: 'sched', label: 'Date Scheduled', type: 'date' },
+    { key: 'orderDate', label: 'Order Date', type: 'date' },
+    { key: 'need', label: 'Qty Needed', type: 'qty' }, { key: 'lineQty', label: 'Line Qty', type: 'qty' },
+    { key: 'sos', label: 'Sales orders', distinct: true, dim: false }
+];
+const pivotRows = () => visRows().map(r => ({ vendor: r.vendor || '(no default vendor)', part: r.part, desc: r.desc, so: r.so,
+    customer: r.customer, soStatus: S.soStatusName[r.soStatusId] || String(r.soStatusId), lg: r.lg, buy: r.buy, uom: r.uom,
+    created: r.created, sched: r.sched, orderDate: r.orderDate, need: r.need || 0, lineQty: r.lineQty || 0, sos: r.so }));
+function pivotText() {
+    const c = PIVOT.config(), lbl = k => (PIVOT_FIELDS.find(x => x.key === k) || {}).label || '';
+    const m = c.measure === '__count__' ? 'Lines'
+        : c.measure === 'sos' ? 'Sales orders'
+        : ({ sum: 'Total', count: 'Count of', avg: 'Average', min: 'Lowest', max: 'Highest' }[c.agg] + ' ' + lbl(c.measure));
+    return 'Pivot: ' + m + ' by ' + [lbl(c.rowDim), lbl(c.rowDim2)].filter(Boolean).join(' + ') + (c.colDim ? ' × ' + lbl(c.colDim) : '');
+}
+function setView(v, persist) {
+    S.view = v === 'pivot' && PIVOT ? 'pivot' : 'table';
+    document.getElementById('viewSel').value = S.view;
+    document.getElementById('rptWrap').style.display = S.view === 'pivot' ? 'none' : '';
+    document.getElementById('pivotHost').style.display = S.view === 'pivot' ? '' : 'none';
+    document.getElementById('expandBtn').parentNode.style.display = S.view === 'pivot' ? 'none' : '';
+    if (persist) _saveUserKeys({ view: S.view });
+    render(false);
+}
+
+function setAllOpen(open) {
+    S.collapsed = new Set(open ? [] : groups().map(g => g.key));
+    render(false);
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!visRows().length) { showToast('Nothing to export.', 'warn'); return; }
+    const sub = [S.company, filterText(F), orderFromText()].filter(Boolean);
+    const T = 'text', Q = 'qty', D = 'date';
+    const lines = {
+        name: 'SO Lines', title: TITLE, subtitle: sub,
+        cols: [{ key: 'so', label: 'SO #', w: 80, type: T }, { key: 'soStatus', label: 'SO Status', w: 80, type: T },
+               { key: 'customer', label: 'Customer', w: 180, type: T }, { key: 'created', label: 'Date Created', w: 90, type: D },
+               { key: 'issued', label: 'Date Issued', w: 90, type: D }, { key: 'firstShip', label: 'SO Date Scheduled', w: 90, type: D },
+               { key: 'est', label: 'Estimated Time', w: 90, type: T }, { key: 'lg', label: 'Location Group', w: 110, type: T },
+               { key: 'line', label: 'Line', w: 40, type: 'int', noTotal: true }, { key: 'lineType', label: 'Line Type', w: 80, type: T },
+               { key: 'part', label: 'Part #', w: 110, type: T }, { key: 'desc', label: 'Description', w: 220, type: T },
+               { key: 'needX', label: 'Qty Needed', w: 80, type: Q, noTotal: true }, { key: 'uom', label: 'UOM', w: 50, type: T },
+               { key: 'lineQtyX', label: 'Line Qty', w: 80, type: Q, noTotal: true }, { key: 'lineUom', label: 'Line UOM', w: 60, type: T },
+               { key: 'onhand', label: 'On Hand', w: 80, type: Q, noTotal: true }, { key: 'alloc', label: 'Total Allocated', w: 90, type: Q, noTotal: true },
+               { key: 'notavail', label: 'Not Available', w: 80, type: Q, noTotal: true }, { key: 'dropship', label: 'Drop Ship', w: 70, type: Q, noTotal: true },
+               { key: 'avail', label: 'Available', w: 80, type: Q, noTotal: true }, { key: 'short', label: 'Short', w: 70, type: Q, noTotal: true },
+               { key: 'onorder', label: 'On Order', w: 80, type: Q, noTotal: true }, { key: 'vendor', label: 'Default Vendor', w: 150, type: T },
+               { key: 'lead', label: 'Lead Time', w: 60, type: 'int', noTotal: true }, { key: 'sched', label: 'Date Scheduled', w: 90, type: D },
+               { key: 'orderDate', label: 'Order Date', w: 90, type: D }, { key: 'buy', label: 'Buy state', w: 90, type: T }],
+        rows: visRows().map(r => Object.assign({}, r, {
+            soStatus: S.soStatusName[r.soStatusId] || '', created: dstr(r.created) || null, issued: dstr(r.issued) || null,
+            firstShip: dstr(r.firstShip) || null, est: spanText(r.created, r.firstShip),
+            lineType: LINE_TYPE_TAG[r.itemType] || 'sale', needX: r.need === null ? r.remainingLine : r.need,
+            lineQtyX: r.lineQty === null ? r.qtyToFulfill : r.lineQty, uom: r.need === null ? r.lineUom : r.uom,
+            sched: dstr(r.sched) || null, orderDate: r.orderDate || null
+        })),
+        totals: false
+    };
+    const sheets = [lines];
+    if (byPart()) {
+        sheets.unshift({
+            name: 'By Part', title: TITLE + ' – by part', subtitle: sub,
+            cols: [{ key: 'part', label: 'Part #', w: 110, type: T }, { key: 'desc', label: 'Description', w: 220, type: T },
+                   { key: 'lg', label: 'Location Group', w: 110, type: T }, { key: 'lines', label: 'Lines', w: 50, type: 'int', noTotal: true },
+                   { key: 'need', label: 'Qty Needed', w: 80, type: Q, noTotal: true }, { key: 'uom', label: 'UOM', w: 50, type: T },
+                   { key: 'onhand', label: 'On Hand', w: 80, type: Q, noTotal: true }, { key: 'alloc', label: 'Total Allocated', w: 90, type: Q, noTotal: true },
+                   { key: 'avail', label: 'Available', w: 80, type: Q, noTotal: true }, { key: 'short', label: 'Short', w: 70, type: Q, noTotal: true },
+                   { key: 'onorder', label: 'On Order', w: 80, type: Q, noTotal: true }, { key: 'vendor', label: 'Default Vendor', w: 150, type: T },
+                   { key: 'lead', label: 'Lead Time', w: 60, type: 'int', noTotal: true }, { key: 'orderDate', label: 'Earliest Order Date', w: 100, type: D }],
+            rows: groups().map(g => ({ part: g.first.part, desc: g.first.desc, lg: g.first.lg, lines: g.rows.length, need: g.need, uom: g.first.uom,
+                onhand: g.first.onhand, alloc: g.first.alloc, avail: g.first.avail, short: g.short, onorder: g.first.onorder,
+                vendor: g.first.vendor, lead: g.first.lead, orderDate: g.orderDate || null })),
+            totals: false
+        });
+    }
+    if (S.view === 'pivot' && PIVOT) sheets.unshift(Object.assign(PIVOT.sheet('Pivot'), { title: TITLE + ' – ' + pivotText(), subtitle: sub }));
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'Advanced_Purchasing_By_SO_' + ymd(new Date()), sheets });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's pages (fb-doc). Without fb-doc on the server, the
+// plain printout below: JxBrowser won't print the report page itself, so it
+// is built in a new window and printed there. Collapsed groups print as
+// their group row.
+function printReport() {
+    if (PDF) {
+        if (!visRows().length) { showToast('Nothing to print.', 'warn'); return; }
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    if (!visRows().length) { showToast('Nothing to print.', 'warn'); return; }
+    const cs = cols();
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' + esc(TITLE) + '</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8.5pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:11pt;font-weight:700}h2{text-align:center;font-size:14pt;margin:2px 0}.sub{text-align:center;font-size:8.5pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{font-size:8.5pt;text-align:left;padding:3px 5px;border-bottom:1px solid #000}' +
+        'td{font-size:8.5pt;padding:2px 5px;vertical-align:top}.num-cell{text-align:right}' +
+        'tr.rpt-grp td{font-weight:700;padding-top:7px;border-bottom:1px solid #999}.grp-field{margin-left:12px}.grp-field b{font-weight:400}' +
+        '.rpt-grp-meta,.grp-desc,.ln-tag{font-weight:400;color:#555;margin-left:8px}.neg{color:#F00}' +
+        'tfoot td{font-weight:700;border-top:1px solid #000}a{color:#000;text-decoration:none}' +
+        '@page{size:Letter landscape;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>' + esc(TITLE) + '</h2><p class="sub">' + esc(filterText(F) + ' · ' + orderFromText()) + '</p>' +
+        '<table><thead>' + headRow(cs).replace(/ style="[^"]*"/g, '') + '</thead><tbody>' + bodyRows(cs, true).join('') +
+        '</tbody><tfoot>' + footRow(cs) + '</tfoot></table>' +
+        '<p style="font-size:7.5pt;margin-top:8px">Printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters what everyone sees each time this report opens?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        _lgMs = FBLib.Common.MultiSelect.create({ containerId: 'lgMs', items: [], placeholder: 'All my location groups', maxTags: 2, onClose: applySoon });
+        const fRange = document.getElementById('fRange');
+        fRange.innerHTML = RANGES.map(r => `<option value="${r[0]}">${esc(r[1])}</option>`).join('');
+        // A quick range fills the dates (All dates clears them); editing a date makes the range Custom.
+        fRange.onchange = () => {
+            const p = presetDates(fRange.value);
+            if (fRange.value !== 'custom') {
+                document.getElementById('fFrom').value = p ? p[0] : '';
+                document.getElementById('fTo').value = p ? p[1] : '';
+            }
+            applySoon();
+        };
+        ['fFrom', 'fTo'].forEach(id => document.getElementById(id).addEventListener('change', () => { fRange.value = 'custom'; applySoon(); }));
+        const fSoNum = document.getElementById('fSoNum');
+        fSoNum.addEventListener('change', applySoon);
+        fSoNum.addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        document.querySelectorAll('#fGroupBy, #fOrderFrom, #fOpenOnly').forEach(el => el.addEventListener('change', applySoon));
+        xcolBoxes().forEach(b => b.addEventListener('change', applySoon));
+        document.getElementById('resetFiltersBtn').onclick = () => { writeFilters(DEFAULT_FILTERS); applySoon(); };
+
+        // Column resize / sort / reorder, and the Pivot view (fb-lib).
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({ table: document.getElementById('rpt'),
+                                                         onSort: () => render(true), onReorder: () => render(true) });
+        if (FBLib.Pivot) PIVOT = FBLib.Pivot.mount(document.getElementById('pivotHost'), {
+            fields: PIVOT_FIELDS, rows: pivotRows, countLabel: 'Lines',
+            defaults: { rowDim: 'vendor', rowDim2: 'part', colDim: 'buy', colBucket: 'month', measure: 'need', agg: 'sum', showColTotals: false },
+            format: (fld, v) => (fld && fld.type === 'qty' ? fmtQty(v) : null)
+        });
+        else document.getElementById('viewSelWrap').style.display = 'none';
+        document.getElementById('viewSel').addEventListener('change', e => setView(e.target.value, true));
+        document.getElementById('resetColsBtn').onclick = () => { if (COLS) { COLS.reset(); render(false); } };
+        S.view = _resolve('view', 'table') === 'pivot' && PIVOT ? 'pivot' : 'table';
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: document.getElementById('appView'), toggleBefore: document.getElementById('exportBtn'),
+                page: { size: 'Letter', orientation: 'landscape' },
+                doc: docSpec, title: () => TITLE
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        setView(S.view, false);
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('expandBtn').onclick = () => setAllOpen(true);
+        document.getElementById('collapseBtn').onclick = () => setAllOpen(false);
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('unpublishBtn').onclick = () => {
+            if (!confirm('Stop using company defaults for this report? Everyone goes back to their own last choices.')) return;
+            const ok = FBLib.Settings.clearCompany(['filters', 'opts']) !== false;
+            showToast(ok ? 'This report no longer has company defaults.' : 'That was not saved.', ok ? 'success' : 'error');
+        };
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        const wrap = document.getElementById('rptWrap');
+        wrap.addEventListener('scroll', () => { if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 400) appendChunk(); });
+        document.getElementById('rpt').addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (a) {
+                e.preventDefault();
+                try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+                catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+                return;
+            }
+            const g = e.target.closest('tr.rpt-grp');
+            if (!g) return;
+            const key = g.dataset.grp;
+            if (S.collapsed.has(key)) S.collapsed.delete(key); else S.collapsed.add(key);
+            render(true);
+        });
+
+        await loadLookups();
+        writeFilters(savedFilters());
+        F = readFilters();          // drops saved picks that no longer exist
+        await loadAll();
+    } catch (e) {
+        console.error('[' + TITLE + '] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

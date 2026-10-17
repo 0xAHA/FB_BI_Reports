@@ -1,0 +1,2037 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  REPORT: Available to Build
+  PATH:   iReport_Ports/ManufactureOrder/AvailableToBuild.htm
+  --------------------------------------------------------------------------------
+  Interactive HTML rebuild of Fishbowl's standard JasperReports report
+  ManufactureOrder/AvailableToBuild.jrxml, on the shared fb-lib / fb-styles
+  stack. Skeleton copied from Template/Core_Dashboard_Template.htm; filter /
+  CSV patterns follow iReport_Ports/PurchaseOrder/PurchaseOrderSummary.htm.
+
+  WHAT IT ANSWERS
+    For each BOM (finished good) in the selected location group(s): how many
+    complete units can be built RIGHT NOW from current inventory, without any
+    new purchasing or manufacturing. The scarcest component is the bottleneck.
+
+  CORE MATH (faithful to the .jrxml)
+    Per BOM x location group, over the default-group component lines that are
+    inventory parts (bomitem.groupdefault = 1, bomitem.typeid <> 10 finished
+    good, part.typeid = 10 inventory):
+        perComponentBuilds = FLOOR( availableForSale_base / qtyPerBuild_base )
+        Available to Build  = MIN(perComponentBuilds)   (floored at 0)
+    qtyPerBuild_base = bomitem.quantity * multiply / factor, converting
+    bomitem.uomid -> part.uomid via uomconversion (the stored row,
+    or the exact inverse of one; no chaining). Multiply first, divide last:
+    the ratio form quantity * (multiply / factor) rounds twice and can drop a
+    whole build at a FLOOR boundary. No conversion = unknown, never 1:1.
+    Availability from qtyInventoryTotals is already in the part base UOM.
+
+  AVAILABILITY BASIS = "Available for Sale" (matches the standard report):
+        OnHand - Allocated - NotAvailable + DropShip   (floored at 0)
+    Reproduced by aggregating the qtyInventoryTotals view per part+LG — the
+    same source InventoryAvailability.htm uses.
+
+  FEATURES
+    - BOM summary table (FBLib.Table: sort / drag-reorder / drag-resize / lazy
+      render / saved column layout). Filtering is in the Filters drawer via
+      FBLib.Common.MultiSelect (Location Group / Finished Good / Constraint) +
+      a BOM search + buildability chips — the same widget PurchaseOrderSummary
+      uses. Click a row's Components (or Constraint) cell to drill into the
+      component breakdown (constraint rows highlighted).
+    - Incoming supply (On Order) + "Build After Incoming" projection, and
+      Ready By: when that projection can be built, from the scheduled dates
+      of the open order lines behind On Order (buildIncomingSQL).
+    - Buildable value (Available to Build x units per build x finished-good
+      cost), units per build in the finished good's stocking UOM.
+    - Constraint (bottleneck) column — the component limiting each build;
+      compact (first part + "+N"), click for the full breakdown.
+    - Staged / nested sub-assembly expansion in the drill (the .jrxml's
+      subAvailableToBuild recursion), cycle-guarded.
+    - Defaults to BOMs buildable now; toggle All / Zero-buildable in Filters.
+
+  VIEWS
+    The header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+    report out as pages like the standard Available To Build report:
+      - Letter landscape by default; company and title on the first page;
+        the column headings on every page; "Page X of Y".
+      - A heading per location group, then per BOM: its Available to Build,
+        with a note line (finished good and units per build, constraint,
+        After Incoming / Ready By, build cost and value).
+      - The BOM's lines under their item type (Finished Good, Raw Good, ...)
+        as the original's groups: Qty per BOM in the BOM's unit, the builds
+        each component's available stock supports (the limiting one bold),
+        Available for Sale in the part's unit, "Non-Inv" for others.
+      - A staged sub-assembly's own lines nested under it, as the
+        original's subreport.
+    Settings > PDF view > "List each BOM's components" off prints the BOM
+    rows only. BOMs follow the App table's sort within each location group.
+    Paper size, orientation and the view are remembered per user; Print
+    prints the pages in either view (the plain table printout without
+    fb-doc). Differences from the original's pages: no System Demand column
+    (this report does not compute reorder demand), each component's builds
+    where the original leaves that column blank, and no line numbers.
+
+  DEPLOY ORDER (re-save on the server, in this order, or the report breaks):
+    1. fb-styles  (Style  named exactly "fb-styles", source scripts/fb-styles.css)
+    2. fb-lib     (Script named exactly "fb-lib",    source scripts/fb-lib.js)
+    3. fb-doc + fb-doc-fonts (Script / Style, scripts/fb-doc.js and
+       scripts/fb-doc-fonts.css) for the PDF view; without them the report
+       is App only
+    4. THIS report (the Script and Style directives only re-run on save)
+
+  STATUS: static / desk-built. NOT yet client-tested. Verify ATB parity
+  against the standard AvailableToBuild report for the same BOM+LG before use.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-folder" content="Manufacture Order">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="How many units of each BOM can be built now from current stock, and which components limit it.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting, saved view and shared payload
+        //          this report stores in Fishbowl. Copying this report in
+        //          Fishbowl to make a SEPARATE report? Give the copy its own
+        //          key (e.g. add '2') so it keeps its own settings - left
+        //          as-is, the copy shares the original's. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped automatically from this file's content by
+        //          tools/stamp/stamp.js - never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.availabletobuild',
+            name:  'Available To Build',
+            build: '2026.10.16-b2ae7d9'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Available to Build — Fishbowl BI</title>
+
+    <!-- Inter font (matches the rest of the suite). -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+
+    <!-- Moment.js — kept for date formatting parity with the suite. -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script>
+
+    <!-- Shared Fishbowl BI lib — inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared Fishbowl BI stylesheet — inlined from the saved "fb-styles"
+         Style (scripts/fb-styles.css). MUST come BEFORE the inline block so
+         per-report rules win the cascade on identical selectors. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* =====================================================
+           BASE + LAYOUT  (copied from Core_Dashboard_Template — tokens live
+           in fb-styles; style new work off var(--…), never hardcoded hexes)
+           ===================================================== */
+        * { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; height: 100%; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            font-size: 13px; color: var(--c-primary); background: var(--bg-1);
+            display: flex; flex-direction: column; min-height: 100vh;
+            padding-bottom: var(--debug-drawer-h, 0px);
+            transition: padding-bottom 0.12s ease;
+        }
+        header h1 { font-size: 16px; font-weight: 700; color: var(--c-primary); margin: 0; line-height: 1.15; }
+        #statusLine { font-size: 12px; color: var(--c-tertiary); line-height: 1.15; margin: 2px 0 0; }
+        .hdr-actions { display: flex; align-items: center; gap: 8px; }
+
+        /* Drawer grid (from Core). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 220px; min-width: 220px; }
+        .fb-grid-cols { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); align-items: start; }
+        .fb-grid-cols .fb-group { flex: none; min-width: 0; }
+        .fb-grid-cols .fb-field select,
+        .fb-grid-cols .fb-field input[type=text] { width: 100%; }
+        @media (max-width: 520px) { .fb-grid-cols { grid-template-columns: 1fr; } }
+        /* The Filters drawer hosts fb-lib multi-select dropdowns (Location
+           Group / Finished Good / Constraint). The drawer body scrolls
+           (overflow-y:auto), which CLIPS an open .ms-dropdown so its list is
+           cut off. The filter content is short and never needs to scroll, so
+           let this drawer's body overflow visibly — an open dropdown can then
+           extend past the drawer without being clipped. (The dropdown itself is
+           capped at 280px with its own internal scroll, so it stays bounded.) */
+        #filtersOverlay .fb-drawer-body { overflow: visible; }
+        /* The drawer backdrop scrim is injected + managed by fb-lib
+           (registerDrawer → #fbDrawerScrim). Never add a local scrim or a
+           `.fb-drawer.open { z-index }` override: the drawer must keep the
+           fb-styles z-index (10001) that sits above fb-lib's scrim (10000). */
+        .fb-group-title {
+            font-size: 12px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.04em; color: var(--c-secondary); border-bottom: 1px solid var(--border);
+            padding-bottom: 4px; margin-bottom: 8px;
+        }
+        .fb-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+        .fb-field label { font-size: 11px; font-weight: 600; color: var(--c-secondary); }
+        .fb-field select, .fb-field input[type=text] {
+            padding: 4px 8px; font-size: 12px; border: 1px solid var(--border);
+            border-radius: 6px; background: var(--bg-1); font-family: inherit; color: #415157;
+        }
+        /* Buildability radio chips inside the filter drawer. */
+        .build-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+        .build-chips label {
+            display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+            padding: 4px 10px; border: 1px solid var(--border-strong); border-radius: var(--r-pill);
+            font-size: 12px; font-weight: 600; color: var(--c-secondary); background: #fff;
+        }
+        .build-chips input { display: none; }
+        .build-chips label.on { background: var(--tint-blue); border-color: var(--fb-blue); color: var(--fb-blue-accent); }
+
+        .ds-btn { padding: 7px 13px; font-size: 12px; border-radius: 7px; border: 1px solid var(--border-strong); background: #fff; cursor: pointer; font-family: inherit; font-weight: 600; color: #415157; }
+        .ds-btn:hover { background: var(--bg-2); }
+        .ds-btn-primary { background: var(--color-primary); color: #fff; border-color: var(--color-primary); }
+        .ds-btn-primary:hover { background: var(--color-primary-dark); }
+        .ds-btn-admin { background: var(--acc-orange-bg); border-color: var(--acc-orange); color: var(--acc-orange-con); margin-right: 6px; }
+        .ds-lock-badge { background: var(--acc-orange-bg); color: var(--acc-orange-con); border: 1px solid var(--acc-orange); padding: 7px 10px; border-radius: 7px; font-size: 12px; margin-bottom: 14px; }
+
+        /* App shell (from Core — no KPI strip). */
+        .app-shell { width: 100%; margin: 0; padding: 0; flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+
+        /* Data table (from Core — the styles FBLib.Table.init expects). Single
+           sticky title row (32px); the per-column filter row is hidden (see
+           below), so the body scrolls directly under one sticky header with no
+           gap. */
+        .fb-table-container { flex: 1 1 auto; min-height: 0; overflow: auto; background: #fff; }
+        table.fb-table { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
+        table.fb-table th {
+            background: var(--menu-bg); color: #fff; font-weight: 500;
+            padding: 0 10px; height: 32px; text-align: left; white-space: nowrap;
+            cursor: grab; user-select: none; position: sticky; top: 0; z-index: 10;
+            overflow: hidden; text-overflow: ellipsis;
+        }
+        table.fb-table th:active { cursor: grabbing; }
+        table.fb-table th:hover { background: #164A5F; }
+        table.fb-table th.sort-asc::after  { content: ' \2191'; opacity: 0.8; }
+        table.fb-table th.sort-desc::after { content: ' \2193'; opacity: 0.8; }
+        table.fb-table th.col-drag-over { background: #164A5F; border-left: 3px solid #CBE5FB; }
+        /* No per-column filter row — filtering is in the Filters drawer. Hide
+           the empty row FBLib.Table renders so the body sits directly under the
+           single sticky title row (no gap). */
+        table.fb-table tr.filter-row { display: none; }
+        /* Clip data to its own column — never bleed into the neighbour. */
+        table.fb-table td {
+            padding: 4px 10px; border-bottom: 1px solid var(--border); white-space: nowrap;
+            vertical-align: middle; overflow: hidden; text-overflow: ellipsis;
+        }
+        table.fb-table tr:nth-child(even) td { background: var(--bg-1); }
+        table.fb-table tr:hover td { background: var(--tint-blue) !important; }
+        table.fb-table .num-cell { text-align: right; font-variant-numeric: tabular-nums; }
+        .fb-row-link { color: var(--fb-blue); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--fb-blue-accent); }
+        .fb-col-resize { position: absolute; right: 0; top: 0; width: 6px; height: 100%; cursor: col-resize; user-select: none; }
+        .fb-col-resize:hover { background: rgba(255,255,255,0.3); }
+        /* Every heading carries an explanation (fb-styles .app-tooltip, wired by
+           _wireHeaderTips); the dotted underline says so without adding chrome. */
+        table.fb-table thead tr:first-child th,
+        .drill-tbl th[data-tip] {
+            text-decoration: underline dotted; text-underline-offset: 3px;
+            text-decoration-color: rgba(255,255,255,0.45);
+        }
+        .drill-tbl th[data-tip] { text-decoration-color: var(--border-strong); cursor: help; }
+
+        /* Drill link inside a table cell (Components column). */
+        .drill-link { color: var(--fb-blue); cursor: pointer; font-weight: 600; text-decoration: none; }
+        .drill-link:hover { text-decoration: underline; color: var(--fb-blue-accent); }
+
+        /* Component-drill modal (chrome ships as .modal-* in fb-styles §12).
+           ONE table, table-layout:fixed + a colgroup, so the numeric columns
+           line up straight down the whole nested tree. Only the Component cell
+           indents per nesting level (its inner div's padding-left). */
+        #drillModal .modal-card { max-width: 940px; width: 94%; }
+        .drill-tbl { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
+        .drill-tbl th { background: var(--bg-2); color: var(--c-secondary); text-align: left; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; padding: 6px 8px; border-bottom: 1px solid var(--border); position: sticky; top: 0; }
+        .drill-tbl th.num { text-align: right; }
+        .drill-tbl td { padding: 6px 8px; border-bottom: 1px solid var(--bg-2); vertical-align: top; }
+        .drill-tbl td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+        .drill-tbl tr.constraint td { background: var(--acc-yellow-bg); }
+        .drill-tbl td.comp-part { font-weight: 600; }
+        .drill-tbl td.comp-part > div { min-width: 0; }
+        .drill-tbl .comp-desc { color: var(--c-secondary); font-size: 11px; font-weight: 400; }
+        .drill-tbl .noninv { color: var(--c-tertiary); font-style: italic; }
+        /* Qty/Build is shown in the PART's stocking UOM (see _drillRows); when the
+           BOM authored the line in a different unit the original rides along muted
+           so the conversion is auditable rather than invisible. */
+        .drill-tbl .uom-orig { color: var(--c-tertiary); font-size: 10.5px; font-weight: 400; white-space: nowrap; cursor: help; }
+        .drill-tbl .uom-bad { color: var(--fb-negative); font-weight: 700; cursor: help; }
+        .stage-toggle { display: inline-flex; align-items: center; cursor: pointer; color: var(--fb-blue); vertical-align: middle; margin-right: 2px; }
+        .stage-toggle svg { width: 13px; height: 13px; transition: transform 0.12s; }
+        .stage-toggle.open svg { transform: rotate(90deg); }
+        .drill-hint { font-size: 11.5px; color: var(--c-tertiary); margin: 0 0 10px; display: flex; align-items: center; gap: 6px; }
+        .drill-hint .sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; background: var(--acc-yellow-bg); border: 1px solid var(--acc-yellow); }
+
+        /* Custom scrollbar (from Core). */
+        .fb-drawer-body::-webkit-scrollbar, .fb-table-container::-webkit-scrollbar, .modal-body::-webkit-scrollbar { width: 8px; height: 8px; }
+        .fb-drawer-body::-webkit-scrollbar-track, .fb-table-container::-webkit-scrollbar-track, .modal-body::-webkit-scrollbar-track { background: var(--bg-2); border-radius: 4px; }
+        .fb-drawer-body::-webkit-scrollbar-thumb, .fb-table-container::-webkit-scrollbar-thumb, .modal-body::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+
+        @media print {
+            html, body { overflow: visible; }
+            @page { size: A4 landscape; margin: 0.5in; }
+            header, .hdr-btn, .fb-drawer, .fblib-debug-drawer, .modal-overlay { display: none !important; }
+            .fb-table-container { overflow: visible !important; }
+            table.fb-table th { position: static !important; background: #ddd !important; color: #000 !important; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- Drawer backdrop scrim is injected + managed by fb-lib (registerDrawer). -->
+
+<!-- Column-heading explanations (fb-styles .app-tooltip), filled on hover by _wireHeaderTips. -->
+<div id="hdrTip" class="app-tooltip" role="tooltip"></div>
+
+<!-- ==================== HEADER ==================== -->
+<header>
+    <div>
+        <h1>Available to Build</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.toggleDrawer('filtersOverlay')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <button id="refreshBtn" class="hdr-btn" type="button" onclick="loadDashboard()" title="Refresh data">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <button id="exportBtn" class="hdr-btn" type="button" onclick="exportCsv()" title="Export visible rows to CSV">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            CSV
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" onclick="printReport()" title="Print the PDF view's pages (laid out like the standard report)">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span style="width:1px; height:18px; background:var(--border); margin:0 4px;"></span>
+        <button id="helpBtn" class="hdr-btn" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How to use this report">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            Help
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ==================== FILTERS DRAWER ==================== -->
+<div id="filtersOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>🔍 Filters</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('filtersOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+
+            <!-- Location Group — drives every availability query (the .jrxml's
+                 locationGroupID parameter). Defaults to the user's accessible LGs. -->
+            <div class="fb-group">
+                <div class="fb-group-title">Location Group</div>
+                <div class="fb-field">
+                    <label>Location group(s)</label>
+                    <div class="ms-container" id="lgMs">
+                        <div class="ms-trigger" id="lgMs-trigger">
+                            <span class="ms-placeholder" id="lgMs-placeholder">All my location groups</span>
+                        </div>
+                        <div class="ms-dropdown hidden" id="lgMs-dropdown">
+                            <div class="ms-actions"><span id="lgMs-all">Select All</span><span id="lgMs-clear">Clear All</span></div>
+                            <div class="ms-list" id="lgMs-list"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- BOM number search (the .jrxml's bomNum) + active toggle. -->
+            <div class="fb-group">
+                <div class="fb-group-title">BOM</div>
+                <div class="fb-field">
+                    <label>BOM number</label>
+                    <input type="text" id="filterBom" placeholder="contains…" />
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="filterActiveOnly" checked />
+                        <span>Active BOMs only</span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Finished Good — multi-select (same widget as PurchaseOrderSummary's
+                 filters); options come from the loaded rows. -->
+            <div class="fb-group">
+                <div class="fb-group-title">Finished Good</div>
+                <div class="fb-field">
+                    <label>Finished-good part(s)</label>
+                    <div class="ms-container" id="fgMs">
+                        <div class="ms-trigger" id="fgMs-trigger">
+                            <span class="ms-placeholder" id="fgMs-placeholder">All finished goods</span>
+                        </div>
+                        <div class="ms-dropdown hidden" id="fgMs-dropdown">
+                            <div class="ms-search"><input type="text" id="fgMs-search" placeholder="Search…" /></div>
+                            <div class="ms-actions"><span id="fgMs-all">Select All</span><span id="fgMs-clear">Clear All</span></div>
+                            <div class="ms-list" id="fgMs-list"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Constraint (bottleneck) part — multi-select; "show me BOMs
+                 limited by part X". Options come from the loaded rows. -->
+            <div class="fb-group">
+                <div class="fb-group-title">Constraint Part</div>
+                <div class="fb-field">
+                    <label>Limiting component(s)</label>
+                    <div class="ms-container" id="constraintMs">
+                        <div class="ms-trigger" id="constraintMs-trigger">
+                            <span class="ms-placeholder" id="constraintMs-placeholder">All constraint parts</span>
+                        </div>
+                        <div class="ms-dropdown hidden" id="constraintMs-dropdown">
+                            <div class="ms-search"><input type="text" id="constraintMs-search" placeholder="Search…" /></div>
+                            <div class="ms-actions"><span id="constraintMs-all">Select All</span><span id="constraintMs-clear">Clear All</span></div>
+                            <div class="ms-list" id="constraintMs-list"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Buildability quick filter (applied in JS after the ATB compute). -->
+            <div class="fb-group">
+                <div class="fb-group-title">Buildability</div>
+                <div class="fb-field">
+                    <label>Show</label>
+                    <div class="build-chips" id="buildChips">
+                        <label data-v="now" class="on"><input type="radio" name="bf" value="now" checked>Buildable now</label>
+                        <label data-v="all"><input type="radio" name="bf" value="all">All BOMs</label>
+                        <label data-v="zero"><input type="radio" name="bf" value="zero">Zero-buildable</label>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn" onclick="clearFilters()">Clear all</button>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="loadDashboard()">Apply</button>
+    </div>
+</div>
+
+<!-- ==================== SETTINGS DRAWER ==================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div id="dsLockBadge" class="ds-lock-badge" style="display:none;">Locked by admin — your changes won't be saved.</div>
+        <div class="fb-grid fb-grid-cols">
+
+            <div class="fb-group">
+                <div class="fb-group-title">Buildable value</div>
+                <div class="fb-field">
+                    <label>Cost basis</label>
+                    <select id="setCostBasis" onchange="onSettingsChange()">
+                        <option value="std">Standard cost</option>
+                        <option value="avg">Average cost</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setShowDebug" onchange="onSettingsChange()" />
+                        <span>Show debug console</span>
+                    </label>
+                </div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setRememberFilters" onchange="onSettingsChange()" />
+                        <span>Remember filter selections</span>
+                    </label>
+                </div>
+            </div>
+
+            <div class="fb-group">
+                <div class="fb-group-title">PDF view</div>
+                <div class="fb-field">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" id="setPdfComponents" onchange="onSettingsChange()" />
+                        <span>List each BOM's components</span>
+                    </label>
+                </div>
+            </div>
+
+        </div>
+
+        <div id="dsAdminSection" style="display:none; margin-top:14px; padding-top:14px; border-top: 1px dashed var(--border-strong);">
+            <div class="fb-group-title">Admin</div>
+            <p>Make the current filters and settings what everyone sees each time this report opens. Anyone can still change them while it is open.</p>
+            <button type="button" class="ds-btn ds-btn-admin" onclick="publishDefaults()">Use these for everyone</button>
+            <button type="button" class="ds-btn" onclick="unpublishDefaults()" title="Everyone goes back to their own last choices">Stop using them</button>
+            <button type="button" class="ds-btn ds-btn-admin" id="dsLockBtn" onclick="toggleUserEditing()">Lock user editing</button>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <button type="button" class="ds-btn" onclick="resetSettings()">Reset to defaults</button>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ==================== HELP DRAWER ==================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How to Use This Report</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group" style="flex:1 1 320px;">
+                <div class="fb-group-title">What it shows</div>
+                <p style="font-size:12px; color:#415157;">One row per <strong>BOM × location group</strong>. <strong>Available to Build</strong> is how many complete finished units you could build right now from on-hand stock — capped by the scarcest component (the <strong>constraint part</strong>).</p>
+                <p style="font-size:12px; color:#415157;">"Available" here means <strong>Available for Sale</strong> = On Hand − Allocated − Not Available + Drop Ship, matching Fishbowl's standard Available to Build report.</p>
+            </div>
+            <div class="fb-group" style="flex:1 1 320px;">
+                <div class="fb-group-title">Drill &amp; columns</div>
+                <ul style="font-size:12px; color:#415157; padding-left:18px; margin:4px 0;">
+                    <li><strong>Hover a column heading</strong> (dotted underline) for what the column means and what its markers (? * † —) stand for.</li>
+                    <li>Click the <strong>Components</strong> cell to see every component, its available stock, and how many builds each supports — the limiting one(s) are highlighted.</li>
+                    <li>A <strong>staged sub-assembly</strong> expands to show its own components and build count.</li>
+                    <li><strong>After Incoming</strong> projects the build count once open orders arrive, and <strong>Ready By</strong> shows when: the scheduled date of the last order it depends on (red "late" when that date has passed).</li>
+                    <li><strong>Sort</strong> a column by clicking its header; <strong>reorder</strong> by dragging headers; <strong>resize</strong> by dragging a header edge. Your layout is saved.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and printable pages laid out like the standard report: each location group, each BOM with its Available to Build, and the BOM's components with the builds each supports. In PDF view pick the paper size and orientation in the bar above the pages; they are remembered. <strong>Print</strong> prints those pages. Settings &rsaquo; PDF view can leave the components out.</li>
+                    <li>Click a <strong>BOM #</strong> or <strong>Finished Good</strong> to open it in Fishbowl; click a <strong>Constraint</strong> or <strong>Components</strong> cell for the full component breakdown.</li>
+                </ul>
+            </div>
+            <div class="fb-group" style="flex:1 1 320px;">
+                <div class="fb-group-title">Filters &amp; settings</div>
+                <p style="font-size:12px; color:#415157;">By default only BOMs you can <strong>build now</strong> are listed — switch to <strong>All BOMs</strong> or <strong>Zero-buildable</strong> in the filter drawer. There you can also multi-select <strong>Location Group</strong>, <strong>Finished Good</strong> and <strong>Constraint Part</strong> (e.g. "show every BOM blocked by part X"), and search a BOM number. Settings (cost basis, debug) persist to your Fishbowl user account; admins can Publish defaults for everyone.</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ==================== MAIN CONTENT ==================== -->
+<div class="app-shell" id="appView">
+    <div class="fb-table-container">
+        <table class="fb-table" id="reportTable">
+            <thead></thead>
+            <tbody></tbody>
+        </table>
+    </div>
+</div>
+
+<!-- ==================== COMPONENT DRILL MODAL ==================== -->
+<div class="modal-overlay" id="drillModal">
+    <div class="modal-card">
+        <div class="modal-head">
+            <h3 id="drillTitle" style="margin:0;font-size:15px;">Components</h3>
+            <button type="button" class="fb-drawer-close" onclick="closeDrill()" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body" id="drillBody" style="max-height:70vh; overflow:auto;"></div>
+        <div class="modal-foot">
+            <button type="button" class="ds-btn ds-btn-primary" onclick="closeDrill()">Close</button>
+        </div>
+    </div>
+</div>
+
+<script>
+// ============================================================================
+//  BAIL EARLY — needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report requires the Fishbowl embedded browser environment. ' +
+        'Open it from the Fishbowl client\'s BI module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+// ============================================================================
+//  FB-LIB FEATURE CHECK
+// ============================================================================
+(function () {
+    var missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    if (window.FBLib && !FBLib.Common) missing.push('FBLib.Common');
+    if (window.FBLib && FBLib.Common && typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common.toggleDrawer');
+    if (window.FBLib && FBLib.Common && !FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+    if (window.FBLib && !FBLib.Table) missing.push('FBLib.Table');
+    if (!missing.length) return;
+    function showBanner() {
+        var banner = document.createElement('div');
+        banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 -apple-system,Segoe UI,sans-serif;';
+        banner.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: <code style="background:#fff;padding:1px 5px;border-radius:3px;">' +
+            missing.join('</code>, <code style="background:#fff;padding:1px 5px;border-radius:3px;">') +
+            '</code>. Open BI Script Editor, confirm a script named exactly <code>fb-lib</code> exists with the current contents of <code>scripts/fb-lib.js</code>, then re-save THIS report.';
+        document.body.appendChild(banner);
+        try { console.error('[AvailableToBuild] fb-lib feature check failed:', missing); } catch (_) {}
+    }
+    if (document.body) showBanner(); else document.addEventListener('DOMContentLoaded', showBanner);
+})();
+
+// ============================================================================
+//  FBLIB SETTINGS INIT
+// ============================================================================
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',   // shared admin defaults via userproperties, not report data (which needs a SAVED report — see FBLib.SharedData)
+        // Every open starts from the company defaults (admin or the report's Edit Settings users publish them).
+        company: { keys: ['lgSel', 'buildFilter', 'costBasis', 'pdfComponents'], editors: true },
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: {
+            v: 1,
+            rememberFilters: true,
+            showDebug: false,
+            costBasis: 'std',      // 'std' | 'avg' — buildable-value cost source
+            pdfComponents: true,   // PDF view / Print: list each BOM's components (the original's detail)
+            lgSel: [],             // remembered LG selection (empty = all accessible)
+            buildFilter: 'now',    // 'all' | 'now' | 'zero' — default: only BOMs buildable now
+            tablePrefs: null        // FBLib.Table column order/widths/sort
+        },
+        propFallback: {
+            showDebug: { name: 'BI_SHOW_DEBUG', dflt: 'false', parse: function (v) { return v === 'true'; } }
+        }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+var _resolve = function (key, dflt) {
+    try { var v = FBLib.Settings.resolve(key); return (v === undefined || v === null) ? dflt : v; }
+    catch (_) { return dflt; }
+};
+var _setUserKey = function (key, value) {
+    try { FBLib.Settings.setUserKey(key, value); FBLib.Settings.saveUser(); } catch (_) {}
+};
+var debugLog = function (msg, kind) { FBLib.Common.debugLog(msg, kind); };
+
+// ============================================================================
+//  STATE
+// ============================================================================
+var _allRows = [];             // every summary row (BOM x LG) in the current scope
+var _dataset = [];             // _allRows after the buildability chip filter (fed to the table)
+var _componentsByKey = {};     // "bomid|lgid" -> [component objects] (for the drill)
+var _bomAtbByKey = {};         // "bomid|lgid" -> ATB number (incl. stage BOMs)
+var _constraintByKey = {};     // "bomid|lgid" -> Set(partid) of the limiting components
+var _bomMetaById = {};         // bomid -> { bomnum, bomdesc }
+var _table = null;
+var _lgMs = null;              // Location Group multi-select (drives the queries)
+var _fgMs = null;             // Finished Good multi-select (client-side filter)
+var _constraintMs = null;     // Constraint Part multi-select (client-side filter)
+var _lgAccessible = [];        // [{id,name}] the user can access
+var _loadToken = 0;
+var _buildFilter = 'now';
+var _company = '';             // company name, for the PDF view's title band
+var _loadedAt = null;          // when the rows on screen were computed (null = not yet)
+
+var _uomConvMap = {};          // "fromUomId>toUomId" -> { num, den }: value_to = value_from * num / den
+
+var CAP_BOMS = 3000;           // safety cap on the BOM-header query
+var STAGE_MAX_PASSES = 8;      // staged-BOM closure depth guard
+
+// ============================================================================
+//  RUNQUERY NORMALISER
+// ============================================================================
+async function runQueryP(sql) {
+    if (typeof runQueryAsync === 'function') {
+        var r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    var raw = runQuery(sql);
+    if (!raw) return [];
+    try { var p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+function escSQL(s) { return FBLib.Common.escSQL(s); }
+function num(v) { var n = parseFloat(v); return isNaN(n) ? 0 : n; }
+function intList(arr) {
+    return (arr || []).map(function (x) { return parseInt(x, 10); })
+        .filter(function (n) { return !isNaN(n); });
+}
+function fmtQty(v) { return FBLib.Common.formatQty(v); }
+function fmtMoney(v) { return FBLib.Common.formatMoney(v); }
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' })[c]; }); }
+
+// FLOOR for build counts. Quantities are decimal(28,9), so a quotient within a
+// hair of a whole number IS that number; binary floating point must not turn
+// 10489 complete builds into 10488.999999999998 -> 10488.
+function _floorBuilds(avail, qpb) {
+    var x = avail / qpb, r = Math.round(x);
+    return Math.abs(x - r) <= 1e-9 * Math.max(1, Math.abs(x)) ? r : Math.floor(x);
+}
+
+// A query date as a local 'YYYY-MM-DD' day key (sorts and compares as text),
+// or null. moment reads both "2026-09-11 00:00:00" and ISO-with-zone forms.
+function _dayKey(v) {
+    if (v == null || v === '') return null;
+    if (typeof moment === 'function') { var m = moment(v); return m.isValid() ? m.format('YYYY-MM-DD') : null; }
+    // No moment (CDN blocked): a zoned timestamp needs local time, else take the date part.
+    if (/T.*(Z|[+-]\d{2}:?\d{2})$/.test(String(v))) { var d = new Date(v); return isNaN(d) ? null : _localKey(d); }
+    var s = String(v).match(/^(\d{4}-\d{2}-\d{2})/);
+    return s ? s[1] : null;
+}
+function _localKey(d) {
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+function _todayKey() { return _localKey(new Date()); }
+
+// ============================================================================
+//  UOM CONVERSION
+//  uomconversion semantics, per Fishbowl's own views:
+//      value_in_TO = value_in_FROM * multiply / factor
+//  Uses the stored FROM -> TO row, else the exact inverse of a stored TO -> FROM
+//  row. No chaining through other units: customers' factors are rounded
+//  (kg -> lbs = 2.2046), so g -> lbs -> kg lands 0.0005% high and drops a whole
+//  build at a FLOOR boundary, and Fishbowl's own views never chain either. A
+//  conversion is kept as a numerator / denominator pair so the caller
+//  multiplies first and divides last: quantity * multiply / factor.
+// ============================================================================
+// Re-read on every load (the table is tiny) so a conversion added in Fishbowl
+// is picked up by Refresh.
+async function _loadUomConversions() {
+    var rows = await runQueryP('SELECT fromuomid, touomid, multiply, factor FROM uomconversion');
+    var map = {}, n = 0;
+    rows.forEach(function (r) {
+        var f = parseInt(r.fromuomid, 10), t = parseInt(r.touomid, 10);
+        var m = parseFloat(r.multiply), d = parseFloat(r.factor);
+        if (!(f && t && f !== t && m > 0 && d > 0)) return;
+        map[f + '>' + t] = { num: m, den: d };
+        n++;
+    });
+    // Inverses only where no stored row exists, so a stored row always wins.
+    Object.keys(map).forEach(function (k) {
+        var p = k.split('>'), rk = p[1] + '>' + p[0];
+        if (!map[rk]) map[rk] = { num: map[k].den, den: map[k].num, inverse: true };
+    });
+    _uomConvMap = map;
+    debugLog('UOM conversions: ' + n + ' stored row(s)', 'info');
+}
+// { num, den } converting a quantity in fromId into toId, or null when no
+// conversion exists. Null means unknown — never assume 1:1.
+function _uomConv(fromId, toId) {
+    fromId = parseInt(fromId, 10); toId = parseInt(toId, 10);
+    if (!fromId || !toId) return null;
+    if (fromId === toId) return { num: 1, den: 1 };
+    return _uomConvMap[fromId + '>' + toId] || null;
+}
+
+// The location groups currently in scope: the user's selection, else every
+// accessible LG. Availability is computed per LG within this set.
+function selectedLgIds() {
+    var sel = _lgMs ? intList(_lgMs.getSelected()) : [];
+    if (sel.length) return sel;
+    return _lgAccessible.map(function (l) { return parseInt(l.id, 10); }).filter(function (n) { return !isNaN(n); });
+}
+function lgNameById(id) {
+    var m = _lgAccessible.find(function (l) { return String(l.id) === String(id); });
+    return m ? m.name : ('LG ' + id);
+}
+
+// ============================================================================
+//  COLUMN DEFINITIONS  (FBLib.Table)
+// ============================================================================
+function _qtyCell(v) { return (v == null || v === '') ? '' : fmtQty(num(v)); }
+// Plain figures in the grid — no pills. Zero reads as muted, buildable as bold;
+// the colour alone carries the state without a filled chip on every row.
+function _atbCell(v, row) {
+    if (row && row._atbNoConv && row._atbNoConv.length) {
+        return '<span style="color:#b45309;font-weight:700;cursor:help" title="' + esc('Unknown: ' +
+            row._atbNoConv.join(', ') + ' is used on this BOM in a unit with no conversion to its ' +
+            'stocking unit, so it cannot be compared with inventory. Set the conversion up in ' +
+            'Fishbowl\'s UOM module.') + '">?</span>';
+    }
+    if (v == null || v === '') return '<span style="color:var(--c-tertiary)">—</span>';
+    var n = num(v);
+    return n <= 0
+        ? '<span style="color:var(--c-tertiary)">0</span>'
+        : '<strong>' + fmtQty(n) + '</strong>';
+}
+// Constraint cell — compact: the first limiting part plus "+N" when there are
+// more, the full list in the tooltip, and the whole cell opens the drill (which
+// lists every component with the constraints highlighted).
+function _constraintCell(v, row) {
+    var parts = (row && row._constraintParts) || [];
+    if (!parts.length) return '<span style="color:var(--c-tertiary)">—</span>';
+    var more = parts.length - 1;
+    var label = esc(parts[0]) + (more > 0 ? ' <span style="color:var(--c-tertiary)">+' + more + '</span>' : '');
+    return '<a class="drill-link" style="display:inline-flex;align-items:center;gap:4px;max-width:100%" ' +
+        'onclick="openDrill(' + row.bomid + ',' + row.lgid + ')" ' +
+        'title="' + esc(parts.join(', ')) + ' — click for the full breakdown">' + label + '</a>';
+}
+// When the After Incoming builds can be made. A past date is supply that is
+// late, not stock on hand: it stays a date (in red, "late"), never "now".
+function _readyCell(v, row) {
+    var r = (row && row._ready) || { state: 'na' };
+    if (r.state === 'na') return '<span style="color:var(--c-tertiary)">—</span>';
+    if (r.state === 'unknown') {
+        return '<span style="color:#b45309;font-weight:700;cursor:help" title="' + esc('Unknown: ' + r.why) + '">?</span>';
+    }
+    var d = FBLib.Common.formatDate(r.date);
+    var why = 'Waiting on ' + r.order + ' for ' + r.part + ', scheduled ' + d + '.';
+    if (r.state === 'overdue') {
+        return '<span style="color:var(--fb-negative);cursor:help" title="' + esc(why + ' That date has passed and the ' +
+            'supply hasn\'t arrived, so the real date is later.') + '">' + esc(d) +
+            ' <span style="font-size:10.5px;font-weight:600">late</span></span>';
+    }
+    return '<span style="cursor:help" title="' + esc(why) + '">' + esc(d) + '</span>';
+}
+// Units of finished good per build, in the finished good's stocking UOM (the
+// unit FG Available and its cost are in). The authored figure rides along in
+// brackets when the BOM line uses another unit.
+function _perBuildCell(v, row) {
+    if (!row) return _qtyCell(v);
+    if (v == null) {
+        return '<span style="color:#b45309;cursor:help" title="' + esc('No UOM conversion from ' +
+            row._fgbomuom + ' to ' + row._fgpartuom + ' (the finished good\'s stocking unit), so ' +
+            'Build Cost / Unit and Build Value cannot be calculated. Set the conversion up in ' +
+            'Fishbowl\'s UOM module.') + '">' + fmtQty(row._fgqtyAuthored) + ' ' + esc(row._fgbomuom) + ' *</span>';
+    }
+    if (row._fgbomuom && row._fgpartuom && row._fgbomuom !== row._fgpartuom) {
+        return '<span title="' + esc('BOM authors this as ' + fmtQty(row._fgqtyAuthored) + ' ' + row._fgbomuom +
+            '; shown in ' + row._fgpartuom + ', the finished good\'s stocking unit.') + '">' + fmtQty(v) +
+            ' <span style="color:var(--c-tertiary);font-size:10.5px">(' + fmtQty(row._fgqtyAuthored) + ' ' +
+            esc(row._fgbomuom) + ')</span></span>';
+    }
+    return fmtQty(v);
+}
+// Cost to build ONE finished unit from its components. Blank when no component
+// carries a cost or the finished good's UOM cannot be converted; flagged when a
+// component's UOM could not be converted, since that line is then left out.
+function _unitCostCell(v, row) {
+    if (v == null || v === '') return '<span style="color:var(--c-tertiary)">—</span>';
+    var txt = fmtMoney(num(v));
+    if (row && row._costNoConv) {
+        return '<span style="color:#b45309" title="' + esc(row._costNoConv + ' component line(s) have no ' +
+            'UOM conversion to the part stocking unit and are left out, so this figure is understated') + '">' +
+            txt + ' *</span>';
+    }
+    if (row && row._costMissing) {
+        return '<span title="' + esc(row._costMissing + ' component line(s) have no unit cost — ' +
+            'this figure is understated') + '">' + txt + ' <span style="color:var(--c-tertiary)">†</span></span>';
+    }
+    return txt;
+}
+function _drillCell(v, row) {
+    var n = num(v);
+    return '<a class="drill-link" onclick="openDrill(' + row.bomid + ',' + row.lgid + ')" title="Show component breakdown">▸ ' +
+        n + ' component' + (n === 1 ? '' : 's') + '</a>';
+}
+function _moneyCell(v) { return (v == null || v === '') ? '' : fmtMoney(num(v)); }
+// Text cell that keeps the full value in a hover tooltip (so a value clipped by
+// its column width is still readable).
+function _titleCell(v) { var s = (v == null ? '' : String(v)); return '<span title="' + esc(s) + '">' + esc(s) + '</span>'; }
+
+// Filtering is done in the Filters drawer (Location Group / Finished Good /
+// Constraint multi-selects + BOM search + buildability), so the table columns
+// carry no per-column filter row (filter:false). Columns still sort, reorder,
+// resize and persist. BOM Description has NO fixed width, so under
+// table-layout:fixed it absorbs the slack and the table fills the page width.
+var _columns = [
+    { key: 'locationgroup',  label: 'Location Group',     width: 110, filter: false },
+    { key: 'bomnum',         label: 'BOM #',              width: 90,  link: 'Bill of Materials', filter: false },
+    { key: 'bomdesc',        label: 'BOM Description',     filter: false, format: _titleCell },
+    { key: 'fgpartnum',      label: 'Finished Good',      width: 115, link: 'Part', filter: false },
+    { key: 'fgqty',          label: 'Per Build',          width: 80,  align: 'right', qty: true, filter: false, format: _perBuildCell },
+    { key: 'atb',           label: 'Available to Build',  width: 125, align: 'right', qty: true, filter: false, format: _atbCell },
+    { key: 'constraint',     label: 'Constraint',         width: 110, filter: false, format: _constraintCell },
+    { key: 'fgavailable',    label: 'FG Available',        width: 95, align: 'right', qty: true, filter: false, format: _qtyCell },
+    { key: 'onorder',        label: 'On Order',           width: 85,  align: 'right', qty: true, filter: false, format: _qtyCell },
+    { key: 'atbafter',       label: 'After Incoming',     width: 110, align: 'right', qty: true, filter: false, format: _atbCell },
+    { key: 'readyby',        label: 'Ready By',           width: 120, align: 'right', filter: false, format: _readyCell },
+    { key: 'unitbuildcost',  label: 'Build Cost / Unit',  width: 120, align: 'right', money: true, filter: false, format: _unitCostCell },
+    { key: 'buildablevalue', label: 'Build Value',        width: 100, align: 'right', money: true, filter: false, format: _moneyCell },
+    { key: 'componentcount', label: 'Components',         width: 110, align: 'center', qty: true, sortable: true, filter: false, format: _drillCell }
+];
+
+// ============================================================================
+//  COLUMN-HEADING TOOLTIPS
+//  Main grid headings are keyed by column key (FBLib.Table stamps each <th>
+//  with data-col-key); drill headings by their data-tip. `meta` is the small
+//  print under the rule: markers and caveats. Plain text, escaped on render;
+//  \n breaks a line (.app-tooltip is white-space: pre-line).
+// ============================================================================
+var _HEADER_TIPS = {
+    locationgroup: { title: 'Location Group',
+        desc: 'The location group this row is calculated for. Only stock held in this location group counts.',
+        meta: 'One row per BOM × location group.' },
+    bomnum: { title: 'BOM #',
+        desc: 'The bill of materials. Click it to open the BOM in Fishbowl.' },
+    bomdesc: { title: 'BOM Description',
+        desc: 'The description saved on the BOM.' },
+    fgpartnum: { title: 'Finished Good',
+        desc: 'The part this BOM makes. Click it to open the part in Fishbowl.',
+        meta: 'A BOM with several finished goods shows the first.' },
+    fgqty: { title: 'Per Build',
+        desc: 'Units of the finished good one build makes, in the finished good\'s stocking unit. When the BOM uses another unit, its own figure follows in brackets.',
+        meta: '* No conversion to the stocking unit, so Build Cost / Unit and Build Value can\'t be calculated.' },
+    atb: { title: 'Available to Build',
+        desc: 'Complete builds you can make right now from available stock: the lowest count any inventory component supports. Multiply by Per Build for units.',
+        meta: 'Available = On Hand − Allocated − Not Available + Drop Ship.\n? A component\'s unit has no conversion to its stocking unit.\n— The BOM has no inventory components.' },
+    constraint: { title: 'Constraint',
+        desc: 'The component limiting Available to Build, the one that runs out first. Click it for the full component breakdown.',
+        meta: '+N More components tie for the limit.' },
+    fgavailable: { title: 'FG Available',
+        desc: 'Finished goods already available in this location group (On Hand − Allocated − Not Available + Drop Ship), in the finished good\'s stocking unit.' },
+    onorder: { title: 'On Order',
+        desc: 'Fishbowl\'s On Order quantity for the finished good in this location group: open purchase, manufacture, transfer and return orders.' },
+    atbafter: { title: 'After Incoming',
+        desc: 'Available to Build once every component\'s open orders arrive: each component\'s Available plus its On Order. Ready By says when.',
+        meta: 'Same as Available to Build when the limiting component has nothing on order.\nSame ? and — markers as Available to Build.' },
+    readyby: { title: 'Ready By',
+        desc: 'When the After Incoming builds can be made: the scheduled date of the last open order they depend on (PO line, work order, transfer or customer return). Hover a date for the order and part it\'s waiting on.',
+        meta: 'Red "late": the date has passed and the supply hasn\'t arrived.\n— Incoming supply adds no builds.\n? An order it depends on has no scheduled date.\nScheduled dates, not confirmed arrivals.' },
+    unitbuildcost: { title: 'Build Cost / Unit',
+        desc: 'Cost to make one unit of the finished good from its components: each component\'s quantity × its unit cost, divided by Per Build. Uses the cost basis in Settings, falling back to the other basis when a component has no cost.',
+        meta: '† A component has no cost, so the figure is understated.\n* A component\'s unit can\'t be converted. It is left out, so the figure is understated.' },
+    buildablevalue: { title: 'Build Value',
+        desc: 'What you can build now is worth: Available to Build × Per Build × the finished good\'s own cost (standard or average, per Settings).',
+        meta: 'Values the output at the finished good\'s cost, not what its components cost.' },
+    componentcount: { title: 'Components',
+        desc: 'Component lines on the BOM (default options only). Click to see each component\'s stock and how many builds it supports.' },
+
+    'drill.component': { title: 'Component',
+        desc: 'Each component line on the BOM, default options only. Highlighted rows are the constraint. A staged sub-assembly expands to its own components.' },
+    'drill.qpb': { title: 'Qty / Build',
+        desc: 'Quantity used per build, in the part\'s stocking unit so it compares directly with On Hand and Available. When the BOM uses another unit, its own figure follows in brackets.',
+        meta: '* No conversion to the stocking unit, so this line\'s builds are unknown.' },
+    'drill.uom': { title: 'UOM',
+        desc: 'The part\'s stocking unit: the unit On Hand and Available are counted in.' },
+    'drill.onhand': { title: 'On Hand',
+        desc: 'Physical stock of the part in this location group.' },
+    'drill.available': { title: 'Available',
+        desc: 'Stock free to use: On Hand − Allocated − Not Available + Drop Ship.' },
+    'drill.builds': { title: 'Builds',
+        desc: 'Builds this component alone supports: Available ÷ Qty / Build, rounded down. The lowest figure is the BOM\'s Available to Build.',
+        meta: '? The unit can\'t be converted.\n∞ Zero quantity per build.\n— Not an inventory part, so not counted.' }
+};
+
+// One delegated listener pair serves both tables, so the tips survive every
+// FBLib.Table re-render (sort, reorder, resize) and every drill rebuild.
+function _wireHeaderTips() {
+    var tip = document.getElementById('hdrTip');
+    if (!tip) return;
+    var timer = null, current = null;
+    function hide() {
+        clearTimeout(timer); timer = null; current = null;
+        tip.classList.remove('show');
+    }
+    function show(th, t) {
+        tip.innerHTML = '<span class="tt-title">' + esc(t.title) + '</span>' +
+            '<span class="tt-desc">' + esc(t.desc) + '</span>' +
+            (t.meta ? '<span class="tt-meta">' + esc(t.meta) + '</span>' : '');
+        // Below the heading (headings sit at the top of the view), clamped to
+        // the viewport; flipped above only if there is no room below.
+        var r = th.getBoundingClientRect();
+        var w = tip.offsetWidth, h = tip.offsetHeight;
+        var left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8));
+        var top = r.bottom + 6;
+        if (top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 6);
+        tip.style.left = left + 'px';
+        tip.style.top = top + 'px';
+        tip.classList.add('show');
+    }
+    document.addEventListener('mouseover', function (e) {
+        var th = e.target && e.target.closest &&
+            e.target.closest('#reportTable thead tr:first-child th[data-col-key], .drill-tbl th[data-tip]');
+        if (th === current) return;
+        hide();
+        if (!th) return;
+        var t = _HEADER_TIPS[th.getAttribute('data-tip') || th.getAttribute('data-col-key')];
+        if (!t) return;
+        current = th;
+        // A short delay so sweeping the pointer across the header row doesn't
+        // flash a tip for every column it crosses.
+        timer = setTimeout(function () { if (current === th) show(th, t); }, 350);
+    });
+    // Sorting, dragging or scrolling moves the heading out from under the tip.
+    ['mousedown', 'dragstart', 'wheel'].forEach(function (ev) { document.addEventListener(ev, hide, true); });
+    window.addEventListener('blur', hide);
+}
+
+// ============================================================================
+//  FILTERS
+// ============================================================================
+function clearFilters() {
+    document.getElementById('filterBom').value = '';
+    document.getElementById('filterActiveOnly').checked = true;
+    _setBuildFilter('now');
+    _setUserKey('buildFilter', 'now');
+    if (_lgMs) _lgMs.setSelected([]);
+    if (_fgMs) _fgMs.setSelected([]);
+    if (_constraintMs) _constraintMs.setSelected([]);
+    loadDashboard();
+}
+
+async function loadFilters() {
+    try {
+        var co = await runQueryP('SELECT name FROM company WHERE id = 1');
+        _company = (co[0] && co[0].name) || '';
+    } catch (e) { debugLog('loadFilters: company failed: ' + e.message, 'warn'); }
+    // Location groups the current user can access (getLocationGroupList), active only.
+    try {
+        var ids = (typeof getLocationGroupList === 'function' ? getLocationGroupList() : []) || [];
+        var where = ids.length ? (' AND id IN (' + intList(ids).join(',') + ')') : '';
+        var lgs = await runQueryP('SELECT id, name FROM locationgroup WHERE activeflag = 1' + where + ' ORDER BY name');
+        _lgAccessible = lgs.map(function (r) { return { id: parseInt(r.id, 10), name: r.name || ('LG ' + r.id) }; });
+        _lgMs.setItems(_lgAccessible.map(function (l) { return { value: l.id, label: l.name }; }));
+        // Restore the remembered LG selection only when "Remember filter
+        // selections" is on; otherwise every session starts on all-accessible.
+        var savedLg = _resolve('lgSel', []);
+        if (_resolve('rememberFilters', true) && Array.isArray(savedLg) && savedLg.length) _lgMs.setSelected(savedLg);
+    } catch (e) { debugLog('loadFilters: locationgroup failed: ' + e.message, 'warn'); }
+}
+
+// ============================================================================
+//  CLIENT-SIDE FILTERS  (buildability chip + Finished-Good / Constraint
+//  multi-selects). Applied over _allRows -> _dataset with no re-query, so
+//  toggling them repaints instantly.
+// ============================================================================
+function _setBuildFilter(v) {
+    _buildFilter = (v === 'now' || v === 'zero') ? v : 'all';
+    document.querySelectorAll('#buildChips label').forEach(function (el) {
+        el.classList.toggle('on', el.getAttribute('data-v') === _buildFilter);
+        var input = el.querySelector('input'); if (input) input.checked = (el.getAttribute('data-v') === _buildFilter);
+    });
+}
+function onBuildFilterChange(v) {
+    _setBuildFilter(v);
+    _setUserKey('buildFilter', _buildFilter);
+    _refreshTable();
+}
+function _applyClientFilters() {
+    var fgSel  = _fgMs ? new Set(_fgMs.getSelected().map(String)) : new Set();
+    var conSel = _constraintMs ? new Set(_constraintMs.getSelected().map(String)) : new Set();
+    _dataset = _allRows.filter(function (r) {
+        // A row whose ATB is unknown (missing UOM conversion) passes every
+        // buildability chip, so the default "Buildable now" view can't hide it.
+        var unknown = r._atbNoConv && r._atbNoConv.length;
+        if (!unknown && _buildFilter === 'now'  && !(num(r.atb) >= 1)) return false;
+        if (!unknown && _buildFilter === 'zero' && !(r.atb != null && num(r.atb) === 0)) return false;
+        if (fgSel.size  && !fgSel.has(String(r.fgpartnum))) return false;
+        if (conSel.size && !(r._constraintParts || []).some(function (p) { return conSel.has(String(p)); })) return false;
+        return true;
+    });
+}
+// Re-apply the client filters + repaint (no re-query). Used by the buildability
+// chips and the Finished-Good / Constraint multi-selects.
+function _refreshTable() {
+    _applyClientFilters();
+    if (_table) _table.render();
+    document.getElementById('statusLine').textContent = _statusText();
+    if (PDF) PDF.refresh();
+}
+// Populate the Finished-Good + Constraint multi-selects from the loaded rows,
+// preserving any still-valid current selection.
+function _populateValueFilters() {
+    var fgs = {}, cons = {};
+    _allRows.forEach(function (r) {
+        if (r.fgpartnum) fgs[r.fgpartnum] = true;
+        (r._constraintParts || []).forEach(function (p) { if (p) cons[p] = true; });
+    });
+    if (_fgMs) {
+        var keepFg = _fgMs.getSelected().filter(function (v) { return fgs[v]; });
+        _fgMs.setItems(Object.keys(fgs).sort().map(function (v) { return { value: v, label: v }; }));
+        _fgMs.setSelected(keepFg);
+    }
+    if (_constraintMs) {
+        var keepCon = _constraintMs.getSelected().filter(function (v) { return cons[v]; });
+        _constraintMs.setItems(Object.keys(cons).sort().map(function (v) { return { value: v, label: v }; }));
+        _constraintMs.setSelected(keepCon);
+    }
+}
+function _statusText() {
+    return _dataset.length.toLocaleString() + ' of ' + _allRows.length.toLocaleString() +
+        ' BOM×LG row' + (_allRows.length === 1 ? '' : 's');
+}
+
+// ============================================================================
+//  SQL BUILDERS
+// ============================================================================
+// Matching BOM headers (+ their finished-good part). One row per BOM.
+function buildBomHeaderSQL() {
+    var where = ['fgbi.typeid = 10', 'fgbi.groupdefault = 1'];
+    if (document.getElementById('filterActiveOnly').checked) where.push('bom.activeflag = 1');
+    var bom = document.getElementById('filterBom').value.trim();
+    if (bom) where.push("bom.num LIKE '%" + escSQL(bom) + "%'");
+    return [
+        'SELECT bom.id AS bomid, bom.num AS bomnum, bom.description AS bomdesc,',
+        '       fgpart.id AS fgpartid, fgpart.num AS fgpartnum, fgpart.description AS fgpartdesc,',
+        '       fgpart.typeid AS fgparttype, fgpart.stdcost AS fgstdcost, fgbi.quantity AS fgqty,',
+        '       fgbi.uomid AS fgbomuomid, fgbiuom.code AS fgbomuom,',
+        '       fgpart.uomid AS fgpartuomid, fgpartuom.code AS fgpartuom',
+        'FROM bom',
+        'JOIN bomitem fgbi ON fgbi.bomid = bom.id AND fgbi.typeid = 10 AND fgbi.groupdefault = 1',
+        'JOIN part fgpart ON fgpart.id = fgbi.partid',
+        'JOIN uom fgbiuom ON fgbiuom.id = fgbi.uomid',
+        'JOIN uom fgpartuom ON fgpartuom.id = fgpart.uomid',
+        'WHERE ' + where.join(' AND '),
+        'ORDER BY bom.num',
+        'LIMIT ' + (CAP_BOMS + 1)
+    ].join('\n');
+}
+
+// Component lines for a set of BOM ids (default group only). Mirrors the .jrxml
+// FROM/JOIN. Carries both UOM ids so qty-per-build normalises to the part base
+// UOM in JS (_uomConv).
+function buildComponentSQL(bomIds) {
+    return [
+        'SELECT bomitem.bomid AS bomid, bomitem.id AS bomitemid,',
+        '       bomitem.typeid AS bitypeid, bomitemtype.name AS bitype,',
+        '       (bomitem.stage + 0) AS stageflag, bomitem.stagebomid AS stagebomid,',
+        '       bomitem.quantity AS bomqty, biuom.code AS bomuom,',
+        '       part.id AS partid, part.num AS partnum, part.description AS partdesc,',
+        '       part.typeid AS parttype, partuom.code AS partuom,',
+        '       COALESCE(part.stdCost, 0) AS stdcost, COALESCE(pcost.avgCost, 0) AS avgcost,',
+        '       bomitem.uomid AS bomuomid, part.uomid AS partuomid',
+        'FROM bomitem',
+        'JOIN bomitemtype ON bomitem.typeid = bomitemtype.id',
+        'JOIN part ON bomitem.partid = part.id',
+        'JOIN uom partuom ON part.uomid = partuom.id',
+        'JOIN uom biuom ON bomitem.uomid = biuom.id',
+        'LEFT JOIN partcost pcost ON pcost.partId = part.id',
+        'WHERE bomitem.groupdefault = 1 AND bomitem.bomid IN (' + bomIds.join(',') + ')',
+        'ORDER BY bomitem.bomid, bomitem.sortidconfig'
+    ].join('\n');
+}
+
+// Available-for-Sale per part+LG, from qtyInventoryTotals (same source as
+// InventoryAvailability.htm). Scoped by LG + the component/FG part set.
+function buildAvailabilitySQL(partIds, lgIds) {
+    return [
+        'SELECT partId AS partid, locationGroupId AS lgid,',
+        '       SUM(qtyOnHand)       AS onhand,',
+        '       SUM(qtyNotAvailable) AS notavail,',
+        '       SUM(qtyDropship)     AS dropship,',
+        '       SUM(qtyAllocated)    AS allocated,',
+        '       SUM(qtyOnOrder)      AS onorder',
+        'FROM qtyInventoryTotals',
+        'WHERE locationGroupId IN (' + lgIds.join(',') + ') AND partId IN (' + partIds.join(',') + ')',
+        'GROUP BY partId, locationGroupId'
+    ].join('\n');
+}
+
+// Incoming supply as dated events, one row per open order line, so After
+// Incoming can say WHEN. Each branch mirrors one of the views behind
+// qtyInventoryTotals.qtyOnOrder (QTYONORDERPO / SO / MO / TORECEIVE / TOSEND,
+// same filters and UOM handling), so per part + LG the rows sum to exactly
+// the On Order figure the availability query returns (demodb: 73/73 pairs).
+// The date is the order's scheduled date: line first, header as fallback.
+function buildIncomingSQL(partIds, lgIds) {
+    var P = partIds.join(','), L = lgIds.join(',');
+    function conv(q, u) { return 'CASE WHEN ' + u + ' <> part.uomid AND uc.id > 0 THEN ' + q + ' * uc.multiply / uc.factor ELSE ' + q + ' END'; }
+    return [
+        'SELECT * FROM (',
+        // Open PO receipt lines (QTYONORDERPO).
+        'SELECT part.id AS partid, receipt.locationgroupid AS lgid, ' + conv('receiptitem.qty', 'receiptitem.uomid') + ' AS qty,',
+        '       COALESCE(poitem.datescheduledfulfillment, po.datefirstship, rpo.datefirstship) AS eta,',
+        "       'PO' AS src, COALESCE(po.num, rpo.num) AS ordernum",
+        'FROM receipt JOIN receiptitem ON receiptitem.receiptid = receipt.id JOIN part ON part.id = receiptitem.partid',
+        'LEFT JOIN uomconversion uc ON uc.touomid = part.uomid AND uc.fromuomid = receiptitem.uomid',
+        'LEFT JOIN poitem ON poitem.id = receiptitem.poitemid LEFT JOIN po ON po.id = poitem.poid',
+        'LEFT JOIN po rpo ON rpo.id = receipt.poid',
+        'WHERE receipt.ordertypeid = 10 AND receiptitem.statusid IN (10, 20)',
+        '  AND part.id IN (' + P + ') AND receipt.locationgroupid IN (' + L + ')',
+        'UNION ALL',
+        // Customer credit-return lines on open SOs (QTYONORDERSO).
+        'SELECT part.id, so.locationgroupid, ' + conv('(soitem.qtytofulfill - soitem.qtyfulfilled)', 'soitem.uomid') + ',',
+        "       COALESCE(soitem.datescheduledfulfillment, so.datefirstship), 'SO', so.num",
+        'FROM part JOIN product ON product.partid = part.id JOIN soitem ON soitem.productid = product.id',
+        'JOIN so ON so.id = soitem.soid',
+        'LEFT JOIN uomconversion uc ON uc.touomid = part.uomid AND uc.fromuomid = soitem.uomid',
+        'WHERE so.statusid IN (20, 25) AND soitem.statusid IN (10, 14, 30) AND soitem.typeid = 20',
+        '  AND part.id IN (' + P + ') AND so.locationgroupid IN (' + L + ')',
+        'UNION ALL',
+        // Finished-good output of open work orders (QTYONORDERMO).
+        'SELECT part.id, wo.locationgroupid, ' + conv('woitem.qtytarget', 'woitem.uomid') + ',',
+        "       COALESCE(wo.datescheduled, moitem.datescheduled), 'WO', wo.num",
+        'FROM part JOIN woitem ON woitem.partid = part.id JOIN wo ON wo.id = woitem.woid',
+        'LEFT JOIN moitem ON moitem.id = wo.moitemid',
+        'LEFT JOIN uomconversion uc ON uc.touomid = part.uomid AND uc.fromuomid = woitem.uomid',
+        'WHERE wo.statusid < 40 AND woitem.typeid IN (10, 31)',
+        '  AND part.id IN (' + P + ') AND wo.locationgroupid IN (' + L + ')',
+        'UNION ALL',
+        // Transfer lines into this LG (QTYONORDERTORECEIVE + QTYONORDERTOSEND).
+        'SELECT part.id, CASE WHEN xoitem.typeid = 20 THEN xo.fromlgid ELSE xo.shiptolgid END,',
+        '       ' + conv('(xoitem.qtytofulfill - xoitem.qtyfulfilled)', 'xoitem.uomid') + ',',
+        "       COALESCE(xoitem.datescheduledfulfillment, xo.datescheduled), 'TO', xo.num",
+        'FROM part JOIN xoitem ON xoitem.partid = part.id JOIN xo ON xo.id = xoitem.xoid',
+        'LEFT JOIN uomconversion uc ON uc.touomid = part.uomid AND uc.fromuomid = xoitem.uomid',
+        'WHERE xo.statusid IN (20, 30, 40, 50, 60) AND xoitem.statusid IN (10, 20, 30, 40, 50)',
+        '  AND xoitem.typeid IN (10, 20) AND part.id IN (' + P + ')',
+        '  AND (CASE WHEN xoitem.typeid = 20 THEN xo.fromlgid ELSE xo.shiptolgid END) IN (' + L + ')',
+        ') s'
+    ].join('\n');
+}
+
+// Optional average-cost lookup for finished goods (cost basis = avg).
+function buildAvgCostSQL(fgPartIds) {
+    return 'SELECT partId AS partid, avgCost AS avgcost FROM partcost WHERE partId IN (' + fgPartIds.join(',') + ')';
+}
+
+// ============================================================================
+//  LOAD + COMPUTE
+// ============================================================================
+async function loadDashboard() {
+    var tok = ++_loadToken;
+    debugLog('loadDashboard [' + tok + ']: start', 'info');
+    document.getElementById('statusLine').textContent = 'Loading…';
+    if (_lgMs) _setUserKey('lgSel', _lgMs.getSelected());
+
+    try {
+        var lgIds = selectedLgIds();
+        if (!lgIds.length) {
+            _allRows = []; _dataset = []; _componentsByKey = {}; _bomAtbByKey = {}; _constraintByKey = {};
+            if (_table) _table.render();
+            document.getElementById('statusLine').textContent = 'No accessible location group';
+            _loadedAt = new Date(); if (PDF) PDF.refresh();
+            return;
+        }
+
+        // 0) UOM conversions (BOM lines are often authored in another unit).
+        await _loadUomConversions();
+        if (tok !== _loadToken) return;
+
+        // 1) Matching BOM headers + finished good.
+        var hdr = await runQueryP(buildBomHeaderSQL());
+        if (tok !== _loadToken) return;
+        var fgByBom = {};
+        var topBomIds = [];
+        hdr.slice(0, CAP_BOMS).forEach(function (r) {
+            var bid = parseInt(r.bomid, 10);
+            if (fgByBom[bid]) return;   // one FG per BOM (dedupe extra typeid=10 lines)
+            // Units per build in the FG's stocking UOM, the unit its cost and
+            // availability are in. null = no conversion (unknown).
+            var fgAuthored = num(r.fgqty) || 1;
+            var fgConv = _uomConv(r.fgbomuomid, r.fgpartuomid);
+            fgByBom[bid] = {
+                bomid: bid, bomnum: r.bomnum || '', bomdesc: r.bomdesc || '',
+                fgpartid: parseInt(r.fgpartid, 10) || 0, fgpartnum: r.fgpartnum || '',
+                fgparttype: parseInt(r.fgparttype, 10) || 0, fgstdcost: num(r.fgstdcost),
+                fgqty: fgConv ? fgAuthored * fgConv.num / fgConv.den : null,
+                fgqtyauthored: fgAuthored, fgbomuom: r.fgbomuom || '', fgpartuom: r.fgpartuom || ''
+            };
+            _bomMetaById[bid] = { bomnum: r.bomnum || '', bomdesc: r.bomdesc || '' };
+            topBomIds.push(bid);
+        });
+        var limitHit = hdr.length > CAP_BOMS;
+        if (!topBomIds.length) {
+            _allRows = []; _dataset = []; _componentsByKey = {}; _bomAtbByKey = {}; _constraintByKey = {};
+            if (_table) _table.render();
+            document.getElementById('statusLine').textContent = 'No BOMs match the current filters';
+            _loadedAt = new Date(); if (PDF) PDF.refresh();
+            return;
+        }
+
+        // 2) Component lines for the top BOMs + staged sub-assembly closure.
+        var compByBom = {};       // bomid -> [component rows]
+        var loadedBoms = {};      // bomid -> true
+        var toLoad = topBomIds.slice();
+        var pass = 0;
+        while (toLoad.length && pass < STAGE_MAX_PASSES) {
+            pass++;
+            var comps = await runQueryP(buildComponentSQL(toLoad));
+            if (tok !== _loadToken) return;
+            toLoad.forEach(function (b) { loadedBoms[b] = true; if (!compByBom[b]) compByBom[b] = []; });
+            var nextStage = {};
+            comps.forEach(function (r) {
+                var bid = parseInt(r.bomid, 10);
+                var bomqty = num(r.bomqty);
+                var conv = _uomConv(r.bomuomid, r.partuomid);
+                var c = {
+                    bomid: bid, bomitemid: parseInt(r.bomitemid, 10),
+                    bitypeid: parseInt(r.bitypeid, 10), bitype: r.bitype || '',
+                    stageflag: (String(r.stageflag) === '1' || r.stageflag === true),
+                    stagebomid: (r.stagebomid != null && String(r.stagebomid).length) ? parseInt(r.stagebomid, 10) : null,
+                    bomqty: bomqty, bomuom: r.bomuom || '',
+                    partid: parseInt(r.partid, 10), partnum: r.partnum || '', partdesc: r.partdesc || '',
+                    parttype: parseInt(r.parttype, 10), partuom: r.partuom || '',
+                    stdcost: num(r.stdcost), avgcost: num(r.avgcost),
+                    // Qty per build in the part's stocking UOM: multiply first,
+                    // divide last. null = no conversion (unknown).
+                    qpb: conv ? bomqty * conv.num / conv.den : null,
+                    convnum: conv ? conv.num : null, convden: conv ? conv.den : null
+                };
+                (compByBom[bid] = compByBom[bid] || []).push(c);
+                if (c.stageflag && c.stagebomid && !loadedBoms[c.stagebomid]) nextStage[c.stagebomid] = true;
+            });
+            toLoad = Object.keys(nextStage).map(function (x) { return parseInt(x, 10); });
+        }
+
+        // 3) Availability (Available for Sale) per part+LG for every loaded part.
+        var partIdSet = {};
+        Object.keys(compByBom).forEach(function (b) { compByBom[b].forEach(function (c) { if (c.partid) partIdSet[c.partid] = true; }); });
+        topBomIds.forEach(function (b) { var fg = fgByBom[b]; if (fg && fg.fgpartid) partIdSet[fg.fgpartid] = true; });
+        var partIds = Object.keys(partIdSet).map(function (x) { return parseInt(x, 10); });
+        var availMap = {};   // "partid|lgid" -> { available, onhand, onorder }
+        if (partIds.length) {
+            var av = await runQueryP(buildAvailabilitySQL(partIds, lgIds));
+            if (tok !== _loadToken) return;
+            av.forEach(function (r) {
+                var onhand = num(r.onhand), allocated = num(r.allocated), notavail = num(r.notavail), dropship = num(r.dropship);
+                availMap[r.partid + '|' + r.lgid] = {
+                    available: Math.max(0, onhand - allocated - notavail + dropship),
+                    onhand: onhand,
+                    onorder: num(r.onorder)
+                };
+            });
+        }
+        _drillAvail = availMap;   // mirror for the drill modal (component On Hand / Available cells)
+
+        // 3b) The same On Order, as dated order lines, for the Ready By date.
+        //     Soonest first; an undated line sorts last and makes the date unknown.
+        var incomingMap = {};   // "partid|lgid" -> [{ qty, eta, label }]
+        if (partIds.length) {
+            try {
+                var inc = await runQueryP(buildIncomingSQL(partIds, lgIds));
+                if (tok !== _loadToken) return;
+                inc.forEach(function (r) {
+                    var q = num(r.qty);
+                    if (!(q > 0)) return;
+                    (incomingMap[r.partid + '|' + r.lgid] = incomingMap[r.partid + '|' + r.lgid] || []).push({
+                        qty: q, eta: _dayKey(r.eta), label: (r.src || '') + ' ' + (r.ordernum || '')
+                    });
+                });
+                Object.keys(incomingMap).forEach(function (k) {
+                    incomingMap[k].sort(function (a, b) {
+                        return a.eta === b.eta ? 0 : a.eta == null ? 1 : b.eta == null ? -1 : (a.eta < b.eta ? -1 : 1);
+                    });
+                });
+            } catch (e) { debugLog('incoming supply query failed: ' + e.message, 'warn'); incomingMap = null; }
+        }
+
+        // 4) Cost basis for buildable value.
+        var costBasis = _resolve('costBasis', 'std');
+        var avgCostByPart = {};
+        if (costBasis === 'avg') {
+            var fgIds = topBomIds.map(function (b) { return fgByBom[b].fgpartid; }).filter(Boolean);
+            if (fgIds.length) {
+                try {
+                    (await runQueryP(buildAvgCostSQL(fgIds))).forEach(function (r) { avgCostByPart[r.partid] = num(r.avgcost); });
+                    if (tok !== _loadToken) return;
+                } catch (e) { debugLog('avg cost query failed: ' + e.message, 'warn'); }
+            }
+        }
+
+        // 5) Compute ATB for every loaded BOM x LG, then assemble summary rows for
+        //    the top BOMs. availGet(partid,lg,proj) returns available (+on order if proj).
+        _componentsByKey = {}; _bomAtbByKey = {}; _constraintByKey = {};
+        function availGet(pid, lg, proj) {
+            var a = availMap[pid + '|' + lg];
+            if (!a) return 0;
+            return proj ? (a.available + a.onorder) : a.available;
+        }
+        // Per-BOM+LG build count over inventory constraint components.
+        function computeBom(bid, lg, proj) {
+            var comps = compByBom[bid] || [];
+            var cons = comps.filter(function (c) { return c.bitypeid !== 10 && c.parttype === 10; });
+            if (!cons.length) return { atb: null, constraint: [], noConv: [] };
+            var minBuilds = Infinity, per = [], noConv = [];
+            cons.forEach(function (c) {
+                if (c.qpb == null) { noConv.push(c.partnum); return; }
+                var avail = availGet(c.partid, lg, proj);
+                var builds = c.qpb > 0 ? _floorBuilds(avail, c.qpb) : Infinity;
+                per.push({ partid: c.partid, partnum: c.partnum, builds: builds });
+                if (builds < minBuilds) minBuilds = builds;
+            });
+            // One unconvertible constraint line makes the whole answer unknown:
+            // the MIN over the rest is only an upper bound.
+            if (noConv.length) return { atb: null, constraint: [], noConv: noConv };
+            if (!isFinite(minBuilds)) return { atb: null, constraint: [], noConv: [] };
+            var atb = Math.max(0, minBuilds);
+            var constraint = per.filter(function (p) { return p.builds === minBuilds; });
+            return { atb: atb, constraint: constraint, noConv: [] };
+        }
+
+        // When `target` builds (the After Incoming figure) can be made: per
+        // inventory component, walk its incoming lines soonest-first until
+        // available + arrivals cover target x qty per build; the BOM is ready
+        // when its LAST component is. Returns the binding line so the cell can
+        // name what it's waiting on. date null = an undated line was needed (or
+        // the lines didn't add up to On Order).
+        var today = _todayKey();
+        function computeReadyBy(bid, lg, target) {
+            if (!incomingMap) return { state: 'unknown', why: 'The incoming-supply query failed (see the debug console).' };
+            var comps = (compByBom[bid] || []).filter(function (c) { return c.bitypeid !== 10 && c.parttype === 10 && c.qpb > 0; });
+            var worst = null;
+            for (var i = 0; i < comps.length; i++) {
+                var c = comps[i];
+                var a = availMap[c.partid + '|' + lg];
+                var cum = a ? a.available : 0;
+                if (_floorBuilds(cum, c.qpb) >= target) continue;    // covered by stock now
+                var evs = incomingMap[c.partid + '|' + lg] || [], hit = null;
+                for (var j = 0; j < evs.length && !hit; j++) {
+                    cum += evs[j].qty;
+                    if (_floorBuilds(cum, c.qpb) >= target) hit = evs[j];
+                }
+                if (!hit || !hit.eta) {
+                    return { state: 'unknown', part: c.partnum, why: hit
+                        ? hit.label + ' for ' + c.partnum + ' has no scheduled date.'
+                        : 'The open orders for ' + c.partnum + ' could not be matched to its On Order quantity.' };
+                }
+                if (!worst || hit.eta > worst.eta) worst = { eta: hit.eta, part: c.partnum, order: hit.label };
+            }
+            if (!worst) return { state: 'na' };
+            return { state: worst.eta < today ? 'overdue' : 'date', date: worst.eta, part: worst.part, order: worst.order };
+        }
+
+        // Cost to build ONE unit of the finished good, from its own components:
+        //   SUM( qty converted into the part's stocking UOM x that part's unit cost )
+        //   divided by the finished-good quantity the BOM yields per build.
+        // Note this is NOT `buildablevalue`, which values the output at the
+        // finished good's own inventory cost. Component lines only (typeid <> 10),
+        // and buildComponentSQL already restricts to groupdefault = 1 so a
+        // configurable BOM is priced on its default option, not every option.
+        function computeBuildCost(bid, fgQty) {
+            var comps = (compByBom[bid] || []).filter(function (c) { return c.bitypeid !== 10; });
+            if (!comps.length || fgQty == null) return { unit: null, missing: 0, noconv: 0 };
+            var total = 0, missing = 0, noconv = 0;
+            comps.forEach(function (c) {
+                // Unknown quantity: left out (and flagged), never costed 1:1.
+                if (c.qpb == null) { noconv++; return; }
+                var unit = (costBasis === 'avg')
+                    ? (c.avgcost > 0 ? c.avgcost : c.stdcost)
+                    : (c.stdcost > 0 ? c.stdcost : c.avgcost);
+                if (!(unit > 0)) missing++;
+                total += c.qpb * (unit || 0);
+            });
+            var per = (fgQty > 0) ? total / fgQty : total;
+            return { unit: per, missing: missing, noconv: noconv };
+        }
+
+        var lgList = lgIds;
+        _allRows = [];
+        // Precompute ATB for ALL loaded BOMs per LG (needed for staged drill lookups).
+        Object.keys(compByBom).forEach(function (b) {
+            var bid = parseInt(b, 10);
+            lgList.forEach(function (lg) {
+                var res = computeBom(bid, lg, false);
+                _bomAtbByKey[bid + '|' + lg] = res.atb;
+                _componentsByKey[bid + '|' + lg] = compByBom[bid] || [];
+                _constraintByKey[bid + '|' + lg] = new Set(res.constraint.map(function (c) { return c.partid; }));
+            });
+        });
+        // Summary rows for the top-level matching BOMs.
+        topBomIds.forEach(function (bid) {
+            var fg = fgByBom[bid];
+            lgList.forEach(function (lg) {
+                var res = computeBom(bid, lg, false);
+                var proj = computeBom(bid, lg, true);
+                var fgAvail = availGet(fg.fgpartid, lg, false);
+                var fgOnOrder = (availMap[fg.fgpartid + '|' + lg] || {}).onorder || 0;
+                var cost = (costBasis === 'avg' && avgCostByPart[fg.fgpartid] != null) ? avgCostByPart[fg.fgpartid] : fg.fgstdcost;
+                var atb = res.atb;
+                var consNames = res.constraint.map(function (c) { return c.partnum; });
+                var bc = computeBuildCost(bid, fg.fgqty);
+                // Ready By only means something when incoming supply adds builds.
+                var rb = (atb != null && proj.atb != null && proj.atb > atb)
+                    ? computeReadyBy(bid, lg, proj.atb) : { state: 'na' };
+                _allRows.push({
+                    bomid: bid, lgid: lg,
+                    locationgroup: lgNameById(lg),
+                    bomnum: fg.bomnum, bomdesc: fg.bomdesc,
+                    fgpartnum: fg.fgpartnum, fgqty: fg.fgqty,
+                    _fgqtyAuthored: fg.fgqtyauthored, _fgbomuom: fg.fgbomuom, _fgpartuom: fg.fgpartuom,
+                    atb: atb,
+                    _atbNoConv: res.noConv,
+                    constraint: consNames.join(', '),      // filter/CSV/datalist value
+                    _constraintParts: consNames,           // for the compact constraint cell
+                    fgavailable: fgAvail,
+                    onorder: fgOnOrder,
+                    atbafter: proj.atb,
+                    readyby: rb.date || null,               // 'YYYY-MM-DD': sorts and exports as text
+                    _ready: rb,
+                    unitbuildcost: bc.unit,
+                    _costMissing: bc.missing,
+                    _costNoConv: bc.noconv,
+                    // Builds x units per build x FG unit cost: ATB counts complete
+                    // builds, and a build can yield many units (Kombucha Batch: 500 L).
+                    buildablevalue: (atb != null && fg.fgqty != null ? atb * fg.fgqty * (cost || 0) : null),
+                    // Count the COMPONENT lines only (exclude the finished-good
+                    // typeid=10 lines) so it matches what the drill lists.
+                    componentcount: (compByBom[bid] || []).filter(function (c) { return c.bitypeid !== 10; }).length
+                });
+            });
+        });
+
+        _populateValueFilters();
+        _applyClientFilters();
+        if (_table) _table.render();
+        document.getElementById('statusLine').textContent = _statusText() + (limitHit ? ' — capped at ' + CAP_BOMS + ' BOMs' : '');
+        _loadedAt = new Date();
+        if (PDF) PDF.refresh();
+        debugLog('Computed ' + _allRows.length + ' rows across ' + topBomIds.length + ' BOM(s) x ' + lgList.length + ' LG(s)', 'success');
+    } catch (e) {
+        debugLog('loadDashboard error: ' + (e && e.message), 'error');
+        document.getElementById('statusLine').textContent = 'Error — see debug console';
+    }
+}
+
+// ============================================================================
+//  COMPONENT DRILL MODAL  (+ staged / nested sub-assembly recursion)
+// ============================================================================
+var _drillAvail = {};        // populated in loadDashboard (mirror of availMap)
+var _drillCollapsed = null;  // Set of collapsed stage-group ids for the open drill
+var _drillGroupSeq = 0;      // unique id generator for stage groups
+
+function openDrill(bomid, lgid) {
+    _drillCollapsed = new Set();
+    _drillGroupSeq = 0;
+    var key = bomid + '|' + lgid;
+    var meta = _bomMetaById[bomid] || {};
+    var atb = _bomAtbByKey[key];
+    var unknown = (_componentsByKey[key] || []).some(function (c) { return c.bitypeid !== 10 && c.parttype === 10 && c.qpb == null; });
+    document.getElementById('drillTitle').innerHTML =
+        'BOM ' + esc(meta.bomnum || bomid) + ' · ' + esc(lgNameById(lgid)) +
+        ' — Available to Build: ' + (unknown ? '<strong style="color:#b45309">? (missing UOM conversion, marked *)</strong>'
+            : atb == null ? '—' : '<strong>' + fmtQty(atb) + '</strong>');
+    var rows = _drillRows(bomid, lgid, 0, [], new Set([bomid]));
+    var body = '<p class="drill-hint"><span class="sw"></span> Highlighted rows are the constraint (the components limiting this build). Click a ▸ staged sub-assembly to fold its own components.</p>' +
+        '<table class="drill-tbl"><colgroup>' +
+          '<col><col style="width:92px"><col style="width:56px"><col style="width:94px"><col style="width:94px"><col style="width:78px">' +
+        '</colgroup><thead><tr>' +
+          '<th data-tip="drill.component">Component</th><th class="num" data-tip="drill.qpb">Qty / Build</th>' +
+          '<th data-tip="drill.uom">UOM</th><th class="num" data-tip="drill.onhand">On Hand</th>' +
+          '<th class="num" data-tip="drill.available">Available</th><th class="num" data-tip="drill.builds">Builds</th>' +
+        '</tr></thead><tbody id="drillTbody">' + rows + '</tbody></table>';
+    document.getElementById('drillBody').innerHTML = body;
+    document.getElementById('drillModal').classList.add('open');
+}
+function closeDrill() { document.getElementById('drillModal').classList.remove('open'); }
+
+// Recursive component rows, all in ONE table (no nested tables) so the numeric
+// columns line up down the tree. `level` indents ONLY the Component cell;
+// `ancestorGroups` is the chain of enclosing stage-group ids (each row gets a
+// `dg-<id>` class per ancestor so collapsing a group hides its whole subtree);
+// `visited` guards BOM cycles.
+function _drillRows(bomid, lgid, level, ancestorGroups, visited) {
+    var key = bomid + '|' + lgid;
+    var comps = _componentsByKey[key] || [];
+    var constraintSet = _constraintByKey[key] || new Set();
+    var ancCls = ancestorGroups.map(function (g) { return 'dg-' + g; }).join(' ');
+    var pad = 8 + level * 18;
+    var out = '', any = false;
+    comps.forEach(function (c) {
+        if (c.bitypeid === 10) return;   // skip the finished-good line itself
+        any = true;
+        var inv = (c.parttype === 10);
+        var a = _availForDrill(c.partid, lgid);
+        var qpb = c.qpb;
+        var builds = !inv ? '—'
+            : qpb == null ? '<span class="uom-bad">?</span>'
+            : qpb > 0 ? fmtQty(_floorBuilds(a ? a.available : 0, qpb)) : '∞';
+        // Qty/Build and UOM are rendered in the PART'S STOCKING UOM, not the unit the
+        // BOM line was authored in. On Hand, Available and Builds all come from inventory,
+        // which is always held in the part base UOM, so showing the authored figure here
+        // silently mixed two unit systems in adjacent columns: AlumExtrusion reads 389 mm
+        // per build against 490.8778 4.8m lengths on hand, and Builds (6056) then looks
+        // impossible to derive. The authored quantity is kept in brackets so the
+        // conversion stays auditable.
+        // With no conversion the line stays in its authored unit, marked.
+        var rowUom = qpb == null ? c.bomuom : (c.partuom || c.bomuom);
+        var mixedUom = c.bomuom && c.partuom && c.bomuom !== c.partuom;
+        var qpbCell = qpb == null
+            ? fmtQty(c.bomqty) + ' <span class="uom-bad" title="No UOM conversion from ' + esc(c.bomuom) +
+              ' to ' + esc(c.partuom) + ' exists in Fishbowl (in either direction), so this ' +
+              'line cannot be compared with inventory. Its Builds, and the BOM&apos;s Available to Build, ' +
+              'are unknown until the conversion is set up.">*</span>'
+            : fmtQty(qpb) +
+              (mixedUom
+                  ? ' <span class="uom-orig" title="BOM line is authored as ' + fmtQty(c.bomqty) + ' ' +
+                    esc(c.bomuom) + '; converted to ' + esc(c.partuom) + ' (x' + fmtQty(c.convnum) + ' / ' +
+                    fmtQty(c.convden) + ') because inventory is held in ' + esc(c.partuom) + '.">(' +
+                    fmtQty(c.bomqty) + ' ' + esc(c.bomuom) + ')</span>'
+                  : '');
+        var isConstraint = inv && constraintSet.has(c.partid);
+        var canExpand = c.stageflag && c.stagebomid && _componentsByKey[c.stagebomid + '|' + lgid] && !visited.has(c.stagebomid);
+        var gid = canExpand ? (++_drillGroupSeq) : null;
+        var subAtb = (c.stageflag && c.stagebomid != null) ? _bomAtbByKey[c.stagebomid + '|' + lgid] : null;
+        var toggle = canExpand
+            ? '<span class="stage-toggle open" onclick="_toggleStage(this,' + gid + ')" title="Fold / unfold this sub-assembly"><svg fill="none" stroke="currentColor" stroke-width="2.4" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></span>'
+            : '';
+        // Staged parts are marked inline (no pill); when the sub-assembly's own
+        // ATB is known it rides along, e.g. "stage · 4".
+        var stageTag = c.stageflag
+            ? ' <span style="color:var(--c-tertiary);font-size:10.5px;" title="Staged sub-assembly' +
+              (subAtb != null ? ' — buildable ' + fmtQty(subAtb) : '') + '">stage' +
+              (subAtb != null ? ' · ' + fmtQty(subAtb) : '') + '</span>'
+            : '';
+        var partCell =
+            '<div style="padding-left:' + pad + 'px">' +
+              toggle +
+              '<a class="fb-row-link" onclick="openModule(\'Part\',\'' + esc(String(c.partnum).replace(/'/g, "\\'")) + '\')">' + esc(c.partnum) + '</a>' +
+              stageTag +
+              '<div class="comp-desc">' + esc(c.partdesc) + (inv ? '' : ' · <span class="noninv">' + esc(c.bitype || 'non-inventory') + '</span>') + '</div>' +
+            '</div>';
+        out += '<tr class="' + (isConstraint ? 'constraint ' : '') + ancCls + '">' +
+            '<td class="comp-part">' + partCell + '</td>' +
+            '<td class="num">' + qpbCell + '</td>' +
+            '<td>' + esc(rowUom) + '</td>' +
+            '<td class="num">' + (inv && a ? fmtQty(a.onhand) : '—') + '</td>' +
+            '<td class="num">' + (inv ? fmtQty(a ? a.available : 0) : '<span class="noninv">Non-Inv</span>') + '</td>' +
+            '<td class="num">' + builds + '</td>' +
+            '</tr>';
+        if (canExpand) {
+            var v2 = new Set(visited); v2.add(bomid);
+            out += _drillRows(c.stagebomid, lgid, level + 1, ancestorGroups.concat([gid]), v2);
+        }
+    });
+    if (!any && level === 0) out = '<tr><td colspan="6" style="color:var(--c-tertiary); padding:14px; text-align:center;">No inventory components on this BOM.</td></tr>';
+    return out;
+}
+function _availForDrill(partid, lgid) {
+    return _drillAvail[partid + '|' + lgid] || null;
+}
+// Fold / unfold a stage group: toggle its id in _drillCollapsed and recompute
+// row visibility. A row is hidden when ANY of its ancestor groups is collapsed.
+function _toggleStage(el, gid) {
+    gid = String(gid);
+    if (_drillCollapsed.has(gid)) _drillCollapsed.delete(gid); else _drillCollapsed.add(gid);
+    el.classList.toggle('open', !_drillCollapsed.has(gid));
+    var tb = document.getElementById('drillTbody');
+    if (!tb) return;
+    Array.prototype.forEach.call(tb.querySelectorAll('tr'), function (tr) {
+        var hide = false;
+        Array.prototype.forEach.call(tr.classList, function (cls) {
+            if (cls.indexOf('dg-') === 0 && _drillCollapsed.has(cls.slice(3))) hide = true;
+        });
+        tr.style.display = hide ? 'none' : '';
+    });
+}
+
+// ============================================================================
+//  PRINT  (new-window workaround — reliable inside JxBrowser)
+// ============================================================================
+// The PDF view's pages (fb-doc), in either view. Without fb-doc on the
+// server, the plain table printout below.
+function printReport() {
+    if (PDF) {
+        PDF.print().catch(function (e) { debugLog('Printing failed: ' + ((e && e.message) || e), 'error'); });
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    if (!_table) return;
+    var cols = _table.getColumns().filter(function (c) { return c.vis !== false; });
+    var rows = _table.getVisibleRows();
+    if (!rows.length) { debugLog('printPlain: no rows', 'warn'); return; }
+    function escHtml(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' })[c]; }); }
+    function cellText(col, row) {
+        var raw = row[col.key];
+        var out = (typeof col.format === 'function') ? col.format(raw, row) : raw;
+        if (out == null) return '';
+        var s = String(out).replace(/<[^>]+>/g, '');
+        return s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+    }
+    var title = document.title || 'Available to Build';
+    var hdr = cols.map(function (c) { return '<th>' + escHtml(c.label) + '</th>'; }).join('');
+    var body = rows.map(function (r) {
+        return '<tr>' + cols.map(function (c) {
+            var t = escHtml(cellText(c, r));
+            var cls = (c.align === 'right') ? ' class="nr"' : (c.align === 'center' ? ' class="nc"' : '');
+            return '<td' + cls + '>' + t + '</td>';
+        }).join('') + '</tr>';
+    }).join('');
+    var html = '<!DOCTYPE html><html><head><meta charset="UTF-8"/><title>' + escHtml(title) + '</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:.4in;color:#111}' +
+        'h2{font-size:11pt;margin:0 0 4px;color:#0B3140}.sub{font-size:7.5pt;color:#506872;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}' +
+        'th{background:#0B3140;color:#fff;font-size:7pt;padding:4px 5px;text-align:left;-webkit-print-color-adjust:exact;print-color-adjust:exact}' +
+        'td{font-size:7.5pt;padding:3px 5px;border-bottom:1px solid #E3E3E3}' +
+        'tr:nth-child(even) td{background:#F7F7F7;-webkit-print-color-adjust:exact;print-color-adjust:exact}' +
+        '.nr{text-align:right}.nc{text-align:center}@page{size:A4 landscape;margin:.4in}' +
+        '</style></head><body><h2>' + escHtml(title) + '</h2>' +
+        '<p class="sub">' + rows.length.toLocaleString() + ' row' + (rows.length === 1 ? '' : 's') + ' — printed ' + new Date().toLocaleDateString() + '</p>' +
+        '<table><thead><tr>' + hdr + '</tr></thead><tbody>' + body + '</tbody></table></body></html>';
+    var w = window.open('', '_blank');
+    if (!w) { debugLog('printPlain: popup blocked', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+    debugLog('Printed ' + rows.length + ' rows', 'success');
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc FBDoc.Report) — the pages laid out like the standard
+//  Available To Build report (see VIEWS in the header comment). Built from
+//  the rows and components already loaded; no query of its own.
+// ============================================================================
+var PDF = null;
+var PDF_CSS = [
+    '.fbdoc-rpt-tbl .rpt-grp-inner>:first-child{white-space:nowrap}',
+    '.fbdoc-rpt-tbl .pdf-note{display:block;font-size:.85em;font-weight:400;color:#444}',
+    '.fbdoc-rpt-tbl tr.pdf-noterow td{padding-top:0;padding-bottom:2pt}',
+    '.fbdoc-rpt-tbl tr.pdf-bomnote td{border-bottom:.5pt solid #bbb}',
+    '.fbdoc-rpt-tbl tr.pdf-bom .rpt-grp-inner>:first-child,.fbdoc-rpt-tbl tr.pdf-bom td.num-cell{font-weight:700}',
+    '.fbdoc-rpt-tbl tr.pdf-type td{font-weight:700;padding-left:14pt;padding-top:2pt}',
+    '.fbdoc-rpt-tbl td.pdf-item{padding-left:24pt}',
+    '.fbdoc-rpt-tbl tr.pdf-con td.pdf-builds{font-weight:700}',
+    '.fbdoc-rpt-tbl .pdf-stage{font-size:.85em;color:#444;white-space:nowrap}'
+].concat([1, 2, 3, 4, 5, 6, 7, 8].map(function (n) {
+    return '.fbdoc-rpt-tbl td.pdf-item.lv' + n + '{padding-left:' + (24 + n * 12) + 'pt}';
+})).join('');
+
+// The filters as one line under the title.
+function _pdfFilterText() {
+    var parts = [];
+    var lgSel = _lgMs ? intList(_lgMs.getSelected()) : [];
+    parts.push(lgSel.length ? 'Location groups: ' + lgSel.map(lgNameById).join(', ') : 'All my location groups');
+    var bom = document.getElementById('filterBom').value.trim();
+    if (bom) parts.push('BOM contains "' + bom + '"');
+    parts.push(document.getElementById('filterActiveOnly').checked ? 'Active BOMs' : 'Active and inactive BOMs');
+    parts.push({ now: 'Buildable now', zero: 'Zero-buildable', all: 'All BOMs' }[_buildFilter] || 'All BOMs');
+    var fg = _fgMs ? _fgMs.getSelected() : [];
+    if (fg.length) parts.push('Finished goods: ' + fg.join(', '));
+    var con = _constraintMs ? _constraintMs.getSelected() : [];
+    if (con.length) parts.push('Constraint: ' + con.join(', '));
+    parts.push((_resolve('costBasis', 'std') === 'avg' ? 'Average' : 'Standard') + ' cost');
+    return parts.join(' · ');
+}
+function _pdfAtb(atb, noConv) {
+    if (noConv && noConv.length) return '?';
+    return atb == null ? '—' : fmtQty(atb);
+}
+// The BOM row's note line: what the App table's other columns say.
+function _pdfBomNote(r) {
+    var m = [];
+    if (r.fgpartnum) {
+        m.push('Finished good ' + r.fgpartnum + (r.fgqty != null
+            ? ', ' + fmtQty(r.fgqty) + (r._fgpartuom ? ' ' + r._fgpartuom : '') + ' per build' : ''));
+    }
+    if (r._atbNoConv && r._atbNoConv.length) m.push('Unknown: no UOM conversion for ' + r._atbNoConv.join(', '));
+    else if (r._constraintParts && r._constraintParts.length) m.push('Constraint: ' + r._constraintParts.join(', '));
+    if (r.atb != null && r.atbafter != null && r.atbafter > r.atb) {
+        var rb = r._ready || {};
+        m.push('After incoming ' + fmtQty(r.atbafter) +
+            (rb.state === 'date' || rb.state === 'overdue'
+                ? ', ready by ' + FBLib.Common.formatDate(rb.date) + (rb.state === 'overdue' ? ' (late)' : '')
+                : rb.state === 'unknown' ? ', ready date unknown' : ''));
+    }
+    var under = (r._costNoConv || r._costMissing) ? ' (understated)' : '';
+    if (r.unitbuildcost != null) m.push('Build cost / unit ' + fmtMoney(r.unitbuildcost) + under);
+    if (r.buildablevalue != null) m.push('Build value ' + fmtMoney(r.buildablevalue));
+    return m.join(' · ');
+}
+// One BOM: a heading when its lines follow, else a plain line, then its note
+// on a full-width row of its own (a spanning cell isn't measured, so the long
+// note never widens the Item column; only the heading repeats over a break).
+function _pdfBomRows(r, heading, out) {
+    var note = _pdfBomNote(r);
+    out.push('<tr class="' + (heading ? 'rpt-sub' : 'pdf-bom') + '"><td>' +
+        '<div class="rpt-grp-inner"><span>' + esc(r.bomnum) + '</span>' +
+        (r.bomdesc ? '<span class="rpt-grp-meta">' + esc(r.bomdesc) + '</span>' : '') + '</div></td>' +
+        '<td></td><td></td><td class="num-cell">' + esc(_pdfAtb(r.atb, r._atbNoConv)) + '</td><td></td><td></td></tr>');
+    if (note) out.push('<tr class="rpt-minor pdf-noterow' + (heading ? '' : ' pdf-bomnote') + '"><td colspan="6"><span class="pdf-note">' + esc(note) + '</span></td></tr>');
+}
+// A BOM's lines. At the top level they sit under their item type, in type
+// name order (the original's itemType group: Finished Good before Raw Good);
+// a staged sub-assembly's lines follow its line, indented, without types,
+// as the original's subreport. visited guards a BOM that stages itself.
+function _pdfComponentRows(bomid, lg, level, visited, out) {
+    var key = bomid + '|' + lg;
+    var comps = (_componentsByKey[key] || []).filter(function (c) { return level === 0 || c.bitypeid !== 10; });
+    var cons = _constraintByKey[key] || new Set();
+    var groups;
+    if (level === 0) {
+        var byType = {}, names = [];
+        comps.forEach(function (c) {
+            var t = c.bitype || 'Other';
+            if (!byType[t]) { byType[t] = []; names.push(t); }
+            byType[t].push(c);
+        });
+        names.sort(function (a, b) { return a.localeCompare(b); });
+        groups = names.map(function (t) { return { type: t, comps: byType[t] }; });
+    } else groups = [{ type: null, comps: comps }];
+    groups.forEach(function (g) {
+        if (g.type) out.push('<tr class="rpt-sub pdf-type" data-pdf-level="3"><td colspan="6">' + esc(g.type) + '</td></tr>');
+        g.comps.forEach(function (c) {
+            var inv = c.parttype === 10, fgLine = c.bitypeid === 10;
+            var a = _drillAvail[c.partid + '|' + lg];
+            var avail = a ? a.available : 0;
+            var builds = (!inv || fgLine) ? '' : c.qpb == null ? '?' : c.qpb > 0 ? fmtQty(_floorBuilds(avail, c.qpb)) : '';
+            var subAtb = (c.stageflag && c.stagebomid != null) ? _bomAtbByKey[c.stagebomid + '|' + lg] : null;
+            var stage = c.stageflag
+                ? ' <span class="pdf-stage">staged' + (subAtb != null ? ', buildable ' + fmtQty(subAtb) : '') + '</span>' : '';
+            var con = inv && !fgLine && cons.has(c.partid);
+            out.push('<tr' + (con ? ' class="pdf-con"' : '') + '>' +
+                '<td class="pdf-item' + (level ? ' lv' + Math.min(level, 8) : '') + '">' +
+                    esc(c.partnum + (c.partdesc ? ' - ' + c.partdesc : '')) + stage + '</td>' +
+                '<td class="num-cell">' + fmtQty(c.bomqty) + '</td>' +
+                '<td>' + esc(c.bomuom) + '</td>' +
+                '<td class="num-cell pdf-builds">' + builds + '</td>' +
+                '<td class="num-cell">' + (inv ? fmtQty(avail) : 'Non-Inv') + '</td>' +
+                '<td>' + (inv ? esc(c.partuom) : '') + '</td></tr>');
+            if (c.stageflag && c.stagebomid && _componentsByKey[c.stagebomid + '|' + lg] && !visited.has(c.stagebomid)) {
+                var v2 = new Set(visited); v2.add(c.stagebomid);
+                _pdfComponentRows(c.stagebomid, lg, level + 1, v2, out);
+            }
+        });
+    });
+}
+// Location groups in name order; within each, the BOMs in the App table's
+// order (its sort), each with its lines when components are on.
+function _pdfRows(withComponents) {
+    var list = _table ? _table.getVisibleRows() : _dataset.slice();
+    var byLg = {}, lgs = [], out = [];
+    list.forEach(function (r) {
+        if (!byLg[r.lgid]) { byLg[r.lgid] = []; lgs.push(r.lgid); }
+        byLg[r.lgid].push(r);
+    });
+    lgs.sort(function (a, b) { return lgNameById(a).localeCompare(lgNameById(b)); });
+    lgs.forEach(function (lg) {
+        var boms = byLg[lg];
+        out.push('<tr class="rpt-grp"><td colspan="6"><div class="rpt-grp-inner"><span>' + esc(lgNameById(lg)) + '</span>' +
+            '<span class="rpt-grp-meta">' + boms.length + ' BOM' + (boms.length === 1 ? '' : 's') + '</span></div></td></tr>');
+        boms.forEach(function (r) {
+            _pdfBomRows(r, withComponents, out);
+            if (withComponents) _pdfComponentRows(r.bomid, lg, 0, new Set([r.bomid]), out);
+        });
+    });
+    return out;
+}
+function docSpec() {
+    if (!_loadedAt) return null;
+    var withComponents = !!_resolve('pdfComponents', true);
+    var sub = [_pdfFilterText() + ' · as of ' + _loadedAt.toLocaleString()];
+    if (withComponents) sub.push('A component\'s Available to Build is the builds its available stock supports; the lowest, in bold, limits the BOM.');
+    return {
+        company: _company, title: 'Available To Build', subtitle: sub, titleEveryPage: false,
+        head: '<tr><th>Item - Description</th><th class="num-cell">Qty per BOM</th><th>UOM</th>' +
+              '<th class="num-cell">Available to Build</th><th class="num-cell">Available for Sale</th><th>UOM</th></tr>',
+        rows: _pdfRows(withComponents), foot: '',
+        empty: 'No BOMs match these filters.', css: PDF_CSS, fontPt: 10
+    };
+}
+
+// ============================================================================
+//  EXPORT CSV  (visible rows)
+// ============================================================================
+function exportCsv() {
+    if (!_table || !_dataset.length) { debugLog('exportCsv: no data', 'warn'); return; }
+    var cols = _table.getColumns().filter(function (c) { return c.vis !== false; });
+    var rows = _table.getVisibleRows();
+    function csvCell(col, row) {
+        var raw = row[col.key];
+        return raw == null ? '' : String(raw);
+    }
+    var header = cols.map(function (c) { return '"' + c.label.replace(/"/g, '""') + '"'; }).join(',');
+    var body = rows.map(function (row) {
+        return cols.map(function (c) { return '"' + csvCell(c, row).replace(/"/g, '""') + '"'; }).join(',');
+    }).join('\r\n');
+    var blob = new Blob([header + '\r\n' + body], { type: 'text/csv;charset=utf-8;' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = 'available_to_build_' + new Date().toISOString().split('T')[0] + '.csv';
+    a.rel = 'noopener'; a.style.display = 'none';
+    document.body.appendChild(a); a.click();
+    setTimeout(function () { try { document.body.removeChild(a); } catch (_) {} try { URL.revokeObjectURL(url); } catch (_) {} }, 4000);
+    debugLog('Exported ' + rows.length + ' rows', 'success');
+}
+
+// ============================================================================
+//  SETTINGS
+// ============================================================================
+function _hydrateSettings() {
+    document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+    document.getElementById('setRememberFilters').checked = !!_resolve('rememberFilters', true);
+    document.getElementById('setCostBasis').value = _resolve('costBasis', 'std');
+    document.getElementById('setPdfComponents').checked = !!_resolve('pdfComponents', true);
+    _setBuildFilter(_resolve('buildFilter', 'now'));
+}
+function onSettingsChange() {
+    var showDebug = document.getElementById('setShowDebug').checked;
+    _setUserKey('showDebug', showDebug);
+    _setUserKey('rememberFilters', document.getElementById('setRememberFilters').checked);
+    var withComponents = document.getElementById('setPdfComponents').checked;
+    if (withComponents !== !!_resolve('pdfComponents', true)) {
+        _setUserKey('pdfComponents', withComponents);
+        if (PDF) PDF.refresh();
+    }
+    var basis = document.getElementById('setCostBasis').value;
+    var prev = _resolve('costBasis', 'std');
+    _setUserKey('costBasis', basis);
+    _applyDebugDrawer(showDebug);
+    if (basis !== prev) loadDashboard();   // cost basis changes the value column — re-run
+}
+function resetSettings() {
+    if (!confirm('Reset your personal settings to defaults?')) return;
+    try { FBLib.Settings.clearUser(); } catch (_) {}
+    _hydrateSettings();
+    _applyDebugDrawer(!!_resolve('showDebug', false));
+    loadDashboard();
+}
+function publishDefaults() {
+    if (!FBLib.Settings.isAdmin()) return;
+    if (!confirm('Make the current filters and settings what everyone sees each time this report opens?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it (it also holds the company paper).
+        FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, {
+            costBasis: document.getElementById('setCostBasis').value,
+            rememberFilters: document.getElementById('setRememberFilters').checked,
+            pdfComponents: document.getElementById('setPdfComponents').checked,
+            lgSel: _lgMs ? _lgMs.getSelected() : [],
+            buildFilter: _buildFilter
+        }));
+        debugLog('Defaults published', 'success');
+    } catch (e) { debugLog('publishDefaults: ' + e.message, 'error'); }
+}
+function unpublishDefaults() {
+    if (!FBLib.Settings.isAdmin()) return;
+    if (!confirm('Stop using company defaults for this report? Everyone goes back to their own last choices.')) return;
+    try {
+        FBLib.Settings.clearCompany(['lgSel', 'buildFilter', 'costBasis', 'pdfComponents', 'rememberFilters']);
+        debugLog('Company defaults cleared', 'success');
+    } catch (e) { debugLog('unpublishDefaults: ' + e.message, 'error'); }
+}
+function toggleUserEditing() {
+    if (!FBLib.Settings.isAdmin()) return;
+    try { FBLib.Settings.setLock(FBLib.Settings.userEditingAllowed()); _refreshAdminUi(); }
+    catch (e) { debugLog('toggleUserEditing: ' + e.message, 'error'); }
+}
+function _refreshAdminUi() {
+    var isAdmin = FBLib.Settings.isAdmin();
+    document.getElementById('dsAdminSection').style.display = isAdmin ? 'block' : 'none';
+    var allowed = FBLib.Settings.userEditingAllowed();
+    document.getElementById('dsLockBadge').style.display = (!allowed && !isAdmin) ? 'block' : 'none';
+    var lockBtn = document.getElementById('dsLockBtn');
+    if (lockBtn) lockBtn.textContent = allowed ? 'Lock user editing' : 'Unlock user editing';
+}
+
+// ============================================================================
+//  DEBUG DRAWER
+// ============================================================================
+var _debugApi = null;
+function _applyDebugDrawer(showIt) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (showIt) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    if (_debugApi.element) _observeDebugDrawer(_debugApi.element);
+}
+function _observeDebugDrawer(el) {
+    if (!el || el._observed) return;
+    el._observed = true;
+    var apply = function () {
+        var visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        var h = (visible && open) ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    if (typeof ResizeObserver === 'function') { try { new ResizeObserver(apply).observe(el); } catch (_) {} }
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async function () {
+  try {
+    // Register the drawers with fb-lib — mutual-exclusion, ESC-to-close,
+    // trigger .active state, and the shared backdrop scrim are all handled by
+    // fb-lib (no local scrim wiring; see the CSS note above).
+    FBLib.Common.registerDrawer({ id: 'filtersOverlay', triggerId: 'filtersBtn' });
+    FBLib.Common.registerDrawer({ id: 'setOverlay',     triggerId: 'setBtn'     });
+    FBLib.Common.registerDrawer({ id: 'helpOverlay',    triggerId: 'helpBtn'    });
+
+    // Buildability chips.
+    document.querySelectorAll('#buildChips input').forEach(function (inp) {
+        inp.addEventListener('change', function () { onBuildFilterChange(inp.value); });
+    });
+
+    // Location Group multi-select — drives the SQL, so re-run the query once
+    // per dropdown session (onClose). Finished-Good + Constraint are client-side
+    // filters over the loaded rows, so they repaint live on each change (onChange).
+    _lgMs = FBLib.Common.MultiSelect.create({
+        containerId: 'lgMs',
+        items: [],
+        placeholder: 'All my location groups',
+        onClose: function () { loadDashboard(); }
+    });
+    _fgMs = FBLib.Common.MultiSelect.create({
+        containerId: 'fgMs',
+        items: [],
+        placeholder: 'All finished goods',
+        onChange: function () { _refreshTable(); }
+    });
+    _constraintMs = FBLib.Common.MultiSelect.create({
+        containerId: 'constraintMs',
+        items: [],
+        placeholder: 'All constraint parts',
+        onChange: function () { _refreshTable(); }
+    });
+
+    // FBLib.Table: sort / filter / drag-reorder / drag-resize / lazy render +
+    // persisted layout (settingsKey). getRows returns the chip-filtered set.
+    _table = FBLib.Table.init({
+        tableEl: document.getElementById('reportTable'),
+        columns: _columns,
+        getRows: function () { return _dataset; },
+        chunkSize: 200,
+        settingsKey: 'tablePrefs'
+    });
+
+    // App / PDF views (needs the fb-doc script; without it the report is App only).
+    if (window.FBDoc && FBDoc.Report) {
+        PDF = FBDoc.Report.view({
+            app: document.getElementById('appView'), toggleBefore: document.getElementById('exportBtn'),
+            page: { size: 'Letter', orientation: 'landscape' },
+            doc: docSpec, title: function () { return 'Available To Build'; }
+        });
+    } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+    _hydrateSettings();
+    _applyDebugDrawer(!!_resolve('showDebug', false));
+    _refreshAdminUi();
+    _wireHeaderTips();
+
+    document.getElementById('filterBom').addEventListener('keydown', function (e) { if (e.key === 'Enter') loadDashboard(); });
+    document.getElementById('filterActiveOnly').addEventListener('change', loadDashboard);
+
+    await loadFilters();
+    await loadDashboard();
+    debugLog('Report initialised', 'success');
+  } catch (e) {
+    console.error('[AvailableToBuild init] failed:', e);
+    var sl = document.getElementById('statusLine');
+    if (sl) sl.textContent = 'Init failed — ' + (e && e.message ? e.message : 'see browser console');
+    try { FBLib.Common.debugLog('Init failed: ' + (e && e.stack ? e.stack : e), 'error'); } catch (_) {}
+  }
+});
+
+// Inline-handler exports.
+window.loadDashboard     = loadDashboard;
+window.clearFilters      = clearFilters;
+window.exportCsv         = exportCsv;
+window.printReport       = printReport;
+window.onSettingsChange  = onSettingsChange;
+window.resetSettings     = resetSettings;
+window.publishDefaults   = publishDefaults;
+window.toggleUserEditing = toggleUserEditing;
+window.openDrill         = openDrill;
+window.closeDrill        = closeDrill;
+window._toggleStage      = _toggleStage;
+</script>
+
+</body>
+</html>

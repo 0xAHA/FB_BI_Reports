@@ -1,0 +1,1034 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Customer Detail List (iReport port)
+  PATH:   iReport_Ports/Customer/CustomerDetailList.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard Customer/CustomerDetailList.jrxml and
+  its recursive subreport subCustomerDetails.jrxml: every customer's
+  addresses and the contacts on each address, with each customer's jobs
+  listed under it. Same source, same rules, same columns; only the
+  presentation is interactive. (The original's REPORTDESCRIPTION
+  parameter says "Basic Report for Bill Of Materials": a copy-paste
+  leftover, it describes nothing here.)
+
+    Source     customer ⋈ address (same account) ⋈ addresstype, LEFT JOIN
+               contact (same account AND contact.addressId = address.id)
+               + contacttype, stateconst (code), countryconst
+               (abbreviation). A customer with no address of the chosen
+               type is not listed, and neither are its jobs. A contact
+               with no address is never listed (the original's join).
+    Filters    Customer (empty = all), address type (All / Main Office /
+               Home / Remit To / Bill To / Ship To), active / inactive
+               (default active only), Include jobs, Show country, Show
+               contact info.
+    Top level  With no customer chosen, only customers with jobDepth <= 1
+               (top-level customers: jobDepth is 1 for them, 2 for a
+               job, 3 for a job's job). A chosen customer is listed
+               whatever its depth, under its own name.
+    Jobs       With Include jobs on, each listed customer's jobs
+               (customer.parentId = it) follow it as "Parent:Job",
+               recursively, as the subreport does. The subreport does not
+               apply the active filter, so neither does this: a listed
+               customer's inactive jobs are listed too. The label is the
+               parent's full name (ReportHelperModule
+               .getCustomerParentName → the "A:B" chain) + ":" + the job.
+               The whole tree comes from one query and is nested here,
+               instead of one subreport query per customer.
+    Order      UPPER(customer name), UPPER(address name), UPPER(contact
+               name); jobs in name order under their parent.
+    Totals     None, as the original. The status line counts customers,
+               jobs, addresses and contacts.
+
+  Layout: the REPORT chrome (fb-styles §35): 56px header, push-down filter
+  panel that applies as you change it, collapsible group rows (one per
+  customer, jobs as their own group rows indented under their parent and
+  hidden while an ancestor is collapsed), contacts as minor rows under
+  their address: "(Type) Name" in the first column, the value in the
+  second.
+  Table tools (fb-lib FBLib.RptCols / RowCap): column headings sort the
+  addresses within each customer or job (customers and jobs keep the
+  standard name order; contacts stay under their address), drag to reorder
+  and resize (remembered per user); a contact's label and value take the
+  first two columns, whichever they are. Large lists: one load lists at
+  most 2,500 customers (about 10,000 lines), each with all of its
+  addresses, contacts and jobs, with Load all. A row LIMIT would cut a
+  customer's addresses or drop the jobs of a customer it kept.
+  Views: the header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+  report out as pages like the original: Letter landscape by default, the
+  company / title / filters band on every page (the original's page header),
+  the column headings repeated, each customer's name in the original's navy
+  bold over a rule, its jobs as navy bold sub-headings under it (a customer
+  or job carried over a page break is repeated "(continued)"), contacts as
+  minor rows under their address, no totals (the original has none), "Page X
+  of Y". Columns fit the page and the font steps down from the original's
+  10pt when they don't. The paper size and orientation, and the view, are
+  remembered per user. Print prints those pages in either view.
+
+  Deliberate differences, all cosmetic or bug fixes:
+    - A job's jobs are listed once, under it. The original also runs the
+      subreport for every job that the main query returns (its rows are
+      only hidden by printWhenExpression), so a job's jobs printed a
+      second time as a loose block, and the jobs of an active job whose
+      parent was filtered out printed with no parent at all.
+    - Jobs are indented by depth. The subreport computes a "spacing"
+      variable per level for this but never prints it.
+    - No bold "Contacts" heading line per address, and no blank contact
+      line for an address with no contacts: the contacts are the minor
+      rows themselves.
+    - Customers are grouped by id, not name (the original would merge two
+      customers with the same name), and an address's rows are kept
+      together when two addresses share a name.
+    - More than one customer can be chosen (the original takes one). A
+      chosen job that already sits under another chosen customer is not
+      repeated as its own entry.
+
+  Additions over the iReport version: customer links (openModule
+  'Customer' with the name the original's hyperlink carries: the name,
+  or "Parent:Job" for a job), a searchable customer picker in place of
+  the id LIKE, Excel (one flat sheet).
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-folder" content="Customer">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="Each customer’s addresses, contacts and jobs.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipCustDetailList',
+            name:  'Customer Detail List',
+            build: '2026.10.16-dd50f79'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Customer Detail List — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 460px; overflow: hidden; text-overflow: ellipsis; vertical-align: top; }
+        .rpt-table td.addr-cell { white-space: pre-line; min-width: 220px; }
+        .rpt-table th { cursor: default; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        /* A job's group row: lighter than its parent's, indented by depth. */
+        .rpt-table tr.rpt-grp.is-job td { background: #F3F8FB; border-bottom: 1px solid var(--tint-blue-2); }
+        .rpt-table tr.rpt-grp td.grp-cell { max-width: none; }
+        .grp-flag { font-size: 10.5px; font-weight: 600; padding: 0 6px; border-radius: 8px; background: #fff;
+            border: 1px solid var(--border); color: var(--c-secondary); }
+        .grp-flag.inactive { color: #8A1E30; border-color: #D9A4B2; background: var(--acc-maroon-bg); }
+        .rpt-table tr.rpt-minor td.ct-label { color: #415157; }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>Customer Detail List</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="split-btn">
+            <button id="expandBtn" class="hdr-btn" type="button" title="Show every customer's addresses, contacts and jobs">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+                Expand
+            </button>
+            <button id="collapseBtn" class="hdr-btn" type="button" title="Customer names only">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 12h14" stroke-linecap="round"/></svg>
+                Collapse
+            </button>
+        </span>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook (one row per contact, or per address with no contacts)">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages: collapsed customers print as their name only">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Customers</div>
+            <div>
+                <div class="rpt-flabel">Customer</div>
+                <div class="ms-container" id="custMs">
+                    <div class="ms-trigger" id="custMs-trigger"><span class="ms-placeholder" id="custMs-placeholder">All customers</span></div>
+                    <div class="ms-dropdown hidden" id="custMs-dropdown">
+                        <div class="ms-search"><input type="text" id="custMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="custMs-all">Select All</span><span id="custMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="custMs-list"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="rpt-fnote">Empty lists every top-level customer.<br>A chosen job is listed on its own.</div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fActive"> Active customers</label>
+            <label class="rpt-fcheck"><input type="checkbox" id="fInactive"> Inactive customers</label>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Addresses &amp; jobs</div>
+            <div>
+                <div class="rpt-flabel">Address type</div>
+                <select id="fAddrType"></select>
+            </div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fJobs"> Include jobs</label>
+            <div class="rpt-fnote">Jobs are listed under their customer<br>whether active or not, as in the standard report.</div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Show</div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fCountry"> Show country</label>
+            <label class="rpt-fcheck"><input type="checkbox" id="fContacts"> Show contact info</label>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own sort">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters what everyone sees each time this report opens. Anyone can still change them while it is open.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+                <button type="button" class="ds-btn" id="unpublishBtn" title="Everyone goes back to their own last choices">Stop using them</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>Every customer's addresses, and the contacts saved on each address. It is the BI version of the standard <strong>Customer Detail List</strong> and reads the same data the same way.</p>
+                <p>A customer with no address of the chosen type is left out, and so are its jobs. Contacts that aren't attached to an address aren't listed.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Jobs</div>
+                <p>With <strong>Include jobs</strong> on, each customer's jobs follow it as <em>Customer:Job</em>, indented, and a job's own jobs follow that. The active / inactive filter applies to the customers you list, not to their jobs, as in the standard report.</p>
+                <p>With no customer chosen, the list starts from top-level customers. Choose a job to list it on its own.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>Filter changes apply straight away.</li>
+                    <li>Click a customer's row to show or hide its addresses and jobs; <strong>Expand</strong> / <strong>Collapse</strong> do every customer. Click the name to open it in Fishbowl.</li>
+                    <li>Click a column heading to sort each customer's addresses (again to reverse, a third time for the standard order); customers stay in name order and contacts stay under their address. Drag a heading onto another to move the column; drag a heading's right edge to resize it. Your layout is remembered; <strong>Settings → Reset column layout</strong> undoes it.</li>
+                    <li>A very long list shows its first 2,500 customers, each complete with its addresses, contacts and jobs, and a <strong>Load all</strong> button.</li>
+                    <li><strong>Excel</strong> saves one row per contact (or per address, with contact info off or no contacts), with the customer and its parent.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable pages, laid out like the standard report. In PDF view pick the paper size and orientation in the bar above the pages; they are remembered. <strong>Print</strong> prints those pages.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Common || !FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+// The original's cbAddressType choices ('' = All, its '%').
+const ADDRESS_TYPES = ['Main Office', 'Home', 'Remit To', 'Bill To', 'Ship To'];
+const DEFAULT_FILTERS = { custs: [], addrType: '', active: true, inactive: false, includeJobs: true, showCountry: false, showContacts: true };
+const QUERY_KEYS = ['custs', 'addrType', 'active', 'inactive', 'includeJobs'];
+const INDENT = 22;   // px per job level
+// Large lists: one load lists at most this many customers, each with ALL of
+// its rows and jobs (FBLib.RowCap's notice + Load all). ~4 lines a customer
+// makes it about RowCap's 10,000 lines. A LIMIT on the detail rows instead
+// would cut a customer's addresses and drop the jobs of customers it kept.
+const CUST_CAP = 2500;
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        company: { keys: ['filters', 'opts'], editors: true },   // every open starts from the company defaults
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const ints = a => (Array.isArray(a) ? a : []).map(Number).filter(n => Number.isInteger(n));
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const openLink = (module, number) => number
+    ? `<a class="fb-row-link" data-open="${esc(module)}" data-num="${esc(number)}">${esc(number)}</a>` : '';
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const cut = s => `<span title="${esc(s)}">${esc(s)}</span>`;
+// address.address holds line breaks; on one line they read as ", ".
+const oneLine = s => String(s ?? '').split(/\r?\n/).map(x => x.trim()).filter(Boolean).join(', ');
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS — the panel applies as it changes (one short debounce). Show
+//  country / contact info only redraw; the rest re-query.
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _custMs = null;
+let _hydrating = false, _applyTimer = null;
+
+function readFilters() {
+    return {
+        custs: ints(_custMs.getSelected()),
+        addrType: document.getElementById('fAddrType').value,
+        active: document.getElementById('fActive').checked,
+        inactive: document.getElementById('fInactive').checked,
+        includeJobs: document.getElementById('fJobs').checked,
+        showCountry: document.getElementById('fCountry').checked,
+        showContacts: document.getElementById('fContacts').checked
+    };
+}
+function writeFilters(f) {
+    _hydrating = true;
+    _custMs.setSelected(ints(f.custs));
+    document.getElementById('fAddrType').value = ADDRESS_TYPES.indexOf(f.addrType) !== -1 ? f.addrType : '';
+    document.getElementById('fActive').checked = f.active !== false;
+    document.getElementById('fInactive').checked = !!f.inactive;
+    document.getElementById('fJobs').checked = f.includeJobs !== false;
+    document.getElementById('fCountry').checked = !!f.showCountry;
+    document.getElementById('fContacts').checked = f.showContacts !== false;
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const requery = QUERY_KEYS.some(k => JSON.stringify(next[k]) !== JSON.stringify(F[k]));
+        F = next;
+        remember();
+        if (requery) { S.noCap = false; loadAll(); } else render(false);
+    }, 250);
+}
+
+// "Address type: All · Active only" for the status line, print and Excel.
+function scopeText(f) {
+    const st = f.active && f.inactive ? 'Active and inactive' : f.active ? 'Active only' : f.inactive ? 'Inactive only' : 'No status ticked';
+    const parts = ['Address type: ' + (f.addrType || 'All'), st];
+    if (f.custs.length) parts.push(plural(f.custs.length, 'customer') + ' chosen');
+    if (!f.includeJobs) parts.push('No jobs');
+    return parts.join(' · ');
+}
+
+// ============================================================================
+//  SQL — the iReport query, run once for the whole tree. The listed
+//  customers are the original's main query (customer id or top level, plus
+//  the active filter); with Include jobs on, every job comes too (the
+//  subreport's rows, which skip the active filter) and is nested in JS.
+// ============================================================================
+// The listed customers: the chosen ones, else the top level, through the
+// original's ckShowActive / ckShowInactive ("1"/"100" and "0"/"100").
+function listedWhere(f) {
+    const act = [f.active ? 1 : 100, f.inactive ? 0 : 100];
+    return [(f.custs.length ? 'customer.id IN (' + f.custs.join(',') + ')' : 'COALESCE(customer.jobdepth, 1) <= 1'),
+            'customer.activeflag+0 IN (' + act.join(', ') + ')'].join(' AND ');
+}
+// The listed customers alone (each needs an address of the chosen type), in
+// the report's order: the cap's natural boundary (CUST_CAP).
+function buildRootsSQL(f) {
+    const at = f.addrType ? `WHERE addresstype.name = '${sqlStr(f.addrType)}'` : '';
+    return `
+        SELECT customer.id, UPPER(customer.name) AS sortname
+        FROM customer
+        JOIN (SELECT DISTINCT address.accountid FROM address INNER JOIN addresstype ON address.typeid = addresstype.id ${at}) a
+          ON a.accountid = customer.accountid
+        WHERE ${listedWhere(f)}
+        ORDER BY sortname, customer.id`;
+}
+// ids: when the list is capped, the listed customers kept (with Include
+// jobs, their jobs are added from the customer list); else every customer
+// the filters list.
+function buildSQL(f, ids) {
+    const listed = listedWhere(f);
+    let who = f.includeJobs ? `((${listed}) OR customer.parentid > 0)` : `(${listed})`;
+    if (ids) {
+        const all = f.includeJobs ? withJobs(ids) : ids;
+        // No customer list to find the jobs in: every job, as uncapped.
+        who = f.includeJobs && !S.all.size ? `(customer.id IN (${ids.join(',')}) OR customer.parentid > 0)` : `customer.id IN (${all.join(',') || '0'})`;
+    }
+    const w = [who];
+    if (f.addrType) w.push(`addresstype.name = '${sqlStr(f.addrType)}'`);
+    return `
+        SELECT customer.id AS customerid, customer.name AS customername,
+               COALESCE(customer.parentid, 0) AS parentid, COALESCE(customer.jobdepth, 1) AS jobdepth,
+               customer.activeflag+0 AS active,
+               address.id AS addressid, address.name AS addressname, addresstype.name AS addresstypename,
+               address.address, address.city, address.zip,
+               COALESCE(stateconst.code, '') AS stateabbr, COALESCE(countryconst.abbreviation, '') AS countryabbr,
+               COALESCE(contact.id, 0) AS contactid, COALESCE(contact.contactname, '') AS contactname,
+               COALESCE(contact.datus, '') AS datus, COALESCE(contacttype.name, '') AS contacttypename
+        FROM customer
+        INNER JOIN address ON customer.accountid = address.accountid
+        INNER JOIN addresstype ON address.typeid = addresstype.id
+        LEFT JOIN contact ON (customer.accountid = contact.accountid AND address.id = contact.addressid)
+        LEFT JOIN contacttype ON contact.typeid = contacttype.id
+        LEFT JOIN countryconst ON address.countryid = countryconst.id
+        LEFT JOIN stateconst ON address.stateid = stateconst.id
+        WHERE ${w.join('\n          AND ')}
+        ORDER BY UPPER(customer.name), customer.id, UPPER(address.name), address.id, UPPER(contact.contactname), contact.id`;
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+// all: every customer (id → { name, parentId, active }) for the picker and
+// the full "A:B" names; tree: the listed customers, each { c, level, label,
+// kids }; collapsed: customer ids whose group is closed.
+const S = { all: new Map(), tree: [], counts: null, company: '', loadedAt: null, collapsed: new Set(), allClosed: false, noCap: false };
+let _loadToken = 0;
+
+// The given customers and all of their jobs, down the chain (from the
+// customer list), for a capped load.
+function withJobs(ids) {
+    const kids = new Map();
+    S.all.forEach((c, id) => { if (c.parentId) { if (!kids.has(c.parentId)) kids.set(c.parentId, []); kids.get(c.parentId).push(id); } });
+    const out = new Set();
+    const go = id => { if (out.has(id)) return; out.add(id); (kids.get(id) || []).forEach(go); };
+    ids.forEach(go);
+    return [...out];
+}
+
+// A customer's full name, "Parent:Job" up the chain (the guard stops a
+// broken parent loop).
+function fullName(id, guard) {
+    const c = S.all.get(id);
+    if (!c) return '';
+    guard = guard || new Set();
+    if (!c.parentId || guard.has(id) || !S.all.has(c.parentId)) return c.name;
+    guard.add(id);
+    return fullName(c.parentId, guard) + ':' + c.name;
+}
+
+async function loadLookups() {
+    const [co, custs] = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('Customers', 'SELECT id, name, COALESCE(parentid, 0) AS pickparent, activeflag+0 AS active FROM customer')
+    ]);
+    S.company = co.status === 'fulfilled' ? ((co.value[0] || {}).name || '') : '';
+    S.all = new Map((custs.status === 'fulfilled' ? custs.value : []).map(r =>
+        [Number(r.id), { name: String(r.name ?? ''), parentId: Number(r.pickparent) || 0, active: Number(r.active) === 1 }]));
+    const items = [...S.all.keys()].map(id => {
+        const c = S.all.get(id);
+        const sub = [c.parentId ? 'Job' : '', c.active ? '' : 'Inactive'].filter(Boolean).join(' · ');
+        return sub ? { value: id, label: fullName(id), sub } : { value: id, label: fullName(id) };
+    });
+    items.sort((a, b) => a.label.toUpperCase() < b.label.toUpperCase() ? -1 : a.label.toUpperCase() > b.label.toUpperCase() ? 1 : 0);
+    _custMs.setItems(items);
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    const f = F;
+    document.getElementById('banner').textContent = '';
+    document.getElementById('loading').classList.add('show');
+    setStatus('Loading…');
+    let rows, capped = false;
+    try {
+        // The cap's natural boundary: the first CUST_CAP listed customers, then
+        // every row of those customers and their jobs. Load all skips it.
+        let ids = null;
+        if (!S.noCap) {
+            const roots = FBLib.RowCap.apply(await q('Listed customers', FBLib.RowCap.sql(buildRootsSQL(f), CUST_CAP)), CUST_CAP);
+            if (tok !== _loadToken) return;
+            if (roots.capped) { capped = true; ids = roots.rows.map(r => Number(r.id)); }
+        }
+        rows = await q('Customer details', buildSQL(f, ids));
+    } catch (e) {
+        if (tok !== _loadToken) return;
+        document.getElementById('loading').classList.remove('show');
+        document.getElementById('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        FBLib.RowCap.notice({ before: document.getElementById('rptWrap'), capped: false });
+        S.tree = []; S.counts = null; S.loadedAt = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    if (tok !== _loadToken) return;
+    document.getElementById('loading').classList.remove('show');
+    FBLib.RowCap.notice({ before: document.getElementById('rptWrap'), capped, limit: CUST_CAP, what: 'customers',
+                          onLoadAll: () => { S.noCap = true; loadAll(); } });
+    buildTree(rows, f);
+    if (S.allClosed) S.collapsed = new Set(groupIds());
+    S.loadedAt = new Date();
+    render();
+}
+
+// Rows → customers → addresses → contacts, then the printed tree.
+function buildTree(rows, f) {
+    const cust = new Map();
+    rows.forEach(r => {
+        const id = Number(r.customerid);
+        let c = cust.get(id);
+        if (!c) {
+            c = { id, name: String(r.customername ?? ''), parentId: Number(r.parentid) || 0, depth: Number(r.jobdepth) || 1,
+                  active: Number(r.active) === 1, addrs: [], byAddr: new Map(), kids: [] };
+            cust.set(id, c);
+        }
+        const aid = Number(r.addressid);
+        let a = c.byAddr.get(aid);
+        if (!a) {
+            a = { id: aid, name: r.addressname || '', type: r.addresstypename || '', address: r.address || '', city: r.city || '',
+                  state: r.stateabbr || '', zip: r.zip || '', country: r.countryabbr || '', contacts: [] };
+            c.byAddr.set(aid, a);
+            c.addrs.push(a);
+        }
+        if (Number(r.contactid)) a.contacts.push({ type: r.contacttypename || '', name: r.contactname || '', value: r.datus || '' });
+    });
+    // Jobs in name order under their parent (the rows arrive in name order).
+    cust.forEach(c => { const p = cust.get(c.parentId); if (p && p !== c) p.kids.push(c); });
+
+    // The listed customers: the chosen ones (any depth), else the top level,
+    // through the active filter. The SQL already did this; it is repeated
+    // because the job rows that come with Include jobs skip it.
+    const chosen = new Set(f.custs);
+    const statusOk = c => c.active ? f.active : f.inactive;
+    let roots = [...cust.values()].filter(c => (chosen.size ? chosen.has(c.id) : c.depth <= 1) && statusOk(c));
+    if (f.includeJobs) {
+        // A chosen customer that already sits under another chosen one is not repeated.
+        const under = new Set();
+        const collect = (c, path) => c.kids.forEach(k => {
+            if (path.has(k.id)) return;
+            under.add(k.id);
+            collect(k, new Set(path).add(k.id));
+        });
+        roots.forEach(r => collect(r, new Set([r.id])));
+        roots = roots.filter(r => !under.has(r.id));
+    }
+    const counts = { customers: 0, jobs: 0, addresses: 0, contacts: 0 };
+    const node = (c, level, label, path) => {
+        counts[level ? 'jobs' : 'customers']++;
+        counts.addresses += c.addrs.length;
+        c.addrs.forEach(a => { counts.contacts += a.contacts.length; });
+        const n = { c, level, label, parentLabel: level ? fullName(c.parentId) : (c.parentId ? fullName(c.parentId) : ''), kids: [] };
+        if (f.includeJobs) {
+            // The subreport's label: getCustomerParentName(parent) + ":" + name.
+            c.kids.forEach(k => { if (!path.has(k.id)) n.kids.push(node(k, level + 1, (fullName(c.id) || c.name) + ':' + k.name, new Set(path).add(k.id))); });
+        }
+        return n;
+    };
+    S.tree = roots.map(c => node(c, 0, c.name, new Set([c.id])));
+    S.counts = counts;
+}
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+
+// ============================================================================
+//  TABLE
+// ============================================================================
+const ADDR_COLS = [
+    { key: 'name',    label: 'Address Name', w: 170 },
+    { key: 'address', label: 'Address',      w: 240 },
+    { key: 'city',    label: 'City',         w: 140 },
+    { key: 'state',   label: 'State',        w: 60 },
+    { key: 'zip',     label: 'Zip',          w: 70 },
+    { key: 'country', label: 'Country',      w: 70, country: true }
+];
+let COLS = null;      // FBLib.RptCols: resize / sort / reorder
+const shownCols = () => {
+    const base = ADDR_COLS.filter(c => !c.country || F.showCountry);
+    return COLS ? COLS.arrange(base) : base;      // the user's column order
+};
+// Heading-click sort: a customer's (or job's) addresses sort among
+// themselves; customers and jobs keep the standard name order, and
+// contacts stay under their address.
+const sortVal = (a, k) => ({ name: a.name, address: oneLine(a.address), city: a.city, state: a.state, zip: a.zip, country: a.country })[k];
+const sortAddrs = list => (COLS && COLS.sort() ? list.slice().sort((a, b) => COLS.compare(a, b, sortVal)) : list);
+
+// Every printed node, depth first (the report's order).
+function walk(fn) {
+    const go = (n, hidden) => { fn(n, hidden); n.kids.forEach(k => go(k, hidden || S.collapsed.has(n.c.id))); };
+    S.tree.forEach(n => go(n, false));
+}
+function groupIds() { const ids = []; walk(n => ids.push(n.c.id)); return ids; }
+
+// A group row: one per customer or job, its identity across every column.
+// In print a job is a sub-group row (rpt-sub) of its customer, so the PDF
+// view carries both over a page break.
+function groupRow(n, forPrint) {
+    const open = !S.collapsed.has(n.c.id);
+    const meta = [plural(n.c.addrs.length, 'address', 'addresses')];
+    if (n.kids.length) meta.push(plural(n.kids.length, 'job'));
+    const cls = !n.level ? 'rpt-grp' : forPrint ? 'rpt-sub is-job' : 'rpt-grp is-job';
+    return `<tr class="${cls}" data-grp="${n.c.id}"><td class="grp-cell" colspan="${shownCols().length}">` +
+        `<div class="rpt-grp-inner" style="padding-left:${n.level * INDENT}px">` +
+        (forPrint ? '' : `<span class="rpt-toggle">${open ? '▼' : '▶'}</span>`) +
+        openLink('Customer', n.label) +
+        (n.c.active ? '' : '<span class="grp-flag inactive">Inactive</span>') +
+        `<span class="rpt-grp-meta">${esc(meta.join(' · '))}</span></div></td></tr>`;
+}
+// The tree's indent sits on the first column, whichever the user has put first.
+function addressRow(n, a) {
+    const pad = n.level * INDENT + 10;   // the original's 10px address-name inset
+    const cell = { name: cut(a.name), address: esc(a.address), city: cut(a.city), state: esc(a.state), zip: esc(a.zip), country: esc(a.country) };
+    return '<tr>' + shownCols().map((c, i) =>
+        `<td${c.key === 'address' ? ' class="addr-cell"' : ''}${i === 0 ? ` style="padding-left:${pad}px"` : ''}>${cell[c.key]}</td>`).join('') + '</tr>';
+}
+// "(Type) Name" then the value, as the original's detail band: the first
+// two columns, whatever they are.
+function contactRow(n, ct) {
+    const label = ('(' + ct.type + ') ' + ct.name).trim();
+    return `<tr class="rpt-minor"><td class="ct-label" style="padding-left:${n.level * INDENT + 26}px">${cut(label)}</td>` +
+        `<td>${cut(ct.value)}</td>` + '<td></td>'.repeat(Math.max(0, shownCols().length - 2)) + '</tr>';
+}
+function bodyRows(forPrint) {
+    const out = [];
+    walk((n, hidden) => {
+        if (hidden) return;
+        out.push(groupRow(n, forPrint));
+        if (S.collapsed.has(n.c.id)) return;
+        sortAddrs(n.c.addrs).forEach(a => {
+            out.push(addressRow(n, a));
+            if (F.showContacts) a.contacts.forEach(ct => out.push(contactRow(n, ct)));
+        });
+    });
+    return out;
+}
+const headRow = () => '<tr>' + shownCols().map(c => `<th data-col="${c.key}" style="min-width:${c.w}px">${esc(c.label)}</th>`).join('') + '</tr>';
+
+function countText() {
+    const k = S.counts;
+    if (!k) return '';
+    const parts = [plural(k.customers, 'customer')];
+    if (k.jobs) parts.push(plural(k.jobs, 'job'));
+    parts.push(plural(k.addresses, 'address', 'addresses'));
+    if (F.showContacts) parts.push(plural(k.contacts, 'contact'));
+    return parts.join(', ');
+}
+
+// Long reports paint in chunks as the user scrolls.
+const CHUNK = 600;
+let _paint = { html: [], shown: 0 };
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+function render(keepScroll) {
+    const tbl = document.getElementById('rpt');
+    const wrap = document.getElementById('rptWrap');
+    const top = wrap.scrollTop;
+    const any = S.tree.length > 0;
+    tbl.querySelector('thead').innerHTML = headRow();
+    _paint = { html: bodyRows(false), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    while (keepScroll && _paint.shown < _paint.html.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+    tbl.style.display = any ? '' : 'none';
+    document.getElementById('rptEmpty').textContent = any || !S.loadedAt ? '' :
+        (!F.active && !F.inactive ? 'Tick Active and/or Inactive customers to list any.' : 'No customers match these filters.');
+    wrap.scrollTop = keepScroll ? top : 0;
+    const parts = [S.company, scopeText(F)];
+    if (S.loadedAt) parts.push(countText() + ' · loaded ' + S.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    setStatus(parts.filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the pages as the standard Customer Detail List prints
+//  them: Letter landscape, the company / title / filters on every page (the
+//  original's page header), customer names navy bold over a rule and job
+//  names navy bold (the original's #000099), no totals (the original has
+//  none).
+// ============================================================================
+let PDF = null;
+const PDF_CSS =
+    '.fbdoc-rpt-tbl tr.rpt-grp td,.fbdoc-rpt-tbl tr.rpt-sub td{color:#000099}' +
+    '.fbdoc-rpt-tbl tr.rpt-grp td{border-bottom-width:1pt}' +
+    '.fbdoc-rpt-tbl td.addr-cell{white-space:pre-line}' +
+    '.fbdoc-rpt-tbl .grp-flag{background:none;border:0;border-radius:0;padding:0;font-size:.85em;font-weight:400;font-style:italic;color:#000}';
+function docSpec() {
+    if (!S.loadedAt) return null;
+    return {
+        company: S.company, title: 'Customer Detail List', subtitle: scopeText(F), titleEveryPage: true,
+        head: headRow(), rows: bodyRows(true), foot: '',
+        empty: !F.active && !F.inactive ? 'Tick Active and/or Inactive customers to list any.' : 'No customers match these filters.',
+        css: PDF_CSS, fontPt: 10
+    };
+}
+
+function setAllOpen(open) {
+    S.allClosed = !open;
+    S.collapsed = new Set(open ? [] : groupIds());
+    render(false);
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.tree.length) { showToast('Nothing to export.', 'warn'); return; }
+    const rows = [];
+    walk(n => {
+        sortAddrs(n.c.addrs).forEach(a => {
+            const base = { customer: n.label, parent: n.parentLabel, addrName: a.name, addrType: a.type, address: oneLine(a.address),
+                           city: a.city, state: a.state, zip: a.zip, country: a.country, ctType: '', ctName: '', ctValue: '' };
+            if (F.showContacts && a.contacts.length) a.contacts.forEach(ct => rows.push(Object.assign({}, base, { ctType: ct.type, ctName: ct.name, ctValue: ct.value })));
+            else rows.push(base);
+        });
+    });
+    const cols = [{ key: 'customer', label: 'Customer', w: 220, type: 'text' }, { key: 'parent', label: 'Parent', w: 180, type: 'text' },
+                  { key: 'addrName', label: 'Address Name', w: 180, type: 'text' }, { key: 'addrType', label: 'Address Type', w: 100, type: 'text' },
+                  { key: 'address', label: 'Address', w: 260, type: 'text' }, { key: 'city', label: 'City', w: 130, type: 'text' },
+                  { key: 'state', label: 'State', w: 60, type: 'text' }, { key: 'zip', label: 'Zip', w: 70, type: 'text' }]
+        .concat(F.showCountry ? [{ key: 'country', label: 'Country', w: 70, type: 'text' }] : [])
+        .concat(F.showContacts ? [{ key: 'ctType', label: 'Contact Type', w: 90, type: 'text' }, { key: 'ctName', label: 'Contact Name', w: 160, type: 'text' },
+                                  { key: 'ctValue', label: 'Contact', w: 220, type: 'text' }] : []);
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'Customer_Detail_List_' + ymd(new Date()), sheets: [
+            { name: 'Customer Detail', title: 'Customer Detail List', subtitle: [S.company, scopeText(F), countText()].filter(Boolean), cols, rows, totals: false }
+        ] });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's pages (fb-doc). Without fb-doc on the server, the
+// plain printout below: JxBrowser won't print the report page itself, so it
+// is built in a new window and printed there. Collapsed customers print as
+// their name only.
+function printReport() {
+    if (PDF) {
+        if (!S.tree.length) { showToast('Nothing to print.', 'warn'); return; }
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    if (!S.tree.length) { showToast('Nothing to print.', 'warn'); return; }
+    const html ='<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Customer Detail List</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:11pt;font-weight:700}h2{text-align:center;font-size:14pt;margin:2px 0}.sub{text-align:center;font-size:8.5pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{font-size:8.5pt;text-align:left;padding:3px 5px;border-bottom:1px solid #000}' +
+        'td{font-size:8pt;padding:2px 5px;vertical-align:top}td.addr-cell{white-space:pre-line}' +
+        'tr.rpt-grp td{font-weight:700;padding-top:7px;border-bottom:1px solid #000}tr.rpt-sub td{font-weight:700;padding-top:5px;border-bottom:1px solid #999}' +
+        '.rpt-grp-meta{font-weight:400;color:#555;margin-left:8px}.grp-flag{font-weight:400;font-size:7.5pt;margin-left:6px;color:#555}' +
+        'tr.rpt-minor td{color:#333}a{color:#000099;text-decoration:none}' +
+        '@page{size:Letter landscape;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>Customer Detail List</h2><p class="sub">' + esc(scopeText(F)) + '</p>' +
+        '<table><thead>' + headRow().replace(/ style="[^"]*"/g, '') + '</thead><tbody>' + bodyRows(true).join('') + '</tbody></table>' +
+        '<p style="font-size:7.5pt;margin-top:8px">' + esc(countText()) + ' · printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters what everyone sees each time this report opens?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        _custMs = FBLib.Common.MultiSelect.create({ containerId: 'custMs', items: [], placeholder: 'All customers', maxTags: 2, onClose: applySoon });
+        document.getElementById('fAddrType').innerHTML = '<option value="">All</option>' +
+            ADDRESS_TYPES.map(t => `<option value="${esc(t)}">${esc(t)}</option>`).join('');
+        document.querySelectorAll('#fAddrType, #fActive, #fInactive, #fJobs, #fCountry, #fContacts')
+            .forEach(el => el.addEventListener('change', applySoon));
+        document.getElementById('resetFiltersBtn').onclick = () => { writeFilters(DEFAULT_FILTERS); applySoon(); };
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: document.getElementById('rptWrap'), toggleBefore: document.getElementById('exportBtn'),
+                page: { size: 'Letter', orientation: 'landscape' },
+                doc: docSpec, title: () => 'Customer Detail List'
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        // Column resize / sort / reorder (fb-lib).
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({ table: document.getElementById('rpt'), onSort: () => render(true), onReorder: () => render(true) });
+        document.getElementById('resetColsBtn').onclick = () => { if (COLS) { COLS.reset(); render(false); } };
+
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('expandBtn').onclick = () => setAllOpen(true);
+        document.getElementById('collapseBtn').onclick = () => setAllOpen(false);
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('unpublishBtn').onclick = () => {
+            if (!confirm('Stop using company defaults for this report? Everyone goes back to their own last choices.')) return;
+            const ok = FBLib.Settings.clearCompany(['filters', 'opts']) !== false;
+            showToast(ok ? 'This report no longer has company defaults.' : 'That was not saved.', ok ? 'success' : 'error');
+        };
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        const wrap = document.getElementById('rptWrap');
+        wrap.addEventListener('scroll', () => { if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 400) appendChunk(); });
+        document.getElementById('rpt').addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (a) {
+                e.preventDefault();
+                try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+                catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+                return;
+            }
+            const g = e.target.closest('tr.rpt-grp');
+            if (!g) return;
+            const id = Number(g.dataset.grp);
+            if (S.collapsed.has(id)) S.collapsed.delete(id); else S.collapsed.add(id);
+            render(true);
+        });
+
+        await loadLookups();
+        writeFilters(savedFilters());
+        F = readFilters();          // drops saved picks that no longer exist
+        await loadAll();
+    } catch (e) {
+        console.error('[Customer Detail List] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

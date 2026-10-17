@@ -1,0 +1,1464 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Reverse Lot History (iReport port)
+  PATH:   iReport_Ports/Inventory/ReverseLotHistory.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard Inventory/ReverseLotHistory.jrxml ("Shows
+  the history for the specified lot number", traced back to what went into
+  it). Same source, same rules, same columns; only the presentation is
+  interactive.
+
+    Source     inventorylog rows that carry a lot (tiinventorylog,
+               partTrackingId 1, the lot tracking), with the part and the
+               event type. Yield rows (typeId 40) never: they repeat a
+               movement another row records.
+    Filters    Lot: matches ANY tracking value recorded on the event (lot,
+               dates, numbers, serials), contains, case-insensitive, as the
+               original's LIKE on its trackValue roll-up. Part number:
+               LIKE (% wildcard, * accepted), blank = every part (the
+               original's default '%').
+    Columns    Part Number, Description, Type, Event (inventorylog.info),
+               Event Date, Qty (the signed change), Lot #, Customer, Phone,
+               Email. Customer: a shipment's SO customer (ship line -> SO
+               line -> SO), with the customer's default phone (contact
+               type 50) and email (type 60).
+    Raw goods  Under each work-order event (a receive or consume logged
+               against a WO line, typeId 10 / 50), the table of the WO's
+               raw goods (woitem typeId 20) and their receive / consume
+               events with their lot (blank when not lot-tracked); Qty is
+               the change without its sign. The original's SubReport
+               dataset.
+    Order      Part number, then newest event first (the original's ORDER
+               BY part.num, eventdate DESC); raw goods by part number, then
+               newest first.
+    Levels     (an addition) The genealogy goes on past the original's one
+               level: under a raw-good lot that a work order made, that
+               WO's raw goods, and so on. Level 1 is the original's table;
+               level n+1 comes from the lots among level n's raw goods: the
+               WOs that made them (a WO's finished-good lines, woitem typeId
+               10, with their lot from trackinginfo, as Lot History finds a
+               WO's finished-good lots; trackinginfo.info is indexed), then
+               those WOs' raw goods by the same raw-goods query. It runs in
+               JS one level per batch of queries, never as recursive SQL.
+               Bounds: the Levels filter (1-10, default 5: a genealogy needs
+               the whole tree back to the bought-in lots, live trees run 3
+               deep, e.g. F500SB06 20203 <- FM-SB 20202 <- FM-NO 20201 <-
+               ingredients, and a level costs queries only when the one
+               above it has lots); MAX_TRACE_WOS (1,000) work orders in
+               all: level 1, the original's, always loads, and a further
+               level that would take the genealogy past the cap isn't
+               loaded at all, so every level shown is complete (Load all
+               lifts the cap). The edge level's lots still get their makers
+               looked up (cheap), so the note can say how many WOs lie
+               deeper: one extra query per load even at Levels 1. Live: the
+               made-by query 0.2 s for 6-12 lots (index on
+               trackinginfo.info); raw goods 0.26 s for 3 WOs. A WO is loaded
+               once, at the first level that reaches it; a WO that comes
+               back on its own path (a rework loop) is named, not followed.
+               Below level 1 a WO already shown in full higher up is named
+               with "raw goods listed above" instead of being repeated
+               (level 1 repeats per WO event, as the original). WOs past the
+               limit are named "not traced", and a note says how many lie
+               deeper.
+
+  Layout: the REPORT chrome (fb-styles §35): 56px header, push-down filter
+  panel that applies as you change it, a collapsible row per part, the
+  events under it, and under each work-order event a bold row naming the
+  WO with its raw goods as minor rows, each deeper level stepped in further
+  under the raw-good lot it made; sticky footer.
+  Table tools (fb-lib FBLib.RptCols / RowCap / Pivot): column headings sort
+  the events within each part, and a work order's raw goods within their
+  block, which stays under its WO event (newest-first is only the default:
+  no figure runs down the rows, and a part's net is the same in any order;
+  Part Number and Description don't sort, they hold one value per part);
+  drag to reorder and resize (remembered per user); a Table / Pivot view
+  selector (Qty or a row count by any two of level, trace level, part, lot,
+  type, order, customer and event date, with drill-down; every WO loaded
+  counts once). The search guard below, and the genealogy's level and size
+  limits, show as RowCap's notice, with Load all.
+  Views: the header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+  report out as pages like the original: Letter landscape by default, the
+  company / title / lot band on the first page (the original's title band),
+  the column headings on every page, a part (and a work order's raw goods
+  inside it, at every level) carried over a page break as "(continued)",
+  each WO event's raw goods stepped in under it, the original's grey rule
+  under each event, "Page X of Y". No totals, as in the original. Columns
+  fit the page and the font steps down from the original's 8pt when they
+  don't. A hidden heading row closes a raw-goods block where its parent's
+  rows resume, so a page that starts there doesn't repeat the closed
+  block's heading. The paper and the view are remembered per user. Print
+  prints those pages in either view.
+
+  Deliberate differences (speed first; the rows are the original's):
+    - The lot test. The original rolls up every tiinventorylog row in
+      the database to test the lot (9.5 s for that step alone on the
+      live database, 1M rows). Here a first query finds the events with
+      a tracking value containing the text (one scan of tiinventorylog,
+      no index on it: 0.6-1.4 s; 0.1 s with a part number), the roll-up
+      runs only for those, and the original's LIKE is then applied to it
+      unchanged. It can only miss a match that spans two tracking values
+      or sits in a label alone (typing "Batch#" or "UseBy" matched every
+      row). Lot History has the live checks.
+    - The original's WOITEMS derived table grouped every WO's raw-good
+      line ids into a GROUP_CONCAT list (all 30k WOs on every run: 0.4 s
+      live) and the table re-ran its query per WO event by that list.
+      Here the events' WO ids go to one batched raw-goods query (0.3 s
+      for 52 WOs, 356 rows): same rows, and no id list that
+      group_concat_max_len (1,024 characters by default) could cut
+      short on a WO with very many raw goods (the longest live list is
+      139 characters).
+    - The report waits for a lot number, or a part number on its own
+      (the original prompted for the lot: blank gave every lot event in
+      the database). Over 20,000 matching events, it asks for a
+      narrower search instead of painting part of them (a partial lot
+      history would read as the whole trace); Load all runs it anyway,
+      in batches. Live: a lot number matches 3-200 events; the busiest
+      part on its own 10,101 (1,511 WOs, 7,612 raw-good rows); a one-
+      character search ("2") 505,721 and every lot event 319,220.
+    - Unused query outputs are dropped: QTYONHAND, TYPEID, INFO,
+      WONUMBER, COMPANY (read once), TAGQTY and TAGENDQTY with their tag
+      joins (tag.num is unique, so no row counts change), WOITEMIDS (see
+      above); in the raw-goods query also the vendor and its contacts,
+      the tag joins and the unused trackInfo roll-up.
+  Additions: a per-part group row with the part's net Qty; record links
+  (part, PO / SO / WO from the event, customer; a receipt's PO comes from
+  receipt-line joins added for the link, one row each); the raw-good rows also
+  show Description and Type (the dataset selected them, the table did not
+  print them); a switch for the raw goods; Excel (event and raw-goods
+  sheets, the latter with each row's level); the raw-goods levels past the
+  original's one and the Levels filter (see Levels); the pivot's Trace
+  level field.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-folder" content="Inventory">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="Traces a lot back through what went into it.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipReverseLotHistory',
+            name:  'Reverse Lot History',
+            build: '2026.10.16-f754be7'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reverse Lot History — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 240px; overflow: hidden; text-overflow: ellipsis; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table th { cursor: default; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        .ev-link { font-weight: 500; }
+        .pp-neg { color: #8A1E30; }
+        .rpt-table tr.rpt-grp .pp-neg { color: #8A1E30; }
+        .nowrap { white-space: nowrap; }
+        /* Raw-goods block: the bold row steps in under its WO event, the
+           raw goods a step further; each deeper level (--lv, set from level
+           2, capped at 6) one more step. */
+        .rg-cell { display: flex; align-items: baseline; gap: 6px; padding-left: calc(20px + (var(--lv, 1) - 1) * 16px); white-space: nowrap; }
+        .rg-meta { font-size: 11px; font-weight: 400; color: var(--c-secondary); }
+        .rg-ev { padding-left: calc(34px + (var(--lv, 1) - 1) * 16px); white-space: nowrap; }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>Reverse Lot History</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <div class="rpt-viewsel" id="viewSelWrap" title="Table: the report as the standard one lays it out. Pivot: total Qty by any two fields">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 5h18M3 10h10M3 15h18M3 20h10" stroke-linecap="round"/></svg>
+            <select id="viewSel">
+                <option value="table">Table</option>
+                <option value="pivot">Pivot</option>
+            </select>
+        </div>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="split-btn">
+            <button id="expandBtn" class="hdr-btn" type="button" title="Show every part's events">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+                Expand
+            </button>
+            <button id="collapseBtn" class="hdr-btn" type="button" title="Part rows only">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 12h14" stroke-linecap="round"/></svg>
+                Collapse
+            </button>
+        </span>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook (event and raw-goods sheets)">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages: collapsed parts print as their rows only">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Lot</div>
+            <div>
+                <div class="rpt-flabel">Lot #</div>
+                <input type="text" id="fLot" placeholder="Lot number, or part of it">
+            </div>
+            <div>
+                <div class="rpt-flabel">Part number</div>
+                <input type="text" id="fPart" placeholder="Any (% is a wildcard)">
+            </div>
+            <div class="rpt-fnote" style="max-width:240px;">Matches any tracking value recorded on the event (lot, dates, numbers), as the standard report does. Press Enter to search.</div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Show</div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fShowRaw"> Raw goods under each work-order event</label>
+            <div class="rpt-fnote" style="max-width:260px;">What the work order consumed, with each raw good's lot (the standard report's raw-goods table).</div>
+            <div>
+                <div class="rpt-flabel">Levels to trace</div>
+                <select id="fDepth" title="How far back the genealogy follows raw-good lots that work orders made">
+                    <option value="1">1 (the standard report)</option><option value="2">2</option><option value="3">3</option>
+                    <option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option>
+                    <option value="8">8</option><option value="9">9</option><option value="10">10</option>
+                </select>
+            </div>
+            <div class="rpt-fnote" style="max-width:260px;">Level 1 is the work order's raw goods; each further level shows the raw goods of the work order that made a raw-good lot.</div>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Clear the search">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own newest-first order">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters what everyone sees each time this report opens. Anyone can still change them while it is open.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+                <button type="button" class="ds-btn" id="unpublishBtn" title="Everyone goes back to their own last choices">Stop using them</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>Every inventory event recorded against a lot, newest first, and for each one that belongs to a work order, the raw goods that work order consumed with their lots: what went into the lot. It is the BI version of the standard <strong>Reverse Lot History</strong> report and reads the same data the same way.</p>
+                <p>For the other direction (where a lot went) use <strong>Lot History</strong>.</p>
+                <p>The genealogy goes back level by level: when a raw-good lot was itself made by a work order, that work order's raw goods show under it, stepped in further, and so on back to the lots that were bought in. <strong>Filters → Levels to trace</strong> sets how far (1 is the standard report; the default 5). A work order already listed higher up is named with "raw goods listed above" rather than repeated; one that comes round again (a rework loop) is named but not followed.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Searching</div>
+                <ul>
+                    <li>Type a lot number, or part of one, and press Enter. Every event whose tracking values contain it is listed, so a short search can match several lots.</li>
+                    <li>A part number narrows it to that part; <code>%</code> or <code>*</code> is a wildcard.</li>
+                    <li>A part number on its own lists every lot event of that part.</li>
+                    <li>Over 20,000 matching events, nothing is shown and a note asks for a narrower search; <strong>Load all</strong> in the note runs it anyway (it can take a while).</li>
+                    <li>When the genealogy stops short, a note says so and how many work orders lie deeper: past the levels you set (<strong>Load all</strong> traces all ten), or before a level that would take it over 1,000 work orders (<strong>Load all</strong> loads it anyway).</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Reading it</div>
+                <ul>
+                    <li><strong>Qty</strong> is the event's change in the part's stocking UOM; a part's row carries the net of its events. On a raw good it is the quantity consumed, without its sign.</li>
+                    <li><strong>Customer</strong> is the SO's customer on a shipment; phone and email are the customer's.</li>
+                    <li>Yield events are left out: they repeat a movement another event already records.</li>
+                    <li>Click a part's row to show or hide its events; <strong>Expand</strong> / <strong>Collapse</strong> do every part. Click a part, an event's order or a customer to open it in Fishbowl.</li>
+                    <li>Click a column heading to sort the events within each part, say by Type or Customer (again to reverse, a third time for newest first). Each work-order event keeps its raw goods under it; they sort the same way. Drag a heading onto another to move the column; drag a heading's right edge to resize it. Your layout is remembered; <strong>Settings → Reset column layout</strong> undoes it.</li>
+                    <li>The <strong>Table / Pivot</strong> selector switches to a pivot: total Qty (or count events) by any two of level (the lot's own events or the raw goods), trace level, part, lot, type, order, customer and event date. Rows part + lot by level lists every raw-good lot and how much of it went in, once per work order, at every level traced. Click a figure to see the events behind it. Print, PDF and Excel follow the view on screen.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable pages, laid out like the standard report. In PDF view pick the paper size and orientation in the bar above the pages; they are remembered. <strong>Print</strong> prints those pages.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-app" id="appView">
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+</div>
+<div class="pivot-host" id="pivotHost" style="display:none"></div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const LOT_TRACKING = 1;                 // parttracking 1: the lot ("Lot Number"; some databases rename it)
+const T_WOITEM = -355941248;            // inventorylog.tableId of a work order line
+const T_RECEIPTITEM = 1259138490;       // ... of a receipt line
+const T_SHIPITEM = 1555030112;          // ... of a shipment line
+const MAX_EVENTS = 20000;               // more than this: ask for a narrower search (or Load all)
+const ID_CHUNK = 2000;                  // event / WO ids per query
+const PAIR_CHUNK = 200;                 // raw-good lots per made-by query
+const MAX_DEPTH = 10;                   // the Levels filter's top
+const MAX_TRACE_WOS = 1000;             // work orders a genealogy loads in all; level 1 always loads (Load all lifts it)
+const DEFAULT_FILTERS = { lot: '', part: '', showRaw: true, depth: 5, details: true };
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        company: { keys: ['filters', 'opts'], editors: true },   // every open starts from the company defaults
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const dstr = v => { const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v ?? '')); return m ? m[1] : ''; };
+const tstr = v => { const m = /^\d{4}-\d{2}-\d{2}[ T](\d{2}:\d{2})/.exec(String(v ?? '')); return m ? m[1] : ''; };
+const fmtDate = v => { const d = dstr(v); return d ? FBLib.Common.formatDate(d) : ''; };
+const fmtDateTime = v => [fmtDate(v), tstr(v)].filter(Boolean).join(' ');
+const qtyRound = v => Math.round(num(v) * 1e6) / 1e6 || 0;     // float noise off sums, never "-0"
+const fmtQty = v => FBLib.Common.formatQty(qtyRound(v));
+const qty = v => '<span class="' + (qtyRound(v) < 0 ? 'pp-neg' : '') + '">' + esc(fmtQty(v)) + '</span>';
+const openLink = (module, number) => number
+    ? `<a class="fb-row-link" data-open="${esc(module)}" data-num="${esc(number)}">${esc(number)}</a>` : '';
+// A record link whose label is not the number (an event's text).
+const docLink = (module, number, label) => number
+    ? `<a class="fb-row-link ev-link" data-open="${esc(module)}" data-num="${esc(number)}" title="${esc(label)}">${esc(label)}</a>` : cut(label);
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const cut = s => `<span title="${esc(s)}">${esc(s)}</span>`;
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const chunks = (a, n) => { const out = []; for (let i = 0; i < a.length; i += n) out.push(a.slice(i, i + n)); return out; };
+const inList = a => a.map(v => "'" + sqlStr(v) + "'").join(', ');
+const clampDepth = v => Math.min(MAX_DEPTH, Math.max(1, parseInt(v, 10) || DEFAULT_FILTERS.depth));
+// Indent from level 2 on (a deep level stays at level 6's step).
+const lvStyle = lv => lv > 1 ? ` style="--lv:${Math.min(lv, 6)}"` : '';
+// A part and lot matched as SQL's = does (case-insensitive, trailing spaces ignored).
+const pairKey = (part, lot) => String(part).toLowerCase().trimEnd() + '\u0001' + String(lot).toLowerCase().trimEnd();
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS — the panel applies as it changes (one short debounce).
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _hydrating = false, _applyTimer = null;
+
+function readFilters() {
+    return {
+        lot: document.getElementById('fLot').value.trim(),
+        part: document.getElementById('fPart').value.trim(),
+        showRaw: document.getElementById('fShowRaw').checked,
+        depth: clampDepth(document.getElementById('fDepth').value),
+        details: F.details
+    };
+}
+function writeFilters(f) {
+    _hydrating = true;
+    document.getElementById('fLot').value = f.lot || '';
+    document.getElementById('fPart').value = f.part || '';
+    document.getElementById('fShowRaw').checked = f.showRaw !== false;
+    document.getElementById('fDepth').value = String(clampDepth(f.depth));
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        if (next.lot !== F.lot || next.part !== F.part) S.noCap = S.noTraceCap = false;    // a new search: the limits again
+        F = next;
+        remember();
+        loadAll();
+    }, 250);
+}
+const hasSearch = f => !!(f.lot || f.part);
+function searchText(f) {
+    const p = [];
+    if (f.lot) p.push('Search: lot contains "' + f.lot + '"');
+    if (f.part) p.push('Part ' + f.part);
+    return p.join(' · ');
+}
+
+// ============================================================================
+//  SQL — the iReport queries. The lot test is the original's, run only on
+//  the events a first query finds (see the header).
+// ============================================================================
+// The original's PART.NUM LIKE $P{partNum}; blank = its default '%'.
+const partWhere = f => `part.num LIKE '${sqlStr(f.part.replace(/\*/g, '%'))}'`;
+const lotPattern = f => `'%${sqlStr(f.lot)}%'`;
+
+// 1) Events with a tracking value containing the text: each value as the
+//    original renders it (dates as their first 11 characters, decimals to
+//    2 and 5 places, serials from tiinventorylogsn).
+function candidateSQL(f) {
+    const p = lotPattern(f);
+    const w = ['(' + [
+        `t.info LIKE ${p}`,
+        `SUBSTRING(t.infodate FROM 1 FOR 11) LIKE ${p}`,
+        `CAST(t.infodouble AS DECIMAL(18,2)) LIKE ${p}`,
+        `CAST(t.infodouble AS DECIMAL(18,5)) LIKE ${p}`,
+        `t.infointeger LIKE ${p}`,
+        `t.id IN (SELECT sn.tiinventorylogid FROM tiinventorylogsn sn WHERE sn.serialnum LIKE ${p})`
+    ].join('\n               OR ') + ')'];
+    if (f.part) w.push(partWhere(f));
+    return `
+        SELECT DISTINCT t.inventorylogid AS id
+        FROM tiinventorylog t
+        ${f.part ? 'JOIN inventorylog il ON il.id = t.inventorylogid JOIN part ON part.id = il.partid' : ''}
+        WHERE ${w.join('\n          AND ')}`;
+}
+// The search guard: one row past MAX_EVENTS (FBLib.RowCap.sql), none after
+// Load all (S.noCap).
+const guardSQL = sql => {
+    const n = S.noCap ? 0 : MAX_EVENTS;
+    if (FBLib.RowCap) return FBLib.RowCap.sql(sql, n);
+    return n ? sql + '\n        LIMIT ' + (n + 1) : sql;
+};
+
+// The original's TRACKINFO roll-up, verbatim but for the event ids.
+function trackInfoSQL(ids) {
+    return `(SELECT partrackinfo.invlogid AS invlogid, GROUP_CONCAT(partrackinfo.trackvalue, ', ') AS trackvalue
+             FROM (SELECT tiinventorylog.inventorylogid AS invlogid,
+                          CONCAT(parttracking.abbr, ': ', GROUP_CONCAT((CASE
+                              WHEN parttracking.typeid = 10 THEN tiinventorylog.info
+                              WHEN parttracking.typeid = 20 THEN SUBSTRING(tiinventorylog.infodate FROM 1 FOR 11)
+                              WHEN parttracking.typeid = 30 THEN SUBSTRING(tiinventorylog.infodate FROM 1 FOR 11)
+                              WHEN parttracking.typeid = 40 THEN tiinventorylogsn.serialnum
+                              WHEN parttracking.typeid = 50 THEN CAST(tiinventorylog.infodouble AS DECIMAL(18,2))
+                              WHEN parttracking.typeid = 60 THEN CAST(tiinventorylog.infodouble AS DECIMAL(18,5))
+                              WHEN parttracking.typeid = 70 THEN tiinventorylog.infointeger
+                              WHEN parttracking.typeid = 80 THEN tiinventorylog.infointeger
+                              ELSE tiinventorylog.info END))) AS trackvalue
+                   FROM tiinventorylog
+                   JOIN parttracking ON tiinventorylog.parttrackingid = parttracking.id
+                   LEFT JOIN tiinventorylogsn ON tiinventorylog.id = tiinventorylogsn.tiinventorylogid
+                   WHERE tiinventorylog.inventorylogid IN (${ids.join(',')})
+                   GROUP BY tiinventorylog.inventorylogid, parttracking.abbr, parttracking.sortorder) AS partrackinfo
+             GROUP BY partrackinfo.invlogid) trackinfo`;
+}
+
+// 2) ReverseLotHistory.jrxml's main query. `ids` null = no lot entered
+//    (the roll-up can then filter nothing, so it is left out) and the
+//    guard applies. The receipt joins only name a receipt's PO for its link.
+function mainSQL(f, ids) {
+    const w = ['il.typeid != 40'];
+    if (ids) w.unshift('il.id IN (' + ids.join(',') + ')');
+    if (f.part) w.push(partWhere(f));
+    if (f.lot) w.push(`COALESCE(UPPER(trackinfo.trackvalue), '') LIKE UPPER(${lotPattern(f)})`);
+    return `
+        SELECT part.num AS partnum, part.description AS description, il.changeqty AS changeqty, til.info AS lot,
+               il.info AS event, ilt.description AS type, il.eventdate AS eventdate, il.id AS ilid, il.typeid AS iltype,
+               woitem.woid AS woid, wo.num AS wonum,
+               customer.name AS customer, phone.datus AS phone, email.datus AS email,
+               so.num AS sonum, po.num AS ponum
+        FROM inventorylog il
+        JOIN tiinventorylog til ON il.id = til.inventorylogid AND til.parttrackingid = ${LOT_TRACKING}
+        JOIN part ON il.partid = part.id
+        JOIN inventorylogtype ilt ON il.typeid = ilt.id
+        LEFT JOIN woitem ON il.recordid = woitem.id AND il.tableid = ${T_WOITEM} AND il.typeid IN (10, 50)
+        LEFT JOIN wo ON wo.id = woitem.woid
+        ${f.lot ? 'LEFT JOIN ' + trackInfoSQL(ids) + ' ON il.id = trackinfo.invlogid' : ''}
+        LEFT JOIN shipitem ON il.recordid = shipitem.id AND il.typeid = 20 AND il.tableid = ${T_SHIPITEM}
+        LEFT JOIN soitem ON shipitem.soitemid = soitem.id
+        LEFT JOIN so ON soitem.soid = so.id
+        LEFT JOIN customer ON customer.id = so.customerid
+        LEFT JOIN contact phone ON customer.accountid = phone.accountid AND phone.typeid = 50 AND phone.defaultflag = 1
+        LEFT JOIN contact email ON customer.accountid = email.accountid AND email.typeid = 60 AND email.defaultflag = 1
+        LEFT JOIN receiptitem ON il.recordid = receiptitem.id AND il.typeid = 10 AND il.tableid = ${T_RECEIPTITEM}
+        LEFT JOIN poitem ON receiptitem.poitemid = poitem.id
+        LEFT JOIN po ON poitem.poid = po.id
+        WHERE ${w.join('\n          AND ')}
+        ORDER BY part.num, il.eventdate DESC, il.id DESC`;
+}
+
+// 3) The SubReport dataset: the raw-good lines (woitem typeId 20) of the
+//    events' work orders and their receive / consume events, lot or not.
+//    Qty is ABS(changeQty), as the dataset.
+function rawSQL(woids) {
+    return `
+        SELECT woitem.woid AS woid, wo.num AS wonum, part.num AS partnum, part.description AS description,
+               ABS(il.changeqty) AS changeqty, til.info AS lot, il.info AS event, ilt.description AS type,
+               il.eventdate AS eventdate, il.id AS ilid
+        FROM woitem
+        JOIN inventorylog il ON il.recordid = woitem.id AND il.tableid = ${T_WOITEM} AND il.typeid IN (10, 50)
+        LEFT JOIN tiinventorylog til ON il.id = til.inventorylogid AND til.parttrackingid = ${LOT_TRACKING}
+        JOIN part ON il.partid = part.id
+        JOIN inventorylogtype ilt ON il.typeid = ilt.id
+        JOIN wo ON wo.id = woitem.woid
+        WHERE woitem.typeid = 20
+          AND woitem.woid IN (${woids.join(',')})
+        ORDER BY woitem.woid, part.num, il.eventdate DESC, il.id DESC`;
+}
+
+// 4) The work orders that made these raw-good lots (an addition, the
+//    genealogy's next level): a WO's finished-good lines (woitem typeId 10)
+//    with their lot from trackinginfo, as Lot History finds the lots a WO
+//    made (the original's finishedgood table), looked up by lot
+//    (trackinginfo.info is indexed) and part. The pairs are matched up in JS.
+function madeBySQL(pairs) {
+    const parts = [...new Set(pairs.map(p => p.part))], lots = [...new Set(pairs.map(p => p.lot))];
+    return `
+        SELECT part.num AS partnum, trackinginfo.info AS lot, woitem.woid AS woid, wo.num AS wonum
+        FROM trackinginfo
+        JOIN woitem ON woitem.id = trackinginfo.recordid AND woitem.typeid = 10
+        JOIN wo ON wo.id = woitem.woid
+        JOIN part ON part.id = woitem.partid
+        WHERE trackinginfo.tableid = ${T_WOITEM}
+          AND trackinginfo.parttrackingid = ${LOT_TRACKING}
+          AND trackinginfo.info IN (${inList(lots)})
+          AND part.num IN (${inList(parts)})
+        ORDER BY woitem.woid, trackinginfo.id`;
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+// S.raw: WO id -> its raw-good events, every level (a WO loaded with none
+// has an empty list); S.woLevel: the level each WO was loaded at; S.made:
+// raw-good lot (pairKey) -> the WOs that made it ([{ woid, wonum }]);
+// S.trace: { levels, cut } of the last load (null without the raw goods).
+const S = { events: [], raw: new Map(), woLevel: new Map(), made: new Map(), trace: null, company: '', loadedAt: null,
+            collapsed: new Set(), tooMany: false, view: 'table', noCap: false, noTraceCap: false };
+let _loadToken = 0;
+
+// The search guard and the genealogy's limits as FBLib.RowCap's notice
+// (same place, look and Load all), in their own words. Over the guard
+// nothing is painted, since part of a lot's history would read as the
+// whole trace; a genealogy cut short says how many WOs lie deeper.
+function guardNotice() {
+    const before = document.getElementById('appView');
+    const cut = F.showRaw && S.trace ? S.trace.cut : null;
+    let html = '', onLoadAll = null, all = true;
+    if (S.tooMany) {
+        html = esc('More than ' + MAX_EVENTS.toLocaleString() + ' events match this search, so none are shown. Narrow it (a longer lot number, or a part number)')
+            .replace(MAX_EVENTS.toLocaleString(), '<strong>$&</strong>') + ', or';
+        onLoadAll = () => { S.noCap = true; loadAll(); };
+    } else if (cut) {
+        const wos = plural(cut.wos, 'work order');
+        if (cut.why === 'depth') {
+            all = F.depth < MAX_DEPTH;
+            html = esc('The genealogy stops at level ' + cut.level + ': ' + wos + ' that made raw-good lots ' + (cut.wos === 1 ? 'lies' : 'lie') + ' deeper.' +
+                (all ? ' Raise Levels to trace in Filters, or' : ''));
+            onLoadAll = () => { F = Object.assign({}, F, { depth: MAX_DEPTH }); writeFilters(F); remember(); loadAll(); };
+        } else {
+            html = esc('The genealogy stops after level ' + cut.level + ': the next level adds ' + wos + ', past the ' +
+                MAX_TRACE_WOS.toLocaleString() + '-work-order limit. Lower Levels to trace, or');
+            onLoadAll = () => { S.noTraceCap = true; loadAll(); };
+        }
+    }
+    const on = !!html;
+    if (!FBLib.RowCap) { if (on) document.getElementById('banner').textContent = html.replace(/<[^>]+>/g, '').replace(/&amp;/g, '&'); return; }
+    FBLib.RowCap.notice({ before, capped: on, html, onLoadAll });
+    const btn = on ? before.parentNode.querySelector(':scope > .rowcap-note .rowcap-all') : null;
+    if (btn && !all) { btn.remove(); return; }
+    // Act on the press, not the click: with the filters open (as they are
+    // after a search) the press closes them, the note moves up and the
+    // click would land on whatever slid under the pointer.
+    if (btn) btn.addEventListener('pointerdown', e => { if (e.button === 0) btn.click(); });
+}
+const loadingLabel = t => { document.querySelector('#loading .lo-label').textContent = t; };
+
+async function loadLookups() {
+    try { S.company = ((await q('Company', 'SELECT name FROM company WHERE id = 1'))[0] || {}).name || ''; }
+    catch (_) { S.company = ''; }
+}
+
+// One row per event (the original's Log group on ILID): a repeated event
+// (two default contacts, say) keeps the last row's fields, as a Jasper
+// group footer prints them.
+function toEvents(rows) {
+    const byId = new Map(), out = [];
+    rows.forEach(r => {
+        const id = Number(r.ilid);
+        let e = byId.get(id);
+        if (!e) { e = { ilid: id }; byId.set(id, e); out.push(e); }
+        Object.assign(e, {
+            part: r.partnum || '', desc: r.description || '', change: num(r.changeqty), lot: r.lot || '',
+            event: r.event || '', type: r.type || '', date: String(r.eventdate || ''), iltype: Number(r.iltype),
+            woid: Number(r.woid) || 0, wonum: r.wonum || '',
+            customer: r.customer || '', phone: r.phone || '', email: r.email || '', sonum: r.sonum || '', ponum: r.ponum || ''
+        });
+    });
+    return out;
+}
+
+// The raw goods of these work orders (rawSQL, the original's SubReport
+// dataset, batched), at genealogy level lv: raw gets WO id -> its raw-good
+// events, one row per event (the last row wins); a WO with none gets an
+// empty list, so it counts as loaded. False when a newer load started.
+async function loadRaw(woids, lv, raw, woLevel, tok) {
+    for (const c of chunks(woids, ID_CHUNK)) {
+        const want = new Set(c);
+        (await q('Raw goods' + (lv > 1 ? ' (level ' + lv + ')' : ''), rawSQL(c))).forEach(r => {
+            const k = Number(r.woid);
+            if (!want.has(k)) return;
+            const list = raw.get(k) || [];
+            const x = {
+                ilid: Number(r.ilid), part: r.partnum || '', desc: r.description || '', change: num(r.changeqty),
+                lot: r.lot || '', event: r.event || '', type: r.type || '', date: String(r.eventdate || ''), wonum: r.wonum || '', woid: k
+            };
+            const at = list.findIndex(y => y.ilid === x.ilid);     // one row per event: the last wins
+            if (at === -1) list.push(x); else list[at] = x;
+            raw.set(k, list);
+        });
+        if (tok !== _loadToken) return false;
+        c.forEach(w => { if (!raw.has(w)) raw.set(w, []); if (!woLevel.has(w)) woLevel.set(w, lv); });
+    }
+    return true;
+}
+
+// The WOs that made these raw-good lots (madeBySQL, batched): made gets
+// pairKey -> [{ woid, wonum }] (empty: bought in, or made outside a WO).
+async function lookUpMadeBy(pairs, made, tok) {
+    for (const c of chunks(pairs, PAIR_CHUNK)) {
+        const want = new Map(c.map(p => [pairKey(p.part, p.lot), []]));
+        (await q('Made by', madeBySQL(c))).forEach(r => {
+            const list = want.get(pairKey(r.partnum || '', String(r.lot ?? '')));
+            const w = Number(r.woid);
+            if (list && w && !list.some(m => m.woid === w)) list.push({ woid: w, wonum: r.wonum || '' });
+        });
+        if (tok !== _loadToken) return false;
+        want.forEach((list, k) => made.set(k, list));
+    }
+    return true;
+}
+
+// The genealogy past level 1, level by level (see the header): the lots
+// among the last level's raw goods, the WOs that made them, those WOs' raw
+// goods; no recursive SQL. A WO is loaded once, at the first level that
+// reaches it, so a loop ends there. The Levels filter bounds the depth and
+// MAX_TRACE_WOS the size: a level that would pass it is not loaded at all,
+// so every level loaded is whole. The lots at the edge still get their
+// makers (cheap, by lot): they show as "not traced" and the notice counts
+// them. Returns { levels, cut }, or null when a newer load started.
+async function traceBack(lv1, f, raw, woLevel, made, tok) {
+    let frontier = lv1, levels = 1, cut = null;
+    const lotsOf = wos => {
+        const out = [], seen = new Set();
+        wos.forEach(w => (raw.get(w) || []).forEach(x => {
+            if (!x.lot) return;
+            const k = pairKey(x.part, x.lot);
+            if (!seen.has(k)) { seen.add(k); out.push({ part: x.part, lot: x.lot, k }); }
+        }));
+        return out;
+    };
+    for (let lv = 2; ; lv++) {
+        const lots = lotsOf(frontier);
+        const todo = lots.filter(p => !made.has(p.k));
+        if (todo.length && !(await lookUpMadeBy(todo, made, tok))) return null;
+        const next = [], fresh = new Set();
+        lots.forEach(p => (made.get(p.k) || []).forEach(m => {
+            if (!raw.has(m.woid) && !fresh.has(m.woid)) { fresh.add(m.woid); next.push(m.woid); }
+        }));
+        if (!next.length) break;
+        if (lv > f.depth) { cut = { why: 'depth', level: f.depth, wos: next.length }; break; }
+        if (!S.noTraceCap && raw.size + next.length > MAX_TRACE_WOS) { cut = { why: 'cap', level: lv - 1, wos: next.length }; break; }
+        loadingLabel('Loading… raw goods, level ' + lv);
+        if (!(await loadRaw(next, lv, raw, woLevel, tok))) return null;
+        levels = lv;
+        frontier = next;
+    }
+    return { levels, cut };
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    const f = F;
+    document.getElementById('banner').textContent = '';
+    S.tooMany = false;
+    if (!hasSearch(f)) {
+        S.events = []; S.raw = new Map(); S.woLevel = new Map(); S.made = new Map(); S.trace = null; S.loadedAt = null;
+        render();
+        return;
+    }
+    loadingLabel('Loading…');
+    document.getElementById('loading').classList.add('show');
+    setStatus('Loading…');
+    try {
+        let rows = [];
+        if (f.lot) {
+            const ids = (await q('Matching events', guardSQL(candidateSQL(f)))).map(r => Number(r.id)).filter(Number.isFinite);
+            if (tok !== _loadToken) return;
+            if (!S.noCap && ids.length > MAX_EVENTS) S.tooMany = true;
+            else for (const [i, c] of chunks(ids, ID_CHUNK).entries()) {
+                if (ids.length > ID_CHUNK) loadingLabel('Loading… ' + (i * ID_CHUNK).toLocaleString() + ' of ' + ids.length.toLocaleString() + ' events');
+                rows = rows.concat(await q('Reverse lot history', mainSQL(f, c)));
+                if (tok !== _loadToken) return;
+            }
+            // Several chunks: put them back in the original's order.
+            if (ids.length > ID_CHUNK) rows.sort((a, b) => String(a.partnum).localeCompare(String(b.partnum), undefined, { sensitivity: 'base' }) ||
+                String(b.eventdate).localeCompare(String(a.eventdate)) || Number(b.ilid) - Number(a.ilid));
+        } else {
+            rows = await q('Reverse lot history', guardSQL(mainSQL(f, null)));
+            if (tok !== _loadToken) return;
+            if (!S.noCap && rows.length > MAX_EVENTS) { S.tooMany = true; rows = []; }
+        }
+        const events = S.tooMany ? [] : toEvents(rows);
+        const raw = new Map(), woLevel = new Map(), made = new Map();
+        let trace = null;
+        if (f.showRaw && !S.tooMany) {
+            const lv1 = [...new Set(events.filter(e => e.woid).map(e => e.woid))];
+            if (!(await loadRaw(lv1, 1, raw, woLevel, tok))) return;
+            trace = await traceBack(lv1, f, raw, woLevel, made, tok);
+            if (!trace) return;
+        }
+        if (tok !== _loadToken) return;
+        S.events = events; S.raw = raw; S.woLevel = woLevel; S.made = made; S.trace = trace;
+    } catch (e) {
+        if (tok !== _loadToken) return;
+        document.getElementById('loading').classList.remove('show');
+        document.getElementById('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        S.events = []; S.raw = new Map(); S.woLevel = new Map(); S.made = new Map(); S.trace = null; S.loadedAt = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    document.getElementById('loading').classList.remove('show');
+    // Expand / Collapse decides how a fresh load opens.
+    S.collapsed = new Set(F.details ? [] : parts().map(p => p.name));
+    S.loadedAt = new Date();
+    render();
+}
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+
+// ============================================================================
+//  MODEL + TABLE
+// ============================================================================
+const BASE_COLS = [
+    { key: 'part',   label: 'Part Number', w: 100 },
+    { key: 'desc',   label: 'Description', w: 160 },
+    { key: 'type',   label: 'Type',        w: 80 },
+    { key: 'event',  label: 'Event',       w: 150 },
+    { key: 'date',   label: 'Event Date',  w: 110 },
+    { key: 'change', label: 'Qty',         w: 80, num: true, tip: 'The event’s change, in the part’s stocking UOM (raw goods: consumed, unsigned)' },
+    { key: 'lot',    label: 'Lot #',       w: 90 },
+    { key: 'who',    label: 'Customer',    w: 130, tip: 'Shipment: the SO’s customer' },
+    { key: 'phone',  label: 'Phone',       w: 95 },
+    { key: 'email',  label: 'Email',       w: 140 }
+];
+// The columns in the user's order (FBLib.RptCols).
+const cols = () => (COLS ? COLS.arrange(BASE_COLS) : BASE_COLS);
+// Part Number and Description hold one value per part, so sorting a part's
+// events by them means nothing.
+const NO_SORT = ['part', 'desc'];
+
+// Parts in the original's order (part number), each with its events.
+function parts() {
+    const out = [];
+    S.events.forEach(e => {
+        const p = out.length && out[out.length - 1].name === e.part ? out[out.length - 1] : null;
+        if (p) { p.events.push(e); p.net += e.change; if (p.lots.indexOf(e.lot) === -1) p.lots.push(e.lot); }
+        else out.push({ name: e.part, desc: e.desc, events: [e], net: e.change, lots: [e.lot] });
+    });
+    return out;
+}
+const lotsText = lots => lots.length === 1 ? lots[0] : plural(lots.length, 'lot');
+const eventDoc = e => e.ponum ? ['Purchase Order', e.ponum] : e.sonum ? ['Sales Order', e.sonum] : e.wonum ? ['Work Order', e.wonum] : null;
+const docText = d => d ? { 'Purchase Order': 'PO ', 'Sales Order': 'SO ', 'Work Order': 'WO ' }[d[0]] + d[1] : '';
+const eventCell = e => { const d = eventDoc(e); return d ? docLink(d[0], d[1], e.event) : cut(e.event); };
+// Email is one long word: the PDF view lets it wrap anywhere, wherever the
+// user has put the column.
+const cellClass = c => [c.num ? 'num-cell' : '', c.key === 'email' ? 'em-cell' : ''].filter(Boolean).join(' ');
+const rowCells = (cs, cell) => cs.map(c => `<td class="${cellClass(c)}">${cell[c.key] ?? ''}</td>`).join('');
+// A part's, a raw-goods block's or the footer's row: `identity` spans the
+// columns before the first column that carries one of the row's figures
+// (whatever order the user has put the columns in) and each figure lands in
+// its own column. With a figure column first, the identity takes the first
+// run of columns without one, so no figure is ever dropped.
+function totalsCells(cs, identity, figs) {
+    const has = c => figs[c.key] != null && figs[c.key] !== '';
+    let a = cs.findIndex(c => !has(c));
+    if (a < 0) a = 0;
+    let b = a + 1;
+    while (b < cs.length && !has(cs[b])) b++;
+    const cell = c => `<td class="${cellClass(c)}">${figs[c.key] ?? ''}</td>`;
+    return cs.slice(0, a).map(cell).join('') + `<td colspan="${b - a}">${identity}</td>` + cs.slice(b).map(cell).join('');
+}
+// Heading-click sort (FBLib.RptCols): a part's events sort within the part,
+// a work order's raw goods within their block (which stays under its WO
+// event); the parts keep the report's order. Ties keep the report's order.
+const sortVal = (x, k) => ({
+    type: x.type, event: x.event, date: x.date, change: x.change, lot: x.lot, who: x.customer, phone: x.phone, email: x.email
+})[k];
+const sortLines = list => (COLS && COLS.sort() ? list.slice().sort((a, b) => COLS.compare(a, b, sortVal)) : list);
+
+// A part's row: the identity spans the columns up to the part's net Qty (so
+// the description stays on one line); the net and its lot(s) sit in their
+// own columns.
+function partRow(cs, p, forPrint) {
+    const open = !S.collapsed.has(p.name);
+    const id = '<div class="rpt-grp-inner">' + (forPrint ? '' : `<span class="rpt-toggle">${open ? '▼' : '▶'}</span>`) +
+        openLink('Part', p.name) + `<span class="rpt-grp-meta">${esc(plural(p.events.length, 'event'))} · ${esc(p.desc)}</span></div>`;
+    return `<tr class="rpt-grp" data-grp="${esc(p.name)}">` + totalsCells(cs, id, {
+        change: `<span title="Net change of the events listed">${qty(p.net)}</span>`,
+        lot: `<span class="nowrap">${cut(lotsText(p.lots))}</span>`
+    }) + '</tr>';
+}
+function eventRow(cs, e) {
+    return '<tr>' + rowCells(cs, {
+        part: openLink('Part', e.part), desc: cut(e.desc), type: cut(e.type), event: eventCell(e),
+        date: `<span class="nowrap">${esc(fmtDateTime(e.date))}</span>`, change: qty(e.change), lot: `<span class="nowrap">${esc(e.lot)}</span>`,
+        who: e.customer ? openLink('Customer', e.customer) : '', phone: cut(e.phone), email: cut(e.email)
+    }) + '</tr>';
+}
+// A work order's raw goods (the original's raw-goods table) at genealogy
+// level lv. Level 1 heads the raw goods of a WO event's WO, as the
+// original; level n > 1 the raw goods of the WO that made raw-good lot
+// `via`. In print the indent marks it: the print fonts have no arrow glyph.
+// mode: 'full' (the raw goods follow), 'above' (shown in full higher up),
+// 'loop' (the WO again on its own path), 'cut' (past the genealogy's
+// limits: not loaded). Below level 1 the row is a deeper PDF heading
+// (data-pdf-level), so a page break repeats every level's heading
+// "(continued)".
+function rawHeadRow(cs, wonum, list, forPrint, lv, via, mode) {
+    lv = lv || 1; mode = mode || 'full';
+    if (lv === 1) {
+        const id = `<div class="rg-cell">${forPrint ? '' : '↳ '}Raw goods used by WO ${openLink('Work Order', wonum)}` +
+            `<span class="rg-meta">${esc(plural(list.length, 'event'))}</span></div>`;
+        return '<tr class="rpt-sub">' + totalsCells(cs, id, {}) + '</tr>';
+    }
+    const cutBy = S.trace && S.trace.cut && S.trace.cut.why === 'cap'
+        ? 'over the ' + MAX_TRACE_WOS.toLocaleString() + '-work-order limit' : 'past the ' + plural(F.depth, 'level') + ' set';
+    const meta = 'level ' + lv + ' · ' + (
+        mode === 'cut' ? 'not traced: ' + cutBy
+        : mode === 'loop' ? 'this work order again (a loop): not followed'
+        : mode === 'above' ? 'its raw goods are listed above'
+        : plural(list.length, 'event'));
+    const id = `<div class="rg-cell"${lvStyle(lv)}>${forPrint ? '' : '↳ '}${openLink('Part', via.part)} lot ${esc(via.lot)} was made by WO ${openLink('Work Order', wonum)}` +
+        `<span class="rg-meta">${esc(meta)}</span></div>`;
+    return `<tr class="rpt-sub" data-pdf-level="${lv + 1}">` + totalsCells(cs, id, {}) + '</tr>';
+}
+function rawRow(cs, x, lv) {
+    return '<tr class="rpt-minor">' + rowCells(cs, {
+        part: `<span class="rg-ev"${lvStyle(lv || 1)}>${openLink('Part', x.part)}</span>`, desc: cut(x.desc), type: cut(x.type),
+        event: x.wonum ? docLink('Work Order', x.wonum, x.event) : cut(x.event),
+        date: `<span class="nowrap">${esc(fmtDateTime(x.date))}</span>`, change: qty(x.change), lot: `<span class="nowrap">${esc(x.lot)}</span>`
+    }) + '</tr>';
+}
+// A hidden heading row (PDF and print only) where a block's parent rows
+// resume: fb-doc then stops counting those rows as inside the block, so a
+// page that starts there doesn't repeat the closed block's heading.
+const closeRow = (cs, pdfLevel) => `<tr class="rpt-sub trace-close" data-pdf-level="${pdfLevel}"><td colspan="${cs.length}"></td></tr>`;
+// A work order's raw goods, and under each raw-good lot a WO made, that
+// WO's raw goods, level by level. `path` holds the WOs above (below level
+// 1 a WO on it is a loop: a rework that made a lot it consumed); `seen`
+// the WOs shown in full so far (below level 1 such a WO is named, not
+// repeated). Level 1 is always the original's table, in full.
+function rawBlock(cs, woid, wonum, lv, via, path, seen, forPrint, out) {
+    const list = S.raw.get(woid);
+    if (lv === 1 && !(list && list.length)) return;     // no raw goods: no table, as the original
+    const mode = lv > 1 && path.has(woid) ? 'loop' : !list ? 'cut' : lv > 1 && seen.has(woid) ? 'above' : 'full';
+    if (mode === 'full' && !list.length) return;        // a WO with no raw-good events
+    out.push(rawHeadRow(cs, wonum, list || [], forPrint, lv, via, mode));
+    if (mode !== 'full') return;
+    seen.add(woid);
+    const inner = new Set(path).add(woid);
+    sortLines(list).forEach(x => {
+        out.push(rawRow(cs, x, lv));
+        const makers = x.lot ? S.made.get(pairKey(x.part, x.lot)) || [] : [];
+        if (!makers.length) return;
+        const n = out.length;
+        makers.forEach(m => rawBlock(cs, m.woid, m.wonum, lv + 1, x, inner, seen, forPrint, out));
+        if (forPrint && out.length > n) out.push(closeRow(cs, lv + 2));
+    });
+}
+function bodyRows(cs, forPrint) {
+    const out = [], seen = new Set();
+    parts().forEach(p => {
+        out.push(partRow(cs, p, forPrint));
+        if (S.collapsed.has(p.name)) return;
+        sortLines(p.events).forEach(e => {
+            out.push(eventRow(cs, e));
+            if (!F.showRaw || !e.woid) return;
+            const n = out.length;
+            rawBlock(cs, e.woid, e.wonum, 1, null, new Set(), seen, forPrint, out);
+            if (forPrint && out.length > n) out.push(closeRow(cs, 2));
+        });
+    });
+    return out;
+}
+function counts() {
+    const lots = new Set(S.events.map(e => e.part + '\u0001' + e.lot));
+    return { parts: parts().length, lots: lots.size, events: S.events.length };
+}
+function footRow(cs) {
+    const c = counts();
+    return '<tr>' + totalsCells(cs, esc(`Total — ${plural(c.parts, 'part')}, ${plural(c.lots, 'lot')}, ${plural(c.events, 'event')}`), {}) + '</tr>';
+}
+// descMin (pt, PDF view only): the Description column's floor.
+const headRow = (cs, descMin) => '<tr>' + cs.map(c =>
+    `<th data-col="${c.key}" class="${c.num ? 'num-cell' : ''}" style="min-width:${c.w}px"${c.key === 'desc' && descMin ? ` data-pdf-min="${descMin}"` : ''}${c.tip ? ` title="${esc(c.tip)}"` : ''}>${esc(c.label)}</th>`).join('') + '</tr>';
+
+// Long reports paint in chunks as the user scrolls.
+const CHUNK = 600;
+let _paint = { html: [], shown: 0 };
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+function lotTitle() {
+    // The original's title: "Lot #" and the first row's lot.
+    const lots = [...new Set(S.events.map(e => e.lot))];
+    return lots.length ? 'Lot # ' + lots[0] + (lots.length > 1 ? ' (+' + (lots.length - 1) + ' more)' : '') : '';
+}
+
+const eventsText = () => S.tooMany ? 'over ' + plural(MAX_EVENTS, 'event') : plural(counts().events, 'event');
+function render(keepScroll) {
+    const bits = [S.company];
+    if (!hasSearch(F)) bits.push('Enter a lot number');
+    else if (S.loadedAt) bits.push(lotTitle() || searchText(F));
+    guardNotice();
+    if (S.view === 'pivot' && PIVOT) {
+        PIVOT.render();
+        if (S.loadedAt) bits.push('pivot', eventsText());
+        setStatus(bits.filter(Boolean).join(' · '));
+        if (PDF) PDF.refresh();
+        return;
+    }
+    const tbl = document.getElementById('rpt');
+    const wrap = document.getElementById('rptWrap');
+    const top = wrap.scrollTop;
+    const cs = cols();
+    tbl.querySelector('thead').innerHTML = headRow(cs);
+    _paint = { html: bodyRows(cs, false), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    while (keepScroll && _paint.shown < _paint.html.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+    const has = S.events.length > 0;
+    tbl.querySelector('tfoot').innerHTML = has ? footRow(cs) : '';
+    tbl.style.display = has ? '' : 'none';
+    document.getElementById('rptEmpty').textContent = has ? ''
+        : !hasSearch(F) ? 'Enter a lot number (or a part number) in Filters to see its history.'
+        : S.loadedAt && !S.tooMany ? 'No lot events match this search.' : '';
+    wrap.scrollTop = keepScroll ? top : 0;
+    if (hasSearch(F) && S.loadedAt)
+        bits.push(eventsText() + (F.showRaw && S.trace && S.trace.levels > 1 ? ' · raw goods to level ' + S.trace.levels : '') +
+            ' · loaded ' + S.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    setStatus(bits.filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the pages as the standard Reverse Lot History prints
+//  them: Letter landscape, the title band on the first page, the 8pt detail
+//  lines, the grey rule under each event (above its raw goods), no totals
+//  (the original has none).
+// ============================================================================
+let PDF = null;
+const PDF_CSS =
+    '.fbdoc-rpt-tbl .pp-neg{color:inherit}' +
+    '.fbdoc-rpt-tbl .rpt-grp-inner>a,.fbdoc-rpt-tbl tr.fbdoc-cont .rpt-grp-inner::after{flex:none}' +
+    // The raw goods step in under their WO event, each deeper level a step
+    // further (--lv); inline, so a repeated heading's "(continued)" stays
+    // on its line.
+    '.fbdoc-rpt-tbl tr.rpt-sub>td:first-child{padding-left:11pt}' +
+    '.fbdoc-rpt-tbl .rg-cell{display:inline;white-space:normal;padding:0 0 0 calc((var(--lv,1) - 1) * 9pt)}' +
+    '.fbdoc-rpt-tbl .rg-meta{margin-left:6pt;font-size:.85em;font-weight:400;color:#444}' +
+    '.fbdoc-rpt-tbl .rg-ev{padding-left:calc(12pt + (var(--lv,1) - 1) * 9pt)}' +
+    // The hidden heading that closes a block where its parent's rows resume.
+    '.fbdoc-rpt-tbl tr.trace-close{display:none}' +
+    // Stretching fields, as the original's: an event's time may drop under
+    // its date, a long lot or part number wrap, rather than clip on narrow
+    // paper. Email is one long word: it wraps, as the original's 77pt field
+    // does, instead of claiming the description's width.
+    '.fbdoc-rpt-tbl .nowrap,.fbdoc-rpt-tbl .rg-ev{white-space:normal}' +
+    '.fbdoc-rpt-tbl td.em-cell{overflow-wrap:anywhere}' +
+    // The original's rule right under each event, above its raw goods.
+    '.fbdoc-rpt-tbl tr:not([class])>td{border-bottom:.75pt solid #999}';
+// Description keeps the original's share of the width (its 130pt field of
+// 752pt, plus the cell padding) on whatever paper is chosen: fitted like the
+// short columns it would wrap every raw-good line several deep.
+function descMinPt() {
+    try {
+        const pp = PDF.paper();
+        const g = FBDoc.page.geometry(FBDoc.page.resolve(pp.size + ' ' + pp.orientation, { fallback: 'Letter', margin: 'document' }), {});
+        return Math.round(g.CWpt * 136 / 752);
+    } catch (_) { return 0; }
+}
+const emptyText = () => S.tooMany
+    ? 'More than ' + MAX_EVENTS.toLocaleString() + ' events match this search. Narrow it (a longer lot number, or a part number), or use Load all.'
+    : 'No lot events match this search.';
+function docSpec() {
+    if (!S.loadedAt) return null;
+    const subtitle = [lotTitle(), searchText(F)].filter(Boolean).join(' · ');
+    if (S.view === 'pivot' && PIVOT) {
+        const p = PIVOT.pdfSpec();
+        return { company: S.company, title: 'Reverse Lot History Report', subtitle: [subtitle, pivotText()], titleEveryPage: false,
+                 head: p.head, rows: p.rows, foot: p.foot, empty: emptyText(), css: '.fbdoc-rpt-tbl .pp-neg{color:inherit}', fontPt: 8 };
+    }
+    const cs = cols();
+    return {
+        company: S.company, title: 'Reverse Lot History Report', subtitle,
+        titleEveryPage: false,
+        head: headRow(cs, descMinPt()), rows: bodyRows(cs, true), foot: '',
+        empty: emptyText(),
+        css: PDF_CSS, fontPt: 8
+    };
+}
+
+// ============================================================================
+//  PIVOT VIEW (FBLib.Pivot) — Qty (or a count of events) by any two of
+//  level, trace level, part, lot, type, order, customer and event date. The
+//  lot's own events and each work order's raw goods (once per WO, not once
+//  per WO event; every level loaded) are the rows; the Table view keeps the
+//  nesting. A raw good's Qty is the consumed quantity without its sign, as
+//  in the table.
+// ============================================================================
+let PIVOT = null, COLS = null;
+const TRACE_LEVELS = ['This lot'].concat(Array.from({ length: MAX_DEPTH }, (_, i) => 'Level ' + (i + 1)));
+const PIVOT_FIELDS = [
+    { key: 'level', label: 'Level' }, { key: 'trace', label: 'Trace level', order: TRACE_LEVELS },
+    { key: 'part', label: 'Part Number' }, { key: 'desc', label: 'Description', dim: false },
+    { key: 'lot', label: 'Lot #' }, { key: 'type', label: 'Type' }, { key: 'order', label: 'Order' },
+    { key: 'who', label: 'Customer' }, { key: 'date', label: 'Event Date', type: 'date' },
+    { key: 'event', label: 'Event', dim: false }, { key: 'phone', label: 'Phone', dim: false }, { key: 'email', label: 'Email', dim: false },
+    { key: 'change', label: 'Qty', type: 'qty' }
+];
+function pivotRows() {
+    const row = (level, trace, x, d) => ({ level, trace, part: x.part, desc: x.desc, lot: x.lot, type: x.type, order: docText(d), who: x.customer || '',
+        date: x.date, event: x.event, phone: x.phone || '', email: x.email || '', change: qtyRound(x.change) });
+    const out = S.events.map(e => row('Lot event', TRACE_LEVELS[0], e, eventDoc(e)));
+    if (F.showRaw) S.raw.forEach((list, w) => {
+        const t = TRACE_LEVELS[S.woLevel.get(w) || 1] || 'Level ' + S.woLevel.get(w);
+        list.forEach(x => out.push(row('Raw good', t, x, x.wonum ? ['Work Order', x.wonum] : null)));
+    });
+    return out;
+}
+function pivotText() {
+    const c = PIVOT.config(), lbl = k => (PIVOT_FIELDS.find(x => x.key === k) || {}).label || '';
+    const m = c.measure === '__count__' ? 'Event count'
+        : ({ sum: 'Total', count: 'Count of', avg: 'Average', min: 'Lowest', max: 'Highest' }[c.agg] + ' ' + lbl(c.measure));
+    return 'Pivot: ' + m + ' by ' + [lbl(c.rowDim), lbl(c.rowDim2)].filter(Boolean).join(' + ') + (c.colDim ? ' × ' + lbl(c.colDim) : '');
+}
+function setView(v, persist) {
+    S.view = v === 'pivot' && PIVOT ? 'pivot' : 'table';
+    document.getElementById('viewSel').value = S.view;
+    document.getElementById('rptWrap').style.display = S.view === 'pivot' ? 'none' : '';
+    document.getElementById('pivotHost').style.display = S.view === 'pivot' ? '' : 'none';
+    document.getElementById('expandBtn').parentNode.style.display = S.view === 'pivot' ? 'none' : '';
+    if (persist) _saveUserKeys({ view: S.view });
+    render(false);
+}
+
+function setAllOpen(open) {
+    S.collapsed = new Set(open ? [] : parts().map(p => p.name));
+    F = Object.assign({}, F, { details: open });
+    remember();
+    render(false);
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.events.length) { showToast('Nothing to export.', 'warn'); return; }
+    const sub = [S.company, searchText(F)].filter(Boolean);
+    const T = (key, label, w, type, extra) => Object.assign({ key, label, w, type }, extra || {});
+    const evCols = [
+        T('part', 'Part Number', 120, 'text'), T('desc', 'Description', 220, 'text'), T('type', 'Type', 100, 'text'),
+        T('event', 'Event', 200, 'text'), T('date', 'Event Date', 95, 'date'), T('time', 'Time', 55, 'text'),
+        T('change', 'Qty', 90, 'qty', { noTotal: true }), T('lot', 'Lot #', 100, 'text')
+    ];
+    const line = x => ({ part: x.part, desc: x.desc, type: x.type, event: x.event, date: dstr(x.date) || null, time: tstr(x.date),
+        change: qtyRound(x.change), lot: x.lot });
+    const sheets = [
+        { name: 'Reverse Lot History', title: 'Reverse Lot History', subtitle: sub,
+          cols: evCols.concat([T('who', 'Customer', 160, 'text'), T('phone', 'Phone', 110, 'text'), T('email', 'Email', 180, 'text')]),
+          rows: S.events.map(e => Object.assign(line(e), { who: e.customer, phone: e.phone, email: e.email })), totals: false }
+    ];
+    if (F.showRaw) {
+        // The table's walk (see rawBlock), every level: each row with the
+        // lot it goes into (level 1: the event's; below: the raw-good lot
+        // the WO made) and its level; a WO named "above", a loop and a WO
+        // past the limits add no rows.
+        const rawRows = [], seen = new Set();
+        const walk = (woid, wonum, lv, head, path) => {
+            const list = S.raw.get(woid);
+            if (!list || (lv > 1 && (path.has(woid) || seen.has(woid)))) return;
+            seen.add(woid);
+            const inner = new Set(path).add(woid);
+            list.forEach(x => {
+                rawRows.push(Object.assign({ level: lv }, head, { wonum }, line(x)));
+                if (x.lot) (S.made.get(pairKey(x.part, x.lot)) || []).forEach(m =>
+                    walk(m.woid, m.wonum, lv + 1, { epart: x.part, elot: x.lot, eevent: x.event }, inner));
+            });
+        };
+        S.events.forEach(e => { if (e.woid) walk(e.woid, e.wonum, 1, { epart: e.part, elot: e.lot, eevent: e.event }, new Set()); });
+        sheets.push({ name: 'Raw Goods', title: 'Reverse Lot History – Raw goods', subtitle: sub,
+            cols: [T('level', 'Level', 50, 'int', { noTotal: true }), T('epart', 'Lot Part', 120, 'text'), T('elot', 'Lot', 100, 'text'),
+                   T('eevent', 'Lot Event', 180, 'text'), T('wonum', 'WO', 90, 'text')].concat(evCols),
+            rows: rawRows, totals: false });
+    }
+    if (S.view === 'pivot' && PIVOT) sheets.unshift(Object.assign(PIVOT.sheet('Pivot'), { title: 'Reverse Lot History – ' + pivotText(), subtitle: sub }));
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'Reverse_Lot_History_' + ymd(new Date()), sheets });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's pages (fb-doc). Without fb-doc on the server, the
+// plain printout below: JxBrowser won't print the report page itself, so it
+// is built in a new window and printed there. Collapsed parts print as
+// their rows only.
+function printReport() {
+    if (PDF) {
+        if (!S.events.length) { showToast('Nothing to print.', 'warn'); return; }
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    if (!S.events.length) { showToast('Nothing to print.', 'warn'); return; }
+    const cs = cols();
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Reverse Lot History</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:7.5pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:11pt;font-weight:700}h2{text-align:center;font-size:14pt;margin:2px 0}.sub{text-align:center;font-size:8.5pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{font-size:7.5pt;text-align:left;padding:3px 4px;border-bottom:1px solid #000}' +
+        'td{font-size:7.5pt;padding:2px 4px;vertical-align:top;border-bottom:1px solid #ddd}.num-cell{text-align:right}' +
+        'tr.rpt-grp td{font-weight:700;font-size:8.5pt;padding-top:8px;border-bottom:1px solid #999}.rpt-grp-meta{font-weight:400;font-size:7.5pt;color:#555;margin-left:8px}' +
+        'tr.rpt-sub td{font-weight:700;padding-top:4px;border-bottom:none}.rg-cell{padding-left:calc(10px + (var(--lv,1) - 1) * 10px)}.rg-meta{font-weight:400;color:#555;margin-left:6px}' +
+        'tr.rpt-minor td{color:#333;border-bottom:none}.rg-ev{padding-left:calc(16px + (var(--lv,1) - 1) * 10px)}.nowrap{white-space:nowrap}tr.trace-close{display:none}' +
+        'tfoot td{font-weight:700;border-top:1px solid #000;padding-top:4px}tr{page-break-inside:avoid}a{color:#000;text-decoration:none}.pp-neg{color:#000}' +
+        '@page{size:Letter landscape;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>Reverse Lot History Report</h2><p class="sub">' + esc([lotTitle(), searchText(F)].filter(Boolean).join(' · ')) + '</p>' +
+        '<table><thead>' + headRow(cs).replace(/ style="[^"]*"/g, '').replace(/ title="[^"]*"/g, '') + '</thead><tbody>' + bodyRows(cs, true).filter(r => !/trace-close/.test(r)).join('') +
+        '</tbody><tfoot>' + footRow(cs) + '</tfoot></table>' +
+        '<p style="font-size:7.5pt;margin-top:8px">Printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters what everyone sees each time this report opens?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        ['fLot', 'fPart'].forEach(id => {
+            const el = document.getElementById(id);
+            el.addEventListener('change', applySoon);
+            el.addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        });
+        document.getElementById('fShowRaw').addEventListener('change', applySoon);
+        document.getElementById('fDepth').addEventListener('change', applySoon);
+        document.getElementById('resetFiltersBtn').onclick = () => { writeFilters(DEFAULT_FILTERS); applySoon(); };
+
+        // Column resize / sort / reorder, and the Pivot view (fb-lib).
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({
+            table: document.getElementById('rpt'), sortable: k => NO_SORT.indexOf(k) === -1,
+            onSort: () => render(true), onReorder: () => render(true)
+        });
+        if (FBLib.Pivot) PIVOT = FBLib.Pivot.mount(document.getElementById('pivotHost'), {
+            fields: PIVOT_FIELDS, rows: pivotRows,
+            defaults: { rowDim: 'part', rowDim2: 'lot', colDim: 'level', measure: 'change', agg: 'sum' },
+            format: (fld, v) => (fld && fld.type === 'qty' ? fmtQty(v) : null)
+        });
+        else document.getElementById('viewSelWrap').style.display = 'none';
+        document.getElementById('viewSel').addEventListener('change', e => setView(e.target.value, true));
+        document.getElementById('resetColsBtn').onclick = () => { if (COLS) { COLS.reset(); render(false); } };
+        S.view = _resolve('view', 'table') === 'pivot' && PIVOT ? 'pivot' : 'table';
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: document.getElementById('appView'), toggleBefore: document.getElementById('exportBtn'),
+                page: { size: 'Letter', orientation: 'landscape' },
+                doc: docSpec, title: () => 'Reverse Lot History'
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        setView(S.view, false);
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('expandBtn').onclick = () => setAllOpen(true);
+        document.getElementById('collapseBtn').onclick = () => setAllOpen(false);
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('unpublishBtn').onclick = () => {
+            if (!confirm('Stop using company defaults for this report? Everyone goes back to their own last choices.')) return;
+            const ok = FBLib.Settings.clearCompany(['filters', 'opts']) !== false;
+            showToast(ok ? 'This report no longer has company defaults.' : 'That was not saved.', ok ? 'success' : 'error');
+        };
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        const wrap = document.getElementById('rptWrap');
+        wrap.addEventListener('scroll', () => { if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 400) appendChunk(); });
+        document.getElementById('rpt').addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (a) {
+                e.preventDefault();
+                try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+                catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+                return;
+            }
+            const g = e.target.closest('tr.rpt-grp');
+            if (!g) return;
+            const name = g.dataset.grp;
+            if (S.collapsed.has(name)) S.collapsed.delete(name); else S.collapsed.add(name);
+            render(true);
+        });
+
+        await loadLookups();
+        F = savedFilters();
+        writeFilters(F);
+        F = readFilters();
+        // Nothing to search for yet: open the filters on the lot box.
+        if (!hasSearch(F)) { FBLib.Common.togglePanel('filtersPanel', true); document.getElementById('fLot').focus(); }
+        await loadAll();
+    } catch (e) {
+        console.error('[Reverse Lot History] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

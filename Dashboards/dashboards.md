@@ -1,0 +1,334 @@
+# Fishbowl BI Dashboards (v1.2)
+
+This document covers the three customisable analytics dashboards: **Sales**,
+**Inventory** and **Purchasing**. All three run on one shared framework. Each
+user can arrange their own tiles and KPI badges, and an admin can publish a
+default layout for everyone and lock it.
+
+It is written for the development team, as the source for customer-facing
+wiki pages.
+
+| Dashboard | File | Record name | Storage key |
+|---|---|---|---|
+| Sales | `Sales_Dashboard_v1.2.htm` | `Sales Dashboard v1.2` | `cdx.bi.salesdash` |
+| Inventory | `Inventory_Dashboard_v1.2.htm` | `Inventory Dashboard v1.2` | `cdx.bi.invdash` |
+| Purchasing | `Purchasing_Dashboard_v1.2.htm` | `Purchasing Dashboard v1.2` | `cdx.bi.purchdash` |
+
+The older fixed-layout versions (`Sales_Dashboard.htm`,
+`Inventory_Dashboard.htm`, `Purchasing_Dashboard.htm`) and the Sales v1.2
+prototypes (`Sales_Dashboard_DragDrop.htm`, `Sales_Dashboard_Grid_POC.htm`)
+are kept in `archived/Dashboards/` for comparison.
+
+---
+
+## Installation
+
+The v1.2 dashboards ship built into Fishbowl. They are not distributed
+through the shared BI Reports folder. To load one by hand (development or
+testing), note that it needs two shared assets, found by record name. Import
+them first, in this order, from BI Reports ▸ `Standard`:
+
+1. `fb-styles-Style.json`, the Style `fb-styles`
+2. `fb-lib-Script.json`, the Script `fb-lib`
+
+Then import the dashboard's `-Page.json` and tick **Dashboard Gadget** on its
+Details tab. If fb-lib is missing, the page shows "fb-lib not loaded".
+
+**Internet access is required.** GridStack 10.3.1, D3 v7, Tailwind,
+moment.js 2.29.4 and the Inter / Space Mono fonts all load from CDNs. On a
+network without internet access the dashboards don't render.
+
+No system properties are required (see [System properties](#system-properties)).
+
+---
+
+## Shared framework
+
+### Header
+
+- **Title and date line.** The dashboard name, with the active date range
+  underneath.
+- **KPI badges.** A strip of small summary pills.
+  - When unlocked, drag to reorder, ✕ to remove, and **+** to add a badge.
+- **Zoom.** − / % / +, from 50% to 130% in 5% steps.
+  - Clicking the % fits the dashboard to a 1920px width.
+  - The zoom level is saved per user.
+- **Refresh (↻).** Re-runs every tile's query without changing the layout.
+- **Padlock.** Switches between locked (view) and edit mode.
+- **Edit controls** (unlocked only): **Reset**, **Save Layout**, **Add Widget**.
+- **Admin controls** (unlocked, admin only): the **Users: Can Edit / Users:
+  Read Only** toggle and **Publish**.
+- **Help (?)** opens the Instructions drawer. Its text is specific to each
+  dashboard.
+- **Gear** opens the Settings drawer:
+  - **Show debug console**;
+  - **Reset my saved layout & filters**;
+  - on Sales only, **Product categories ▸ Category level**.
+
+### Filter strip
+
+- **Date range presets:**
+  - Today, This Week, This Month, Last Month;
+  - Last 30 / 60 / 90 Days, Last 6 Months, Last Year;
+  - This / Last Quarter;
+  - Current / Last Financial Year;
+  - Current / Last Calendar Year;
+  - Custom Range.
+- **Dimension filters:** one multi-select per dimension (see each dashboard
+  below). Each has its own Clear, and an overall **Clear** chip resets them
+  all.
+- **Re-querying:** every tile re-queries when the date range or a filter
+  changes.
+
+### Tile grid
+
+The dashboard is a 12-column GridStack grid. When unlocked:
+
+- drag a tile by its header;
+- resize it from any edge;
+- remove it with ✕.
+
+Every tile header has:
+
+- an ⓘ that shows the tile's description;
+- an **Export this tile to CSV** button (all tiles except KPIs).
+
+**Add Widget** opens a picker with **All / KPIs / Charts / Tables** tabs. Each
+card shows the tile's title, description and default size.
+
+### Drill-downs
+
+Clicking a chart bar, a donut segment or a name opens a drill-down window.
+
+- The window has a search box and sortable columns, and **Export CSV**.
+- On Sales and Purchasing, each row expands to show its order lines.
+- Order and part numbers open the Fishbowl record.
+
+### Lock, publish and read-only mode
+
+- **Locked** hides every edit affordance. The dashboard opens in whichever
+  state the user last saved.
+- **Save Layout** saves the user's own layout, filters, badges and lock state.
+- **Reset** restores the default layout. Nothing is saved until **Save
+  Layout** is clicked.
+- **Publish** (admin) saves the admin's layout, filters and badges as the
+  **master** layout.
+  - Users who have never saved a layout get the master.
+  - Users who have saved one keep theirs.
+- **Users: Read Only** (admin) makes every non-admin user see the master
+  layout.
+  - It is shown read-only and the padlock is hidden.
+  - Their own saved layouts are ignored, and a save shows "Locked by admin".
+- **Users: Can Edit** switches back.
+
+An admin is the Fishbowl user named `admin` or any user with the `Admin`
+access right (`FBLib.Settings.isAdmin()`).
+
+### Persistence
+
+The dashboards use `FBLib.Settings` with `masterStorage: 'userProperties'`.
+
+| What | Key | Written by |
+|---|---|---|
+| User layout, filters, badges, lock, zoom, debug (Sales: category level) | `<key>.user.v1` | Save Layout, the lock toggle, zoom, the Settings drawer |
+| Master layout, filters, badges, read-only flag | `<key>.master.v1` | Publish, the Users toggle (admin only) |
+
+The master is written to the admin's own `userproperties` row and read by
+everyone. It doesn't depend on the report having a saved report-data record.
+
+**Sales migration.** Sales v1.2 copies an older per-user layout from
+`cdx.bi.sales-dashboard-grid` once, and leaves the old key in place. It
+rescales old layouts to the 40px row height.
+
+---
+
+## Sales Dashboard
+
+**Filters:**
+
+- Customer Group
+- Customer: searchable; selected customers are listed first, and up to 200
+  matches are drawn at a time
+- Product Category
+- Sales Person
+- Margin: Good (> 30%), Medium (15–30%), Low (< 15%)
+
+**Default date range:** Current Financial Year.
+
+**Category level (Settings)** sets how deep in the Product Tree the categories
+roll up. It is saved per user and can be published. **Refresh** also reloads
+the Product Tree.
+
+| Type | Tiles |
+|---|---|
+| KPI | Total Revenue, Order Count, Avg Order Value, Gross Margin, Gross Profit, Cost of Goods, Revenue vs Prior |
+| Chart | Revenue & Margin Trend (bar/line; weekly for ranges of 6 months or less), Top Customers by Revenue, Top Customers by Margin, Top Products by Qty, Top Products by Revenue, Sales by Category, Customer Groups, Top Salespeople, Orders per Salesperson, Low Margin Customers, High Value Orders, New vs Repeat Customers, Margin Mix, Profit Bridge, Growth vs Margin |
+| Table | Monthly Revenue Table, Customer Revenue Table, Negative Margin Orders |
+
+Notes on specific tiles:
+
+- **Revenue vs Prior** compares with the previous period of the same length.
+- **Top Customers by Margin** only includes customers with at least $1k of
+  revenue.
+- **High Value Orders** lists orders over $10k.
+- **Profit Bridge** (needs Compare) splits the change in gross profit into a
+  **volume effect**, the revenue change at the comparison margin, and a
+  **margin effect**, the rest: this period's revenue × the margin change.
+  The two always add up to the change.
+- **Growth vs Margin** (needs Compare) plots the top 30 customers,
+  categories, sales people or products. Use the Cust / Cat / Rep / Prod
+  buttons to choose which.
+  - Across is revenue change; up is margin change in points; bubble size is
+    revenue.
+  - Anything with no comparison revenue is listed as new underneath.
+  - With Compare off, both tiles offer the two Compare modes.
+
+**Drill-downs:** Customer, period (a trend week or month), Category,
+Customer Group, Salesperson, Product, and New/Repeat.
+
+**Revenue & Margin Trend.**
+- **Buckets.** A range of 6 months or less is drawn in weeks, a longer one in
+  calendar months.
+- **Axes.** Both are sized from the data:
+  - Revenue always includes zero.
+  - Margin is held to −100%…100%; a value beyond that sits on the edge as ▲ or
+    ▼, and the tooltip shows the real figure.
+  - A period with no revenue has no margin and leaves a gap in the line.
+- **Legend.** Click an entry to hide that series.
+
+**Compare.** The **Compare** chip in the filter strip (also the Off / Prev / LY
+buttons on the trend tile) is one dashboard-wide setting:
+
+- **Off** is the default.
+- **Previous period** is the equal-length range just before.
+- **Same period last year** is the same dates one year earlier.
+
+While Compare is on:
+
+- **KPI tiles and badges** show the change (▲/▼ %, or points for margin).
+- **The trend chart** draws the comparison bars beside each bar, with a faint
+  comparison margin line and a summary line on top.
+- **Monthly Revenue Table and Customer Revenue Table** add comparison revenue,
+  revenue change and margin change.
+- **Top Customers by Revenue, Top Salespeople and Top Products by Revenue**
+  label each bar with its change ("new" when there was none).
+
+Saved and published with the rest of the filter state.
+
+**Loading.** Comparison data never delays the first paint. Every tile draws
+its own figures first; the comparison pass (`runComparePass`) runs only once
+no primary render is queued or running. It then re-draws the
+comparison-aware tiles from cached data plus the comparison queries.
+
+- **Compare off:** nothing extra is queried, except the previous-period query
+  behind **Revenue vs Prior** (tile and badge), which also waits for that
+  pass.
+
+**How margin is calculated.** Margins follow Fishbowl's Margins report
+(`SalesOrder/marginsreport.jrxml`):
+
+- **Formula.** Any group or total uses
+  `(SUM(revenue) − SUM(cost)) / SUM(revenue)` (`MARGIN_AGG`). It is 0 when
+  revenue is ≤ 0, and is never an average of per-line margins.
+- **Lines counted.** Sales, misc sales, drop ships, credit returns, misc
+  credits, discount amounts, associated prices and kits (`soitem.typeId` 10,
+  11, 12, 20, 21, 31, 50, 80). Discount % (30) is folded into each line's
+  revenue.
+- **Lines left out.** Subtotal, shipping, tax and note lines
+  (`EXCLUDED_LINE_TYPES`).
+- **Margin filter.** Good / Medium / Low still tests each line's own margin.
+
+---
+
+## Inventory Dashboard
+
+**Filters:**
+
+- Location Group
+- Vendor (the part's default vendor)
+
+**Default date range:** Last 90 Days.
+
+Each tile description starts with **Snapshot** (current state; ignores the
+date range) or **Dated** (uses the date range).
+
+| Type | Tiles |
+|---|---|
+| KPI | Total Inventory Value, Active SKUs, Units On Hand, Below Reorder Point, Unavailable Value, Stock Loss, Short Pick Parts, Inventory Revenue |
+| Chart | Stock Value by Location Group (bar/donut), Top Parts by Value, Stock Value by ABC Code, Stock Movements (Value), Stock Movement Trend (bar/line, # / $), Slow-Moving Inventory |
+| Table | Stock by Location Group, Inventory Availability (By LG / Company), Below Reorder Point, Unavailable Stock, Short Parts in Picking, Fulfillment Pipeline, Cycle Count Adjustments, Scrap, Received Lines, Shipped Lines, Stock-Out Risk (Days of Cover), Expiring Lots (90 Days), Suggested Reorders, Negative Inventory |
+
+**Drill-downs:** Location Group, ABC code (with an "All parts" view), and
+Movement. Bars on Top Parts by Value and Slow-Moving Inventory open the
+part.
+
+---
+
+## Purchasing Dashboard
+
+**Filters:**
+
+- Vendor
+- Category
+- ABC Code (A / B / C / N)
+- Location Group
+
+**Default date range:** Last 90 Days.
+
+| Type | Tiles |
+|---|---|
+| KPI | Total Spend, Inventory Spend, Other Spend, POs Received, Avg PO Value, Avg Lead Time |
+| Chart | Monthly PO Spend, PO Status Overview, Top Vendors by Spend, Top Vendors by PO Count, Vendor On-Time Performance, Top Products by Qty, Purchases by Category, Open PO Value by Week Due, Lead Time Trend |
+| Table | Expected Receipts (7 Days), Overdue POs, Recently Received, High Value POs, Pending Approval |
+
+Notes on specific tiles:
+
+- **Avg Lead Time** is green at 7 days or less and amber up to 14.
+- **Vendor On-Time Performance** is an approximation and needs at least 3
+  lines per vendor.
+- **Pending Approval** lists POs in status 15.
+
+**Drill-downs:** Vendor, Category, PO Status, and Week.
+
+---
+
+## System properties
+
+All optional.
+
+| Property | Default | Purpose |
+|---|---|---|
+| `BI_FY_START_MONTH` | `7` | First month of the financial year (1–12), used by the financial-year presets |
+| `BI_SHOW_DEBUG` | `false` | `true` turns on debug logging |
+| `BI_ADMIN_USER_ID` / `BI_ADMIN_USER` | `1` / empty | Sales only, legacy. Admin tools now need the `Admin` access right. A matching user without it gets a toast saying so |
+
+Currency comes from `currencyLocale()`, falling back to `$` / en-US.
+
+---
+
+## Scope and limits
+
+- **Company-wide, by design.** These are company-wide analytics dashboards,
+  not operational pages, so they show every location group rather than
+  limiting a user to their assigned ones (`getLocationGroupList()`). Users
+  narrow a view with the Location Group filter. The operational order tiles
+  and Company Dashboard v1.2 do apply the user's location groups.
+- **No saved views or .xlsx export.** Export is CSV per tile and per
+  drill-down.
+
+---
+
+## Notes for the development team
+
+- **Adding a tile.** A tile needs:
+  - an entry in `WIDGET_REGISTRY` (title, description, category, default size,
+    render function);
+  - its query.
+
+  The shared render helpers cover KPIs, horizontal bars, donuts, time series
+  and sortable tables.
+- **Loading.** Every tile renders asynchronously with its own spinner, so a
+  slow tile doesn't block the rest.
+- **Queries.** They go through `runQueryAsync` when it's available.
+- **Styling.** It comes from fb-styles (the Workspace chrome). Deploy
+  fb-styles, then fb-lib, then the dashboards.

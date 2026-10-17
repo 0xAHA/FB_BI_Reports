@@ -1,0 +1,1539 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Turnover Report (iReport port)
+  PATH:   iReport_Ports/Inventory/TurnoverReport.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard Inventory/TurnoverReport.jrxml
+  ("Displays the number of times inventory is turned over during the given
+  date range"). Same source, same rules, same columns and totals; only the
+  presentation is interactive.
+
+    Rows       One per active Inventory part (part.typeId 10) and location
+               group that has an inventory event in the date range.
+    Units Sold soitem.qtyFulfilled of Sale lines (soitem.typeId 10) whose
+               LAST fulfilment falls in the range, converted to the part's
+               UOM by the direct uomconversion row (qty x multiply /
+               factor; 1:1 when there is none), credited to the sales
+               order's location group.
+    Avg QOH    AVG(inventorylog.qtyOnHand) over the log rows in the range
+               with typeId 1, 10, 15, 20, 30, 40, 50, 60, 64, 67, 68, 72:
+               the on-hand recorded with each event, averaged (not
+               time-weighted). Type 40 is kept on purpose. In this report
+               nothing sums changeQty, which is where type 40 double-counts.
+               Each type-40 row is a location move and carries the location
+               group's true on-hand at that moment. Live, from April 2026:
+               3,640 of 3,641 type-40 rows are moves (begin location <> end
+               location), and 3,299 repeat the previous on-hand. 217 changed
+               it, 208 of them moves between location groups, and none of
+               those 217 has another row recording the change. Dropping
+               type 40 would lose those changes. It would also drop 17 of
+               May 2026's 169 part/group rows (parts that only moved). The
+               original also samples the no-change types 68 and 72, so
+               sampling every event is its design.
+    TO Rate    Units Sold / Avg QOH (0 when Avg QOH is 0).
+    Avg TO     DATEDIFF / TO Rate (0 when nothing sold). DATEDIFF is
+      Days     TIMESTAMPDIFF(DAY, start, end - 1 s), so it is 30 for a
+               31-day month, as in the original.
+    Totals     Per group and for the company: Units Sold and Avg QOH
+               summed, TO Rate = the SUM of the rows' rates (the original's
+               running-total expression, reproduced exactly), Avg TO Days =
+               average DATEDIFF / that TO Rate.
+    Filters    Date range (default This month; the range is start 00:00
+               to end 23:59:59), location groups (only the user's own),
+               part number (LIKE; % is a wildcard).
+    Grouping   Part Number (rows are its location groups) or Location
+               Group (rows are its parts), ordered by group, then part.
+
+  Layout: the REPORT chrome (fb-styles §35): 56px header, push-down filter
+  panel that applies as you change it, collapsible group rows carrying
+  the group totals, sticky Company Totals footer.
+  Table tools (fb-lib FBLib.RptCols / RowCap / Pivot): column headings sort
+  the rows within each group (the group and company totals are still the
+  jrxml's running totals, taken in the standard order); drag a heading to
+  reorder, its edge to resize (remembered per user). A Table / Pivot view
+  selector: Units Sold, Avg QOH, TO Rate or Avg. TO Days by part × location
+  group, with drill-down (summed TO Rates are the report's own totals).
+  The query fetches at most 10,000 rows, cut back to whole groups so every
+  group's totals are complete, with Load all.
+  Two more views on the same selector (they have their own column layouts,
+  sort / resize / reorder, chunked painting, PDF pages and an Excel sheet
+  of their own, first in the workbook; Print, and the plain printout when
+  fb-doc is missing, follow the view on show):
+    Ranking        Every row of the table in one list by TO Rate, highest
+                   first; ties by Units Sold, then part number; rows equal
+                   on both share a rank (1, 2, 2, 4). Columns: #, Part,
+                   Description, Location Group, Units Sold, Avg QOH, TO Rate,
+                   Avg TO Days. Footer = the report's Company Totals. Filters
+                   → "Company-wide ranking" (redraw only) ranks parts across
+                   their location groups by Σ units sold ÷ Σ avg QOH (the
+                   part's pooled stock); that is NOT the report's own total,
+                   which adds the groups' rates (see Help for why it
+                   differs); its footer pools every part the same way.
+    Monthly trend  The report's own query (buildSQL, unchanged) once per
+                   calendar month of the range, the first / last months cut
+                   to it, months starting after today left out, at most the
+                   last 24 months (said in a note), 3 queries at a time, with
+                   "Loading month x of y" and the load token (a filter change
+                   / Refresh / Load all cancels a run). Rows: part (the
+                   month's group-by-part totals: Units Sold summed, TO Rate =
+                   the groups' rates summed, the jrxml's rule) or part ×
+                   location group (the month's row), a column per month and
+                   "Whole range" (the Table view's figure); TO Rate or Units
+                   Sold (Filters, redraw only). "—" = no inventory event that
+                   month (not listed by the report). Footer = column sums.
+                   TO Rates show 2 decimals here (Excel has them in full);
+                   rows in part number order (case-insensitive, character
+                   by character: near enough the table's ORDER BY). The
+                   PDF leaves the description out past 6 months (the part
+                   number names the part) and heads the months "Jun 24"
+                   past 12: 24 months fit Letter landscape at 9pt; portrait
+                   scales them a little to fit.
+                   No row cap of its own: each month's rows are a subset of
+                   the table's rows (a row needs an event in the month, which
+                   lies in the range), and when the table's load was capped
+                   the months keep to the same parts (part.num <= the last
+                   part kept, or the location groups kept), so no month can
+                   outgrow the table's 10,000. Timed live (2026-10-12, all 7
+                   location groups, each including the tool's EXPLAIN pass):
+                   one month 0.39-0.67 s (Mar 2022 126 rows 0.39 s, Jan 2025
+                   231 rows 0.46 s, Apr 2026 232 rows 0.50 s, Sep 2020 - the
+                   busiest month by events - 0.67 s) against 1.4 s for one
+                   24-month query; so 24 months cost ~12 s one at a time
+                   (24 x ~0.5 s), an estimated 4-6 s three at a time if the
+                   server runs them side by side. A part filter makes each
+                   month cheaper (Y%, 3 groups: 6 queries in 1.25 s).
+  Views: the header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+  report out as pages like the original: Letter portrait by default, the
+  company / title / date range band on every page (the original's page
+  header), the column headings repeated, group rows with their totals
+  (a part's named by its number alone, as the original's group header)
+  carried over a page break as "(continued)", the Company Totals after the
+  last line, "Page X of Y". Columns fit the page and the font steps down
+  from the original's 10pt when they don't. The paper size and orientation,
+  and the view, are remembered per user. Print prints those pages in
+  either view.
+
+  Deliberate differences:
+    - No "All dates" range. The original treats a range from the year
+      1000 or earlier to 3000 or later as "All". That makes DATEDIFF, and
+      so every Avg TO Days, hundreds of thousands of days.
+    - The location-group filter is also applied inside the on-hand and
+      sold sub-queries. The outer join already restricts them to the same
+      groups, so the result is the same (checked live: 2025 and May 2026
+      match the original in row count and the Units Sold / Avg QOH sums). It only lets a
+      run for fewer groups skip the other groups' rows.
+  Additions: collapsible groups (collapsed = the totals only), record
+  links, Excel (detail + group-totals sheets), Print.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-folder" content="Inventory">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="Inventory turnover per part and location group over a date range.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipTurnover',
+            name:  'Turnover Report',
+            build: '2026.10.16-572a3dd'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Turnover Report — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 460px; overflow: hidden; text-overflow: ellipsis; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table th { cursor: default; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        .grp-desc { font-weight: 400; color: var(--c-secondary); }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+        #appView { position: relative; }            /* the loading overlay covers the view on show */
+        /* Ranking / Monthly trend. */
+        .rpt-table td.rank-cell { color: var(--c-secondary); }
+        .trend-none { color: var(--border-strong); }
+        .rpt-table tfoot .trend-none { color: inherit; opacity: .6; }
+        .trend-note { margin: 8px 20px; border-radius: 8px; padding: 6px 12px; font-size: 12.5px; flex-shrink: 0;
+            border: 1px solid var(--acc-yellow); background: var(--acc-yellow-bg); color: var(--acc-yellow-con); }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>Turnover Report</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <div class="rpt-viewsel" id="viewSelWrap" title="Table: the report as the standard one lays it out. Ranking: every row in one list by TO Rate, highest first. Monthly trend: the report run month by month. Pivot: any figure by part × location group">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 5h18M3 10h10M3 15h18M3 20h10" stroke-linecap="round"/></svg>
+            <select id="viewSel">
+                <option value="table">Table</option>
+                <option value="rank">Ranking</option>
+                <option value="trend">Monthly trend</option>
+                <option value="pivot">Pivot</option>
+            </select>
+        </div>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="split-btn">
+            <button id="expandBtn" class="hdr-btn" type="button" title="Show every group's rows">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+                Expand
+            </button>
+            <button id="collapseBtn" class="hdr-btn" type="button" title="Group totals only">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 12h14" stroke-linecap="round"/></svg>
+                Collapse
+            </button>
+        </span>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook (detail and group-totals sheets)">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages: collapsed groups print as their totals">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Date range</div>
+            <div>
+                <div class="rpt-flabel">Quick range</div>
+                <select id="fRange"></select>
+            </div>
+            <div class="rpt-dates">
+                <input type="date" id="fFrom" aria-label="From">
+                <span class="rpt-fnote">→</span>
+                <input type="date" id="fTo" aria-label="To">
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Layout</div>
+            <div>
+                <div class="rpt-flabel">Group by</div>
+                <select id="fGroupBy">
+                    <option value="part">Part Number</option>
+                    <option value="lg">Location Group</option>
+                </select>
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Where &amp; what</div>
+            <div>
+                <div class="rpt-flabel">Location groups</div>
+                <div class="ms-container" id="lgMs">
+                    <div class="ms-trigger" id="lgMs-trigger"><span class="ms-placeholder" id="lgMs-placeholder">All my location groups</span></div>
+                    <div class="ms-dropdown hidden" id="lgMs-dropdown">
+                        <div class="ms-search"><input type="text" id="lgMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="lgMs-all">Select All</span><span id="lgMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="lgMs-list"></div>
+                    </div>
+                </div>
+            </div>
+            <div>
+                <div class="rpt-flabel">Part number</div>
+                <input type="text" id="fPart" placeholder="All parts (% is a wildcard)">
+            </div>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+        <!-- Shown with the Ranking / Monthly trend views; changes redraw, no new query. -->
+        <div class="rpt-fgroup" id="viewOpts" style="display:none">
+            <div class="rpt-fgroup-title" id="viewOptsTitle">View options</div>
+            <div id="optRank">
+                <label class="rpt-fcheck" title="One row per part, ranked across all its location groups"><input type="checkbox" id="fRankCo"> Company-wide ranking</label>
+                <div class="rpt-fnote">Each part across its location groups:<br>Σ units sold ÷ Σ avg QOH (see Help).</div>
+            </div>
+            <div id="optTrend">
+                <div class="rpt-flabel">Rows</div>
+                <select id="fTrendRows">
+                    <option value="part">Part</option>
+                    <option value="partLg">Part × location group</option>
+                </select>
+                <div class="rpt-flabel" style="margin-top:8px">Figure</div>
+                <select id="fTrendFig">
+                    <option value="rate">TO Rate</option>
+                    <option value="sold">Units Sold</option>
+                </select>
+                <div class="rpt-fnote" style="margin-top:6px">The report's own query, once per calendar<br>month of the range (up to 24 months).</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own sort">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters what everyone sees each time this report opens. Anyone can still change them while it is open.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+                <button type="button" class="ds-btn" id="unpublishBtn" title="Everyone goes back to their own last choices">Stop using them</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>How many times each part's inventory turned over in the date range, per location group. It is the BI version of the standard <strong>Turnover Report</strong> and reads the same data the same way.</p>
+                <p>A part is listed for a location group when it had an inventory event there in the range (a receipt, shipment, consumption, adjustment, move…). Active Inventory parts only.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">The figures</div>
+                <ul>
+                    <li><strong>Units Sold</strong>: quantity fulfilled on sales order lines whose last fulfilment is in the range, in the part's unit, counted in the sales order's location group.</li>
+                    <li><strong>Avg QOH</strong>: the average of the on-hand quantity recorded with each inventory event in the range. It is not weighted by time.</li>
+                    <li><strong>TO Rate</strong>: Units Sold ÷ Avg QOH.</li>
+                    <li><strong>Avg. TO Days</strong>: the range's length in days ÷ TO Rate. The length counts from the first day to the last, so a 31-day month counts as 30, as in the standard report.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Totals</div>
+                <p>A group's row and the Company Totals add up Units Sold and Avg QOH. Their <strong>TO Rate</strong> is the <em>sum</em> of the rows' rates, and their Avg. TO Days divides the range's length by that sum, exactly as the standard report does.</p>
+                <ul>
+                    <li>Filter changes apply straight away.</li>
+                    <li>Click a group's row to show or hide its rows; <strong>Collapse</strong> leaves just the totals.</li>
+                    <li>Click a column heading to sort the rows within each group (again to reverse, a third time for the standard order): <strong>TO Rate</strong> puts the slowest movers first. The totals don't change. Drag a heading onto another to move the column; drag a heading's right edge to resize it. Your layout is remembered; <strong>Settings → Reset column layout</strong> undoes it.</li>
+                    <li>The <strong>Table / Pivot</strong> selector switches to a pivot: any figure by part and location group, side by side. Summed, the TO Rates give the same totals as the report. Click a figure to see the rows behind it. Print, PDF and Excel follow the view on screen.</li>
+                    <li><strong>Ranking</strong> (same selector) lists every row of the table in one list, fastest turner first: <strong>#</strong> is the rank by TO Rate; equal rates put more Units Sold first, and rows equal on both share a rank. Click a heading to sort by another column; the # stays the TO Rate rank. Its footer is the report's own Company Totals.</li>
+                    <li><strong>Company-wide ranking</strong> (Filters, with Ranking on) ranks each <em>part</em> across its location groups instead, with TO Rate = its units sold added up ÷ its Avg QOH added up: the turnover of the part's whole stock. That is <em>not</em> the report's own total, which adds the location groups' TO Rates. A part that sold 100 from an average 10 in one group and nothing from 1,000 in another has a report total of 10 + 0 = 10, but turns over 100 ÷ 1,010 = 0.099 company-wide: added-up rates let a small, busy stock hide a large, idle one. Its footer applies the same rule to every part together.</li>
+                    <li><strong>Monthly trend</strong> runs the report's own query once for each calendar month of the date range (the first and last months cut to the range) and lays the months side by side: TO Rate, or Units Sold (Filters → Figure), for each part or each part in each location group (Filters → Rows). A month is exactly what the Table view shows for that month on its own; a part's figure is its location groups added up, as the report's part totals are. <strong>—</strong> means no inventory event that month, so the report wouldn't list it. <strong>Whole range</strong> is the Table view's own figure: monthly TO Rates don't add up to it, because Avg QOH is an average of the month's events. The footer adds each column up, as the report's Company Totals do.</li>
+                    <li>The trend loads three months at a time, with progress in the middle of the page; it covers at most <strong>24 months</strong> (the last 24 of a longer range) and leaves out months that start after today. A month takes about half a second on a typical database, so 24 months take around 5–15 seconds. Changing a filter while it loads cancels it and starts again; changing the Rows or Figure doesn't reload anything. TO Rates show two decimal places here (Excel has them in full). On paper, a trend of more than six months leaves the description out so the months fit; choose <strong>Landscape</strong> for a long one.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable pages, laid out like the standard report. In PDF view pick the paper size and orientation in the bar above the pages; they are remembered. <strong>Print</strong> prints those pages.</li>
+                    <li>A very large result shows its first 10,000 or so rows (whole groups) with a <strong>Load all</strong> button; the Company Totals then cover the rows shown.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-app" id="appView">
+<!-- Covers whichever view is on: the report's load, then the Monthly trend's months. -->
+<div class="loading-overlay" id="loading">
+    <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+    <span class="lo-label">Loading…</span>
+</div>
+<div class="rpt-scroll" id="rptWrap">
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+</div>
+<div class="rpt-scroll" id="rankWrap" style="display:none">
+    <table class="rpt-table" id="rankTbl"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rankEmpty"></div>
+</div>
+<div class="trend-note" id="trendNote" style="display:none"></div>
+<div class="rpt-scroll" id="trendWrap" style="display:none">
+    <table class="rpt-table" id="trendTbl"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="trendEmpty"></div>
+</div>
+<div class="pivot-host" id="pivotHost" style="display:none"></div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Common || !FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+// inventorylog types whose on-hand the original averages (see the header).
+const LOG_TYPES = [1, 10, 15, 20, 30, 40, 50, 60, 64, 67, 68, 72];
+const SALE_LINE = 10;                        // soitem.typeId Sale
+const GROUP_LABEL = { part: 'Part Number', lg: 'Location Group' };
+const DEFAULT_FILTERS = { range: 'thisMonth', from: '', to: '', groupBy: 'part', lgs: [], part: '',
+                          rankCo: false, trendRows: 'part', trendFig: 'rate' };
+// View options: they only change what is drawn (no new query).
+const REDRAW_ONLY = ['rankCo', 'trendRows', 'trendFig'];
+const VIEWS = ['table', 'rank', 'trend', 'pivot'];
+// Monthly trend: at most 24 months (the last 24 of a longer range), 3
+// months' queries in flight at a time.
+const TREND_MAX = 24, TREND_PARALLEL = 3;
+const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        company: { keys: ['filters', 'opts'], editors: true },   // every open starts from the company defaults
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const ints = a => (Array.isArray(a) ? a : []).map(Number).filter(n => Number.isInteger(n));
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const fmtQty = v => FBLib.Common.formatQty(v);
+const openLink = (module, number, title) => number
+    ? `<a class="fb-row-link" data-open="${esc(module)}" data-num="${esc(number)}"${title ? ` title="${esc(title)}"` : ''}>${esc(number)}</a>` : '';
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const cut = s => `<span title="${esc(s)}">${esc(s)}</span>`;
+// Part numbers / names near enough as the report's ORDER BY sorts them (case-insensitive, character by character).
+const cmpText = (a, b) => { const x = String(a ?? '').toUpperCase(), y = String(b ?? '').toUpperCase(); return x < y ? -1 : x > y ? 1 : 0; };
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// ---- Date ranges (Fishbowl's "This Month" etc.). No "All dates": see the header. ----
+const RANGES = [
+    ['custom', 'Custom…'], ['today', 'Today'], ['yesterday', 'Yesterday'], ['last7', 'Last 7 days'],
+    ['thisMonth', 'This month'], ['lastMonth', 'Last month'], ['thisQuarter', 'This quarter'], ['lastQuarter', 'Last quarter'],
+    ['thisYear', 'This year'], ['lastYear', 'Last year']
+];
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const isYmd = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+
+// A quick range as [from, to] ISO dates.
+function presetDates(key) {
+    const t = new Date(); t.setHours(0, 0, 0, 0);
+    const y = t.getFullYear(), m = t.getMonth(), d = t.getDate(), qm = Math.floor(m / 3) * 3;
+    const D = (yy, mm, dd) => new Date(yy, mm, dd);
+    const r = {
+        today: [t, t], yesterday: [D(y, m, d - 1), D(y, m, d - 1)], last7: [D(y, m, d - 6), t],
+        thisMonth: [D(y, m, 1), D(y, m + 1, 0)], lastMonth: [D(y, m - 1, 1), D(y, m, 0)],
+        thisQuarter: [D(y, qm, 1), D(y, qm + 3, 0)], lastQuarter: [D(y, qm - 3, 1), D(y, qm, 0)],
+        thisYear: [D(y, 0, 1), D(y, 11, 31)], lastYear: [D(y - 1, 0, 1), D(y - 1, 11, 31)]
+    }[key];
+    return r ? [ymd(r[0]), ymd(r[1])] : null;
+}
+// { start, endExcl, label }: Fishbowl's dateRange1 / dateRange2 (the day
+// after the last day). A one-sided custom range is closed with today.
+function dateRange(f) {
+    let a = f.from, b = f.to;
+    if (f.range !== 'custom') { const p = presetDates(f.range) || presetDates('thisMonth'); [a, b] = p; }
+    const today = ymd(new Date());
+    a = isYmd(a) ? a : (isYmd(b) ? b : today); b = isYmd(b) ? b : (a > today ? a : today);
+    if (a > b) [a, b] = [b, a];
+    const after = new Date(b + 'T00:00:00'); after.setDate(after.getDate() + 1);
+    return { start: a, endExcl: ymd(after), label: FBLib.Common.formatDate(a) + ' – ' + FBLib.Common.formatDate(b) };
+}
+function rangeText(f) { return 'Date Range: ' + dateRange(f).label; }
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS — the panel applies as it changes (one short debounce).
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _lgMs = null;
+let _hydrating = false, _applyTimer = null;
+// cut: how the row cap cut the last load ({ maxPart?, lgs? }, null = not
+// cut); the Monthly trend's queries keep to the same parts. trend: the
+// Monthly trend's months for the current load (null = not loaded yet).
+const S = { rows: [], company: '', myLgs: [], lgNames: {}, loadedAt: null, collapsed: new Set(), view: 'table', noCap: false,
+            loading: false, cut: null, trend: null };
+
+function readFilters() {
+    return {
+        range: document.getElementById('fRange').value,
+        from: document.getElementById('fFrom').value,
+        to: document.getElementById('fTo').value,
+        groupBy: document.getElementById('fGroupBy').value,
+        lgs: ints(_lgMs.getSelected()),
+        part: document.getElementById('fPart').value.trim(),
+        rankCo: document.getElementById('fRankCo').checked,
+        trendRows: document.getElementById('fTrendRows').value,
+        trendFig: document.getElementById('fTrendFig').value
+    };
+}
+function writeFilters(f) {
+    _hydrating = true;
+    document.getElementById('fRange').value = RANGES.some(r => r[0] === f.range) ? f.range : DEFAULT_FILTERS.range;
+    const p = f.range === 'custom' ? [f.from, f.to] : (presetDates(document.getElementById('fRange').value) || ['', '']);
+    document.getElementById('fFrom').value = p[0] || '';
+    document.getElementById('fTo').value = p[1] || '';
+    document.getElementById('fGroupBy').value = GROUP_LABEL[f.groupBy] ? f.groupBy : 'part';
+    _lgMs.setSelected(ints(f.lgs));
+    document.getElementById('fPart').value = f.part || '';
+    document.getElementById('fRankCo').checked = !!f.rankCo;
+    document.getElementById('fTrendRows').value = f.trendRows === 'partLg' ? 'partLg' : 'part';
+    document.getElementById('fTrendFig').value = f.trendFig === 'sold' ? 'sold' : 'rate';
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const requery = queryKey(next) !== queryKey(F);
+        F = next;
+        remember();
+        if (!requery) { render(false); return; }        // a view option: redraw only
+        S.noCap = false;
+        loadAll();
+    }, 250);
+}
+const queryKey = f => JSON.stringify(Object.assign({}, f, ...REDRAW_ONLY.map(k => ({ [k]: null }))));
+
+// ============================================================================
+//  SQL — the iReport query, its parameters bound inline. The location
+//  groups are also filtered inside the two sub-queries (same result).
+// ============================================================================
+// lim (the Monthly trend's months): keep to the rows the table's load kept
+// when the row cap cut it: { maxPart: last part number kept } and / or
+// { lgs: location group ids kept } (see loadAll).
+function buildSQL(f, lim) {
+    const r = dateRange(f);
+    const d1 = `'${r.start} 00:00:00'`, d2 = `'${r.endExcl} 00:00:00'`;
+    const lastSec = `DATE_SUB(${d2}, INTERVAL 1 SECOND)`;
+    // Location groups: the chosen ones, else every group this user may see.
+    let lgs = (f.lgs.length ? f.lgs : S.myLgs).filter(id => S.myLgs.indexOf(id) !== -1);
+    if (lim && lim.lgs) lgs = lgs.filter(id => lim.lgs.indexOf(id) !== -1);
+    const lgIn = ints(lgs).join(',') || '0';
+    const w = ['part.activeflag = 1', 'part.typeid = 10', `locationgroup.id IN (${lgIn})`];
+    if (f.part) w.push(`part.num LIKE '${sqlStr(f.part.replace(/\*/g, '%'))}'`);
+    if (lim && lim.maxPart != null) w.push(`part.num <= '${sqlStr(lim.maxPart)}'`);
+    const order = f.groupBy === 'lg' ? 'lgname, part.num' : 'part.num, lgname';
+    return `
+        SELECT part.num AS partnum, part.description AS partdesc, part.id AS partid, onhand.lgid,
+               COALESCE(sold.qtysold, 0) AS qtysold,
+               TIMESTAMPDIFF(DAY, ${d1}, ${lastSec}) AS datediff,
+               COALESCE(onhand.avgqoh, 0) AS avgqoh,
+               COALESCE(locationgroup.name, 'No Inventory') AS lgname
+        FROM part
+        INNER JOIN (SELECT AVG(il.qtyonhand) AS avgqoh, il.partid, il.locationgroupid AS lgid
+                    FROM inventorylog il
+                    WHERE il.typeid IN (${LOG_TYPES.join(',')})
+                      AND il.eventdate BETWEEN ${d1} AND ${lastSec}
+                      AND il.locationgroupid IN (${lgIn})
+                    GROUP BY il.partid, il.locationgroupid) onhand ON part.id = onhand.partid
+        LEFT JOIN locationgroup ON onhand.lgid = locationgroup.id
+        LEFT JOIN (SELECT product.partid,
+                          SUM((soitem.qtyfulfilled * COALESCE(uomconversion.multiply, 1)) / COALESCE(uomconversion.factor, 1)) AS qtysold,
+                          so.locationgroupid AS lgid
+                   FROM soitem
+                   LEFT JOIN product ON soitem.productid = product.id
+                   LEFT JOIN so ON so.id = soitem.soid
+                   LEFT JOIN part ON product.partid = part.id
+                   LEFT JOIN uomconversion ON (uomconversion.touomid = part.uomid AND uomconversion.fromuomid = soitem.uomid)
+                   WHERE soitem.typeid = ${SALE_LINE}
+                     AND soitem.datelastfulfillment BETWEEN ${d1} AND ${lastSec}
+                     AND so.locationgroupid IN (${lgIn})
+                   GROUP BY product.partid, so.locationgroupid) sold ON part.id = sold.partid AND locationgroup.id = sold.lgid
+        WHERE ${w.join('\n          AND ')}
+        ORDER BY ${order}`;
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+let _loadToken = 0;
+
+async function loadLookups() {
+    let myLgs = [];
+    try { myLgs = ints(typeof getLocationGroupList === 'function' ? getLocationGroupList() : []); } catch (_) {}
+    S.myLgs = myLgs;
+    const lgIn = myLgs.join(',') || '0';
+    const res = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('Location groups', `SELECT id, name, activeflag+0 AS active FROM locationgroup WHERE id IN (${lgIn}) ORDER BY name`)
+    ]);
+    const ok = i => res[i].status === 'fulfilled' ? res[i].value : [];
+    S.company = (ok(0)[0] || {}).name || '';
+    ok(1).forEach(r => { S.lgNames[Number(r.id)] = r.name; });
+    _lgMs.setItems(ok(1).map(r => ({ value: Number(r.id), label: r.name + (Number(r.active) === 1 ? '' : ' (inactive)') })));
+    const failed = res.filter(x => x.status === 'rejected').map(x => x.reason && x.reason.message);
+    if (failed.length) document.getElementById('banner').textContent = 'Some filter lists failed to load: ' + failed.join('; ');
+}
+
+// FBLib.RowCap, cut back to whole groups: a capped result drops its last
+// group when the row past the cap shows that group goes on, so every group
+// row's totals cover all of its rows. A first group bigger than the cap is
+// kept as fetched.
+function capWhole(rows, cap, keyOf) {
+    const c = FBLib.RowCap.apply(rows, cap);
+    if (!c.capped) return c;
+    const next = keyOf(rows[c.limit]);
+    let n = c.rows.length;
+    while (n > 0 && keyOf(c.rows[n - 1]) === next) n--;
+    return n > 0 ? { rows: c.rows.slice(0, n), capped: true, limit: n, whole: true } : Object.assign(c, { whole: false });
+}
+
+// One query row as the report holds it: the original's TURNOVERRATE and
+// Avg. TO Days per row.
+function rowOf(r) {
+    const sold = num(r.qtysold), qoh = num(r.avgqoh), days = num(r.datediff);
+    const rate = qoh !== 0 ? sold / qoh : 0;
+    return { part: r.partnum || '', desc: r.partdesc || '', lg: r.lgname || '', sold, qoh, datediff: days,
+             rate, toDays: (sold === 0 || rate === 0) ? 0 : days / rate };
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    cancelTrend();                                  // a new load: any monthly run still going is dropped
+    S.trend = null;
+    document.getElementById('banner').textContent = '';
+    S.loading = true; syncLoading();
+    setStatus('Loading…');
+    let rows;
+    const cap = S.noCap ? 0 : undefined;           // FBLib.RowCap: the first 10,000 rows unless Load all
+    try { rows = await q('Turnover', FBLib.RowCap.sql(buildSQL(F), cap)); }
+    catch (e) {
+        if (tok !== _loadToken) return;
+        S.loading = false; syncLoading();
+        document.getElementById('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        FBLib.RowCap.notice({ before: document.getElementById('appView'), capped: false });
+        S.rows = []; S.loadedAt = null; S.cut = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    if (tok !== _loadToken) return;
+    S.loading = false; syncLoading();
+    const capped = capWhole(rows, cap, r => (F.groupBy === 'lg' ? r.lgname : r.partnum));
+    rows = capped.rows;
+    FBLib.RowCap.notice({ before: document.getElementById('appView'), capped: capped.capped, limit: capped.limit, what: 'rows',
+                          onLoadAll: () => { S.noCap = true; loadAll(); } });
+    // Where the cap cut, for the Monthly trend: grouped by part, the rows
+    // run in part number order, so the parts kept are those up to the last
+    // one; grouped by location group, the groups kept (and, when a single
+    // group was bigger than the cap, its parts up to the last one).
+    const last = rows[rows.length - 1];
+    S.cut = !capped.capped || !last ? null
+        : F.groupBy === 'lg' ? { lgs: [...new Set(rows.map(r => Number(r.lgid)))], maxPart: capped.whole ? null : last.partnum }
+        : { maxPart: last.partnum };
+    S.rows = rows.map(rowOf);
+    S.collapsed = new Set();
+    S.loadedAt = new Date();
+    render();
+    if (S.view === 'trend') loadTrend();
+}
+
+// ============================================================================
+//  MONTHLY TREND — the report's own query once per calendar month of the
+//  range (each month cut to the range; a month starting after today is
+//  left out; the last 24 of a longer range), three at a time. A new load
+//  (filter change, Refresh, Load all) cancels a run in flight: its months
+//  are dropped as they come back. Each month is exactly what the Table view
+//  would show for that month on its own. When the row cap cut the table's
+//  load, the months keep to the same parts (S.cut), so every month is a
+//  subset of the table's rows and needs no cap of its own.
+// ============================================================================
+let _trendToken = 0;
+const cancelTrend = () => { _trendToken++; };
+const monthLabel = m => MON[+m.ym.slice(5, 7) - 1] + ' ' + m.ym.slice(0, 4) + (m.partial ? ' (' + (+m.from.slice(8)) + '–' + (+m.to.slice(8)) + ')' : '');
+
+function trendPlan(f) {
+    const r = dateRange(f), today = ymd(new Date());
+    const months = [];
+    let all = 0, future = 0;
+    const d = new Date(+r.start.slice(0, 4), +r.start.slice(5, 7) - 1, 1);
+    while (ymd(d) < r.endExcl) {
+        const first = ymd(d), next = ymd(new Date(d.getFullYear(), d.getMonth() + 1, 1));
+        const from = first < r.start ? r.start : first, endExcl = next < r.endExcl ? next : r.endExcl;
+        all++;
+        if (from > today) future++;
+        else {
+            const lastDay = new Date(+endExcl.slice(0, 4), +endExcl.slice(5, 7) - 1, +endExcl.slice(8, 10) - 1);
+            months.push({ key: 'm' + first.slice(0, 4) + first.slice(5, 7), ym: first.slice(0, 7), from, to: ymd(lastDay),
+                          partial: from !== first || endExcl !== next, rows: null });
+        }
+        d.setMonth(d.getMonth() + 1);
+    }
+    return { months: months.slice(-TREND_MAX), started: months.length, dropped: Math.max(0, months.length - TREND_MAX), future, all };
+}
+
+async function loadTrend() {
+    if (!S.loadedAt) return;                       // the table's load starts it when it finishes
+    const tok = ++_trendToken, lim = S.cut;
+    const T = S.trend = Object.assign(trendPlan(F), { busy: true, done: 0, failed: '', t0: performance.now(), ms: 0 });
+    syncLoading();
+    if (S.view === 'trend') render(false);
+    let next = 0;
+    const worker = async () => {
+        while (next < T.months.length && tok === _trendToken && !T.failed) {
+            const m = T.months[next++];
+            // The report's own query for this month alone, in part order.
+            const f = Object.assign({}, F, { range: 'custom', from: m.from, to: m.to, groupBy: 'part' });
+            let rows;
+            try { rows = await q('Turnover ' + m.ym, buildSQL(f, lim)); }
+            catch (e) { if (tok === _trendToken) T.failed = e.message; return; }
+            if (tok !== _trendToken) return;
+            m.rows = rows.map(rowOf);
+            T.done++;
+            syncLoading();
+            if (S.view === 'trend') setStatus(trendStatus());
+        }
+    };
+    await Promise.all(Array.from({ length: Math.min(TREND_PARALLEL, T.months.length) }, worker));
+    if (tok !== _trendToken) return;               // cancelled by a newer load
+    T.busy = false;
+    T.ms = Math.round(performance.now() - T.t0);
+    debugLog('Monthly trend: ' + plural(T.months.length, 'month') + ' in ' + T.ms + ' ms' + (T.failed ? ' (failed)' : ''), T.failed ? 'error' : 'success');
+    if (T.failed) document.getElementById('banner').textContent = 'A monthly query failed: ' + T.failed + '. The debug console (Settings) has the SQL.';
+    syncLoading();
+    if (S.view === 'trend') render(false);
+}
+
+// The loading overlay: the report's load, or the trend's months while the trend is on show.
+function syncLoading() {
+    const T = S.trend, trendBusy = S.view === 'trend' && !!T && T.busy;
+    const el = document.getElementById('loading');
+    el.classList.toggle('show', S.loading || trendBusy);
+    el.querySelector('.lo-label').textContent = !S.loading && trendBusy ? trendProgress() : 'Loading…';
+}
+const trendProgress = () => 'Loading month ' + Math.min(S.trend.done + 1, S.trend.months.length).toLocaleString() + ' of ' + S.trend.months.length.toLocaleString() + '…';
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+
+// ============================================================================
+//  MODEL — the original's group and report variables, evaluated row by row
+//  in its declaration order (each running total sees its own row first).
+// ============================================================================
+const byPart = () => F.groupBy !== 'lg';
+
+// One running total block: groupTotal* / reportTotal* in the jrxml.
+function newTotals() { return { sold: 0, qoh: 0, to: 0, daysSum: 0, n: 0 }; }
+function addRow(t, r) {
+    t.sold += r.sold;                                      // ...TotalSold        (Sum)
+    t.qoh += r.qoh;                                        // ...TotalAvgQOH      (Sum)
+    t.to += t.sold === 0 ? 0 : (t.qoh === 0 ? 0 : (r.qoh !== 0 ? r.sold / r.qoh : 0));   // ...TotalTurnover (Sum)
+    t.daysSum += r.datediff; t.n += 1;                     // ...TotalAvgDays     (Average)
+}
+const avgDays = t => t.n ? t.daysSum / t.n : 0;
+const toDays = t => (t.sold === 0 || t.to === 0) ? 0 : avgDays(t) / t.to;
+
+function groups() {
+    const out = [];
+    S.rows.forEach(r => {
+        const key = byPart() ? r.part : r.lg;
+        let g = out.length && out[out.length - 1].key === key ? out[out.length - 1] : null;
+        if (!g) { g = { key, desc: r.desc, rows: [], t: newTotals() }; out.push(g); }
+        g.rows.push(r);
+        addRow(g.t, r);
+    });
+    return out;
+}
+function companyTotals() { const t = newTotals(); S.rows.forEach(r => addRow(t, r)); return t; }
+
+// ============================================================================
+//  TABLE
+// ============================================================================
+// The original's columns, then in the user's order (FBLib.RptCols).
+function cols() {
+    const base = [
+        byPart() ? { key: 'lg', label: 'Location Group', w: 160 } : { key: 'part', label: 'Part Number', w: 140 },
+        { key: 'desc',   label: 'Part Description', w: 300 },
+        { key: 'sold',   label: 'Units Sold',   w: 100, num: true, tip: 'Quantity fulfilled on sales order lines whose last fulfilment is in the range, in the part\'s unit' },
+        { key: 'qoh',    label: 'Avg QOH',      w: 100, num: true, tip: 'Average on-hand recorded with each inventory event in the range' },
+        { key: 'toDays', label: 'Avg. TO Days', w: 100, num: true, tip: 'Days in the range ÷ TO Rate' },
+        { key: 'rate',   label: 'TO Rate',      w: 90,  num: true, tip: 'Units Sold ÷ Avg QOH' }
+    ];
+    return COLS ? COLS.arrange(base) : base;
+}
+const headRow = cs => '<tr>' + cs.map(c =>
+    `<th data-col="${c.key}" class="${c.num ? 'num-cell' : ''}" style="min-width:${c.w}px"${c.tip ? ` title="${esc(c.tip)}"` : ''}>${esc(c.label)}</th>`).join('') + '</tr>';
+const rowCells = (cs, cell) => cs.map(c => `<td class="${c.num ? 'num-cell' : ''}">${cell[c.key] ?? ''}</td>`).join('');
+// Heading-click sort (FBLib.RptCols): rows sort within their group; the
+// groups keep the standard order, and their totals are still run over the
+// rows in that order (groups() above), so sorting never changes a total.
+const sortVal = (r, k) => ({ lg: r.lg, part: r.part, desc: r.desc, sold: r.sold, qoh: r.qoh, toDays: r.toDays, rate: r.rate })[k];
+const sortLines = list => (COLS && COLS.sort() ? list.slice().sort((a, b) => COLS.compare(a, b, sortVal)) : list);
+// A totals row: `identity` spans the first run of columns without a figure
+// (whatever order the user has put the columns in); each figure sits in
+// its own column.
+function totalsCells(cs, identity, t) {
+    const fig = { sold: fmtQty(t.sold), qoh: fmtQty(t.qoh), toDays: fmtQty(toDays(t)), rate: fmtQty(t.to) };
+    let a = cs.findIndex(c => fig[c.key] == null);
+    if (a < 0) a = 0;
+    let b = a + 1;
+    while (b < cs.length && fig[cs[b].key] == null) b++;
+    const cell = c => `<td class="${c.num ? 'num-cell' : ''}">${esc(fig[c.key] ?? '')}</td>`;
+    return cs.slice(0, a).map(cell).join('') + `<td colspan="${b - a}">${identity}</td>` + cs.slice(b).map(cell).join('');
+}
+
+function groupRow(cs, g, forPrint) {
+    const open = !S.collapsed.has(g.key);
+    const name = byPart()
+        ? openLink('Part', g.key, g.desc) + (g.desc ? `<span class="grp-desc"> – ${esc(g.desc)}</span>` : '')
+        : `<span>${esc(g.key)}</span>`;
+    const meta = byPart() ? plural(g.rows.length, 'location group') : plural(g.rows.length, 'part');
+    const id = '<div class="rpt-grp-inner">' + (forPrint ? '' : `<span class="rpt-toggle">${open ? '▼' : '▶'}</span>`) +
+        name + `<span class="rpt-grp-meta">Totals · ${esc(meta)}</span></div>`;
+    return `<tr class="rpt-grp" data-grp="${esc(g.key)}">${totalsCells(cs, id, g.t)}</tr>`;
+}
+function lineRow(cs, r) {
+    return '<tr>' + rowCells(cs, {
+        lg: esc(r.lg), part: openLink('Part', r.part, r.desc), desc: cut(r.desc),
+        sold: esc(fmtQty(r.sold)), qoh: esc(fmtQty(r.qoh)), toDays: esc(fmtQty(r.toDays)), rate: esc(fmtQty(r.rate))
+    }) + '</tr>';
+}
+function bodyRows(cs, forPrint) {
+    const out = [];
+    groups().forEach(g => {
+        out.push(groupRow(cs, g, forPrint));
+        if (!S.collapsed.has(g.key)) sortLines(g.rows).forEach(r => out.push(lineRow(cs, r)));
+    });
+    return out;
+}
+function footRow(cs) {
+    return '<tr>' + totalsCells(cs, 'Company Totals — ' + esc(plural(S.rows.length, 'row')), companyTotals()) + '</tr>';
+}
+
+// ============================================================================
+//  RANKING — every row of the table in one list by TO Rate, highest first
+//  (ties: more Units Sold first, then part number), with its rank. Company-
+//  wide: one row per part across its location groups, TO Rate = Σ units
+//  sold ÷ Σ avg QOH (the part's whole stock). That is NOT the report's own
+//  total, which adds the location groups' rates (see Help).
+// ============================================================================
+const k9 = v => Math.round(v * 1e9);            // compare figures without float noise
+function rankList() {
+    let list;
+    if (F.rankCo) {
+        const m = new Map();
+        S.rows.forEach(r => {
+            let p = m.get(r.part);
+            if (!p) m.set(r.part, p = { part: r.part, desc: r.desc, lgs: [], sold: 0, qoh: 0, datediff: r.datediff });
+            p.lgs.push(r.lg); p.sold += r.sold; p.qoh += r.qoh;
+        });
+        list = [...m.values()].map(p => {
+            const rate = p.qoh !== 0 ? p.sold / p.qoh : 0;
+            return Object.assign(p, { lg: p.lgs.join(', '), rate, toDays: (p.sold === 0 || rate === 0) ? 0 : p.datediff / rate });
+        });
+    } else list = S.rows.map(r => Object.assign({}, r));
+    list.sort((a, b) => k9(b.rate) - k9(a.rate) || k9(b.sold) - k9(a.sold) || cmpText(a.part, b.part) || cmpText(a.lg, b.lg));
+    // Equal TO Rate and Units Sold share a rank (1, 2, 2, 4).
+    list.forEach((r, i) => { const p = list[i - 1]; r.rank = p && k9(p.rate) === k9(r.rate) && k9(p.sold) === k9(r.sold) ? p.rank : i + 1; });
+    return list;
+}
+function rankCols() {
+    const base = [
+        { key: 'rank',   label: '#',                w: 50,  num: true, tip: 'Rank by TO Rate, highest first; equal rates rank more Units Sold first' },
+        { key: 'part',   label: 'Part Number',      w: 130 },
+        { key: 'desc',   label: 'Part Description', w: 260 },
+        { key: 'lg',     label: F.rankCo ? 'Location Groups' : 'Location Group', w: 150 },
+        { key: 'sold',   label: 'Units Sold',       w: 100, num: true },
+        { key: 'qoh',    label: 'Avg QOH',          w: 100, num: true },
+        { key: 'rate',   label: 'TO Rate',          w: 90,  num: true, tip: F.rankCo ? 'Σ units sold ÷ Σ avg QOH over the part\'s location groups' : 'Units Sold ÷ Avg QOH' },
+        { key: 'toDays', label: 'Avg. TO Days',     w: 100, num: true, tip: 'Days in the range ÷ TO Rate' }
+    ];
+    return RCOLS ? RCOLS.arrange(base) : base;
+}
+// Heading clicks re-sort the list; the rank stays the TO Rate rank.
+const rankSorted = list => (RCOLS && RCOLS.sort() ? list.slice().sort((a, b) => RCOLS.compare(a, b, (r, k) => r[k])) : list);
+const rankBody = (cs, list) => rankSorted(list).map(r => '<tr>' + cs.map(c => {
+    const v = { rank: esc(r.rank), part: openLink('Part', r.part, r.desc), desc: cut(r.desc), lg: cut(r.lg),
+                sold: esc(fmtQty(r.sold)), qoh: esc(fmtQty(r.qoh)), rate: esc(fmtQty(r.rate)), toDays: esc(fmtQty(r.toDays)) }[c.key];
+    return `<td class="${c.key === 'rank' ? 'num-cell rank-cell' : c.num ? 'num-cell' : ''}">${v ?? ''}</td>`;
+}).join('') + '</tr>');
+// The footer: per location group, the report's own Company Totals (TO Rate
+// = the rows' rates added up, as in the Table view); company-wide, the same
+// pooled rule as the rows: Σ units sold ÷ Σ avg QOH over everything.
+function rankFootFigs(list) {
+    if (!F.rankCo) { const t = companyTotals(); return { label: 'Company Totals — ' + plural(list.length, 'row'), sold: t.sold, qoh: t.qoh, rate: t.to, toDays: toDays(t) }; }
+    const sold = list.reduce((s, r) => s + r.sold, 0), qoh = list.reduce((s, r) => s + r.qoh, 0), rate = qoh !== 0 ? sold / qoh : 0;
+    const days = S.rows.length ? S.rows[0].datediff : 0;
+    return { label: 'All parts — ' + plural(list.length, 'part') + ' (Σ units sold ÷ Σ avg QOH)', sold, qoh, rate, toDays: (sold === 0 || rate === 0) ? 0 : days / rate };
+}
+// The # column keeps a cell of its own (blank) so the label spans the part
+// columns, wherever the user has moved the figures.
+function rankFoot(cs, list) {
+    const t = rankFootFigs(list);
+    return '<tr>' + FBLib.RptCols.totalsCells(cs, esc(t.label),
+        { rank: '&nbsp;', sold: esc(fmtQty(t.sold)), qoh: esc(fmtQty(t.qoh)), rate: esc(fmtQty(t.rate)), toDays: esc(fmtQty(t.toDays)) }) + '</tr>';
+}
+const rankText = () => 'Ranked by TO Rate, highest first' + (F.rankCo ? ' · company-wide (Σ units sold ÷ Σ avg QOH per part)' : ' · per location group');
+
+// ============================================================================
+//  MONTHLY TREND — rows: a part (the report's group-by-part totals for the
+//  month: Units Sold added up, TO Rate = its location groups' rates added
+//  up) or a part × location group (the report's row for the month); a
+//  column per month, then the whole range (the Table view's figure). "—" =
+//  no inventory event that month, so the report doesn't list it. The
+//  Company Totals add each column up, the report's own rule.
+// ============================================================================
+function trendModel() {
+    const T = S.trend, byLg = F.trendRows === 'partLg', sold = F.trendFig === 'sold';
+    const fig = t => (sold ? t.sold : t.to);
+    const rows = new Map();
+    const get = (part, desc, lg) => {
+        const k = byLg ? JSON.stringify([part, lg]) : part;
+        let o = rows.get(k);
+        if (!o) rows.set(k, o = { part, desc, lg: byLg ? lg : '', v: {} });
+        return o;
+    };
+    T.months.forEach(m => {
+        if (!m.rows) return;
+        if (byLg) { m.rows.forEach(r => { get(r.part, r.desc, r.lg).v[m.key] = sold ? r.sold : r.rate; }); return; }
+        const per = new Map();
+        m.rows.forEach(r => { let g = per.get(r.part); if (!g) per.set(r.part, g = { r, t: newTotals() }); addRow(g.t, r); });
+        per.forEach(g => { get(g.r.part, g.r.desc).v[m.key] = fig(g.t); });
+    });
+    // Whole range: the Table view's figure (its row, or the part's group totals).
+    if (byLg) S.rows.forEach(r => { const o = rows.get(JSON.stringify([r.part, r.lg])); if (o) o.v.whole = sold ? r.sold : r.rate; });
+    else {
+        const per = new Map();
+        S.rows.forEach(r => { let t = per.get(r.part); if (!t) per.set(r.part, t = newTotals()); addRow(t, r); });
+        rows.forEach(o => { const t = per.get(o.part); if (t) o.v.whole = fig(t); });
+    }
+    const list = [...rows.values()].sort((a, b) => cmpText(a.part, b.part) || cmpText(a.lg, b.lg));
+    const foot = {};
+    T.months.map(m => m.key).concat('whole').forEach(k => {
+        let s = null;
+        list.forEach(o => { if (o.v[k] != null) s = (s || 0) + o.v[k]; });
+        foot[k] = s;
+    });
+    return { list, foot };
+}
+function trendCols() {
+    const T = S.trend, sold = F.trendFig === 'sold';
+    const base = [{ key: 'part', label: 'Part Number', w: 130 }, { key: 'desc', label: 'Part Description', w: 240 }]
+        .concat(F.trendRows === 'partLg' ? [{ key: 'lg', label: 'Location Group', w: 140 }] : [])
+        .concat(T.months.map(m => ({ key: m.key, label: monthLabel(m), w: 80, num: true,
+            tip: (sold ? 'Units Sold' : 'TO Rate') + ', ' + FBLib.Common.formatDate(m.from) + ' – ' + FBLib.Common.formatDate(m.to) })))
+        .concat([{ key: 'whole', label: 'Whole range', w: 100, num: true, tip: 'The Table view\'s figure for the whole date range (not the months added up)' }]);
+    return TCOLS ? TCOLS.arrange(base) : base;
+}
+const NONE = '<span class="trend-none" title="No inventory event: the report doesn\'t list it">—</span>';
+// TO Rates to 2 places (a ratio; 24 months side by side stay legible, in print too); Units
+// Sold as the report shows quantities. Excel keeps every figure in full.
+const rate2 = v => String(Math.round(v * 100) / 100);
+const trendVal = v => (v == null ? NONE : esc(F.trendFig === 'sold' ? fmtQty(v) : rate2(v)));
+const trendSorted = list => (TCOLS && TCOLS.sort() ? list.slice().sort((a, b) => TCOLS.compare(a, b, (o, k) => (k === 'part' || k === 'desc' || k === 'lg' ? o[k] : o.v[k]))) : list);
+const trendBody = (cs, list) => trendSorted(list).map(o => '<tr>' + cs.map(c => {
+    const v = c.key === 'part' ? openLink('Part', o.part, o.desc) : c.key === 'desc' ? cut(o.desc) : c.key === 'lg' ? esc(o.lg) : trendVal(o.v[c.key]);
+    return `<td class="${c.num ? 'num-cell' : ''}">${v}</td>`;
+}).join('') + '</tr>');
+function trendFoot(cs, model) {
+    const figs = {};
+    cs.filter(c => c.num).forEach(c => { figs[c.key] = trendVal(model.foot[c.key]); });
+    return '<tr>' + FBLib.RptCols.totalsCells(cs, esc('Company Totals — ' + plural(model.list.length, F.trendRows === 'partLg' ? 'row' : 'part')), figs) + '</tr>';
+}
+function trendText() {
+    const T = S.trend;
+    return 'Monthly trend: ' + (F.trendFig === 'sold' ? 'Units Sold' : 'TO Rate') + ' by ' + (F.trendRows === 'partLg' ? 'part × location group' : 'part') +
+        (T && T.months.length ? ', ' + monthLabel(T.months[0]) + (T.months.length > 1 ? ' – ' + monthLabel(T.months[T.months.length - 1]) : '') : '') +
+        (T && T.dropped ? ' (the last ' + TREND_MAX + ' months)' : '');
+}
+// The note over the trend: months cut off, months not started, the row cap.
+function trendNote() {
+    const T = S.trend;
+    if (!T || T.busy) return '';
+    const out = [];
+    if (T.dropped) out.push('The range has ' + T.started + ' months; the trend shows the last ' + TREND_MAX + '.');
+    if (T.future) out.push(plural(T.future, 'month') + ' of the range ' + (T.future === 1 ? 'starts' : 'start') + ' after today and ' + (T.future === 1 ? 'is' : 'are') + ' left out.');
+    if (S.cut) out.push('Like the table, it covers the rows loaded: Load all for every part.');
+    return out.join(' ');
+}
+function trendStatus() {
+    const T = S.trend;
+    if (!T || T.busy) return [S.company, rangeText(F), 'Monthly trend', T ? trendProgress() : 'Loading…'].join(' · ');
+    return [S.company, rangeText(F), trendText(), T.failed ? 'a month failed to load' : 'loaded in ' + (T.ms / 1000).toFixed(1) + ' s'].filter(Boolean).join(' · ');
+}
+
+// Long reports paint in chunks as the user scrolls (the table on show).
+const CHUNK = 600;
+let _paint = { tbody: null, html: [], shown: 0 };
+function appendChunk() {
+    if (!_paint.tbody || _paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    _paint.tbody.insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+// Paints a table's body; returns the scroll position to keep.
+function paint(tbl, wrap, html, keepScroll) {
+    const top = wrap.scrollTop;
+    _paint = { tbody: tbl.tBodies[0], html, shown: 0 };
+    _paint.tbody.innerHTML = '';
+    appendChunk();
+    while (keepScroll && _paint.shown < _paint.html.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+    return top;
+}
+
+function filterText() {
+    const lgs = F.lgs.length ? F.lgs.map(id => S.lgNames[id] || id).join(', ') : 'All my location groups';
+    return [lgs, F.part ? 'Part ' + F.part : ''].filter(Boolean).join(' · ');
+}
+
+function renderRank(keepScroll) {
+    const tbl = document.getElementById('rankTbl'), wrap = document.getElementById('rankWrap');
+    const cs = rankCols(), list = rankList();
+    tbl.querySelector('thead').innerHTML = headRow(cs);
+    const top = paint(tbl, wrap, rankBody(cs, list), keepScroll);
+    tbl.querySelector('tfoot').innerHTML = list.length ? rankFoot(cs, list) : '';
+    tbl.style.display = list.length ? '' : 'none';
+    document.getElementById('rankEmpty').textContent = list.length || !S.loadedAt ? '' : 'No inventory activity matches these filters.';
+    wrap.scrollTop = keepScroll ? top : 0;
+    setStatus([S.company, rangeText(F), 'Ranking' + (F.rankCo ? ' (company-wide)' : ''),
+               S.loadedAt ? plural(list.length, F.rankCo ? 'part' : 'row') : ''].filter(Boolean).join(' · '));
+}
+function renderTrend(keepScroll) {
+    const T = S.trend, tbl = document.getElementById('trendTbl'), wrap = document.getElementById('trendWrap');
+    const note = document.getElementById('trendNote');
+    note.textContent = trendNote();
+    note.style.display = note.textContent ? '' : 'none';
+    const ready = !!T && !T.busy && !T.failed;
+    const model = ready ? trendModel() : { list: [], foot: {} };
+    const cs = ready ? trendCols() : [];
+    tbl.querySelector('thead').innerHTML = ready ? headRow(cs) : '';
+    const top = paint(tbl, wrap, ready ? trendBody(cs, model.list) : [], keepScroll);
+    tbl.querySelector('tfoot').innerHTML = model.list.length ? trendFoot(cs, model) : '';
+    tbl.style.display = model.list.length ? '' : 'none';
+    document.getElementById('trendEmpty').textContent = model.list.length ? '' : trendEmptyText();
+    wrap.scrollTop = keepScroll ? top : 0;
+    setStatus(trendStatus());
+}
+function trendEmptyText() {
+    const T = S.trend;
+    return !T || T.busy || !S.loadedAt ? ''
+        : T.failed ? 'The monthly figures could not be loaded: see the message above.'
+        : !T.months.length ? 'No month of this range has started yet.'
+        : 'No inventory activity matches these filters in any month.';
+}
+
+function render(keepScroll) {
+    syncLoading();
+    if (S.view === 'pivot' && PIVOT) {
+        PIVOT.render();
+        setStatus([S.company, rangeText(F), 'pivot', S.loadedAt ? plural(S.rows.length, 'row') : ''].filter(Boolean).join(' · '));
+        if (PDF) PDF.refresh();
+        return;
+    }
+    if (S.view === 'rank' || S.view === 'trend') {
+        if (S.view === 'rank') renderRank(keepScroll); else renderTrend(keepScroll);
+        if (S.loading) setStatus('Loading…');
+        if (PDF) PDF.refresh();
+        return;
+    }
+    const tbl = document.getElementById('rpt');
+    const wrap = document.getElementById('rptWrap');
+    const cs = cols();
+    tbl.querySelector('thead').innerHTML = headRow(cs);
+    const top = paint(tbl, wrap, bodyRows(cs, false), keepScroll);
+    tbl.querySelector('tfoot').innerHTML = S.rows.length ? footRow(cs) : '';
+    tbl.style.display = S.rows.length ? '' : 'none';
+    document.getElementById('rptEmpty').textContent = S.rows.length || !S.loadedAt ? '' : 'No inventory activity matches these filters.';
+    wrap.scrollTop = keepScroll ? top : 0;
+    const parts = [S.company, rangeText(F)];
+    if (S.loadedAt) parts.push(plural(S.rows.length, 'row') + ', grouped by ' + GROUP_LABEL[F.groupBy] + ' · loaded ' +
+        S.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    setStatus(parts.filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the pages as the standard Turnover Report prints
+//  them: Letter portrait, the company / title / date range on every page
+//  (the original's page header), group rows carrying their totals, the
+//  Company Totals after the last line.
+// ============================================================================
+let PDF = null;
+// A group heading keeps its name (part number, location group) on one
+// line and wraps the rest ("(continued)" too) between words: a page cell
+// otherwise lets them break anywhere, splitting the part number. A part's
+// heading is its number alone, as the original's group header: its lines
+// carry the Part Description.
+const PDF_CSS =
+    '.fbdoc-rpt-tbl .rpt-grp-inner{overflow-wrap:break-word}' +
+    '.fbdoc-rpt-tbl .rpt-grp-inner>:first-child{white-space:nowrap}' +
+    '.fbdoc-rpt-tbl .grp-desc{display:none}';
+// The plain printout's sub-heading: date range, grouping and filters.
+const printSubtitle = () => rangeText(F) + ' · Grouped by ' + GROUP_LABEL[F.groupBy] + ' · ' + filterText();
+function docSpec() {
+    if (!S.loadedAt) return null;
+    if (S.view === 'pivot' && PIVOT) {
+        const p = PIVOT.pdfSpec();
+        return { company: S.company, title: 'Turnover Report', subtitle: [rangeText(F) + ' · ' + filterText(), pivotText()], titleEveryPage: true,
+                 head: p.head, rows: p.rows, foot: p.foot, empty: 'No inventory activity matches these filters.', css: PDF_CSS, fontPt: 10 };
+    }
+    if (S.view === 'rank') {
+        const cs = rankCols(), list = rankList();
+        return { company: S.company, title: 'Turnover Report', subtitle: [rangeText(F) + ' · ' + filterText(), rankText()], titleEveryPage: true,
+                 head: headRow(cs), rows: rankBody(cs, list), foot: list.length ? rankFoot(cs, list) : '',
+                 empty: 'No inventory activity matches these filters.', css: PDF_CSS, fontPt: 10 };
+    }
+    if (S.view === 'trend') {
+        const T = S.trend;
+        if (!T || T.busy) return null;               // laid out when the months are in
+        // More than 6 months: the pages leave the description out (the part
+        // number names the part, as the report's own group headings do) so
+        // the months keep a readable size; more than 12: months headed
+        // "Jun 24".
+        const short = T.months.length > 12, byKey = {};
+        T.months.forEach(m => { byKey[m.key] = MON[+m.ym.slice(5, 7) - 1] + ' ' + m.ym.slice(2, 4); });
+        const model = T.failed ? { list: [] } : trendModel();
+        const cs = trendCols().filter(c => c.key !== 'desc' || T.months.length <= 6)
+            .map(c => (short && byKey[c.key] ? Object.assign({}, c, { label: byKey[c.key] }) : c));
+        return { company: S.company, title: 'Turnover Report', subtitle: [rangeText(F) + ' · ' + filterText(), trendText()], titleEveryPage: true,
+                 head: headRow(cs), rows: model.list.length ? trendBody(cs, model.list) : [], foot: model.list.length ? trendFoot(cs, model) : '',
+                 empty: trendEmptyText() || 'No inventory activity matches these filters in any month.', css: PDF_CSS, fontPt: 10 };
+    }
+    const cs = cols();
+    return {
+        company: S.company, title: 'Turnover Report', subtitle: printSubtitle(), titleEveryPage: true,
+        head: headRow(cs), rows: bodyRows(cs, true), foot: S.rows.length ? footRow(cs) : '',
+        empty: 'No inventory activity matches these filters.', css: PDF_CSS, fontPt: 10
+    };
+}
+
+// ============================================================================
+//  PIVOT VIEW (FBLib.Pivot) — any figure by part × location group, side by
+//  side. Summed, the TO Rates are the report's own totals (the jrxml totals
+//  a TO Rate as the sum of the rows' rates). The report's own grouping
+//  stays in the Table view.
+// ============================================================================
+let PIVOT = null, COLS = null, RCOLS = null, TCOLS = null;     // RptCols of the Table / Ranking / Monthly trend
+const PIVOT_FIELDS = [
+    { key: 'part', label: 'Part Number' }, { key: 'desc', label: 'Part Description', dim: false }, { key: 'lg', label: 'Location Group' },
+    { key: 'sold', label: 'Units Sold', type: 'qty' }, { key: 'qoh', label: 'Avg QOH', type: 'qty' },
+    { key: 'toDays', label: 'Avg. TO Days', type: 'number' }, { key: 'rate', label: 'TO Rate', type: 'number' }
+];
+const pivotRows = () => S.rows.map(r => ({ part: r.part, desc: r.desc, lg: r.lg, sold: r.sold, qoh: r.qoh, toDays: r.toDays, rate: r.rate }));
+function pivotText() {
+    const c = PIVOT.config(), lbl = k => (PIVOT_FIELDS.find(x => x.key === k) || {}).label || '';
+    const m = c.measure === '__count__' ? 'Row count'
+        : ({ sum: 'Total', count: 'Count of', avg: 'Average', min: 'Lowest', max: 'Highest' }[c.agg] + ' ' + lbl(c.measure));
+    return 'Pivot: ' + m + ' by ' + [lbl(c.rowDim), lbl(c.rowDim2)].filter(Boolean).join(' + ') + (c.colDim ? ' × ' + lbl(c.colDim) : '');
+}
+function setView(v, persist) {
+    S.view = v === 'pivot' ? (PIVOT ? 'pivot' : 'table') : (VIEWS.indexOf(v) !== -1 ? v : 'table');
+    const show = (id, on) => { document.getElementById(id).style.display = on ? '' : 'none'; };
+    document.getElementById('viewSel').value = S.view;
+    show('rptWrap', S.view === 'table');
+    show('rankWrap', S.view === 'rank');
+    show('trendWrap', S.view === 'trend');
+    if (S.view !== 'trend') show('trendNote', false);
+    show('pivotHost', S.view === 'pivot');
+    document.getElementById('expandBtn').parentNode.style.display = S.view === 'table' ? '' : 'none';
+    // The Filters panel's view options: those of the view on show.
+    show('viewOpts', S.view === 'rank' || S.view === 'trend');
+    show('optRank', S.view === 'rank');
+    show('optTrend', S.view === 'trend');
+    document.getElementById('viewOptsTitle').textContent = S.view === 'trend' ? 'Monthly trend' : 'Ranking';
+    if (persist) _saveUserKeys({ view: S.view });
+    // The trend's months load the first time it is shown after a load.
+    if (S.view === 'trend' && S.loadedAt && !S.loading && (!S.trend || (S.trend.failed && !S.trend.busy))) { loadTrend(); return; }
+    render(false);
+}
+
+function setAllOpen(open) {
+    S.collapsed = new Set(open ? [] : groups().map(g => g.key));
+    render(false);
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    const sub = [S.company, rangeText(F), 'Grouped by ' + GROUP_LABEL[F.groupBy], filterText()].filter(Boolean);
+    // Units Sold / Avg QOH / TO Rate total as the report does (a sum);
+    // Avg. TO Days is a ratio, never summed.
+    const figs = [{ key: 'sold', label: 'Units Sold', w: 100, type: 'qty' }, { key: 'qoh', label: 'Avg QOH', w: 100, type: 'qty' },
+                  { key: 'toDays', label: 'Avg. TO Days', w: 100, type: 'qty', noTotal: true }, { key: 'rate', label: 'TO Rate', w: 90, type: 'qty' }];
+    const grpCol = { key: 'group', label: GROUP_LABEL[F.groupBy], w: 160, type: 'text' };
+    const sheets = [
+        { name: 'Detail', title: 'Turnover Report', subtitle: sub,
+          cols: [grpCol, { key: 'part', label: 'Part Number', w: 130, type: 'text' }, { key: 'desc', label: 'Part Description', w: 280, type: 'text' },
+                 { key: 'lg', label: 'Location Group', w: 150, type: 'text' }].filter((c, i) => i === 0 || c.key !== (byPart() ? 'part' : 'lg')).concat(figs),
+          rows: S.rows.map(r => Object.assign({ group: byPart() ? r.part : r.lg }, r)), totals: true },
+        { name: 'Group Totals', title: 'Turnover Report – ' + GROUP_LABEL[F.groupBy] + ' Totals', subtitle: sub,
+          cols: [grpCol].concat(byPart() ? [{ key: 'desc', label: 'Part Description', w: 280, type: 'text' }] : [])
+                .concat([{ key: 'n', label: byPart() ? 'Location Groups' : 'Parts', w: 90, type: 'int', noTotal: true }]).concat(figs),
+          rows: groups().map(g => ({ group: g.key, desc: g.desc, n: g.rows.length, sold: g.t.sold, qoh: g.t.qoh, toDays: toDays(g.t), rate: g.t.to })),
+          totals: true }
+    ];
+    if (S.view === 'pivot' && PIVOT) sheets.unshift(Object.assign(PIVOT.sheet('Pivot'), { title: 'Turnover Report – ' + pivotText(), subtitle: sub }));
+    // Ranking / Monthly trend: their own sheet first, the columns in the
+    // user's order, the footer row as on screen (it isn't always a sum).
+    const xtype = c => (c.key === 'rank' ? 'int' : c.num ? 'qty' : 'text');
+    if (S.view === 'rank') {
+        const cs = rankCols(), list = rankSorted(rankList()), t = rankFootFigs(list);
+        sheets.unshift({ name: 'Ranking', title: 'Turnover Report – Ranking', subtitle: sub.concat(rankText()),
+            cols: cs.map(c => ({ key: c.key, label: c.label, w: c.w, type: xtype(c) })),
+            rows: list.map(r => ({ rank: r.rank, part: r.part, desc: r.desc, lg: r.lg, sold: r.sold, qoh: r.qoh, rate: r.rate, toDays: r.toDays }))
+                .concat([{ part: t.label, sold: t.sold, qoh: t.qoh, rate: t.rate, toDays: t.toDays, __row: 'total' }]),
+            totals: false });
+    }
+    if (S.view === 'trend') {
+        const T = S.trend;
+        if (!T || T.busy) { showToast('The months are still loading: export again when they are in.', 'warn'); return; }
+        if (!T.failed) {
+            const cs = trendCols(), model = trendModel(), list = trendSorted(model.list);
+            const row = o => { const x = { part: o.part, desc: o.desc, lg: o.lg }; cs.filter(c => c.num).forEach(c => { x[c.key] = o.v[c.key] ?? null; }); return x; };
+            sheets.unshift({ name: 'Monthly Trend', title: 'Turnover Report – Monthly Trend', subtitle: sub.concat(trendText()),
+                cols: cs.map(c => ({ key: c.key, label: c.label, w: c.w, type: xtype(c) })),
+                rows: list.map(row).concat([Object.assign(row({ part: 'Company Totals', desc: '', lg: '', v: model.foot }), { __row: 'total' })]),
+                totals: false });
+        }
+    }
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'Turnover_Report_' + ymd(new Date()), sheets });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's pages (fb-doc). Without fb-doc on the server, the
+// plain printout below: JxBrowser won't print the report page itself, so it
+// is built in a new window and printed there. Collapsed groups print as
+// their totals. Both follow the view on show.
+function printReport() {
+    if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+    if (S.view === 'trend' && (!S.trend || S.trend.busy)) { showToast('The months are still loading: print again when they are in.', 'warn'); return; }
+    if (PDF) {
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    const d = docSpec();
+    if (!d || !S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Turnover Report</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:11pt;font-weight:700}h2{text-align:center;font-size:14pt;margin:2px 0}.sub{text-align:center;font-size:8.5pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{font-size:8pt;text-align:left;padding:3px 5px;border-bottom:1px solid #000;vertical-align:bottom}' +
+        'td{font-size:8pt;padding:2px 5px;vertical-align:top}.num-cell{text-align:right}' +
+        'tr.rpt-grp td{font-weight:700;padding-top:7px;border-bottom:1px solid #999}.rpt-grp-meta{font-weight:400;color:#555;margin-left:8px}' +
+        '.grp-desc{font-weight:400;color:#555}tfoot td{font-weight:700;border-top:1px solid #000}a{color:#000;text-decoration:none}' +
+        '.trend-none{color:#777}' +
+        '@page{size:Letter portrait;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>Turnover Report</h2>' + [].concat(d.subtitle).map(s => '<p class="sub">' + esc(s) + '</p>').join('') +
+        '<table><thead>' + d.head.replace(/ style="[^"]*"/g, '') + '</thead><tbody>' + d.rows.join('') +
+        '</tbody><tfoot>' + (d.foot || '') + '</tfoot></table>' +
+        '<p style="font-size:7.5pt;margin-top:8px">Printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters what everyone sees each time this report opens?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        _lgMs = FBLib.Common.MultiSelect.create({ containerId: 'lgMs', items: [], placeholder: 'All my location groups', maxTags: 2, onClose: applySoon });
+
+        const fRange = document.getElementById('fRange');
+        fRange.innerHTML = RANGES.map(r => `<option value="${r[0]}">${esc(r[1])}</option>`).join('');
+        // A quick range fills the dates; editing a date makes the range Custom.
+        fRange.onchange = () => {
+            const p = presetDates(fRange.value);
+            if (fRange.value !== 'custom' && p) {
+                document.getElementById('fFrom').value = p[0];
+                document.getElementById('fTo').value = p[1];
+            }
+            applySoon();
+        };
+        ['fFrom', 'fTo'].forEach(id => document.getElementById(id).addEventListener('change', () => { fRange.value = 'custom'; applySoon(); }));
+        document.getElementById('fGroupBy').addEventListener('change', applySoon);
+        ['fRankCo', 'fTrendRows', 'fTrendFig'].forEach(id => document.getElementById(id).addEventListener('change', applySoon));
+        const fPart = document.getElementById('fPart');
+        fPart.addEventListener('change', applySoon);
+        fPart.addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        document.getElementById('resetFiltersBtn').onclick = () => { writeFilters(DEFAULT_FILTERS); applySoon(); };
+
+        // Column resize / sort / reorder, and the Pivot view (fb-lib).
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({ table: document.getElementById('rpt'), onSort: () => render(true), onReorder: () => render(true) });
+        // The Ranking and Monthly trend tables keep their own layouts. A
+        // trend's month columns stay in calendar order (they don't drag).
+        if (FBLib.RptCols) RCOLS = FBLib.RptCols.attach({ table: document.getElementById('rankTbl'), key: 'rankCols', onSort: () => render(true), onReorder: () => render(true) });
+        if (FBLib.RptCols) TCOLS = FBLib.RptCols.attach({ table: document.getElementById('trendTbl'), key: 'trendCols', draggable: k => !/^m\d{6}$/.test(k),
+                                                          onSort: () => render(true), onReorder: () => render(true) });
+        if (FBLib.Pivot) PIVOT = FBLib.Pivot.mount(document.getElementById('pivotHost'), {
+            fields: PIVOT_FIELDS, rows: pivotRows,
+            defaults: { rowDim: 'part', colDim: 'lg', measure: 'rate', agg: 'sum' },
+            format: (fld, v) => (fld && ['qty', 'number'].indexOf(fld.type) !== -1 ? fmtQty(v) : null)
+        });
+        else document.getElementById('viewSelWrap').style.display = 'none';
+        document.getElementById('viewSel').addEventListener('change', e => setView(e.target.value, true));
+        document.getElementById('resetColsBtn').onclick = () => { [COLS, RCOLS, TCOLS].forEach(c => c && c.reset()); render(false); };
+        S.view = _resolve('view', 'table');
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: document.getElementById('appView'), toggleBefore: document.getElementById('exportBtn'),
+                page: { size: 'Letter', orientation: 'portrait' },
+                doc: docSpec, title: () => 'Turnover Report'
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        setView(S.view, false);
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('expandBtn').onclick = () => setAllOpen(true);
+        document.getElementById('collapseBtn').onclick = () => setAllOpen(false);
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('unpublishBtn').onclick = () => {
+            if (!confirm('Stop using company defaults for this report? Everyone goes back to their own last choices.')) return;
+            const ok = FBLib.Settings.clearCompany(['filters', 'opts']) !== false;
+            showToast(ok ? 'This report no longer has company defaults.' : 'That was not saved.', ok ? 'success' : 'error');
+        };
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        ['rptWrap', 'rankWrap', 'trendWrap'].forEach(id => {
+            const wrap = document.getElementById(id);
+            wrap.addEventListener('scroll', () => { if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 400) appendChunk(); });
+        });
+        const openFrom = e => {
+            const a = e.target.closest('[data-open]');
+            if (!a) return false;
+            e.preventDefault();
+            try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+            catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+            return true;
+        };
+        document.getElementById('rankTbl').addEventListener('click', openFrom);
+        document.getElementById('trendTbl').addEventListener('click', openFrom);
+        document.getElementById('rpt').addEventListener('click', e => {
+            if (openFrom(e)) return;
+            const g = e.target.closest('tr.rpt-grp');
+            if (!g) return;
+            const key = g.dataset.grp;
+            if (S.collapsed.has(key)) S.collapsed.delete(key); else S.collapsed.add(key);
+            render(true);
+        });
+
+        await loadLookups();
+        writeFilters(savedFilters());
+        F = readFilters();          // drops saved picks that no longer exist
+        await loadAll();
+    } catch (e) {
+        console.error('[Turnover Report] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>
