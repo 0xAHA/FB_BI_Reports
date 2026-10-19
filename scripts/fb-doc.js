@@ -60,7 +60,7 @@
   'use strict';
 
   var FBDoc = {};
-  FBDoc.BUILD = '2026.10.16-ce518d1';   // @fb-build
+  FBDoc.BUILD = '2026.10.19-3670837';   // @fb-build
   FBDoc.VERSION = FBDoc.BUILD;
 
   // ===================================================================
@@ -2554,7 +2554,7 @@
 
     function control(box, it) {
       var name = it[0], label = it[1], kind = it[3], ph = it[4], tip = it[5], c;
-      var src = '<span class="fbdoc-opt-src hidden" data-optsrc="' + esc(name) + '" title="Set in the stock ' + esc(cfg.stock || '') + ' report\'s saved options">stock</span>';
+      var src = '';   // no per-option source pill for now (it marked every saved stock option, which said little)
       if (Array.isArray(kind) || kind === 'text') {
         var wrap = document.createElement('div');
         wrap.innerHTML = '<div class="rpt-flabel">' + esc(label) + src + '</div>' + (kind === 'text'
@@ -2675,7 +2675,7 @@
         var n = Object.keys(presetVals).length, co = false;
         try { co = !!L.Settings.hasCompany(key); } catch (_) {}
         note.textContent = (co ? 'Starting point: the company defaults. ' : '') + (n
-          ? 'The stock ' + (cfg.stock || '') + ' report\'s saved options set ' + n + ' option' + (n === 1 ? '' : 's') + ' (marked stock); the rest are the standard defaults.'
+          ? 'The stock ' + (cfg.stock || '') + ' report\'s saved options set ' + n + ' option' + (n === 1 ? '' : 's') + '; the rest are the standard defaults.'
           : 'The stock ' + (cfg.stock || '') + ' report has no saved options: the standard defaults apply.');
       },
       publish: function () {
