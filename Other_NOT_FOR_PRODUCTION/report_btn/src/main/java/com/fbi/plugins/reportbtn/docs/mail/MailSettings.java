@@ -37,7 +37,23 @@ public final class MailSettings {
         return new MailSettings();
     }
 
+    /**
+     * Signing in to an account in the email settings sets the server to smtp.gmail.com or
+     * smtp.microsoft.com, and both accounts' sign-ins can stay stored after switching, so
+     * the server says which one is current. Any other server is SMTP; with no server, the
+     * stored sign-in decides (Google first, as the settings panel does).
+     */
     public Route route() {
+        String host = server.toLowerCase();
+        if (host.equals("smtp.microsoft.com") && !blank(microsoftRefresh)) {
+            return Route.MICROSOFT;
+        }
+        if (host.equals("smtp.gmail.com") && !blank(googleRefresh)) {
+            return Route.GOOGLE;
+        }
+        if (!blank(server)) {
+            return Route.SMTP;
+        }
         if (!blank(googleRefresh)) {
             return Route.GOOGLE;
         }

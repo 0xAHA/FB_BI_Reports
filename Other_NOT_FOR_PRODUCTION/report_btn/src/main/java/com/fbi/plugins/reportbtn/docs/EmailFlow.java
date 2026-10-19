@@ -3,6 +3,7 @@ package com.fbi.plugins.reportbtn.docs;
 import com.evnt.client.EmailSettingsPanel;
 import com.evnt.client.modules.ClientModuleImpl;
 import com.fbi.plugins.reportbtn.WorkspaceHost;
+import com.fbi.plugins.reportbtn.docs.mail.EmailAddresses;
 import com.fbi.plugins.reportbtn.docs.mail.EmailComposer;
 import com.fbi.plugins.reportbtn.docs.mail.EmailDraft;
 import com.fbi.plugins.reportbtn.docs.mail.EmailTemplates;
@@ -12,6 +13,8 @@ import com.fbi.plugins.reportbtn.docs.mail.OwnMailProgram;
 import javax.swing.SwingWorker;
 import java.awt.Component;
 import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * From a document's PDF to an email: the module's template (subject and body) with
@@ -49,6 +52,16 @@ final class EmailFlow {
                 DocDefaults.setUsesMailProgram(userId, on);
             }
         };
+        // The To / Cc / Bcc buttons: the record's own address, its customer or vendor contacts, the Fishbowl users.
+        EmailComposer.AddressBook book = () -> {
+            List<EmailAddresses.Address> all = new ArrayList<>();
+            for (String a : rec.to) {
+                all.add(new EmailAddresses.Address("", a, "This " + slot.module.noun));
+            }
+            all.addAll(EmailAddresses.forRecord(Docs::rows, slot.module.code, recordId));
+            all.addAll(EmailAddresses.users(Docs::rows));
+            return all;
+        };
         String note = Docs.blank(t.source) ? "No email template is set for " + slot.module.noun + "s (Tools › Options › Email)."
             : "Template: " + t.source;
 
@@ -67,7 +80,7 @@ final class EmailFlow {
                         Throwable c = e.getCause() != null ? e.getCause() : e;
                         Docs.log("handing the email to the user's program failed", c);
                         Docs.error(parent, "Your email program didn't take the email (" + c.getMessage() + "). It opens here instead.");
-                        EmailComposer.open(parent, d, note, prefs);
+                        EmailComposer.open(parent, d, note, prefs, book);
                     }
                 }
             }.execute();
@@ -78,7 +91,7 @@ final class EmailFlow {
                 + "email program\" under Apps (beta) › Documents.");
             return;
         }
-        EmailComposer.open(parent, d, note, prefs);
+        EmailComposer.open(parent, d, note, prefs, book);
     }
 
     private static boolean emailSetUp() {

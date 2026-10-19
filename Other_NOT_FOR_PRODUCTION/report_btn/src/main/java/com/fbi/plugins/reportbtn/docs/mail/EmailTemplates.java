@@ -95,21 +95,60 @@ public final class EmailTemplates {
             + escape(t.body).replace("\n", "<br>") + "</body></html>";
     }
 
+    /** A footer written with HTML tags (the stock one is "<br><br><br>-----<br>This email was sent…"). */
+    private static final java.util.regex.Pattern FOOTER_TAG = java.util.regex.Pattern.compile(
+        "(?i)</?(br|p|div|span|a|b|i|u|strong|em|font|img|hr|table|tr|td|ul|ol|li|center|small|h[1-6])\\b[^>]*>");
+    private static final java.util.regex.Pattern URL = java.util.regex.Pattern.compile("(?i)\\b(https?://[^\\s<>\"']+|www\\.[^\\s<>\"']+)");
+
     /**
      * The email footer (Settings › Email), when one is set, before the closing body or
-     * html tag, its line breaks kept, as the stock window adds it.
+     * html tag, as the stock window adds it. A footer written with HTML tags goes in as
+     * HTML; a plain one is escaped, with its line breaks kept and its web addresses linked.
      */
     public static String withFooter(String html, String footer) {
         if (footer == null || footer.trim().isEmpty()) {
             return html;
         }
-        String f = "<br>" + escape(footer).replace("\r\n", "\n").replace("\n", "<br>");
+        String f = footerHtml(footer);
         String lower = html.toLowerCase();
         int at = lower.lastIndexOf("</body>");
         if (at < 0) {
             at = lower.lastIndexOf("</html>");
         }
         return at < 0 ? html + f : html.substring(0, at) + f + html.substring(at);
+    }
+
+    static String footerHtml(String footer) {
+        String text = footer.replace("\r\n", "\n").replace('\r', '\n');
+        if (!FOOTER_TAG.matcher(text).find()) {
+            return "<br>" + linkify(escape(text)).replace("\n", "<br>");
+        }
+        if (text.toLowerCase().contains("<a ")) {
+            return text;   // its own links: as written
+        }
+        // Link the addresses in the text between the tags.
+        StringBuilder out = new StringBuilder();
+        java.util.regex.Matcher tag = java.util.regex.Pattern.compile("<[^>]*>").matcher(text);
+        int at = 0;
+        while (tag.find()) {
+            out.append(linkify(text.substring(at, tag.start()))).append(tag.group());
+            at = tag.end();
+        }
+        return out.append(linkify(text.substring(at))).toString();
+    }
+
+    /** Web addresses in a piece of HTML text as links (a trailing full stop or comma stays outside). */
+    private static String linkify(String s) {
+        java.util.regex.Matcher m = URL.matcher(s);
+        StringBuffer out = new StringBuffer();
+        while (m.find()) {
+            String u = m.group(1).replaceAll("[.,;:)]+$", "");
+            String tail = m.group(1).substring(u.length());
+            String href = u.toLowerCase().startsWith("www.") ? "https://" + u : u;
+            m.appendReplacement(out, java.util.regex.Matcher.quoteReplacement("<a href=\"" + href + "\">" + u + "</a>" + tail));
+        }
+        m.appendTail(out);
+        return out.toString();
     }
 
     static String escape(String s) {

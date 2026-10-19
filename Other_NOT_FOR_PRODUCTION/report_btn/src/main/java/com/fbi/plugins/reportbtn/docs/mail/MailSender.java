@@ -38,14 +38,16 @@ public final class MailSender {
             case GOOGLE: {
                 Session session = EmailSettingsPanel.createOauthSession(s.portOr(587));
                 MimeMessage m = MimeBuilder.build(session, d, s, false);
-                oauth("Google", s.googleAccess, t -> GoogleConnectionDriver.sendGmail(t, s.user, m),
+                String account = linkedAccount(s, "Google");
+                oauth("Google", s.googleAccess, t -> GoogleConnectionDriver.sendGmail(account, t, m),
                     () -> GoogleConnectionDriver.refreshAccessToken(s.googleRefresh));
                 break;
             }
             case MICROSOFT: {
                 Session session = EmailSettingsPanel.createOauthSession(s.portOr(587));
                 MimeMessage m = MimeBuilder.build(session, d, s, false);
-                oauth("Microsoft", s.microsoftAccess, t -> MicrosoftConnectionDriver.sendEmail(t, s.user, m),
+                String account = linkedAccount(s, "Microsoft");
+                oauth("Microsoft", s.microsoftAccess, t -> MicrosoftConnectionDriver.sendEmail(account, t, m),
                     () -> MicrosoftConnectionDriver.refreshAccessToken(s.microsoftRefresh).getAccessToken());
                 break;
             }
@@ -59,6 +61,20 @@ public final class MailSender {
                 EmailSettingsPanel.sendEmail(session, m, s.server, s.user, decrypt(s.passwordEncrypted));
             }
         }
+    }
+
+    /**
+     * The mailbox a linked Google or Microsoft account sends from: the From email, as the
+     * stock email settings pass it (the helpers put it in their request address, so the
+     * SMTP user name, or a display name with spaces, won't do).
+     */
+    static String linkedAccount(MailSettings s, String who) throws Exception {
+        String a = !MailSettings.blank(s.fromEmail) ? s.fromEmail.trim() : s.user.trim();
+        if (a.isEmpty() || !a.contains("@") || a.matches(".*\\s.*")) {
+            throw new Exception("Set the From email in the email settings to the " + who
+                + " account's address (Tools › Options › Email); it is the mailbox the email is sent from.");
+        }
+        return a;
     }
 
     private static void oauth(String who, String stored, Send send, Refresh refresh) throws Exception {

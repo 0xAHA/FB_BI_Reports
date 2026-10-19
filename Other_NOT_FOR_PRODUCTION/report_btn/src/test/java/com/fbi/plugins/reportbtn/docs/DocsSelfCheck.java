@@ -1,6 +1,7 @@
 package com.fbi.plugins.reportbtn.docs;
 
 import com.fbi.plugins.reportbtn.docs.mail.CssInliner;
+import com.fbi.plugins.reportbtn.docs.mail.EmailAddresses;
 import com.fbi.plugins.reportbtn.docs.mail.EmailDraft;
 import com.fbi.plugins.reportbtn.docs.mail.EmailTemplates;
 import com.fbi.plugins.reportbtn.docs.mail.EmailTokens;
@@ -37,6 +38,7 @@ public final class DocsSelfCheck {
         tokens();
         inliner();
         mime();
+        addresses();
         System.out.println("DocsSelfCheck: " + passed + " checks passed");
     }
 
@@ -76,6 +78,14 @@ public final class DocsSelfCheck {
         eq(EmailTemplates.withFooter("<html><body>A</body></html>", "Line 1\nLine <2>"),
             "<html><body>A<br>Line 1<br>Line &lt;2&gt;</body></html>", "footer before the body end");
         eq(EmailTemplates.withFooter("<p>A</p>", ""), "<p>A</p>", "no footer");
+        eq(EmailTemplates.withFooter("<html><body>A</body></html>",
+                "<br><br><br>-----<br>This email was sent using Fishbowl Inventory 2026.\r\n<br>https://www.FishbowlInventory.com.au"),
+            "<html><body>A<br><br><br>-----<br>This email was sent using Fishbowl Inventory 2026.\n<br>"
+                + "<a href=\"https://www.FishbowlInventory.com.au\">https://www.FishbowlInventory.com.au</a></body></html>",
+            "an HTML footer (the stock one) goes in as HTML, its address linked");
+        eq(EmailTemplates.withFooter("<body>A</body>", "Thanks.\nwww.acme.test, or https://acme.test/x."),
+            "<body>A<br>Thanks.<br><a href=\"https://www.acme.test\">www.acme.test</a>, or <a href=\"https://acme.test/x\">https://acme.test/x</a>.</body>",
+            "a plain footer: escaped, line breaks kept, addresses linked");
 
         // The stock templates that ship with the client, when this machine has them.
         File dir = new File(System.getProperty("reportbtn.fbhome", "C:/Program Files/Fishbowl"), "client/email-templates");
@@ -132,6 +142,48 @@ public final class DocsSelfCheck {
         eq(String.valueOf(out.contains("pink")), "true", "hover rule stays in the block only");
         eq(String.valueOf(out.contains("style=\"color: pink")), "false", "hover rule not inlined");
         eq(String.valueOf(CssInliner.inline("<p>x</p>").contains("<p>x</p>")), "true", "no style sheet: unchanged");
+    }
+
+    // The To / Cc / Bcc buttons: the contacts and users read, and the field merged back.
+    private static void addresses() {
+        EmailTokens.Rows sql = (q, cols) -> {
+            java.util.List<Map<String, String>> rows = new java.util.ArrayList<>();
+            if (q.contains("FROM so ")) {
+                rows.add(row(cols, "7", "Acme Ltd", "Customer"));
+            } else if (q.contains("FROM contact ")) {
+                rows.add(row(cols, "Anna", "anna@acme.test; Ben@acme.test", "Main Office"));
+                rows.add(row(cols, "", "accounts@acme.test", "Bill To"));
+                rows.add(row(cols, "Dup", "ANNA@acme.test", "Main Office"));
+                rows.add(row(cols, "Phone", "555-0100", "Main Office"));
+            } else if (q.contains("FROM sysuser ")) {
+                rows.add(row(cols, "Sam Smith", "sam", "sam@fb.test"));
+                rows.add(row(cols, " ", "admin", "admin@fb.test"));
+            }
+            return rows;
+        };
+        java.util.List<EmailAddresses.Address> c = EmailAddresses.forRecord(sql, "SO", 1);
+        StringBuilder got = new StringBuilder();
+        for (EmailAddresses.Address a : c) {
+            got.append(a.name).append('<').append(a.email).append(">@").append(a.source).append(' ');
+        }
+        eq(got.toString().trim(), "Anna<anna@acme.test>@Customer Acme Ltd Anna<Ben@acme.test>@Customer Acme Ltd "
+            + "Bill To<accounts@acme.test>@Customer Acme Ltd", "contacts: split, named by address when blank, no duplicates, no phone numbers");
+        eq(String.valueOf(EmailAddresses.forRecord(sql, "WO", 1).size()), "0", "no account behind a WO");
+        java.util.List<EmailAddresses.Address> u = EmailAddresses.users(sql);
+        eq(u.get(0).name + "," + u.get(1).name + "," + u.get(1).source, "Sam Smith,admin,Fishbowl user", "users: login when no name");
+        java.util.List<EmailAddresses.Address> list = new java.util.ArrayList<>(c);
+        list.addAll(u);
+        boolean[] ticked = {false, true, false, true, false};   // Ben, Sam
+        eq(String.join("; ", EmailAddresses.merge(list, ticked, Arrays.asList("typed@x.test", "anna@acme.test", "ben@ACME.test"))),
+            "typed@x.test; ben@ACME.test; sam@fb.test", "merge: typed kept, unticked dropped, ticked kept once, new appended");
+    }
+
+    private static Map<String, String> row(String[] cols, String... values) {
+        Map<String, String> m = new LinkedHashMap<>();
+        for (int i = 0; i < cols.length; i++) {
+            m.put(cols[i], i < values.length ? values[i] : null);
+        }
+        return m;
     }
 
     private static void mime() throws Exception {

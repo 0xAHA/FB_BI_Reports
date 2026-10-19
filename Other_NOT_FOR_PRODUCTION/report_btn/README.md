@@ -1,6 +1,6 @@
 # report_btn: module-related BI reports, and the Apps (beta) module
 
-**Status:** proof of concept, version 0.7.2.
+**Status:** proof of concept, version 0.7.3.
 - **0.1.0 works in the client** (2026-10-12): Reports → Apps in Sales Order opens the
   Sales Order paperwork on the open order.
 - **0.3.0** adds module and menu-group keys.
@@ -91,6 +91,7 @@
   in for a module's Jasper document, through new **Print (App)** and **Email (rich)** ribbon
   buttons, and emails open in a rich HTML window. See
   [Documents and email (PoC)](#documents-and-email-poc).
+- **0.7.3:** the email window. The To, Cc and Bcc labels are buttons: each opens a list of the record's customer or vendor email contacts (the order's own address first) and the Fishbowl users, ticked where the field already has them; their tooltip says to separate addresses with a semicolon. **Open in my email program ▾** offers *Just this once* or *Always* (remembered; untick it there to stop). The body editor's list, indent, alignment, link and undo / redo buttons are icons (the link button toggles: inside a link it removes it; Ctrl+K), and deleting everything (select all, Delete) starts a plain email without the template's style sheet; Ctrl+Z straight after brings the template back.
 - **0.7.2:** Edit on an app no longer fails with "Comparison method violates its general contract". When two scripts exported the same name, the autocomplete list held a function and a plain entry under one name, and their sort broke; now one entry per name is kept, and a completion failure no longer stops the editor opening. System apps open read-only, ready to duplicate. The App Library's folder chips are strictly A-Z (All first, Unfiled last).
 - **0.7.1:** "Open in my email program" goes to the user's default email app (the one Windows
   uses for mailto: links), not just whichever Outlook is installed. New Outlook gets the draft
@@ -564,9 +565,13 @@ Builder reports all qualify. The PDF comes from the native panel's own Save→PD
 window off the screen.
 
 **The email window** (`docs/mail/EmailComposer`)
-- **Fields:** To, Cc, Bcc, Subject, attachments and the body.
+- **Fields:** To, Cc, Bcc, Subject, attachments and the body. The **To, Cc and Bcc**
+  buttons list the email contacts of the record's customer (SO, RMA, SO shipment) or vendor
+  (PO, PO shipment), and the active Fishbowl users with an email address.
 - **The body editor is `Composer.htm` in the jar.** It keeps an HTML template's own style
   sheet and shows it as it will arrive. It has formatting, links and an HTML view.
+  Deleting everything starts a plain email (the template's style sheet goes too); Ctrl+Z
+  straight after brings the template back.
 - **Template:** the module's email template, as the client's settings name it (SO, PO,
   Ship, else Generic), with its eight tokens filled from the record. A plain-text template
   becomes simple HTML.
@@ -575,7 +580,8 @@ window off the screen.
 - **The message:** `multipart/mixed` holding `alternative` (a text part, plus HTML with
   inline images), then the attachments. The style sheet is copied onto the elements
   (`CssInliner`), so Gmail and Outlook keep the look.
-- **"Open in my email program"** is remembered per user. Classic Outlook gets the mail
+- **"Open in my email program"**: just this once, or always (remembered per user; it then
+  skips this window). Classic Outlook gets the mail
   through COM, with HTML and attachments (its main window is opened if it wasn't running, so
   the email leaves the Outbox). New Outlook gets a `.eml` draft marked unsent, through
   `olk.exe`. Anything else gets the `.eml` draft, opened with the `.eml` program. Which
