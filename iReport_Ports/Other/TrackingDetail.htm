@@ -1,0 +1,1088 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Tracking Detail (iReport port)
+  PATH:   iReport_Ports/Other/TrackingDetail.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard Other/TrackingDetail.jrxml ("Find Parts
+  attached to Tracking Information on Works Orders, Purchase Orders, and
+  Sales Orders.") with its subreports subTrackingCustom.jrxml and
+  subTrackingWorkOrderCost.jrxml. Same source, same rules, same columns;
+  only the presentation is interactive.
+
+    Source     Every trackinginfo row (lot, revision, expiry, serial…) whose
+               value contains the Tracking value (TrackingValue, default %:
+               everything): UPPER(info), UPPER(serial number) or the info
+               date as text, LIKE '%value%'; rows with recordId -1 left out.
+               One printed row per tracking record and serial number, as
+               subTrackingCustom prints it, read the way its per-table SQL
+               reads it (one UNION ALL branch per table here):
+                 - ReceiptItem: "<part> - <desc> on PO: / on SO: / on TO:"
+                   by the receipt's order type (poitem / soitem / xoitem);
+                 - PickItem: "<part> - <desc> Picked for PO: / SO: / TO:";
+                 - ShipItem: "<part> - <desc> on PO: / on SO: / on TO:";
+                 - WOItem (finished, raw and repair items, typeId 10/20/30):
+                   "<item description> Item on WO:";
+                 - WO: "<part> - <desc> Created with WO:";
+                 - SOItem: "<part> - <desc> on SO:"; RMAItem: "… on RMA:";
+                 - any other table: "Unknown: Table-<name> ID-<id>" with
+                   the number "Unknown".
+               The order number (NUM) follows, a link into its module. A row
+               whose description or number comes out NULL is not printed
+               (the subreport's printWhenExpression), e.g. a pick for a work
+               order (pick order type 30, which the CASE doesn't cover).
+    Value      The tracking date when there is one (short date), else the
+               serial number, else the text.
+    WO block   Under a WO / WOItem row, subTrackingWorkOrderCost: the column
+               headings (WO, Original, Needed, Used, Unit Cost, Total), the
+               work order's header (WO #, finished part, status, scheduled /
+               started / finished dates, qty ordered / fulfilled / remaining
+               with the UOM, cost, its tracking) and every finished, raw,
+               repair and by-product item ("+ " finished good, "- " the
+               rest; raw items first, ORDER BY type DESC, description) with
+               Original (qtyTarget), Needed (qtyTarget × (WO target - the
+               item's MO-item fulfilled), 0 once Fulfilled), Used, Unit
+               Cost (cost / used), Total (cost) and the item's tracking.
+    Filters    Tracking value (TrackingValue). Options: Work order details
+               (every WO row, as the standard; once per work order; off) and
+               Include work-order picks (off, as the standard).
+    Order      Tracking record id, then serial (the original has no ORDER BY:
+               the database's order).
+    Totals     None (the original has none).
+
+  Layout: the REPORT chrome (fb-styles §35): 56px header, push-down filter
+  panel, sticky header. Table tools (fb-lib FBLib.RptCols / RowCap): a
+  heading sorts the rows (their WO block moves with them; again to reverse,
+  a third time for the report's order), drag to reorder, edge to resize. The
+  query fetches at most 10,000 rows (whole tracking records) with Load all.
+  No pivot: the rows carry no measure and the report is a look-up (a count
+  by tracking type × source would be the only cross-tab).
+  App / PDF (fb-doc, FBDoc.Report): the PDF lays the rows out as the
+  original: Letter portrait, the company and "Tracking Details" on every
+  page (its page header), the headings TRACKING / VALUE / Order Details, a
+  rule over each row, the order number underlined in the original's blue,
+  the WO block indented in 7pt under its row, "Page X of Y".
+
+  Deliberate differences (DIFFERENCES.md has them all):
+    - A tracking record with several serial numbers prints each serial once.
+      The original prints them once per serial (n × n lines): its main query
+      joins the serials, and every main row runs the subreport, which joins
+      them again.
+    - Decimal, count, money and yes/no tracking (types 50-80) print their
+      value (infoDouble / infoInteger) and can be searched; the original
+      prints the empty info column and never matches them.
+    - The WO block's finished part, Qty Fulfilled, Qty Remaining and UOM
+      always show. The original fills them only when the WO's finished-good
+      tracking contains the row's printed value, so a raw-material lot, an
+      expiry date (printed as a short date) or a different serial left them
+      blank and Qty Remaining fell back to Qty Ordered.
+    - A WO-table row reads the finished good from its woitem (the original's
+      WOSQL joins wo.partid, a column Fishbowl doesn't have: the subreport
+      would fail; no such rows on the local server).
+    - Dates print in the company's date format, not Java's SHORT locale
+      format; the WO block's tracking dates as the server helper's "MMM d,
+      yyyy".
+    - "Orginal" is spelled Original.
+    - The page header names the tracking value searched for (the original
+      prints a blank line).
+    - Rows are in tracking-record order (the original leaves it to the
+      database).
+  Additions: work order details once per WO or off; Include work-order
+  picks (option, off by default); links; Excel (rows and WO items); Print;
+  remembered filters and company defaults.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-folder" content="Other">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="Find every order a lot, serial or other tracking value appears on: receipts, picks, shipments, work orders, sales orders and RMAs.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipTrackingDetail',
+            name:  'Tracking Detail',
+            build: '2026.10.20-149cce3'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tracking Detail — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 520px; overflow: hidden; text-overflow: ellipsis; vertical-align: top; }
+        .rpt-table th { cursor: default; }
+        .rpt-table th.ra, .rpt-table td.ra { text-align: right; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        .trd-search { width: 100%; }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+
+        /* The WO block (subTrackingWorkOrderCost): lines laid out on the
+           subreport's own 453pt grid, indented as its 43pt offset. */
+        .rpt-table tr.trd-wo td { padding-top: 0; padding-bottom: 0; border-bottom: 0; background: #FBFCFC; max-width: none; }
+        .rpt-table tr.trd-wo-last td { padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+        .wob { margin-left: 7.8%; width: 82%; max-width: 900px; font-size: 11px; color: #33474F; }
+        .wob-ln { position: relative; height: 16px; }
+        .wob-ln > span { position: absolute; top: 0; height: 16px; line-height: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .wob-ln > span.r { text-align: right; }
+        .wob-hd { font-weight: 700; border-bottom: 1px solid #9AA9AF; }
+        .wob-top { margin-top: 4px; }
+        .wob-rule { border-bottom: 1px solid #9AA9AF; }
+        .wob-trk { padding-left: 12.1%; line-height: 15px; white-space: normal; overflow-wrap: anywhere; }
+        .wob-trk b { font-weight: 400; margin-left: -12.1%; display: inline-block; width: 12.1%; }
+        .wob-mute { color: var(--c-secondary); }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>Tracking Detail</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Tracking</div>
+            <div>
+                <div class="rpt-flabel">Tracking value</div>
+                <input type="text" id="fValue" class="trd-search" placeholder="Everything (contains; % is a wildcard)">
+            </div>
+            <div class="rpt-fnote">Matches lot / revision text, serial numbers,<br>dates (as YYYY-MM-DD) and numbers that<br>contain it. Enter applies it.</div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Options</div>
+            <div>
+                <div class="rpt-flabel">Work order details</div>
+                <select id="fWoMode">
+                    <option value="every">Under every work order row</option>
+                    <option value="first">Once per work order</option>
+                    <option value="none">Off</option>
+                </select>
+            </div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fWoPicks"> Include work-order picks</label>
+            <div class="rpt-fnote">The standard report shows the details under<br>every row and leaves work-order picks out.</div>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own sort">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters and options what everyone sees each time this report opens. Anyone can still change them while it is open.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+                <button type="button" class="ds-btn" id="unpublishBtn" title="Everyone goes back to their own last choices">Stop using them</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>Where a lot, serial number, expiry date or other tracking value was recorded: the receipts, picks, shipments, work orders, sales orders and RMAs that carry it, with the order number. It is the BI version of the standard <strong>Tracking Detail</strong> report and reads the same data the same way.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">The rows</div>
+                <ul>
+                    <li><strong>Tracking</strong> is the tracking type (Lot Number, Serial Number…), <strong>Value</strong> its value: the date for a date type, else the serial number, else the text.</li>
+                    <li><strong>Order Details</strong> says where it was recorded ("… on PO:", "… Picked for SO:", "… Item on WO:"), followed by the order number. Click the number to open the order.</li>
+                    <li>A work order row is followed by the work order: its finished part, status, dates, quantities and cost, and every item with its original, needed and used quantity, unit and total cost and tracking ("+" the finished good, "-" the items used).</li>
+                    <li>Picks for work orders are left out, as in the standard report (the work order's own item rows show what it used): <strong>Include work-order picks</strong> lists them too.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>Type part of a tracking value and press Enter. Empty shows every tracking record, as the standard default (%).</li>
+                    <li><strong>Work order details</strong>: under every work order row (the standard), once per work order (the first of its rows), or off.</li>
+                    <li>Click a column heading to sort (again to reverse, a third time for the report's order); a work order's details move with their row. Drag a heading onto another to move the column; drag a heading's right edge to resize it. <strong>Settings → Reset column layout</strong> undoes it.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable pages, laid out like the standard report. <strong>Print</strong> prints those pages.</li>
+                    <li>A very large result shows its first 10,000 or so rows (whole tracking records) with a <strong>Load all</strong> button.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-app" id="appView">
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+</div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.RowCap) missing.push('FBLib.RowCap');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const TITLE = 'Tracking Details';                    // the original's page-header title
+const STOCK_REPORT_PATH = '../reports/Other/TrackingDetail.jasper';
+const WOITEM_TABLE_ID = -355941248;                  // trackinginfo.tableId of woitem
+const WO_TABLE_ID = -1031383360;                     // … of wo
+// The tables the original's detailSQL knows (anything else: "Unknown").
+const KNOWN_TABLES = ['WOItem', 'WO', 'SOItem', 'ReceiptItem', 'ShipItem', 'PickItem', 'RMAItem'];
+// The subreport's MODULE (hyperlink anchor) → openModule's module name.
+const MODULE_NAME = { WO: 'Work Order', SO: 'Sales Order', PO: 'Purchase Order', TO: 'Transfer Order', RMA: 'RMA' };
+const DEFAULT_FILTERS = { value: '', woMode: 'every', woPicks: false };
+let BASE = Object.assign({}, DEFAULT_FILTERS);
+const QUERY_KEYS = ['value', 'woPicks'];
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        company: { keys: ['filters', 'opts'], editors: true },   // every open starts from the company defaults
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const int = v => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : 0; };
+const has = v => v !== null && v !== undefined && String(v) !== '';
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const dstr = v => { const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v ?? '')); return m ? m[1] : ''; };
+const fmtDate = v => { const d = dstr(v); return d ? FBLib.Common.formatDate(d) : ''; };
+const fmtQty = v => FBLib.Common.formatQty(v);
+const fmtMoney = v => FBLib.Common.formatMoney(v);
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const v = id => document.getElementById(id);
+// The server helper's date format ("Aug 15, 2025") for the WO block's tracking.
+function helperDate(val) {
+    const d = dstr(val);
+    if (!d) return '';
+    try { if (window.FBDoc && FBDoc.fmt) return FBDoc.fmt.date('MMM d, yyyy', val); } catch (_) {}
+    return new Date(d + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = v('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _hydrating = false, _applyTimer = null;
+// rows: the printed rows; wos: woid -> { head, items }; trk: "table:id" -> text.
+const S = { rows: [], wos: {}, trk: {}, company: '', loadedAt: null, noCap: false };
+
+function readFilters() {
+    return { value: v('fValue').value.trim(), woMode: v('fWoMode').value, woPicks: v('fWoPicks').checked };
+}
+function writeFilters(f) {
+    _hydrating = true;
+    v('fValue').value = f.value || '';
+    v('fWoMode').value = ['every', 'first', 'none'].indexOf(f.woMode) !== -1 ? f.woMode : 'every';
+    v('fWoPicks').checked = !!f.woPicks;
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, BASE, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const requery = QUERY_KEYS.some(k => JSON.stringify(next[k]) !== JSON.stringify(F[k]));
+        F = next;
+        remember();
+        if (requery) { S.noCap = false; loadAll(); } else render(true);
+    }, 250);
+}
+const searchValue = f => (String(f.value || '').trim() || '%');
+function filterText(f) {
+    const out = [];
+    if (searchValue(f) !== '%') out.push('Tracking value: ' + f.value);
+    if (f.woPicks) out.push('Work-order picks included');
+    if (f.woMode === 'first') out.push('Work order details once per work order');
+    if (f.woMode === 'none') out.push('No work order details');
+    return out.join(' · ');
+}
+
+// ============================================================================
+//  SQL — the original's main query (which tracking records match) and its
+//  per-table detail SQL (subTrackingCustom's `sql`), one UNION ALL branch
+//  per table, each with its own joins; rows whose description or number is
+//  NULL are dropped as the subreport's printWhenExpression drops them.
+// ============================================================================
+const DT = c => `DATE_FORMAT(${c}, '%Y-%m-%d %H:%i:%s')`;
+function buildSQL(f) {
+    const val = sqlStr(searchValue(f));
+    // The original's match, plus the number types (see the header).
+    const match = `ti.recordid <> -1 AND (UPPER(ti.info) LIKE CONCAT('%', UPPER('${val}'), '%')
+               OR ti.infodate LIKE CONCAT('%', '${val}', '%')
+               OR EXISTS (SELECT 1 FROM trackinginfosn s2 WHERE s2.trackinginfoid = ti.id AND UPPER(s2.serialnum) LIKE CONCAT('%', UPPER('${val}'), '%'))
+               OR (pt.typeid IN (50, 60) AND CAST(ti.infodouble AS CHAR) LIKE CONCAT('%', '${val}', '%'))
+               OR (pt.typeid = 70 AND CAST(ti.infointeger AS CHAR) LIKE CONCAT('%', '${val}', '%')))`;
+    const base = (title, module, numExpr, lineExpr, woid, joins, where) => `
+        SELECT ti.id AS tiid, COALESCE(sn.id, 0) AS snid, tr.tablerefname AS tablename, pt.name AS tracking, pt.typeid AS pttype,
+               COALESCE(sn.serialnum, '') AS serialnum, (sn.id IS NOT NULL)+0 AS hassn, COALESCE(ti.info, '') AS info,
+               ${DT('ti.infodate')} AS infodate, COALESCE(ti.infodouble, 0) AS infodouble, COALESCE(ti.infointeger, 0) AS infointeger,
+               ${title} AS title, ${module} AS module, ${numExpr} AS num, ${lineExpr} AS lineitem, ${woid} AS woid
+        FROM trackinginfo ti
+        JOIN tablereference tr ON tr.tableid = ti.tableid
+        JOIN parttracking pt ON pt.id = ti.parttrackingid
+        LEFT JOIN trackinginfosn sn ON sn.trackinginfoid = ti.id
+        ${joins}
+        WHERE ${where}
+          AND ${match}`;
+    const byType = (col, m) => '(CASE ' + Object.keys(m).map(k => `WHEN ${col} = ${k} THEN ${m[k]}`).join(' ') + ' END)';
+    const parts = [
+        // WOItem: finished, raw and repair items.
+        base(`CONCAT(wi.description, ' Item on WO: ')`, `'WO'`, 'wo.num', 'wi.typeid', 'wo.id',
+             `JOIN woitem wi ON ti.recordid = wi.id AND wi.typeid IN (10, 20, 30)
+        JOIN wo ON wi.woid = wo.id`, `tr.tablerefname = 'WOItem'`),
+        // WO: the finished good from the WO's first finished-good item (the original's wo.partid doesn't exist).
+        base(`CONCAT(fp.num, ' - ', fp.description, ' Created with WO: ')`, `'WO'`, 'wo.num', '0', 'wo.id',
+             `JOIN wo ON ti.recordid = wo.id
+        LEFT JOIN woitem fi ON fi.id = (SELECT MIN(x.id) FROM woitem x WHERE x.woid = wo.id AND x.typeid = 10)
+        LEFT JOIN part fp ON fp.id = fi.partid`, `tr.tablerefname = 'WO'`),
+        base(`CONCAT(part.num, ' - ', part.description, ' on SO: ')`, `'SO'`, 'so.num', 'soitem.solineitem', '0',
+             `JOIN soitem ON ti.recordid = soitem.id
+        JOIN so ON soitem.soid = so.id
+        JOIN product ON soitem.productid = product.id
+        JOIN part ON product.partid = part.id`, `tr.tablerefname = 'SOItem'`),
+        base(byType('receipt.ordertypeid', { 10: "CONCAT(poitem.partnum, ' - ', poitem.description, ' on PO: ')",
+                                              20: "CONCAT(soitem.productnum, ' - ', soitem.description, ' on SO: ')",
+                                              40: "CONCAT(xoitem.partnum, ' - ', xoitem.description, ' on TO: ')" }),
+             byType('receipt.ordertypeid', { 10: "'PO'", 20: "'SO'", 40: "'TO'" }),
+             byType('receipt.ordertypeid', { 10: 'po.num', 20: 'so.num', 40: 'xo.num' }),
+             byType('receipt.ordertypeid', { 10: 'poitem.polineitem', 20: 'soitem.solineitem', 40: 'xoitem.lineitem' }), '0',
+             `JOIN receiptitem ON ti.recordid = receiptitem.id
+        JOIN receipt ON receiptitem.receiptid = receipt.id
+        LEFT JOIN poitem ON receiptitem.poitemid = poitem.id
+        LEFT JOIN po ON poitem.poid = po.id
+        LEFT JOIN soitem ON receiptitem.soitemid = soitem.id
+        LEFT JOIN so ON soitem.soid = so.id
+        LEFT JOIN xoitem ON receiptitem.xoitemid = xoitem.id
+        LEFT JOIN xo ON xoitem.xoid = xo.id`, `tr.tablerefname = 'ReceiptItem'`),
+        base(byType('shipitem.ordertypeid', { 10: "CONCAT(popart.num, ' - ', popart.description, ' on PO: ')",
+                                               20: "CONCAT(sopart.num, ' - ', sopart.description, ' on SO: ')",
+                                               40: "CONCAT(xopart.num, ' - ', xopart.description, ' on TO: ')" }),
+             byType('shipitem.ordertypeid', { 10: "'PO'", 20: "'SO'", 40: "'TO'" }),
+             byType('shipitem.ordertypeid', { 10: 'po.num', 20: 'so.num', 40: 'xo.num' }),
+             byType('shipitem.ordertypeid', { 10: 'poitem.polineitem', 20: 'soitem.solineitem', 40: 'xoitem.lineitem' }), '0',
+             `JOIN shipitem ON ti.recordid = shipitem.id
+        LEFT JOIN soitem ON shipitem.soitemid = soitem.id
+        LEFT JOIN so ON soitem.soid = so.id
+        LEFT JOIN product ON soitem.productid = product.id
+        LEFT JOIN part sopart ON product.partid = sopart.id
+        LEFT JOIN poitem ON shipitem.poitemid = poitem.id
+        LEFT JOIN po ON poitem.poid = po.id
+        LEFT JOIN part popart ON poitem.partid = popart.id
+        LEFT JOIN xoitem ON shipitem.xoitemid = xoitem.id
+        LEFT JOIN xo ON xoitem.xoid = xo.id
+        LEFT JOIN part xopart ON xoitem.partid = xopart.id`, `tr.tablerefname = 'ShipItem'`),
+        // PickItem: PO / SO / TO picks; work-order picks (type 30) only with the option.
+        base(byType('pickitem.ordertypeid', Object.assign({ 10: "CONCAT(part.num, ' - ', part.description, ' Picked for PO: ')",
+                                                             20: "CONCAT(part.num, ' - ', part.description, ' Picked for SO: ')",
+                                                             40: "CONCAT(part.num, ' - ', part.description, ' Picked for TO: ')" },
+                                                           f.woPicks ? { 30: "CONCAT(part.num, ' - ', part.description, ' Picked for WO: ')" } : {})),
+             byType('pickitem.ordertypeid', Object.assign({ 10: "'PO'", 20: "'SO'", 40: "'TO'" }, f.woPicks ? { 30: "'WO'" } : {})),
+             byType('pickitem.ordertypeid', Object.assign({ 10: 'po.num', 20: 'so.num', 40: 'xo.num' }, f.woPicks ? { 30: 'pwo.num' } : {})),
+             byType('pickitem.ordertypeid', { 10: 'poitem.polineitem', 20: 'soitem.solineitem', 40: 'xoitem.lineitem' }), '0',
+             `JOIN pickitem ON ti.recordid = pickitem.id
+        JOIN part ON pickitem.partid = part.id
+        LEFT JOIN soitem ON pickitem.soitemid = soitem.id
+        LEFT JOIN so ON soitem.soid = so.id
+        LEFT JOIN poitem ON pickitem.poitemid = poitem.id
+        LEFT JOIN po ON poitem.poid = po.id
+        LEFT JOIN xoitem ON pickitem.xoitemid = xoitem.id
+        LEFT JOIN xo ON xoitem.xoid = xo.id` + (f.woPicks ? `
+        LEFT JOIN woitem pwi ON pickitem.woitemid = pwi.id
+        LEFT JOIN wo pwo ON pwi.woid = pwo.id` : ''), `tr.tablerefname = 'PickItem'`),
+        base(`CONCAT(part.num, ' - ', part.description, ' on RMA: ')`, `'RMA'`, 'rma.num', 'rmaitem.linenum', '0',
+             `JOIN rmaitem ON ti.recordid = rmaitem.id
+        JOIN rma ON rmaitem.rmaid = rma.id
+        JOIN product ON rmaitem.productid = product.id
+        JOIN part ON product.partid = part.id`, `tr.tablerefname = 'RMAItem'`),
+        // Any other table: the original's standardSQL.
+        base(`CONCAT('Unknown: Table-', tr.tablerefname, ' ID-', ti.id)`, `''`, `'Unknown'`, 'ti.recordid', '0', '',
+             `tr.tablerefname NOT IN (${KNOWN_TABLES.map(t => `'${t}'`).join(', ')})`)
+    ];
+    return `SELECT * FROM (${parts.join('\n        UNION ALL')}) t
+        WHERE t.title IS NOT NULL AND t.num IS NOT NULL
+        ORDER BY t.tiid, t.snid`;
+}
+
+// The WO block (subTrackingWorkOrderCost): each work order's header, its
+// finished good (the first finished-good item) and its items.
+function woSQL(ids) {
+    const inList = ids.join(', ');
+    return `
+        SELECT wo.id AS woid, wo.num, COALESCE(ws.name, '') AS status, ${DT('wo.datescheduled')} AS datescheduled,
+               ${DT('wo.datestarted')} AS datestarted, ${DT('wo.datefinished')} AS datefinished,
+               COALESCE(wo.qtytarget, 0) AS qtyordered, COALESCE(wo.cost, 0) AS wocost,
+               COALESCE(fp.num, '') AS fgnum, COALESCE(fp.description, '') AS fgdesc, (fi.id IS NOT NULL)+0 AS hasfg,
+               COALESCE(fm.qtyfulfilled, 0) AS fgfulfilled, COALESCE(wo.qtytarget - fm.qtyfulfilled, 0) AS fgremaining, COALESCE(fu.code, '') AS fguom,
+               wi.id AS itemid, COALESCE(wi.description, '') AS itemdesc, wi.typeid AS itemtype,
+               COALESCE(wi.qtytarget, 0) AS qtyorig, COALESCE(wi.qtyused, 0) AS qtyused,
+               COALESCE(wi.qtytarget * (wo.qtytarget - mi.qtyfulfilled), 0) AS qtyneeded, wiu.code AS itemuom,
+               COALESCE(wi.cost / (CASE WHEN COALESCE(wi.qtyused, 0) = 0 THEN 1 ELSE wi.qtyused END), 0) AS unitcost,
+               COALESCE(wi.cost, 0) AS totalcost
+        FROM wo
+        JOIN wostatus ws ON wo.statusid = ws.id
+        JOIN woitem wi ON wo.id = wi.woid
+        JOIN part ON wi.partid = part.id
+        JOIN uom partuom ON part.uomid = partuom.id
+        JOIN uom wiu ON wi.uomid = wiu.id
+        LEFT JOIN moitem mi ON wi.moitemid = mi.id
+        LEFT JOIN (SELECT x.woid, MIN(x.id) AS id FROM woitem x WHERE x.typeid = 10 AND x.woid IN (${inList}) GROUP BY x.woid) fg ON fg.woid = wo.id
+        LEFT JOIN woitem fi ON fi.id = fg.id
+        LEFT JOIN part fp ON fp.id = fi.partid
+        LEFT JOIN uom fu ON fu.id = fi.uomid
+        LEFT JOIN moitem fm ON fm.id = fi.moitemid
+        WHERE wi.typeid IN (10, 20, 30, 31)
+          AND wo.id IN (${inList})
+        ORDER BY wo.num, wi.typeid DESC, wi.description, wi.id`;
+}
+// getAllTrackingInfo("WOItem", id) / ("WO", id): the items' and the work
+// orders' tracking records.
+function woTrackSQL(ids) {
+    const inList = ids.join(', ');
+    return `
+        SELECT ti.tableid, ti.recordid, pt.id AS ptid, pt.abbr, pt.typeid, COALESCE(ti.info, '') AS info, ${DT('ti.infodate')} AS infodate,
+               COALESCE(ti.infodouble, 0) AS infodouble, COALESCE(ti.infointeger, 0) AS infointeger, COALESCE(sn.serialnum, '') AS serialnum
+        FROM trackinginfo ti
+        JOIN parttracking pt ON pt.id = ti.parttrackingid
+        LEFT JOIN trackinginfosn sn ON sn.trackinginfoid = ti.id AND pt.typeid = 40
+        WHERE (ti.tableid = ${WOITEM_TABLE_ID} AND ti.recordid IN (SELECT wi.id FROM woitem wi WHERE wi.woid IN (${inList})))
+           OR (ti.tableid = ${WO_TABLE_ID} AND ti.recordid IN (${inList}))
+        ORDER BY ti.tableid, ti.recordid, pt.sortorder, pt.id, ti.id, sn.id`;
+}
+
+// A number tracking type's value (the WO block helper's formats).
+function numberValue(t, dbl, intg) {
+    if (t === 50) return fmtMoney(dbl);
+    if (t === 60) return fmtQty(dbl);
+    if (t === 70) return String(intg);
+    if (t === 80) return int(intg) === 1 ? 'Yes' : 'No';
+    return '';
+}
+// "Abbr: value, value  Abbr: value" per record (the server helper's text).
+function trackText(rows) {
+    const order = [], types = {};
+    rows.forEach(r => {
+        let T = types[r.ptid];
+        if (!T) { T = types[r.ptid] = { abbr: r.abbr, vals: [] }; order.push(r.ptid); }
+        const t = int(r.typeid);
+        const val = t === 40 ? String(r.serialnum || '') : (t === 20 || t === 30) ? helperDate(r.infodate)
+            : t >= 50 ? numberValue(t, num(r.infodouble), int(r.infointeger)) : String(r.info || '');
+        if (val !== '' && (t === 40 || T.vals.indexOf(val) < 0)) T.vals.push(val);
+    });
+    return order.map(k => types[k].abbr + ': ' + types[k].vals.join(', ')).join('  ');
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+let _loadToken = 0;
+
+async function loadLookups() {
+    const res = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('Stock options', `SELECT rp.name AS name, rp.paramvalue AS value FROM reportparameter rp
+            JOIN report r ON r.id = rp.reportid WHERE r.path = '${sqlStr(STOCK_REPORT_PATH)}'`)
+    ]);
+    const ok = i => res[i].status === 'fulfilled' ? res[i].value : [];
+    S.company = (ok(0)[0] || {}).name || '';
+    // The stock report's saved TrackingValue, as the starting point.
+    const tv = ok(1).find(r => r.name === 'TrackingValue');
+    if (tv && has(tv.value) && String(tv.value).trim() !== '%') { BASE.value = String(tv.value).trim(); debugLog('Stock option TrackingValue = ' + tv.value); }
+    const failed = res.filter(x => x.status === 'rejected').map(x => x.reason && x.reason.message);
+    if (failed.length) debugLog('Lookups failed: ' + failed.join('; '), 'warn');
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    const stale = () => tok !== _loadToken;
+    v('banner').textContent = '';
+    v('loading').classList.add('show');
+    setStatus('Loading…');
+    const cap = S.noCap ? 0 : undefined;           // FBLib.RowCap: the first 10,000 rows unless Load all
+    let rows, wos = [], trk = [];
+    try {
+        rows = await q('Tracking', FBLib.RowCap.sql(buildSQL(F), cap));
+        if (stale()) return;
+        // Cut back to whole tracking records.
+        const capped = FBLib.RowCap.apply(rows, cap, { keyOf: r => r.tiid });
+        FBLib.RowCap.notice({ before: v('appView'), capped: capped.capped, limit: capped.limit, what: 'rows', totals: false,
+                              onLoadAll: () => { S.noCap = true; loadAll(); } });
+        rows = capped.rows;
+        const ids = Array.from(new Set(rows.map(r => int(r.woid)).filter(n => n > 0)));
+        for (let i = 0; i < ids.length; i += 500) {
+            const chunk = ids.slice(i, i + 500);
+            const [w, t] = await Promise.all([q('Work orders', woSQL(chunk)), q('WO tracking', woTrackSQL(chunk))]);
+            if (stale()) return;
+            wos = wos.concat(w); trk = trk.concat(t);
+        }
+    } catch (e) {
+        if (stale()) return;
+        v('loading').classList.remove('show');
+        v('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        FBLib.RowCap.notice({ before: v('appView'), capped: false });
+        S.rows = []; S.wos = {}; S.loadedAt = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    v('loading').classList.remove('show');
+    S.rows = rows.map((r, i) => ({
+        i, ti: int(r.tiid), sn: int(r.snid), table: String(r.tablename || ''), tracking: String(r.tracking || ''), type: int(r.pttype),
+        serial: String(r.serialnum || ''), hasSn: int(r.hassn) === 1, info: String(r.info ?? ''), date: String(r.infodate || ''),
+        dbl: num(r.infodouble), intg: int(r.infointeger), title: String(r.title ?? ''), module: String(r.module || ''),
+        num: String(r.num ?? ''), woid: int(r.woid)
+    }));
+    S.rows.forEach(r => { r.value = valueOf(r); r.sortVal = r.type === 20 || r.type === 30 ? dstr(r.date) || r.value : r.value; });
+    // Tracking text per WO item / WO.
+    const byRec = {};
+    trk.forEach(t => { const k = (int(t.tableid) === WO_TABLE_ID ? 'wo:' : 'wi:') + int(t.recordid); (byRec[k] = byRec[k] || []).push(t); });
+    S.trk = {};
+    Object.keys(byRec).forEach(k => { S.trk[k] = trackText(byRec[k]); });
+    S.wos = {};
+    wos.forEach(w => {
+        const id = int(w.woid);
+        let W = S.wos[id];
+        if (!W) {
+            W = S.wos[id] = { id, num: String(w.num || ''), status: String(w.status || ''), sched: w.datescheduled, started: w.datestarted,
+                finished: w.datefinished, ordered: num(w.qtyordered), cost: num(w.wocost), fgNum: String(w.fgnum || ''), fgDesc: String(w.fgdesc || ''),
+                hasFg: int(w.hasfg) === 1, fulfilled: num(w.fgfulfilled), remaining: num(w.fgremaining), uom: String(w.fguom || ''), items: [] };
+        }
+        W.items.push({ id: int(w.itemid), desc: String(w.itemdesc || ''), type: int(w.itemtype), orig: num(w.qtyorig), used: num(w.qtyused),
+                       needed: num(w.qtyneeded), uom: String(w.itemuom || ''), unit: num(w.unitcost), total: num(w.totalcost) });
+    });
+    S.loadedAt = new Date();
+    render();
+}
+
+function setStatus(t) { v('statusLine').textContent = t; }
+
+// The printed value: the date (a date type), else the serial, else the
+// text; number types their number (see the header).
+function valueOf(r) {
+    if (dstr(r.date)) return fmtDate(r.date);
+    if (r.hasSn) return r.serial;
+    if (r.type >= 50 && r.type <= 80 && r.info === '') return numberValue(r.type, r.dbl, r.intg);
+    return r.info;
+}
+
+// ============================================================================
+//  MODEL + TABLE
+// ============================================================================
+// The original's columns (pt): TRACKING 100, VALUE 150, the description
+// 215 (right-aligned) and the order number 75, under the headings TRACKING,
+// VALUE and Order Details.
+function cols() {
+    const base = [
+        { key: 'tracking', label: 'Tracking',      pdf: 'TRACKING',      w: 150 },
+        { key: 'value',    label: 'Value',         pdf: 'VALUE',         w: 200 },
+        { key: 'title',    label: 'Order Details', pdf: 'Order Details', w: 380, ra: true },
+        { key: 'num',      label: 'Order #',       pdf: '',              w: 110 }
+    ];
+    return COLS ? COLS.arrange(base) : base;
+}
+const headRow = (cs, forPrint) => '<tr>' + cs.map(c =>
+    `<th data-col="${c.key}" class="${c.ra ? 'ra' : ''}" style="min-width:${c.w}px">${esc(forPrint ? c.pdf : c.label)}</th>`).join('') + '</tr>';
+function numLink(r) {
+    const m = MODULE_NAME[r.module];
+    return m && r.num ? `<a class="fb-row-link trd-num" data-open="${esc(m)}" data-num="${esc(r.num)}">${esc(r.num)}</a>` : esc(r.num);
+}
+function lineRow(cs, r) {
+    const cell = { tracking: esc(r.tracking), value: esc(r.value), title: `<span title="${esc(r.title)}">${esc(r.title)}</span>`, num: numLink(r) };
+    return '<tr class="trd-row">' + cs.map(c => `<td class="${c.ra ? 'ra' : ''}">${cell[c.key] ?? ''}</td>`).join('') + '</tr>';
+}
+
+// ---- The WO block ----
+// One line on the subreport's 453pt grid: [x, width, html, right?].
+const SUB_W = 453;
+const seg = (x, w, html, right) => `<span class="${right ? 'r' : ''}" style="left:${(x / SUB_W * 100).toFixed(2)}%;width:${(w / SUB_W * 100).toFixed(2)}%">${html}</span>`;
+const wobRow = (n, inner, cls) => `<tr class="rpt-minor trd-wo${cls ? ' ' + cls : ''}"><td colspan="${n}"><div class="wob">${inner}</div></td></tr>`;
+function woBlock(n, W) {
+    const fulfilled = W.status.trim() === 'Fulfilled';
+    const fg = [W.fgNum, W.fgDesc].filter(Boolean).join(' - ');
+    const wtrk = S.trk['wo:' + W.id] || '';
+    const lines = [];
+    // Column header band (printed above the group header, as Jasper does).
+    lines.push(`<div class="wob-ln wob-hd wob-top">${seg(0, 151, 'WO')}${seg(151, 55, 'Original', 1)}${seg(225, 55, 'Needed', 1)}` +
+        `${seg(298, 45, 'Used', 1)}${seg(363, 47, 'Unit Cost', 1)}${seg(410, 40, 'Total', 1)}</div>`);
+    lines.push(`<div class="wob-ln">${seg(0, 40, 'WO #:')}${seg(40, 100, numLink({ module: 'WO', num: W.num }))}${seg(140, 307, esc(fg))}</div>`);
+    lines.push(`<div class="wob-ln">${seg(0, 40, 'Status:')}${seg(40, 65, esc(W.status))}${seg(106, 50, 'Scheduled:')}${seg(156, 52, esc(fmtDate(W.sched)))}` +
+        `${seg(225, 56, 'Qty Ordered:')}${seg(289, 44, esc(fmtQty(W.ordered)), 1)}${seg(336, 23, esc(W.uom))}${seg(370, 35, 'Cost:')}${seg(408, 42, esc(fmtMoney(W.cost)), 1)}</div>`);
+    lines.push(`<div class="wob-ln">${seg(106, 50, 'Started:')}${seg(156, 52, esc(fmtDate(W.started)))}` +
+        `${seg(225, 56, 'Qty Fulfilled:')}${seg(289, 44, W.hasFg ? esc(fmtQty(W.fulfilled)) : '', 1)}${seg(336, 23, esc(W.uom))}</div>`);
+    const remaining = fulfilled ? 0 : (W.hasFg ? W.remaining : W.ordered);
+    lines.push(`<div class="wob-ln${wtrk ? '' : ' wob-rule'}">${seg(106, 50, 'Finished:')}${seg(156, 52, esc(fmtDate(W.finished)))}` +
+        `${seg(225, 56, 'Qty Remaining:')}${seg(289, 44, esc(fmtQty(remaining)), 1)}${seg(336, 23, esc(W.uom))}</div>`);
+    if (wtrk) lines.push(`<div class="wob-trk wob-rule"><b>Tracking:</b>${esc(wtrk)}</div>`);
+    W.items.forEach(it => {
+        const needed = fulfilled ? 0 : it.needed;
+        const itrk = S.trk['wi:' + it.id] || '';
+        lines.push(`<div class="wob-ln">${seg(0, 151, esc((it.type === 10 ? '+ ' : '- ') + it.desc))}${seg(151, 55, esc(fmtQty(it.orig)), 1)}${seg(206, 19, '&nbsp;' + esc(it.uom))}` +
+            `${seg(225, 55, esc(fmtQty(needed)), 1)}${seg(280, 18, '&nbsp;' + esc(it.uom))}${seg(298, 45, esc(fmtQty(it.used)), 1)}${seg(343, 20, '&nbsp;' + esc(it.uom))}` +
+            `${seg(363, 47, esc(fmtMoney(it.unit)), 1)}${seg(410, 41, esc(fmtMoney(it.total)), 1)}</div>` +
+            (itrk ? `<div class="wob-trk"><b>Tracking:</b>${esc(itrk)}</div>` : ''));
+    });
+    return lines.map((l, i) => wobRow(n, l, i === lines.length - 1 ? 'trd-wo-last' : ''));
+}
+
+// Heading-click sort (FBLib.RptCols): rows move with their WO block. With
+// no heading sort, the report's order.
+const sortVal = (r, k) => ({ tracking: r.tracking, value: r.sortVal, title: r.title, num: r.num })[k];
+const sorted = () => (COLS && COLS.sort() ? S.rows.slice().sort((a, b) => COLS.compare(a, b, sortVal)) : S.rows);
+function bodyRows(cs) {
+    const out = [], seen = new Set();
+    sorted().forEach(r => {
+        out.push(lineRow(cs, r));
+        const W = r.woid && S.wos[r.woid];
+        if (!W || F.woMode === 'none' || (F.woMode === 'first' && seen.has(r.woid))) return;
+        seen.add(r.woid);
+        woBlock(cs.length, W).forEach(x => out.push(x));
+    });
+    return out;
+}
+function countText() {
+    const recs = new Set(S.rows.map(r => r.ti)).size;
+    const wos = new Set(S.rows.filter(r => r.woid).map(r => r.woid)).size;
+    return plural(S.rows.length, 'row') + ' · ' + plural(recs, 'tracking record') + (wos ? ' · ' + plural(wos, 'work order') : '');
+}
+const emptyText = () => (searchValue(F) === '%' ? 'No tracking information was found.' : 'No tracking information contains "' + F.value + '".');
+
+// Long reports paint in chunks as the user scrolls.
+const CHUNK = 600;
+let _paint = { html: [], shown: 0 };
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+function render(keepScroll) {
+    const tbl = v('rpt');
+    const wrap = v('rptWrap');
+    const top = wrap.scrollTop;
+    const cs = cols();
+    tbl.querySelector('thead').innerHTML = headRow(cs);
+    _paint = { html: bodyRows(cs), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    while (keepScroll && _paint.shown < _paint.html.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+    tbl.style.display = S.rows.length ? '' : 'none';
+    v('rptEmpty').textContent = S.rows.length || !S.loadedAt ? '' : emptyText();
+    wrap.scrollTop = keepScroll ? top : 0;
+    setStatus([S.company, S.loadedAt ? countText() : '', filterText(F)].filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the pages as the standard report prints them: Letter
+//  portrait, the company and "Tracking Details" on every page (its page
+//  header), TRACKING / VALUE / Order Details, a rule over each row, the
+//  order number underlined in the original's blue (#000099), the WO block
+//  indented at 7pt (headings 8pt bold).
+// ============================================================================
+let PDF = null;
+const PDF_CSS =
+    '.fbdoc-rpt-tbl th.ra,.fbdoc-rpt-tbl td.ra{text-align:right}' +
+    '.fbdoc-rpt-tbl tr.trd-row td{border-top:.75pt solid #000}' +
+    '.fbdoc-rpt-tbl a.trd-num{color:#000099;text-decoration:underline;font-weight:400}' +
+    '.fbdoc-rpt-tbl tr.trd-wo td{padding-top:0;padding-bottom:0;border:0;background:none}' +
+    '.fbdoc-rpt-tbl tr.trd-wo-last td{padding-bottom:3pt}' +
+    '.fbdoc-rpt-tbl .wob{margin-left:7.8%;width:82%;max-width:none;font-size:7pt;color:#000}' +
+    '.fbdoc-rpt-tbl .wob a.trd-num{color:#000;text-decoration:none}' +
+    '.fbdoc-rpt-tbl .wob-ln{position:relative;height:9.5pt}' +
+    '.fbdoc-rpt-tbl .wob-ln>span{position:absolute;top:0;height:9.5pt;line-height:9.5pt;white-space:nowrap;overflow:hidden}' +
+    '.fbdoc-rpt-tbl .wob-ln>span.r{text-align:right}' +
+    '.fbdoc-rpt-tbl .wob-hd{font-size:8pt;font-weight:700;height:10.5pt;border-bottom:.75pt solid #000}' +
+    '.fbdoc-rpt-tbl .wob-top{margin-top:2pt}' +
+    '.fbdoc-rpt-tbl .wob-rule{border-bottom:.75pt solid #000}' +
+    '.fbdoc-rpt-tbl .wob-trk{padding-left:12.1%;line-height:9.5pt;white-space:normal;overflow-wrap:anywhere}' +
+    '.fbdoc-rpt-tbl .wob-trk b{font-weight:400;margin-left:-12.1%;display:inline-block;width:12.1%}';
+function docSpec() {
+    if (!S.loadedAt) return null;
+    const cs = cols();
+    return {
+        company: S.company, title: TITLE, subtitle: filterText(F) || ' ', titleEveryPage: true,
+        head: headRow(cs, true), rows: bodyRows(cs), foot: '',
+        empty: emptyText(), css: PDF_CSS, fontPt: 10
+    };
+}
+
+let COLS = null;
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    const sub = [S.company, filterText(F)].filter(Boolean);
+    const rows = {
+        name: 'Tracking', title: TITLE, subtitle: sub,
+        cols: [{ key: 'tracking', label: 'Tracking', w: 120, type: 'text' }, { key: 'value', label: 'Value', w: 150, type: 'text' },
+               { key: 'table', label: 'Recorded on', w: 90, type: 'text' }, { key: 'title', label: 'Order Details', w: 320, type: 'text' },
+               { key: 'module', label: 'Order Type', w: 70, type: 'text' }, { key: 'num', label: 'Order #', w: 90, type: 'text' }],
+        rows: sorted().map(r => ({ tracking: r.tracking, value: r.value, table: r.table, title: r.title, module: r.module, num: r.num })),
+        totals: false
+    };
+    const sheets = [rows];
+    const wos = Object.values(S.wos);
+    if (wos.length && F.woMode !== 'none') sheets.push({
+        name: 'Work Orders', title: TITLE + ' – work orders', subtitle: sub,
+        cols: [{ key: 'wo', label: 'WO #', w: 80, type: 'text' }, { key: 'fg', label: 'Finished Part', w: 200, type: 'text' },
+               { key: 'status', label: 'Status', w: 70, type: 'text' }, { key: 'item', label: 'Item', w: 240, type: 'text' },
+               { key: 'orig', label: 'Original', w: 70, type: 'qty' }, { key: 'needed', label: 'Needed', w: 70, type: 'qty' },
+               { key: 'used', label: 'Used', w: 70, type: 'qty' }, { key: 'uom', label: 'UOM', w: 45, type: 'text' },
+               { key: 'unit', label: 'Unit Cost', w: 80, type: 'money' }, { key: 'total', label: 'Total', w: 80, type: 'money' },
+               { key: 'trk', label: 'Tracking', w: 220, type: 'text' }],
+        rows: [].concat(...wos.map(W => W.items.map(it => ({ wo: W.num, fg: [W.fgNum, W.fgDesc].filter(Boolean).join(' - '), status: W.status,
+            item: (it.type === 10 ? '+ ' : '- ') + it.desc, orig: it.orig, needed: W.status.trim() === 'Fulfilled' ? 0 : it.needed, used: it.used,
+            uom: it.uom, unit: it.unit, total: it.total, trk: S.trk['wi:' + it.id] || '' })))),
+        totals: false
+    });
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'Tracking_Detail_' + ymd(new Date()), sheets });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's pages (fb-doc). Without fb-doc on the server, the
+// plain printout below: JxBrowser won't print the report page itself, so it
+// is built in a new window and printed there.
+function printReport() {
+    if (PDF) {
+        if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+    const cs = cols();
+    const css = PDF_CSS.replace(/\.fbdoc-rpt-tbl /g, '');
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' + esc(TITLE) + '</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:9pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:12pt;font-weight:700}h2{text-align:center;font-size:15pt;margin:2px 0}.sub{text-align:center;font-size:9pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{font-size:10pt;text-align:left;padding:3px 5px;border-bottom:1px solid #000}' +
+        'td{font-size:9pt;padding:2px 5px;vertical-align:top}' + css +
+        '@page{size:Letter portrait;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>' + esc(TITLE) + '</h2><p class="sub">' + esc(filterText(F)) + '</p>' +
+        '<table><thead>' + headRow(cs, true).replace(/ style="[^"]*"/g, '') + '</thead><tbody>' + bodyRows(cs).join('') + '</tbody></table>' +
+        '<p style="font-size:7.5pt;margin-top:8px">Printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters and options what everyone sees each time this report opens?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        v('fValue').addEventListener('change', applySoon);
+        v('fValue').addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        ['fWoMode', 'fWoPicks'].forEach(id => v(id).addEventListener('change', applySoon));
+        v('resetFiltersBtn').onclick = () => { writeFilters(BASE); applySoon(); };
+
+        // Column resize / sort / reorder (fb-lib).
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({ table: v('rpt'), onSort: () => render(true), onReorder: () => render(true) });
+        v('resetColsBtn').onclick = () => { if (COLS) { COLS.reset(); render(false); } };
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: v('appView'), toggleBefore: v('exportBtn'),
+                page: { size: 'Letter', orientation: 'portrait' },
+                doc: docSpec, title: () => TITLE
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        v('refreshBtn').onclick = () => loadAll();
+        v('exportBtn').onclick = exportWorkbook;
+        v('printBtn').onclick = printReport;
+        v('publishBtn').onclick = publishFilters;
+        v('unpublishBtn').onclick = () => {
+            if (!confirm('Stop using company defaults for this report? Everyone goes back to their own last choices.')) return;
+            const ok = FBLib.Settings.clearCompany(['filters', 'opts']) !== false;
+            showToast(ok ? 'This report no longer has company defaults.' : 'That was not saved.', ok ? 'success' : 'error');
+        };
+        v('adminGroup').classList.toggle('hidden', !isAdmin());
+        v('setRemember').checked = !!_resolve('remember', true);
+        v('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        v('setShowDebug').checked = !!_resolve('showDebug', false);
+        v('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        const wrap = v('rptWrap');
+        wrap.addEventListener('scroll', () => { if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 400) appendChunk(); });
+        v('rpt').addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (!a) return;
+            e.preventDefault();
+            try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+            catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+        });
+
+        await loadLookups();
+        writeFilters(savedFilters());
+        F = readFilters();
+        await loadAll();
+    } catch (e) {
+        console.error('[Tracking Detail] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

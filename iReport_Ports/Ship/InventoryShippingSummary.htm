@@ -1,0 +1,982 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Inventory Shipping Summary (iReport port)
+  PATH:   iReport_Ports/Ship/InventoryShippingSummary.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard Ship/InventoryShippingSummary.jrxml (its
+  "Details" table dataset). Same source, same rules, same columns; only the
+  presentation is interactive.
+
+    Source     One row per shipped item: ship ⋈ shipitem ⋈ product (on
+               shipitem.itemId) ⋈ shipcarton (the item's carton) ⋈ carrier,
+               with the sales order (order type 20), the ship-to state and the
+               SO's customer. A shipment without a carrier or carton never
+               shows; since the customer filter is a LIKE on customer.id, only
+               sales order shipments show (a PO / TO shipment has no customer).
+    Columns    SO # and Customer PO (links to the sales order), Product #,
+               Description, Quantity (the company's quantity format, no UOM:
+               the original prints none), Date Shipped (company date format),
+               Shipped To, Address, City, State (code), Zip, Tracking # (the
+               carton's), Carrier, Customer. Each one is a col* option with
+               the original's default: SO #, Customer PO and Description off,
+               the rest on.
+    Filters    Date shipped (dateRange1 / dateRange2, default This Month;
+               both end days count in full; "All dates" still needs a ship
+               date). Customer (customerID). Product number (productNum, LIKE,
+               default %). Shipped to name, Address, City, Zip (contains;
+               ShippedToName, ShippedToAddress, City, Zip; a blank field on the
+               shipment never matches, as in the original). Carrier (carrier,
+               contains). State code (StateCode, LIKE, default %): the
+               shipment's state; "Show items with no state"
+               (ckShowItemsWithNoState, off) also lists lines whose sales
+               order has no ship-to state. Report title (ReportTitle).
+    Order      Date shipped, SO number (the original's ORDER BY), then the
+               shipped item.
+    Totals     None in the original. The App view's footer counts the lines
+               and shipments (an addition; the PDF prints none).
+
+  Layout: the REPORT chrome (fb-styles §35). Table tools (fb-lib
+  FBLib.RptCols / RowCap): a heading sorts the rows (again to reverse, a
+  third time for the report's order), drag to reorder, edge to resize; at
+  most 10,000 lines with Load all. Pivot view (FBLib.Pivot): quantity or
+  line / shipment count by product, customer, state, city, carrier, ship-to
+  or month shipped. App / PDF (fb-doc, FBDoc.Report): the PDF prints as the
+  original: Letter landscape, the company, title and "Date Range: …" on the
+  first page only (its title band), 9pt bold headings over a 1pt rule, 9pt
+  rows ruled in light grey, SO # / Customer PO in the original's blue,
+  "Page X of Y".
+
+  Deliberate differences (DIFFERENCES.md has them all):
+    - Ties in the original's order (same ship date and SO) keep the shipped
+      item order (the original leaves them to the database).
+    - Empty text filters are the original's "%" (match everything); the
+      original's carrier and customer parameters have no default.
+  Additions: the App footer (line and shipment count); Pivot; links; Excel;
+  Print; remembered filters and company defaults.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-folder" content="Ship">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="Every product shipped on sales orders in a period, with where it went, the tracking number, carrier and customer.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipInvShippingSummary',
+            name:  'Inventory Shipping Summary',
+            build: '2026.10.20-99c37d5'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inventory Shipping Summary — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 360px; overflow: hidden; text-overflow: ellipsis; vertical-align: top; }
+        .rpt-table th { cursor: default; }
+        .rpt-table th.ra, .rpt-table td.ra { text-align: right; }
+        .rpt-table th.ca, .rpt-table td.ca { text-align: center; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+        .rpt-fgroup select { width: 100%; }
+        .col-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>Inventory Shipping Summary</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <div class="rpt-viewsel" id="viewSelWrap" title="Table: the report as the standard one lays it out. Pivot: quantity or line count by any two fields">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 5h18M3 10h10M3 15h18M3 20h10" stroke-linecap="round"/></svg>
+            <select id="viewSel">
+                <option value="table">Table</option>
+                <option value="pivot">Pivot</option>
+            </select>
+        </div>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Date shipped</div>
+            <div>
+                <div class="rpt-flabel">Quick range</div>
+                <select id="fRange"></select>
+            </div>
+            <div class="rpt-dates">
+                <input type="date" id="fFrom" aria-label="From">
+                <span class="rpt-fnote">→</span>
+                <input type="date" id="fTo" aria-label="To">
+            </div>
+            <div class="rpt-fnote">Both end days count in full.</div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">What / who</div>
+            <div>
+                <div class="rpt-flabel">Customer</div>
+                <select id="fCustomer"><option value="">All customers</option></select>
+            </div>
+            <div>
+                <div class="rpt-flabel">Product number</div>
+                <input type="text" id="fProduct" placeholder="All products (% is a wildcard)">
+            </div>
+            <div>
+                <div class="rpt-flabel">Carrier</div>
+                <select id="fCarrier"><option value="">All carriers</option></select>
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Shipped to</div>
+            <div>
+                <div class="rpt-flabel">Name contains</div>
+                <input type="text" id="fName" placeholder="Any name">
+            </div>
+            <div>
+                <div class="rpt-flabel">Address contains</div>
+                <input type="text" id="fAddress" placeholder="Any address">
+            </div>
+            <div>
+                <div class="rpt-flabel">City contains</div>
+                <input type="text" id="fCity" placeholder="Any city">
+            </div>
+            <div style="display:flex;gap:8px">
+                <div style="flex:1"><div class="rpt-flabel">State code</div><input type="text" id="fState" placeholder="All (% wildcard)" style="width:100%"></div>
+                <div style="flex:1"><div class="rpt-flabel">Zip contains</div><input type="text" id="fZip" placeholder="Any" style="width:100%"></div>
+            </div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fNoState"> Show items with no state</label>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Columns</div>
+            <div class="col-grid" id="colGrid"></div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Title</div>
+            <div>
+                <div class="rpt-flabel">Report title</div>
+                <input type="text" id="fTitle" placeholder="Inventory Shipping Summary">
+            </div>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own sort">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters and columns what everyone sees each time this report opens. Anyone can still change them while it is open.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+                <button type="button" class="ds-btn" id="unpublishBtn" title="Everyone goes back to their own last choices">Stop using them</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>Every product shipped on a sales order in the period: how many, when, where it went (name, address, city, state, zip), the carton's tracking number, the carrier and the customer. It is the BI version of the standard <strong>Inventory Shipping Summary</strong> report and reads the same data the same way.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">The rows</div>
+                <ul>
+                    <li>One row per item shipped, with the tracking number of the carton it went in. Quantities are in the item's shipped UOM (the report shows no UOM, as the standard one).</li>
+                    <li>Only sales order shipments: the customer filter needs one.</li>
+                    <li>Lines without a ship-to state are left out unless <strong>Show items with no state</strong> is ticked.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>The period starts on <strong>This month</strong>, as in the standard report. The name, address, city and zip boxes match any part of the value; product number and state code take % as a wildcard.</li>
+                    <li><strong>Columns</strong> shows or hides each column, as the standard report's column options. Click a column heading to sort (again to reverse, a third time for the report's order); drag a heading onto another to move the column; drag its right edge to resize it.</li>
+                    <li>The <strong>Table / Pivot</strong> selector switches to a pivot: the quantity, lines or shipments by product, customer, state, city, carrier, ship-to or month shipped.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable pages, laid out like the standard report. <strong>Print</strong> prints those pages.</li>
+                    <li>A very large result shows its first 10,000 lines with a <strong>Load all</strong> button.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-app" id="appView">
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+</div>
+<div class="pivot-host" id="pivotHost" style="display:none"></div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.RowCap) missing.push('FBLib.RowCap');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const DEFAULT_TITLE = 'Inventory Shipping Summary';
+const STOCK_REPORT_PATH = '../reports/Ship/InventoryShippingSummary.jasper';
+// The original's columns, in its order: [option, key, heading, width (pt), default, class].
+const COLUMNS = [
+    ['colSONum', 'so', 'SO #', 54, false], ['colCustomerPO', 'po', 'Customer PO', 65, false],
+    ['colProductNum', 'product', 'Product #', 54, true], ['colProductDescription', 'desc', 'Description', 118, false],
+    ['colQuantity', 'qty', 'Quantity', 46, true, 'ra'], ['colDateShipped', 'date', 'Date Shipped', 70, true, 'ca'],
+    ['colShippedTo', 'shipto', 'Shipped To', 84, true], ['colAddress', 'address', 'Address', 118, true],
+    ['colCity', 'city', 'City', 81, true], ['colState', 'state', 'State', 33, true], ['colZip', 'zip', 'Zip', 40, true],
+    ['colTrackingNum', 'tracking', 'Tracking #', 75, true], ['colCarrier', 'carrier', 'Carrier', 46, true],
+    ['colCustomer', 'customer', 'Customer', 84, true]
+];
+const RANGES = [
+    ['custom', 'Custom…'], ['all', 'All dates'], ['today', 'Today'], ['yesterday', 'Yesterday'], ['last7', 'Last 7 days'],
+    ['thisWeek', 'This week'], ['lastWeek', 'Last week'], ['thisMonth', 'This month'], ['lastMonth', 'Last month'],
+    ['thisQuarter', 'This quarter'], ['lastQuarter', 'Last quarter'], ['thisYear', 'This year'], ['lastYear', 'Last year']
+];
+const DEFAULT_FILTERS = Object.assign({ range: 'thisMonth', from: '', to: '', customer: '', product: '', carrier: '',
+    name: '', address: '', city: '', state: '', zip: '', noState: false, title: '' },
+    Object.fromEntries(COLUMNS.map(c => [c[0], c[4]])));
+let BASE = Object.assign({}, DEFAULT_FILTERS);
+const QUERY_KEYS = ['range', 'from', 'to', 'customer', 'product', 'carrier', 'name', 'address', 'city', 'state', 'zip', 'noState'];
+const TEXTS = { fProduct: 'product', fName: 'name', fAddress: 'address', fCity: 'city', fState: 'state', fZip: 'zip', fTitle: 'title' };
+// The stock report's parameter names → filter keys (the col* options keep theirs).
+const PARAM_KEYS = { productNum: 'product', ShippedToName: 'name', ShippedToAddress: 'address', City: 'city', StateCode: 'state',
+                     Zip: 'zip', carrier: 'carrier', customerID: 'customer', ReportTitle: 'title' };
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        company: { keys: ['filters', 'opts'], editors: true },   // every open starts from the company defaults
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const int = v => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : 0; };
+const has = v => v !== null && v !== undefined && String(v) !== '';
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const dstr = v => { const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v ?? '')); return m ? m[1] : ''; };
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const isYmd = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+const v = id => document.getElementById(id);
+const bool = x => (typeof x === 'boolean' ? x : /^(true|1|yes)$/i.test(String(x ?? '').replace(/"/g, '').trim()));
+// The company's formats (REPORT_DATE_FORMAT, REPORT_DECIMAL_QTY), as the jrxml prints.
+const ENV = { date: 'MM/dd/yyyy', qty: '#,##0.#####' };
+function jdate(x) {
+    if (!dstr(x)) return '';
+    try { if (window.FBDoc && FBDoc.fmt) return FBDoc.fmt.date(ENV.date, String(x)); } catch (_) {}
+    return FBLib.Common.formatDate(dstr(x));
+}
+function jqty(x) {
+    try { if (window.FBDoc && FBDoc.fmt) return FBDoc.fmt.number(ENV.qty, x); } catch (_) {}
+    return FBLib.Common.formatQty(x);
+}
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = v('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ---- Date ranges (Fishbowl's "This Month" etc.) ----
+function presetDates(key) {
+    const t = new Date(); t.setHours(0, 0, 0, 0);
+    const y = t.getFullYear(), m = t.getMonth(), d = t.getDate(), qm = Math.floor(m / 3) * 3, wd = t.getDay();
+    const D = (yy, mm, dd) => new Date(yy, mm, dd);
+    const r = {
+        today: [t, t], yesterday: [D(y, m, d - 1), D(y, m, d - 1)], last7: [D(y, m, d - 6), t],
+        thisWeek: [D(y, m, d - wd), D(y, m, d - wd + 6)], lastWeek: [D(y, m, d - wd - 7), D(y, m, d - wd - 1)],
+        thisMonth: [D(y, m, 1), D(y, m + 1, 0)], lastMonth: [D(y, m - 1, 1), D(y, m, 0)],
+        thisQuarter: [D(y, qm, 1), D(y, qm + 3, 0)], lastQuarter: [D(y, qm - 3, 1), D(y, qm, 0)],
+        thisYear: [D(y, 0, 1), D(y, 11, 31)], lastYear: [D(y - 1, 0, 1), D(y - 1, 11, 31)]
+    }[key];
+    return r ? [ymd(r[0]), ymd(r[1])] : null;
+}
+function dateRange(f) {
+    let a = f.from, b = f.to;
+    if (f.range !== 'custom') { const p = presetDates(f.range); if (!p) return null; [a, b] = p; }
+    if (!isYmd(a) && !isYmd(b)) return null;
+    a = isYmd(a) ? a : '1900-01-01'; b = isYmd(b) ? b : '2999-12-31';
+    if (a > b) [a, b] = [b, a];
+    const after = new Date(b + 'T00:00:00'); after.setDate(after.getDate() + 1);
+    return { start: a, endExcl: ymd(after), label: jdate(a) + ' - ' + jdate(b) };
+}
+function rangeKey(s) {
+    const t = String(s || '').replace(/["\s]/g, '').toLowerCase();
+    const hit = RANGES.find(r => r[0].toLowerCase() === t || r[1].replace(/\s/g, '').toLowerCase() === t);
+    return hit ? hit[0] : null;
+}
+
+// ============================================================================
+//  FILTERS
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _hydrating = false, _applyTimer = null;
+const S = { rows: [], company: '', customers: {}, loadedAt: null, noCap: false, view: 'table' };
+
+function readFilters() {
+    const f = { range: v('fRange').value, from: v('fFrom').value, to: v('fTo').value,
+                customer: v('fCustomer').value, carrier: v('fCarrier').value, noState: v('fNoState').checked };
+    Object.keys(TEXTS).forEach(id => { f[TEXTS[id]] = v(id).value.trim(); });
+    COLUMNS.forEach(c => { f[c[0]] = v('col_' + c[0]).checked; });
+    return f;
+}
+function selectValue(id, val) {
+    const el = v(id);
+    el.value = val || '';
+    if (el.value !== (val || '')) {                    // a choice no longer listed
+        const o = document.createElement('option'); o.value = val; o.textContent = val; el.appendChild(o); el.value = val;
+    }
+}
+function writeFilters(f) {
+    _hydrating = true;
+    v('fRange').value = RANGES.some(r => r[0] === f.range) ? f.range : DEFAULT_FILTERS.range;
+    const p = v('fRange').value === 'custom' ? [f.from, f.to] : (presetDates(v('fRange').value) || ['', '']);
+    v('fFrom').value = p[0] || ''; v('fTo').value = p[1] || '';
+    selectValue('fCustomer', f.customer ? String(f.customer) : '');
+    selectValue('fCarrier', f.carrier || '');
+    v('fNoState').checked = !!f.noState;
+    Object.keys(TEXTS).forEach(id => { v(id).value = f[TEXTS[id]] || ''; });
+    COLUMNS.forEach(c => { v('col_' + c[0]).checked = f[c[0]] !== undefined ? !!f[c[0]] : c[4]; });
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, BASE, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const requery = QUERY_KEYS.some(k => JSON.stringify(next[k]) !== JSON.stringify(F[k]));
+        F = next;
+        remember();
+        if (requery) { S.noCap = false; loadAll(); } else render(true);
+    }, 250);
+}
+const reportTitle = () => (F.title && F.title !== '%' ? F.title : DEFAULT_TITLE);
+// The original's parameter line.
+const rangeLine = f => { const r = dateRange(f); return 'Date Range: ' + (r ? r.label : 'All'); };
+function filterText(f) {
+    return [rangeLine(f), f.customer ? 'Customer ' + (S.customers[f.customer] || f.customer) : '',
+        f.product && f.product !== '%' ? 'Product ' + f.product : '', f.carrier ? 'Carrier ' + f.carrier : '',
+        f.name ? 'Shipped to "' + f.name + '"' : '', f.address ? 'Address "' + f.address + '"' : '', f.city ? 'City "' + f.city + '"' : '',
+        f.state && f.state !== '%' ? 'State ' + f.state : '', f.zip ? 'Zip "' + f.zip + '"' : '', f.noState ? 'Items with no state included' : '']
+        .filter(Boolean).join(' · ');
+}
+
+// ============================================================================
+//  SQL — the original's "Details" query, as it is: the text filters are its
+//  LIKE / contains on the shipment's fields (a blank field never matches),
+//  the state test is its own (the shipment's state code, or with the option
+//  the SO without a ship-to state). Shipped item id breaks the ties.
+// ============================================================================
+function buildSQL(f) {
+    const like = s => `'${sqlStr(s)}'`;
+    const r = dateRange(f);
+    const w = [r ? `ship.dateshipped >= '${r.start} 00:00:00' AND ship.dateshipped < '${r.endExcl} 00:00:00'` : 'ship.dateshipped IS NOT NULL',
+        `product.num LIKE ${like(f.product || '%')}`,
+        `UPPER(ship.shiptoname) LIKE UPPER(CONCAT('%', ${like(f.name)}, '%'))`,
+        `UPPER(carrier.name) LIKE UPPER(CONCAT('%', ${like(f.carrier)}, '%'))`,
+        `customer.id LIKE ${like(f.customer ? String(int(f.customer)) : '%')}`,
+        `(UPPER(sostate.code) LIKE UPPER(${like(f.state || '%')}) OR (${f.noState ? "'0'" : "'1'"} = '0' AND so.shiptostateid IS NULL))`,
+        `ship.shiptozip LIKE CONCAT('%', ${like(f.zip)}, '%')`,
+        `UPPER(ship.shiptocity) LIKE UPPER(CONCAT('%', ${like(f.city)}, '%'))`,
+        `UPPER(ship.shiptoaddress) LIKE UPPER(CONCAT('%', ${like(f.address)}, '%'))`];
+    return `
+        SELECT shipitem.id AS itemid, ship.id AS shipid, product.num AS partnumber, COALESCE(product.description, '') AS productdescription,
+               COALESCE(shipitem.qtyshipped, 0) AS qtyshipped, DATE_FORMAT(ship.dateshipped, '%Y-%m-%d %H:%i:%s') AS dateshipped,
+               COALESCE(ship.shiptoname, '') AS shiptoname, COALESCE(ship.shiptoaddress, '') AS shiptoaddress,
+               COALESCE(ship.shiptocity, '') AS shiptocity, COALESCE(ship.shiptozip, '') AS shiptozip, COALESCE(sostate.code, '') AS shiptostate,
+               COALESCE(shipcarton.trackingnum, '') AS trackingnum, carrier.name AS carrier, COALESCE(customer.name, '') AS customername,
+               COALESCE(so.num, '') AS sonumber, COALESCE(so.customerpo, '') AS customerpo
+        FROM ship
+        JOIN shipitem ON ship.id = shipitem.shipid
+        JOIN product ON shipitem.itemid = product.id
+        JOIN shipcarton ON shipitem.shipcartonid = shipcarton.id
+        JOIN carrier ON ship.carrierid = carrier.id
+        LEFT JOIN so ON ship.soid = so.id AND ship.ordertypeid = 20
+        LEFT JOIN stateconst sostate ON ship.shiptostateid = sostate.id
+        LEFT JOIN customer ON so.customerid = customer.id
+        WHERE ${w.join('\n          AND ')}
+        ORDER BY ship.dateshipped, so.num, shipitem.id`;
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+let _loadToken = 0;
+
+async function loadLookups() {
+    const res = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('Stock options', `SELECT rp.name AS name, rp.paramvalue AS value FROM reportparameter rp
+            JOIN report r ON r.id = rp.reportid WHERE r.path = '${sqlStr(STOCK_REPORT_PATH)}'`),
+        q('Report formats', "SELECT syskey, sysvalue FROM sysproperties WHERE syskey IN ('REPORT_DATE_FORMAT', 'REPORT_DECIMAL_QTY')"),
+        q('Carriers', 'SELECT name FROM carrier ORDER BY name'),
+        q('Customers', 'SELECT id, name, activeflag+0 AS active FROM customer ORDER BY name')
+    ]);
+    const ok = i => res[i].status === 'fulfilled' ? res[i].value : [];
+    S.company = (ok(0)[0] || {}).name || '';
+    ok(2).forEach(r => {
+        const k = String(r.syskey || '').toUpperCase();
+        if (k === 'REPORT_DATE_FORMAT' && has(r.sysvalue)) ENV.date = String(r.sysvalue);
+        if (k === 'REPORT_DECIMAL_QTY' && has(r.sysvalue)) ENV.qty = String(r.sysvalue);
+    });
+    ok(3).forEach(r => { const o = document.createElement('option'); o.value = o.textContent = String(r.name || ''); v('fCarrier').appendChild(o); });
+    ok(4).forEach(r => {
+        S.customers[String(r.id)] = String(r.name || '');
+        const o = document.createElement('option'); o.value = String(r.id);
+        o.textContent = String(r.name || '') + (int(r.active) === 1 ? '' : ' (inactive)');
+        v('fCustomer').appendChild(o);
+    });
+    // The stock report's saved options, as the starting point.
+    const applied = [];
+    ok(1).forEach(r => {
+        const val = r.value == null ? '' : String(r.value).replace(/^"|"$/g, '').trim();
+        if (r.name === 'dateRange1') { const k = rangeKey(val); if (k) { BASE.range = k; applied.push(r.name); } return; }
+        if (r.name === 'ckShowItemsWithNoState') { BASE.noState = val === '0'; applied.push(r.name); return; }
+        if (COLUMNS.some(c => c[0] === r.name)) { BASE[r.name] = bool(val); applied.push(r.name); return; }
+        const k = PARAM_KEYS[r.name];
+        if (k) { BASE[k] = val === '%' ? '' : val; applied.push(r.name); }
+    });
+    if (applied.length) debugLog('Stock options applied: ' + applied.join(', '));
+    const failed = res.filter(x => x.status === 'rejected').map(x => x.reason && x.reason.message);
+    if (failed.length) debugLog('Lookups failed: ' + failed.join('; '), 'warn');
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    const stale = () => tok !== _loadToken;
+    v('banner').textContent = '';
+    v('loading').classList.add('show');
+    setStatus('Loading…');
+    const cap = S.noCap ? 0 : undefined;           // FBLib.RowCap: the first 10,000 lines unless Load all
+    let rows;
+    try {
+        rows = await q('Shipped items', FBLib.RowCap.sql(buildSQL(F), cap));
+        if (stale()) return;
+    } catch (e) {
+        if (stale()) return;
+        v('loading').classList.remove('show');
+        v('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        FBLib.RowCap.notice({ before: v('appView'), capped: false });
+        S.rows = []; S.loadedAt = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    v('loading').classList.remove('show');
+    const capped = FBLib.RowCap.apply(rows, cap);
+    FBLib.RowCap.notice({ before: v('appView'), capped: capped.capped, limit: capped.limit, what: 'lines',
+                          onLoadAll: () => { S.noCap = true; loadAll(); } });
+    S.rows = capped.rows.map(r => ({
+        shipId: int(r.shipid), so: String(r.sonumber || ''), po: String(r.customerpo || ''), product: String(r.partnumber || ''),
+        desc: String(r.productdescription || ''), qty: num(r.qtyshipped), date: String(r.dateshipped || ''),
+        shipto: String(r.shiptoname || ''), address: String(r.shiptoaddress || ''), city: String(r.shiptocity || ''),
+        state: String(r.shiptostate || ''), zip: String(r.shiptozip || ''), tracking: String(r.trackingnum || ''),
+        carrier: String(r.carrier || ''), customer: String(r.customername || '')
+    }));
+    S.loadedAt = new Date();
+    render();
+}
+
+function setStatus(t) { v('statusLine').textContent = t; }
+
+// ============================================================================
+//  MODEL + TABLE
+// ============================================================================
+// The original's columns that are switched on, in its order, then in the
+// user's order (FBLib.RptCols).
+function cols() {
+    const base = COLUMNS.filter(c => F[c[0]]).map(c => ({ key: c[1], label: c[2], w: Math.round(c[3] * 1.6), cls: c[5] || '' }));
+    return COLS ? COLS.arrange(base) : base;
+}
+const headRow = cs => '<tr>' + cs.map(c => `<th data-col="${c.key}" class="${c.cls}" style="min-width:${c.w}px">${esc(c.label)}</th>`).join('') + '</tr>';
+const soLink = (r, text) => (r.so ? `<a class="fb-row-link iss-num" data-open="Sales Order" data-num="${esc(r.so)}">${esc(text)}</a>` : esc(text));
+const cut = s => `<span title="${esc(s)}">${esc(s)}</span>`;
+function lineRow(cs, r) {
+    const cell = {
+        so: soLink(r, r.so), po: soLink(r, r.po), product: esc(r.product), desc: cut(r.desc), qty: esc(jqty(r.qty)),
+        date: esc(jdate(r.date)), shipto: cut(r.shipto), address: cut(r.address), city: esc(r.city), state: esc(r.state),
+        zip: esc(r.zip), tracking: esc(r.tracking), carrier: esc(r.carrier), customer: cut(r.customer)
+    };
+    return '<tr>' + cs.map(c => `<td class="${c.cls}">${cell[c.key] ?? ''}</td>`).join('') + '</tr>';
+}
+// Heading-click sort (FBLib.RptCols). With no heading sort, the report's order.
+const sortVal = (r, k) => (k === 'qty' ? r.qty : k === 'date' ? r.date : String(r[k] ?? '').toLowerCase());
+const sorted = () => (COLS && COLS.sort() ? S.rows.slice().sort((a, b) => COLS.compare(a, b, sortVal)) : S.rows);
+const bodyRows = cs => sorted().map(r => lineRow(cs, r));
+const shipCount = () => new Set(S.rows.map(r => r.shipId)).size;
+const footRow = cs => `<tr><td colspan="${Math.max(1, cs.length)}">${esc('Total — ' + plural(S.rows.length, 'line') + ' on ' + plural(shipCount(), 'shipment'))}</td></tr>`;
+const emptyText = () => 'No shipped items match these filters.';
+
+// Long reports paint in chunks as the user scrolls.
+const CHUNK = 600;
+let _paint = { html: [], shown: 0 };
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+function render(keepScroll) {
+    if (S.view === 'pivot' && PIVOT) {
+        PIVOT.render();
+        setStatus([S.company, 'pivot', S.loadedAt ? plural(S.rows.length, 'line') : '', filterText(F)].filter(Boolean).join(' · '));
+        if (PDF) PDF.refresh();
+        return;
+    }
+    const tbl = v('rpt');
+    const wrap = v('rptWrap');
+    const top = wrap.scrollTop;
+    const cs = cols();
+    tbl.querySelector('thead').innerHTML = headRow(cs);
+    _paint = { html: bodyRows(cs), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    while (keepScroll && _paint.shown < _paint.html.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+    tbl.querySelector('tfoot').innerHTML = S.rows.length ? footRow(cs) : '';
+    tbl.style.display = S.rows.length ? '' : 'none';
+    v('rptEmpty').textContent = S.rows.length || !S.loadedAt ? '' : emptyText();
+    wrap.scrollTop = keepScroll ? top : 0;
+    setStatus([S.company, S.loadedAt ? plural(S.rows.length, 'line') + ' · ' + plural(shipCount(), 'shipment') : '', filterText(F)]
+        .filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the pages as the standard report prints them: Letter
+//  landscape, the company, title and "Date Range: …" on the first page (its
+//  title band), 9pt bold headings over a 1pt rule, 9pt rows ruled in
+//  #CCCCCC, Quantity right, Date Shipped centred, SO # / Customer PO in the
+//  original's blue (#000099).
+// ============================================================================
+let PDF = null;
+const PDF_CSS =
+    '.fbdoc-rpt-tbl th{font-weight:700;border-bottom:1pt solid #000}' +
+    '.fbdoc-rpt-tbl td{border-bottom:1pt solid #CCCCCC}' +
+    '.fbdoc-rpt-tbl th.ra,.fbdoc-rpt-tbl td.ra{text-align:right}' +
+    '.fbdoc-rpt-tbl th.ca,.fbdoc-rpt-tbl td.ca{text-align:center}' +
+    '.fbdoc-rpt-tbl a.iss-num{color:#000099;text-decoration:none;font-weight:400}';
+function docSpec() {
+    if (!S.loadedAt) return null;
+    if (S.view === 'pivot' && PIVOT) {
+        const p = PIVOT.pdfSpec();
+        return { company: S.company, title: reportTitle(), titleEveryPage: false, subtitle: [rangeLine(F), pivotText()],
+                 head: p.head, rows: p.rows, foot: p.foot, empty: emptyText(), css: PDF_CSS, fontPt: 9 };
+    }
+    const cs = cols();
+    return {
+        company: S.company, title: reportTitle(), subtitle: rangeLine(F), titleEveryPage: false,
+        head: headRow(cs), rows: bodyRows(cs), foot: '',
+        empty: ' ', css: PDF_CSS, fontPt: 9
+    };
+}
+
+// ============================================================================
+//  PIVOT VIEW (FBLib.Pivot) — quantity, lines or shipments by product,
+//  customer, state, city, carrier, ship-to or month shipped.
+// ============================================================================
+let PIVOT = null, COLS = null;
+const PIVOT_FIELDS = [
+    { key: 'product', label: 'Product #' }, { key: 'desc', label: 'Description', dim: false }, { key: 'customer', label: 'Customer' },
+    { key: 'state', label: 'State' }, { key: 'city', label: 'City' }, { key: 'zip', label: 'Zip' }, { key: 'carrier', label: 'Carrier' },
+    { key: 'shipto', label: 'Shipped To' }, { key: 'so', label: 'SO #' }, { key: 'date', label: 'Date Shipped', type: 'date' },
+    { key: 'qty', label: 'Quantity', type: 'qty' }, { key: 'ship', label: 'Shipments', distinct: true, dim: false }
+];
+const pivotRows = () => S.rows.map(r => ({ product: r.product, desc: r.desc, customer: r.customer, state: r.state, city: r.city, zip: r.zip,
+    carrier: r.carrier, shipto: r.shipto, so: r.so, date: dstr(r.date), qty: r.qty, ship: r.shipId }));
+function pivotText() {
+    const c = PIVOT.config(), lbl = k => (PIVOT_FIELDS.find(x => x.key === k) || {}).label || '';
+    const fld = PIVOT_FIELDS.find(x => x.key === c.measure);
+    const m = c.measure === '__count__' ? 'Lines' : fld && fld.distinct ? lbl(c.measure)
+        : ({ sum: 'Total', count: 'Count of', avg: 'Average', min: 'Lowest', max: 'Highest' }[c.agg] || '') + ' ' + lbl(c.measure);
+    return 'Pivot: ' + m + ' by ' + [lbl(c.rowDim), lbl(c.rowDim2)].filter(Boolean).join(' + ') + (c.colDim ? ' × ' + lbl(c.colDim) : '');
+}
+function setView(x, persist) {
+    S.view = x === 'pivot' && PIVOT ? 'pivot' : 'table';
+    v('viewSel').value = S.view;
+    v('rptWrap').style.display = S.view === 'pivot' ? 'none' : '';
+    v('pivotHost').style.display = S.view === 'pivot' ? '' : 'none';
+    if (persist) _saveUserKeys({ view: S.view });
+    render(false);
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    const sub = [S.company, filterText(F)].filter(Boolean);
+    const type = { qty: 'qty', date: 'date' };
+    const sheet = {
+        name: 'Shipped Items', title: reportTitle(), subtitle: sub,
+        cols: COLUMNS.map(c => ({ key: c[1], label: c[2], w: Math.max(50, Math.round(c[3] * 1.4)), type: type[c[1]] || 'text', noTotal: true })),
+        rows: sorted().map(r => Object.assign({}, r, { date: dstr(r.date) || null })),
+        totals: false
+    };
+    const sheets = [sheet];
+    if (S.view === 'pivot' && PIVOT) sheets.unshift(Object.assign(PIVOT.sheet('Pivot'), { title: reportTitle() + ' – ' + pivotText(), subtitle: sub }));
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'Inventory_Shipping_Summary_' + ymd(new Date()), sheets });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's pages (fb-doc). Without fb-doc on the server, the
+// plain printout below: JxBrowser won't print the report page itself, so it
+// is built in a new window and printed there.
+function printReport() {
+    if (PDF) {
+        if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+    const cs = cols();
+    const css = PDF_CSS.replace(/\.fbdoc-rpt-tbl /g, '');
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' + esc(reportTitle()) + '</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:8pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:12pt;font-weight:700}h2{text-align:center;font-size:15pt;margin:2px 0}.sub{text-align:center;font-size:9pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{text-align:left;padding:2px 3px}td{padding:2px 3px;vertical-align:top}' + css +
+        '@page{size:Letter landscape;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>' + esc(reportTitle()) + '</h2><p class="sub">' + esc(rangeLine(F)) + '</p>' +
+        '<table><thead>' + headRow(cs).replace(/ style="[^"]*"/g, '') + '</thead><tbody>' + bodyRows(cs).join('') + '</tbody></table>' +
+        '<p style="font-size:7.5pt;margin-top:8px">Printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters and columns what everyone sees each time this report opens?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        // The column options (the original's col* parameters).
+        v('colGrid').innerHTML = COLUMNS.map(c => `<label class="rpt-fcheck"><input type="checkbox" id="col_${c[0]}"> ${esc(c[2])}</label>`).join('');
+        COLUMNS.forEach(c => v('col_' + c[0]).addEventListener('change', applySoon));
+
+        const fRange = v('fRange');
+        fRange.innerHTML = RANGES.map(r => `<option value="${r[0]}">${esc(r[1])}</option>`).join('');
+        fRange.onchange = () => {
+            if (fRange.value !== 'custom') { const p = presetDates(fRange.value); v('fFrom').value = p ? p[0] : ''; v('fTo').value = p ? p[1] : ''; }
+            applySoon();
+        };
+        ['fFrom', 'fTo'].forEach(id => v(id).addEventListener('change', () => { fRange.value = 'custom'; applySoon(); }));
+        ['fCustomer', 'fCarrier', 'fNoState'].forEach(id => v(id).addEventListener('change', applySoon));
+        Object.keys(TEXTS).forEach(id => {
+            v(id).addEventListener('change', applySoon);
+            v(id).addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        });
+        v('resetFiltersBtn').onclick = () => { writeFilters(BASE); applySoon(); };
+
+        // Column resize / sort / reorder, and the Pivot view (fb-lib).
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({ table: v('rpt'), onSort: () => render(true), onReorder: () => render(true) });
+        if (FBLib.Pivot) PIVOT = FBLib.Pivot.mount(v('pivotHost'), {
+            fields: PIVOT_FIELDS, rows: pivotRows, countLabel: 'Lines',
+            defaults: { rowDim: 'product', colDim: 'date', colBucket: 'month', measure: 'qty', agg: 'sum' },
+            format: (fld, x) => (fld && fld.type === 'qty' ? jqty(x) : null)
+        });
+        else v('viewSelWrap').style.display = 'none';
+        v('viewSel').addEventListener('change', e => setView(e.target.value, true));
+        v('resetColsBtn').onclick = () => { if (COLS) { COLS.reset(); render(false); } };
+        S.view = _resolve('view', 'table') === 'pivot' && PIVOT ? 'pivot' : 'table';
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: v('appView'), toggleBefore: v('exportBtn'),
+                page: { size: 'Letter', orientation: 'landscape' },
+                doc: docSpec, title: () => reportTitle()
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        v('refreshBtn').onclick = () => loadAll();
+        v('exportBtn').onclick = exportWorkbook;
+        v('printBtn').onclick = printReport;
+        v('publishBtn').onclick = publishFilters;
+        v('unpublishBtn').onclick = () => {
+            if (!confirm('Stop using company defaults for this report? Everyone goes back to their own last choices.')) return;
+            const ok = FBLib.Settings.clearCompany(['filters', 'opts']) !== false;
+            showToast(ok ? 'This report no longer has company defaults.' : 'That was not saved.', ok ? 'success' : 'error');
+        };
+        v('adminGroup').classList.toggle('hidden', !isAdmin());
+        v('setRemember').checked = !!_resolve('remember', true);
+        v('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        v('setShowDebug').checked = !!_resolve('showDebug', false);
+        v('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        const wrap = v('rptWrap');
+        wrap.addEventListener('scroll', () => { if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 400) appendChunk(); });
+        v('rpt').addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (!a) return;
+            e.preventDefault();
+            try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+            catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+        });
+
+        await loadLookups();
+        writeFilters(savedFilters());
+        F = readFilters();
+        setView(S.view, false);
+        await loadAll();
+    } catch (e) {
+        console.error('[Inventory Shipping Summary] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

@@ -41,7 +41,13 @@ async function capture(report, out, o) {
         if (seen.has(k) || /userproperties/i.test(q)) continue;
         seen.add(k);
         if (!/^\s*SELECT\b/i.test(q)) { console.warn('skipped (not a SELECT): ' + q.slice(0, 80)); continue; }
-        let rows = await sql(q);
+        let rows;
+        try { rows = await sql(q); }
+        catch (e) {
+            // A query the server rejects is answered with no rows, as the page would see it.
+            console.warn('FAILED (answered with []): ' + q.replace(/\s+/g, ' ').slice(0, 300) + '\n  ' + String(e.message || e).slice(0, 300));
+            rows = [];
+        }
         if (o.maxRows && rows.length > o.maxRows) rows = rows.slice(0, o.maxRows);
         fx.push([k, rows]);
         added++;

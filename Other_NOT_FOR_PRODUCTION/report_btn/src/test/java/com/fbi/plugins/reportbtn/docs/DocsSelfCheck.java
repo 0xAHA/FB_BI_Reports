@@ -171,11 +171,39 @@ public final class DocsSelfCheck {
         eq(String.valueOf(EmailAddresses.forRecord(sql, "WO", 1).size()), "0", "no account behind a WO");
         java.util.List<EmailAddresses.Address> u = EmailAddresses.users(sql);
         eq(u.get(0).name + "," + u.get(1).name + "," + u.get(1).source, "Sam Smith,admin,Fishbowl user", "users: login when no name");
-        java.util.List<EmailAddresses.Address> list = new java.util.ArrayList<>(c);
-        list.addAll(u);
-        boolean[] ticked = {false, true, false, true, false};   // Ben, Sam
-        eq(String.join("; ", EmailAddresses.merge(list, ticked, Arrays.asList("typed@x.test", "anna@acme.test", "ben@ACME.test"))),
-            "typed@x.test; ben@ACME.test; sam@fb.test", "merge: typed kept, unticked dropped, ticked kept once, new appended");
+        eq(EmailAddresses.recordTab("SO", c) + "," + EmailAddresses.recordTab("PO", c), "Customer,Vendor", "the first tab's title");
+
+        // The company tab: the company's contacts, then the users not already there.
+        EmailTokens.Rows co = (q, cols) -> {
+            java.util.List<Map<String, String>> rows = new java.util.ArrayList<>();
+            if (q.contains("FROM company ")) {
+                rows.add(row(cols, "3", "Demo Co"));
+            } else if (q.contains("FROM contact ")) {
+                rows.add(row(cols, "Office", "office@demo.test", "Main"));
+                rows.add(row(cols, "Sam", "SAM@fb.test", "Main"));
+            } else if (q.contains("FROM sysuser ")) {
+                rows.add(row(cols, "Sam Smith", "sam", "sam@fb.test"));
+                rows.add(row(cols, "Jo Jones", "jo", "jo@fb.test"));
+            }
+            return rows;
+        };
+        StringBuilder cg = new StringBuilder();
+        for (EmailAddresses.Address a : EmailAddresses.company(co)) {
+            cg.append(a.email).append('@').append(a.source).append(' ');
+        }
+        eq(cg.toString().trim(), "office@demo.test@Company SAM@fb.test@Company jo@fb.test@Fishbowl user",
+            "company tab: company contacts, then users not already listed");
+
+        // Double-click adds an address to a field: Name <email>, once.
+        EmailAddresses.Address anna = new EmailAddresses.Address("Anna", "anna@acme.test", "x");
+        eq(EmailAddresses.append("", anna), "Anna <anna@acme.test>", "append to an empty field");
+        eq(EmailAddresses.append("typed@x.test", anna), "typed@x.test; Anna <anna@acme.test>", "append after a typed address");
+        eq(EmailAddresses.append("ANNA@acme.test", anna), "ANNA@acme.test", "an address already there isn't added again");
+        eq(EmailAddresses.display(new EmailAddresses.Address("Smith, Jo", "jo@x.test", "x")), "\"Smith, Jo\" <jo@x.test>",
+            "a name with a comma is quoted");
+        eq(EmailAddresses.display(new EmailAddresses.Address("", "jo@x.test", "x")), "jo@x.test", "no name: the bare address");
+        eq(String.join("|", com.fbi.plugins.reportbtn.docs.mail.EmailDraft.split("\"Smith, Jo\" <jo@x.test>; ann@x.test, <a,b@x.test>")),
+            "\"Smith, Jo\" <jo@x.test>|ann@x.test|<a,b@x.test>", "split keeps quoted names and <…> whole");
     }
 
     private static Map<String, String> row(String[] cols, String... values) {

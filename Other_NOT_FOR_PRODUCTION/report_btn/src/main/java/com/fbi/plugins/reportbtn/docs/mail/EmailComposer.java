@@ -1,23 +1,28 @@
 package com.fbi.plugins.reportbtn.docs.mail;
 
+import com.fbi.gui.button.FBButton;
 import com.fbi.plugins.reportbtn.BrowserFit;
 import com.fbi.util.FishbowlBrowser;
 
+import javax.swing.AbstractButton;
 import javax.swing.BorderFactory;
+import javax.swing.Icon;
+import javax.swing.ImageIcon;
 import javax.swing.JButton;
 import javax.swing.JCheckBoxMenuItem;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
-import javax.swing.JOptionPane;
 import javax.swing.JMenuItem;
+import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JPopupMenu;
+import javax.swing.JSeparator;
 import javax.swing.JTextField;
+import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
 import javax.swing.SwingWorker;
 import javax.swing.Timer;
-import javax.swing.UIManager;
 import javax.swing.WindowConstants;
 import java.awt.BorderLayout;
 import java.awt.Color;
@@ -35,18 +40,19 @@ import java.awt.Window;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.InputStream;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * The rich email window: To / Cc / Bcc / Subject, the attachments, and the body in
- * an HTML editor (Composer.htm in a JxBrowser view), so an HTML template shows as it
- * will arrive. Send goes through Fishbowl's own email settings (MailSender); "Open in
- * my email program" hands the email to the user's own email program instead
- * (OwnMailProgram), just this once or from now on (remembered for the user). The To, Cc and Bcc
- * labels are buttons that list the record's customer or vendor contacts and the
- * Fishbowl users.
+ * The rich email window. It keeps the stock Compose Email window's layout (the Send /
+ * Cancel toolbar, From, the To / Cc / Bcc buttons that open the client's Email Address
+ * Book, Subject, and Attachments at the foot) so users find everything where it was;
+ * only the body differs: an HTML editor (Composer.htm in a JxBrowser view), so an HTML
+ * template shows as it will arrive. Send goes through Fishbowl's own email settings
+ * (MailSender); the Email App button hands the email to the user's own email program
+ * instead (OwnMailProgram), just this once or from now on (remembered for the user).
  */
 public final class EmailComposer extends JFrame {
 
@@ -57,9 +63,13 @@ public final class EmailComposer extends JFrame {
         void setUsesProgram(boolean on) throws Exception;
     }
 
-    /** The addresses the To / Cc / Bcc buttons offer (the record's contacts, then the Fishbowl users), read when first needed. */
+    /** The address book behind To / Cc / Bcc (the record's account, the company), read when first needed. */
     public interface AddressBook {
-        List<EmailAddresses.Address> addresses();
+        EmailAddresses.Book read();
+
+        default void log(String message, Throwable error) {
+            System.err.println("[report_btn docs] " + message + (error == null ? "" : ": " + error));
+        }
     }
 
     private static final String SEPARATE = "<html>Separate several addresses with a semicolon ( ; ),<br>"
@@ -69,15 +79,16 @@ public final class EmailComposer extends JFrame {
     private final JTextField to = new JTextField(), cc = new JTextField(), bcc = new JTextField(), subject = new JTextField();
     private final JPanel chips = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
     private final List<File> files = new ArrayList<>();
-    private final JButton send = new JButton("Send");
-    private final JButton program = new JButton("Open in my email program ▾");
+    private final FBButton send = toolButton("Send", "/side_toolbar/send16.png");
+    private final FBButton program = toolButton("Email App", "/side_toolbar/email16.png");
     private final Prefs prefs;
     private final AddressBook book;
-    private List<EmailAddresses.Address> addresses;
-    private String pendingHtml;
+    private EmailAddresses.Book addresses;
+    private boolean picking;
+    private String pendingHtml, pendingNote;
 
     private EmailComposer(Window owner, EmailDraft d, String note, Prefs prefs, AddressBook book) {
-        super(d.subject == null || d.subject.isEmpty() ? "Email" : d.subject);
+        super("Compose Email");
         this.prefs = prefs;
         this.book = book;
         setModalExclusionType(Dialog.ModalExclusionType.APPLICATION_EXCLUDE);
@@ -91,52 +102,70 @@ public final class EmailComposer extends JFrame {
         subject.setText(d.subject);
         files.addAll(d.attachments);
 
-        JPanel form = new JPanel(new GridBagLayout());
-        form.setBorder(BorderFactory.createEmptyBorder(8, 10, 4, 10));
+        // The toolbar, as the stock window has it: Send, Cancel (and the plugin's Email App).
+        // One row, left to right (the client's FBSideToolbar stacks its buttons in a column).
+        JPanel bar = new JPanel(new FlowLayout(FlowLayout.LEFT, 2, 2));
+        FBButton cancel = toolButton("Cancel", "/side_toolbar/cancel_red16.png");
+        send.setToolTipText("Send it now through Fishbowl's email settings");
+        send.addActionListener(e -> send(false));
+        cancel.setToolTipText("Close without sending");
+        cancel.addActionListener(e -> dispose());
+        program.setToolTipText("Open this email in your own email program (Outlook, or your default email app) to send from there");
+        program.addActionListener(e -> programMenu().show(program, 0, program.getHeight()));
+        bar.add(send);
+        bar.add(cancel);
+        bar.add(program);
+
+        // From, To, Cc, Bcc, Subject.
+        JPanel header = new JPanel(new GridBagLayout());
+        header.setBorder(BorderFactory.createEmptyBorder(6, 6, 6, 10));
         MailSettings s = MailSettings.current();
-        String from = MailSettings.blank(s.fromEmail) ? "(the address in your email settings)"
-            : (MailSettings.blank(s.fromName) ? s.fromEmail : s.fromName + " <" + s.fromEmail + ">");
-        row(form, 0, "From", new JLabel(from));
-        row(form, 1, chooser("To", to), to);
-        row(form, 2, chooser("Cc", cc), cc);
-        row(form, 3, chooser("Bcc", bcc), bcc);
-        row(form, 4, "Subject", subject);
-        JPanel attach = new JPanel(new BorderLayout(6, 0));
-        attach.add(chips, BorderLayout.CENTER);
-        JButton add = new JButton("Attach…");
-        add.addActionListener(e -> addFile());
-        attach.add(add, BorderLayout.EAST);
-        row(form, 5, "Attached", attach);
-        if (note != null && !note.isEmpty()) {
-            JLabel n = new JLabel(note);
-            n.setForeground(UIManager.getColor("Label.disabledForeground"));
-            row(form, 6, "", n);
-        }
-        renderChips();
+        JTextField from = new JTextField();
+        from.setText(MailSettings.blank(s.fromEmail) ? "(the address in your email settings)"
+            : (MailSettings.blank(s.fromName) ? s.fromEmail : s.fromName + " <" + s.fromEmail + ">"));
+        from.setEditable(false);
+        from.setEnabled(false);
+        row(header, 0, new JLabel("From:"), from);
+        row(header, 1, chooser("To", to), to);
+        row(header, 2, chooser("Cc", cc), cc);
+        row(header, 3, chooser("Bcc", bcc), bcc);
+        row(header, 4, new JLabel("Subject:"), subject);
+
+        JPanel north = new JPanel(new BorderLayout());
+        north.add(bar, BorderLayout.NORTH);
+        north.add(new JSeparator(), BorderLayout.CENTER);
+        north.add(header, BorderLayout.SOUTH);
 
         FishbowlBrowser.start();   // the client's shared engine; does nothing once it runs
         browser = new FishbowlBrowser();
         Component view = browser.getBrowserView();
         JPanel center = new JPanel(new BorderLayout());
+        center.add(new JSeparator(), BorderLayout.NORTH);
         center.add(view, BorderLayout.CENTER);
         BrowserFit.attach(center);
 
+        // Attachments at the foot, the paperclip on the right.
+        JPanel footer = new JPanel(new BorderLayout(6, 0));
+        footer.setBorder(BorderFactory.createEmptyBorder(6, 6, 6, 10));
+        footer.add(new JLabel("Attachments:"), BorderLayout.WEST);
+        footer.add(chips, BorderLayout.CENTER);
+        FBButton attach = new FBButton();
+        Icon clip = icon("/side_toolbar/attach16.png");
+        if (clip != null) {
+            attach.setIcon(clip);
+        } else {
+            attach.setText("Attach…");
+        }
+        attach.setToolTipText("Attach a file");
+        attach.addActionListener(e -> addFile());
+        footer.add(attach, BorderLayout.EAST);
         JPanel south = new JPanel(new BorderLayout());
-        south.setBorder(BorderFactory.createEmptyBorder(6, 10, 8, 10));
-        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
-        JButton cancel = new JButton("Cancel");
-        cancel.addActionListener(e -> dispose());
-        send.setToolTipText("Send it now through Fishbowl's email settings");
-        send.addActionListener(e -> send(false));
-        program.setToolTipText("Hand this email to your own email program (Outlook, or your default email app) to send from there");
-        program.addActionListener(e -> programMenu().show(program, 0, program.getHeight()));
-        buttons.add(cancel);
-        buttons.add(program);
-        buttons.add(send);
-        south.add(buttons, BorderLayout.EAST);
+        south.add(new JSeparator(), BorderLayout.NORTH);
+        south.add(footer, BorderLayout.CENTER);
+        renderChips();
 
         getContentPane().setLayout(new BorderLayout());
-        getContentPane().add(form, BorderLayout.NORTH);
+        getContentPane().add(north, BorderLayout.NORTH);
         getContentPane().add(center, BorderLayout.CENTER);
         getContentPane().add(south, BorderLayout.SOUTH);
         addWindowListener(new java.awt.event.WindowAdapter() {
@@ -149,11 +178,12 @@ public final class EmailComposer extends JFrame {
                 }
             }
         });
-        setSize(owner != null && owner.getWidth() > 600 ? new Dimension(Math.min(1100, owner.getWidth() * 3 / 4),
-            owner.getHeight() * 4 / 5) : new Dimension(1000, 780));
+        setSize(owner != null && owner.getWidth() > 600 ? new Dimension(Math.min(900, owner.getWidth() * 2 / 3),
+            Math.min(860, owner.getHeight() * 5 / 6)) : new Dimension(820, 780));
         setLocationRelativeTo(owner);
 
         pendingHtml = d.html;
+        pendingNote = note;
         browser.loadHtml(page());
         BrowserFit.afterLoad(center);
         // The editor page defines window.Composer once it has loaded; then the body goes in.
@@ -163,6 +193,9 @@ public final class EmailComposer extends JFrame {
             Object ready = js("typeof window.Composer");
             if ("object".equals(String.valueOf(ready))) {
                 js("Composer.load(" + jsString(pendingHtml) + ")");
+                if (pendingNote != null && !pendingNote.isEmpty()) {
+                    js("Composer.note && Composer.note(" + jsString(pendingNote) + ")");
+                }
                 pendingHtml = null;
                 t.stop();
             } else if (System.currentTimeMillis() > until) {
@@ -177,6 +210,25 @@ public final class EmailComposer extends JFrame {
     public static void open(Component parent, EmailDraft d, String note, Prefs prefs, AddressBook book) {
         Window owner = parent == null ? null : (parent instanceof Window ? (Window) parent : SwingUtilities.getWindowAncestor(parent));
         new EmailComposer(owner, d, note, prefs, book).setVisible(true);
+    }
+
+    /** A toolbar button as the stock window draws them: the icon over its label. */
+    private static FBButton toolButton(String label, String iconPath) {
+        FBButton b = new FBButton();
+        b.setText(label);
+        Icon i = icon(iconPath);
+        if (i != null) {
+            b.setIcon(i);
+        }
+        b.setVerticalTextPosition(SwingConstants.BOTTOM);
+        b.setHorizontalTextPosition(SwingConstants.CENTER);
+        return b;
+    }
+
+    /** One of the client's own toolbar icons, or null when this client hasn't got it. */
+    private static Icon icon(String path) {
+        URL u = EmailComposer.class.getResource(path);
+        return u == null ? null : new ImageIcon(u);
     }
 
     /** "Just this once", and "Always" (remembered for the user; unticked, it stops). */
@@ -214,29 +266,47 @@ public final class EmailComposer extends JFrame {
         }
     }
 
-    /** The field's label as a button that opens the address list; the field gets the how-to-type tooltip. */
+    /** "To:", "Cc:", "Bcc:": a button opening the Email Address Book on that field. */
     private JButton chooser(String label, JTextField field) {
         field.setToolTipText(SEPARATE);
-        JButton b = new JButton(label);
+        JButton b = new JButton(label + ":");
         b.setMargin(new Insets(2, 8, 2, 8));
-        b.setToolTipText("Pick " + label + " addresses from the customer's or vendor's contacts, or from the Fishbowl users");
-        b.addActionListener(e -> {
-            List<String> next = AddressPicker.choose(this, label, addresses(), EmailDraft.split(field.getText()));
-            if (next != null) {
-                field.setText(EmailDraft.join(next));
-            }
-        });
+        b.setToolTipText("Choose addresses from the email address book");
+        b.addActionListener(e -> pick(label));
         return b;
     }
 
-    private List<EmailAddresses.Address> addresses() {
+    private void pick(String field) {
+        if (picking) {
+            return;
+        }
+        EmailAddresses.Book b = addresses();
+        if (b == null) {
+            return;
+        }
+        picking = true;
+        try {
+            String[] next = AddressPicker.choose(this, field, b, to.getText(), cc.getText(), bcc.getText(),
+                (m, err) -> { if (book != null) book.log(m, err); });
+            if (next != null) {
+                to.setText(next[0] == null ? "" : next[0]);
+                cc.setText(next[1] == null ? "" : next[1]);
+                bcc.setText(next[2] == null ? "" : next[2]);
+            }
+        } finally {
+            picking = false;
+        }
+    }
+
+    private EmailAddresses.Book addresses() {
         if (addresses == null) {
             setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
             try {
-                addresses = book == null ? new ArrayList<>() : book.addresses();
+                addresses = book == null ? new EmailAddresses.Book("Customer", new ArrayList<>(), new ArrayList<>(), "GENERIC")
+                    : book.read();
             } catch (RuntimeException e) {
                 JOptionPane.showMessageDialog(this, "The addresses couldn't be read: " + e.getMessage(), "Email", JOptionPane.WARNING_MESSAGE);
-                return new ArrayList<>();
+                return null;
             } finally {
                 setCursor(Cursor.getDefaultCursor());
             }
@@ -261,8 +331,7 @@ public final class EmailComposer extends JFrame {
             JOptionPane.showMessageDialog(this, "Add at least one recipient.", "Email", JOptionPane.WARNING_MESSAGE);
             return;
         }
-        send.setEnabled(false);
-        program.setEnabled(false);
+        setButtonsEnabled(false);
         new SwingWorker<String, Void>() {
             @Override
             protected String doInBackground() throws Exception {
@@ -275,8 +344,7 @@ public final class EmailComposer extends JFrame {
 
             @Override
             protected void done() {
-                send.setEnabled(true);
-                program.setEnabled(true);
+                setButtonsEnabled(true);
                 try {
                     String said = get();
                     dispose();
@@ -290,6 +358,12 @@ public final class EmailComposer extends JFrame {
                 }
             }
         }.execute();
+    }
+
+    private void setButtonsEnabled(boolean on) {
+        for (AbstractButton b : new AbstractButton[] {send, program}) {
+            b.setEnabled(on);
+        }
     }
 
     private static List<String> recipients(EmailDraft d) {
@@ -314,9 +388,6 @@ public final class EmailComposer extends JFrame {
 
     private void renderChips() {
         chips.removeAll();
-        if (files.isEmpty()) {
-            chips.add(new JLabel("Nothing attached"));
-        }
         for (File f : files) {
             JPanel chip = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
             chip.setBorder(BorderFactory.createLineBorder(new Color(0xC6D0D4)));
@@ -355,17 +426,13 @@ public final class EmailComposer extends JFrame {
         }
     }
 
-    private static void row(JPanel p, int y, String label, Component field) {
-        row(p, y, new JLabel(label), field);
-    }
-
     private static void row(JPanel p, int y, Component label, Component field) {
         GridBagConstraints l = new GridBagConstraints();
         l.gridx = 0;
         l.gridy = y;
         l.anchor = GridBagConstraints.WEST;
         l.fill = label instanceof JButton ? GridBagConstraints.HORIZONTAL : GridBagConstraints.NONE;
-        l.insets = new Insets(2, 0, 2, 8);
+        l.insets = new Insets(2, 0, 2, 6);
         p.add(label, l);
         GridBagConstraints f = new GridBagConstraints();
         f.gridx = 1;

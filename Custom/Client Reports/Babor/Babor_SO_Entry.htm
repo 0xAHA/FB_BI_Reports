@@ -59,7 +59,7 @@
         window.FB_REPORT = {
             key:   'cdx.bi.baborSoEntry',
             name:  'Babor SO Entry',
-            build: '2026.10.17-f667305'     // @fb-build
+            build: '2026.10.20-138db0e'     // @fb-build
         };
     </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -2838,8 +2838,13 @@ function resolveOrderTaxRateId(lines) {
         const id = t ? t.id : NONE_TAX_ID;
         counts.set(id, (counts.get(id) || 0) + 1);
     });
+    // A taxed rate wins over None whenever any line is taxed (most common taxed
+    // rate, then most common overall). With None on the order, the create stores
+    // the order's tax total as 0 even though a line carries GST (SO 260,
+    // 2026-10-20), so the stock documents print no GST.
     let best = NONE_TAX_ID, bestN = -1;
-    counts.forEach((n, id) => { if (n > bestN) { bestN = n; best = id; } });
+    counts.forEach((n, id) => { if (id !== NONE_TAX_ID && n > bestN) { bestN = n; best = id; } });
+    if (best === NONE_TAX_ID) counts.forEach((n, id) => { if (n > bestN) { bestN = n; best = id; } });
     return best;
 }
 function lineTaxCode(l) {
@@ -3831,6 +3836,28 @@ function extractCreatedSo(resp) {
 }
 function safeParse(s) { try { return JSON.parse(s); } catch (_) { return null; } }
 
+// The stored tax total against the lines' tax (each line rounded), or null when
+// they agree or can't be read. A mismatch means the documents print the wrong
+// GST until the order is saved once in the Sales Order module.
+async function orderTaxMismatch(soId) {
+    try {
+        const rows = await qp(`
+            SELECT so.totalTax AS stored,
+                   (SELECT COALESCE(SUM(ROUND(si.taxRate * si.totalPrice, 2)), 0) FROM soitem si WHERE si.soId = so.id) AS lines
+            FROM so WHERE so.id = ${intOf(soId)}`);
+        const r = rows && rows[0];
+        if (!r) return null;
+        const stored = numOf(r.stored) || 0, lines = numOf(r.lines) || 0;
+        if (Math.abs(stored - lines) < 0.005) return null;
+        dbg('tax check: stored ' + stored.toFixed(2) + ', lines ' + lines.toFixed(2), 'warn');
+        return 'its tax total was stored as ' + fmtMoney(stored) + ' but its lines carry ' + fmtMoney(lines) +
+            ' of tax (open it in the Sales Order module and Save once to correct the totals)';
+    } catch (e) {
+        dbg('tax check failed: ' + (e && e.message || e), 'warn');
+        return null;
+    }
+}
+
 // Read the order back and compare it to what was sent. A custom field that
 // silently didn't land would be invisible until the reporting screen came up
 // empty months later.
@@ -3854,6 +3881,10 @@ async function verifyCreated(created, sent) {
                 problems.push('line ' + si.lineNumber + ' price came back as ' + fmtMoney(match.unitPrice) + ', not ' + fmtMoney(si.unitPrice));
             }
         });
+        // The order's stored tax total must match its lines' tax: documents and
+        // statements print the stored total, the order screen recalculates.
+        const taxCheck = await orderTaxMismatch(created.id);
+        if (taxCheck) problems.push(taxCheck);
         if (problems.length) {
             toast('The order was created, but it did not store everything sent: ' + problems.join('; ') +
                   '. Check it in the Sales Order module.', 'warn', 25000);

@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   MTD Sales (iReport port)
+  PATH:   iReport_Ports/SalesOrder/MTDSales.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard SalesOrder/MTDSales.jrxml ("Prints a
+  graph of gross sales for the date range specified."). Same source, same
+  rules, same two charts; only the presentation is interactive.
+
+    Source     Every posted sales line (postsoitem -> postso, LEFT JOIN
+               soitem), any item type, any location group, summed per day of
+               the month of the Date parameter (the original's
+               CAST(DATE_SUB($P{Date}, INTERVAL 1 SECOND) AS date): the
+               chosen date's month, since Fishbowl adds a day to a date
+               parameter). The whole month is reported, days after today
+               included; there is no "to date" cut.
+    Amount     postsoitem.qty x (soitem.unitPrice + adjustAmount /
+               qtyToFulfill (1 when 0)): home currency, home symbol,
+               REPORT_DECIMAL_PRICE_PRECISION. Credit returns count with
+               their negative price.
+    Days       Days 1 to 31 (the original's CREATELIST(31)), each with its
+               amount or 0: a 30-day month still plots day 31 at 0.
+    Header     The company, the title (ReportTitle: "Month to Date Sales"
+               unless one is given), the month ("MMMM yyyy") and "Total to
+               Date:" = the sum of the 31 days.
+    Charts     A bar chart and a line chart (with point markers) of the
+               amount by day, no legend, no titles: the original's
+               bar3DChart (552 x 300) above its lineChart (552 x 298),
+               Letter portrait, no page footer.
+
+  Layout: the REPORT chrome (fb-styles §35): 56px header, push-down filter
+  panel that applies as you change it. The App view shows the month and
+  its total, the two charts (hover a bar or point for its day and amount),
+  and a daily table under them: Day, Date, Amount and Month to date (a
+  running total), with the month's total in the footer.
+  Table tools: the daily table resizes (FBLib.RptCols); it doesn't sort or
+  reorder: its order carries the running total. No RowCap (31 rows at
+  most). No Pivot view: the data has one dimension (the day); the charts
+  are the report's view of it.
+  Views: the header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+  report out like the original: Letter portrait, the company / title /
+  month / total band, then the bar chart and the line chart, both fitted
+  to one page; no page footer. "Daily figures in the PDF" (off by default)
+  adds the daily table on a page of its own.
+
+  Revenue vs the Sales Dashboard: the dashboard's posted revenue
+  (Dashboards/Sales_Dashboard_v1.2.htm) uses postsoitem.totalPrice less a
+  following discount line's percentage, dated by postso.dateCreated. This
+  port keeps the jrxml's unitPrice + adjustAmount formula and postDate.
+
+  Deliberate differences:
+    - The month is picked as a month (This month / Last month / a month),
+      not as a date whose month is used; the result is the same.
+    - The query sums the chosen month only (postDate from the first of the
+      month to the first of the next); the original summed every posted
+      line ever by year / month / day, then joined the month's days. Same
+      figures (live: October 2026, 2 days and $7,200.39; July 2025, 15 days
+      and $12,547.30, every day equal).
+    - The bar chart is flat (the original's is 3-D) and the value axis is
+      in currency.
+  Additions: the hover tooltips; the daily table with its running total
+  (on screen, in Excel and, as an option, in the PDF); Excel; Print.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-folder" content="Sales Order">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="Posted sales for a month, day by day, as a bar chart and a line chart with the month's total.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipMTDSales',
+            name:  'MTD Sales',
+            build: '2026.10.20-e93f747'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MTD Sales — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 420px; overflow: hidden; text-overflow: ellipsis; vertical-align: top; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table th { cursor: default; }
+        .mtd-sum { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 22px; padding: 14px 20px 4px; }
+        .mtd-sum .mtd-title { font-size: 16px; font-weight: 700; color: var(--c-primary, #0B3140); }
+        .mtd-sum .mtd-month { font-size: 14px; color: var(--c-secondary); }
+        .mtd-sum .mtd-total { font-size: 14px; color: var(--c-secondary); }
+        .mtd-sum .mtd-total b { font-size: 18px; color: var(--c-primary, #0B3140); }
+        .mtd-charts { display: flex; flex-wrap: wrap; gap: 8px 20px; padding: 4px 20px 10px; }
+        .mtd-chart { flex: 1 1 520px; min-width: 360px; max-width: 1100px; }
+        .mtd-chart h3 { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--c-secondary); margin: 6px 0 2px; }
+        .mtd-chart svg { display: block; width: 100%; height: auto; }
+        .mtd-chart svg .mtd-hit:hover + .mtd-mark, .mtd-chart svg .mtd-bar:hover { opacity: .8; }
+        .mtd-tbl-wrap { padding: 0 0 20px; }
+        tr.mtd-future td { color: var(--c-tertiary); }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>MTD Sales</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download the daily figures as an Excel workbook">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Month (posting date)</div>
+            <div>
+                <div class="rpt-flabel">Month</div>
+                <select id="fMode">
+                    <option value="this">This month</option>
+                    <option value="last">Last month</option>
+                    <option value="custom">Custom…</option>
+                </select>
+            </div>
+            <input type="month" id="fMonth" aria-label="Month">
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Layout</div>
+            <div>
+                <div class="rpt-flabel">Title</div>
+                <input type="text" id="fTitle" placeholder="Month to Date Sales">
+            </div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fDaily"> Daily figures in the PDF</label>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural column widths">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters what everyone sees each time this report opens. Anyone can still change them while it is open.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+                <button type="button" class="ds-btn" id="unpublishBtn" title="Everyone goes back to their own last choices">Stop using them</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>A month's posted sales, day by day: a bar chart and a line chart of each day's amount, and the month's <strong>Total to Date</strong>. It is the BI version of the standard <strong>MTD Sales</strong> report and reads the same data the same way.</p>
+                <p>A sale counts on the day its order was <strong>posted</strong>. Every posted line counts (any item type, any location group); credit returns count with their negative amount.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">The figures</div>
+                <ul>
+                    <li><strong>Amount</strong> = (unit price + the line's adjustment spread over its ordered quantity) × the quantity posted, in your home currency.</li>
+                    <li>The charts always run from day 1 to day 31, as the standard report's do; days with no sales (and day 31 of a shorter month) are 0.</li>
+                    <li><strong>Total to Date</strong> is the whole month's total.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>Pick the month under <strong>Filters</strong>; changes apply straight away. <strong>Title</strong> replaces "Month to Date Sales" on the page.</li>
+                    <li>Hover a bar or a point to see its day and amount. The table under the charts lists each day with a running <strong>Month to date</strong> total.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable page, laid out like the standard report: the two charts on one page. <strong>Daily figures in the PDF</strong> adds the table on a second page. <strong>Print</strong> prints those pages; <strong>Excel</strong> saves the daily figures.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-app" id="appView">
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <div class="mtd-sum" id="mtdSum"></div>
+    <div class="mtd-charts">
+        <div class="mtd-chart"><h3>Sales by day</h3><div id="barChart"></div></div>
+        <div class="mtd-chart"><h3>Trend</h3><div id="lineChart"></div></div>
+    </div>
+    <div class="mtd-tbl-wrap">
+        <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    </div>
+</div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const TITLE = 'MTD Sales';
+const DEFAULT_PAGE_TITLE = 'Month to Date Sales';     // the original's title when ReportTitle is "%"
+const DAYS = 31;                                       // the original's CREATELIST(31)
+const DEFAULT_FILTERS = { mode: 'this', month: '', title: '', daily: false };
+// The original's chart sizes (pt): bar 552 x 300 over line 552 x 298, 12pt apart.
+const CHART_W = 552, CHART_H = 300, CHART_GAP = 12;
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        company: { keys: ['filters', 'opts'], editors: true },   // every open starts from the company defaults
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const isYm = s => /^\d{4}-\d{2}$/.test(s || '');
+const r1 = v => Math.round(v * 10) / 10;
+
+// Amounts at the system's report precision (REPORT_DECIMAL_PRICE_PRECISION,
+// the original's REPORT_DECIMAL_PRICE pattern), home currency symbol.
+let PRICE_DP = 2;
+function fmtMoney(v) {
+    const n = num(v), c = FBLib.Common.currency();
+    return (n < 0 ? '-' : '') + c.symbol + Math.abs(n).toLocaleString(c.locale, { minimumFractionDigits: PRICE_DP, maximumFractionDigits: PRICE_DP });
+}
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// The month as "YYYY-MM", from the filter.
+function monthOf(f) {
+    const t = new Date();
+    if (f.mode === 'custom' && isYm(f.month)) return f.month;
+    const d = new Date(t.getFullYear(), t.getMonth() - (f.mode === 'last' ? 1 : 0), 1);
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
+}
+// The original's "MMMMM yyyy" (e.g. "October 2026").
+const monthLabel = ym => new Date(+ym.slice(0, 4), +ym.slice(5, 7) - 1, 1).toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+const pageTitle = f => (f.title && f.title.trim() && f.title.trim() !== '%' ? f.title.trim() : DEFAULT_PAGE_TITLE);
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS — the panel applies as it changes (one short debounce). The month
+//  re-queries; the title and the PDF option only redraw.
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _hydrating = false, _applyTimer = null;
+const S = { days: [], month: '', total: 0, company: '', loadedAt: null };
+
+function readFilters() {
+    return {
+        mode: document.getElementById('fMode').value,
+        month: document.getElementById('fMonth').value,
+        title: document.getElementById('fTitle').value,
+        daily: document.getElementById('fDaily').checked
+    };
+}
+function writeFilters(f) {
+    _hydrating = true;
+    const mode = ['this', 'last', 'custom'].indexOf(f.mode) !== -1 ? f.mode : 'this';
+    document.getElementById('fMode').value = mode;
+    document.getElementById('fMonth').value = monthOf(Object.assign({}, f, { mode }));
+    document.getElementById('fTitle').value = f.title || '';
+    document.getElementById('fDaily').checked = !!f.daily;
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const requery = monthOf(next) !== monthOf(F);
+        F = next;
+        remember();
+        if (requery) loadAll(); else render();
+    }, 250);
+}
+
+// ============================================================================
+//  SQL — the iReport query's sales sub-query, for the chosen month only (see
+//  the header comment): the amount per day of the month.
+// ============================================================================
+function buildSQL(ym) {
+    const y = +ym.slice(0, 4), m = +ym.slice(5, 7);
+    const next = new Date(y, m, 1);
+    return `
+        SELECT DAY(postso.postdate) AS dateday,
+               SUM(postsoitem.qty) AS qty,
+               SUM(postsoitem.qty * (soitem.unitprice + (soitem.adjustamount / (CASE WHEN soitem.qtytofulfill = 0 THEN 1 ELSE soitem.qtytofulfill END)))) AS amt
+        FROM postsoitem
+        JOIN postso ON postso.id = postsoitem.postsoid
+        LEFT JOIN soitem ON soitem.id = postsoitem.soitemid
+        WHERE postso.postdate >= '${ym}-01 00:00:00' AND postso.postdate < '${ymd(next)} 00:00:00'
+        GROUP BY 1
+        ORDER BY 1`;
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+let _loadToken = 0;
+
+async function loadLookups() {
+    const res = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('Report precision', "SELECT sysvalue FROM sysproperties WHERE syskey = 'REPORT_DECIMAL_PRICE_PRECISION'")
+    ]);
+    const ok = i => res[i].status === 'fulfilled' ? res[i].value : [];
+    S.company = (ok(0)[0] || {}).name || '';
+    const n = parseInt((ok(1)[0] || {}).sysvalue, 10);
+    if (Number.isInteger(n) && n >= 0 && n <= 9) PRICE_DP = n;
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    const ym = monthOf(F);
+    document.getElementById('banner').textContent = '';
+    document.getElementById('loading').classList.add('show');
+    setStatus('Loading…');
+    let rows;
+    try { rows = await q('MTD sales', buildSQL(ym)); }
+    catch (e) {
+        if (tok !== _loadToken) return;
+        document.getElementById('loading').classList.remove('show');
+        document.getElementById('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        S.days = []; S.total = 0; S.loadedAt = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    if (tok !== _loadToken) return;
+    document.getElementById('loading').classList.remove('show');
+    // Days 1..31, each with its amount or 0 (the original's CREATELIST(31)
+    // LEFT JOIN); a day past the month's end has no date.
+    const byDay = {};
+    rows.forEach(r => { byDay[Math.round(num(r.dateday))] = num(r.amt); });
+    const y = +ym.slice(0, 4), m = +ym.slice(5, 7), last = new Date(y, m, 0).getDate();
+    const today = ymd(new Date());
+    let run = 0;
+    S.days = [];
+    for (let d = 1; d <= DAYS; d++) {
+        const amt = byDay[d] || 0;
+        run += amt;
+        const date = d <= last ? ymd(new Date(y, m - 1, d)) : '';
+        S.days.push({ day: d, date, amt, run, future: !!date && date > today, sales: d in byDay });
+    }
+    S.total = run;
+    S.month = ym;
+    S.loadedAt = new Date();
+    render();
+}
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+
+// ============================================================================
+//  CHARTS — the original's bar chart and line chart: one category per day
+//  (1..31), the value axis from zero (JFreeChart's default; below zero when
+//  a day is negative), no legend, no titles. The App draws them at 1000 x
+//  300 (scaled to the panel) with hover tips; the PDF at the page's width,
+//  in points, black.
+// ============================================================================
+function niceStep(raw) {
+    if (!(raw > 0)) return 1;
+    const mag = Math.pow(10, Math.floor(Math.log10(raw))), r = raw / mag;
+    return (r <= 1 ? 1 : r <= 2 ? 2 : r <= 2.5 ? 2.5 : r <= 5 ? 5 : 10) * mag;
+}
+function tickText(v, step) {
+    const s = String(+step.toFixed(9)), dot = s.indexOf('.');
+    const d = Math.min(4, dot < 0 ? 0 : s.length - dot - 1);
+    const c = FBLib.Common.currency();
+    return (v < 0 ? '-' : '') + c.symbol + Math.abs(v).toLocaleString(c.locale, { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+const tipText = p => 'Day ' + p.day + (p.date ? ' (' + FBLib.Common.formatDate(p.date) + ')' : ' (no such day this month)') + ': ' + fmtMoney(p.amt);
+
+function chartSvg(kind, o) {
+    const P = S.days, n = P.length;
+    const W = o.w, H = o.h, fs = o.fs, print = !!o.print;
+    const ink = print ? '#000' : '#506872', gridC = print ? '#BBBBBB' : '#E3E3E3', axisC = print ? '#000' : '#C6D0D4';
+    const mainC = print ? (kind === 'bar' ? '#555' : '#000') : '#2d9cdb';
+    const vals = P.map(p => p.amt);
+    let lo = Math.min(0, ...vals), hi = Math.max(0, ...vals);
+    if (hi === lo) hi = lo + 1;
+    const step = niceStep((hi - lo) / 5);
+    lo = Math.floor(lo / step + 1e-9) * step; hi = Math.ceil(hi / step - 1e-9) * step;
+    const nt = Math.round((hi - lo) / step), ticks = [];
+    for (let k = 0; k <= nt; k++) ticks.push(lo + k * step);
+    const yW = Math.max(...ticks.map(t => tickText(t, step).length)) * fs * 0.6;
+    const padT = Math.round(fs * 0.8), padR = Math.round(fs * 0.8), padL = Math.ceil(yW + fs), padB = Math.ceil(fs * 2);
+    const pw = W - padL - padR, ph = H - padT - padB;
+    if (pw < 40 || ph < 40) return '';
+    const band = pw / n;
+    const X = i => padL + (i + 0.5) * band, Y = v => padT + (hi - v) / (hi - lo) * ph;
+    const every = Math.max(1, Math.ceil(fs * 1.6 / band));
+    const out = [];
+    out.push(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}"` + (print ? ` width="${W}pt" height="${H}pt"` : '') +
+        ` role="img" aria-label="${esc((kind === 'bar' ? 'Bar' : 'Line') + ' chart of sales by day of ' + monthLabel(S.month))}" font-size="${fs}" font-family="inherit">`);
+    ticks.forEach(t => {
+        const y = r1(Y(t));
+        out.push(`<line x1="${padL}" x2="${r1(padL + pw)}" y1="${y}" y2="${y}" stroke="${gridC}" stroke-width="${print ? 0.5 : 1}"/>`);
+        out.push(`<text x="${r1(padL - fs * 0.5)}" y="${y}" dy="0.35em" text-anchor="end" fill="${ink}">${esc(tickText(t, step))}</text>`);
+    });
+    const y0 = r1(Y(0));
+    out.push(`<line x1="${padL}" x2="${padL}" y1="${padT}" y2="${r1(padT + ph)}" stroke="${axisC}" stroke-width="${print ? 0.75 : 1}"/>`);
+    out.push(`<line x1="${padL}" x2="${r1(padL + pw)}" y1="${r1(padT + ph)}" y2="${r1(padT + ph)}" stroke="${axisC}" stroke-width="${print ? 0.75 : 1}"/>`);
+    if (lo < 0) out.push(`<line x1="${padL}" x2="${r1(padL + pw)}" y1="${y0}" y2="${y0}" stroke="${axisC}" stroke-width="${print ? 0.75 : 1}"/>`);
+    for (let i = 0; i < n; i += every) {
+        out.push(`<text x="${r1(X(i))}" y="${r1(padT + ph + fs * 1.2)}" text-anchor="middle" fill="${ink}">${P[i].day}</text>`);
+    }
+    if (kind === 'bar') {
+        const bw = Math.max(1, band * 0.7);
+        P.forEach((p, i) => {
+            const y = Y(p.amt), top = Math.min(y, y0), h = Math.abs(y - y0);
+            out.push(`<rect class="mtd-bar" x="${r1(X(i) - bw / 2)}" y="${r1(top)}" width="${r1(bw)}" height="${r1(Math.max(h, 0))}" fill="${mainC}">` +
+                (print ? '' : `<title>${esc(tipText(p))}</title>`) + '</rect>');
+            if (!print) out.push(`<rect x="${r1(X(i) - band / 2)}" y="${padT}" width="${r1(band)}" height="${r1(ph)}" fill="transparent"><title>${esc(tipText(p))}</title></rect>`);
+        });
+    } else {
+        out.push(`<path d="${P.map((p, i) => (i ? 'L' : 'M') + r1(X(i)) + ' ' + r1(Y(p.amt))).join(' ')}" fill="none" stroke="${mainC}" stroke-width="${print ? 1 : 2}" stroke-linejoin="round"/>`);
+        P.forEach((p, i) => {
+            if (!print) out.push(`<rect class="mtd-hit" x="${r1(X(i) - band / 2)}" y="${padT}" width="${r1(band)}" height="${r1(ph)}" fill="transparent"><title>${esc(tipText(p))}</title></rect>`);
+            out.push(print
+                ? `<rect x="${r1(X(i) - 1.6)}" y="${r1(Y(p.amt) - 1.6)}" width="3.2" height="3.2" fill="${mainC}"/>`
+                : `<circle class="mtd-mark" cx="${r1(X(i))}" cy="${r1(Y(p.amt))}" r="3.5" fill="${mainC}" stroke="#fff" stroke-width="1.5" pointer-events="none"/>`);
+        });
+    }
+    out.push('</svg>');
+    return out.join('');
+}
+
+// ============================================================================
+//  TABLE (an addition) — each day with its amount and the running total.
+// ============================================================================
+let PDF = null, COLS = null;
+function cols() {
+    const base = [
+        { key: 'day',  label: 'Day',           w: 50, num: true },
+        { key: 'date', label: 'Date',          w: 120 },
+        { key: 'amt',  label: 'Amount',        w: 120, num: true },
+        { key: 'run',  label: 'Month to date', w: 130, num: true, tip: 'Running total from day 1' }
+    ];
+    return COLS ? COLS.arrange(base) : base;
+}
+const headRow = cs => '<tr>' + cs.map(c =>
+    `<th data-col="${c.key}" class="${c.num ? 'num-cell' : ''}" style="min-width:${c.w}px"${c.tip ? ` title="${esc(c.tip)}"` : ''}>${esc(c.label)}</th>`).join('') + '</tr>';
+function dayRow(cs, p, forPrint) {
+    const c = { day: String(p.day), date: p.date ? esc(FBLib.Common.formatDate(p.date)) : '<span title="This month has no such day">–</span>',
+                amt: esc(fmtMoney(p.amt)), run: esc(fmtMoney(p.run)) };
+    return `<tr${!forPrint && p.future ? ' class="mtd-future" title="After today"' : ''}>` +
+        cs.map(k => `<td class="${k.num ? 'num-cell' : ''}">${c[k.key] ?? ''}</td>`).join('') + '</tr>';
+}
+const footRow = cs => `<tr>${FBLib.RptCols.totalsCells(cs, 'Total to Date', { amt: esc(fmtMoney(S.total)) })}</tr>`;
+
+function render() {
+    const tbl = document.getElementById('rpt');
+    const cs = cols();
+    if (!S.loadedAt) {
+        document.getElementById('mtdSum').innerHTML = '';
+        document.getElementById('barChart').innerHTML = '';
+        document.getElementById('lineChart').innerHTML = '';
+        tbl.querySelector('thead').innerHTML = tbl.querySelector('tbody').innerHTML = tbl.querySelector('tfoot').innerHTML = '';
+        if (PDF) PDF.refresh();
+        return;
+    }
+    document.getElementById('mtdSum').innerHTML =
+        `<span class="mtd-title">${esc(pageTitle(F))}</span><span class="mtd-month">${esc(monthLabel(S.month))}</span>` +
+        `<span class="mtd-total">Total to Date: <b>${esc(fmtMoney(S.total))}</b></span>`;
+    const app = { w: 1000, h: 300, fs: 12 };
+    document.getElementById('barChart').innerHTML = chartSvg('bar', app);
+    document.getElementById('lineChart').innerHTML = chartSvg('line', app);
+    tbl.querySelector('thead').innerHTML = headRow(cs);
+    tbl.querySelector('tbody').innerHTML = S.days.map(p => dayRow(cs, p, false)).join('');
+    tbl.querySelector('tfoot').innerHTML = footRow(cs);
+    const withSales = S.days.filter(p => p.sales).length;
+    setStatus([S.company, monthLabel(S.month), 'Total to Date ' + fmtMoney(S.total), withSales + ' of ' + new Date(+S.month.slice(0, 4), +S.month.slice(5, 7), 0).getDate() + ' days with sales'].filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the page as the standard report prints it: Letter
+//  portrait, the company / title / month / total band, the bar chart over
+//  the line chart, both on one page; no page footer (the original has
+//  none). "Daily figures in the PDF" adds the table on its own page.
+// ============================================================================
+const PDF_CSS = '.fbdoc-rpt-flow .mtd-svg svg{display:block}.fbdoc-rpt-flow .mtd-svg{margin-bottom:' + CHART_GAP + 'pt}';
+// The charts' size on the current paper: the page's width and half the
+// height left under the title band (the original's 552 x 300, never more).
+function pdfChartSize() {
+    const pp = PDF && PDF.paper ? PDF.paper() : { size: 'Letter', orientation: 'portrait' };
+    let w = CHART_W, h = 732;
+    try {
+        const spec = FBDoc.page.resolve(pp.size + ' ' + pp.orientation, { fallback: 'Letter', margin: 'document' });
+        const g = FBDoc.page.geometry(spec, {});
+        w = g.CWpt; h = g.innerH * 72 / 96;
+    } catch (_) {}
+    // title band (company, title, month, total) ~ 86pt + slack
+    const each = Math.floor((h - 100 - CHART_GAP * 2) / 2);
+    return { w: Math.floor(w), h: Math.max(140, Math.min(CHART_H, each)) };
+}
+function docSpec() {
+    if (!S.loadedAt) return null;
+    const sz = pdfChartSize();
+    const svg = kind => `<div class="mtd-svg">${chartSvg(kind, { w: sz.w, h: sz.h, fs: 8, print: true })}</div>`;
+    const sections = [{ flow: [svg('bar'), svg('line')] }];
+    if (F.daily) {
+        const cs = cols();
+        sections.push({ newPage: true, head: headRow(cs), rows: S.days.map(p => dayRow(cs, p, true)), foot: footRow(cs) });
+    }
+    return {
+        company: S.company, title: pageTitle(F), titleEveryPage: true,
+        subtitle: [monthLabel(S.month), 'Total to Date: ' + fmtMoney(S.total)],
+        sections, css: PDF_CSS, fontPt: 10, pageFooter: false, empty: 'No sales.'
+    };
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.loadedAt) { showToast('Nothing to export.', 'warn'); return; }
+    const sheet = {
+        name: 'MTD Sales', title: pageTitle(F), subtitle: [S.company, monthLabel(S.month), 'Total to Date: ' + fmtMoney(S.total)].filter(Boolean),
+        cols: [{ key: 'day', label: 'Day', w: 50, type: 'int', noTotal: true }, { key: 'date', label: 'Date', w: 100, type: 'date' },
+               { key: 'amt', label: 'Amount', w: 120, type: 'money' }, { key: 'run', label: 'Month to date', w: 130, type: 'money', noTotal: true }],
+        rows: S.days.map(p => ({ day: p.day, date: p.date || null, amt: p.amt, run: p.run })),
+        totals: true
+    };
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'MTD_Sales_' + S.month, sheets: [sheet] });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's page (fb-doc). Without fb-doc on the server, the
+// plain printout below: JxBrowser won't print the report page itself, so it
+// is built in a new window and printed there.
+function printReport() {
+    if (!S.loadedAt) { showToast('Nothing to print.', 'warn'); return; }
+    if (PDF) {
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    const svg = kind => chartSvg(kind, { w: CHART_W, h: CHART_H, fs: 8, print: true });
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' + esc(TITLE) + '</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:9pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:11pt;font-weight:700}h2{text-align:center;font-size:14pt;margin:2px 0}.sub{text-align:center;font-size:10pt;margin:0 0 4px}' +
+        'svg{display:block;margin:10pt auto 0}@page{size:Letter portrait;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>' + esc(pageTitle(F)) + '</h2><p class="sub">' + esc(monthLabel(S.month)) + '</p>' +
+        '<p class="sub">Total to Date: ' + esc(fmtMoney(S.total)) + '</p>' + svg('bar') + svg('line') + '</body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters what everyone sees each time this report opens?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        // This / Last month fill the month; picking a month makes it Custom.
+        const fMode = document.getElementById('fMode'), fMonth = document.getElementById('fMonth');
+        fMode.onchange = () => { if (fMode.value !== 'custom') fMonth.value = monthOf({ mode: fMode.value }); applySoon(); };
+        fMonth.addEventListener('change', () => { if (isYm(fMonth.value)) { fMode.value = 'custom'; applySoon(); } });
+        const fTitle = document.getElementById('fTitle');
+        fTitle.addEventListener('change', applySoon);
+        fTitle.addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        document.getElementById('fDaily').addEventListener('change', applySoon);
+        document.getElementById('resetFiltersBtn').onclick = () => { writeFilters(DEFAULT_FILTERS); applySoon(); };
+
+        // Column resize (fb-lib); the days keep their order (running total).
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({ table: document.getElementById('rpt'), sortable: false, draggable: false });
+        document.getElementById('resetColsBtn').onclick = () => { if (COLS) { COLS.reset(); render(); } };
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: document.getElementById('appView'), toggleBefore: document.getElementById('exportBtn'),
+                page: { size: 'Letter', orientation: 'portrait' },
+                doc: docSpec, title: () => TITLE
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        writeFilters(savedFilters());
+        F = readFilters();
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('unpublishBtn').onclick = () => {
+            if (!confirm('Stop using company defaults for this report? Everyone goes back to their own last choices.')) return;
+            const ok = FBLib.Settings.clearCompany(['filters', 'opts']) !== false;
+            showToast(ok ? 'This report no longer has company defaults.' : 'That was not saved.', ok ? 'success' : 'error');
+        };
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        await loadLookups();
+        await loadAll();
+    } catch (e) {
+        console.error('[' + TITLE + '] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

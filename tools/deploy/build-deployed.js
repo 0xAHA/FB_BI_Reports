@@ -69,7 +69,7 @@ const DEPLOYED_NAMES = {
   // v1.2 is the released QuickOrder (confirmed 2026-10-01). The record was
   // first recovered from a v1.0 export; v1.0 now lives in archived/.
   'Custom/SalesOrder/QuickOrder_v1.2.htm':                        ['- Sales - QuickOrder V2', '- Sales - QuickOrder V2'],
-  'Custom/SalesOrder/SalesOrderSummary.htm':                      ['- Sales - Sales Order Summary', '- Sales - Sales Order Summary'],
+  'iReport_Ports/SalesOrder/SalesOrderSummary.htm':                      ['- Sales - Sales Order Summary', '- Sales - Sales Order Summary'],
   'Template/Core_Dashboard_Template.htm':                  ['- System - BI Template', '- System - BI Template'],
   // Shared assets — names must match exactly or the {% Script %} /
   // {% Style %} directives in every report stop resolving.

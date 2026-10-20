@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
+<meta name="fb-folder" content="Work Order">
 <meta name="description" content="Raw material availability and a ready date for each open work order.">
 <script>
     // ================================================================
@@ -11,7 +12,7 @@
     //          Fishbowl to make a SEPARATE report? Give the copy its own
     //          key (e.g. add '2') so it keeps its own settings - left
     //          as-is, the copy shares the original's. 31 chars max.
-    //   name   This report's Fishbowl record name ('- Folder - Report').
+    //   name   This report's Fishbowl record name (plain, no folder prefix).
     //          Publishing finds its copy in the SharePoint BI Reports
     //          folder by this name; null = not published.
     //   build  Stamped automatically from this file's content by
@@ -19,15 +20,27 @@
     // ================================================================
     window.FB_REPORT = {
         key:   'cdx.bi.woavail',
-        name:  null,          // not published yet - set when you publish it
-        build: '2026.10.17-0798a84'     // @fb-build
+        name:  'Work Order Parts Availability',
+        build: '2026.10.20-5c643d9'     // @fb-build
     };
 </script>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Work Order Parts Availability — Fishbowl BI</title>
 <!--
-  Work Order Parts Availability (v1.2)
+  Work Order Parts Availability (v1.3)
   ------------------------------------
+  v1.3 — Procurement shows On hand per location group (one column per LG, with a
+  picker for which LGs to show); when another LG holds spare stock that covers a
+  shortage, a Move button raises a Move transfer order (POST /api/transfer-orders)
+  from that LG into the shortage's LG. Issued TOs count as incoming supply in the
+  engine; Entered/Request TOs show as pending. New MO # filter in the filter strip.
+  v1.3.1 — Create TO now sends a carrier (REST doesn't default one; xo.carrierId=0
+  broke the carrier FK). Org setting "Fulfill TO after create": issue the TO, then
+  finish its pick via ImportPickingData (that TO's pick only), verified by read-back.
+  v1.3.2 — Merged onto the v1.2 Create PO fixes: PO lines carry the part description,
+  are raised in the vendor's UOM (converted from stock) against the vendor part, with
+  PO tax rates. Short by / On hand follow the Stock UOM | Vendor UOM toggle.
+
   Oversight for work orders whose raw goods must be sourced. Traces each open
   WO's raw components, computes an availability picture per part+location group
   (available-to-pick stock, committed picks, incoming POs — including MO-linked
@@ -315,6 +328,30 @@
         /* Create PO drawer (Procurement tab). */
         #poScrim { z-index:10009; }
         #poPanel { z-index:10010; width:600px; }
+        /* Create TO (Move) drawer (Procurement tab). */
+        #toScrim { z-index:10011; }
+        #toPanel { z-index:10012; width:640px; }
+
+    /* ── Procurement: per-LG on-hand columns + transfer (Move) cell ── */
+        /* Stock-LG picker lives in a hidden holder and is re-parented into the
+           sub-tab bar after every renderProcure (innerHTML would destroy it). */
+        #procLgHolder { display:none; }
+        .proc-lgslot { margin-left:auto; align-self:center; display:flex; align-items:center; gap:6px; padding-bottom:4px; }
+        .proc-lgslot .ms-container { min-width:220px; }
+        .tbl-wrap.proc-tbl th.ohh { text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .tbl-wrap.proc-tbl th.ohh .ohh-lg { display:block; font-size:9.5px; opacity:.8; overflow:hidden; text-overflow:ellipsis; }
+        .proc-tbl td.ohc { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+        .proc-tbl td.ohc.dem { background:#FBF1F3; }
+        .proc-tbl td.ohc .ohs { display:block; font-size:10.5px; font-weight:700; }
+        .proc-tbl td.ohc .ohs.short { color:var(--fb-negative); }
+        .proc-tbl td.ohc .ohs.full { color:#1B7A46; }
+        .proc-tbl td.ohc .ohs.part { color:#8A4E10; }
+        .proc-tbl td.ohc .ohz { color:var(--c-tertiary); }
+        .proc-mv { display:flex; flex-direction:column; gap:3px; align-items:flex-start; }
+        .proc-mv .mv-line { font-size:11px; color:var(--c-secondary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
+        .proc-mv .ps-btn { text-transform:none; }
+        .to-warn { font-size:10px; line-height:1.3; margin-top:3px; color:#8A4E10; white-space:normal; }
+        .to-warn.bad { color:#8A1E30; }
 
     /* ── Ported CSS: PO/MO drawer banner + line-item table ── */
             .pf-banner { display:flex; align-items:center; gap:12px; flex-wrap:wrap;
@@ -421,6 +458,15 @@
             <div class="ms-list" id="woMs-list"></div>
         </div>
     </div>
+    <span class="fl-lbl">MO #</span>
+    <div class="ms-container srch-ms" id="moMs">
+        <div class="ms-trigger" id="moMs-trigger"><span class="ms-placeholder" id="moMs-placeholder">All MO #s</span></div>
+        <div class="ms-dropdown hidden" id="moMs-dropdown">
+            <div class="ms-search"><input type="text" id="moMs-search" placeholder="Search…" /></div>
+            <div class="ms-actions"><span id="moMs-all">Select All</span><span id="moMs-clear">Clear All</span></div>
+            <div class="ms-list" id="moMs-list"></div>
+        </div>
+    </div>
     <span class="fl-lbl">Raw Good</span>
     <div class="ms-container srch-ms" id="rawMs">
         <div class="ms-trigger" id="rawMs-trigger"><span class="ms-placeholder" id="rawMs-placeholder">All raw goods</span></div>
@@ -473,6 +519,25 @@
 <div class="scrim" id="poScrim" onclick="psClosePoDrawer()"></div>
 <aside class="detail" id="poPanel"></aside>
 
+<!-- CREATE TO (MOVE) DRAWER (Procurement) -->
+<div class="scrim" id="toScrim" onclick="psCloseToDrawer()"></div>
+<aside class="detail" id="toPanel"></aside>
+
+<!-- PROCUREMENT STOCK-LG PICKER (re-parented into the sub-tab bar by renderProcure) -->
+<div id="procLgHolder">
+    <div class="proc-lgslot" id="procLgSlotInner">
+        <span class="fl-lbl">On hand in</span>
+        <div class="ms-container" id="ohLgMs">
+            <div class="ms-trigger" id="ohLgMs-trigger"><span class="ms-placeholder" id="ohLgMs-placeholder">LGs with stock</span></div>
+            <div class="ms-dropdown hidden" id="ohLgMs-dropdown">
+                <div class="ms-search"><input type="text" id="ohLgMs-search" placeholder="Search…" /></div>
+                <div class="ms-actions"><span id="ohLgMs-all">Select All</span><span id="ohLgMs-clear">Clear All</span></div>
+                <div class="ms-list" id="ohLgMs-list"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- SETTINGS DRAWER (admin-only business calendar) -->
 <div class="scrim" id="setScrim" onclick="toggleSettings()"></div>
 <aside class="detail" id="setPanel"></aside>
@@ -507,6 +572,8 @@
         <p><b>Worth knowing:</b> this is deliberately simple. It assumes each build gets a whole working day at a time, doesn't split a part-day, and doesn't limit how many work orders share the same day (no machine or labour capacity). It also assumes the BOM's estimated time is per unit. And when you <b>Apply</b>, only the dates change — each work order keeps its existing time of day. Work orders without an estimated build time keep their original calendar length.</p>
         <h3>Procurement</h3>
         <p>The genuine shortages across the work orders in view, split into <b>To Purchase</b> (grouped by default vendor) and <b>To Manufacture</b> (parts with a BOM). Create PO / Create MO write directly to Fishbowl via the REST API; supply is created in the same location group the shortage sits in so the engine can match it. Creating a PO does not email the vendor.</p>
+        <p><b>On hand per location group.</b> Each location group gets its own On hand column. Use <b>On hand in</b> (top right of the Procurement tab) to choose which ones to show; left empty, it shows every location group that holds stock of a listed part or has a shortage. The shortage's own location group is tinted and shows how much it is short.</p>
+        <p><b>Move (transfer order).</b> When another shown location group has <i>spare</i> stock of a short part, the Transfer column offers <b>Move</b>. Spare = available to pick there, minus what that location group's own open work orders need from it, minus stock already on open outbound transfer orders — so a move never takes stock its own builds are counting on. Move raises a <b>Move</b> transfer order into the shortage's location group (Issued, or Entered as a draft). Issued transfer orders count as incoming supply on the next refresh; Entered / Requested ones are listed as pending and the part stays short. When an administrator turns on <b>Fulfill TO after create</b> (Settings), the transfer order is issued and its pick is finished immediately (a Picking Data import of just that TO's pick), so the stock is in the shortage's location group straight away; if the pick can't finish, the drawer says so and links to it.</p>
     </div>
 </aside>
 
@@ -546,6 +613,13 @@ let psMoCfDefs = null;             // cached MO custom-field defs
 let psPoCfDefs = null;             // cached PO custom-field defs (order-level, tablereference 'PO')
 let psMoDraft = null;              // Create-MO drawer state
 let psPoDraft = null;              // Create-PO drawer state
+let psToDraft = null;              // Create-TO (Move) drawer state
+let psStockInfo = new Map();       // "pid|lg" -> { onhand, avail, demand, outbound, spare } — per-LG stock picture (base uom)
+let psPendingTo = new Map();       // "pid|toLg" -> [{ tonum, statusId, statusName, outstanding, eta, fromLg }] — Entered/Request TOs (not firm supply)
+let psPartBaseUom = new Map();     // partId -> base uom id (TO lines are raised in base uom, matching the engine's quantities)
+let psLgList = [];                 // [{ id, name }] accessible active location groups (A→Z)
+let psProcOhSel = new Set();       // LG ids whose On hand column shows on Procurement (empty = auto)
+let _ohLgMs = null;                // Procurement "On hand in" multi-select
 let psDefaultLgId;                 // cached user default LG (undefined=unqueried)
 let psView = 'workorders';         // active tab: workorders | suggested | procure
 let _detailWoId = null;            // WO shown in the detail drawer
@@ -554,8 +628,8 @@ let _detailWoId = null;            // WO shown in the detail drawer
    ONLY buildable-now). The two are mutually exclusive (see toggleHideOk/toggleOnlyOk).
    readyStates = a Set of availability states to keep (empty = all). sortDir toggles
    asc/desc on repeated header clicks. */
-const flt = { selLg: new Set(), statuses: new Set([10, 30]), selWo: new Set(), selRaw: new Set(), selFg: new Set(), hideOk: false, showOnlyOk: false, readyStates: new Set(), sortMode: 'ready', sortDir: 'asc' };
-let _lgMs = null, _woMs = null, _rawMs = null, _fgMs = null;
+const flt = { selLg: new Set(), statuses: new Set([10, 30]), selWo: new Set(), selMo: new Set(), selRaw: new Set(), selFg: new Set(), hideOk: false, showOnlyOk: false, readyStates: new Set(), sortMode: 'ready', sortDir: 'asc' };
+let _lgMs = null, _woMs = null, _moMs = null, _rawMs = null, _fgMs = null;
 // Ready-status filter pills → the availability states each keeps.
 const READY_PILLS = [
     ['now', 'Now', ['now']],
@@ -573,6 +647,7 @@ const SETTINGS = {
     masterKey: FB_REPORT.key + '.master.v1',
     defaults: { selLg: [], statuses: [10, 30], hideOk: false, showOnlyOk: false, readyStates: [], sortMode: 'ready', sortDir: 'asc', psView: 'workorders',
                 moCreateStatus: 'Issued', poCreateStatus: 'Bid Request', poForceBidRequest: false, procQtyUom: 'stock',
+                toCreateStatus: 'Issued', procOhLgs: [], toCarrierId: null, toAutoFulfill: false,
                 bizDays: [1, 2, 3, 4, 5], bizStart: '08:00', bizEnd: '17:00' }
 };
 function initSettings() {
@@ -587,6 +662,7 @@ function initSettings() {
         const sm = FBLib.Settings.resolve('sortMode'); if (sm) flt.sortMode = sm;
         const sd = FBLib.Settings.resolve('sortDir'); if (sd === 'asc' || sd === 'desc') flt.sortDir = sd;
         const pv = FBLib.Settings.resolve('psView'); if (pv === 'workorders' || pv === 'suggested' || pv === 'procure') psView = pv;
+        const ol = FBLib.Settings.resolve('procOhLgs'); if (Array.isArray(ol)) { psProcOhSel.clear(); ol.forEach(v => psProcOhSel.add(String(v))); }
     } catch (e) { debugLog('warn', 'Settings restore failed: ' + (e && e.message)); }
 }
 function saveState() {
@@ -599,6 +675,7 @@ function saveState() {
         FBLib.Settings.setUserKey('sortMode', flt.sortMode);
         FBLib.Settings.setUserKey('sortDir', flt.sortDir);
         FBLib.Settings.setUserKey('psView', psView);
+        FBLib.Settings.setUserKey('procOhLgs', Array.from(psProcOhSel));
         FBLib.Settings.saveUser();
     } catch (e) { debugLog('warn', 'saveState failed: ' + (e && e.message)); }
 }
@@ -767,9 +844,10 @@ function applyFilters() {
     filteredWorkOrders = allWorkOrders.filter(wo => {
         if (flt.statuses.size && !flt.statuses.has(parseInt(wo.wo_status, 10))) return false;
         if (flt.selLg.size && !flt.selLg.has(String(wo.location_group_id))) return false;
-        // Three independent multi-select searches (AND across the three; OR within each):
-        // WO number, finished-good part number, and any consumed raw-good part number.
+        // Independent multi-select searches (AND across them; OR within each): WO number,
+        // MO number, finished-good part number, and any consumed raw-good part number.
         if (flt.selWo.size && !flt.selWo.has(String(wo.wo_num || ''))) return false;
+        if (flt.selMo.size && !flt.selMo.has(String(wo.mo_num || ''))) return false;
         if (flt.selFg.size && !flt.selFg.has(String(wo.part_num || ''))) return false;
         if (flt.selRaw.size && !waParts(wo).some(p => flt.selRaw.has(String(p.partNum || '')))) return false;
         if (flt.hideOk && wo._av && wo._av._buildableNow) return false;
@@ -796,10 +874,11 @@ function toggleReady(key) {
 }
 function clearFilters() {
     flt.selLg.clear(); flt.statuses.clear(); [10, 30].forEach(s => flt.statuses.add(s));
-    flt.selWo.clear(); flt.selRaw.clear(); flt.selFg.clear();
+    flt.selWo.clear(); flt.selMo.clear(); flt.selRaw.clear(); flt.selFg.clear();
     flt.hideOk = false; flt.showOnlyOk = false; flt.readyStates.clear();
     if (_lgMs) _lgMs.setSelected([]);
     if (_woMs) _woMs.setSelected([]);
+    if (_moMs) _moMs.setSelected([]);
     if (_rawMs) _rawMs.setSelected([]);
     if (_fgMs) _fgMs.setSelected([]);
     syncFilterChips(); saveState(); applyFilters(); render();
@@ -1446,12 +1525,13 @@ let bizEdit = null;   // in-flight edit copy while the drawer is open
 function toggleSettings() {
     const p = document.getElementById('setPanel'), s = document.getElementById('setScrim');
     const on = p.classList.toggle('on'); s.classList.toggle('on', on);
-    if (on) { const c = bizCfg(); bizEdit = { days: new Set(c.days), start: c.start, end: c.end, poForceBidRequest: psPoBidLocked() }; renderSettings(); }
+    if (on) { const c = bizCfg(); bizEdit = { days: new Set(c.days), start: c.start, end: c.end, poForceBidRequest: psPoBidLocked(), toAutoFulfill: psToAutoFulfill() }; renderSettings(); }
     else bizEdit = null;
 }
 function toggleBizDay(n) { if (!bizEdit) return; n = Number(n); if (bizEdit.days.has(n)) bizEdit.days.delete(n); else bizEdit.days.add(n); renderSettings(); }
 function setBizField(f, v) { if (bizEdit) bizEdit[f] = v; }
 function toggleBidLock() { if (!bizEdit) return; bizEdit.poForceBidRequest = !bizEdit.poForceBidRequest; renderSettings(); }
+function toggleToAutoFulfill() { if (!bizEdit) return; bizEdit.toAutoFulfill = !bizEdit.toAutoFulfill; renderSettings(); }
 function saveBiz() {
     if (!bizEdit) return;
     let admin = false; try { admin = FBLib.Settings.isAdmin(); } catch (_) {}
@@ -1462,7 +1542,7 @@ function saveBiz() {
         // publishMaster REPLACES the whole master object — merge the current master
         // so other org-wide keys aren't wiped.
         const master = (FBLib.Settings.getMaster && FBLib.Settings.getMaster()) || {};
-        const ok = FBLib.Settings.publishMaster(Object.assign({}, master, { bizDays: days, bizStart: bizEdit.start, bizEnd: bizEdit.end, poForceBidRequest: !!bizEdit.poForceBidRequest }));
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, master, { bizDays: days, bizStart: bizEdit.start, bizEnd: bizEdit.end, poForceBidRequest: !!bizEdit.poForceBidRequest, toAutoFulfill: !!bizEdit.toAutoFulfill }));
         if (ok === false) { showToast('Publish failed — administrator access required', 'error', 5000); return; }
         showToast('Settings saved org-wide', 'success', 4000);
         if (psView === 'suggested') renderPlanner();
@@ -1491,6 +1571,11 @@ function renderSettings() {
             '<input type="checkbox" ' + (c.poForceBidRequest ? 'checked' : '') + ' ' + (admin ? 'onchange="toggleBidLock()"' : 'disabled') + ' style="margin-top:2px">' +
             '<span><span style="font-weight:600;color:var(--c-primary)">Force Create-PO to Bid Request</span>' +
             '<span class="wa-sub" style="display:block;margin-top:1px">Every PO raised from this report is created as a <b>Bid Request</b> (never Issued), so it goes through an approval step before it can be issued. Applies org-wide.' + (admin ? '' : ' <b>Admin only.</b>') + '</span></span>' +
+          '</label>' +
+          '<label style="display:flex;align-items:flex-start;gap:8px;margin-top:12px;cursor:' + (admin ? 'pointer' : 'default') + '">' +
+            '<input type="checkbox" ' + (c.toAutoFulfill ? 'checked' : '') + ' ' + (admin ? 'onchange="toggleToAutoFulfill()"' : 'disabled') + ' style="margin-top:2px">' +
+            '<span><span style="font-weight:600;color:var(--c-primary)">Fulfill TO after create</span>' +
+            '<span class="wa-sub" style="display:block;margin-top:1px">Every transfer order raised from this report (Move) is issued and its pick is finished straight away, by importing Picking Data for that TO\'s pick only — so the stock moves into the shortage\'s location group immediately. Fishbowl picks the stock from the From location group\'s locations itself. Applies org-wide.' + (admin ? '' : ' <b>Admin only.</b>') + '</span></span>' +
           '</label>' +
         '</div>' +
         (admin ? '<div class="dsec" style="display:flex;gap:8px;justify-content:flex-end"><button class="ps-btn" onclick="toggleSettings()">Cancel</button><button class="ps-btn primary" onclick="saveBiz()">Save org-wide</button></div>'
@@ -1543,6 +1628,7 @@ function psLoadAvailability() {
         // is also the natural unit to purchase/build in, so Procurement qtys align.
         const partBase = new Map();
         reqRows.forEach(r => { if (r.base_uom != null) partBase.set(String(r.part_id), parseInt(r.base_uom, 10)); });
+        psPartBaseUom = partBase;   // Create-TO raises lines in base uom (the unit every engine qty is in)
         const uconv = new Map();   // "fromUom|toUom" -> multiplier (multiply / factor)
         try {
             JSON.parse(runQuery('SELECT fromuomid, touomid, multiply, factor FROM uomconversion'))
@@ -1750,6 +1836,54 @@ function psLoadAvailability() {
             });
         });
 
+        // 3b) Open transfer orders (xo / xoitem Send lines) for the demanded parts.
+        //     Inbound (shipToLGId): an Issued-or-later TO (header status 20–60) is
+        //     firm incoming supply into its destination LG, ETA = the line's
+        //     scheduled fulfillment; outstanding = toFulfill − fulfilled. An
+        //     Entered (10) / Request (15) TO is NOT firm — surfaced as pending in the
+        //     Procurement Transfer column (like a Bid Request PO).
+        //     Outbound (fromLGId): stock not yet picked onto ANY open TO is promised
+        //     away, so it is subtracted from that LG's spare (see psStockInfo below)
+        //     — stops the report suggesting the same stock for a second move.
+        //     Item status < 60 = not Fulfilled / Closed Short / Void.
+        const toInByPartLg = new Map();    // "pid|toLg" -> [{ tonum, status, outstanding, eta, fromLg }]
+        const toOutByPartLg = new Map();   // "pid|fromLg" -> unpicked qty (base uom)
+        psPendingTo = new Map();
+        if (partIdArr.length) {
+            try {
+                const TO_STATUS_NAME = { 10: 'Entered', 15: 'Request', 20: 'Issued', 30: 'Picking', 40: 'Partial', 50: 'Picked', 60: 'Shipped' };
+                JSON.parse(runQuery(`
+                    SELECT xo.num AS tonum, xo.statusid AS to_status, xo.fromlgid AS from_lg, xo.shiptolgid AS to_lg,
+                           xi.partid AS part_id, xi.uomid AS to_uom,
+                           COALESCE(xi.qtytofulfill, 0) AS ordered, COALESCE(xi.qtyfulfilled, 0) AS fulfilled,
+                           COALESCE(xi.qtypicked, 0) AS picked,
+                           COALESCE(xi.datescheduledfulfillment, xo.datescheduled) AS eta
+                    FROM xoitem xi INNER JOIN xo ON xo.id = xi.xoid
+                    WHERE xi.partid IN (${partIdArr.join(',')})
+                      AND xo.statusid BETWEEN 10 AND 60
+                      AND xi.statusid < 60
+                      AND xi.typeid = 10
+                      AND COALESCE(xi.qtytofulfill, 0) > COALESCE(xi.qtyfulfilled, 0)
+                `)).forEach(r => {
+                    const pid = String(r.part_id), st = parseInt(r.to_status, 10) || 0;
+                    const ordered = toBaseQ(parseFloat(r.ordered) || 0, r.to_uom, pid);
+                    const fulfilled = toBaseQ(parseFloat(r.fulfilled) || 0, r.to_uom, pid);
+                    const picked = toBaseQ(parseFloat(r.picked) || 0, r.to_uom, pid);
+                    const outstanding = Math.max(0, ordered - fulfilled);
+                    const unpicked = Math.max(0, ordered - Math.max(picked, fulfilled));
+                    const inKey = pid + '|' + String(r.to_lg), outKey = pid + '|' + String(r.from_lg);
+                    const rec = { tonum: r.tonum, status: st, outstanding, eta: r.eta ? String(r.eta).substring(0, 10) : '', fromLg: String(r.from_lg) };
+                    if (!toInByPartLg.has(inKey)) toInByPartLg.set(inKey, []);
+                    toInByPartLg.get(inKey).push(rec);
+                    if (unpicked > 0) toOutByPartLg.set(outKey, (toOutByPartLg.get(outKey) || 0) + unpicked);
+                    if (st === 10 || st === 15) {
+                        if (!psPendingTo.has(inKey)) psPendingTo.set(inKey, []);
+                        psPendingTo.get(inKey).push({ tonum: r.tonum, statusId: st, statusName: TO_STATUS_NAME[st] || 'Pending', outstanding, eta: rec.eta, fromLg: rec.fromLg });
+                    }
+                });
+            } catch (e) { debugLog('warn', 'Transfer-order scan failed (TOs ignored as supply): ' + (e && e.message)); }
+        }
+
         // Staged components: this WO consumes a part produced by another WO.
         const stagedByWo = new Map();  // wo_id → Map(part_num → producer wo_id)
         stagingDependencies.forEach(d => {
@@ -1840,6 +1974,21 @@ function psLoadAvailability() {
             }
             return poMoPool.get(key);
         }
+        // Incoming transfer-order pool — Issued-or-later TOs into this LG (firm),
+        // FIFO-depleted like a blanket PO. Built from toInByPartLg above.
+        const toInPool = new Map();   // "pid|lg" -> [{date, qty}]
+        function ensureToIn(pid, lg) {
+            const key = pid + '|' + lg;
+            if (!toInPool.has(key)) {
+                const ev = [];
+                (toInByPartLg.get(key) || []).forEach(s => {
+                    if (s.status < 20) return;              // Entered / Request isn't firm supply
+                    if (s.outstanding > 0) ev.push({ date: (s.eta && s.eta >= today ? s.eta : today), qty: s.outstanding });
+                });
+                dsort(ev); toInPool.set(key, ev);
+            }
+            return toInPool.get(key);
+        }
         // Incoming WO finished-good production pool (future ETA = producer WO's
         // scheduled finish). Built from woOutByPartLg above.
         const woOutPool = new Map();   // "pid|lg" -> [{date, qty}]
@@ -1916,7 +2065,7 @@ function psLoadAvailability() {
                 }
                 const stockKey = pid + '|' + lg;
                 const pool = freePool(pid, lg);   // FULL available-to-pick — NOT depleted by other WOs
-                let by = today, remaining = need, availNow = 0, drewOnHand = 0, etaFromMoPo = false, etaFromWo = false;
+                let by = today, remaining = need, availNow = 0, drewOnHand = 0, etaFromMoPo = false, etaFromWo = false, etaFromTo = false;
                 // 1) this WO's own committed-pick reservation (guaranteed, now)
                 const useCommitted = Math.min(remaining, committedQ);
                 remaining -= useCommitted; availNow += useCommitted;
@@ -1929,19 +2078,23 @@ function psLoadAvailability() {
                 // 3) MO-linked express POs (future ETA; genuinely finite → FIFO-depleted).
                 //    Flag the ETA as MO-secured when this pool sets the binding date.
                 if (remaining > 0 && wo.mo_num) { const r = consume(ensurePoMo(pid, lg, String(wo.mo_num)), remaining); if (r.by > by) { by = r.by; etaFromMoPo = true; } remaining = r.remaining; availNow += r.nowQty; }
+                // 3b) issued transfer orders into this LG (stock moving in from another
+                //     LG; finite, FIFO) — a TO raised from the Procurement Move button
+                //     registers here once issued.
+                if (remaining > 0) { const r = consume(ensureToIn(pid, lg), remaining); if (r.by > by) { by = r.by; etaFromMoPo = false; etaFromWo = false; etaFromTo = true; } remaining = r.remaining; availNow += r.nowQty; }
                 // 4) blanket POs (future ETA, finite) — a later blanket date supersedes the lock.
-                if (remaining > 0) { const r = consume(ensurePoGen(pid, lg), remaining); if (r.by > by) { by = r.by; etaFromMoPo = false; etaFromWo = false; } remaining = r.remaining; availNow += r.nowQty; }
+                if (remaining > 0) { const r = consume(ensurePoGen(pid, lg), remaining); if (r.by > by) { by = r.by; etaFromMoPo = false; etaFromWo = false; etaFromTo = false; } remaining = r.remaining; availNow += r.nowQty; }
                 // 5) incoming WO finished-good production (future ETA = producer WO's
                 //    scheduled finish; finite) — e.g. a just-created MO raised to cover
                 //    this shortage now registers as expected incoming stock.
-                if (remaining > 0) { const r = consume(ensureWoOut(pid, lg), remaining); if (r.by > by) { by = r.by; etaFromMoPo = false; etaFromWo = true; } remaining = r.remaining; availNow += r.nowQty; }
+                if (remaining > 0) { const r = consume(ensureWoOut(pid, lg), remaining); if (r.by > by) { by = r.by; etaFromMoPo = false; etaFromWo = true; etaFromTo = false; } remaining = r.remaining; availNow += r.nowQty; }
                 const committedFull = committedQ >= need - 1e-6;
                 let unmet = false;
                 if (remaining > 1e-6) { unmet = true; rawUnmet = true; by = null; }   // genuine shortage — needs replenishment
                 // availToPick = the free on-hand pool (net of committed picks) — shown in
                 // the drawer next to On hand so a large physical on-hand that is committed
                 // elsewhere reads correctly.
-                const partRef = { partId: pid, partNum: req.part_num, partDesc: req.part_desc, need, uom: req.uom_code || '', onhand: oh, availToPick: pool, availableBy: by, unmet, staged: false, nonInv: false, committed: committedFull, committedQty: committedQ, committedStatus, availQty: availNow, shortfall: remaining, moPoEta: etaFromMoPo, woEta: etaFromWo, contended: false, contendedBy: [] };
+                const partRef = { partId: pid, partNum: req.part_num, partDesc: req.part_desc, need, uom: req.uom_code || '', onhand: oh, availToPick: pool, availableBy: by, unmet, staged: false, nonInv: false, committed: committedFull, committedQty: committedQ, committedStatus, availQty: availNow, shortfall: remaining, moPoEta: etaFromMoPo, woEta: etaFromWo, toEta: etaFromTo, contended: false, contendedBy: [] };
                 parts.push(partRef);
                 // Record the on-hand draw for the over-subscription contest pass (open WOs only).
                 if (drewOnHand > 1e-6 && !woClosed) {
@@ -1978,6 +2131,23 @@ function psLoadAvailability() {
         });
         // Roll each WO's part-level contest up to its _av (read by the tree walk below).
         allWorkOrders.forEach(w => { if (w._av) w._av.rawContended = (w._av.parts || []).some(p => p.contended); });
+
+        // ── Per-LG stock picture (Procurement On-hand columns + Move suggestions) ──
+        // For every part+LG holding stock: physical on hand, available to pick, the
+        // open-WO demand on that LG's free stock (sum of neededShared from the
+        // contest ledger — every loaded open WO, not just the filtered view, since
+        // the stock is spoken for regardless of what's on screen) and the qty still
+        // to be picked onto open outbound TOs. spare = what could move to another LG
+        // without leaving this LG's own builds short. Date-independent, so the
+        // Planner's scenario re-run reproduces it unchanged.
+        psStockInfo = new Map();
+        const sharedDemandByKey = new Map();
+        contestLedger.forEach((rows, key) => sharedDemandByKey.set(key, rows.reduce((s, r) => s + Math.max(0, r.neededShared || 0), 0)));
+        onhandByPartLg.forEach((m, pid) => m.forEach((oh, lgKey) => {
+            const key = pid + '|' + lgKey;
+            const av = getAvail(pid, lgKey), dem = sharedDemandByKey.get(key) || 0, out = toOutByPartLg.get(key) || 0;
+            psStockInfo.set(key, { onhand: oh, avail: av, demand: dem, outbound: out, spare: Math.max(0, av - dem - out) });
+        }));
 
         // Tree walk — fold each producer WO's earliest finish into its consumers.
         const woById = new Map(allWorkOrders.map(w => [String(w.wo_id), w]));
@@ -2151,7 +2321,9 @@ function psAvailPartsHTML(w) {
                 // the stock is reserved to this WO's MO, which is why an earlier blanket
                 // PO doesn't move the date up.
                 const lock = p.moPoEta ? PS_LOCK_SVG_SM : '';
-                const etaTtl = p.woEta
+                const etaTtl = p.toEta
+                    ? 'Arriving on an issued transfer order from another location group by this date'
+                    : p.woEta
                     ? 'Arriving from a scheduled work order (e.g. a created MO) finishing by this date'
                     : p.moPoEta
                     ? 'Reserved to this MO — arriving by this date on a PO raised for the MO, so an earlier blanket PO does not apply'
@@ -2209,6 +2381,8 @@ function psProcureData(){
                     e = { partNum:p.partNum||'', partId:p.partId, partDesc:p.partDesc||'', uom:p.uom||'',
                           short:0, onhand:(p.onhand!=null?p.onhand:null), wos:[], woList:[], earliest:null,
                           lgId:'', lgName:'', lgIds:new Set(),
+                          shortByLg:new Map(), lgNames:new Map(),   // per-LG shortfall (Move suggestions + On-hand columns)
+                          uomId: psPartBaseUom.get(String(p.partId)) || null,
                           vendorId: vd?vd.id:null, vendorName: vd?(vd.name||''):'',
                           lastCost: (vd&&vd.lastCost!=null)?vd.lastCost:null, vendorPartNum: vd?(vd.vendorPartNum||''):'',
                           qtyMin: (vd&&vd.qtyMin!=null)?vd.qtyMin:null,
@@ -2229,6 +2403,7 @@ function psProcureData(){
                 const woLgId = (wo.location_group_id != null ? String(wo.location_group_id) : '');
                 const woLgName = wo.site_name || '';
                 if(woLgId) e.lgIds.add(woLgId);
+                if(woLgId){ e.shortByLg.set(woLgId, (e.shortByLg.get(woLgId)||0) + short); e.lgNames.set(woLgId, woLgName); }
                 if(!e.lgId && woLgId){ e.lgId = woLgId; e.lgName = woLgName; }
                 if(wo.wo_num && e.wos.indexOf(wo.wo_num) < 0){
                     e.wos.push(wo.wo_num);
@@ -2252,6 +2427,14 @@ function psProcureData(){
         }));
         e.pendingPos = pend;
         e.pendingQty = pend.reduce((s, p) => s + (p.outstanding || 0), 0);
+        // Entered / Requested TOs already raised INTO a shortage LG (not firm supply,
+        // so the row stays short) — shown in the Transfer column so a draft TO is
+        // visible before another Move is raised.
+        const seenTo = new Set(), pendTo = [];
+        lgs.forEach(lg => (psPendingTo.get(String(e.partId) + '|' + String(lg)) || []).forEach(t => {
+            if (seenTo.has(t.tonum)) return; seenTo.add(t.tonum); pendTo.push(Object.assign({ toLg: String(lg) }, t));
+        }));
+        e.pendingTos = pendTo;
     });
     const isMake = r => psMakePartIds && psMakePartIds.has(String(r.partId));
     // Sort most-urgent first (earliest need date), then part number.
@@ -2336,8 +2519,58 @@ function psPoTaxRates(vendorId, partIds){
 /* ============================================================
    PORTED: procurement render (buy/make sub-tabs + blocked cell)
    ============================================================ */
+// ── Procurement: per-LG stock helpers ──
+function psLgName(id){
+    const l = psLgList.find(x=>String(x.id)===String(id));
+    return l ? l.name : ('LG '+id);
+}
+// Every LG a column could show: the accessible list plus any shortage LG missing
+// from it (e.g. a WO in an LG that has since been deactivated), A→Z.
+function psProcLgUniverse(rows){
+    const list = psLgList.slice(), have = new Set(list.map(l=>String(l.id)));
+    rows.forEach(r=>(r.lgNames||new Map()).forEach((nm,id)=>{ if(!have.has(String(id))){ have.add(String(id)); list.push({ id:String(id), name:nm||('LG '+id) }); } }));
+    return list.sort((a,b)=>String(a.name).localeCompare(String(b.name)));
+}
+// LGs whose On-hand column shows: the user's "On hand in" pick, else (auto) every
+// LG that holds stock of a listed part or carries one of its shortages. Move
+// suggestions only source from the shown LGs, so deselecting an LG (quarantine,
+// consignment…) also stops it being suggested as a source.
+function psProcOhCols(rows){
+    const all = psProcLgUniverse(rows);
+    if(psProcOhSel.size){ const sel = all.filter(l=>psProcOhSel.has(String(l.id))); if(sel.length) return sel; }
+    const used = new Set();
+    rows.forEach(r=>{
+        (r.shortByLg||new Map()).forEach((v,lg)=>used.add(String(lg)));
+        all.forEach(l=>{ const si=psStockInfo.get(String(r.partId)+'|'+String(l.id)); if(si && Math.abs(si.onhand)>1e-9) used.add(String(l.id)); });
+    });
+    return all.filter(l=>used.has(String(l.id)));
+}
+// For each LG the part is short in, the shown LG with the most spare stock.
+// Sorted: full cover first, then the biggest shortage.
+function psMoveOptions(r, lgCols){
+    const opts = [];
+    (r.shortByLg||new Map()).forEach((short,dest)=>{
+        if(!(short>1e-6)) return;
+        let best = null;
+        lgCols.forEach(l=>{
+            const src = String(l.id); if(src===String(dest)) return;
+            const si = psStockInfo.get(String(r.partId)+'|'+src);
+            const sp = si ? si.spare : 0;
+            if(sp>1e-6 && (!best || sp>best.spare)) best = { src:src, spare:sp };
+        });
+        if(best) opts.push({ dest:String(dest), short:short, src:best.src, spare:best.spare, full:best.spare>=short-1e-6 });
+    });
+    return opts.sort((a,b)=>(b.full-a.full) || (b.short-a.short));
+}
+// The "On hand in" picker is a static multi-select; park it in its hidden holder
+// before procureView's innerHTML is replaced, then mount it in the sub-tab bar.
+function psParkLgPicker(){ const n=document.getElementById('procLgSlotInner'), h=document.getElementById('procLgHolder'); if(n && h && n.parentNode!==h) h.appendChild(n); }
+function psMountLgPicker(bar){ const n=document.getElementById('procLgSlotInner'); if(n && bar) bar.appendChild(n); }
+const PS_MOVE_SVG = '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M14 5l7 7m0 0l-7 7m7-7H3"/></svg>';
+
 function renderProcure(){
     const host=document.getElementById('procureView'); if(!host) return;
+    psParkLgPicker();
     if(!psAvailReady){
         host.innerHTML='<div class="ps-empty">Component availability hasn’t been computed, so shortages can’t be listed. Refresh, or enable the debug console for details.</div>';
         return;
@@ -2369,7 +2602,52 @@ function renderProcure(){
         }
         return '<td class="num" style="color:var(--fb-negative);font-weight:700">'+psEsc(psFmtQty(a.q))+(a.u?' '+psEsc(a.u):'')+alt+'</td>';
     };
-    const ohCell    = r => '<td class="num">'+(r.onhand!=null?psEsc(psFmtQty(psProcQty(r, r.onhand).q)):'—')+'</td>';
+    // On hand per location group — one column per shown LG, in the unit the
+    // Quantities-in toggle picks (tooltip figures stay in the stocking UOM). A shortage LG's cell is
+    // tinted and says how much it is short there; another LG's cell shows its spare
+    // (green = covers the shortage, amber = partial). Tooltip has the breakdown.
+    const lgCols = psProcOhCols(buy.concat(make));
+    const ohHeads = lgCols.map(l=>'<th class="ohh" title="On hand — '+psEsc(l.name)+'">On hand<span class="ohh-lg">'+psEsc(l.name)+'</span></th>').join('');
+    const ohCells = r => lgCols.map(l=>{
+        const lg = String(l.id);
+        const si = psStockInfo.get(String(r.partId)+'|'+lg);
+        const oh = si ? si.onhand : 0;
+        const shortHere = (r.shortByLg && r.shortByLg.get(lg)) || 0;
+        const maxShort = Math.max(0, ...Array.from((r.shortByLg||new Map()).values()));
+        let cls = 'ohc', sub = '';
+        if(shortHere>1e-6){ cls += ' dem'; sub = '<span class="ohs short">short '+psEsc(psFmtQty(psProcQty(r, shortHere).q))+'</span>'; }
+        else if(si && si.spare>1e-6){ sub = '<span class="ohs '+(si.spare>=maxShort-1e-6?'full':'part')+'">'+psEsc(psFmtQty(psProcQty(r, si.spare).q))+' spare</span>'; }
+        const ttl = l.name+' — on hand '+psFmtQty(oh)+
+            (si ? (' · avail. to pick '+psFmtQty(si.avail)+' · needed by its own open WOs '+psFmtQty(si.demand)+(si.outbound>1e-6?(' · on outbound TOs '+psFmtQty(si.outbound)):'')+' → spare '+psFmtQty(si.spare)) : '')+
+            (shortHere>1e-6 ? (' · short '+psFmtQty(shortHere)+' here') : '')+
+            (r.uom ? ' ('+r.uom+')' : '');
+        const val = (si && Math.abs(oh)>1e-9) ? psEsc(psFmtQty(psProcQty(r, oh).q)) : '<span class="ohz">0</span>';
+        return '<td class="'+cls+'" title="'+psEsc(ttl)+'">'+val+sub+'</td>';
+    }).join('');
+    // Transfer — pending (Entered/Request) TOs already raised into the shortage LG,
+    // then a Move button when a shown LG has spare stock (primary = covers it).
+    const moveCell = r => {
+        const bits = [];
+        (r.pendingTos||[]).forEach(t=>{
+            const numJs = String(t.tonum).replace(/'/g,"\\'");
+            const ttl = t.statusName+' transfer order from '+psLgName(t.fromLg)+' — not issued yet, so not counted as supply. Check / issue it before raising another.';
+            bits.push('<a href="#" onclick="event.preventDefault();event.stopPropagation();openModule(\'Transfer Order\',\''+numJs+'\')" style="text-decoration:none" title="'+psEsc(ttl)+'">'+psSpill('caution','TO '+t.tonum+' · '+t.statusName+(t.outstanding?(' ×'+psFmtQty(t.outstanding)):''))+'</a>');
+        });
+        const opts = psMoveOptions(r, lgCols);
+        if(opts.length){
+            const o = opts[0], qty = Math.min(o.short, o.spare);
+            const ttl = (o.full?'Covers the shortage — ':'Partial — ')+psFmtQty(o.spare)+' spare in '+psLgName(o.src)+', '+psFmtQty(o.short)+' short in '+psLgName(o.dest)+'. Raise a Move transfer order.';
+            bits.push('<button class="ps-btn sm'+(o.full?' primary':'')+'" onclick="event.stopPropagation();psOpenCreateTo(\''+String(r.partId)+'\',\''+o.src+'\',\''+o.dest+'\')" title="'+psEsc(ttl)+'">'+PS_MOVE_SVG+(o.full?'Move':('Move '+psEsc(psFmtQty(qty))))+'</button>');
+            bits.push('<span class="mv-line" title="'+psEsc(psLgName(o.src)+' → '+psLgName(o.dest))+'">'+psEsc(psLgName(o.src))+' → '+psEsc(psLgName(o.dest))+'</span>');
+            if(opts.length>1) bits.push('<span class="mv-line">+'+(opts.length-1)+' more LG short</span>');
+        }
+        if(!bits.length) return '<td><span style="color:var(--c-tertiary)">—</span></td>';
+        return '<td><div class="proc-mv">'+bits.join('')+'</div></td>';
+    };
+    // Fixed-layout colgroup from relative weights (normalised to 100%), so the
+    // per-LG columns can vary in number while every vendor table still lines up.
+    const colgroup = ws => { const tot = ws.reduce((s,w)=>s+w,0); return '<colgroup>'+ws.map(w=>'<col style="width:'+(w/tot*100).toFixed(2)+'%">').join('')+'</colgroup>'; };
+    const ohW = lgCols.map(()=>7);
     const needCell  = r => '<td>'+(r.earliest?psFmtDate(r.earliest):'—')+'</td>';
     // "Order by" = the day the PO must be raised to arrive in time = earliest need-by
     // minus the vendor lead time (vendorparts.leadTime, days). Red + warning glyph
@@ -2446,7 +2724,8 @@ function renderProcure(){
         }).join(' ');
         return '<td>' + links + '</td>';
     };
-    const PROC_BUY_COLS = '<colgroup><col style="width:11%"><col style="width:18%"><col style="width:8%"><col style="width:7%"><col style="width:10%"><col style="width:10%"><col style="width:14%"><col style="width:22%"></colgroup>';
+    // Part · Description · Short by · On hand ×LG · Needed by · Order by · On order · Transfer · Blocked work orders
+    const PROC_BUY_COLS = colgroup([10, 14, 7].concat(ohW, [7, 8, 11, 12, 20]));
     let buyHtml = '';
     if(buy.length){
         const groups = new Map();
@@ -2458,7 +2737,7 @@ function renderProcure(){
             const body=rows.map(r=>'<tr>'+
                 '<td>'+partLink(r)+'</td>'+
                 descCell(r)+
-                shortCell(r)+ohCell(r)+needCell(r)+orderCell(r)+pendingCell(r)+blockedCell(r)+
+                shortCell(r)+ohCells(r)+needCell(r)+orderCell(r)+pendingCell(r)+moveCell(r)+blockedCell(r)+
             '</tr>').join('');
             // Named vendors get a Create PO button in the group header; the
             // "no default vendor" bucket can't (no vendor to raise a PO against).
@@ -2466,7 +2745,7 @@ function renderProcure(){
             const createBtn = (k==='__NOVENDOR__') ? '' :
                 '<button class="ps-btn primary sm" style="margin-left:auto;text-transform:none" onclick="psOpenCreatePo(\''+vkJs+'\')" title="Create a purchase order for this vendor"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 5v14M5 12h14"/></svg>Create PO</button>';
             buyBody += '<div class="proc-vgrp"><div class="proc-vhead">'+psEsc(vlabel)+'<span class="proc-vcount">'+rows.length+'</span>'+createBtn+'</div>'+
-                '<div class="tbl-wrap proc-tbl"><table style="table-layout:fixed">'+PROC_BUY_COLS+'<thead><tr><th>Part</th><th>Description</th><th style="text-align:right">Short by</th><th style="text-align:right">On hand</th><th>Needed by</th><th>Order by</th><th>On order</th><th>Blocked work orders</th></tr></thead><tbody>'+body+'</tbody></table></div></div>';
+                '<div class="tbl-wrap proc-tbl"><table style="table-layout:fixed">'+PROC_BUY_COLS+'<thead><tr><th>Part</th><th>Description</th><th style="text-align:right">Short by</th>'+ohHeads+'<th>Needed by</th><th>Order by</th><th>On order</th><th>Transfer</th><th>Blocked work orders</th></tr></thead><tbody>'+body+'</tbody></table></div></div>';
         });
         // Unit toggle — only worth showing when some vendor sells in a different UOM.
         const uomMode = psProcUomMode();
@@ -2477,7 +2756,7 @@ function renderProcure(){
                 '<button class="'+(uomMode==='vendor'?'active':'')+'" onclick="psSetProcQtyUom(\'vendor\')">Vendor UOM</button></div>'
             : '';
         buyHtml = '<div class="proc-subhead">'+
-              '<span class="proc-subtitle" style="margin:0">Raw goods short of stock and open POs — grouped by default vendor.</span>'+
+              '<span class="proc-subtitle" style="margin:0">Raw goods short of stock and open POs — grouped by default vendor. On hand is per location group; <b>Move</b> raises a transfer order when another location group has spare stock.</span>'+
               '<span style="flex:1"></span>'+uomToggle+
             '</div>'+buyBody;
     }
@@ -2494,12 +2773,12 @@ function renderProcure(){
                 '<td>'+partLink(r)+'</td>'+
                 descCell(r)+
                 '<td class="mono" style="font-size:12px">'+psEsc(r.bomNum||'—')+'</td>'+
-                shortCell(r)+ohCell(r)+needCell(r)+blockedCell(r)+
+                shortCell(r)+ohCells(r)+needCell(r)+moveCell(r)+blockedCell(r)+
             '</tr>';
         }).join('');
         // Uniform fixed layout (checkbox · Part · Description · BOM · Short by ·
-        // On hand · Needed by · Blocked work orders).
-        const PROC_MAKE_COLS = '<colgroup><col style="width:4%"><col style="width:12%"><col style="width:15%"><col style="width:9%"><col style="width:9%"><col style="width:8%"><col style="width:10%"><col style="width:33%"></colgroup>';
+        // On hand ×LG · Needed by · Transfer · Blocked work orders).
+        const PROC_MAKE_COLS = colgroup([3, 10, 13, 8, 7].concat(ohW, [8, 12, 24]));
         makeHtml = '<div class="proc-subhead">'+
               '<span class="proc-subtitle" style="margin:0">Parts with a BOM — tick and create a manufacture order.</span>'+
               '<span style="flex:1"></span>'+
@@ -2507,7 +2786,7 @@ function renderProcure(){
             '</div>'+
             '<div class="tbl-wrap proc-tbl"><table style="table-layout:fixed">'+PROC_MAKE_COLS+'<thead><tr>'+
               '<th style="text-align:center"><input type="checkbox" '+(allSel?'checked':'')+' onclick="psProcureSelectAll(this.checked)" title="Select all"></th>'+
-              '<th>Part</th><th>Description</th><th>BOM</th><th style="text-align:right">Short by</th><th style="text-align:right">On hand</th><th>Needed by</th><th>Blocked work orders</th>'+
+              '<th>Part</th><th>Description</th><th>BOM</th><th style="text-align:right">Short by</th>'+ohHeads+'<th>Needed by</th><th>Transfer</th><th>Blocked work orders</th>'+
             '</tr></thead><tbody>'+body+'</tbody></table></div>';
     }
 
@@ -2519,6 +2798,7 @@ function renderProcure(){
     const tabBtn = (id,label,n,on)=>'<button class="proc-tab'+(on?' active':'')+'" onclick="psSetProcTab(\''+id+'\')">'+label+'<span class="proc-tabn">'+n+'</span></button>';
     const tabBar = '<div class="proc-tabbar">'+tabBtn('buy','To Purchase',buy.length,tab==='buy')+tabBtn('make','To Manufacture',make.length,tab==='make')+'</div>';
     host.innerHTML = '<div style="width:100%">'+tabBar+(tab==='buy'?buyHtml:makeHtml)+'</div>';
+    psMountLgPicker(host.querySelector('.proc-tabbar'));
 }
 
 // Procurement — switch between the To Purchase / To Manufacture tabs.
@@ -3131,9 +3411,288 @@ async function psSubmitPo(){
     }
 }
 
-// ESC closes the top procurement drawer (PO in front of MO) when open.
+/* ============================================================
+   CREATE TRANSFER ORDER (Move) — Procurement → Transfer column
+   ============================================================ */
+// Opened from a row's Move button for one (From LG → To LG) pair. Lists every
+// procurement shortage in the To LG that the From LG holds stock of — the clicked
+// part ticked, the rest available to tick — so one TO can carry several lines.
+// REST shape (TransferOrderRest / ValidatorTransferOrder, fb-rest 26.9.1):
+//   POST /api/transfer-orders  { type:'Move', status:'Entered' (the only status
+//   allowed on create), fromLocationGroup:{id}, toLocationGroup:{id}, ownerIsFrom,
+//   dateScheduled, note, toItems:[{ part:{id}, type:{id:10 = Send}, uom:{id},
+//   quantity, dateScheduled }] }.
+//   Issuing is a separate POST /api/transfer-orders/{id}/issue (needs access to
+//   both LGs). With TO auto-numbering off the create is retried with
+//   GET /api/transfer-orders/next-number → orderNumber.
+// Quantities are in each part's base uom — the unit every engine figure is in.
+function psCloseToDrawer(){ const p=document.getElementById('toPanel'), s=document.getElementById('toScrim'); if(p) p.classList.remove('on'); if(s) s.classList.remove('on'); psToDraft=null; }
+// Org-wide (admin) "Fulfill TO after create": issue the new TO and finish its pick
+// straight away via an ImportPickingData import of just that TO's pick.
+function psToAutoFulfill(){ try { return FBLib.Settings.resolve('toAutoFulfill') === true; } catch(_){ return false; } }
+// Carrier for new TOs. The REST create does NOT default one — omitting it inserts
+// xo.carrierId = 0 and fails the carrier FK ("Cannot add or update a child row …
+// FKip4a2jx987m76j5i4yi871umq"). (carrierServiceId is mapped 0→NULL, so it can be
+// omitted.) Default = the user's last choice, else the carrier on the most recent
+// TO (what this site uses), else the first active carrier.
+let psToCarrierCache = null;
+function psLoadToCarriers(){
+    if(psToCarrierCache) return psToCarrierCache;
+    const c = { list:[], lastTo:null };
+    try {
+        c.list = (JSON.parse(runQuery("SELECT id, name, CASE WHEN activeflag = 1 THEN 1 ELSE 0 END AS active FROM carrier ORDER BY name"))||[])
+            .map(r=>({ id:String(r.id), name:r.name||('Carrier '+r.id), active:Number(r.active)===1 }));
+        const last = JSON.parse(runQuery("SELECT carrierid AS cid FROM xo WHERE carrierid > 0 ORDER BY id DESC LIMIT 1"))||[];
+        if(last.length && last[0].cid!=null) c.lastTo = String(last[0].cid);
+    } catch(e){ debugLog('warn','Carrier lookup failed: '+(e&&e.message)); }
+    psToCarrierCache = c;
+    return c;
+}
+function psDefaultToCarrier(){
+    const c = psLoadToCarriers(), has = id => id!=null && c.list.some(x=>x.id===String(id));
+    let mine=null; try { mine=FBLib.Settings.resolve('toCarrierId'); } catch(_){}
+    if(has(mine)) return String(mine);
+    if(has(c.lastTo)) return c.lastTo;
+    const act = c.list.filter(x=>x.active).sort((a,b)=>Number(a.id)-Number(b.id));
+    return act.length ? act[0].id : (c.list.length ? c.list[0].id : null);
+}
+// Finish the pick(s) of ONE transfer order by importing Picking Data (single
+// column: PickNum — IEPickImpl → LogicPick.saveMassPicks(…, Finished), so Fishbowl
+// allocates the stock itself). Only that TO's open picks are imported. ImportRq
+// can return 1000 without having done anything, so the result is read back from
+// the pick + xo status. A finished Move TO goes straight to Fulfilled.
+function psFulfillToPicks(toNum){
+    const res = { ok:false, picks:[], toStatus:'', msg:'' };
+    if(typeof runApiRequest!=='function'){ res.msg='Legacy API (runApiRequest) unavailable — finish the pick in Picking.'; return res; }
+    const numSql = "'"+String(toNum).replace(/'/g,"''")+"'";
+    const pickQ = "SELECT DISTINCT p.num AS picknum, p.statusid AS st FROM pick p "+
+                  "JOIN pickitem pi ON pi.pickid = p.id AND pi.ordertypeid = 40 "+
+                  "JOIN xo ON xo.id = pi.orderid WHERE xo.num = "+numSql;
+    const TO_ST = { 10:'Entered', 15:'Request', 20:'Issued', 30:'Picking', 40:'Partial', 50:'Picked', 60:'Shipped', 70:'Fulfilled', 80:'Closed Short', 90:'Void' };
+    const readBack = () => {
+        res.picks = (JSON.parse(runQuery(pickQ))||[]).map(r=>({ num:String(r.picknum), st:Number(r.st)||0 }));
+        const x = JSON.parse(runQuery("SELECT statusid AS st FROM xo WHERE num = "+numSql))||[];
+        res.toStatus = x.length ? (TO_ST[Number(x[0].st)] || ('Status '+x[0].st)) : '';
+    };
+    try {
+        readBack();
+        const open = res.picks.filter(p=>p.st<40);
+        if(!res.picks.length){ res.msg='No pick found for TO '+toNum+' — it may not have been issued.'; return res; }
+        if(!open.length){ res.ok=true; res.msg='Pick already finished.'; return res; }
+        let header = 'PickNum';
+        try {
+            const h = JSON.parse(runApiRequest('ImportHeaderRq', JSON.stringify({ ImportHeaderRq:{ Type:'ImportPickingData' } })));
+            if(h && h.ImportHeaderRs && h.ImportHeaderRs.Header && h.ImportHeaderRs.Header.Row) header = h.ImportHeaderRs.Header.Row;
+        } catch(_){}
+        const csv = s => '"'+String(s).replace(/"/g,'""')+'"';
+        const rows = [header].concat(open.map(p=>csv(p.num)));
+        debugLog('info','ImportPickingData for TO '+toNum+':\n  '+rows.join('\n  '));
+        const resp = JSON.parse(runApiRequest('ImportRq', JSON.stringify({ ImportRq:{ Type:'ImportPickingData', Rows:{ Row:rows } } })));
+        const rs = resp && (resp.ImportRs || (resp.FbiJson && resp.FbiJson.FbiMsgsRs && resp.FbiJson.FbiMsgsRs.ImportRs));
+        if(!rs || Number(rs.statusCode)!==1000){ res.msg='Picking import failed'+(rs?(' ('+rs.statusCode+'): '+(rs.statusMessage||'')):'')+' — finish the pick in Picking.'; readBack(); return res; }
+        readBack();
+        const still = res.picks.filter(p=>p.st<40);
+        res.ok = !still.length;
+        res.msg = res.ok ? '' : ('Pick '+still.map(p=>p.num).join(', ')+' did not finish (not enough stock in the From location group\'s pickable locations, or tracking required?) — finish it in Picking.');
+    } catch(e){ res.msg='Fulfil failed: '+(e&&e.message)+' — finish the pick in Picking.'; }
+    return res;
+}
+function psToRows(){ const { buy, make } = psProcureData(); return buy.concat(make); }
+// (Re)build the drawer's lines for the current From/To pair, keeping the user's
+// ticks and typed quantities for parts that remain listed.
+function psToBuildLines(){
+    const d=psToDraft; if(!d) return;
+    const prev = new Map((d.lines||[]).map(l=>[l.partId,l]));
+    d.lines = psToRows().filter(r=>((r.shortByLg && r.shortByLg.get(d.toLg))||0)>1e-6).map(r=>{
+        const pid=String(r.partId), si=psStockInfo.get(pid+'|'+d.fromLg)||null;
+        const avail=si?si.avail:0, spare=si?si.spare:0, short=r.shortByLg.get(d.toLg)||0;
+        const p=prev.get(pid);
+        let qty;
+        if(p && p.qtyTouched) qty=parseFloat(p.qty)||0;
+        else { qty=Math.min(short, spare>1e-6?spare:avail); if(psPoIsEach(r)) qty=Math.ceil(qty-1e-9); qty=Math.max(0, Math.round(qty*1000)/1000); }
+        return { partId:pid, partNum:r.partNum, partDesc:r.partDesc||'', uom:r.uom||'', uomId:r.uomId||null,
+                 short:short, avail:avail, spare:spare, qty:String(qty), qtyTouched:!!(p && p.qtyTouched),
+                 include: p ? p.include : (pid===d.focusPid) };
+    }).filter(l=>l.avail>1e-6 || l.include)
+      .sort((a,b)=>(b.partId===d.focusPid)-(a.partId===d.focusPid) || String(a.partNum).localeCompare(String(b.partNum)));
+}
+function psOpenCreateTo(partId, fromLg, toLg){
+    const row = psToRows().find(r=>String(r.partId)===String(partId));
+    if(!row){ showToast('That part is no longer short — refresh and try again','info'); return; }
+    let st='Issued'; try { const s=FBLib.Settings.resolve('toCreateStatus'); if(s==='Issued'||s==='Entered') st=s; } catch(_){}
+    // Scheduled = the day before the earliest WO that needs it (one-day buffer, as
+    // the PO/MO drawers do), but never in the past.
+    let sched = row.earliest ? row.earliest.clone().subtract(1,'day') : moment();
+    if(sched.isBefore(moment(),'day')) sched = moment();
+    psToDraft = { fromLg:String(fromLg), toLg:String(toLg), focusPid:String(partId), status:st,
+                  carrierId:psDefaultToCarrier(), autoFulfill:psToAutoFulfill(),
+                  dateScheduled:sched.format('YYYY-MM-DD'), note:'', lines:[], state:'idle', error:null, result:null, issueError:null, fulfill:null };
+    psToBuildLines();
+    psRenderToDrawer();
+    const p=document.getElementById('toPanel'), s=document.getElementById('toScrim');
+    if(p) p.classList.add('on'); if(s) s.classList.add('on');
+}
+function psToField(f,v){
+    const d=psToDraft; if(!d) return;
+    d[f]=v;
+    if(f==='fromLg' || f==='toLg'){ d[f]=String(v); psToBuildLines(); psRenderToDrawer(); }
+}
+function psToToggleLine(pid){ const d=psToDraft; if(!d) return; const l=d.lines.find(x=>x.partId===String(pid)); if(l){ l.include=!l.include; psRenderToDrawer(); } }
+function psToToggleAll(on){ const d=psToDraft; if(!d) return; d.lines.forEach(l=>{ l.include=!!on; }); psRenderToDrawer(); }
+function psToQty(pid,v){
+    const d=psToDraft; if(!d) return;
+    const l=d.lines.find(x=>x.partId===String(pid)); if(!l) return;
+    let n=parseFloat(v); if(!isFinite(n) || n<0) n=0;
+    if(psPoIsEach(l)) n=Math.round(n);
+    l.qty=String(n); l.qtyTouched=true; psRenderToDrawer();
+}
+function psRenderToDrawer(){
+    const d=psToDraft, panel=document.getElementById('toPanel'); if(!panel||!d) return;
+    const fromNm=psLgName(d.fromLg), toNm=psLgName(d.toLg);
+    const head='<div class="detail-head"><div class="top"><div class="detail-head-main">'+
+        '<h2>Create Transfer Order</h2>'+
+        '<div class="sub">Move · '+psEsc(fromNm)+' → '+psEsc(toNm)+'</div>'+
+      '</div><div class="detail-actions">'+
+        '<button class="close-x" onclick="psCloseToDrawer()"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></svg></button>'+
+      '</div></div></div>';
+    if(d.state==='done'){
+        const num=(d.result && (d.result.number||d.result.num))||'';
+        const numJs=String(num).replace(/'/g,"\\'");
+        const f=d.fulfill;
+        const st=(f && f.toStatus) || (d.result && d.result.status) || (d.issueError?'Entered':d.status);
+        const openPick = f && f.picks && f.picks.find(p=>p.st<40);
+        const fulfilHtml = !f ? ''
+            : f.ok ? '<div class="pf-banner ok"><span class="pf-summary">'+psSpill('success','Pick '+f.picks.map(p=>p.num).join(', ')+' finished'+(f.toStatus?(' · TO '+f.toStatus):''))+'</span></div>'
+            : '<div class="pf-banner warn"><span class="pf-summary">'+psSpill('caution','Not fulfilled')+'<span class="wa-sub">'+psEsc(f.msg)+'</span></span></div>';
+        panel.innerHTML=head+'<div class="detail-body">'+
+            '<div class="pf-banner ok"><span class="pf-summary">'+psSpill('success','TO '+(num||'created')+' created'+(st?(' · '+st):''))+'</span></div>'+
+            (d.issueError?'<div class="pf-banner warn"><span class="pf-summary">'+psSpill('caution','Created as Entered — issuing failed: '+d.issueError)+'</span></div><div class="hint" style="margin:-6px 0 12px">Issue it from the Transfer Order module. Until it is issued it is listed as pending and the part stays short.</div>':'')+
+            fulfilHtml+
+            '<div class="dsec" style="display:flex;gap:8px">'+
+              (num?'<button class="ps-btn primary" onclick="openModule(\'Transfer Order\',\''+numJs+'\')">Open TO '+psEsc(num)+'</button>':'')+
+              (openPick?'<button class="ps-btn" onclick="openModule(\'Picking\',\''+String(openPick.num).replace(/'/g,"\\'")+'\')">Open pick '+psEsc(openPick.num)+'</button>':'')+
+              '<button class="ps-btn" onclick="psCloseToDrawer()">Close</button></div></div>';
+        return;
+    }
+    const submitting = d.state==='submitting';
+    const rows = d.lines.map(l=>{
+        const inc=!!l.include, q=parseFloat(l.qty)||0, isEach=psPoIsEach(l);
+        let warn='';
+        if(inc && l.avail<=1e-6) warn='<div class="to-warn bad">No stock to pick in '+psEsc(fromNm)+'</div>';
+        else if(inc && q>l.avail+1e-6) warn='<div class="to-warn bad">More than the '+psEsc(psFmtQty(l.avail))+' available to pick in '+psEsc(fromNm)+'</div>';
+        else if(inc && q>l.spare+1e-6) warn='<div class="to-warn">Leaves '+psEsc(fromNm)+'\'s own work orders short (spare '+psEsc(psFmtQty(l.spare))+')</div>';
+        return '<tr'+(inc?'':' style="opacity:.45"')+'>'+
+            '<td style="text-align:center"><input type="checkbox" '+(inc?'checked':'')+' onclick="psToToggleLine(\''+l.partId+'\')" title="Include this line on the TO"></td>'+
+            '<td><span class="pf-partn">'+psEsc(l.partNum)+'</span>'+(l.partDesc?'<div class="pf-desc">'+psEsc(l.partDesc)+'</div>':'')+'</td>'+
+            '<td class="num" style="color:var(--fb-negative);font-weight:700">'+psEsc(psFmtQty(l.short))+'</td>'+
+            '<td class="num" title="Available to pick in '+psEsc(fromNm)+' · spare after its own open work orders and outbound TOs">'+psEsc(psFmtQty(l.avail))+'<div class="pf-desc">'+psEsc(psFmtQty(l.spare))+' spare</div></td>'+
+            '<td class="num"><input type="number" min="0" step="'+(isEach?'1':'0.001')+'" value="'+psEsc(String(l.qty))+'" onchange="psToQty(\''+l.partId+'\',this.value)">'+warn+'</td>'+
+            '<td>'+psEsc(l.uom||'')+'</td></tr>';
+    }).join('');
+    const allInc = d.lines.length>0 && d.lines.every(l=>l.include);
+    const tbl = d.lines.length
+        ? '<div class="pf-tablewrap"><table class="pf-table"><thead><tr>'+
+            '<th style="text-align:center"><input type="checkbox" '+(allInc?'checked':'')+' onclick="psToToggleAll(this.checked)" title="Include / exclude all lines"></th>'+
+            '<th>Part</th><th class="num">Short in '+psEsc(toNm)+'</th><th class="num">Avail. in '+psEsc(fromNm)+'</th><th class="num">Qty to move</th><th>UOM</th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+        : '<div class="hint" style="padding:8px 2px">Nothing short in '+psEsc(toNm)+' has stock in '+psEsc(fromNm)+'. Choose another From location group.</div>';
+    // From = any LG but the destination; To = the LGs that carry a shortage.
+    const fromOpts = psLgList.filter(l=>String(l.id)!==d.toLg).map(l=>'<option value="'+l.id+'"'+(String(l.id)===d.fromLg?' selected':'')+'>'+psEsc(l.name)+'</option>').join('');
+    const toIds = new Set([d.toLg]); psToRows().forEach(r=>(r.shortByLg||new Map()).forEach((v,lg)=>toIds.add(String(lg))));
+    const toOpts = Array.from(toIds).filter(id=>id!==d.fromLg).map(id=>({ id:id, name:psLgName(id) })).sort((a,b)=>a.name.localeCompare(b.name))
+        .map(l=>'<option value="'+l.id+'"'+(l.id===d.toLg?' selected':'')+'>'+psEsc(l.name)+'</option>').join('');
+    // Carrier: active carriers, plus the current pick even if it's inactive.
+    const cars = psLoadToCarriers().list.filter(c=>c.active || c.id===String(d.carrierId));
+    const carOpts = cars.length
+        ? cars.map(c=>'<option value="'+c.id+'"'+(c.id===String(d.carrierId)?' selected':'')+'>'+psEsc(c.name)+(c.active?'':' (inactive)')+'</option>').join('')
+        : '<option value="">(no carriers found)</option>';
+    // "Fulfill TO after create" (org setting) forces Issued and finishes the pick.
+    const statusHtml = d.autoFulfill
+        ? '<input type="text" value="Issued → fulfilled" disabled><span class="ds-toggle-help" style="margin-top:2px">Fulfill TO after create is on (org setting): the TO is issued and its pick is finished straight away via a Picking Data import, so the stock moves now.</span>'
+        : '<select onchange="psToField(\'status\',this.value)">'+['Issued','Entered'].map(s=>'<option'+(s===d.status?' selected':'')+'>'+s+'</option>').join('')+'</select><span class="ds-toggle-help" style="margin-top:2px">Issued = released to the warehouse to pick, and counted as incoming supply · Entered = draft (listed as pending; the part stays short)</span>';
+    panel.innerHTML=head+'<div class="detail-body">'+
+        (d.error?'<div class="pf-banner late"><span class="pf-summary">'+psSpill('critical', d.error)+'</span></div>':'')+
+        '<div class="dsec"><h4>Line items</h4>'+tbl+'</div>'+
+        '<div class="dsec"><h4>Order details</h4><div class="mo-form">'+
+          '<label><span>From location group</span><select onchange="psToField(\'fromLg\',this.value)">'+fromOpts+'</select></label>'+
+          '<label><span>To location group</span><select onchange="psToField(\'toLg\',this.value)">'+toOpts+'</select></label>'+
+          '<label><span>Type</span><input type="text" value="Move" disabled></label>'+
+          '<label><span>Carrier</span><select onchange="psToField(\'carrierId\',this.value)">'+carOpts+'</select></label>'+
+          '<label><span>Order status</span>'+statusHtml+'</label>'+
+          '<label><span>Scheduled date</span><input type="date" value="'+psEsc(d.dateScheduled||'')+'" onchange="psToField(\'dateScheduled\',this.value)"></label>'+
+          '<label><span>Note</span><textarea rows="2" oninput="psToField(\'note\',this.value)">'+psEsc(d.note||'')+'</textarea></label>'+
+        '</div></div>'+
+        '<div class="dsec" style="display:flex;gap:8px;justify-content:flex-end">'+
+          (submitting?'<button class="ps-btn primary" disabled>'+(d.autoFulfill?'Creating &amp; fulfilling…':'Creating…')+'</button>':'<button class="ps-btn primary" onclick="psSubmitTo()">'+(d.autoFulfill?'Create &amp; fulfill TO':'Create TO')+'</button>')+
+          '<button class="ps-btn" onclick="psCloseToDrawer()">Cancel</button>'+
+        '</div></div>';
+}
+function psRestErr(err){ return (err && (err.message || err.status!=null)) ? (err.message || ('HTTP '+err.status)) : 'unknown error'; }
+async function psSubmitTo(){
+    const d=psToDraft; if(!d || d.state==='submitting') return;
+    if(!d.fromLg || !d.toLg){ d.error='Choose both location groups.'; psRenderToDrawer(); return; }
+    if(d.fromLg===d.toLg){ d.error='From and To must be different location groups.'; psRenderToDrawer(); return; }
+    const sched=(d.dateScheduled && /^\d{4}-\d{2}-\d{2}$/.test(d.dateScheduled)) ? d.dateScheduled+'T00:00:00' : null;
+    const items=d.lines.filter(l=>l.include && (parseFloat(l.qty)||0)>0).map(l=>{
+        const it={ part:{ id:parseInt(l.partId,10), name:l.partNum }, type:{ id:10 }, quantity:parseFloat(l.qty) };
+        if(l.uomId) it.uom={ id:parseInt(l.uomId,10) };
+        if(sched) it.dateScheduled=sched;
+        return it;
+    });
+    if(!items.length){ d.error='Include at least one line with a quantity greater than 0.'; psRenderToDrawer(); return; }
+    if(typeof runRestApiAsync!=='function'){ d.error='REST API unavailable — open this report inside Fishbowl with REST enabled to create transfer orders.'; psRenderToDrawer(); return; }
+    if(!d.carrierId){ d.error='Choose a carrier — Fishbowl requires one on a transfer order.'; psRenderToDrawer(); return; }
+    // Re-read the org setting at submit so a change since the drawer opened applies.
+    d.autoFulfill = psToAutoFulfill();
+    const wantIssue = d.autoFulfill || d.status==='Issued';
+    try {
+        if(!d.autoFulfill) FBLib.Settings.setUserKey('toCreateStatus', wantIssue?'Issued':'Entered');
+        FBLib.Settings.setUserKey('toCarrierId', String(d.carrierId));
+        FBLib.Settings.saveUser();
+    } catch(_){}
+    const payload={ type:'Move', status:'Entered', fromLocationGroup:{ id:parseInt(d.fromLg,10) }, toLocationGroup:{ id:parseInt(d.toLg,10) },
+                    carrier:{ id:parseInt(d.carrierId,10) }, ownerIsFrom:true, toItems:items };
+    if(sched) payload.dateScheduled=sched;
+    if(d.note && d.note.trim()) payload.note=d.note.trim();
+    d.state='submitting'; d.error=null; d.issueError=null; d.fulfill=null; psRenderToDrawer();
+    const create = body => runRestApiAsync({ method:'POST', path:'/api/transfer-orders', body:JSON.stringify(body) });
+    try {
+        let res;
+        try { res = await create(payload); }
+        catch(err){
+            // TO auto-numbering off → fetch the next number and retry once.
+            if(!/auto\s*number/i.test(psRestErr(err))) throw err;
+            const nn = await runRestApiAsync({ path:'/api/transfer-orders/next-number' });
+            if(!nn || !nn.orderNumber) throw err;
+            payload.number = String(nn.orderNumber);
+            res = await create(payload);
+        }
+        if(wantIssue && res && res.id){
+            try { res = (await runRestApiAsync({ method:'POST', path:'/api/transfer-orders/'+res.id+'/issue', body:'{}' })) || res; }
+            catch(ie){ d.issueError = psRestErr(ie); debugLog('warn','TO '+(res.number||res.id)+' issue failed: '+d.issueError); }
+        }
+        const num=(res && (res.number||res.num))||'';
+        if(d.autoFulfill){
+            d.fulfill = d.issueError ? { ok:false, picks:[], toStatus:'', msg:'Not fulfilled — the TO could not be issued, so it has no pick yet.' }
+                      : (num ? psFulfillToPicks(num) : { ok:false, picks:[], toStatus:'', msg:'Not fulfilled — the create response carried no TO number.' });
+            debugLog(d.fulfill.ok?'success':'warn', 'TO '+num+' fulfil: '+(d.fulfill.ok?('picks '+d.fulfill.picks.map(p=>p.num).join(', ')+' finished, TO '+d.fulfill.toStatus):d.fulfill.msg));
+        }
+        d.state='done'; d.result=res; psRenderToDrawer();
+        const warn = d.issueError || (d.fulfill && !d.fulfill.ok);
+        showToast('TO '+(num||'created')+' created'+(d.issueError?' (not issued)':(d.fulfill?(d.fulfill.ok?' and fulfilled':' — not fulfilled'):'')), warn?'warn':'success', 5000);
+        // Refresh so an issued TO counts as incoming supply (an Entered one shows as pending).
+        if(typeof loadWorkOrders==='function') loadWorkOrders();
+    } catch(err){
+        d.state='error';
+        d.error='TO create failed: '+psRestErr(err);
+        psRenderToDrawer();
+    }
+}
+
+// ESC closes the top procurement drawer (TO, then PO, then MO) when open.
 document.addEventListener('keydown', e=>{
     if(e.key!=='Escape') return;
+    const tp=document.getElementById('toPanel');
+    if(tp && tp.classList.contains('on')){ psCloseToDrawer(); return; }
     const pp=document.getElementById('poPanel');
     if(pp && pp.classList.contains('on')){ psClosePoDrawer(); return; }
     const mp=document.getElementById('moPanel');
@@ -3149,12 +3708,25 @@ function initLgFilter() {
         // An empty accessible list means the user is unrestricted — show ALL active
         // location groups rather than an empty dropdown.
         const rows = JSON.parse(runQuery('SELECT id, name FROM locationgroup WHERE activeflag = 1' + (ids.length ? (' AND id IN (' + ids.join(',') + ')') : '') + ' ORDER BY name')) || [];
+        psLgList = rows.map(r => ({ id: String(r.id), name: r.name }));   // Procurement On-hand columns + Create TO
         const items = rows.map(r => ({ value: String(r.id), label: r.name }));
         _lgMs = FBLib.Common.MultiSelect.create({
             containerId: 'lgMs', items: items, selected: Array.from(flt.selLg), placeholder: 'All location groups', maxTags: 2,
             onClose: () => { flt.selLg.clear(); (_lgMs.getSelected() || []).forEach(v => flt.selLg.add(String(v))); saveState(); applyFilters(); render(); }
         });
     } catch (e) { debugLog('warn', 'LG filter init failed: ' + (e && e.message)); }
+}
+// Procurement "On hand in" picker — which LGs get an On-hand column (and may be
+// suggested as a Move source). Empty = auto (LGs with stock or a shortage).
+// Persisted per user (procOhLgs).
+function initProcLgPicker() {
+    try {
+        _ohLgMs = FBLib.Common.MultiSelect.create({
+            containerId: 'ohLgMs', items: psLgList.map(l => ({ value: l.id, label: l.name })), selected: Array.from(psProcOhSel),
+            placeholder: 'LGs with stock', maxTags: 2,
+            onClose: () => { psProcOhSel.clear(); (_ohLgMs.getSelected() || []).forEach(v => psProcOhSel.add(String(v))); saveState(); if (psView === 'procure') renderProcure(); }
+        });
+    } catch (e) { debugLog('warn', 'On-hand LG picker init failed: ' + (e && e.message)); }
 }
 // Three search multi-selects (WO # · Raw Good part # · Finished Good part #) replace
 // the old free-text box. Options are (re)populated from the loaded WOs after each
@@ -3170,6 +3742,7 @@ function initSearchFilters() {
         } catch (e) { debugLog('warn', id + ' init failed: ' + (e && e.message)); return null; }
     };
     _woMs = mk('woMs', 'All WO #s', 'selWo');
+    _moMs = mk('moMs', 'All MO #s', 'selMo');
     _rawMs = mk('rawMs', 'All raw goods', 'selRaw');
     _fgMs = mk('fgMs', 'All finished goods', 'selFg');
 }
@@ -3177,10 +3750,12 @@ function initSearchFilters() {
 // raw-good part number, and finished-good part numbers), dropping any stale selection.
 function populateSearchFilters() {
     const woS = new Set();
+    const moS = new Set();
     const rawMap = new Map();   // raw-good partNum -> description
     const fgMap = new Map();    // finished-good partNum -> description
     allWorkOrders.forEach(w => {
         if (w.wo_num) woS.add(String(w.wo_num));
+        if (w.mo_num) moS.add(String(w.mo_num));
         if (w.part_num) { const n = String(w.part_num); if (!fgMap.get(n)) fgMap.set(n, w.description || ''); }
         ((w._av && w._av.parts) || []).forEach(p => { if (p.partNum) { const n = String(p.partNum); if (!rawMap.get(n)) rawMap.set(n, p.partDesc || ''); } });
     });
@@ -3206,12 +3781,21 @@ function populateSearchFilters() {
         if (ms) { try { ms.setItems(itemsArr); ms.setSelected(Array.from(flt[k])); } catch (_) {} }
     };
     sync('selWo', woS, _woMs, numItems(woS));
+    // MO dropdown: MO number, with the linked SO / customer as a searchable sub-line.
+    const moMeta = new Map();
+    manufacturingOrders.forEach(m => {
+        if (m.mo_num == null || moMeta.has(String(m.mo_num))) return;
+        const sub = [m.so_num ? 'SO ' + m.so_num : '', m.customer_name || ''].filter(Boolean).join(' · ');
+        moMeta.set(String(m.mo_num), sub || null);
+    });
+    sync('selMo', moS, _moMs, numItems(moS).map(it => ({ value: it.value, label: it.label, sub: moMeta.get(it.value) || null, tagLabel: it.label })));
     sync('selRaw', new Set(rawMap.keys()), _rawMs, partItems(rawMap));
     sync('selFg', new Set(fgMap.keys()), _fgMs, partItems(fgMap));
 }
 function init() {
     initSettings();
     initLgFilter();
+    initProcLgPicker();
     initSearchFilters();
     syncFilterChips();
     // Restore active tab.

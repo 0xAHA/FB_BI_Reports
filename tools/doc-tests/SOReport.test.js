@@ -46,9 +46,16 @@ test('options: payments, memos, custom fields, Number/Description + BOM rows, al
 });
 
 test('paper sizes from the Page_setup setting (name and CSS forms)', async () => {
+  // A company paper ("Use for everyone" in the paper bar) wins over Page_setup, so when the
+  // database the harness reads has one for this report, every case prints on it.
+  const co = await T.sql("SELECT up.userValue AS v FROM userproperties up " +
+    "WHERE up.userKey = 'cdx.bi.paperwork.so.master.v1' ORDER BY up.id DESC LIMIT 1");
+  const doc = co.length ? (JSON.parse(co[0].v || '{}').docPaper || null) : null;
+  const coSize = doc && { A4, Letter: LETTER }[doc.size];
+  const coPaper = coSize && (doc.orientation === 'landscape' ? [coSize[1], coSize[0]] : coSize);
   for (const [q, size] of [['Letter', LETTER], ['A4 landscape', [A4[1], A4[0]]], ['size: 8.5in 11in portrait; margin: 0.5in;', LETTER], ['Letter:landscape', [LETTER[1], LETTER[0]]]]) {
     const page = await T.open(PAGE, 'so=' + SO.kits + '&print=' + encodeURIComponent(q));
-    await T.check(page, 'paper-' + q.replace(/\W+/g, '_'), opts(size));
+    await T.check(page, 'paper-' + q.replace(/\W+/g, '_'), opts(coPaper || size));
     await page.close();
   }
 });

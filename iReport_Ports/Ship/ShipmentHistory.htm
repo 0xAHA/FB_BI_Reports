@@ -1,0 +1,987 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   Shipment History (iReport port)
+  PATH:   iReport_Ports/Ship/ShipmentHistory.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard Ship/ShipmentHistory.jrxml ("Prints a
+  list of all shipments made in the specified time period."). Same source,
+  same rules, same columns; only the presentation is interactive.
+
+    Source     ship, status Shipped (30), with its SO / PO / TO (by the
+               shipment's order type), carrier and order type. One row per
+               shipment.
+    Columns    Order type and Order Number (bold, a link into the order's
+               module), or the Shipment Number instead (ShowShipNumber, a
+               link into Shipping); Ship To (ship.shipToName); Issued (the
+               order's date issued); Shipped (ship.dateShipped); Days to
+               Fulfill; Carrier. Dates in the company's date format
+               (REPORT_DATE_FORMAT).
+    Filters    Issued (dateRange1IssueDate / dateRange2IssueDate, default
+               Today) and Shipped (dateRange1DateShipped / 2, default Today):
+               both end days count in full, as the original's
+               BETWEEN start AND end - 1 second on Fishbowl's end + 1 day.
+               "All dates" still needs a date (the original's "All" is a
+               BETWEEN too, so an order never issued is left out).
+               Carrier (carrier, UPPER LIKE; a shipment without a carrier
+               never shows). Include sales / purchase / transfer orders
+               (IncludeSalesOrders on, IncludePurchaseOrders and
+               IncludeTransferOrders off): the original fetches every type
+               and blanks (removes) the lines of the types left out; the port
+               leaves them out of the query, same rows printed. Shipments of
+               order type None / WO never print (no type to include).
+               Sort by (sort): Order Type, Order Num, Ship To, Order Date,
+               Date Shipped (default), Carrier, then shipment id. Report
+               title (ReportTitle).
+    Totals     None in the original. The App view's footer counts the
+               shipments and gives the average days to fulfil (an addition;
+               the PDF prints no totals).
+
+  Layout: the REPORT chrome (fb-styles §35). Table tools (fb-lib
+  FBLib.RptCols / RowCap): a heading sorts the rows on screen (again to
+  reverse, a third time for the Sort by order), drag to reorder, edge to
+  resize; at most 10,000 shipments with Load all. Pivot view (FBLib.Pivot):
+  shipment count or days to fulfil (average by default) by carrier, order
+  type, ship-to, month issued / shipped. App / PDF (fb-doc, FBDoc.Report): the
+  PDF prints as the original: Letter portrait, the company, the title and
+  the "Issued: … / Shipped: …" line on every page (its page header), 11pt
+  bold headings over a rule, 10pt rows, the order / shipment number bold in
+  the original's blue, "Page X of Y".
+
+  Deliberate differences (DIFFERENCES.md has them all):
+    - Days to Fulfill is the calendar days between the two dates. The
+      original counts year × 365 + day of year, one day short for every
+      29 February in between (S10049: issued 23 Dec 2024, shipped 7 Apr
+      2025: stock 104, port 105).
+    - The order type checkboxes filter in the query (the original fetches
+      every type and hides the lines): same rows, less fetched.
+    - Ties in the chosen sort fall back to the shipment id (the original
+      leaves them to the database).
+  Additions: the App footer (count, average days); Pivot; links; Excel;
+  Print; remembered filters and company defaults.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-folder" content="Ship">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="Every shipment shipped in a period: the order, ship-to, dates issued and shipped, days to fulfil and carrier.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipShipmentHistory',
+            name:  'Shipment History',
+            build: '2026.10.20-94c06d8'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shipment History — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 420px; overflow: hidden; text-overflow: ellipsis; vertical-align: top; }
+        .rpt-table th { cursor: default; }
+        .rpt-table th.ra, .rpt-table td.ra { text-align: right; }
+        .rpt-table th.ca, .rpt-table td.ca { text-align: center; }
+        .rpt-table td.b { font-weight: 700; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+        .rpt-fgroup select { width: 100%; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1>Shipment History</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <div class="rpt-viewsel" id="viewSelWrap" title="Table: the report as the standard one lays it out. Pivot: shipment count or days to fulfil by any two fields">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 5h18M3 10h10M3 15h18M3 20h10" stroke-linecap="round"/></svg>
+            <select id="viewSel">
+                <option value="table">Table</option>
+                <option value="pivot">Pivot</option>
+            </select>
+        </div>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Date issued</div>
+            <div>
+                <div class="rpt-flabel">Quick range</div>
+                <select id="iRange" class="rangeSel"></select>
+            </div>
+            <div class="rpt-dates">
+                <input type="date" id="iFrom" aria-label="Issued from">
+                <span class="rpt-fnote">→</span>
+                <input type="date" id="iTo" aria-label="Issued to">
+            </div>
+            <div class="rpt-fnote">The order's date issued;<br>both end days count in full.</div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Date shipped</div>
+            <div>
+                <div class="rpt-flabel">Quick range</div>
+                <select id="sRange" class="rangeSel"></select>
+            </div>
+            <div class="rpt-dates">
+                <input type="date" id="sFrom" aria-label="Shipped from">
+                <span class="rpt-fnote">→</span>
+                <input type="date" id="sTo" aria-label="Shipped to">
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Shipments</div>
+            <div>
+                <div class="rpt-flabel">Carrier</div>
+                <select id="fCarrier"><option value="">All carriers</option></select>
+            </div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fSo"> Include sales orders</label>
+            <label class="rpt-fcheck"><input type="checkbox" id="fPo"> Include purchase orders</label>
+            <label class="rpt-fcheck"><input type="checkbox" id="fTo"> Include transfer orders</label>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Layout</div>
+            <div>
+                <div class="rpt-flabel">Sort by</div>
+                <select id="fSort"></select>
+            </div>
+            <label class="rpt-fcheck"><input type="checkbox" id="fShipNum"> Show shipment number</label>
+            <div>
+                <div class="rpt-flabel">Report title</div>
+                <input type="text" id="fTitle" placeholder="Shipment History">
+            </div>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own sort">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters what everyone sees each time this report opens. Anyone can still change them while it is open.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+                <button type="button" class="ds-btn" id="unpublishBtn" title="Everyone goes back to their own last choices">Stop using them</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>Every shipment shipped (status Shipped) for the orders issued and shipped in the chosen periods: the order, who it went to, when the order was issued and when it shipped, how many days that took, and the carrier. It is the BI version of the standard <strong>Shipment History</strong> report and reads the same data the same way.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">The rows</div>
+                <ul>
+                    <li>One row per shipment. <strong>Days to Fulfill</strong> is the calendar days from the order's issue date to the ship date.</li>
+                    <li>Sales order shipments show by default; tick <strong>Include purchase orders</strong> / <strong>transfer orders</strong> for the others.</li>
+                    <li><strong>Show shipment number</strong> shows the shipment number instead of the order. Click a number to open the order or the shipment.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>Both periods start on <strong>Today</strong>, as in the standard report: pick a quick range or type the dates. Both end days count in full.</li>
+                    <li><strong>Sort by</strong> sets the report's order. Click a column heading to sort on screen (again to reverse, a third time for the report's order); drag a heading onto another to move the column; drag a heading's right edge to resize it.</li>
+                    <li>The <strong>Table / Pivot</strong> selector switches to a pivot: the number of shipments or the days to fulfil (average, lowest, highest…) by carrier, order type, ship-to or month issued / shipped.</li>
+                    <li>The <strong>App / PDF</strong> buttons in the header switch between this interactive view and the printable pages, laid out like the standard report. <strong>Print</strong> prints those pages.</li>
+                    <li>A very large result shows its first 10,000 shipments with a <strong>Load all</strong> button.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-app" id="appView">
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+</div>
+<div class="pivot-host" id="pivotHost" style="display:none"></div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.RowCap) missing.push('FBLib.RowCap');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const DEFAULT_TITLE = 'Shipment History';
+const STOCK_REPORT_PATH = '../reports/Ship/ShipmentHistory.jasper';
+// The original's sort choices (its `sort` parameter: a column or position).
+const SORTS = [
+    ['ordertype.name', 'Order Type', 'ordertype.name'], ['3', 'Order Num', 'ordernum'], ['4', 'Ship To', 'ship.shiptoname'],
+    ['5', 'Order Date', 'orderdate_raw'], ['ship.dateshipped', 'Date Shipped', 'ship.dateshipped'], ['carrier.name', 'Carrier', 'carrier.name']
+];
+const ORDER_MODULE = { SO: 'Sales Order', PO: 'Purchase Order', TO: 'Transfer Order' };
+const TYPE_IDS = { so: 20, po: 10, to: 40 };
+const RANGES = [
+    ['custom', 'Custom…'], ['all', 'All dates'], ['today', 'Today'], ['yesterday', 'Yesterday'], ['last7', 'Last 7 days'],
+    ['thisWeek', 'This week'], ['lastWeek', 'Last week'], ['thisMonth', 'This month'], ['lastMonth', 'Last month'],
+    ['thisQuarter', 'This quarter'], ['lastQuarter', 'Last quarter'], ['thisYear', 'This year'], ['lastYear', 'Last year']
+];
+const DEFAULT_FILTERS = { iRange: 'today', iFrom: '', iTo: '', sRange: 'today', sFrom: '', sTo: '', carrier: '',
+                          so: true, po: false, to: false, sort: 'ship.dateshipped', shipNum: false, title: '' };
+let BASE = Object.assign({}, DEFAULT_FILTERS);
+const REDRAW_KEYS = ['shipNum', 'title'];      // everything else re-queries
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        company: { keys: ['filters', 'opts'], editors: true },   // every open starts from the company defaults
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const int = v => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : 0; };
+const has = v => v !== null && v !== undefined && String(v) !== '';
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const dstr = v => { const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v ?? '')); return m ? m[1] : ''; };
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const isYmd = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+const v = id => document.getElementById(id);
+const bool = x => (typeof x === 'boolean' ? x : /^(true|1|yes)$/i.test(String(x ?? '').replace(/"/g, '').trim()));
+// The company's date format (REPORT_DATE_FORMAT), as the jrxml prints dates.
+const ENV = { date: 'MM/dd/yyyy' };
+function jdate(x) {
+    if (!dstr(x)) return '';
+    try { if (window.FBDoc && FBDoc.fmt) return FBDoc.fmt.date(ENV.date, String(x)); } catch (_) {}
+    return FBLib.Common.formatDate(dstr(x));
+}
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = v('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ---- Date ranges (Fishbowl's "Today", "This Month"…) ----
+// A quick range as [from, to] ISO dates, or null for "All dates".
+function presetDates(key) {
+    const t = new Date(); t.setHours(0, 0, 0, 0);
+    const y = t.getFullYear(), m = t.getMonth(), d = t.getDate(), qm = Math.floor(m / 3) * 3, wd = t.getDay();
+    const D = (yy, mm, dd) => new Date(yy, mm, dd);
+    const r = {
+        today: [t, t], yesterday: [D(y, m, d - 1), D(y, m, d - 1)], last7: [D(y, m, d - 6), t],
+        thisWeek: [D(y, m, d - wd), D(y, m, d - wd + 6)], lastWeek: [D(y, m, d - wd - 7), D(y, m, d - wd - 1)],
+        thisMonth: [D(y, m, 1), D(y, m + 1, 0)], lastMonth: [D(y, m - 1, 1), D(y, m, 0)],
+        thisQuarter: [D(y, qm, 1), D(y, qm + 3, 0)], lastQuarter: [D(y, qm - 3, 1), D(y, qm, 0)],
+        thisYear: [D(y, 0, 1), D(y, 11, 31)], lastYear: [D(y - 1, 0, 1), D(y - 1, 11, 31)]
+    }[key];
+    return r ? [ymd(r[0]), ymd(r[1])] : null;
+}
+// { start, endExcl, label } for a range, or null for "All dates".
+function dateRange(key, from, to) {
+    let a = from, b = to;
+    if (key !== 'custom') { const p = presetDates(key); if (!p) return null; [a, b] = p; }
+    if (!isYmd(a) && !isYmd(b)) return null;
+    a = isYmd(a) ? a : '1900-01-01'; b = isYmd(b) ? b : '2999-12-31';
+    if (a > b) [a, b] = [b, a];
+    const after = new Date(b + 'T00:00:00'); after.setDate(after.getDate() + 1);
+    return { start: a, endExcl: ymd(after), label: jdate(a) + ' - ' + jdate(b) };
+}
+const dateWhere = (col, r) => (r ? `${col} >= '${r.start} 00:00:00' AND ${col} < '${r.endExcl} 00:00:00'` : `${col} IS NOT NULL`);
+// A saved range name ("This Month", "Today"…) as a quick range key.
+function rangeKey(s) {
+    const t = String(s || '').replace(/["\s]/g, '').toLowerCase();
+    const hit = RANGES.find(r => r[0].toLowerCase() === t || r[1].replace(/\s/g, '').toLowerCase() === t);
+    return hit ? hit[0] : null;
+}
+
+// ============================================================================
+//  FILTERS
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _hydrating = false, _applyTimer = null;
+const S = { rows: [], company: '', loadedAt: null, noCap: false, view: 'table' };
+
+function readFilters() {
+    return {
+        iRange: v('iRange').value, iFrom: v('iFrom').value, iTo: v('iTo').value,
+        sRange: v('sRange').value, sFrom: v('sFrom').value, sTo: v('sTo').value,
+        carrier: v('fCarrier').value, so: v('fSo').checked, po: v('fPo').checked, to: v('fTo').checked,
+        sort: v('fSort').value, shipNum: v('fShipNum').checked, title: v('fTitle').value.trim()
+    };
+}
+function writeRange(p, key, from, to) {
+    v(p + 'Range').value = RANGES.some(r => r[0] === key) ? key : 'today';
+    const d = v(p + 'Range').value === 'custom' ? [from, to] : (presetDates(v(p + 'Range').value) || ['', '']);
+    v(p + 'From').value = d[0] || ''; v(p + 'To').value = d[1] || '';
+}
+function writeFilters(f) {
+    _hydrating = true;
+    writeRange('i', f.iRange, f.iFrom, f.iTo);
+    writeRange('s', f.sRange, f.sFrom, f.sTo);
+    v('fCarrier').value = f.carrier || '';
+    if (v('fCarrier').value !== (f.carrier || '')) {          // a carrier no longer listed
+        const o = document.createElement('option'); o.value = o.textContent = f.carrier; v('fCarrier').appendChild(o); v('fCarrier').value = f.carrier;
+    }
+    v('fSo').checked = !!f.so; v('fPo').checked = !!f.po; v('fTo').checked = !!f.to;
+    v('fSort').value = SORTS.some(s => s[0] === f.sort) ? f.sort : DEFAULT_FILTERS.sort;
+    v('fShipNum').checked = !!f.shipNum;
+    v('fTitle').value = f.title || '';
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, BASE, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const requery = Object.keys(next).some(k => REDRAW_KEYS.indexOf(k) < 0 && JSON.stringify(next[k]) !== JSON.stringify(F[k]));
+        F = next;
+        remember();
+        if (requery) { S.noCap = false; loadAll(); } else render(true);
+    }, 250);
+}
+const reportTitle = () => (F.title && F.title !== '%' ? F.title : DEFAULT_TITLE);
+// The original's parameter line: "Issued: a - b" / "Shipped: a - b" (or All).
+function rangeLines(f) {
+    const i = dateRange(f.iRange, f.iFrom, f.iTo), s = dateRange(f.sRange, f.sFrom, f.sTo);
+    return ['Issued: ' + (i ? i.label : 'All'), 'Shipped: ' + (s ? s.label : 'All')];
+}
+function filterText(f) {
+    const types = Object.keys(TYPE_IDS).filter(k => f[k]).map(k => k.toUpperCase());
+    return rangeLines(f).concat([f.carrier ? 'Carrier ' + f.carrier : '', types.length === 1 && types[0] === 'SO' ? '' : 'Orders: ' + (types.join(', ') || 'none')])
+        .filter(Boolean).join(' · ');
+}
+
+// ============================================================================
+//  SQL — the original's query: shipped shipments (status 30) with their
+//  order (by order type), carrier and order type, in the two periods; the
+//  order types to include and Days to Fulfill (calendar days) added.
+// ============================================================================
+function buildSQL(f) {
+    const types = Object.keys(TYPE_IDS).filter(k => f[k]).map(k => TYPE_IDS[k]);
+    if (!types.length) return '';
+    const issued = 'COALESCE(po.dateissued, so.dateissued, xo.dateissued)';
+    const sort = (SORTS.find(s => s[0] === f.sort) || SORTS[4])[2];
+    const w = ['ship.statusid = 30',
+        `UPPER(carrier.name) LIKE UPPER('${sqlStr(f.carrier || '%')}')`,
+        `ship.ordertypeid IN (${types.join(', ')})`,
+        dateWhere(issued, dateRange(f.iRange, f.iFrom, f.iTo)),
+        dateWhere('ship.dateshipped', dateRange(f.sRange, f.sFrom, f.sTo))];
+    return `
+        SELECT ordertype.name AS ordertype, COALESCE(so.num, po.num, xo.num, '') AS ordernum,
+               COALESCE(ship.shiptoname, '') AS shipto,
+               DATE_FORMAT(${issued}, '%Y-%m-%d %H:%i:%s') AS orderdate, ${issued} AS orderdate_raw,
+               DATE_FORMAT(ship.dateshipped, '%Y-%m-%d %H:%i:%s') AS dateshipped,
+               COALESCE(carrier.name, '') AS carrier, ship.id AS shipid, COALESCE(ship.num, '') AS shipnum,
+               DATEDIFF(ship.dateshipped, ${issued}) AS days
+        FROM ship
+        LEFT JOIN po ON (po.id = ship.poid AND ship.ordertypeid = 10)
+        LEFT JOIN so ON (so.id = ship.soid AND ship.ordertypeid = 20)
+        LEFT JOIN xo ON (xo.id = ship.xoid AND ship.ordertypeid = 40)
+        LEFT JOIN carrier ON carrier.id = ship.carrierid
+        LEFT JOIN ordertype ON ordertype.id = ship.ordertypeid
+        WHERE ${w.join('\n          AND ')}
+        ORDER BY ${sort}, ship.id`;
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+let _loadToken = 0;
+
+async function loadLookups() {
+    const res = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('Stock options', `SELECT rp.name AS name, rp.paramvalue AS value FROM reportparameter rp
+            JOIN report r ON r.id = rp.reportid WHERE r.path = '${sqlStr(STOCK_REPORT_PATH)}'`),
+        q('Date format', "SELECT sysvalue FROM sysproperties WHERE syskey = 'REPORT_DATE_FORMAT'"),
+        q('Carriers', 'SELECT name FROM carrier ORDER BY name')
+    ]);
+    const ok = i => res[i].status === 'fulfilled' ? res[i].value : [];
+    S.company = (ok(0)[0] || {}).name || '';
+    const df = (ok(2)[0] || {}).sysvalue;
+    if (has(df)) ENV.date = String(df);
+    ok(3).forEach(r => { const o = document.createElement('option'); o.value = o.textContent = String(r.name || ''); v('fCarrier').appendChild(o); });
+    // The stock report's saved options, as the starting point.
+    const applied = [];
+    ok(1).forEach(r => {
+        const val = r.value == null ? '' : String(r.value).trim();
+        const set = (k, x) => { BASE[k] = x; applied.push(r.name); };
+        switch (r.name) {
+            case 'dateRange1IssueDate': { const k = rangeKey(val); if (k) set('iRange', k); break; }
+            case 'dateRange1DateShipped': { const k = rangeKey(val); if (k) set('sRange', k); break; }
+            case 'carrier': set('carrier', val === '%' ? '' : val); break;
+            case 'IncludeSalesOrders': set('so', bool(val)); break;
+            case 'IncludePurchaseOrders': set('po', bool(val)); break;
+            case 'IncludeTransferOrders': set('to', bool(val)); break;
+            case 'ShowShipNumber': set('shipNum', bool(val)); break;
+            case 'sort': if (SORTS.some(s => s[0] === val)) set('sort', val); break;
+            case 'ReportTitle': set('title', val === '%' ? '' : val); break;
+        }
+    });
+    if (applied.length) debugLog('Stock options applied: ' + applied.join(', '));
+    const failed = res.filter(x => x.status === 'rejected').map(x => x.reason && x.reason.message);
+    if (failed.length) debugLog('Lookups failed: ' + failed.join('; '), 'warn');
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    const stale = () => tok !== _loadToken;
+    v('banner').textContent = '';
+    const sql = buildSQL(F);
+    if (!sql) {
+        FBLib.RowCap.notice({ before: v('appView'), capped: false });
+        S.rows = []; S.loadedAt = new Date();
+        render();
+        return;
+    }
+    v('loading').classList.add('show');
+    setStatus('Loading…');
+    const cap = S.noCap ? 0 : undefined;           // FBLib.RowCap: the first 10,000 shipments unless Load all
+    let rows;
+    try {
+        rows = await q('Shipments', FBLib.RowCap.sql(sql, cap));
+        if (stale()) return;
+    } catch (e) {
+        if (stale()) return;
+        v('loading').classList.remove('show');
+        v('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        FBLib.RowCap.notice({ before: v('appView'), capped: false });
+        S.rows = []; S.loadedAt = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    v('loading').classList.remove('show');
+    const capped = FBLib.RowCap.apply(rows, cap);
+    FBLib.RowCap.notice({ before: v('appView'), capped: capped.capped, limit: capped.limit, what: 'shipments',
+                          onLoadAll: () => { S.noCap = true; loadAll(); } });
+    S.rows = capped.rows.map(r => ({
+        type: String(r.ordertype || ''), order: String(r.ordernum ?? ''), shipto: String(r.shipto || ''),
+        issued: String(r.orderdate || ''), shipped: String(r.dateshipped || ''), carrier: String(r.carrier || ''),
+        shipId: int(r.shipid), shipNum: String(r.shipnum || ''), days: r.days == null ? null : int(r.days)
+    }));
+    S.loadedAt = new Date();
+    render();
+}
+
+function setStatus(t) { v('statusLine').textContent = t; }
+
+// ============================================================================
+//  MODEL + TABLE
+// ============================================================================
+// The original's columns: order type 18 + Order Number 91 (or Shipment
+// Number 109), Ship To 156, Issued 65, Shipped 65 (centred), Days to
+// Fulfill 60 (centred), Carrier 97 (right).
+function cols() {
+    const head = F.shipNum
+        ? [{ key: 'shipNum', label: 'Shipment Number', w: 130, b: true }]
+        : [{ key: 'type', label: 'Type', pdf: '', w: 50, b: true }, { key: 'order', label: 'Order Number', w: 120, b: true }];
+    const base = head.concat([
+        { key: 'shipto',  label: 'Ship To',         w: 220 },
+        { key: 'issued',  label: 'Issued',          w: 95, ca: true },
+        { key: 'shipped', label: 'Shipped',         w: 95, ca: true },
+        { key: 'days',    label: 'Days to Fulfill', pdf: 'Days to\nFulfill', w: 95, ca: true },
+        { key: 'carrier', label: 'Carrier',         w: 140, ra: true }
+    ]);
+    return COLS ? COLS.arrange(base) : base;
+}
+const cls = c => [c.ra ? 'ra' : c.ca ? 'ca' : '', c.b ? 'b' : ''].filter(Boolean).join(' ');
+const headRow = (cs, forPrint) => '<tr>' + cs.map(c => {
+    const label = forPrint && c.pdf !== undefined ? c.pdf : c.label;
+    return `<th data-col="${c.key}" class="${c.ra ? 'ra' : c.ca ? 'ca' : ''}" style="min-width:${c.w}px">${esc(label).replace(/\n/g, '<br>')}</th>`;
+}).join('') + '</tr>';
+const link = (module, number) => (number ? `<a class="fb-row-link sh-num" data-open="${esc(module)}" data-num="${esc(number)}">${esc(number)}</a>` : '');
+function lineRow(cs, r) {
+    const cell = {
+        type: esc(r.type), order: ORDER_MODULE[r.type] ? link(ORDER_MODULE[r.type], r.order) : esc(r.order),
+        shipNum: link('Shipping', r.shipNum), shipto: `<span title="${esc(r.shipto)}">${esc(r.shipto)}</span>`,
+        issued: esc(jdate(r.issued)), shipped: esc(jdate(r.shipped)), days: r.days == null ? '' : esc(String(r.days)), carrier: esc(r.carrier)
+    };
+    return '<tr>' + cs.map(c => `<td class="${cls(c)}">${cell[c.key] ?? ''}</td>`).join('') + '</tr>';
+}
+// Heading-click sort (FBLib.RptCols). With no heading sort, the Sort by order.
+const sortVal = (r, k) => ({ type: r.type, order: r.order, shipNum: r.shipNum, shipto: r.shipto.toLowerCase(), issued: r.issued,
+                             shipped: r.shipped, days: r.days, carrier: r.carrier.toLowerCase() })[k];
+const sorted = () => (COLS && COLS.sort() ? S.rows.slice().sort((a, b) => COLS.compare(a, b, sortVal)) : S.rows);
+const bodyRows = cs => sorted().map(r => lineRow(cs, r));
+function avgDays() {
+    const d = S.rows.filter(r => r.days != null);
+    return d.length ? d.reduce((s, r) => s + r.days, 0) / d.length : null;
+}
+function footRow(cs) {
+    const a = avgDays();
+    const i = cs.findIndex(c => c.key === 'days');
+    const label = 'Total — ' + plural(S.rows.length, 'shipment') + (a == null ? '' : ', average days to fulfil');
+    if (i < 1 || a == null) return `<tr><td colspan="${cs.length}">${esc(label)}</td></tr>`;
+    return `<tr><td colspan="${i}">${esc(label)}</td><td class="ca">${esc((Math.round(a * 10) / 10).toLocaleString())}</td>` +
+        (cs.length - i - 1 > 0 ? `<td colspan="${cs.length - i - 1}"></td>` : '') + '</tr>';
+}
+const emptyText = () => 'No shipments match these filters.';
+
+// Long reports paint in chunks as the user scrolls.
+const CHUNK = 600;
+let _paint = { html: [], shown: 0 };
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+function render(keepScroll) {
+    if (S.view === 'pivot' && PIVOT) {
+        PIVOT.render();
+        setStatus([S.company, 'pivot', S.loadedAt ? plural(S.rows.length, 'shipment') : '', filterText(F)].filter(Boolean).join(' · '));
+        if (PDF) PDF.refresh();
+        return;
+    }
+    const tbl = v('rpt');
+    const wrap = v('rptWrap');
+    const top = wrap.scrollTop;
+    const cs = cols();
+    tbl.querySelector('thead').innerHTML = headRow(cs);
+    _paint = { html: bodyRows(cs), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    while (keepScroll && _paint.shown < _paint.html.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+    tbl.querySelector('tfoot').innerHTML = S.rows.length ? footRow(cs) : '';
+    tbl.style.display = S.rows.length ? '' : 'none';
+    v('rptEmpty').textContent = S.rows.length || !S.loadedAt ? '' : emptyText();
+    wrap.scrollTop = keepScroll ? top : 0;
+    setStatus([S.company, S.loadedAt ? plural(S.rows.length, 'shipment') : '', filterText(F)].filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  PDF VIEW (fb-doc) — the pages as the standard report prints them: Letter
+//  portrait, the company, title and "Issued: … / Shipped: …" on every page
+//  (its page header), 11pt bold headings over a 1pt rule, 10pt rows, the
+//  order / shipment number bold in the original's blue (#000099).
+// ============================================================================
+let PDF = null;
+const PDF_CSS =
+    '.fbdoc-rpt-tbl th{font-size:11pt;font-weight:700;vertical-align:bottom;border-bottom:1pt solid #000}' +
+    '.fbdoc-rpt-tbl th.ra,.fbdoc-rpt-tbl td.ra{text-align:right}' +
+    '.fbdoc-rpt-tbl th.ca,.fbdoc-rpt-tbl td.ca{text-align:center}' +
+    '.fbdoc-rpt-tbl td.b{font-weight:700}' +
+    '.fbdoc-rpt-tbl a.sh-num{color:#000099;text-decoration:none;font-weight:700}';
+function docSpec() {
+    if (!S.loadedAt) return null;
+    if (S.view === 'pivot' && PIVOT) {
+        const p = PIVOT.pdfSpec();
+        return { company: S.company, title: reportTitle(), titleEveryPage: true, subtitle: rangeLines(F).concat([pivotText()]),
+                 head: p.head, rows: p.rows, foot: p.foot, empty: emptyText(), css: PDF_CSS, fontPt: 10 };
+    }
+    const cs = cols();
+    return {
+        company: S.company, title: reportTitle(), subtitle: rangeLines(F), titleEveryPage: true,
+        head: headRow(cs, true), rows: bodyRows(cs), foot: '',
+        empty: ' ', css: PDF_CSS, fontPt: 10
+    };
+}
+
+// ============================================================================
+//  PIVOT VIEW (FBLib.Pivot) — shipment count or days to fulfil by carrier,
+//  order type, ship-to, month issued / shipped.
+// ============================================================================
+let PIVOT = null, COLS = null;
+const PIVOT_FIELDS = [
+    { key: 'carrier', label: 'Carrier' }, { key: 'type', label: 'Order Type' }, { key: 'shipto', label: 'Ship To' },
+    { key: 'order', label: 'Order Number', dim: false }, { key: 'issued', label: 'Issued', type: 'date' },
+    { key: 'shipped', label: 'Shipped', type: 'date' }, { key: 'days', label: 'Days to Fulfill', type: 'number' }
+];
+const pivotRows = () => S.rows.map(r => ({ carrier: r.carrier, type: r.type, shipto: r.shipto, order: r.order,
+    issued: dstr(r.issued), shipped: dstr(r.shipped), days: r.days }));
+function pivotText() {
+    const c = PIVOT.config(), lbl = k => (PIVOT_FIELDS.find(x => x.key === k) || {}).label || '';
+    const m = c.measure === '__count__' ? 'Shipments'
+        : ({ sum: 'Total', count: 'Count of', avg: 'Average', min: 'Lowest', max: 'Highest' }[c.agg] + ' ' + lbl(c.measure));
+    return 'Pivot: ' + m + ' by ' + [lbl(c.rowDim), lbl(c.rowDim2)].filter(Boolean).join(' + ') + (c.colDim ? ' × ' + lbl(c.colDim) : '');
+}
+function setView(x, persist) {
+    S.view = x === 'pivot' && PIVOT ? 'pivot' : 'table';
+    v('viewSel').value = S.view;
+    v('rptWrap').style.display = S.view === 'pivot' ? 'none' : '';
+    v('pivotHost').style.display = S.view === 'pivot' ? '' : 'none';
+    if (persist) _saveUserKeys({ view: S.view });
+    render(false);
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    const sub = [S.company].concat(rangeLines(F)).filter(Boolean);
+    const sheet = {
+        name: 'Shipments', title: reportTitle(), subtitle: sub,
+        cols: [{ key: 'type', label: 'Order Type', w: 60, type: 'text' }, { key: 'order', label: 'Order Number', w: 100, type: 'text' },
+               { key: 'shipNum', label: 'Shipment Number', w: 100, type: 'text' }, { key: 'shipto', label: 'Ship To', w: 200, type: 'text' },
+               { key: 'issued', label: 'Issued', w: 90, type: 'date' }, { key: 'shipped', label: 'Shipped', w: 90, type: 'date' },
+               { key: 'days', label: 'Days to Fulfill', w: 80, type: 'int', noTotal: true }, { key: 'carrier', label: 'Carrier', w: 130, type: 'text' }],
+        rows: sorted().map(r => Object.assign({}, r, { issued: dstr(r.issued) || null, shipped: dstr(r.shipped) || null })),
+        totals: false
+    };
+    const sheets = [sheet];
+    if (S.view === 'pivot' && PIVOT) sheets.unshift(Object.assign(PIVOT.sheet('Pivot'), { title: reportTitle() + ' – ' + pivotText(), subtitle: sub }));
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'Shipment_History_' + ymd(new Date()), sheets });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// Print: the PDF view's pages (fb-doc). Without fb-doc on the server, the
+// plain printout below: JxBrowser won't print the report page itself, so it
+// is built in a new window and printed there.
+function printReport() {
+    if (PDF) {
+        if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+    const cs = cols();
+    const css = PDF_CSS.replace(/\.fbdoc-rpt-tbl /g, '');
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' + esc(reportTitle()) + '</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:9pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:12pt;font-weight:700}h2{text-align:center;font-size:15pt;margin:2px 0}.sub{text-align:center;font-size:9pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{text-align:left;padding:3px 5px}' +
+        'td{font-size:9pt;padding:2px 5px;vertical-align:top}' + css +
+        '@page{size:Letter portrait;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>' + esc(reportTitle()) + '</h2><p class="sub">' + rangeLines(F).map(esc).join('<br>') + '</p>' +
+        '<table><thead>' + headRow(cs, true).replace(/ style="[^"]*"/g, '') + '</thead><tbody>' + bodyRows(cs).join('') + '</tbody></table>' +
+        '<p style="font-size:7.5pt;margin-top:8px">Printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters what everyone sees each time this report opens?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        // The two periods: a quick range fills the dates; editing a date makes it Custom.
+        ['i', 's'].forEach(p => {
+            const sel = v(p + 'Range');
+            sel.innerHTML = RANGES.map(r => `<option value="${r[0]}">${esc(r[1])}</option>`).join('');
+            sel.onchange = () => {
+                if (sel.value !== 'custom') { const d = presetDates(sel.value); v(p + 'From').value = d ? d[0] : ''; v(p + 'To').value = d ? d[1] : ''; }
+                applySoon();
+            };
+            [p + 'From', p + 'To'].forEach(id => v(id).addEventListener('change', () => { sel.value = 'custom'; applySoon(); }));
+        });
+        v('fSort').innerHTML = SORTS.map(s => `<option value="${esc(s[0])}">${esc(s[1])}</option>`).join('');
+        ['fCarrier', 'fSo', 'fPo', 'fTo', 'fSort', 'fShipNum'].forEach(id => v(id).addEventListener('change', applySoon));
+        v('fTitle').addEventListener('change', applySoon);
+        v('fTitle').addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        v('resetFiltersBtn').onclick = () => { writeFilters(BASE); applySoon(); };
+
+        // Column resize / sort / reorder, and the Pivot view (fb-lib).
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({ table: v('rpt'), onSort: () => render(true), onReorder: () => render(true) });
+        if (FBLib.Pivot) PIVOT = FBLib.Pivot.mount(v('pivotHost'), {
+            fields: PIVOT_FIELDS, rows: pivotRows, countLabel: 'Shipments',
+            defaults: { rowDim: 'carrier', colDim: 'type', measure: 'days', agg: 'avg' },
+            format: (fld, x) => (fld && fld.key === 'days' ? (Math.round(x * 10) / 10).toLocaleString() : null)
+        });
+        else v('viewSelWrap').style.display = 'none';
+        v('viewSel').addEventListener('change', e => setView(e.target.value, true));
+        v('resetColsBtn').onclick = () => { if (COLS) { COLS.reset(); render(false); } };
+        S.view = _resolve('view', 'table') === 'pivot' && PIVOT ? 'pivot' : 'table';
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: v('appView'), toggleBefore: v('exportBtn'),
+                page: { size: 'Letter', orientation: 'portrait' },
+                doc: docSpec, title: () => reportTitle()
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        v('refreshBtn').onclick = () => loadAll();
+        v('exportBtn').onclick = exportWorkbook;
+        v('printBtn').onclick = printReport;
+        v('publishBtn').onclick = publishFilters;
+        v('unpublishBtn').onclick = () => {
+            if (!confirm('Stop using company defaults for this report? Everyone goes back to their own last choices.')) return;
+            const ok = FBLib.Settings.clearCompany(['filters', 'opts']) !== false;
+            showToast(ok ? 'This report no longer has company defaults.' : 'That was not saved.', ok ? 'success' : 'error');
+        };
+        v('adminGroup').classList.toggle('hidden', !isAdmin());
+        v('setRemember').checked = !!_resolve('remember', true);
+        v('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        v('setShowDebug').checked = !!_resolve('showDebug', false);
+        v('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        const wrap = v('rptWrap');
+        wrap.addEventListener('scroll', () => { if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 400) appendChunk(); });
+        v('rpt').addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (!a) return;
+            e.preventDefault();
+            try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+            catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+        });
+
+        await loadLookups();
+        writeFilters(savedFilters());
+        F = readFilters();
+        setView(S.view, false);
+        await loadAll();
+    } catch (e) {
+        console.error('[Shipment History] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

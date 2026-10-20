@@ -1,0 +1,1146 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   POS Hourly Breakdown (iReport port)
+  PATH:   iReport_Ports/SalesOrder/POSHourlyBreakdown.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard SalesOrder/POSHourlyBreakdown.jrxml. Same
+  source, same rules, same rows, percentages and chart; only the
+  presentation is interactive. No subreports (the chart's dataset is the
+  same query, averaged).
+
+    Source     Point of Sale orders (so.typeId = 20) by the hour they were
+               completed (so.dateCompleted): for every day with at least
+               one such order, one row per hour of the working day with the
+               number of orders completed in that hour (0 when none).
+    Hours      Begin / End of the working day (BeginWorkDay 7, EndWorkDay
+               19, clamped to 0-23 and 1-24): the rows run from Begin to End
+               and only orders completed in those hours (EXTRACT(HOUR) BETWEEN
+               Begin AND End, so 19 means up to 19:59) count. Begin after End
+               gives no rows, as the original.
+    Days       The weekday boxes (ck1Sunday … ck7Saturday, on WEEKDAY(so.
+               dateCompleted)): Monday to Friday by default, as the
+               original's defaults (Saturday and Sunday off).
+    Filters    Date range on so.dateCompleted ("This month" by default, both
+               ends whole days: BETWEEN the first day 00:00:00 and the last
+               day 23:59:59, the original's DATE_SUB(dateRange2, INTERVAL 1
+               SECOND)); location groups (the user's own; none = all of
+               them); customers, salespeople (customerID / salesPerson: one
+               or all in the original; here any number; "all salespeople"
+               leaves out an order with no salesperson, as the original's
+               LIKE '%' does); register (RegisterName, LIKE on
+               COALESCE(register.name, ''): All or one register).
+    Figures    Total # = the orders in the hour; % of Daily Sales = Total #
+               / the day's orders, "#,##0%" (Java's half-even rounding:
+               12.5% prints 12%); the day's "Total:" = its orders.
+    Chart      After the table, on a new page (the summary band's break): a
+               bar chart, "Average Sales Per Hour", one bar per hour of the
+               working day = the orders completed in that hour over the
+               range / the number of days with orders.
+    Title      Report title (ReportTitle; blank = "POS Hourly Breakdown"),
+               with the company and the date range on the first page only
+               (the original's title band); no page footer.
+    Presets    The stock report has no saved options (reportparameter is
+               empty for it on the local server); the jrxml defaults apply.
+
+  Layout: the REPORT chrome (fb-styles §35): header, push-down filter panel
+  that applies as you change it, a collapsible group per day (a collapsed
+  day shows its heading and its Total), the chart under the table.
+  Table tools (fb-lib FBLib.RptCols / RowCap / Pivot): column headings sort
+  the hours within each day (third click: by hour); Hour, Total # and % can
+  be dragged to reorder; every edge resizes (remembered per user). The
+  query returns one row per day and hour with sales (the hour grid is
+  filled in on the page), at most 10,000, cut at a whole day, with Load
+  all. A Table / Pivot view selector: orders by any two of weekday, hour,
+  day (or week, month…); Hour x Weekday is the default (the busy hours of
+  each day of the week).
+  Views: the header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+  report out as pages like the original: Letter portrait, company / title /
+  date range on the first page, the column headings repeated, each day's
+  heading carried over a page break as "(continued)", the day's Total
+  under its hours, then the chart on a page of its own. Print prints those
+  pages.
+
+  Deliberate differences (iReport_Ports/DIFFERENCES.md):
+    - The query returns the orders per day and hour (a GROUP BY) and the
+      page fills in the hours without orders, instead of the stored
+      procedure CREATELIST and its temporary hours table (a BI query must
+      be one SELECT). Same rows and figures.
+    - The chart averages the same orders as the table: the original's chart
+      query counts orders up to the end date's following midnight
+      (BETWEEN dateRange1 AND dateRange2, no DATE_SUB), so an order
+      completed at exactly 00:00:00 the day after the range would count in
+      the chart's hour 0 but nowhere else. Hour 0 is in the chart only
+      when Begin is 0.
+    - The chart is a flat SVG bar chart with the average above each bar
+      (the original is a JFreeChart bar chart with a legend).
+    - Customers, salespeople and location groups take any number of
+      choices (none = all).
+  Additions: an App-only total of the orders on the days shown; the chart
+  figures on hover; the Pivot view; Excel; Print.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-folder" content="Sales Order">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="Point of Sale orders by the hour they were completed, day by day, with the average sales per hour.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipPOSHourly',
+            name:  'POS Hourly Breakdown',
+            build: '2026.10.20-7642d6c'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>POS Hourly Breakdown — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 420px; overflow: hidden; text-overflow: ellipsis; vertical-align: top; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table th.ctr-cell, .rpt-table td.ctr-cell { text-align: center; }
+        .rpt-table th { cursor: default; }
+        tr.ph-tot td { font-weight: 700; }
+        td.ph-lbl { text-align: right; }
+        .ph-zero { color: var(--c-tertiary); }
+        .rpt-fchecks { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; }
+        .ph-hours { display: flex; gap: 8px; align-items: center; }
+        .ph-hours select { width: auto; }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+        .so-charts { display: flex; flex-wrap: wrap; gap: 18px 28px; padding: 18px 20px 28px; }
+        .so-charts:empty { display: none; }
+        .so-chart-box { flex: 1 1 460px; max-width: 760px; background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+        .so-chart-box svg { display: block; width: 100%; height: auto; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1 id="pageTitle">POS Hourly Breakdown</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <div class="rpt-viewsel" id="viewSelWrap" title="Table: the report as the standard one lays it out. Pivot: orders by any two of weekday, hour and day">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 5h18M3 10h10M3 15h18M3 20h10" stroke-linecap="round"/></svg>
+            <select id="viewSel">
+                <option value="table">Table</option>
+                <option value="pivot">Pivot</option>
+            </select>
+        </div>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="split-btn">
+            <button id="expandBtn" class="hdr-btn" type="button" title="Show every day's hours">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+                Expand
+            </button>
+            <button id="collapseBtn" class="hdr-btn" type="button" title="Day totals only">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 12h14" stroke-linecap="round"/></svg>
+                Collapse
+            </button>
+        </span>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages: collapsed days print as their heading and total">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Date completed</div>
+            <div>
+                <div class="rpt-flabel">Quick range</div>
+                <select id="fRange"></select>
+            </div>
+            <div class="rpt-dates">
+                <input type="date" id="fFrom" aria-label="From">
+                <span class="rpt-fnote">→</span>
+                <input type="date" id="fTo" aria-label="To">
+            </div>
+            <div class="rpt-flabel" style="margin-top:4px">Days of the week</div>
+            <div class="rpt-fchecks" id="fDays"></div>
+            <div class="rpt-flabel" style="margin-top:4px">Working day (hours)</div>
+            <div class="ph-hours">
+                <select id="fBegin" aria-label="Begin hour"></select>
+                <span class="rpt-fnote">to</span>
+                <select id="fEnd" aria-label="End hour"></select>
+            </div>
+            <div class="rpt-fnote">The end hour is included (19 = up to 19:59).</div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Which orders</div>
+            <div>
+                <div class="rpt-flabel">Location groups</div>
+                <div class="ms-container" id="lgMs">
+                    <div class="ms-trigger" id="lgMs-trigger"><span class="ms-placeholder" id="lgMs-placeholder">All my location groups</span></div>
+                    <div class="ms-dropdown hidden" id="lgMs-dropdown">
+                        <div class="ms-search"><input type="text" id="lgMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="lgMs-all">Select All</span><span id="lgMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="lgMs-list"></div>
+                    </div>
+                </div>
+            </div>
+            <div>
+                <div class="rpt-flabel">Customers</div>
+                <div class="ms-container" id="custMs">
+                    <div class="ms-trigger" id="custMs-trigger"><span class="ms-placeholder" id="custMs-placeholder">All customers</span></div>
+                    <div class="ms-dropdown hidden" id="custMs-dropdown">
+                        <div class="ms-search"><input type="text" id="custMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="custMs-all">Select All</span><span id="custMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="custMs-list"></div>
+                    </div>
+                </div>
+            </div>
+            <div>
+                <div class="rpt-flabel">Salespeople</div>
+                <div class="ms-container" id="repMs">
+                    <div class="ms-trigger" id="repMs-trigger"><span class="ms-placeholder" id="repMs-placeholder">All salespeople</span></div>
+                    <div class="ms-dropdown hidden" id="repMs-dropdown">
+                        <div class="ms-search"><input type="text" id="repMs-search" placeholder="Search…"></div>
+                        <div class="ms-actions"><span id="repMs-all">Select All</span><span id="repMs-clear">Clear All</span></div>
+                        <div class="ms-list" id="repMs-list"></div>
+                    </div>
+                </div>
+            </div>
+            <div>
+                <div class="rpt-flabel">Register</div>
+                <select id="fRegister"><option value="">All registers</option></select>
+            </div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Layout</div>
+            <div>
+                <div class="rpt-flabel">Report title</div>
+                <input type="text" id="fTitle" placeholder="POS Hourly Breakdown">
+            </div>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own sort">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters what everyone sees each time this report opens. Anyone can still change them while it is open.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+                <button type="button" class="ds-btn" id="unpublishBtn" title="Everyone goes back to their own last choices">Stop using them</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p>How many <strong>Point of Sale</strong> orders were completed in each hour of the working day, day by day, with each hour's share of the day's orders, and a chart of the <strong>average sales per hour</strong> over the range. It is the BI version of the standard <strong>POS Hourly Breakdown</strong> report and counts the same orders the same way.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">The figures</div>
+                <ul>
+                    <li>An order counts in the hour it was <strong>completed</strong>. Only Point of Sale orders count.</li>
+                    <li>Only the ticked <strong>days of the week</strong> (Monday to Friday by default) and the hours of the <strong>working day</strong> (7 to 19 by default, 19 meaning up to 19:59) count; a day with no orders in them is left out.</li>
+                    <li><strong>% of Daily Sales</strong> is the hour's orders over the day's, rounded to a whole percent.</li>
+                    <li>The chart's <strong>average</strong> for an hour is its orders over the range divided by the number of days listed.</li>
+                    <li>"All salespeople" leaves out orders with no salesperson, as the standard report does.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>Filter changes apply straight away.</li>
+                    <li>Click a day's row to show or hide its hours; <strong>Expand</strong> / <strong>Collapse</strong> do every day.</li>
+                    <li>Click a column heading to sort the hours within each day (a third click for the hour order); drag a heading to move the column, its right edge to resize it.</li>
+                    <li>The <strong>Table / Pivot</strong> selector switches to a pivot: orders by any two of weekday, hour and day (or week, month…). Hour × Weekday shows the busy hours of each day of the week.</li>
+                    <li>The <strong>App / PDF</strong> buttons switch between this view and printable pages laid out like the standard report: the days, then the chart on its own page. <strong>Print</strong> prints those pages.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-app" id="appView">
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+    <div class="so-charts" id="charts"></div>
+</div>
+<div class="pivot-host" id="pivotHost" style="display:none"></div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Common || !FBLib.Common.MultiSelect) missing.push('FBLib.Common.MultiSelect');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+        if (!FBLib.RowCap) missing.push('FBLib.RowCap');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const STOCK_TITLE = 'POS Hourly Breakdown';
+const CHART_SERIES = 'Average Sales Per Hour';
+// The original's weekday boxes, in its order (ck1Sunday … ck7Saturday), with
+// MySQL's WEEKDAY() value (Monday 0 … Sunday 6) and the default.
+const WEEKDAYS = [['Sunday', 6, false], ['Monday', 0, true], ['Tuesday', 1, true], ['Wednesday', 2, true],
+                  ['Thursday', 3, true], ['Friday', 4, true], ['Saturday', 5, false]];
+const WD_NAME = Object.fromEntries(WEEKDAYS.map(w => [w[1], w[0]]));
+const DEFAULT_FILTERS = { range: 'thisMonth', from: '', to: '', days: WEEKDAYS.filter(w => w[2]).map(w => w[1]),
+                          begin: 7, end: 19, lgs: [], custs: [], reps: [], register: '', title: '' };
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        company: { keys: ['filters', 'opts'], editors: true },   // every open starts from the company defaults
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const ints = a => (Array.isArray(a) ? a : []).map(Number).filter(n => Number.isInteger(n));
+const sqlStr = s => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''");
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const isYmd = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, Math.trunc(Number(v) || 0)));
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+const DAYNAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const dayDate = s => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s || ''); return m ? new Date(+m[1], +m[2] - 1, +m[3]) : null; };
+// The group heading: the original's "EEEEE, dd MMMMM yyyy" (Thursday, 07 August 2025).
+const longDay = s => { const d = dayDate(s); return d ? DAYNAMES[d.getDay()] + ', ' + String(d.getDate()).padStart(2, '0') + ' ' + MONTHS[d.getMonth()] + ' ' + d.getFullYear() : s; };
+const weekdayOf = s => { const d = dayDate(s); return d ? DAYNAMES[d.getDay()] : ''; };
+// "#,##0%": Java DecimalFormat rounds half-even (12.5% -> 12%, 37.5% -> 38%).
+function pctText(n, d) {
+    if (!d) return '';
+    const x = n * 100 / d, f = Math.floor(x), r = x - f;
+    const v = Math.abs(r - 0.5) < 1e-9 ? (f % 2 === 0 ? f : f + 1) : Math.round(x);
+    return v.toLocaleString() + '%';
+}
+const fmtAvg = v => num(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// ---- Date ranges (Fishbowl's "This Month" etc.) ----
+const RANGES = [
+    ['custom', 'Custom…'], ['all', 'All dates'], ['today', 'Today'], ['yesterday', 'Yesterday'], ['last7', 'Last 7 days'],
+    ['thisMonth', 'This month'], ['lastMonth', 'Last month'], ['thisQuarter', 'This quarter'], ['lastQuarter', 'Last quarter'],
+    ['thisYear', 'This year'], ['lastYear', 'Last year']
+];
+// A quick range as [from, to] ISO dates, or null for "All dates".
+function presetDates(key) {
+    const t = new Date(); t.setHours(0, 0, 0, 0);
+    const y = t.getFullYear(), m = t.getMonth(), d = t.getDate(), qm = Math.floor(m / 3) * 3;
+    const D = (yy, mm, dd) => new Date(yy, mm, dd);
+    const r = {
+        today: [t, t], yesterday: [D(y, m, d - 1), D(y, m, d - 1)], last7: [D(y, m, d - 6), t],
+        thisMonth: [D(y, m, 1), D(y, m + 1, 0)], lastMonth: [D(y, m - 1, 1), D(y, m, 0)],
+        thisQuarter: [D(y, qm, 1), D(y, qm + 3, 0)], lastQuarter: [D(y, qm - 3, 1), D(y, qm, 0)],
+        thisYear: [D(y, 0, 1), D(y, 11, 31)], lastYear: [D(y - 1, 0, 1), D(y - 1, 11, 31)]
+    }[key];
+    return r ? [ymd(r[0]), ymd(r[1])] : null;
+}
+// { start, end, label } for the filter (whole days), or null for no date limit.
+function dateRange(f) {
+    let a = f.from, b = f.to;
+    if (f.range !== 'custom') { const p = presetDates(f.range); if (!p) return null; [a, b] = p; }
+    if (!isYmd(a) && !isYmd(b)) return null;
+    a = isYmd(a) ? a : '1900-01-01'; b = isYmd(b) ? b : '2999-12-31';
+    if (a > b) [a, b] = [b, a];
+    return { start: a, end: b, label: FBLib.Common.formatDate(a) + ' - ' + FBLib.Common.formatDate(b) };
+}
+function rangeText(f) { const r = dateRange(f); return 'Date Range: ' + (r ? r.label : 'All'); }
+// The working day as the original clamps it: Begin 0-23, End 1-24.
+const beginHour = f => clamp(f.begin, 0, 23);
+const endHour = f => clamp(f.end, 1, 24);
+function hourList(f) { const out = []; for (let h = beginHour(f); h <= endHour(f); h++) out.push(h); return out; }
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  CHART — the original's bar chart as SVG (App and PDF views): one bar per
+//  hour of the working day, the average above each bar, a recessive grid,
+//  the series name as the legend under the axis. Hover a bar for its
+//  figures (an SVG <title>).
+// ============================================================================
+const SERIES = ['#2a78d6'];
+const svgText = s => esc(s).replace(/\s+/g, ' ');
+// Axis ticks: about four "nice" steps from 0 to the top.
+function niceTicks(lo, hi) {
+    if (hi === lo) hi = lo + 1;
+    const raw = (hi - lo) / 4, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw) || raw;
+    const out = [];
+    for (let v = Math.floor(lo / step) * step; v <= hi + step * 1e-9; v += step) out.push(Math.round(v / step * 1e6) / 1e6 * step);
+    if (out[out.length - 1] < hi) out.push(out[out.length - 1] + step);
+    return out;
+}
+// items: [{ label, value, tip }]; o: { legend, fmt, W, H }
+function barChartSvg(items, o) {
+    const W = o.W || 552, H = o.H || 265, n = items.length;
+    if (!n) return '';
+    const vals = items.map(i => i.value);
+    const ticks = niceTicks(0, Math.max(0, ...vals));
+    const lo = ticks[0], hi = ticks[ticks.length - 1];
+    const padL = 44, padR = 8, padT = 12, padB = 46;
+    const pw = W - padL - padR, ph = H - padT - padB;
+    const y = v => padT + ph - (v - lo) / (hi - lo) * ph;
+    const band = pw / n, bw = Math.max(4, Math.min(40, band * 0.62));
+    const out = [`<svg class="so-chart" viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="${esc(o.legend)}" xmlns="http://www.w3.org/2000/svg" style="font-family:inherit">`];
+    ticks.forEach(t => {
+        out.push(`<line x1="${padL}" x2="${W - padR}" y1="${y(t).toFixed(1)}" y2="${y(t).toFixed(1)}" stroke="${t === 0 ? '#8a9499' : '#e3e6e8'}" stroke-width="${t === 0 ? 1 : 0.6}"/>`);
+        out.push(`<text x="${padL - 4}" y="${(y(t) + 3).toFixed(1)}" text-anchor="end" font-size="8" fill="#52514e">${svgText(o.fmt(t))}</text>`);
+    });
+    items.forEach((it, i) => {
+        const cx = padL + band * i + band / 2, y0 = y(0), y1 = y(it.value);
+        const h = Math.max(y0 - y1, it.value ? 1 : 0);
+        out.push(`<g><title>${svgText(it.tip || (it.label + ': ' + o.fmt(it.value)))}</title>` +
+            `<rect x="${(cx - bw / 2).toFixed(1)}" y="${(y0 - h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="2" fill="${SERIES[0]}"/>` +
+            `<rect x="${(padL + band * i).toFixed(1)}" y="${padT}" width="${band.toFixed(1)}" height="${ph}" fill="transparent"/></g>`);
+        if (it.value) out.push(`<text x="${cx.toFixed(1)}" y="${(y1 - 3).toFixed(1)}" text-anchor="middle" font-size="${n > 16 ? 6.5 : 7.5}" fill="#111">${svgText(o.fmt(it.value))}</text>`);
+        out.push(`<text x="${cx.toFixed(1)}" y="${padT + ph + 12}" text-anchor="middle" font-size="8" fill="#333">${svgText(it.label)}</text>`);
+    });
+    // Legend (the series) under the hour labels, centred.
+    const lw = 12 + o.legend.length * 4.6, lx = (W - lw) / 2, ly = H - 12;
+    out.push(`<rect x="${lx.toFixed(1)}" y="${ly - 7}" width="9" height="9" rx="2" fill="${SERIES[0]}"/>` +
+        `<text x="${(lx + 13).toFixed(1)}" y="${ly + 1}" font-size="8.5" fill="#111">${svgText(o.legend)}</text>`);
+    out.push('</svg>');
+    return out.join('');
+}
+
+// ============================================================================
+//  FILTERS — the panel applies as it changes (one short debounce). The title
+//  only redraws; the rest re-query.
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _lgMs = null, _custMs = null, _repMs = null;
+let _hydrating = false, _applyTimer = null;
+const S = { counts: [], days: [], company: '', myLgs: [], lgNames: {}, custNames: {}, registers: [],
+            loadedAt: null, collapsed: new Set(), view: 'table', noCap: false, capped: false };
+const QUERY_KEYS = ['range', 'from', 'to', 'days', 'begin', 'end', 'lgs', 'custs', 'reps', 'register'];
+const reportTitle = () => (F.title && F.title !== '%' ? F.title : STOCK_TITLE);
+
+function readFilters() {
+    return {
+        range: document.getElementById('fRange').value,
+        from: document.getElementById('fFrom').value,
+        to: document.getElementById('fTo').value,
+        days: WEEKDAYS.map(w => w[1]).filter(v => document.getElementById('fDay' + v).checked),
+        begin: Number(document.getElementById('fBegin').value),
+        end: Number(document.getElementById('fEnd').value),
+        lgs: ints(_lgMs.getSelected()), custs: ints(_custMs.getSelected()), reps: _repMs.getSelected().map(String),
+        register: document.getElementById('fRegister').value,
+        title: document.getElementById('fTitle').value.trim()
+    };
+}
+function writeFilters(f) {
+    _hydrating = true;
+    document.getElementById('fRange').value = RANGES.some(r => r[0] === f.range) ? f.range : DEFAULT_FILTERS.range;
+    const p = f.range === 'custom' ? [f.from, f.to] : (presetDates(f.range) || ['', '']);
+    document.getElementById('fFrom').value = p[0] || '';
+    document.getElementById('fTo').value = p[1] || '';
+    const days = Array.isArray(f.days) ? ints(f.days) : DEFAULT_FILTERS.days;
+    WEEKDAYS.forEach(w => { document.getElementById('fDay' + w[1]).checked = days.indexOf(w[1]) !== -1; });
+    document.getElementById('fBegin').value = String(clamp(f.begin ?? 7, 0, 23));
+    document.getElementById('fEnd').value = String(clamp(f.end ?? 19, 1, 24));
+    _lgMs.setSelected(ints(f.lgs)); _custMs.setSelected(ints(f.custs)); _repMs.setSelected((f.reps || []).map(String));
+    const reg = document.getElementById('fRegister');
+    reg.value = f.register || ''; if (reg.value !== (f.register || '')) reg.value = '';
+    document.getElementById('fTitle').value = f.title || '';
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(() => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const requery = QUERY_KEYS.some(k => JSON.stringify(next[k]) !== JSON.stringify(F[k]));
+        F = next;
+        remember();
+        if (requery) { S.noCap = false; loadAll(); } else render(false);
+    }, 250);
+}
+
+// ============================================================================
+//  SQL — the iReport query's conditions as written, the orders counted per
+//  day and hour (the hours without orders are filled in on the page, where
+//  the original joins its CREATELIST hours table). The LIKE parameters as
+//  pick lists ('%' = no condition, keeping the original's NULL behaviour);
+//  the weekday and hour parameters from fixed lists.
+// ============================================================================
+function buildSQL(f) {
+    const lgs = (f.lgs.length ? f.lgs : S.myLgs).filter(id => S.myLgs.indexOf(id) !== -1);
+    const days = ints(f.days).filter(d => d >= 0 && d <= 6);
+    const r = dateRange(f);
+    const w = [r ? `so.datecompleted BETWEEN '${r.start} 00:00:00' AND '${r.end} 23:59:59'` : 'so.datecompleted IS NOT NULL',
+               'so.typeid = 20',
+               // UPPER(so.salesman) LIKE UPPER('%') leaves out an order with no salesperson.
+               f.reps.length ? 'so.salesman IN (' + f.reps.map(s => `'${sqlStr(s)}'`).join(', ') + ')' : 'so.salesman IS NOT NULL',
+               'so.locationgroupid IN (' + (lgs.join(', ') || '0') + ')',
+               'WEEKDAY(so.datecompleted) IN (' + (days.join(', ') || '100') + ')',
+               `EXTRACT(HOUR FROM so.datecompleted) BETWEEN ${beginHour(f)} AND ${endHour(f)}`];
+    if (f.custs.length) w.push('so.customerid IN (' + f.custs.join(', ') + ')');
+    if (f.register) w.push(`UPPER(COALESCE(register.name, '')) = UPPER('${sqlStr(f.register)}')`);
+    return `
+        SELECT DATE_FORMAT(so.datecompleted, '%Y-%m-%d') AS saleday, EXTRACT(HOUR FROM so.datecompleted) AS salehour,
+               COUNT(so.id) AS ordercount
+        FROM so
+        LEFT JOIN register ON so.registerid = register.id
+        WHERE ${w.join('\n          AND ')}
+        GROUP BY 1, 2
+        ORDER BY 1, 2`;
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+let _loadToken = 0;
+
+async function loadLookups() {
+    let myLgs = [];
+    try { myLgs = ints(typeof getLocationGroupList === 'function' ? getLocationGroupList() : []); } catch (_) {}
+    S.myLgs = myLgs;
+    const lgIn = myLgs.join(',') || '0';
+    const res = await Promise.allSettled([
+        q('Company', 'SELECT name FROM company WHERE id = 1'),
+        q('Location groups', `SELECT id, name, activeflag+0 AS active FROM locationgroup WHERE id IN (${lgIn}) ORDER BY name`),
+        q('Customers', 'SELECT c.id, c.name FROM customer c JOIN (SELECT DISTINCT customerid FROM so WHERE typeid = 20) d ON d.customerid = c.id ORDER BY c.name'),
+        q('Salespeople', "SELECT DISTINCT salesman FROM so WHERE typeid = 20 AND salesman <> '' ORDER BY salesman"),
+        q('Registers', 'SELECT name FROM register ORDER BY name')
+    ]);
+    const ok = i => res[i].status === 'fulfilled' ? res[i].value : [];
+    S.company = (ok(0)[0] || {}).name || '';
+    ok(1).forEach(r => { S.lgNames[Number(r.id)] = r.name; });
+    _lgMs.setItems(ok(1).map(r => ({ value: Number(r.id), label: r.name + (Number(r.active) === 1 ? '' : ' (inactive)') })));
+    ok(2).forEach(r => { S.custNames[Number(r.id)] = r.name; });
+    _custMs.setItems(ok(2).map(r => ({ value: Number(r.id), label: r.name })));
+    _repMs.setItems(ok(3).map(r => ({ value: String(r.salesman), label: String(r.salesman) })));
+    S.registers = ok(4).map(r => String(r.name));
+    document.getElementById('fRegister').innerHTML = '<option value="">All registers</option>' +
+        S.registers.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+    const failed = res.filter(x => x.status === 'rejected').map(x => x.reason && x.reason.message);
+    if (failed.length) document.getElementById('banner').textContent = 'Some filter lists failed to load: ' + failed.join('; ');
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    document.getElementById('banner').textContent = '';
+    document.getElementById('loading').classList.add('show');
+    setStatus('Loading…');
+    let rows;
+    const cap = S.noCap ? 0 : undefined;           // FBLib.RowCap: the first 10,000 rows unless Load all
+    try { rows = await q('Orders per hour', FBLib.RowCap.sql(buildSQL(F), cap)); }
+    catch (e) {
+        if (tok !== _loadToken) return;
+        document.getElementById('loading').classList.remove('show');
+        document.getElementById('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        FBLib.RowCap.notice({ before: document.getElementById('appView'), capped: false });
+        S.counts = []; S.days = []; S.loadedAt = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    if (tok !== _loadToken) return;
+    document.getElementById('loading').classList.remove('show');
+    // Cut at a whole day, so every day shown has all its hours and its total.
+    const capped = FBLib.RowCap.apply(rows, cap, { keyOf: r => String(r.saleday || '') });
+    S.capped = capped.capped;
+    FBLib.RowCap.notice({ before: document.getElementById('appView'), capped: capped.capped, limit: capped.limit, what: 'day-hours',
+                          onLoadAll: () => { S.noCap = true; loadAll(); } });
+    S.counts = capped.rows.map(r => ({ day: String(r.saleday || ''), hour: Math.trunc(num(r.salehour)), n: Math.round(num(r.ordercount)) }));
+    buildModel();
+    S.collapsed = new Set();
+    S.loadedAt = new Date();
+    render();
+}
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+
+// ============================================================================
+//  MODEL — the original's rows: every day with orders (in date order), and
+//  for each, every hour of the working day with its orders (0 when none);
+//  totalSalesPerDay = the day's orders. The chart: each hour's orders over
+//  the range / the number of days (the original's ChartDataset).
+// ============================================================================
+function buildModel() {
+    const hours = hourList(F), byDay = new Map();
+    S.counts.forEach(c => {
+        let d = byDay.get(c.day);
+        if (!d) { d = { day: c.day, by: {}, total: 0 }; byDay.set(c.day, d); }
+        d.by[c.hour] = (d.by[c.hour] || 0) + c.n;
+        d.total += c.n;
+    });
+    S.days = Array.from(byDay.values()).sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0)).map(d => ({
+        day: d.day, total: d.total, weekday: weekdayOf(d.day),
+        hours: hours.map(h => ({ day: d.day, hour: h, n: d.by[h] || 0, total: d.total }))
+    }));
+}
+function chartItems() {
+    const n = S.days.length;
+    if (!n) return [];
+    return hourList(F).map(h => {
+        const sum = S.days.reduce((s, d) => s + ((d.hours.find(x => x.hour === h) || {}).n || 0), 0);
+        return { label: String(h), value: sum / n, tip: `Hour ${h}: ${fmtAvg(sum / n)} average (${plural(sum, 'order')} over ${plural(n, 'day')})` };
+    });
+}
+const totalOrders = () => S.days.reduce((s, d) => s + d.total, 0);
+
+// ============================================================================
+//  TABLE — the original's columns: Date (the day heading), Hour, Total #,
+//  % of Daily Sales; the day's "Total:" under its hours.
+// ============================================================================
+let PDF = null, PIVOT = null, COLS = null;
+function cols() {
+    const fixed = [{ key: 'date', label: 'Date', w: 200 }];
+    const rest = [
+        { key: 'hour', label: 'Hour', w: 80, ctr: true },
+        { key: 'n', label: 'Total #', w: 90, ctr: true },
+        { key: 'pct', label: '% of Daily Sales', w: 120, num: true }
+    ];
+    return fixed.concat(COLS ? COLS.arrange(rest) : rest);
+}
+const cellCls = c => (c.num ? 'num-cell' : c.ctr ? 'ctr-cell' : '');
+const headRow = cs => '<tr>' + cs.map(c =>
+    `<th data-col="${c.key}" class="${cellCls(c)}" style="min-width:${c.w}px">${esc(c.label)}</th>`).join('') + '</tr>';
+const SORTABLE = k => k !== 'date';
+const sortVal = (r, k) => ({ hour: r.hour, n: r.n, pct: r.total ? r.n / r.total : 0 })[k];
+const sortHours = list => (COLS && COLS.sort() ? list.slice().sort((a, b) => COLS.compare(a, b, sortVal)) : list);
+function groupRow(cs, d, forPrint) {
+    const open = !S.collapsed.has(d.day);
+    const id = '<div class="rpt-grp-inner">' + (forPrint ? '' : `<span class="rpt-toggle">${open ? '▼' : '▶'}</span>`) +
+        `<span>${esc(longDay(d.day))}</span>` + (forPrint ? '' : `<span class="rpt-grp-meta">${esc(plural(d.total, 'order'))}</span>`) + '</div>';
+    return `<tr class="rpt-grp" data-grp="${esc(d.day)}"><td colspan="${cs.length}">${id}</td></tr>`;
+}
+function hourRow(cs, r) {
+    return '<tr>' + cs.map(c => {
+        const v = c.key === 'hour' ? esc(r.hour) : c.key === 'n' ? `<span class="${r.n ? '' : 'ph-zero'}">${esc(r.n)}</span>`
+            : c.key === 'pct' ? esc(pctText(r.n, r.total)) : '';
+        return `<td class="${cellCls(c)}">${v}</td>`;
+    }).join('') + '</tr>';
+}
+// The group footer: "Total:" right-aligned before the Total # column, the
+// day's orders in it (a minor row: on paper it keeps with the last hour).
+function labelled(cs, label, value, cls) {
+    const ni = cs.findIndex(c => c.key === 'n');
+    if (ni <= 0) return `<tr class="${cls}"><td colspan="${cs.length}" class="ph-lbl">${esc(label)} ${esc(value)}</td></tr>`;
+    return `<tr class="${cls}"><td colspan="${ni}" class="ph-lbl">${esc(label)}</td><td class="ctr-cell">${esc(value)}</td>` +
+        (cs.length - ni - 1 ? `<td colspan="${cs.length - ni - 1}"></td>` : '') + '</tr>';
+}
+function bodyRows(cs, forPrint) {
+    const out = [];
+    S.days.forEach(d => {
+        out.push(groupRow(cs, d, forPrint));
+        if (!S.collapsed.has(d.day)) sortHours(d.hours).forEach(r => out.push(hourRow(cs, r)));
+        out.push(labelled(cs, 'Total:', d.total.toLocaleString(), 'ph-tot rpt-minor'));
+    });
+    return out;
+}
+// App only (the original has no grand total).
+const footRow = cs => labelled(cs, 'Total — ' + plural(S.days.length, 'day') + ':', totalOrders().toLocaleString(), '');
+
+function chartHtml() {
+    const items = chartItems();
+    return items.length ? barChartSvg(items, { legend: CHART_SERIES, fmt: fmtAvg, W: 552, H: 265 }) : '';
+}
+
+function filterText() {
+    const names = (ids, map) => ids.map(id => map[id] || id).join(', ');
+    const days = ints(F.days);
+    const dflt = DEFAULT_FILTERS.days;
+    const daysText = days.length === dflt.length && dflt.every(x => days.indexOf(x) !== -1) ? ''
+        : 'Days: ' + (days.length ? WEEKDAYS.filter(w => days.indexOf(w[1]) !== -1).map(w => w[0].slice(0, 3)).join(', ') : 'none');
+    const hoursText = beginHour(F) === 7 && endHour(F) === 19 ? '' : 'Hours ' + beginHour(F) + ' to ' + endHour(F);
+    return [daysText, hoursText, F.lgs.length ? names(F.lgs, S.lgNames) : '', F.custs.length ? names(F.custs, S.custNames) : '',
+            F.reps.length ? 'Salesperson ' + F.reps.join(', ') : '', F.register ? 'Register ' + F.register : ''].filter(Boolean).join(' · ');
+}
+const emptyText = () => (ints(F.days).length ? 'No Point of Sale orders match these filters.' : 'No day of the week is ticked: tick at least one.');
+
+// Long reports paint in chunks as the user scrolls.
+const CHUNK = 600;
+let _paint = { html: [], shown: 0 };
+function appendChunk() {
+    if (_paint.shown >= _paint.html.length) return;
+    const next = _paint.html.slice(_paint.shown, _paint.shown + CHUNK);
+    document.querySelector('#rpt tbody').insertAdjacentHTML('beforeend', next.join(''));
+    _paint.shown += next.length;
+}
+
+function render(keepScroll) {
+    document.getElementById('pageTitle').textContent = reportTitle();
+    const status = () => [S.company, rangeText(F), S.loadedAt ? plural(S.days.length, 'day') + ' · ' + plural(totalOrders(), 'order') + (S.capped ? ' (days shown)' : '') : '']
+        .filter(Boolean).join(' · ');
+    if (S.view === 'pivot' && PIVOT) {
+        PIVOT.render();
+        setStatus(status() + ' · pivot');
+        if (PDF) PDF.refresh();
+        return;
+    }
+    const tbl = document.getElementById('rpt');
+    const wrap = document.getElementById('rptWrap');
+    const top = wrap.scrollTop;
+    const cs = cols();
+    tbl.querySelector('thead').innerHTML = headRow(cs);
+    _paint = { html: bodyRows(cs, false), shown: 0 };
+    tbl.querySelector('tbody').innerHTML = '';
+    appendChunk();
+    while (keepScroll && _paint.shown < _paint.html.length && wrap.scrollHeight < top + wrap.clientHeight) appendChunk();
+    tbl.querySelector('tfoot').innerHTML = S.days.length ? footRow(cs) : '';
+    tbl.style.display = S.days.length ? '' : 'none';
+    document.getElementById('rptEmpty').textContent = S.days.length || !S.loadedAt ? '' : emptyText();
+    const chart = chartHtml();
+    document.getElementById('charts').innerHTML = chart ? `<div class="so-chart-box">${chart}</div>` : '';
+    wrap.scrollTop = keepScroll ? top : 0;
+    setStatus(status());
+    if (PDF) PDF.refresh();
+}
+
+// ============================================================================
+//  PDF VIEW — as the standard report: Letter portrait, company / title /
+//  date range on the first page (its title band), the days, then the chart
+//  on a new page (its summary band); no page footer.
+// ============================================================================
+const PDF_CSS =
+    '.fbdoc-rpt-tbl .rpt-grp-inner>:first-child{white-space:nowrap}' +
+    '.fbdoc-rpt-tbl .ctr-cell{text-align:center}.fbdoc-rpt-tbl th.ctr-cell{text-align:center}' +
+    '.fbdoc-rpt-tbl .ph-zero{color:inherit}.fbdoc-rpt-tbl tr.ph-tot td{font-weight:700}.fbdoc-rpt-tbl td.ph-lbl{text-align:right}' +
+    '.fbdoc-rpt-flow svg{display:block;width:100%;height:auto;margin:0}';
+const printSubtitle = () => [rangeText(F), filterText()].filter(Boolean);
+function docSpec() {
+    if (!S.loadedAt) return null;
+    const base = { company: S.company, title: reportTitle(), subtitle: printSubtitle(), titleEveryPage: false,
+                   empty: emptyText(), css: PDF_CSS, fontPt: 10, pageFooter: false };
+    if (S.view === 'pivot' && PIVOT) {
+        const p = PIVOT.pdfSpec();
+        return Object.assign(base, { subtitle: printSubtitle().concat(pivotText()), head: p.head, rows: p.rows, foot: p.foot });
+    }
+    const cs = cols();
+    if (!S.days.length) return Object.assign(base, { head: '', rows: [], foot: '' });
+    const chart = chartHtml();
+    return Object.assign(base, { sections: [{ head: headRow(cs), rows: bodyRows(cs, true), foot: '' }]
+        .concat(chart ? [{ newPage: true, flow: [chart] }] : []) });
+}
+
+// ============================================================================
+//  PIVOT VIEW (FBLib.Pivot) — orders by any two of weekday, hour and day.
+// ============================================================================
+const PIVOT_FIELDS = [
+    { key: 'weekday', label: 'Weekday', order: DAYNAMES.slice(1).concat(['Sunday']) },
+    { key: 'hour', label: 'Hour', order: (a, b) => Number(a) - Number(b) },
+    { key: 'date', label: 'Day', type: 'date' },
+    { key: 'n', label: 'Orders', type: 'number' }
+];
+const pivotRows = () => {
+    const out = [];
+    S.days.forEach(d => d.hours.forEach(h => out.push({ weekday: d.weekday, hour: String(h.hour), date: d.day, n: h.n })));
+    return out;
+};
+function pivotText() {
+    const c = PIVOT.config(), lbl = k => (PIVOT_FIELDS.find(x => x.key === k) || {}).label || '';
+    const m = c.measure === '__count__' ? 'Day-hours'
+        : ({ sum: 'Total', count: 'Count of', avg: 'Average', min: 'Lowest', max: 'Highest' }[c.agg] + ' ' + lbl(c.measure));
+    return 'Pivot: ' + m + ' by ' + [lbl(c.rowDim), lbl(c.rowDim2)].filter(Boolean).join(' + ') + (c.colDim ? ' × ' + lbl(c.colDim) : '');
+}
+function setView(v, persist) {
+    S.view = v === 'pivot' && PIVOT ? 'pivot' : 'table';
+    document.getElementById('viewSel').value = S.view;
+    document.getElementById('rptWrap').style.display = S.view === 'pivot' ? 'none' : '';
+    document.getElementById('pivotHost').style.display = S.view === 'pivot' ? '' : 'none';
+    document.getElementById('expandBtn').parentNode.style.display = S.view === 'pivot' ? 'none' : '';
+    if (persist) _saveUserKeys({ view: S.view });
+    render(false);
+}
+
+function setAllOpen(open) {
+    S.collapsed = new Set(open ? [] : S.days.map(d => d.day));
+    render(false);
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.days.length) { showToast('Nothing to export.', 'warn'); return; }
+    const sub = [S.company].concat(printSubtitle()).filter(Boolean);
+    const rows = [];
+    S.days.forEach(d => sortHours(d.hours).forEach(h => rows.push({ date: d.day, weekday: d.weekday, hour: h.hour, n: h.n,
+        pct: d.total ? h.n / d.total : 0, total: d.total })));
+    const sheets = [{
+        name: 'By hour', title: reportTitle(), subtitle: sub,
+        cols: [{ key: 'date', label: 'Date', w: 90, type: 'date' }, { key: 'weekday', label: 'Weekday', w: 90, type: 'text' },
+               { key: 'hour', label: 'Hour', w: 60, type: 'int', noTotal: true }, { key: 'n', label: 'Total #', w: 70, type: 'int' },
+               { key: 'pct', label: '% of Daily Sales', w: 100, type: 'percent', noTotal: true },
+               { key: 'total', label: 'Day total', w: 80, type: 'int', noTotal: true }],
+        rows, totals: true
+    }, {
+        name: 'Average per hour', title: reportTitle() + ' – ' + CHART_SERIES, subtitle: sub,
+        cols: [{ key: 'hour', label: 'Hour', w: 60, type: 'text' }, { key: 'avg', label: CHART_SERIES, w: 150, type: 'qty', noTotal: true }],
+        rows: chartItems().map(i => ({ hour: i.label, avg: Math.round(i.value * 100) / 100 })), totals: false
+    }];
+    if (S.view === 'pivot' && PIVOT) sheets.unshift(Object.assign(PIVOT.sheet('Pivot'), { title: reportTitle() + ' – ' + pivotText(), subtitle: sub }));
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'POS_Hourly_Breakdown_' + ymd(new Date()), sheets });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+function printReport() {
+    if (PDF) {
+        if (!S.days.length) { showToast('Nothing to print.', 'warn'); return; }
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    if (!S.days.length) { showToast('Nothing to print.', 'warn'); return; }
+    const cs = cols();
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' + esc(reportTitle()) + '</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:9pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:11pt;font-weight:700}h2{text-align:center;font-size:14pt;margin:2px 0}.sub{text-align:center;font-size:8.5pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{font-size:9pt;text-align:left;padding:3px 5px;border-bottom:1px solid #000}' +
+        'td{font-size:9pt;padding:2px 5px;vertical-align:top}.num-cell{text-align:right}.ctr-cell{text-align:center}.ph-lbl{text-align:right}' +
+        'tr.rpt-grp td{padding-top:7px}tr.ph-tot td{font-weight:700}svg{display:block;width:100%;height:auto;margin-top:12px;break-before:page}' +
+        '@page{size:Letter portrait;margin:.4in}</style></head><body>' +
+        '<div class="co">' + esc(S.company) + '</div><h2>' + esc(reportTitle()) + '</h2><p class="sub">' + esc(printSubtitle().join(' · ')) + '</p>' +
+        '<table><thead>' + headRow(cs).replace(/ style="[^"]*"/g, '') + '</thead><tbody>' + bodyRows(cs, true).join('') + '</tbody></table>' +
+        chartHtml() + '</body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters what everyone sees each time this report opens?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        const ms = (id, ph) => FBLib.Common.MultiSelect.create({ containerId: id, items: [], placeholder: ph, maxTags: 2, onClose: applySoon });
+        _lgMs = ms('lgMs', 'All my location groups');
+        _custMs = ms('custMs', 'All customers');
+        _repMs = ms('repMs', 'All salespeople');
+
+        document.getElementById('fDays').innerHTML = WEEKDAYS.map(w =>
+            `<label class="rpt-fcheck"><input type="checkbox" id="fDay${w[1]}"> ${esc(w[0])}</label>`).join('');
+        WEEKDAYS.forEach(w => document.getElementById('fDay' + w[1]).addEventListener('change', applySoon));
+        const opts = (a, b) => { let h = ''; for (let i = a; i <= b; i++) h += `<option value="${i}">${i}</option>`; return h; };
+        document.getElementById('fBegin').innerHTML = opts(0, 23);
+        document.getElementById('fEnd').innerHTML = opts(1, 24);
+        const fRange = document.getElementById('fRange');
+        fRange.innerHTML = RANGES.map(r => `<option value="${r[0]}">${esc(r[1])}</option>`).join('');
+        // A quick range fills the dates; editing a date makes the range Custom.
+        fRange.onchange = () => {
+            const p = presetDates(fRange.value);
+            if (fRange.value !== 'custom') {
+                document.getElementById('fFrom').value = p ? p[0] : '';
+                document.getElementById('fTo').value = p ? p[1] : '';
+            }
+            applySoon();
+        };
+        ['fFrom', 'fTo'].forEach(id => document.getElementById(id).addEventListener('change', () => { fRange.value = 'custom'; applySoon(); }));
+        ['fBegin', 'fEnd', 'fRegister'].forEach(id => document.getElementById(id).addEventListener('change', applySoon));
+        const fTitle = document.getElementById('fTitle');
+        fTitle.addEventListener('change', applySoon);
+        fTitle.addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        document.getElementById('resetFiltersBtn').onclick = () => { writeFilters(DEFAULT_FILTERS); applySoon(); };
+
+        // Column resize / sort / reorder, and the Pivot view (fb-lib).
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({ table: document.getElementById('rpt'), sortable: SORTABLE,
+                                                         draggable: k => k !== 'date',
+                                                         onSort: () => render(true), onReorder: () => render(true) });
+        if (FBLib.Pivot) PIVOT = FBLib.Pivot.mount(document.getElementById('pivotHost'), {
+            fields: PIVOT_FIELDS, rows: pivotRows, countLabel: 'Day-hours',
+            defaults: { rowDim: 'hour', colDim: 'weekday', measure: 'n', agg: 'sum' }
+        });
+        else document.getElementById('viewSelWrap').style.display = 'none';
+        document.getElementById('viewSel').addEventListener('change', e => setView(e.target.value, true));
+        document.getElementById('resetColsBtn').onclick = () => { if (COLS) { COLS.reset(); render(false); } };
+        S.view = _resolve('view', 'table') === 'pivot' && PIVOT ? 'pivot' : 'table';
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: document.getElementById('appView'), toggleBefore: document.getElementById('exportBtn'),
+                page: { size: 'Letter', orientation: 'portrait' },
+                doc: docSpec, title: () => reportTitle()
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        setView(S.view, false);
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('expandBtn').onclick = () => setAllOpen(true);
+        document.getElementById('collapseBtn').onclick = () => setAllOpen(false);
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('unpublishBtn').onclick = () => {
+            if (!confirm('Stop using company defaults for this report? Everyone goes back to their own last choices.')) return;
+            const ok = FBLib.Settings.clearCompany(['filters', 'opts']) !== false;
+            showToast(ok ? 'This report no longer has company defaults.' : 'That was not saved.', ok ? 'success' : 'error');
+        };
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        const wrap = document.getElementById('rptWrap');
+        wrap.addEventListener('scroll', () => { if (wrap.scrollTop + wrap.clientHeight > wrap.scrollHeight - 400) appendChunk(); });
+        document.getElementById('rpt').addEventListener('click', e => {
+            const g = e.target.closest('tr.rpt-grp');
+            if (!g) return;
+            const key = g.dataset.grp;
+            if (S.collapsed.has(key)) S.collapsed.delete(key); else S.collapsed.add(key);
+            render(true);
+        });
+
+        await loadLookups();
+        writeFilters(savedFilters());
+        F = readFilters();          // drops saved picks that no longer exist
+        await loadAll();
+    } catch (e) {
+        console.error('[' + STOCK_TITLE + '] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

@@ -45,7 +45,8 @@
 //   FBLib.BUILD          — this file's build stamp.
 //   FBLib.Common         — date / money / qty formatting, debug logger,
 //                          status indicators, debug drawer, drop-down
-//                          drawer helpers, multi-select widget.
+//                          drawer helpers, multi-select widget, and
+//                          toast / confirmModal / tooltips / fdrop.
 //   FBLib.SharedData     — one org-wide payload per key, written by an
 //                          admin and read by everyone (userproperties,
 //                          admin-owned rows only).
@@ -64,11 +65,16 @@
 //   FBLib.Table          — Sort / per-column filter / drag-reorder /
 //                          drag-resize scaffolding for a <table> in a
 //                          scroll container. Plug in via FBLib.Table.init.
+//   FBLib.ColumnMenu     — "Columns" drop-down: show / hide, drag to
+//                          reorder, admin rename for everyone. FBLib.Table
+//                          and FBLib.RptCols build one from their
+//                          columnMenu option.
 //   FBLib.Export         — Formatted .xlsx download (real dates/numbers,
 //                          SUBTOTAL totals row); no CDN dependency.
 //   FBLib.RowCap         — Cap a big result (first N rows + "Load all").
 //   FBLib.RptCols        — Resize / heading-click sort / drag-reorder for a
-//                          report-rendered .rpt-table (groups, totals…).
+//                          report-rendered .rpt-table (groups, totals…),
+//                          with an optional Columns drop-down.
 //   FBLib.Pivot          — Pivot (cross-tab) view of a report's flat rows,
 //                          with drill-down, PDF and Excel output.
 //   FBLib.FilterViews    — Saved views (per-user + admin-published company
@@ -141,6 +147,11 @@
 //    retired them. See the "DROP-DOWN DRAWER" comment block in Common
 //    below for the canonical markup + behaviour.
 //
+//  • Toasts, confirm dialogs, data-tip tooltips and filter-strip
+//    drop-downs: FBLib.Common.toast / confirmModal / tooltips / fdrop.
+//    Don't copy a page-local showToast or confirm modal into a new
+//    report (Template/Component_Gallery.htm shows them all).
+//
 //  • Saved filter views are the one exception: use FBLib.FilterViews
 //    (a compact header button + popover holding My views, Company views
 //    and the admin publish / delete-for-all actions). Don't build a
@@ -176,7 +187,7 @@ window.FBLib = (function () {
      * Exposed as FBLib.BUILD so a report can tell which fb-lib the Fishbowl server actually served it.
      * @type {string}
      */
-    const BUILD = '2026.10.15-5505873';   // @fb-build
+    const BUILD = '2026.10.20-3a86ced';   // @fb-build
 
     /**
      * Returns the host report's identity block (window.FB_REPORT, set at the top of every report's head).
@@ -415,8 +426,9 @@ window.FBLib = (function () {
 
         /**
          * Appends a timestamped line to the #debugLog console, only while debug mode is on (see DEBUG_MODE).
-         * The message is inserted as HTML, so escape untrusted text. Does nothing without a #debugLog element.
-         * @param {string} message - The text to log (HTML allowed).
+         * The message is inserted as HTML (callers may log markup), so escape untrusted text with
+         * FBLib.Common.escHtml(): SQL, record names, error messages. Does nothing without a #debugLog element.
+         * @param {string} message - The text to log, as HTML.
          * @param {string} [type] - 'info' | 'success' | 'warning' | 'error' | 'query'; sets the colour.
          * @param {string} [tileId] - Shown as a [tileId] prefix.
          */
@@ -695,7 +707,11 @@ window.FBLib = (function () {
         //   - A press anywhere outside the open drawer or panel closes it:
         //     on the scrim, on the header, on another header button. Its own
         //     trigger button is left to toggle it, and modals, toasts and
-        //     the debug console don't count as outside.
+        //     the debug console don't count as outside. A drawer closes on
+        //     the press; a push-down panel once the press is over, after
+        //     the pressed element's click has run (closing it at once slid
+        //     the page up from under the pointer and the click was lost:
+        //     a row link, a group row, a Retry button).
         //   - The trigger button gets `.active` while its drawer is open.
         //   - ESC closes whichever drawer or panel is open.
         //
@@ -747,11 +763,39 @@ window.FBLib = (function () {
         // Sync --fb-drawer-top to the live header/topbar height so the fixed drawer
         // + scrim drop just below the header (which stays clear + clickable).
         // offsetHeight is layout px — matches the fixed `top` and stays correct
-        // under a page's body-zoom.
-        function _fbSyncDrawerTop() {
-            var hdr = document.querySelector('.topbar') || document.querySelector('header');
+        // under a page's body-zoom. The header is the one holding the drawer's
+        // trigger, else the first .topbar, else the first <header>; a candidate
+        // counts only while it sits at the top of the page, so a page with both
+        // chromes (a REPORT header and a .topbar further down) measures the
+        // header its drawers drop from.
+        function _fbSyncDrawerTop(id) {
+            var cands = [];
+            var trig = id ? _fbTriggerEl(id) : null;
+            if (trig) cands.push(trig.closest('.topbar'), trig.closest('header'));
+            cands = cands.concat(Array.prototype.slice.call(document.querySelectorAll('.topbar')),
+                                 Array.prototype.slice.call(document.querySelectorAll('header')));
+            var hdr = null;
+            for (var i = 0; i < cands.length && !hdr; i++) {
+                var c = cands[i];
+                if (!c || !c.offsetHeight) continue;
+                var t = c.getBoundingClientRect().top;
+                if (t > -2 && t < 2) hdr = c;
+            }
+            if (!hdr) hdr = document.querySelector('.topbar') || document.querySelector('header');
             var top = hdr ? hdr.offsetHeight : 56;
             try { document.documentElement.style.setProperty('--fb-drawer-top', top + 'px'); } catch (_) {}
+        }
+        // The button that opens drawer `id`: its registered trigger, else an
+        // onclick that names it.
+        function _fbTriggerEl(id) {
+            var cfg = _drawers[id];
+            var b = cfg && cfg.triggerId ? document.getElementById(cfg.triggerId) : null;
+            if (b) return b;
+            var els = document.querySelectorAll('[onclick]');
+            for (var i = 0; i < els.length; i++) {
+                if (els[i].getAttribute('onclick').indexOf("'" + id + "'") !== -1 && els[i].offsetHeight) return els[i];
+            }
+            return null;
         }
         // Every open drawer in the page, registered or not.
         function _fbOpenDrawerEls() {
@@ -773,7 +817,7 @@ window.FBLib = (function () {
             if (el) {
                 el.classList.add('open');
                 // Overlay behaviour: position under the header + grey the page behind.
-                _fbSyncDrawerTop();
+                _fbSyncDrawerTop(id);
                 var scrim = _fbDrawerScrim();
                 if (scrim) scrim.classList.add('open');
             }
@@ -843,19 +887,42 @@ window.FBLib = (function () {
                 const t = e.target;
                 if (!t || !t.closest || !document.documentElement.contains(t)) return;
                 // UI that floats above everything isn't "outside"; nor is the
-                // row-cap notice (closing a panel would slide it from under
-                // the pointer and swallow the Load all click).
-                if (t.closest('.modal-overlay, .toast-container, .fblib-debug-drawer, .app-tooltip, .rowcap-note')) return;
+                // row-cap notice or a Columns button and its popover (closing
+                // a panel would slide them from under the pointer and swallow
+                // the click).
+                if (t.closest('.modal-overlay, .toast-container, .fblib-debug-drawer, .app-tooltip, .rowcap-note, .fb-colmenu-btn, .fb-colmenu-pop')) return;
                 _fbOpenDrawerEls().forEach(function (d) {
                     if (d.contains(t) || _fbIsTriggerFor(t, d.id, (_drawers[d.id] || {}).triggerId)) return;
                     closeDrawer(d.id);
                 });
-                _fbOpenPanelIds().forEach(function (pid) {
+                // A push-down panel is in the page flow: closing it now would
+                // move what was pressed, and its click would be lost. Close it
+                // once the press is over, after the click has run, unless
+                // something toggled it meanwhile (a button that opens it).
+                const later = _fbOpenPanelIds().filter(function (pid) {
                     const p = document.getElementById(pid);
-                    if (p.contains(t) || _fbIsTriggerFor(t, pid, _panels[pid].triggerId)) return;
-                    togglePanel(pid, false);
+                    return !(p.contains(t) || _fbIsTriggerFor(t, pid, _panels[pid].triggerId));
                 });
+                if (later.length) _fbClosePanelsAfterPress(later);
             }, true);
+        }
+        function _fbClosePanelsAfterPress(ids) {
+            const seq = ids.map(function (pid) { return (_panels[pid] || {}).seq || 0; });
+            let done = false;
+            function close() {
+                if (done) return;
+                done = true;
+                window.removeEventListener('pointerup', onUp, true);
+                window.removeEventListener('pointercancel', onUp, true);
+                ids.forEach(function (pid, i) {
+                    const p = document.getElementById(pid);
+                    if (p && p.classList.contains('open') && ((_panels[pid] || {}).seq || 0) === seq[i]) togglePanel(pid, false);
+                });
+            }
+            // The click follows pointerup in the same task: a 0 ms timer runs after it.
+            function onUp() { setTimeout(close, 0); }
+            window.addEventListener('pointerup', onUp, true);
+            window.addEventListener('pointercancel', onUp, true);
         }
 
         // ================================================================
@@ -883,8 +950,10 @@ window.FBLib = (function () {
         //   FBLib.Common.closeAllPanels()
         //   The trigger gets `.active` while the panel is open; closing it
         //   closes any open multi-select. A panel takes part in the drawers'
-        //   one-open-at-a-time and outside-press rules (see DROP-DOWN DRAWER).
-        //   Register it so the rules know its trigger.
+        //   one-open-at-a-time and outside-press rules (see DROP-DOWN DRAWER):
+        //   a press outside closes it once the press is over, so the element
+        //   pressed (a row link, a group row) still gets its click. Register
+        //   it so the rules know its trigger.
         // ================================================================
         const _panels = {};
         /**
@@ -898,7 +967,8 @@ window.FBLib = (function () {
          */
         function registerPanel(cfg) {
             if (!cfg || !cfg.id) return null;
-            _panels[cfg.id] = { triggerId: cfg.triggerId || null, onToggle: typeof cfg.onToggle === 'function' ? cfg.onToggle : null };
+            _panels[cfg.id] = { triggerId: cfg.triggerId || null, onToggle: typeof cfg.onToggle === 'function' ? cfg.onToggle : null,
+                                seq: (_panels[cfg.id] && _panels[cfg.id].seq) || 0 };
             return { toggle: function (open) { return togglePanel(cfg.id, open); } };
         }
         function _fbOpenPanelIds() {
@@ -923,6 +993,7 @@ window.FBLib = (function () {
             const el = document.getElementById(id);
             if (!el) return false;
             if (!_panels[id]) _panels[id] = { triggerId: null, onToggle: null };
+            _panels[id].seq = (_panels[id].seq || 0) + 1;
             const next = open === undefined ? !el.classList.contains('open') : !!open;
             // Only one open at a time: opening a panel closes drawers and other panels.
             if (next) { closeAllDrawers(); closeAllPanels(id); }
@@ -1378,6 +1449,331 @@ window.FBLib = (function () {
         /** Multi-select dropdown widget: create(opts), get(containerId) and closeAll(). */
         const MultiSelect = { create: _msCreate, get: _msGet, closeAll: _msCloseAll };
 
+        // ================================================================
+        // TOASTS, CONFIRM MODAL, TOOLTIPS, FILTER-STRIP DROP-DOWNS
+        // (2026-10-20) — the copies every report carried (showToast, a
+        // confirm modal, data-tip positioning, the .fdrop open / close),
+        // lifted here. Each writes fb-styles' own markup (§12 .modal-overlay,
+        // §13 .app-tooltip, §14 .toast, §26 .fdrop), so a page swaps its copy
+        // for the call and looks the same. Template/Component_Gallery.htm
+        // shows each one working.
+        //
+        // DOCUMENT OUTPUT (FB_LAUNCH.output 'pdf': report_btn's Print (App) /
+        // Email (rich)): nothing may wait for a click or cover the page, so
+        // toast() only logs, confirmModal() resolves false at once (and
+        // logs), and tooltips() binds nothing. FB_DOC still reaches ready or
+        // error on its own.
+        //
+        // API
+        //   FBLib.Common.toast(html, type?, ms?) -> the .toast element (null in output)
+        //       type 'info' (default) | 'success' | 'warn' | 'error'; ms default
+        //       3500, 0 = stays until dismissed. `html` is HTML: escape text.
+        //       Uses #toasts (or any .toast-container); creates one if missing.
+        //   FBLib.Common.confirmModal({ title, html?, text?, okText?, cancelText?,
+        //       danger?, note?, wide? }) -> Promise<boolean>
+        //       true on OK; false on Cancel, the ×, Esc or a press on the
+        //       backdrop. danger: a red OK (.ds-btn-danger) and the focus
+        //       starts on Cancel. cancelText: false = an OK-only notice. For a
+        //       write, list the payload in `html`.
+        //   FBLib.Common.tooltips(root?) -> { hide }
+        //       hover any [data-tip] under root (default: the page) for the
+        //       §13 tooltip: data-tip (text, newlines kept), data-tip-title,
+        //       data-tip-meta. Below the element, above when it doesn't fit,
+        //       kept on screen; text is escaped. Idempotent per root.
+        //   FBLib.Common.fdrop(el, { onChange?, onOpen?, onClose?, allText? })
+        //       -> { open, close, toggle, isOpen, value, setValue, element }
+        //       drives one §26 .fdrop: its .fdrop-btn opens it (one open at a
+        //       time; a click outside or Esc closes it). Items with a checkbox
+        //       = multi (value() is an array; [data-clear] clears); items with
+        //       data-v = single (a click picks and closes). An optional
+        //       .fd-val in the button shows the choice (allText when none).
+        //       onChange(value) fires on every change.
+        //   FBLib.Common.escHtml(s)    escape text for any of these (and debugLog)
+        //   FBLib.Common.isOutput()    true in document output
+        // ================================================================
+        /**
+         * Escapes text for HTML (& < > " ').
+         * @param {*} s - The value; null and undefined become ''.
+         * @returns {string} The escaped text.
+         */
+        function escHtml(s) {
+            return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+                return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+            });
+        }
+        /**
+         * Is the page running as document output (window.FB_LAUNCH.output === 'pdf')? Then nothing may wait for a click.
+         * @returns {boolean} True in document output.
+         */
+        function isOutput() {
+            try { const l = window.FB_LAUNCH; return !!(l && typeof l === 'object' && l.output === 'pdf'); } catch (_) { return false; }
+        }
+
+        /**
+         * Shows a §14 toast (the markup every report's showToast wrote). Logs instead in document output.
+         * @param {string} html - The message, as HTML: escape text with escHtml().
+         * @param {string} [type='info'] - 'info' | 'success' | 'warn' | 'error'.
+         * @param {number} [ms=3500] - How long it stays; 0 = until dismissed.
+         * @returns {?HTMLElement} The toast element, or null when nothing was shown.
+         */
+        function toast(html, type, ms) {
+            type = type === 'warning' ? 'warn' : (type || 'info');
+            if (isOutput()) {
+                debugLog('toast (' + escHtml(type) + '): ' + html, type === 'warn' ? 'warning' : type);
+                return null;
+            }
+            if (typeof document === 'undefined' || !document.body) return null;
+            let host = document.getElementById('toasts') || document.querySelector('.toast-container');
+            if (!host) {
+                host = document.createElement('div');
+                host.id = 'toasts';
+                host.className = 'toast-container';
+                document.body.appendChild(host);
+            }
+            const el = document.createElement('div');
+            el.className = 'toast ' + type;
+            const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+            el.innerHTML = '<span class="toast-icon">' + icon + '</span><span class="toast-msg">' + html + '</span>' +
+                '<button type="button" class="toast-x" aria-label="Dismiss">&times;</button>';
+            el.querySelector('.toast-x').onclick = function () { el.remove(); };
+            host.appendChild(el);
+            const dur = ms == null ? 3500 : Number(ms);
+            if (dur > 0) setTimeout(function () { el.style.opacity = '0'; setTimeout(function () { el.remove(); }, 300); }, dur);
+            return el;
+        }
+
+        /**
+         * Asks a yes / no question in a §12 modal. Resolves false at once (and logs) in document output.
+         * @param {object} opts - { title, html?, text?, okText?, cancelText?, danger?, note?, wide? }.
+         * @returns {Promise<boolean>} True on OK; false on Cancel, the ×, Esc or a press on the backdrop.
+         */
+        function confirmModal(opts) {
+            opts = opts || {};
+            if (isOutput()) {
+                debugLog('confirmModal "' + escHtml(opts.title || '') + '" skipped: document output never waits for a click', 'warning');
+                return Promise.resolve(false);
+            }
+            if (typeof document === 'undefined' || !document.body) return Promise.resolve(false);
+            const ov = document.createElement('div');
+            ov.className = 'modal-overlay fb-confirm open';
+            ov.setAttribute('role', 'dialog');
+            ov.setAttribute('aria-modal', 'true');
+            ov.innerHTML =
+                '<div class="modal-card' + (opts.wide ? ' wide' : '') + '">' +
+                    '<div class="modal-head"><h3></h3>' +
+                        '<button type="button" class="close-x" data-fb-cancel aria-label="Cancel">&times;</button></div>' +
+                    '<div class="modal-body"></div>' +
+                    '<div class="modal-foot"><div class="left-grp"><span class="fb-confirm-note"></span></div>' +
+                        '<div class="right-grp"><button type="button" class="ds-btn" data-fb-cancel></button>' +
+                        '<button type="button" class="ds-btn ' + (opts.danger ? 'ds-btn-danger' : 'ds-btn-primary') + '" data-fb-ok></button></div></div>' +
+                '</div>';
+            ov.querySelector('h3').textContent = opts.title || 'Are you sure?';
+            const body = ov.querySelector('.modal-body');
+            if (opts.html != null) body.innerHTML = opts.html;
+            else if (opts.text != null) body.textContent = opts.text;
+            else body.style.display = 'none';
+            ov.querySelector('.fb-confirm-note').textContent = opts.note || '';
+            const okBtn = ov.querySelector('[data-fb-ok]');
+            const cancelBtn = ov.querySelector('.right-grp [data-fb-cancel]');
+            okBtn.textContent = opts.okText || opts.ok || 'OK';
+            if (opts.cancelText === false) cancelBtn.style.display = 'none';
+            else cancelBtn.textContent = opts.cancelText || 'Cancel';
+            const before = document.activeElement;
+            document.body.appendChild(ov);
+            setTimeout(function () {
+                try { (opts.danger && opts.cancelText !== false ? cancelBtn : okBtn).focus(); } catch (_) {}
+            }, 0);
+            return new Promise(function (resolve) {
+                let done = false;
+                function finish(v) {
+                    if (done) return;
+                    done = true;
+                    window.removeEventListener('keydown', onKey, true);
+                    ov.remove();
+                    try { if (before && before.focus && document.documentElement.contains(before)) before.focus(); } catch (_) {}
+                    resolve(v);
+                }
+                // Esc answers this modal only: a drawer or panel under it stays open.
+                function onKey(e) {
+                    if (e.key !== 'Escape') return;
+                    e.preventDefault();
+                    e.stopImmediatePropagation();
+                    finish(false);
+                }
+                ov.addEventListener('click', function (e) {
+                    if (e.target === ov || e.target.closest('[data-fb-cancel]')) finish(false);
+                    else if (e.target.closest('[data-fb-ok]')) finish(true);
+                });
+                window.addEventListener('keydown', onKey, true);
+            });
+        }
+
+        let _tipEl = null, _tipBound = false;
+        function _tipBox() {
+            if (_tipEl && document.documentElement.contains(_tipEl)) return _tipEl;
+            _tipEl = document.createElement('div');
+            _tipEl.className = 'app-tooltip';
+            _tipEl.id = 'fbAppTooltip';
+            _tipEl.setAttribute('role', 'tooltip');
+            document.body.appendChild(_tipEl);
+            return _tipEl;
+        }
+        function _tipHide() { if (_tipEl) _tipEl.classList.remove('show'); }
+        function _tipShow(el) {
+            const tip = _tipBox();
+            const title = el.getAttribute('data-tip-title'), meta = el.getAttribute('data-tip-meta');
+            tip.innerHTML = (title ? '<span class="tt-title">' + escHtml(title) + '</span>' : '') +
+                '<span class="tt-desc">' + escHtml(el.getAttribute('data-tip')) + '</span>' +
+                (meta ? '<span class="tt-meta">' + escHtml(meta) + '</span>' : '');
+            const r = el.getBoundingClientRect();
+            const w = tip.offsetWidth, h = tip.offsetHeight, gap = 6;
+            const vw = window.innerWidth, vh = window.innerHeight;
+            const left = Math.max(8, Math.min(r.left, vw - w - 8));
+            let top = r.bottom + gap;
+            if (top + h > vh - 8 && r.top - gap - h >= 8) top = r.top - gap - h;   // no room below: above
+            tip.style.left = left + 'px';
+            tip.style.top = Math.max(8, Math.min(top, vh - h - 8)) + 'px';
+            tip.classList.add('show');
+        }
+        /**
+         * Shows the §13 tooltip on hover over any [data-tip] under root (data-tip-title, data-tip-meta optional). Nothing in document output.
+         * @param {HTMLElement|string} [root=document] - Where to listen (an element or its id). Idempotent per root.
+         * @returns {{hide: Function}} hide() hides the tooltip.
+         */
+        function tooltips(root) {
+            const api = { hide: _tipHide };
+            if (isOutput() || typeof document === 'undefined') return api;
+            if (typeof root === 'string') root = document.getElementById(root);
+            root = root || document;
+            if (root._fbTips) return api;
+            root._fbTips = true;
+            let cur = null;
+            root.addEventListener('mouseover', function (e) {
+                const el = e.target && e.target.closest ? e.target.closest('[data-tip]') : null;
+                if (el === cur) return;
+                cur = el;
+                if (!el || !el.getAttribute('data-tip')) { _tipHide(); return; }
+                _tipShow(el);
+            });
+            root.addEventListener('mouseout', function (e) {
+                if (cur && !(e.relatedTarget && cur.contains(e.relatedTarget))) { cur = null; _tipHide(); }
+            });
+            if (!_tipBound) {
+                _tipBound = true;
+                window.addEventListener('scroll', _tipHide, true);
+                window.addEventListener('blur', _tipHide);
+                document.addEventListener('pointerdown', _tipHide, true);
+            }
+            return api;
+        }
+
+        const _fdrops = [];
+        let _fdropBound = false;
+        /**
+         * Drives one §26 filter-strip drop-down (.fdrop > .fdrop-btn + .fdrop-panel). See the block above.
+         * @param {HTMLElement|string} el - The .fdrop element or its id.
+         * @param {object} [opts] - { onChange(value), onOpen(api), onClose(value), allText }.
+         * @returns {?object} { open, close, toggle, isOpen, value, setValue, element }; null without the markup.
+         */
+        function fdrop(el, opts) {
+            if (typeof el === 'string') el = document.getElementById(el);
+            if (!el) return null;
+            if (el._fbFdrop) return el._fbFdrop;
+            opts = opts || {};
+            const btn = el.querySelector('.fdrop-btn'), panel = el.querySelector('.fdrop-panel');
+            if (!btn || !panel) return null;
+            const valEl = btn.querySelector('.fd-val');
+            const allText = opts.allText != null ? String(opts.allText) : (valEl ? valEl.textContent : '');
+            const multi = !!panel.querySelector('.fdrop-item input[type=checkbox]');
+            const items = function () { return Array.prototype.slice.call(panel.querySelectorAll('.fdrop-item')); };
+            const boxOf = function (it) { return it.querySelector('input[type=checkbox]'); };
+            const valueOf = function (it) { const cb = boxOf(it); return cb ? cb.value : it.getAttribute('data-v'); };
+            const labelOf = function (it) { const n = it.querySelector('.fdrop-name'); return (n ? n.textContent : it.textContent).trim(); };
+            function value() {
+                if (multi) return items().filter(function (it) { const cb = boxOf(it); return cb && cb.checked; }).map(valueOf);
+                const s = panel.querySelector('.fdrop-item.sel');
+                return s ? valueOf(s) : null;
+            }
+            function sync() {
+                if (multi) {
+                    const on = [];
+                    items().forEach(function (it) {
+                        const cb = boxOf(it);
+                        if (!cb) return;
+                        it.classList.toggle('sel', cb.checked);
+                        if (cb.checked) on.push(labelOf(it));
+                    });
+                    if (valEl) valEl.textContent = on.length ? on.join(', ') : allText;
+                    btn.classList.toggle('on', on.length > 0);
+                } else if (valEl) {
+                    const s = panel.querySelector('.fdrop-item.sel');
+                    valEl.textContent = s ? labelOf(s) : allText;
+                }
+            }
+            function emit() {
+                sync();
+                if (opts.onChange) { try { opts.onChange(value()); } catch (e) { debugLog('fdrop onChange failed: ' + escHtml(e && e.message || e), 'error'); } }
+            }
+            function isOpen() { return el.classList.contains('open'); }
+            function open() {
+                if (isOpen()) return;
+                _fdrops.forEach(function (d) { if (d !== api) d.close(); });
+                el.classList.add('open');
+                btn.classList.add('open');
+                panel.style.display = 'block';
+                if (opts.onOpen) { try { opts.onOpen(api); } catch (_) {} }
+            }
+            function close() {
+                if (!isOpen()) return;
+                el.classList.remove('open');
+                btn.classList.remove('open');
+                panel.style.display = '';
+                if (opts.onClose) { try { opts.onClose(value()); } catch (_) {} }
+            }
+            function setValue(v) {
+                const want = new Set((Array.isArray(v) ? v : v == null ? [] : [v]).map(String));
+                items().forEach(function (it) {
+                    const cb = boxOf(it);
+                    if (cb) cb.checked = want.has(String(cb.value));
+                    else it.classList.toggle('sel', want.has(String(it.getAttribute('data-v'))));
+                });
+                sync();
+            }
+            btn.addEventListener('click', function (e) { e.preventDefault(); if (isOpen()) close(); else open(); });
+            panel.addEventListener('change', function (e) {
+                if (e.target && e.target.matches && e.target.matches('.fdrop-item input[type=checkbox]')) emit();
+            });
+            panel.addEventListener('click', function (e) {
+                if (e.target.closest('[data-clear]')) {
+                    e.preventDefault();
+                    items().forEach(function (it) { const cb = boxOf(it); if (cb) cb.checked = false; else it.classList.remove('sel'); });
+                    emit();
+                    return;
+                }
+                if (multi) return;
+                const it = e.target.closest('.fdrop-item[data-v]');
+                if (!it) return;
+                items().forEach(function (x) { x.classList.toggle('sel', x === it); });
+                emit();
+                close();
+            });
+            const api = { open: open, close: close, toggle: function () { if (isOpen()) close(); else open(); },
+                          isOpen: isOpen, value: value, setValue: setValue, element: el };
+            el._fbFdrop = api;
+            _fdrops.push(api);
+            if (!_fdropBound) {
+                _fdropBound = true;
+                document.addEventListener('click', function (e) {
+                    _fdrops.forEach(function (d) { if (d.isOpen() && !d.element.contains(e.target)) d.close(); });
+                });
+                document.addEventListener('keydown', function (e) {
+                    if (e.key === 'Escape') _fdrops.forEach(function (d) { d.close(); });
+                });
+            }
+            sync();
+            return api;
+        }
+
         /**
          * Mounts the bottom-anchored debug console drawer that debugLog() writes to. Idempotent: later calls return the same API.
          * Before the body exists it defers to DOMContentLoaded and returns null. The drawer starts hidden; call show() or expand().
@@ -1428,7 +1824,13 @@ window.FBLib = (function () {
             registerPanel: registerPanel,
             togglePanel: togglePanel,
             closeAllPanels: closeAllPanels,
-            MultiSelect: MultiSelect
+            MultiSelect: MultiSelect,
+            escHtml: escHtml,
+            isOutput: isOutput,
+            toast: toast,
+            confirmModal: confirmModal,
+            tooltips: tooltips,
+            fdrop: fdrop
         };
     })();
 
@@ -2053,6 +2455,12 @@ window.FBLib = (function () {
              * @returns {boolean} True for an admin.
              */
             isAdmin: function () { return _isAdmin; },
+            /**
+             * The master store init() picked: 'reportData', 'userProperties' or 'none'.
+             * Company settings (publishCompany) are shared and preview-safe only with 'userProperties'.
+             * @returns {string} The masterStorage in use.
+             */
+            masterStorage: function () { return _masterStorage; },
             userEditingAllowed: _userEditingAllowed,
             /**
              * Returns the live user payload object (not a copy); change it with setUserKey() and persist with saveUser().
@@ -2256,14 +2664,18 @@ window.FBLib = (function () {
 
         /**
          * Builds the SELECT-list fragment for a tile's active custom fields, each aliased cf_N (N = the field id).
-         * Returns a single space when none are active, so the query is unchanged.
-         * @param {string} tileKey - The tile key.
+         * Returns a single space when none are active, so the query is unchanged. A report with its own
+         * columns passes the fields instead of a tile key: sqlSelectFor(fields, 'part') with fields
+         * from FBLib.CfCatalog ([{ id, name }]), e.g. the custom-field columns the user has on.
+         * @param {string|Array<{id: *, name: string}>} tileKey - The tile key, or the custom fields themselves.
          * @param {string} tableAlias - Alias of the table that holds customFields, e.g. 'so'.
          * @param {boolean} [useMax=false] - Wrap each value in MAX() for a GROUP BY query.
          * @returns {string} e.g. ", CustomFieldByName(so.customFields, 'Region') AS cf_12 " (note the leading comma).
          */
         function sqlSelectFor(tileKey, tableAlias, useMax) {
-            const cfs = _activeFor(tileKey);
+            const cfs = Array.isArray(tileKey)
+                ? tileKey.filter(function (cf) { return cf && cf.name != null && cf.id != null; })
+                : _activeFor(tileKey);
             if (cfs.length === 0) return ' ';
             const parts = cfs.map(function (cf) {
                 const expr = "CustomFieldByName(" + tableAlias + ".customFields, '" + escSqlString(cf.name) + "')";
@@ -2888,6 +3300,9 @@ window.FBLib = (function () {
     //   • Sticky thead (relies on the host's CSS — see CANONICAL CSS below)
     //   • Optional persistence to FBLib.Settings (column order + widths +
     //     visibility) under a host-supplied settings key.
+    //   • Optional Columns drop-down (FBLib.ColumnMenu): show / hide, drag to
+    //     reorder, reset; with `rename: true` an admin renames a heading for
+    //     everyone (company settings). Pass `columnMenu: { mount }`.
     //
     // CANONICAL CSS  (drop into the host page's <style> block)
     //   .fb-table-container { overflow:auto; }
@@ -2931,6 +3346,8 @@ window.FBLib = (function () {
     //     format:   v => '$' + v      // optional cell formatter (string-in, string-or-Node-out)
     //     link:     'Sales Order'     // optional — wraps cell in <a> calling openModule(link, cellValue)
     //     sortable: true              // default true
+    //     menu:     false             // keep an internal (drill / filter-only) column out of the Columns menu
+    //     locked:   true              // listed in the Columns menu but can't be hidden
     //   }
     //
     // API
@@ -2943,6 +3360,11 @@ window.FBLib = (function () {
     //       onSort:     (key, dir) => {},                        // optional hook
     //       onReorder:  (newColumns) => {},                      // optional hook
     //       settingsKey: 'tablePrefs',                           // optional FBLib.Settings key for persistence
+    //       columnMenu: {                                        // optional Columns drop-down
+    //           mount:  'colsMount',                             //   element / id the button goes in
+    //           rename: true,                                    //   admins rename headings for everyone
+    //           labelsKey: 'tablePrefsLabels'                    //   company key (default settingsKey + 'Labels')
+    //       }
     //   });
     //   table.render();                  // call after getRows() data changes
     //   table.setColumns(newColumns);    // replace columns + re-render
@@ -2951,6 +3373,18 @@ window.FBLib = (function () {
     //   table.getFilters();              // { colKey: filterValue }
     //   table.setFilter(colKey, value);  // programmatic filter
     //   table.clearFilters();
+    //   table.setVisible(key, bool);     // show / hide a column (saved)
+    //   table.moveColumn(key, targetKey, after);   // reorder (saved)
+    //   table.resetColumns();            // the page's own order, visibility and widths
+    //   table.setLabel(key, label);      // admin: rename for everyone; '' / null = the page's own name
+    //   table.columnMenu                 // the FBLib.ColumnMenu, when columnMenu was given
+    //
+    // RENAMED HEADINGS live in the company (master) settings under labelsKey
+    // as { colKey: 'Heading' }, so they need FBLib.Settings.init with a master
+    // store everyone reads (masterStorage 'userProperties', or 'reportData' on
+    // a saved report). Only FBLib.Settings.isAdmin() users may rename.
+    // getColumns() returns the renamed label, so exports and prints follow
+    // it; `defaultLabel` keeps the page's own.
     // ====================================================================
     /** Sort, filter, drag-reorder, drag-resize and lazy-render scaffolding for a plain table; start with init(). */
     const Table = (function () {
@@ -2975,8 +3409,10 @@ window.FBLib = (function () {
          * @param {Function} [opts.onReorder] - Called with the reordered columns.
          * @param {Function} [opts.onResize] - Called with (key, width) after a resize.
          * @param {string} [opts.settingsKey] - FBLib.Settings key that persists order, widths, hidden columns and sort.
+         * @param {object} [opts.columnMenu] - Adds a Columns drop-down: { mount, rename?, labelsKey?, buttonText?, buttonClass? }.
          * @returns {object} API: render(), setColumns(cols), getColumns(), sort(key, dir?), getFilters(), setFilter(key, value),
-         *   clearFilters(), getVisibleRows(), element.
+         *   clearFilters(), getVisibleRows(), setVisible(key, vis), moveColumn(key, targetKey, after), resetColumns(),
+         *   setLabel(key, label), columnMenu, element.
          * @throws {Error} Without tableEl or getRows.
          */
         function init(opts) {
@@ -3001,8 +3437,9 @@ window.FBLib = (function () {
             let tbodyEl = tableEl.querySelector('tbody');
             if (!tbodyEl) { tbodyEl = document.createElement('tbody'); tableEl.appendChild(tbodyEl); }
 
-            // Internal state.
-            let columns = (opts.columns || []).map(_normCol);
+            // Internal state. _defs keeps the page's own columns, for reset.
+            let _defs = (opts.columns || []).map(_normCol);
+            let columns = _defs.map(function (c) { return Object.assign({}, c); });
             const getRows = opts.getRows;
             const chunkSize = opts.chunkSize || 200;
             const lazy = opts.lazy !== false;
@@ -3010,6 +3447,9 @@ window.FBLib = (function () {
             const onReorder = typeof opts.onReorder === 'function' ? opts.onReorder : function () {};
             const onResize = typeof opts.onResize === 'function' ? opts.onResize : function () {};
             const settingsKey = opts.settingsKey || null;
+            const menuOpts = opts.columnMenu || null;
+            const labelsKey = (menuOpts && menuOpts.labelsKey) || ((settingsKey || tableEl.id || 'table') + 'Labels');
+            let columnMenu = null;
 
             let sortCol = null, sortDir = 'asc';
             const filters = {};
@@ -3017,13 +3457,38 @@ window.FBLib = (function () {
             let _renderOffset = 0;
             let _visRows = [];
 
-            // Restore persisted prefs (column order + widths + sort).
+            // Restore persisted prefs (column order + widths + sort), then the
+            // company's renamed headings.
             _restoreFromSettings();
+            _applyLabels();
 
             function _normCol(c) {
-                return Object.assign({
+                const col = Object.assign({
                     vis: true, sortable: true, filter: 'text', align: 'left'
                 }, c);
+                if (col.defaultLabel == null) col.defaultLabel = col.label;
+                col._defVis = col.vis;
+                return col;
+            }
+
+            function _settingsReady() {
+                return !!(window.FBLib && FBLib.Settings && FBLib.Settings._initialised);
+            }
+
+            // Renamed headings: { colKey: label } in the company settings.
+            function _labels() {
+                if (!_settingsReady()) return {};
+                try {
+                    const v = (FBLib.Settings.getMaster() || {})[labelsKey];
+                    return v && typeof v === 'object' ? v : {};
+                } catch (_) { return {}; }
+            }
+            function _applyLabels() {
+                const map = _labels();
+                columns.forEach(function (c) {
+                    const v = map[c.key];
+                    c.label = (typeof v === 'string' && v.trim()) ? v.trim() : c.defaultLabel;
+                });
             }
 
             function _restoreFromSettings() {
@@ -3045,7 +3510,12 @@ window.FBLib = (function () {
                     }
                     if (saved.hidden && Array.isArray(saved.hidden)) {
                         const hs = new Set(saved.hidden);
-                        columns.forEach(function (c) { if (hs.has(c.key)) c.vis = false; });
+                        columns.forEach(function (c) { if (hs.has(c.key) && !c.locked) c.vis = false; });
+                    }
+                    // Columns hidden by default that the user switched on.
+                    if (saved.shown && Array.isArray(saved.shown)) {
+                        const ss = new Set(saved.shown);
+                        columns.forEach(function (c) { if (ss.has(c.key) && c.menu !== false) c.vis = true; });
                     }
                     if (saved.sortCol) { sortCol = saved.sortCol; sortDir = saved.sortDir || 'asc'; }
                 } catch (_) {}
@@ -3058,6 +3528,7 @@ window.FBLib = (function () {
                         order:   columns.map(function (c) { return c.key; }),
                         widths:  columns.reduce(function (a, c) { if (c.width) a[c.key] = c.width; return a; }, {}),
                         hidden:  columns.filter(function (c) { return !c.vis; }).map(function (c) { return c.key; }),
+                        shown:   columns.filter(function (c) { return c.vis && !c._defVis; }).map(function (c) { return c.key; }),
                         sortCol: sortCol,
                         sortDir: sortDir
                     });
@@ -3076,6 +3547,7 @@ window.FBLib = (function () {
                     const th = document.createElement('th');
                     th.dataset.colKey = col.key;
                     th.textContent = col.label;
+                    th.title = col.label !== col.defaultLabel ? col.label + ' (' + col.defaultLabel + ')' : col.label;
                     if (col.width) th.style.width = col.width + 'px';
                     if (col.align === 'right')  th.style.textAlign = 'right';
                     if (col.align === 'center') th.style.textAlign = 'center';
@@ -3116,6 +3588,7 @@ window.FBLib = (function () {
                             onReorder(columns.slice());
                             _persist();
                             render();
+                            if (columnMenu) columnMenu.refresh();
                         });
                     }
                     // Drag-to-resize handle.
@@ -3365,8 +3838,77 @@ window.FBLib = (function () {
 
             // ─── PUBLIC ──────────────────────────────────────────────────
             function render() { _renderHead(); _renderBody(); }
-            function setColumns(newCols) { columns = (newCols || []).map(_normCol); _restoreFromSettings(); render(); }
+            function setColumns(newCols) {
+                _defs = (newCols || []).map(_normCol);
+                columns = _defs.map(function (c) { return Object.assign({}, c); });
+                _restoreFromSettings(); _applyLabels(); render();
+                if (columnMenu) columnMenu.refresh();
+            }
             function getColumns() { return columns.slice(); }
+
+            function setVisible(key, vis) {
+                const c = columns.find(function (x) { return x.key === key; });
+                if (!c || c.menu === false || (c.locked && !vis)) return;
+                c.vis = !!vis;
+                _persist(); render();
+            }
+            // Moves a column next to another: before it, or after it when `after`.
+            function moveColumn(key, targetKey, after) {
+                if (key === targetKey) return;
+                const fi = columns.findIndex(function (c) { return c.key === key; });
+                if (fi === -1) return;
+                const moved = columns.splice(fi, 1)[0];
+                const ti = columns.findIndex(function (c) { return c.key === targetKey; });
+                if (ti === -1) { columns.splice(fi, 0, moved); return; }
+                columns.splice(after ? ti + 1 : ti, 0, moved);
+                onReorder(columns.slice());
+                _persist(); render();
+            }
+            // Back to the page's own order, visibility and widths. Keeps the
+            // sort, the filters and the company's headings.
+            function resetColumns() {
+                columns = _defs.map(function (c) { return Object.assign({}, c); });
+                _applyLabels();
+                onReorder(columns.slice());
+                _persist(); render();
+            }
+            // Admin: renames a heading for everyone. '' / null / the page's own
+            // name drops the rename. True once the company settings hold it.
+            function setLabel(key, label) {
+                if (!_settingsReady() || !FBLib.Settings.isAdmin()) return false;
+                const c = columns.find(function (x) { return x.key === key; });
+                if (!c) return false;
+                const text = String(label == null ? '' : label).replace(/\s+/g, ' ').trim();
+                const next = Object.assign({}, _labels());
+                if (!text || text === c.defaultLabel) delete next[key]; else next[key] = text;
+                let ok;
+                try {
+                    ok = Object.keys(next).length ? FBLib.Settings.publishCompany(labelsKey, next)
+                                                   : FBLib.Settings.clearCompany(labelsKey);
+                } catch (_) { ok = false; }
+                if (!ok) return false;
+                _applyLabels();
+                render();
+                return true;
+            }
+
+            if (menuOpts) {
+                columnMenu = ColumnMenu.create({
+                    mount: menuOpts.mount,
+                    buttonText: menuOpts.buttonText,
+                    buttonClass: menuOpts.buttonClass,
+                    items: function () {
+                        return columns.filter(function (c) { return c.menu !== false; }).map(function (c) {
+                            return { key: c.key, label: c.label, defaultLabel: c.defaultLabel, vis: c.vis, locked: !!c.locked };
+                        });
+                    },
+                    canRename: function () { return !!menuOpts.rename && _settingsReady() && FBLib.Settings.isAdmin(); },
+                    onToggle: setVisible,
+                    onMove: moveColumn,
+                    onReset: resetColumns,
+                    onRename: setLabel
+                });
+            }
             function getFilters() { return Object.assign({}, filters); }
             function setFilter(key, value) { filters[key] = value; render(); }
             function clearFilters() { Object.keys(filters).forEach(function (k) { delete filters[k]; }); render(); }
@@ -3381,11 +3923,305 @@ window.FBLib = (function () {
                 setFilter: setFilter,
                 clearFilters: clearFilters,
                 getVisibleRows: getVisibleRows,
+                setVisible: setVisible,
+                moveColumn: moveColumn,
+                resetColumns: resetColumns,
+                setLabel: setLabel,
+                columnMenu: columnMenu,
                 element: tableEl
             };
         }
 
         return { init: init };
+    })();
+
+    // ====================================================================
+    // FBLib.ColumnMenu — a "Columns" drop-down button: tick to show or
+    // hide, drag a row to reorder, Show all / Reset. With canRename() an
+    // admin clicks a name to rename that heading (for everyone: the host
+    // decides where it is stored). Built for tables with several tabs,
+    // where one settings drawer can't hold every table's columns.
+    //
+    //   const menu = FBLib.ColumnMenu.create({
+    //       mount:     'colsMount',            // element / id; the button is appended
+    //       items:     () => [{ key, label, defaultLabel, vis, locked }],   // in order
+    //       onToggle:  (key, vis) => {},
+    //       onMove:    (key, targetKey, after) => {},
+    //       onReset:   () => {},               // optional: adds Reset
+    //       canRename: () => isAdmin,          // optional
+    //       onRename:  (key, label) => true,   // '' = back to defaultLabel; false = not saved
+    //       buttonText: 'Columns', buttonClass: 'fb-colmenu-btn'
+    //   });
+    //   menu.refresh();  menu.open();  menu.close();  menu.element
+    //
+    // FBLib.Table (.fb-table) and FBLib.RptCols (a report-rendered
+    // .rpt-table) build one from their columnMenu option; prefer that to
+    // calling create() yourself. Styles: fb-styles
+    // §37. The popover is position:fixed on <body>, so a scrolling or
+    // clipping parent never cuts it off.
+    // ====================================================================
+    /** A Columns drop-down: show / hide, drag to reorder, reset, and admin rename; see create(). */
+    const ColumnMenu = (function () {
+        const SVG_COLS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" ' +
+            'stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16M15 4v16"/></svg>';
+        const SVG_EDIT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" ' +
+            'stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z"/></svg>';
+        const SVG_GRIP = '<svg viewBox="0 0 10 16" fill="currentColor" aria-hidden="true"><circle cx="3" cy="3" r="1.4"/>' +
+            '<circle cx="7" cy="3" r="1.4"/><circle cx="3" cy="8" r="1.4"/><circle cx="7" cy="8" r="1.4"/>' +
+            '<circle cx="3" cy="13" r="1.4"/><circle cx="7" cy="13" r="1.4"/></svg>';
+        let _openMenu = null;
+
+        function el(tag, cls, text) {
+            const n = document.createElement(tag);
+            if (cls) n.className = cls;
+            if (text != null) n.textContent = text;
+            return n;
+        }
+
+        /**
+         * Builds a Columns drop-down button in a mount element; see the FBLib.ColumnMenu block above.
+         * @param {object} opts - Options.
+         * @param {HTMLElement|string} opts.mount - Where the button goes.
+         * @param {Function} opts.items - Returns [{ key, label, defaultLabel, vis, locked }] in display order.
+         * @param {Function} opts.onToggle - (key, vis) when a box is ticked or cleared.
+         * @param {Function} opts.onMove - (key, targetKey, after) when a row is dropped on another.
+         * @param {Function} [opts.onReset] - Back to the page's own columns; adds the Reset link.
+         * @param {Function} [opts.canRename] - True when this user may rename headings.
+         * @param {Function} [opts.onRename] - (key, label) → false when not saved.
+         * @param {string} [opts.buttonText='Columns'] - The button's text.
+         * @param {string} [opts.buttonClass='fb-colmenu-btn'] - The button's class.
+         * @returns {object} { open(), close(), refresh(), element } or null without a mount.
+         */
+        function create(opts) {
+            opts = opts || {};
+            const mount = typeof opts.mount === 'string' ? document.getElementById(opts.mount) : opts.mount;
+            if (!mount) return null;
+            const items = typeof opts.items === 'function' ? opts.items : function () { return []; };
+            const canRename = function () { try { return !!(opts.canRename && opts.canRename()); } catch (_) { return false; } };
+
+            const btn = el('button', opts.buttonClass || 'fb-colmenu-btn');
+            btn.type = 'button';
+            btn.title = 'Show, hide and reorder columns';
+            btn.innerHTML = SVG_COLS;
+            btn.appendChild(el('span', 'fb-colmenu-txt', opts.buttonText || 'Columns'));
+            const badge = el('span', 'fb-colmenu-badge');
+            btn.appendChild(badge);
+            mount.appendChild(btn);
+
+            const pop = el('div', 'fb-colmenu-pop');
+            pop.setAttribute('role', 'dialog');
+            pop.setAttribute('aria-label', 'Columns');
+            let _editing = null, _msg = '', _msgKind = '', _dragKey = null;
+
+            function setMsg(text, kind) { _msg = text || ''; _msgKind = kind || ''; }
+
+            function renderBadge() {
+                const hidden = items().filter(function (i) { return !i.vis; }).length;
+                badge.textContent = hidden ? hidden + ' hidden' : '';
+                btn.classList.toggle('fb-colmenu-on', hidden > 0);
+            }
+
+            function render() {
+                renderBadge();
+                if (!pop.isConnected) return;
+                const list = items();
+                const admin = canRename();
+                const prev = pop.querySelector('.fb-colmenu-list');
+                const scrollTop = prev ? prev.scrollTop : 0;
+                pop.innerHTML = '';
+
+                const head = el('div', 'fb-colmenu-head');
+                head.appendChild(el('span', 'fb-colmenu-title', 'Columns'));
+                const acts = el('span', 'fb-colmenu-acts');
+                const showAll = el('a', null, 'Show all');
+                showAll.onclick = function () {
+                    list.forEach(function (i) { if (!i.vis) opts.onToggle(i.key, true); });
+                    render();
+                };
+                acts.appendChild(showAll);
+                if (typeof opts.onReset === 'function') {
+                    const reset = el('a', null, 'Reset');
+                    reset.title = "Back to this table's own order and columns";
+                    reset.onclick = function () { opts.onReset(); setMsg(''); render(); };
+                    acts.appendChild(reset);
+                }
+                head.appendChild(acts);
+                pop.appendChild(head);
+                pop.appendChild(el('div', 'fb-colmenu-hint', admin
+                    ? 'Tick to show, drag to reorder. Click a name to rename it for everyone.'
+                    : 'Tick to show, drag to reorder.'));
+
+                const ul = el('div', 'fb-colmenu-list');
+                list.forEach(function (i) { ul.appendChild(row(i, admin)); });
+                pop.appendChild(ul);
+                ul.scrollTop = scrollTop;
+                if (_msg) pop.appendChild(el('div', 'fb-colmenu-msg' + (_msgKind ? ' ' + _msgKind : ''), _msg));
+                if (_editing) {
+                    const inp = pop.querySelector('.fb-colmenu-input');
+                    if (inp) { inp.focus(); inp.select(); }
+                }
+            }
+
+            function row(i, admin) {
+                const r = el('div', 'fb-colmenu-row' + (i.vis ? '' : ' off'));
+                r.dataset.key = i.key;
+                r.draggable = _editing !== i.key;
+                const grip = el('span', 'fb-colmenu-grip');
+                grip.innerHTML = SVG_GRIP;
+                r.appendChild(grip);
+
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.checked = !!i.vis;
+                cb.disabled = !!i.locked;
+                if (i.locked) cb.title = 'This column is always shown';
+                cb.onchange = function () { opts.onToggle(i.key, cb.checked); render(); };
+                r.appendChild(cb);
+
+                const renamed = i.defaultLabel != null && i.label !== i.defaultLabel;
+                if (_editing === i.key) {
+                    const inp = document.createElement('input');
+                    inp.type = 'text';
+                    inp.className = 'fb-colmenu-input';
+                    inp.maxLength = 80;
+                    inp.value = i.label;
+                    inp.placeholder = i.defaultLabel || '';
+                    let done = false;
+                    const finish = function (save) {
+                        if (done) return;
+                        done = true;
+                        _editing = null;
+                        if (save && inp.value.trim() !== i.label) {
+                            const ok = opts.onRename && opts.onRename(i.key, inp.value);
+                            setMsg(ok === false ? "That heading didn't save." : 'Saved for everyone.', ok === false ? 'err' : 'ok');
+                        }
+                        render();
+                    };
+                    inp.onkeydown = function (e) {
+                        if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+                        else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish(false); }
+                    };
+                    inp.onblur = function () { finish(true); };
+                    r.appendChild(inp);
+                    r.appendChild(el('span', 'fb-colmenu-was', i.defaultLabel && renamed ? i.defaultLabel : ''));
+                    return r;
+                }
+
+                const name = el(admin ? 'button' : 'label', 'fb-colmenu-name' + (renamed ? ' renamed' : ''), i.label);
+                if (admin) {
+                    name.type = 'button';
+                    name.title = 'Rename for everyone' + (renamed ? ' (Fishbowl name: ' + i.defaultLabel + ')' : '');
+                    name.onclick = function () { _editing = i.key; setMsg(''); render(); };
+                    const pen = el('span', 'fb-colmenu-pen');
+                    pen.innerHTML = SVG_EDIT;
+                    name.appendChild(pen);
+                } else {
+                    if (renamed) name.title = 'Fishbowl name: ' + i.defaultLabel;
+                    name.onclick = function () { if (!cb.disabled) { cb.checked = !cb.checked; cb.onchange(); } };
+                }
+                r.appendChild(name);
+                if (admin && renamed) {
+                    const undo = el('button', 'fb-colmenu-undo', '↺');
+                    undo.type = 'button';
+                    undo.title = 'Back to "' + i.defaultLabel + '" for everyone';
+                    undo.onclick = function () {
+                        const ok = opts.onRename && opts.onRename(i.key, '');
+                        setMsg(ok === false ? "That heading didn't save." : 'Saved for everyone.', ok === false ? 'err' : 'ok');
+                        render();
+                    };
+                    r.appendChild(undo);
+                }
+
+                r.addEventListener('dragstart', function (e) {
+                    if (e.target && e.target.tagName === 'INPUT') { e.preventDefault(); return; }
+                    _dragKey = i.key;
+                    r.classList.add('dragging');
+                    try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', i.key); } catch (_) {}
+                });
+                r.addEventListener('dragend', function () {
+                    _dragKey = null;
+                    pop.querySelectorAll('.fb-colmenu-row').forEach(function (x) { x.classList.remove('dragging', 'drop-before', 'drop-after'); });
+                });
+                r.addEventListener('dragover', function (e) {
+                    if (!_dragKey || _dragKey === i.key) return;
+                    e.preventDefault();
+                    try { e.dataTransfer.dropEffect = 'move'; } catch (_) {}
+                    const b = r.getBoundingClientRect();
+                    const after = e.clientY > b.top + b.height / 2;
+                    pop.querySelectorAll('.fb-colmenu-row').forEach(function (x) { if (x !== r) x.classList.remove('drop-before', 'drop-after'); });
+                    r.classList.toggle('drop-after', after);
+                    r.classList.toggle('drop-before', !after);
+                });
+                r.addEventListener('dragleave', function () { r.classList.remove('drop-before', 'drop-after'); });
+                r.addEventListener('drop', function (e) {
+                    e.preventDefault();
+                    const after = r.classList.contains('drop-after');
+                    r.classList.remove('drop-before', 'drop-after');
+                    if (!_dragKey || _dragKey === i.key) return;
+                    opts.onMove(_dragKey, i.key, after);
+                    _dragKey = null;
+                    render();
+                });
+                return r;
+            }
+
+            // Fixed position under the button, right edges aligned; flips
+            // above when there is no room below. Divides by the body zoom.
+            function place() {
+                const rect = btn.getBoundingClientRect();
+                const z = (btn.offsetWidth && rect.width) ? rect.width / btn.offsetWidth : 1;
+                const vw = window.innerWidth / z, vh = window.innerHeight / z;
+                const bt = rect.top / z, bb = rect.bottom / z, br = rect.right / z;
+                const w = Math.min(300, vw - 16);
+                pop.style.width = w + 'px';
+                pop.style.left = Math.max(8, Math.min(br - w, vw - w - 8)) + 'px';
+                const below = vh - bb - 12, above = bt - 12;
+                const up = below < 240 && above > below;
+                pop.style.maxHeight = Math.max(160, Math.min(460, up ? above : below)) + 'px';
+                pop.style.top = up ? '' : (bb + 4) + 'px';
+                pop.style.bottom = up ? (vh - bt + 4) + 'px' : '';
+            }
+
+            function onOutside(e) {
+                if (pop.contains(e.target) || btn.contains(e.target)) return;
+                close();
+            }
+            function onKey(e) { if (e.key === 'Escape' && !_editing) close(); }
+
+            function open() {
+                if (_openMenu && _openMenu !== api) _openMenu.close();
+                if (pop.isConnected) return;
+                setMsg('');
+                document.body.appendChild(pop);
+                btn.classList.add('open');
+                _openMenu = api;
+                render();
+                place();
+                document.addEventListener('pointerdown', onOutside, true);
+                document.addEventListener('keydown', onKey);
+                window.addEventListener('resize', place);
+            }
+            function close() {
+                if (!pop.isConnected) return;
+                const inp = pop.querySelector('.fb-colmenu-input');
+                if (inp) inp.blur();            // saves a rename in progress
+                _editing = null;
+                pop.remove();
+                btn.classList.remove('open');
+                if (_openMenu === api) _openMenu = null;
+                document.removeEventListener('pointerdown', onOutside, true);
+                document.removeEventListener('keydown', onKey);
+                window.removeEventListener('resize', place);
+            }
+
+            btn.addEventListener('click', function () { if (pop.isConnected) close(); else open(); });
+
+            const api = { open: open, close: close, refresh: render, element: btn };
+            renderBadge();
+            return api;
+        }
+
+        return { create: create };
     })();
 
     // ====================================================================
@@ -5011,13 +5847,19 @@ window.FBLib = (function () {
     //       onReorder: order => render(),                  // order = column keys
     //       pinned:    ['so'],                             // columns kept first, in this order
     //                                                      // (e.g. a tree column); never moved
-    //       noUnsorted: true                               // headings cycle asc ↔ desc only (a
+    //       noUnsorted: true,                              // headings cycle asc ↔ desc only (a
     //                                                      // report whose standard order is a sort)
+    //       columnMenu: {                                  // optional Columns drop-down (below)
+    //           mount:     'colsMount',                    //   element / id the button goes in
+    //           rename:    true,                           //   admins rename headings for everyone
+    //           labelsKey: 'rptColsLabels',                //   company key (default key + 'Labels')
+    //           onChange:  () => render()                  //   after a hide / show / rename / reset
+    //       }                                              //   (default: onReorder)
     //   });
     //   cols.arrange(columns, c => c.key)   // the report's columns in the user's order
     //   cols.sort()                         // { key, dir } | null
     //   cols.compare(a, b, valueOf)         // comparator for the current sort (or 0)
-    //   cols.reset()                        // forget widths, order and sort
+    //   cols.reset()                        // forget widths, order and sort (and hidden columns)
     //   FBLib.RptCols.totalsCells(columns, labelHtml, { key: figureHtml })
     //                                       // a group / totals row that stays aligned
     //                                       // whatever order the columns are in
@@ -5026,6 +5868,36 @@ window.FBLib = (function () {
     // order. Drag a heading onto another to move it there. Drag a heading's
     // right edge to resize; double-click the edge to return every column
     // to its natural width.
+    //
+    // COLUMNS DROP-DOWN (columnMenu): an FBLib.ColumnMenu button (fb-styles
+    // §37) to tick columns on and off, drag them into order (the same order
+    // as dragging a heading), Show all / Reset (= cols.reset()), and, with
+    // `rename: true`, for an admin to rename a heading for everyone. With it,
+    // arrange() returns only the columns shown, as copies whose `label` is
+    // the company's heading (`defaultLabel` keeps the page's own), so a page
+    // that builds its App table, PDF report spec and Excel sheet from
+    // arrange() gets the same columns, in the same order, with the same
+    // headings everywhere. Column flags, as FBLib.Table's: `vis: false`
+    // (hidden until the user shows it), `menu: false` (always shown, not
+    // listed: a drill or tree column), `locked: true` (listed, can't be
+    // hidden). Pinned columns are listed but don't move.
+    //   - Hidden / shown columns are saved per user with the widths, order
+    //     and sort (under `key`, as `vis: { colKey: bool }`).
+    //   - Headings live in the company (master) settings under labelsKey as
+    //     { colKey: 'Heading' }, read straight from the master copy (a user's
+    //     own row under that key can't hide them). Renaming needs
+    //     FBLib.Settings.init({ masterStorage: 'userProperties' }) (never
+    //     'reportData': it raises a native dialog in preview) and
+    //     Settings.isAdmin(), which with company.editors includes the
+    //     report's Edit Settings users.
+    //   - Document output (FB_LAUNCH output 'pdf', FBDoc.output.requested())
+    //     prints what the company would: the page's own columns and order
+    //     with the company's headings; one user's hide / move never applies,
+    //     no button is drawn and nothing is saved.
+    //   cols.setVisible(key, vis)  cols.move(key, targetKey, after)
+    //   cols.setLabel(key, label)  ('' = the page's own; false = not saved)
+    //   cols.labels()              // { colKey: heading } (company)
+    //   cols.columnMenu            // the FBLib.ColumnMenu, or null
     // ====================================================================
     /** Resize, heading-click sort and drag-reorder for a report-rendered .rpt-table; see attach(). */
     const RptCols = (function () {
@@ -5042,7 +5914,10 @@ window.FBLib = (function () {
          * @param {Function} [opts.onReorder] - Called with the new column-key order.
          * @param {string[]} [opts.pinned] - Keys kept first, in this order, and never moved.
          * @param {boolean} [opts.noUnsorted] - Headings cycle asc and desc only.
-         * @returns {object} API: decorate(), arrange(columns, keyOf?), compare(a, b, valueOf), sort(), setSort(key, dir), reset().
+         * @param {object} [opts.columnMenu] - Adds a Columns drop-down (FBLib.ColumnMenu): { mount, rename?, labelsKey?, onChange?,
+         *   buttonText?, buttonClass? }. arrange() then returns only the shown columns, relabelled with the company's headings.
+         * @returns {object} API: decorate(), arrange(columns, keyOf?), compare(a, b, valueOf), sort(), setSort(key, dir), reset(),
+         *   setVisible(key, vis), move(key, targetKey, after), setLabel(key, label), labels(), columnMenu.
          */
         function attach(opts) {
             const table = opts.table;
@@ -5052,6 +5927,16 @@ window.FBLib = (function () {
             const isPinned = k => pinned.indexOf(k) !== -1;
             const canDrag0 = typeof opts.draggable === 'function' ? opts.draggable : function () { return opts.draggable !== false; };
             const canDrag = k => !isPinned(k) && canDrag0(k);
+            // The Columns drop-down (opts.columnMenu). Without it nothing below
+            // changes what this helper does.
+            const menuOpts = opts.columnMenu && typeof opts.columnMenu === 'object' ? opts.columnMenu : null;
+            const LABELS = menuOpts ? String(menuOpts.labelsKey || KEY + 'Labels') : null;
+            // Document output prints what the company would: no user's hide / move.
+            const output = !!menuOpts && (function () {
+                try { return !!(window.FBDoc && window.FBDoc.output && window.FBDoc.output.requested()); } catch (_) { return false; }
+            })();
+            let known = [];        // every column of the last arrange() (hidden too), in order
+            let menu = null;
             let st = load();
             let resizing = false, dragKey = null;
 
@@ -5059,14 +5944,19 @@ window.FBLib = (function () {
                 let v = null;
                 try { v = Settings.resolve(KEY); } catch (_) {}
                 v = v && typeof v === 'object' ? v : {};
-                return {
+                const s = {
                     order: Array.isArray(v.order) ? v.order.slice() : [],
                     widths: v.widths && typeof v.widths === 'object' ? Object.assign({}, v.widths) : {},
                     sort: v.sort && v.sort.key ? { key: v.sort.key, dir: v.sort.dir === 'desc' ? 'desc' : 'asc' } : null
                 };
+                if (menuOpts) s.vis = v.vis && typeof v.vis === 'object' ? Object.assign({}, v.vis) : {};
+                return s;
             }
             function save() {
-                try { Settings.setUserKey(KEY, { order: st.order, widths: st.widths, sort: st.sort }); Settings.saveUser(); } catch (_) {}
+                if (output) return;
+                const v = { order: st.order, widths: st.widths, sort: st.sort };
+                if (menuOpts) v.vis = st.vis || {};
+                try { Settings.setUserKey(KEY, v); Settings.saveUser(); } catch (_) {}
             }
             const heads = () => table.tHead ? Array.prototype.slice.call(table.tHead.querySelectorAll('th[data-col]')) : [];
             const zoom = el => { const r = el.getBoundingClientRect(); return el.offsetWidth ? r.width / el.offsetWidth : 1; };
@@ -5183,6 +6073,13 @@ window.FBLib = (function () {
                 e.preventDefault();
                 const shown = heads().map(h => h.dataset.col);
                 const from = shown.indexOf(dragKey), to = shown.indexOf(th.dataset.col);
+                if (menuOpts) {
+                    // Hidden columns keep their place: move within every column.
+                    const k = dragKey;
+                    dragKey = null;
+                    move(k, th.dataset.col, from < to);
+                    return;
+                }
                 shown.splice(from, 1);
                 shown.splice(to, 0, dragKey);
                 // Keep columns not shown now (switched off) where they were.
@@ -5200,7 +6097,28 @@ window.FBLib = (function () {
 
             function arrange(columns, keyOf) {
                 keyOf = keyOf || (c => c.key);
-                if (!st.order.length) {
+                if (!menuOpts) return ordered(columns, keyOf, st.order);
+                // Document output: the page's own order (pinned first), never the user's.
+                const all = ordered(columns, keyOf, output ? [] : st.order);
+                const map = labels();
+                known = all.map(c => {
+                    const o = c && typeof c === 'object' ? c : {};
+                    const dflt = o.defaultLabel != null ? String(o.defaultLabel) : (o.label != null ? String(o.label) : String(keyOf(c)));
+                    return { key: keyOf(c), dflt: dflt, menu: o.menu !== false, locked: !!o.locked, on: o.vis !== false };
+                });
+                const res = [];
+                all.forEach((c, i) => {
+                    const k = known[i];
+                    if (!shown(k)) return;
+                    if (!c || typeof c !== 'object') { res.push(c); return; }
+                    const v = map[k.key];
+                    res.push(Object.assign({}, c, { label: typeof v === 'string' && v.trim() ? v.trim() : k.dflt, defaultLabel: k.dflt }));
+                });
+                if (menu && !menu.element.classList.contains('open')) menu.refresh();
+                return res;
+            }
+            function ordered(columns, keyOf, order) {
+                if (!order.length) {
                     if (!pinned.length) return columns.slice();
                     const first = pinned.map(p => columns.find(c => keyOf(c) === p)).filter(Boolean);
                     return first.concat(columns.filter(c => !isPinned(keyOf(c))));
@@ -5209,7 +6127,7 @@ window.FBLib = (function () {
                 // column (switched on since) goes right after its natural
                 // left-hand neighbour, so untouched columns never jump.
                 const keys = columns.map(keyOf);
-                const res = st.order.filter(k => keys.indexOf(k) !== -1);
+                const res = order.filter(k => keys.indexOf(k) !== -1);
                 keys.forEach((k, i) => {
                     if (res.indexOf(k) !== -1) return;
                     let j = i - 1;
@@ -5230,13 +6148,112 @@ window.FBLib = (function () {
                     : String(va).localeCompare(String(vb), undefined, { numeric: true, sensitivity: 'base' });
                 return st.sort.dir === 'desc' ? -d : d;
             }
+            function reset() {
+                st = { order: [], widths: {}, sort: null };
+                if (menuOpts) st.vis = {};
+                save(); decorate();
+            }
+
+            // ---- The Columns drop-down (opts.columnMenu) --------------------
+            // A column is shown unless the user hid it (or it starts hidden,
+            // vis: false, and they haven't shown it). Document output: the
+            // page's own visibility. menu: false columns are the page's to show.
+            function shown(k) {
+                if (!k.menu) return k.on;
+                if (k.locked) return true;
+                if (output || !st.vis || st.vis[k.key] === undefined) return k.on;
+                return !!st.vis[k.key];
+            }
+            // The company's headings, read from the master copy itself.
+            function labels() {
+                if (!LABELS) return {};
+                try {
+                    const v = (Settings.getMaster() || {})[LABELS];
+                    return v && typeof v === 'object' ? Object.assign({}, v) : {};
+                } catch (_) { return {}; }
+            }
+            function changed() {
+                const fn = menuOpts && typeof menuOpts.onChange === 'function' ? menuOpts.onChange : opts.onReorder;
+                if (typeof fn === 'function') fn(st.order.slice());
+            }
+            function setVisible(key, vis) {
+                if (!menuOpts || output) return;
+                const k = known.find(x => x.key === key);
+                if (!k || !k.menu || (k.locked && !vis)) return;
+                // Never hide the last column shown.
+                if (!vis && known.filter(x => shown(x) && x.key !== key).length === 0) return;
+                st.vis[key] = !!vis;
+                save();
+                changed();
+            }
+            // Moves a column before another (after it when `after`), counting
+            // hidden columns, so they keep their place. Pinned columns don't move.
+            function move(key, targetKey, after) {
+                if (output || key === targetKey || !canDrag(key) || isPinned(targetKey)) return;
+                const order = known.length ? known.map(x => x.key) : heads().map(h => h.dataset.col);
+                const from = order.indexOf(key);
+                if (from === -1 || order.indexOf(targetKey) === -1) return;
+                order.splice(from, 1);
+                const to = order.indexOf(targetKey);
+                order.splice(after ? to + 1 : to, 0, key);
+                // Columns not in this render (another grouping's) keep their place after.
+                st.order = order.concat(st.order.filter(k => order.indexOf(k) === -1));
+                save();
+                if (typeof opts.onReorder === 'function') opts.onReorder(st.order.slice());
+            }
+            function canRename() {
+                try {
+                    return !!(menuOpts && menuOpts.rename) && !output && Settings._initialised && Settings.isAdmin() &&
+                        Settings.masterStorage() === 'userProperties';
+                } catch (_) { return false; }
+            }
+            // Admin: renames a heading for everyone ('' / null / the page's own
+            // name drops the rename). True once the company settings hold it.
+            function setLabel(key, label) {
+                if (!canRename()) return false;
+                const k = known.find(x => x.key === key);
+                if (!k) return false;
+                const text = String(label == null ? '' : label).replace(/\s+/g, ' ').trim();
+                const next = labels();
+                if (!text || text === k.dflt) delete next[key]; else next[key] = text;
+                let ok;
+                try { ok = Object.keys(next).length ? Settings.publishCompany(LABELS, next) : Settings.clearCompany(LABELS); }
+                catch (_) { ok = false; }
+                if (!ok) return false;
+                changed();
+                return true;
+            }
+            if (menuOpts && !output) {
+                menu = ColumnMenu.create({
+                    mount: menuOpts.mount,
+                    buttonText: menuOpts.buttonText,
+                    buttonClass: menuOpts.buttonClass,
+                    items: function () {
+                        const map = labels();
+                        return known.filter(k => k.menu).map(k => ({
+                            key: k.key, label: typeof map[k.key] === 'string' && map[k.key].trim() ? map[k.key].trim() : k.dflt,
+                            defaultLabel: k.dflt, vis: shown(k), locked: k.locked
+                        }));
+                    },
+                    canRename: canRename,
+                    onToggle: setVisible,
+                    onMove: move,
+                    onReset: function () { reset(); changed(); },
+                    onRename: setLabel
+                });
+            }
             return {
                 decorate: decorate,
                 arrange: arrange,
                 compare: compare,
                 sort: () => (st.sort ? { key: st.sort.key, dir: st.sort.dir } : null),
                 setSort: (key, dir) => { st.sort = key ? { key: key, dir: dir === 'desc' ? 'desc' : 'asc' } : null; save(); decorate(); },
-                reset: () => { st = { order: [], widths: {}, sort: null }; save(); decorate(); }
+                reset: reset,
+                setVisible: setVisible,
+                move: move,
+                setLabel: setLabel,
+                labels: labels,
+                columnMenu: menu
             };
         }
         /**
@@ -5629,6 +6646,7 @@ window.FBLib = (function () {
         Columns: Columns,
         Picker: Picker,
         Table: Table,
+        ColumnMenu: ColumnMenu,
         FilterViews: FilterViews,
         RowCap: RowCap,
         RptCols: RptCols,

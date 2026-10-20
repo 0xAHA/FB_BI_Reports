@@ -36,6 +36,7 @@ failed" banner.
 | The stock report's options (jrxml parameters) on screen | `FBDoc.Options` (+ `FBDoc.presets`) |
 | The company's report formats (decimals, dates, edition, logo) | `FBDoc.env` |
 | A barcode | `FBDoc.code128.svg(text, { module: 1, quiet: 0 })` |
+| Print HTML that isn't on the screen (a count sheet, a receipt) on pages | `FBDoc.printPages({ docs, page, title })`: `paginate` off-screen + `printWindow`, in one call |
 | Print a page you laid out yourself | `FBDoc.printWindow({ mount })` |
 
 `Template/List_Report_Template.htm` and `Template/Record_Document_Template.htm`
@@ -65,9 +66,11 @@ PDF.refresh();
 PDF.print();
 ```
 
-Returns `{ mode(), setMode(m), refresh(), print(), paper(), settled() }`.
+Returns `{ mode(), setMode(m), refresh(), print(), paper(), settled(), setPaper(page), setOrientation(o) }`.
 `refresh()` is cheap: it re-lays the sheets only while the PDF view shows.
 `settled()` resolves once the PDF view has laid out what is on show (tests).
+`paper()` is the paper on show, `{ size, orientation }` (a roll: `{ roll: true,
+label, widthPt, wMm, hMm }`).
 
 **Paper, first match wins** (the same in every report):
 1. the user's own choice in the paper bar (remembered per user, key `docView`);
@@ -78,7 +81,63 @@ Returns `{ mode(), setMode(m), refresh(), print(), paper(), settled() }`.
    else by edition: Letter for US / CA, A4 elsewhere) unless the report's
    Page_setup setting was chosen on purpose (`page.chosen`).
 
-Document output (below) never uses the user's paper.
+Over all three: the orientation the report's layout needs (`setOrientation`,
+below) wins, and roll paper replaces them.
+
+Document output (below) never uses the user's paper, nor the user's own
+options (`FBDoc.Options`): it prints what the company would.
+
+### The report's paper from code — `setPaper` / `setOrientation`
+
+When a report option changes the layout (the Packing Slip's *Page layout =
+Landscape*, the POS Receipt's *Format*), the report changes its own paper:
+
+```js
+PDF.setOrientation('landscape');   // the layout needs landscape; null = it needs none again
+PDF.setPaper({ size: 'Legal' });   // the report's standard size (opts.page.size); chosen: true beats the all-reports size
+PDF.setPaper({ roll: true, widthPt: 216, marginPt: 0, label: '3 in roll' });   // roll paper (below)
+PDF.setPaper({ roll: false });     // back to sheets
+```
+
+- `setPaper(page)` takes the form of `opts.page`; fields left out keep their
+  value. It replaces the paper the report passed in and re-lays the view. It
+  never writes the user's saved paper or the company's.
+- **orientation** is what the layout *needs*: it wins over the user's own,
+  the company's and the standard orientation, so a user who saved *portrait*
+  still gets landscape for a landscape layout. The paper bar's orientation
+  buttons are off while it applies; the size stays the user's / company's /
+  standard one. `null` drops it (the order above applies again), which is what
+  a layout that suits either orientation passes. *Use for everyone* while it
+  applies saves the size and the bar's own orientation, not the layout's.
+- **size** replaces the stock report's size: the user's own paper and the
+  company paper still come first, the all-reports size too unless `chosen`.
+- Document output reports the paper actually used (`FB_DOC.paper`). A report
+  sets its layout's paper from the option values document output uses (the
+  company's), so the two always agree.
+
+### Roll paper (receipt printers)
+
+`page: { roll: true, widthPt: 216, marginPt?: 0, label?: '3 in roll' }` (at
+`Report.view` or through `setPaper`; `FBDoc.page.roll(r)` makes the PageSpec
+for `FBDoc.paginate`):
+
+- one sheet `widthPt` wide and **as tall as its content** (measured after
+  layout, rounded up to a point, + 2pt), never split into pages (`data-pdf-break`
+  and `brk` are ignored; past 5 m it would go onto a second sheet, with a
+  warning); `marginPt` is the sheet padding (a number or `{ t, r, b, l }`);
+- **no print inset**: `@page { size: W H; margin: 0 }` with the measured height,
+  in the report page's print CSS (the toolbar's Print / Save, `body.fbdoc-on`)
+  and the print window (`PDF.print()`) alike;
+- the paper bar shows the roll (`3 in roll (216 pt wide)`) and no sheet sizes,
+  orientation or paper buttons; the user's and the company's sheet paper don't
+  apply;
+- `pages(geom, page)` gets `geom.CWpt` = the roll's width less its margins; a
+  report spec (`doc`) works too (one sheet, its footer on it).
+- Document output reports `paper: { name: null, orientation: 'portrait', wMm,
+  hMm, roll: true, label, insetMm: 0 }`: the same members as a sheet, plus the
+  roll's (a host that knows them prints at that size with no margin).
+
+`iReport_Ports/SalesOrder/POSReceipt.htm` (3 in / 2 in rolls) is the example.
 
 ### Report spec (`doc`)
 
@@ -199,21 +258,27 @@ Item kinds: none = checkbox; `[[value, label], …]` or `['a', 'b']` = select;
 `'text'` = text box. The page's `FBLib.Settings.init` must declare
 `company: { keys: ['filters'], editors: true }`.
 
+In document output (`FB_LAUNCH.output 'pdf'`) the starting point stops at the
+company defaults: one user's own choices are never used, and nothing is saved
+(as with the paper).
+
 ## Smaller pieces
 
 | API | What it does |
 |---|---|
-| `FBDoc.env(extraSysKeys)` | The company's formats: `edition`, `isAU` / `isUS` / `isCaOrIntl`, `multiCurrency`, `price` / `cost` / `total` / `qty` / `date` patterns, `barcodeDI`, `useCode`, `logo`, `sys` |
+| `FBDoc.env(extraSysKeys)` | The company's formats: `edition`, `isAU` / `isUS` / `isCaOrIntl`, `multiCurrency`, `price` / `cost` / `total` / `qty` / `date` patterns, `barcodeDI`, `useCode`, `logo` (a data: URL with no whitespace, so it works in a CSS `url()` as well as an `<img>`), `sys` |
 | `FBDoc.fmt.number(pattern, v, { symbol, rounding })`, `.date(pattern, v)`, `.currencySymbol(code, useCode)`, `.printedAt()` | Java DecimalFormat / SimpleDateFormat ports, as the jrxml prints |
 | `FBDoc.q(sql, params)` | SELECT with `?` bound inline (escaped); throws on Fishbowl's error row |
-| `FBDoc.sys(keys)`, `FBDoc.presets(path)`, `FBDoc.companyLogo()` | system properties, a stock report's saved options, the company image |
+| `FBDoc.sys(keys)`, `FBDoc.presets(path)`, `FBDoc.companyLogo()` | system properties, a stock report's saved options, the company image (a data: URL; the line breaks Fishbowl stores in the base64 are removed, since a CSS `url()` stops at the first one) |
 | `FBDoc.param(v, fallback)`, `.fromEl(id)`, `.bool`, `.int` | a report setting's value (the token's default when unsubstituted) |
 | `FBDoc.launch.get()` | the normalised `window.FB_LAUNCH` (see [launch-context.md](launch-context.md)) |
 | `FBDoc.output.requested() / loading() / ready(info) / fail(msg)` | document output state for a host |
-| `FBDoc.picker(opts)` | the typeahead record picker FBDoc.Record uses |
+| `FBDoc.picker(opts)` | the typeahead record picker FBDoc.Record uses: `{ input, button?, filters?, search(term, filters), onPick, onEnter?, onFilters? }` → `{ open, close, filters, setCurrent }`. Its list is `position: fixed` under the input (above it when there is no room below), follows the input when the page or a box around it scrolls, and closes once the input scrolls out of sight. Opening it with the shown record's label unchanged browses everything; once the user types, the text is a search, even when it spells the shown record's label (so Enter picks that record) |
 | `FBDoc.page.resolve(raw)`, `FBDoc.page.geometry(spec)` | paper from a Page_setup value, and its geometry |
+| `FBDoc.page.roll({ widthPt, marginPt, label })` | a roll-paper PageSpec (one sheet as tall as its content, no print inset) |
 | `FBDoc.paper.all()` / `.setAll(size)` | the paper size for every report |
 | `FBDoc.printWindow({ mount, title, win })` | print laid-out sheets through a new window (`window.print()` on the report page is unreliable in Fishbowl's browser) |
+| `FBDoc.printPages({ docs, page, title, win?, noPrint? })` → `Promise<{ win, result }>` | "print this HTML on pages": `paginate`'s options without a mount, laid out in an off-screen host (inline styles, so `paginate`'s `.fbdoc-canvas { position: relative }` can't pull it on screen), printed through `printWindow`, and the host removed. It opens the window at once, so call it from the click; `win` is null when the popup was blocked, and a layout error closes the window and rejects. Not in document output. `Template/Form_Tool_Template.htm`'s `printRecord()` is the example |
 | `FBDoc.layout(model)` | the pure page-break algorithm (Node-testable) |
 
 ## Tests
@@ -229,4 +294,10 @@ Promoted from the Paperwork proof of concept (archived in
 `archived/Other_NOT_FOR_PRODUCTION/Paperwork_POC/`). Its screen shell
 `FBDoc.app` ran the four paperwork documents as paper-only pages until
 2026-10-16, when they moved to the REPORT chrome with App and PDF views and
-`FBDoc.Record` / `FBDoc.Options` / `FBDoc.env` replaced it.
+`FBDoc.Record` / `FBDoc.Options` / `FBDoc.env` replaced it. 2026-10-20: roll
+paper and `setPaper` / `setOrientation`, replacing the POS Receipt's own roll
+page and the Packing Slip's orientation-button workaround; document output's
+options stopped taking one user's own choices. Later that day: `printPages`,
+the picker's fixed list that follows a scrolling page and searches a retyped
+label, and `companyLogo` without line breaks (the templates' own workarounds
+for all three are gone).

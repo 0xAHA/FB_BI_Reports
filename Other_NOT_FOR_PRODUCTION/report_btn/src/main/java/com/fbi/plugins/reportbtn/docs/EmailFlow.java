@@ -52,15 +52,24 @@ final class EmailFlow {
                 DocDefaults.setUsesMailProgram(userId, on);
             }
         };
-        // The To / Cc / Bcc buttons: the record's own address, its customer or vendor contacts, the Fishbowl users.
-        EmailComposer.AddressBook book = () -> {
-            List<EmailAddresses.Address> all = new ArrayList<>();
-            for (String a : rec.to) {
-                all.add(new EmailAddresses.Address("", a, "This " + slot.module.noun));
+        // The address book behind To / Cc / Bcc, in the stock window's two tabs: the record's
+        // own address and its customer's or vendor's contacts; the company's contacts and the users.
+        EmailComposer.AddressBook book = new EmailComposer.AddressBook() {
+            @Override
+            public EmailAddresses.Book read() {
+                List<EmailAddresses.Address> record = new ArrayList<>();
+                for (String a : rec.to) {
+                    record.add(new EmailAddresses.Address("", a, "This " + slot.module.noun));
+                }
+                record.addAll(EmailAddresses.forRecord(Docs::rows, slot.module.code, recordId));
+                return new EmailAddresses.Book(EmailAddresses.recordTab(slot.module.code, record), record,
+                    EmailAddresses.company(Docs::rows), slot.module.mail.name());
             }
-            all.addAll(EmailAddresses.forRecord(Docs::rows, slot.module.code, recordId));
-            all.addAll(EmailAddresses.users(Docs::rows));
-            return all;
+
+            @Override
+            public void log(String message, Throwable error) {
+                Docs.log(message, error);
+            }
         };
         String note = Docs.blank(t.source) ? "No email template is set for " + slot.module.noun + "s (Tools › Options › Email)."
             : "Template: " + t.source;

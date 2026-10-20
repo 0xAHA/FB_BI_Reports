@@ -13,7 +13,14 @@
  App / PDF toggle; FBDoc.launch; and FBDoc.Record / FBDoc.Options / FBDoc.env,
  which every record document runs on. The POC's screen shell FBDoc.app ran the
  paperwork documents as paper-only pages until 2026-10-16, when they moved to
- the REPORT chrome with App and PDF views; it was removed then.
+ the REPORT chrome with App and PDF views; it was removed then. 2026-10-20:
+ roll paper (FBDoc.page.roll, page { roll: true, widthPt }: one page as tall
+ as its content, no print inset) and the report's own paper set from code
+ (Report.view's setPaper / setOrientation); document output's options never
+ take one user's own choices. Later on 2026-10-20: FBDoc.printPages (lay
+ out and print HTML off-screen in one call), the picker follows a scrolling
+ page and searches a retyped label, and the company logo comes without line
+ breaks (a CSS url() takes it).
 
  Replaces JasperReports output with HTML that prints and saves as PDF from the
  BI Report module's own Print / Save / Email buttons. The page IS the paper, so
@@ -60,7 +67,7 @@
   'use strict';
 
   var FBDoc = {};
-  FBDoc.BUILD = '2026.10.19-3670837';   // @fb-build
+  FBDoc.BUILD = '2026.10.20-6da4628';   // @fb-build
   FBDoc.VERSION = FBDoc.BUILD;
 
   // ===================================================================
@@ -320,10 +327,11 @@
   // preview frame); W/H = the printable sheet. H is floored to Chromium's layout
   // unit (1/64 px) and shortened by `shortPx`, so accumulated rounding can never
   // push a sheet onto an extra (blank) printed page.
+  // A roll (spec.roll) has no print inset: its page is the paper, margin 0.
   function geometry(spec, opts) {
     opts = opts || {};
     var floor64 = function (px) { return Math.floor(px * 64) / 64; };
-    var insetMm = opts.printInsetMm != null ? opts.printInsetMm : PRINT_INSET_MM;
+    var insetMm = opts.printInsetMm != null ? opts.printInsetMm : spec.roll ? 0 : PRINT_INSET_MM;
     var inset = insetMm * PX_PER_MM;
     var paperW = floor64(spec.wMm * PX_PER_MM), paperH = floor64(spec.hMm * PX_PER_MM);
     var W = floor64(paperW - 2 * inset);
@@ -339,7 +347,26 @@
     };
   }
 
-  FBDoc.page = { resolve: resolvePage, geometry: geometry, SIZES: SIZES, JASPER_MARGIN_MM: JASPER_MARGIN_MM, PRINT_INSET_MM: PRINT_INSET_MM };
+  // Roll paper (a receipt printer): one sheet `widthPt` wide and as tall as its
+  // content, never split into pages, no print inset (@page margin 0). The
+  // PageSpec starts ROLL_MAX_MM tall, the most one roll page may hold;
+  // paginate() measures the laid-out sheet and sets spec.hMm to its height.
+  //   r = { widthPt: 216, marginPt?: n | { t, r, b, l } (pt, default 0), label?: '3 in roll' }
+  var ROLL_MAX_MM = 5000;
+  function rollPage(r) {
+    r = r || {};
+    var warnings = [];
+    var wPt = parseFloat(r.widthPt);
+    if (!(wPt >= 72 && wPt <= 1000)) { warnings.push('roll width ' + r.widthPt + 'pt out of range (72 to 1000) — using 216pt'); wPt = 216; }
+    var mp = r.marginPt, box = mp && typeof mp === 'object' ? mp : { t: mp, r: mp, b: mp, l: mp };
+    var margin = {};
+    ['t', 'r', 'b', 'l'].forEach(function (k) { var v = parseFloat(box[k]); margin[k] = v > 0 ? Math.min(v, wPt / 3) / PT_PER_MM : 0; });
+    var label = r.label || (Math.round(wPt / 72 * 100) / 100) + ' in roll';
+    return { name: null, roll: true, label: String(label), widthPt: wPt, wMm: wPt / PT_PER_MM, hMm: ROLL_MAX_MM, orientation: 'portrait',
+             margin: margin, source: 'roll', raw: null, warnings: warnings };
+  }
+
+  FBDoc.page = { resolve: resolvePage, geometry: geometry, roll: rollPage, SIZES: SIZES, JASPER_MARGIN_MM: JASPER_MARGIN_MM, PRINT_INSET_MM: PRINT_INSET_MM, ROLL_MAX_MM: ROLL_MAX_MM };
   FBDoc.units = { PX_PER_MM: PX_PER_MM, PX_PER_PT: PX_PER_PT, PT_PER_MM: PT_PER_MM };
 
   // ===================================================================
@@ -871,13 +898,17 @@
     return out;
   }
 
+  // The company logo as a data: URL, or null. Fishbowl stores the base64 with
+  // line breaks: fine in an <img src>, but a CSS url() stops at the first one,
+  // so every whitespace character is removed.
   async function companyLogo() {
     var rows = await q("SELECT imageFull AS full, imageThumbnail AS thumb FROM image " +
       "WHERE LOWER(tableName) = 'company' AND recordId = 1 ORDER BY id LIMIT 1");
     if (!rows.length) return null;
     var b = rows[0].full || rows[0].thumb;
     if (!b) return null;
-    b = String(b);
+    b = String(b).replace(/\s+/g, '');
+    if (!b) return null;
     return b.indexOf('data:') === 0 ? b : 'data:image/png;base64,' + b;
   }
 
@@ -1020,7 +1051,9 @@
     var t0 = Date.now();
     ensureCss();
     var spec = opts.page, slack = opts.slackPx == null ? 2 : opts.slackPx;
-    var g = geometry(spec, { shortPx: opts.shortPx, printInsetMm: opts.printInsetMm });
+    // A roll is laid out on one sheet ROLL_MAX_MM tall, then cut to its content (below).
+    var g = geometry(spec.roll ? Object.assign({}, spec, { hMm: ROLL_MAX_MM }) : spec, { shortPx: opts.shortPx, printInsetMm: opts.printInsetMm });
+    g.spec = spec;
     applyPageCss(spec, g.insetMm);
     var mount = opts.mount;
     mount.classList.add('fbdoc-canvas');
@@ -1049,7 +1082,7 @@
         Object.keys(m.theads).forEach(function (key) { chrome[key] = hOf(m.theads[key]); });
         var groups = {};
         var items = m.blocks.map(function (b, idx) {
-          var it = { h: hOf(b.node), table: b.def.table || null, kwn: !!b.def.kwn, kwp: !!b.def.kwp, brk: !!b.def.brk, grp: b.def.grp || [] };
+          var it = { h: hOf(b.node), table: b.def.table || null, kwn: !!b.def.kwn, kwp: !!b.def.kwp, brk: !!b.def.brk && !spec.roll, grp: b.def.grp || [] };
           if (b.def.groupHeader) groups[b.def.groupHeader] = { header: idx, repeatH: b.repeatNode ? hOf(b.repeatNode) : 0 };
           if (b.def.split) {
             var st = splitTarget(b.node);
@@ -1150,7 +1183,13 @@
             }
           }
           sheet.setAttribute('data-fbdoc-page', pi + 1);
-          docSheets.push({ sheet: sheet, body: body, last: pg.last });
+          // A roll's height, estimated from the measurements, for a mount that isn't laid out.
+          var est = 0;
+          if (spec.roll && pages.length === 1) {
+            est = g.pad.t + g.pad.b + hdrH + lastH + items.reduce(function (s, x) { return s + x.h; }, 0) +
+              Object.keys(chrome).reduce(function (s, key) { return s + chrome[key]; }, 0);
+          }
+          docSheets.push({ sheet: sheet, body: body, last: pg.last, est: est });
         });
 
         // ---- page numbers + zebra (per sheet, per table run, like Jasper's PAGE_COUNT)
@@ -1184,6 +1223,7 @@
       });
       stage.appendChild(scaler);
       mount.replaceChildren(stage);
+      if (spec.roll) cutRoll(spec, g, sheets, scaler, opts.shortPx == null ? 2 : opts.shortPx, warnings);
       fitView(mount, g, sheets.length);
 
       // ---- verify: any sheet whose body overflows -> retry with more slack
@@ -1204,6 +1244,29 @@
     } finally {
       host.remove();
     }
+  }
+
+  // A roll: each sheet is cut to its content (its natural height, measured with
+  // the sheet's height released), rounded up to a whole point plus 2pt; the
+  // page is that tall (the tallest, if a very long roll ran onto a second
+  // sheet). spec.hMm becomes the page height, and @page says it, margin 0.
+  function cutRoll(spec, g, sheets, scaler, shortPx, warnings) {
+    var maxPx = 0;
+    sheets.forEach(function (s) {
+      s.sheet.style.height = 'auto'; s.body.style.flex = 'none';
+      var n = s.sheet.offsetHeight || s.est || 0;
+      s.body.style.flex = '';
+      maxPx = Math.max(maxPx, n);
+    });
+    if (sheets.length > 1) warnings.push('roll: ' + sheets.length + ' sheets (the receipt is over ' + ROLL_MAX_MM + ' mm long)');
+    var hPt = Math.ceil(maxPx / PX_PER_PT) + 2;
+    spec.hMm = hPt / PT_PER_MM;
+    g.paperH = Math.floor(hPt * PX_PER_PT * 64) / 64;
+    g.H = g.paperH - shortPx;
+    g.innerH = g.H - g.pad.t - g.pad.b;
+    sheets.forEach(function (s) { s.sheet.style.height = g.H + 'px'; });
+    Array.prototype.forEach.call(scaler.children, function (p) { p.style.height = g.paperH + 'px'; });
+    applyPageCss(spec, g.insetMm);
   }
 
   function appendContent(el, content, ctx) {
@@ -1331,8 +1394,48 @@
     return w;
   }
 
+  // ===================================================================
+  //  FBDoc.printPages(opts) -> Promise<{ win, result }>
+  //  "Print this HTML on pages" in one call: lays opts out with paginate()
+  //  (its options, without a mount) in an off-screen host, prints the pages
+  //  through printWindow() and removes the host. For a tool's printout (a
+  //  count sheet, a receipt) that never shows on the page. The print window
+  //  opens before the layout, so call it straight from the click.
+  //    opts.title   the print window's title
+  //    opts.win     a window you opened during the click (optional)
+  //    opts.noPrint lay out and copy into the window, but don't print
+  //  win is null when the popup was blocked (result too); a layout error
+  //  closes the window and rejects. Never in document output (it logs and
+  //  returns { win: null }).
+  // ===================================================================
+  async function printPages(opts) {
+    opts = opts || {};
+    if (outputRequested()) { log('printPages: not in document output', 'warn'); return { win: null, result: null }; }
+    var win = opts.win || window.open('', '_blank');
+    if (!win) { log('printPages: popup blocked', 'warn'); return { win: null, result: null }; }
+    var host = document.createElement('div');
+    host.setAttribute('aria-hidden', 'true');
+    // Inline, so it wins over .fbdoc-canvas (position: relative) that paginate adds.
+    host.style.cssText = 'position:absolute;left:-30000px;top:0;width:1200px;height:0;overflow:hidden;padding:0';
+    document.body.appendChild(host);
+    try {
+      var p = Object.assign({}, opts, { mount: host });
+      delete p.win; delete p.title; delete p.noPrint;
+      var result = await paginate(p);
+      printWindow({ mount: host, title: opts.title, win: win, noPrint: opts.noPrint });
+      return { win: win, result: result };
+    } catch (e) {
+      try { win.close(); } catch (_) {}
+      throw e;
+    } finally {
+      try { if (host._fbdocRO) host._fbdocRO.disconnect(); } catch (_) {}
+      host.remove();
+    }
+  }
+
   FBDoc.paginate = paginate;
   FBDoc.printWindow = printWindow;
+  FBDoc.printPages = printPages;
   FBDoc.CSS = CSS;
 
   // ===================================================================
@@ -1346,10 +1449,15 @@
   //    search: async (term, filterValues) -> [{ value, label, sub?, meta?:[..] }]
   //    onPick(item), onEnter?(text), onFilters?(filterValues)   (persist them)
   //  })
-  //  Returns { open, close, filters() }.
+  //  Returns { open, close, filters(), setCurrent(label) }.
+  //  The list is position:fixed under the input (above it when there is no
+  //  room below) and follows the input when the page or a box around it
+  //  scrolls; it closes once the input scrolls out of sight. Opening it
+  //  with the shown record's label unchanged browses everything; a label
+  //  typed again is searched for (Enter then picks that record).
   // ===================================================================
   var PICK_CSS = [
-    '.fbdoc-pick{position:absolute;z-index:10050;background:#fff;border:1px solid #c9d1d6;border-radius:8px;',
+    '.fbdoc-pick{position:fixed;z-index:10050;background:#fff;border:1px solid #c9d1d6;border-radius:8px;',
     '  box-shadow:0 8px 24px rgba(0,0,0,.18);display:none;min-width:420px;max-width:640px;font:12px/1.35 "Segoe UI",sans-serif;color:#1d2a30}',
     '.fbdoc-pick-filters{padding:8px 10px 6px;border-bottom:1px solid #e3e7e9;background:#f7f9fa;border-radius:8px 8px 0 0}',
     '.fbdoc-pick-frow{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin-bottom:4px}',
@@ -1385,6 +1493,9 @@
     // The label of the record on show: while the box still holds it unchanged,
     // opening the dropdown browses everything instead of searching for it.
     var current = '';
+    // Typed since the record was shown? Then the box's text is a search, even
+    // when it spells the record's own label.
+    var edited = false;
 
     function values() {
       var v = {}; filters.forEach(function (f) { v[f.key] = f.multi ? f.value.slice() : f.value; }); return v;
@@ -1402,19 +1513,23 @@
     }
     function place() {
       var r = input.getBoundingClientRect();
+      if (r.bottom < 0 || r.top > window.innerHeight || (!r.width && !r.height)) { close(); return; }
       var w = Math.min(640, Math.max(420, r.width));
       var left = Math.min(r.left, window.innerWidth - w - 8);
-      box.style.left = (Math.max(8, left) + window.scrollX) + 'px';
-      box.style.top = (r.bottom + window.scrollY + 3) + 'px';
+      box.style.left = Math.max(8, left) + 'px';
+      var h = box.offsetHeight, top = r.bottom + 3;
+      if (top + h > window.innerHeight - 8 && r.top - 3 - h >= 8) top = r.top - 3 - h;
+      box.style.top = top + 'px';
     }
     function renderList(note) {
-      if (note) { list.innerHTML = '<div class="fbdoc-pick-note">' + esc(note) + '</div>'; return; }
+      if (note) { list.innerHTML = '<div class="fbdoc-pick-note">' + esc(note) + '</div>'; if (isOpen) place(); return; }
       list.innerHTML = items.map(function (it, i) {
         return '<div class="fbdoc-pick-row' + (i === active ? ' act' : '') + '" data-i="' + i + '">' +
           '<span class="lb">' + esc(it.label) + '</span><span class="sb">' + esc(it.sub || '') + '</span>' +
           (it.meta || []).map(function (m) { return '<span class="mt">' + esc(m) + '</span>'; }).join('') + '</div>';
       }).join('');
       var act = list.querySelector('.act'); if (act && act.scrollIntoView) act.scrollIntoView({ block: 'nearest' });
+      if (isOpen) place();
     }
     function show() {
       if (!isOpen) { isOpen = true; renderFilters(); box.style.display = 'block'; }
@@ -1425,7 +1540,7 @@
     function run(delay) {
       clearTimeout(timer);
       var my = ++token, term = input.value.trim();
-      if (term === current) term = '';
+      if (term === current && !edited) term = '';
       timer = setTimeout(async function () {
         if (!isOpen) return;
         renderList('Searching…');
@@ -1445,12 +1560,13 @@
       var it = items[i]; if (!it) return;
       close();
       input.value = current = String(it.label);
+      edited = false;
       opts.onPick(it);
     }
 
     input.addEventListener('focus', function () { input.select(); open(); });
     input.addEventListener('click', function () { if (!isOpen) open(); });
-    input.addEventListener('input', function () { show(); run(); });
+    input.addEventListener('input', function () { edited = true; show(); run(); });
     input.addEventListener('keydown', function (e) {
       if (e.key === 'ArrowDown') { if (!isOpen) open(); else { active = Math.min(items.length - 1, active + 1); renderList(); } e.preventDefault(); }
       else if (e.key === 'ArrowUp') { active = Math.max(0, active - 1); renderList(); e.preventDefault(); }
@@ -1483,8 +1599,10 @@
     });
     input.addEventListener('blur', function () { setTimeout(function () { if (document.activeElement !== input) close(); }, 150); });
     window.addEventListener('resize', function () { if (isOpen) place(); });
+    // Any scroll (the page, or a box the input sits in): keep the list on the input.
+    window.addEventListener('scroll', function (e) { if (isOpen && !box.contains(e.target)) place(); }, true);
     return { open: open, close: close, filters: values,
-             setCurrent: function (label) { current = String(label == null ? '' : label); input.value = current; } };
+             setCurrent: function (label) { current = String(label == null ? '' : label); input.value = current; edited = false; } };
   }
   FBDoc.picker = picker;
 
@@ -1512,7 +1630,8 @@
   //  past that every column scales.
   //
   //  FBDoc.Report.render(mount, spec, pageSpec) -> paginate result
-  //  FBDoc.Report.view(opts)  -> { mode, setMode, refresh, print }
+  //  FBDoc.Report.view(opts)  -> { mode, setMode, refresh, print, paper, settled,
+  //                                setPaper, setOrientation }
   //    the App / PDF icon toggle (header) + paper bar + sheets, with the
   //    user's view, paper size and orientation remembered per report (the
   //    report's FBLib.Settings, user key "docView").
@@ -1933,7 +2052,10 @@
    *   page:         the original's paper { size: 'Letter', orientation: 'landscape' };
    *                 chosen: true when it comes from the report's Page_setup
    *                 setting changed on purpose: it then wins over the size
-   *                 for all reports
+   *                 for all reports. Or roll paper:
+   *                 { roll: true, widthPt: 216, marginPt?: 0, label?: '3 in roll' }
+   *                 (FBDoc.page.roll): one page at the roll's width, as tall as
+   *                 the content; the paper bar then shows the roll only.
    *   doc():        the report spec (above), built from the current state
    *   pages(geom, page): instead of doc(), a document that lays out its own
    *                 sheets (a paperwork document): returns an FBDoc.paginate
@@ -1943,18 +2065,48 @@
    *   title():      the print window's title (optional)
    *   onMode(mode): called after the view changes (optional)
    * }
-   * Returns { mode(), setMode(m), refresh(), print(), paper(), settled() }:
+   * Returns { mode(), setMode(m), refresh(), print(), paper(), settled(),
+   *           setPaper(page), setOrientation(o) }:
    * settled() resolves once the PDF view has laid out what is on show.
+   *
+   * setPaper(page): the REPORT's own paper changed, because a report option
+   * chose another layout. `page` has the form of opts.page; fields left out
+   * keep their value. It never touches the user's saved paper or the
+   * company's, and the view re-lays out.
+   *   size (+ chosen)   the report's paper size: replaces opts.page.size (the
+   *                     standard paper). The user's own choice and the
+   *                     company paper still come first, the size for all
+   *                     reports too unless chosen is true.
+   *   orientation       the orientation the layout NEEDS: 'portrait' or
+   *                     'landscape' wins over the user's own, the company's
+   *                     and the standard orientation (the paper bar's
+   *                     orientation buttons are then off); null drops it.
+   *   roll: true, widthPt, marginPt?, label?   roll paper (as opts.page);
+   *                     roll: false goes back to sheets.
+   * setOrientation(o) is setPaper({ orientation: o }).
    */
   function reportView(opts) {
     if (opts.pages) ensureCss(true);
     ensureRptCss();
-    var original = { size: (opts.page && opts.page.size) || 'Letter', orientation: (opts.page && opts.page.orientation) === 'landscape' ? 'landscape' : 'portrait' };
-    var settingChosen = !!(opts.page && opts.page.chosen);
+    var p0 = opts.page || {};
+    var original = { size: p0.size || 'Letter', orientation: p0.orientation === 'landscape' ? 'landscape' : 'portrait' };
+    var settingChosen = !!p0.chosen;
+    // Roll paper (the report's own): replaces every sheet paper while it is set.
+    var roll = null;
+    function setRoll(p) {
+      roll = { widthPt: p.widthPt, marginPt: p.marginPt, label: p.label };
+      rollPage(roll).warnings.forEach(function (w) { log(w, 'warn'); });
+    }
+    if (p0.roll) setRoll(p0);
+    // The orientation the report's layout needs (setPaper): wins over every other choice.
+    var need = null;
     // The standard paper: the size set for all reports (or the edition's), in this report's
     // own orientation; a Page_setup setting changed on purpose wins over it.
-    var all = allReportsPaper();
-    var std = all && !settingChosen ? { size: all.size, orientation: original.orientation } : original;
+    var all = allReportsPaper(), std;
+    function standard() {
+      std = all && !settingChosen ? { size: all.size, orientation: original.orientation } : { size: original.size, orientation: original.orientation };
+    }
+    standard();
     var saved = {};
     try { var v = global.FBLib && global.FBLib.Settings && global.FBLib.Settings.resolve(PREF_KEY); if (v && typeof v === 'object') saved = v; } catch (_) {}
     // Document output: always the PDF view, nothing remembered; ready once the
@@ -1964,6 +2116,8 @@
     // then the company's paper for this report (FBLib.Settings master 'docPaper',
     // set here by admin or the report's Edit Settings users), then the original's.
     // Document output always uses the company's (or the original's) paper.
+    // The orientation the layout needs (setPaper) wins over all three; roll paper
+    // replaces them all.
     var company = companyPaper();
     var base = company || std;
     var own = saved.paperChosen ? validPaper(saved) : null;
@@ -1972,8 +2126,9 @@
     var state = {
       mode: output || saved.mode === 'pdf' ? 'pdf' : 'app',
       size: start.size,
-      orientation: start.orientation
+      orientation: start.orientation   // the paper bar's choice; orient() is the one printed
     };
+    function orient() { return need || state.orientation; }
     function save() {
       if (output) return;
       try {
@@ -1986,7 +2141,8 @@
       chosen = !(state.size === base.size && state.orientation === base.orientation);
     }
     function pageSpec() {
-      return resolvePage(state.size + ' ' + state.orientation, { fallback: std.size, margin: 'document' });
+      if (roll) return rollPage(roll);
+      return resolvePage(state.size + ' ' + orient(), { fallback: std.size, margin: 'document' });
     }
 
     // ---- header toggle
@@ -2009,10 +2165,11 @@
       '<div class="fbdoc-view-bar">' +
         '<span>Paper</span><select class="fbdoc-vb-paper" title="Paper size">' +
           PAPERS.map(function (p) { return '<option value="' + p + '">' + p + '</option>'; }).join('') + '</select>' +
-        '<span class="split-btn">' +
+        '<span class="split-btn fbdoc-vb-orient">' +
           '<button type="button" class="hdr-btn hdr-btn-icon" data-orient="portrait" title="Portrait">' + ICON.portrait + '</button>' +
           '<button type="button" class="hdr-btn hdr-btn-icon" data-orient="landscape" title="Landscape">' + ICON.landscape + '</button>' +
         '</span>' +
+        '<span class="fbdoc-vb-roll" style="display:none" title="Roll paper: one page as wide as the roll and as tall as the content"></span>' +
         '<span class="fbdoc-vb-info"></span><span class="fbdoc-vb-spacer"></span>' +
         '<button type="button" class="hdr-btn fbdoc-vb-std"></button>' +
         '<button type="button" class="hdr-btn ds-btn-admin fbdoc-vb-pub" title="Make this paper the one everyone gets for this report, and the one its documents print and email on">Use for everyone</button>' +
@@ -2023,14 +2180,30 @@
     opts.app.parentNode.insertBefore(wrap, opts.app.nextSibling);
     var bar = wrap.firstChild, canvas = wrap.lastChild;
     var paperSel = bar.querySelector('.fbdoc-vb-paper'), info = bar.querySelector('.fbdoc-vb-info'), stdBtn = bar.querySelector('.fbdoc-vb-std');
+    var orientBox = bar.querySelector('.fbdoc-vb-orient'), rollBox = bar.querySelector('.fbdoc-vb-roll');
     var pubBtn = bar.querySelector('.fbdoc-vb-pub'), unpubBtn = bar.querySelector('.fbdoc-vb-unpub'), allBtn = bar.querySelector('.fbdoc-vb-all');
     var mayPublish = !output && mayPublishCompany();
     var mayPublishAllReports = !output && mayPublishAll();
 
     function syncControls() {
       Array.prototype.forEach.call(tog.querySelectorAll('[data-view]'), function (b) { b.classList.toggle('active', b.getAttribute('data-view') === state.mode); });
+      // Roll paper: the bar shows the roll only (no sheet sizes, no orientation, no paper buttons).
+      paperSel.style.display = roll ? 'none' : '';
+      orientBox.style.display = roll ? 'none' : '';
+      rollBox.style.display = roll ? '' : 'none';
+      if (roll) {
+        var rp = rollPage(roll);
+        rollBox.textContent = rp.label + ' (' + Math.round(rp.widthPt * 100) / 100 + ' pt wide)';
+        [stdBtn, pubBtn, unpubBtn, allBtn].forEach(function (b) { b.style.display = 'none'; });
+        return;
+      }
       paperSel.value = state.size;
-      Array.prototype.forEach.call(bar.querySelectorAll('[data-orient]'), function (b) { b.classList.toggle('active', b.getAttribute('data-orient') === state.orientation); });
+      Array.prototype.forEach.call(bar.querySelectorAll('[data-orient]'), function (b) {
+        var o = b.getAttribute('data-orient');
+        b.classList.toggle('active', o === orient());
+        b.disabled = !!need;
+        b.title = need ? 'This layout prints in ' + need : o === 'portrait' ? 'Portrait' : 'Landscape';
+      });
       var onBase = state.size === base.size && state.orientation === base.orientation;
       stdBtn.textContent = company ? 'Company paper' : 'Standard paper';
       stdBtn.title = company ? 'The company\'s paper for this report: ' + company.size + ' ' + company.orientation
@@ -2051,7 +2224,7 @@
       if (!confirm('Use ' + size + ' for every report that has no paper of its own? Each report keeps its own orientation, and anyone can still pick another paper for themselves.')) return;
       if (!setAllReportsPaper(size)) { info.textContent = 'The paper for all reports wasn\'t saved.'; return; }
       all = { size: size, set: true };
-      if (!settingChosen) std = { size: size, orientation: original.orientation };
+      standard();
       if (!company) { base = std; pick(); }
       save(); syncControls();
       info.textContent = 'Every report without its own paper now uses ' + size + '.';
@@ -2059,13 +2232,15 @@
     allBtn.addEventListener('click', publishAllReports);
     function publishPaper() {
       var paper = { size: state.size, orientation: state.orientation };
-      if (!confirm('Use ' + paper.size + ' ' + paper.orientation + ' for this report for everyone, including the documents it prints and emails?')) return;
+      // While the layout needs an orientation, the company paper's own orientation serves the other layouts.
+      var said = paper.size + ' ' + paper.orientation + (need ? ' (this layout prints ' + need + ')' : '');
+      if (!confirm('Use ' + said + ' for this report for everyone, including the documents it prints and emails?')) return;
       var ok = false;
       try { ok = global.FBLib.Settings.publishCompany(COMPANY_PAPER, paper) !== false; } catch (e) { log('publishing the company paper failed: ' + errText(e), 'error'); }
       if (!ok) { info.textContent = 'The company paper wasn\'t saved.'; return; }
       company = paper; base = paper; chosen = false;
       save(); syncControls();
-      info.textContent = 'Everyone now gets ' + paper.size + ' ' + paper.orientation + ' for this report.';
+      info.textContent = 'Everyone now gets ' + said + ' for this report.';
     }
     function unpublishPaper() {
       if (!confirm('Stop using a company paper for this report? Everyone goes back to the standard report\'s paper (' + std.size + ' ' + std.orientation + '), or their own choice.')) return;
@@ -2091,8 +2266,20 @@
       (res.warnings || []).forEach(function (w) { log('page: ' + w, 'warn'); });
       return res;
     }
+    // The paper a layout used, as document output reports it. A roll adds roll,
+    // label and insetMm 0 (its page has no print margin; sheets are sized for 0.4 in).
+    function paperOf(page) {
+      var p = { name: page.name, orientation: page.orientation, wMm: page.wMm, hMm: page.hMm };
+      if (page.roll) { p.roll = true; p.label = page.label; p.insetMm = 0; }
+      return p;
+    }
+    function paperText(page) {
+      if (!page.roll) return state.size + ' ' + orient();
+      var hPt = Math.round(page.hMm * PT_PER_MM);
+      return page.label + ' · ' + Math.round(page.widthPt * 100) / 100 + ' × ' + hPt + ' pt (' + Math.round(page.wMm) + ' × ' + Math.round(page.hMm) + ' mm), as tall as the content';
+    }
 
-    var timer = null, running = false, dirty = false, laidOut = false;
+    var timer = null, running = false, dirty = false, laidOut = false, lastPage = null;
     function refresh(now) {
       laidOut = false;
       if (output) { clearTimeout(readyTimer); FBDoc.output.loading(); }
@@ -2115,14 +2302,14 @@
           info.textContent = '';
         } else {
           laidOut = !dirty;
-          info.textContent = res.sheets + (res.sheets === 1 ? ' page' : ' pages') + ' · ' + state.size + ' ' + state.orientation +
+          lastPage = page;
+          info.textContent = res.sheets + (res.sheets === 1 ? ' page' : ' pages') + ' · ' + paperText(page) +
             (res.fontPt ? ' · ' + res.fontPt + 'pt' + (res.scaled ? ' (scaled to fit)' : '') : '');
           if (output && asked && laidOut) {
             clearTimeout(readyTimer);
             readyTimer = setTimeout(function () {
               if (laidOut && !running && !timer) {
-                FBDoc.output.ready({ pages: res.sheets, title: titleOf(spec),
-                  paper: { name: page.name, orientation: page.orientation, wMm: page.wMm, hMm: page.hMm } });
+                FBDoc.output.ready({ pages: res.sheets, title: titleOf(spec), paper: paperOf(page) });
               }
             }, 300);
           }
@@ -2150,6 +2337,29 @@
       if (opts.onMode) { try { opts.onMode(state.mode); } catch (_) {} }
     }
 
+    // The report's own paper changed (a report option): see setPaper above.
+    function setPaper(p) {
+      p = p || {};
+      if (p.roll) setRoll(p);
+      else if (p.roll === false) roll = null;
+      if (p.size != null) {
+        var size = PAPERS.filter(function (x) { return x.toLowerCase() === String(p.size).toLowerCase(); })[0];
+        if (!size) log('setPaper: unknown paper size "' + p.size + '"', 'warn');
+        else {
+          original.size = size;
+          if (p.chosen != null) settingChosen = !!p.chosen;
+          standard();
+          if (!company) {
+            base = std;
+            if (!chosen) { state.size = base.size; state.orientation = base.orientation; }
+          }
+        }
+      }
+      if (p.orientation !== undefined) need = p.orientation === 'portrait' || p.orientation === 'landscape' ? p.orientation : null;
+      syncControls();
+      refresh(true);
+    }
+
     tog.addEventListener('click', function (e) {
       var b = e.target.closest('[data-view]');
       if (b && b.getAttribute('data-view') !== state.mode) setMode(b.getAttribute('data-view'), true);
@@ -2157,7 +2367,7 @@
     paperSel.addEventListener('change', function () { state.size = paperSel.value; pick(); syncControls(); save(); refresh(true); });
     bar.addEventListener('click', function (e) {
       var o = e.target.closest('[data-orient]');
-      if (o && o.getAttribute('data-orient') !== state.orientation) { state.orientation = o.getAttribute('data-orient'); pick(); syncControls(); save(); refresh(true); }
+      if (o && !need && o.getAttribute('data-orient') !== state.orientation) { state.orientation = o.getAttribute('data-orient'); pick(); syncControls(); save(); refresh(true); }
       if (e.target.closest('.fbdoc-vb-std')) { state.size = base.size; state.orientation = base.orientation; chosen = false; syncControls(); save(); refresh(true); }
     });
 
@@ -2201,7 +2411,14 @@
         });
       },
       print: print,
-      paper: function () { return { size: state.size, orientation: state.orientation }; }
+      // The paper on show: { size, orientation }; a roll: { roll, label, widthPt, wMm, hMm } (hMm once laid out).
+      paper: function () {
+        if (!roll) return { size: state.size, orientation: orient() };
+        var rp = rollPage(roll), hMm = lastPage && lastPage.roll ? lastPage.hMm : null;
+        return { size: null, orientation: 'portrait', roll: true, label: rp.label, widthPt: rp.widthPt, wMm: rp.wMm, hMm: hMm };
+      },
+      setPaper: setPaper,
+      setOrientation: function (o) { setPaper({ orientation: o === undefined ? null : o }); }
     };
   }
 
@@ -2480,7 +2697,7 @@
   //  saved options (reportparameter rows) map straight onto it. Starting
   //  point: the jrxml default, then the stock report's saved value, then the
   //  company defaults (FBLib.Settings company key `key`), else the user's own
-  //  last choices (the same key, user side). Controls go in the Filters panel
+  //  last choices (the same key, user side; never in document output). Controls go in the Filters panel
   //  (where 'filters') or the Settings drawer (where 'settings') and apply as
   //  they change.
   //
@@ -2623,8 +2840,16 @@
       hydrating = false;
     }
     function remember() { return cfg.remember ? !!cfg.remember() : true; }
+    // Document output (FB_LAUNCH output 'pdf') prints what the company prints,
+    // as with its paper: the jrxml defaults, the stock report's saved options,
+    // then the company defaults; never one user's own choices, and it saves nothing.
+    var output = outputRequested();
+    function started() {
+      if (!output) return resolve(key, null);
+      try { return L.Settings.hasCompany(key) ? L.Settings.getMaster()[key] : null; } catch (_) { return null; }
+    }
     function save() {
-      if (!remember()) return;
+      if (output || !remember()) return;
       try { L.Settings.setUserKey(key, cur); L.Settings.saveUser(); } catch (_) {}
     }
     function soon() {
@@ -2650,7 +2875,7 @@
         try { hasCo = !!L.Settings.hasCompany(key); } catch (_) {}
         if (!hasCo && legacyCompany) base = Object.assign(base, norm(legacyCompany));
         if (!Object.keys(els).length) build();
-        cur = Object.assign({}, base, norm(resolve(key, null)));
+        cur = Object.assign({}, base, norm(started()));
         write(cur);
         O.markSources();
         if (Object.keys(presetVals).length) log('Stock report options applied: ' + Object.keys(presetVals).join(', '));

@@ -23,6 +23,8 @@ The full guide is `docs/building-apps.md`; read it once. The steps:
 
 Copy it to `<Folder>/<Report_Name>.htm` (spaces as underscores). Every template is a working report: build and run it once in the harness before changing it (step 5).
 
+For a piece the template doesn't show (a control, a style, a helper), look it up in `Template/Component_Gallery.htm`: every fb-styles section and fb-lib / fb-doc / fb-label widget, live, with its code. Take only sections marked **Current**. Never copy a shared function into the page: toasts are `FBLib.Common.toast(html, type, ms)`, the write confirm `FBLib.Common.confirmModal({ title, html, okText, danger, wide })` (a Promise of true / false), `data-tip` tooltips `FBLib.Common.tooltips()`, validation states fb-styles' `.is-invalid` / `.is-warn` / `.field-msg` / `.cell-msg` / `.req`, drawer content `.fb-grid` / `.fb-group`, the error `.banner`, a destructive button `.ds-btn-danger`, a printout that isn't on screen `FBDoc.printPages`, custom-field SELECTs `FBLib.CfCols.sqlSelectFor(fields, alias)`, the Columns drop-down `FBLib.RptCols.attach({ …, columnMenu })`. In document output the helpers never wait for a click (`confirmModal` answers false, `toast` only logs).
+
 ## 3. Replace every `TEMPLATE:` marker
 Search the file for `TEMPLATE:` and work through them in order. The header comment lists them. Always:
 - The head: `fb-folder`, the description, `FB_REPORT.key` (unique, ≤ 31 characters), `FB_REPORT.name` (the record name), `<title>`, `h1`. Leave `build` as it is (the stamp hook writes it). No `fb-origin` tag (a new report is custom). An `fb-launch` tag only when step 1 said so, right after `<meta charset>`.
@@ -32,7 +34,7 @@ Search the file for `TEMPLATE:` and work through them in order. The header comme
 - A tool that writes: keep the write pattern in the template's header (access right, re-read, one confirm, payload logged, status checked, data read back). No dry-run or admin-enable switches.
 
 ## 4. Printability
-Every app prints. List and record templates already have the PDF view (`FBDoc.Report.view`): give `docSpec()` (or `pages`) your rows and the stock paper. A tool without a PDF view prints its screen through a print window, never `window.print()` on the page.
+Every app prints. List and record templates already have the PDF view (`FBDoc.Report.view`): give `docSpec()` (or `pages`) your rows and the stock paper. A tool without a PDF view prints through a print window: `FBDoc.printPages` for a printout laid out on pages (the form template's `printRecord()`), else a small page of its own; never `window.print()` on the page.
 
 ## 5. Test
 ```

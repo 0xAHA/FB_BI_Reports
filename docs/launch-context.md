@@ -229,6 +229,19 @@ window.FB_DOC = { state: 'ready', pages: 2, title: 'Sales Order 10042',
 window.FB_DOC = { state: 'error', message: 'This document takes SO records; …' };
 ```
 
+A document on roll paper (fb-doc roll pages, e.g. the POS Receipt's 3 in / 2 in roll)
+adds members to `paper` and keeps the rest of the shape: one page as tall as its content, at
+the roll width, printed with no margins.
+
+```js
+paper: { name: null, orientation: 'portrait', wMm: 76.2, hMm: 148.5, roll: true, label: '3 in roll', insetMm: 0 }
+```
+
+The output paper is never the user's own choice: company paper, then the all-reports size,
+then the report's own. A roll goes out only when the company default (or the report's own
+paper) is a roll. In output mode, `FBDoc.Options` uses the stock and company option values,
+never a user's own saved options.
+
 - **`FBDoc.output`** (in the shared `scripts/fb-doc.js`) does it: `requested()`, `loading()`,
   `ready(info)`, `fail(message)`. Each does nothing unless `output` was asked for, so a
   page opened any other way is unchanged and sets no `FB_DOC`.

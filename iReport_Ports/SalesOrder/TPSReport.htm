@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+  FILE:   TPS Report (iReport port)
+  PATH:   iReport_Ports/SalesOrder/TPSReport.htm
+  --------------------------------------------------------------------------------
+  BI version of Fishbowl's standard SalesOrder/TPSReport.jrxml ("Total
+  Product Sales. Prints a list of gross sales for the date range specified,
+  ordered from greatest to least. An empty date range will report on gross
+  sales to date"). Same source, same rules, same columns and order; only the
+  presentation is interactive. No subreports.
+
+    Source     Posted sales lines (postsoitem, the quantities posted when
+               sales order items are fulfilled) of lines with a product,
+               summed per product number:
+               SUM(postsoitem.qty x (soitem.unitPrice + soitem.adjustAmount /
+               GREATEST(1, postsoitem.qty))), home currency. The joins are
+               the original's: the order's location group, and the order's
+               salesperson must be a Fishbowl user (JOIN sysuser ON userName
+               = so.salesman), so an order with no salesperson, or one who is
+               no longer a user, is left out.
+    Filters    Date posted (dateRange1 / dateRange2 on postso.postDate,
+               "This month" by default, both ends whole days: BETWEEN the
+               first day 00:00:00 and the last day 23:59:59, the original's
+               DATE_SUB(dateRange2, INTERVAL 1 SECOND)); "All dates" = sales
+               to date.
+    Order      Sales, greatest first, then product number (ORDER BY 4 DESC,
+               2).
+    Options    Include cover sheet (IncludeCoverSheet, off): a first page
+               with the company logo, the company, the title, "C O V E R
+               S H E E T" and "C O N F I D E N T I A L", as the original's
+               title band (isTitleNewPage).
+    Title      Report title (ReportTitle; blank = "T.P.S. Report"), with
+               the company and the date range on every page (the
+               original's page header); the printed date and "Page X of Y"
+               in the footer.
+    Totals     None in the original. The App view's footer adds the total of
+               the products listed; the PDF view has none.
+    Presets    The stock report has no saved options (reportparameter is
+               empty for it on the local server); the jrxml defaults apply.
+
+  Layout: the REPORT chrome (fb-styles §35): header, push-down filter panel
+  that applies as you change it, the table, a sticky App-only total.
+  Table tools (fb-lib FBLib.RptCols): column headings sort the products
+  (third click: the report's order); drag to reorder, the edge to resize
+  (remembered per user). No row cap: one row per product, at most the
+  product count. No Pivot view: the rows have one dimension (the product).
+  Views: the header's App / PDF toggle (fb-doc, FBDoc.Report). PDF lays the
+  report out as pages like the original: Letter portrait, the cover sheet
+  when asked for, the company / title / date range on every page, the
+  column headings repeated, "Page X of Y". Print prints those pages.
+
+  Deliberate differences (iReport_Ports/DIFFERENCES.md):
+    - The cover sheet's texts keep the original's sizes and places (9pt,
+      centred, top to bottom); its page has no page header or footer and
+      counts as page 1, as the original's.
+    - A product's description is read with MAX() under GROUP BY
+      product.num (the original selects it ungrouped; product numbers are
+      unique, so it is the same description).
+  Additions: Product links; an App-only total; Excel; Print.
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="fb-folder" content="Sales Order">
+    <meta name="fb-origin" content="system">
+    <meta name="description" content="Total product sales: gross posted sales per product for a date range, greatest first.">
+    <script>
+        // ================================================================
+        // REPORT IDENTITY
+        //   key    Prefix of every setting this report stores. A copy of
+        //          this report needs its own key. 31 chars max.
+        //   name   This report's Fishbowl record name (null = unpublished).
+        //   build  Stamped by tools/stamp/stamp.js. Never edit it by hand.
+        // ================================================================
+        window.FB_REPORT = {
+            key:   'cdx.bi.ipTPSReport',
+            name:  'TPS Report',
+            build: '2026.10.20-bd42831'     // @fb-build
+        };
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TPS Report — Fishbowl BI</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Shared Fishbowl BI lib, inlined by Fishbowl from the saved "fb-lib"
+         script. Source of truth: scripts/fb-lib.js. -->
+    <script>
+        {% Script fb-lib %}
+    </script>
+
+    <!-- Paginated PDF view, inlined from the saved "fb-doc" script.
+         Source of truth: scripts/fb-doc.js. -->
+    <script>
+        {% Script fb-doc %}
+    </script>
+
+    <!-- Shared stylesheet, inlined by Fishbowl from the saved "fb-styles"
+         Style: §4 header, §29 .rpt-table, §35 report chrome. It must come
+         before the local block below. -->
+    <style>
+        {% Style fb-styles %}
+    </style>
+
+    <!-- Open Sans for the PDF view (the standard reports' font), from the
+         saved "fb-doc-fonts" style: scripts/fb-doc-fonts.css. -->
+    <style>
+        {% Style fb-doc-fonts %}
+    </style>
+
+    <style>
+        /* Report-specific bits only; the chrome is fb-styles §4 / §29 / §35. */
+        .hdr-actions { flex-wrap: nowrap; }
+        .rpt-table td { max-width: 520px; overflow: hidden; text-overflow: ellipsis; vertical-align: top; }
+        .rpt-table th.num-cell { text-align: right; }
+        .rpt-table th { cursor: default; }
+        .fb-row-link { color: var(--link); cursor: pointer; text-decoration: none; font-weight: 600; }
+        .fb-row-link:hover { text-decoration: underline; color: var(--link-hover); }
+        .pp-neg { color: #8A1E30; }
+        .banner { margin: 8px 20px 0; border-radius: 8px; padding: 8px 12px; font-size: 12.5px; border: 1px solid #D9A4B2;
+            background: var(--acc-maroon-bg); color: #8A1E30; flex-shrink: 0; }
+        .banner:empty { display: none; }
+        #loading { display: none; }
+        #loading.show { display: flex; }
+
+        /* Drawer content (Settings / Help). */
+        .fb-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+        .fb-group { flex: 1 1 240px; min-width: 220px; }
+        .fb-group-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--c-secondary); border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 8px; }
+        .fb-group p, .fb-group li { font-size: 12px; color: #415157; line-height: 1.5; margin: 4px 0; }
+        .fb-group ul { padding-left: 18px; margin: 4px 0; }
+    </style>
+</head>
+<body class="rpt-page">
+
+<!-- ====================================================================
+     HEADER — report chrome (fb-styles §4)
+     ==================================================================== -->
+<header>
+    <div>
+        <h1 id="pageTitle">T.P.S. Report</h1>
+        <p id="statusLine">Loading…</p>
+    </div>
+    <div class="hdr-actions">
+        <button id="filtersBtn" class="hdr-btn" type="button" onclick="FBLib.Common.togglePanel('filtersPanel')" title="Show / hide filters">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="refreshBtn" class="hdr-btn" type="button" title="Reload from Fishbowl">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="exportBtn" class="hdr-btn" type="button" title="Download as an Excel workbook">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            Excel
+        </button>
+        <button id="printBtn" class="hdr-btn" type="button" title="Print the PDF view's pages">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+            Print
+        </button>
+        <span class="hdr-divider"></span>
+        <button id="helpBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('helpOverlay')" title="How this report works">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </button>
+        <button id="setBtn" class="hdr-btn hdr-btn-icon" type="button" onclick="FBLib.Common.toggleDrawer('setOverlay')" title="Settings">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.62.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96a7.03 7.03 0 00-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .32.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 018.4 12 3.6 3.6 0 0112 8.4a3.6 3.6 0 013.6 3.6 3.6 3.6 0 01-3.6 3.6z"/></svg>
+        </button>
+    </div>
+</header>
+
+<!-- ====================================================================
+     FILTERS — push-down panel (fb-styles §35). Changes apply at once.
+     ==================================================================== -->
+<div id="filtersPanel" class="rpt-filters">
+    <div class="rpt-fgrid">
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Date posted</div>
+            <div>
+                <div class="rpt-flabel">Quick range</div>
+                <select id="fRange"></select>
+            </div>
+            <div class="rpt-dates">
+                <input type="date" id="fFrom" aria-label="From">
+                <span class="rpt-fnote">→</span>
+                <input type="date" id="fTo" aria-label="To">
+            </div>
+            <div class="rpt-fnote">When the sales were posted (the items fulfilled).<br>All dates = gross sales to date.</div>
+        </div>
+        <div class="rpt-fgroup">
+            <div class="rpt-fgroup-title">Layout</div>
+            <label class="rpt-fcheck" title="A first page with the company logo, the company and the title (PDF view and Print)"><input type="checkbox" id="fCover"> Include cover sheet</label>
+            <div>
+                <div class="rpt-flabel">Report title</div>
+                <input type="text" id="fTitle" placeholder="T.P.S. Report">
+            </div>
+            <button type="button" class="hdr-btn" id="resetFiltersBtn" style="align-self:flex-start;" title="Back to the standard report's defaults">Reset filters</button>
+        </div>
+    </div>
+</div>
+
+<!-- ====================================================================
+     SETTINGS
+     ==================================================================== -->
+<div id="setOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>⚙ Settings</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('setOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">Display</div>
+                <label class="rpt-fcheck"><input type="checkbox" id="setRemember"> Remember my filters</label>
+                <label class="rpt-fcheck" style="margin-top:6px"><input type="checkbox" id="setShowDebug"> Show debug console</label>
+                <button type="button" class="hdr-btn" id="resetColsBtn" style="margin-top:8px" title="Natural widths, the standard column order and the report's own sort">Reset column layout</button>
+                <p class="rpt-fnote">The debug console logs every query and how long it took.</p>
+            </div>
+            <div class="fb-group hidden" id="adminGroup">
+                <div class="fb-group-title">Admin</div>
+                <p>Make the current filters what everyone sees each time this report opens. Anyone can still change them while it is open.</p>
+                <button type="button" class="ds-btn ds-btn-admin" id="publishBtn">Use these filters for everyone</button>
+                <button type="button" class="ds-btn" id="unpublishBtn" title="Everyone goes back to their own last choices">Stop using them</button>
+            </div>
+        </div>
+    </div>
+    <div class="fb-drawer-foot">
+        <span></span>
+        <button type="button" class="ds-btn ds-btn-primary" onclick="FBLib.Common.closeDrawer('setOverlay')">Done</button>
+    </div>
+</div>
+
+<!-- ====================================================================
+     HELP
+     ==================================================================== -->
+<div id="helpOverlay" class="fb-drawer">
+    <div class="fb-drawer-head">
+        <h2>📖 How this report works</h2>
+        <button type="button" class="fb-drawer-close" onclick="FBLib.Common.closeDrawer('helpOverlay')" aria-label="Close">&times;</button>
+    </div>
+    <div class="fb-drawer-body">
+        <div class="fb-grid">
+            <div class="fb-group">
+                <div class="fb-group-title">What it shows</div>
+                <p><strong>Total Product Sales</strong>: each product's gross sales posted in the date range, greatest first. With <strong>All dates</strong> it is the gross sales to date. It is the BI version of the standard <strong>TPS Report</strong> and reads the same data the same way.</p>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">The figures</div>
+                <ul>
+                    <li><strong>Sales</strong> adds up, for each posted sales order line of the product, the quantity posted × the line's unit price, plus the line's adjustment. Amounts are in the home currency.</li>
+                    <li>A sale counts when it was <strong>posted</strong> (the items fulfilled), not when it was ordered.</li>
+                    <li>Only orders whose salesperson is a Fishbowl user count (as the standard report): orders without one, or whose salesperson is no longer a user, are left out.</li>
+                </ul>
+            </div>
+            <div class="fb-group">
+                <div class="fb-group-title">Using it</div>
+                <ul>
+                    <li>Filter changes apply straight away. <strong>Include cover sheet</strong> adds the standard report's confidential cover page to the PDF view and Print.</li>
+                    <li>Click a column heading to sort (a third click for the report's order); drag a heading to move the column, its right edge to resize it.</li>
+                    <li>The <strong>App / PDF</strong> buttons switch between this view and printable pages laid out like the standard report. <strong>Print</strong> prints those pages.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="banner" id="banner"></div>
+<div class="rpt-app" id="appView">
+<div class="rpt-scroll" id="rptWrap">
+    <div class="loading-overlay" id="loading">
+        <svg class="spin" width="32" height="32" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#E3E3E3" stroke-width="3"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--link)"/></svg>
+        <span class="lo-label">Loading…</span>
+    </div>
+    <table class="rpt-table" id="rpt"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="rpt-empty" id="rptEmpty"></div>
+</div>
+</div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+'use strict';
+// ============================================================================
+//  BAIL EARLY: this report needs the Fishbowl embedded browser.
+// ============================================================================
+if (typeof runQuery !== 'function' && typeof runQueryAsync !== 'function') {
+    document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#506872;">' +
+        '<h2>Not running inside Fishbowl</h2>' +
+        '<p>This report needs the Fishbowl embedded browser. Open it from the BI Reports module.</p></div>';
+    throw new Error('runQuery unavailable');
+}
+
+(function () {
+    const missing = [];
+    if (!window.FBLib) missing.push('window.FBLib');
+    else {
+        if (!FBLib.Common || typeof FBLib.Common.toggleDrawer !== 'function') missing.push('FBLib.Common');
+        if (!FBLib.Common || typeof FBLib.Common.togglePanel !== 'function') missing.push('FBLib.Common.togglePanel');
+        if (!FBLib.Settings) missing.push('FBLib.Settings');
+        if (!FBLib.Export || typeof FBLib.Export.xlsx !== 'function') missing.push('FBLib.Export.xlsx');
+    }
+    if (!missing.length) return;
+    const show = () => {
+        const b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#F0D7DD;color:#8A1E30;border-bottom:1px solid #D9A4B2;padding:10px 16px;font:13px/1.4 sans-serif;';
+        b.innerHTML = '<strong>fb-lib feature check failed.</strong> Missing: ' + missing.join(', ') +
+            '. In the BI Script Editor, check a script named exactly <code>fb-lib</code> holds the current scripts/fb-lib.js, then re-save this report.';
+        document.body.appendChild(b);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+})();
+
+// ============================================================================
+//  CONFIG
+// ============================================================================
+const STOCK_TITLE = 'T.P.S. Report';
+const DEFAULT_FILTERS = { range: 'thisMonth', from: '', to: '', cover: false, title: '' };
+
+try {
+    FBLib.Settings.init({
+        masterStorage: 'userProperties',
+        company: { keys: ['filters', 'opts'], editors: true },   // every open starts from the company defaults
+        userKey:   FB_REPORT.key + '.user.v1',
+        masterKey: FB_REPORT.key + '.master.v1',
+        defaults: { v: 1, filters: null, remember: true, showDebug: false }
+    });
+} catch (e) { console.warn('FBLib.Settings.init failed:', e); }
+
+const _resolve = (key, dflt) => {
+    try { const v = FBLib.Settings.resolve(key); return v === undefined || v === null ? dflt : v; }
+    catch (_) { return dflt; }
+};
+const _saveUserKeys = obj => {
+    try { Object.keys(obj).forEach(k => FBLib.Settings.setUserKey(k, obj[k])); FBLib.Settings.saveUser(); } catch (_) {}
+};
+const debugLog = (msg, kind) => { try { FBLib.Common.debugLog(msg, kind); } catch (_) {} };
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const fmtMoney = v => FBLib.Common.formatMoney(v);
+const money = v => `<span class="${num(v) < 0 ? 'pp-neg' : ''}">${esc(fmtMoney(v))}</span>`;
+const openLink = (module, number, title) => number
+    ? `<a class="fb-row-link" data-open="${esc(module)}" data-num="${esc(number)}"${title ? ` title="${esc(title)}"` : ''}>${esc(number)}</a>` : '';
+const plural = (n, one, many) => n.toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+const cut = s => `<span title="${esc(s)}">${esc(s)}</span>`;
+const ymd = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const isYmd = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+
+async function runQueryP(sql) {
+    sql = String(sql).trim();       // Fishbowl only accepts SQL that starts with SELECT
+    if (typeof runQueryAsync === 'function') {
+        const r = await runQueryAsync(sql);
+        return Array.isArray(r) ? r : [];
+    }
+    const raw = runQuery(sql);
+    if (!raw) return [];
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+}
+
+// Runs one named query and logs it with its timing. Throws on failure.
+async function q(name, sql) {
+    const t0 = performance.now();
+    debugLog(name + ': ' + sql.replace(/\s+/g, ' ').trim(), 'query');
+    try {
+        const rows = await runQueryP(sql);
+        debugLog(name + ': ' + rows.length + ' rows in ' + Math.round(performance.now() - t0) + ' ms', 'success');
+        return rows;
+    } catch (e) {
+        const msg = typeof e === 'string' ? e : ((e && e.message) || String(e));
+        debugLog(name + ' failed: ' + msg, 'error');
+        throw new Error(name + ': ' + msg);
+    }
+}
+
+// ---- Date ranges (Fishbowl's "This Month" etc.) ----
+const RANGES = [
+    ['custom', 'Custom…'], ['all', 'All dates'], ['today', 'Today'], ['yesterday', 'Yesterday'], ['last7', 'Last 7 days'],
+    ['thisMonth', 'This month'], ['lastMonth', 'Last month'], ['thisQuarter', 'This quarter'], ['lastQuarter', 'Last quarter'],
+    ['thisYear', 'This year'], ['lastYear', 'Last year']
+];
+// A quick range as [from, to] ISO dates, or null for "All dates".
+function presetDates(key) {
+    const t = new Date(); t.setHours(0, 0, 0, 0);
+    const y = t.getFullYear(), m = t.getMonth(), d = t.getDate(), qm = Math.floor(m / 3) * 3;
+    const D = (yy, mm, dd) => new Date(yy, mm, dd);
+    const r = {
+        today: [t, t], yesterday: [D(y, m, d - 1), D(y, m, d - 1)], last7: [D(y, m, d - 6), t],
+        thisMonth: [D(y, m, 1), D(y, m + 1, 0)], lastMonth: [D(y, m - 1, 1), D(y, m, 0)],
+        thisQuarter: [D(y, qm, 1), D(y, qm + 3, 0)], lastQuarter: [D(y, qm - 3, 1), D(y, qm, 0)],
+        thisYear: [D(y, 0, 1), D(y, 11, 31)], lastYear: [D(y - 1, 0, 1), D(y - 1, 11, 31)]
+    }[key];
+    return r ? [ymd(r[0]), ymd(r[1])] : null;
+}
+// { start, end, label } for the filter (whole days), or null for no date limit.
+function dateRange(f) {
+    let a = f.from, b = f.to;
+    if (f.range !== 'custom') { const p = presetDates(f.range); if (!p) return null; [a, b] = p; }
+    if (!isYmd(a) && !isYmd(b)) return null;
+    a = isYmd(a) ? a : '1900-01-01'; b = isYmd(b) ? b : '2999-12-31';
+    if (a > b) [a, b] = [b, a];
+    return { start: a, end: b, label: FBLib.Common.formatDate(a) + ' - ' + FBLib.Common.formatDate(b) };
+}
+function rangeText(f) { const r = dateRange(f); return 'Date Range: ' + (r ? r.label : 'All'); }
+
+// fb-styles §14 toasts. `html` must already be escaped.
+function showToast(html, type = 'info', duration = 3500) {
+    const host = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';
+    el.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-msg">${html}</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>`;
+    el.querySelector('.toast-x').onclick = () => el.remove();
+    host.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ============================================================================
+//  FILTERS — the panel applies as it changes (one short debounce). The
+//  cover sheet and the title only redraw; the dates re-query.
+// ============================================================================
+let F = Object.assign({}, DEFAULT_FILTERS);
+let _hydrating = false, _applyTimer = null;
+const S = { rows: [], company: '', logo: null, logoLoaded: false, loadedAt: null };
+const QUERY_KEYS = ['range', 'from', 'to'];
+const reportTitle = () => (F.title && F.title !== '%' ? F.title : STOCK_TITLE);
+
+function readFilters() {
+    return {
+        range: document.getElementById('fRange').value,
+        from: document.getElementById('fFrom').value,
+        to: document.getElementById('fTo').value,
+        cover: document.getElementById('fCover').checked,
+        title: document.getElementById('fTitle').value.trim()
+    };
+}
+function writeFilters(f) {
+    _hydrating = true;
+    document.getElementById('fRange').value = RANGES.some(r => r[0] === f.range) ? f.range : DEFAULT_FILTERS.range;
+    const p = f.range === 'custom' ? [f.from, f.to] : (presetDates(f.range) || ['', '']);
+    document.getElementById('fFrom').value = p[0] || '';
+    document.getElementById('fTo').value = p[1] || '';
+    document.getElementById('fCover').checked = !!f.cover;
+    document.getElementById('fTitle').value = f.title || '';
+    _hydrating = false;
+}
+function savedFilters() {
+    const s = _resolve('filters', null);
+    return Object.assign({}, DEFAULT_FILTERS, s && typeof s === 'object' ? s : {});
+}
+function remember() { if (_resolve('remember', true)) _saveUserKeys({ filters: F }); }
+function applySoon() {
+    if (_hydrating) return;
+    clearTimeout(_applyTimer);
+    _applyTimer = setTimeout(async () => {
+        const next = readFilters();
+        if (JSON.stringify(next) === JSON.stringify(F)) return;
+        const requery = QUERY_KEYS.some(k => JSON.stringify(next[k]) !== JSON.stringify(F[k]));
+        F = next;
+        remember();
+        if (F.cover) await loadLogo();
+        if (requery) loadAll(); else render();
+    }, 250);
+}
+
+// ============================================================================
+//  SQL — the iReport query: its joins (the sysuser join drops orders whose
+//  salesperson isn't a user), its sales expression and order; the date
+//  range bound inline.
+// ============================================================================
+function buildSQL(f) {
+    const r = dateRange(f);
+    return `
+        SELECT product.num AS productnum, MAX(product.description) AS productdescription,
+               SUM(postsoitem.qty * (soitem.unitprice + (soitem.adjustamount / GREATEST(1, postsoitem.qty)))) AS sales
+        FROM postsoitem
+        JOIN postso ON postso.id = postsoitem.postsoid
+        JOIN soitem ON soitem.id = postsoitem.soitemid
+        JOIN product ON product.id = soitem.productid
+        JOIN so ON so.id = soitem.soid
+        JOIN locationgroup ON locationgroup.id = so.locationgroupid
+        JOIN sysuser ON sysuser.username = so.salesman
+        WHERE ${r ? `postso.postdate BETWEEN '${r.start} 00:00:00' AND '${r.end} 23:59:59'` : 'postso.postdate IS NOT NULL'}
+        GROUP BY product.num
+        ORDER BY 3 DESC, 1`;
+}
+
+// ============================================================================
+//  LOAD
+// ============================================================================
+let _loadToken = 0;
+
+// The company image for the cover sheet (the original's
+// ReportHelperModule.getImageData("Company", 1)), read once when needed.
+async function loadLogo() {
+    if (S.logoLoaded) return;
+    S.logoLoaded = true;
+    try { if (window.FBDoc && FBDoc.companyLogo) S.logo = await FBDoc.companyLogo(); }
+    catch (e) { S.logo = null; debugLog('Company logo: ' + (e && e.message || e), 'warn'); }
+}
+
+async function loadAll() {
+    const tok = ++_loadToken;
+    document.getElementById('banner').textContent = '';
+    document.getElementById('loading').classList.add('show');
+    setStatus('Loading…');
+    let rows;
+    try { rows = await q('Total product sales', buildSQL(F)); }
+    catch (e) {
+        if (tok !== _loadToken) return;
+        document.getElementById('loading').classList.remove('show');
+        document.getElementById('banner').textContent = 'The query failed: ' + e.message + '. The debug console (Settings) has the SQL.';
+        S.rows = []; S.loadedAt = null;
+        render();
+        setStatus('Query failed');
+        return;
+    }
+    if (tok !== _loadToken) return;
+    document.getElementById('loading').classList.remove('show');
+    S.rows = rows.map(r => ({ num: String(r.productnum ?? ''), desc: String(r.productdescription ?? ''), sales: num(r.sales) }));
+    S.loadedAt = new Date();
+    render();
+}
+
+function setStatus(t) { document.getElementById('statusLine').textContent = t; }
+
+// ============================================================================
+//  TABLE — the original's columns: Product #, Description, Sales.
+// ============================================================================
+let PDF = null, COLS = null;
+function cols() {
+    const base = [
+        { key: 'num',   label: 'Product #',   w: 140 },
+        { key: 'desc',  label: 'Description', w: 340 },
+        { key: 'sales', label: 'Sales',       w: 130, num: true }
+    ];
+    return COLS ? COLS.arrange(base) : base;
+}
+const headRow = cs => '<tr>' + cs.map(c =>
+    `<th data-col="${c.key}" class="${c.num ? 'num-cell' : ''}" style="min-width:${c.w}px">${esc(c.label)}</th>`).join('') + '</tr>';
+const rowCells = (cs, cell) => cs.map(c => `<td class="${c.num ? 'num-cell' : ''}">${cell[c.key] ?? ''}</td>`).join('');
+const SORTABLE = () => true;
+const sortVal = (r, k) => ({ num: r.num, desc: r.desc, sales: r.sales })[k];
+const sorted = () => (COLS && COLS.sort() ? S.rows.slice().sort((a, b) => COLS.compare(a, b, sortVal)) : S.rows);
+const bodyRows = cs => sorted().map(r => '<tr>' + rowCells(cs, { num: openLink('Product', r.num, r.desc), desc: cut(r.desc), sales: money(r.sales) }) + '</tr>');
+const totalSales = () => S.rows.reduce((s, r) => s + r.sales, 0);
+// App only (the original has no total).
+const footRow = cs => `<tr>${FBLib.RptCols.totalsCells(cs, 'Total — ' + esc(plural(S.rows.length, 'product')), { sales: money(totalSales()) })}</tr>`;
+
+function render() {
+    document.getElementById('pageTitle').textContent = reportTitle();
+    const tbl = document.getElementById('rpt');
+    const cs = cols();
+    tbl.querySelector('thead').innerHTML = headRow(cs);
+    tbl.querySelector('tbody').innerHTML = S.rows.length ? bodyRows(cs).join('') : '';
+    tbl.querySelector('tfoot').innerHTML = S.rows.length && FBLib.RptCols ? footRow(cs) : '';
+    tbl.style.display = S.rows.length ? '' : 'none';
+    document.getElementById('rptEmpty').textContent = S.rows.length || !S.loadedAt ? '' : emptyText();
+    const parts = [S.company, rangeText(F)];
+    if (S.loadedAt) parts.push(plural(S.rows.length, 'product') + ' · ' + fmtMoney(totalSales()));
+    setStatus(parts.filter(Boolean).join(' · '));
+    if (PDF) PDF.refresh();
+}
+const emptyText = () => 'No posted sales match these filters.';
+
+// ============================================================================
+//  PDF VIEW — as the standard report: Letter portrait, the cover sheet when
+//  asked for (its title band, a page of its own with no page header or
+//  footer), the company / title / date range on every page (its page
+//  header), "Page X of Y". No totals (the original has none).
+// ============================================================================
+// The cover sheet: the original's title band (552 x 600 pt) with its texts
+// at their places, less the page header's height above it (the header is
+// hidden on this sheet, its room kept): logo, company, title, "C O V E R
+// S H E E T", and "C O N F I D E N T I A L" at the foot. 9pt throughout.
+function coverHtml() {
+    const at = (top, h, inner, css) => `<div style="position:absolute;left:0;right:0;top:${top}pt;height:${h}pt;display:flex;align-items:center;justify-content:center;text-align:center;${css || ''}">${inner}</div>`;
+    return '<div class="tps-cover" style="position:relative;height:520pt;font-size:9pt">' +
+        (S.logo ? at(20, 40, `<img src="${esc(S.logo)}" alt="" style="max-width:169pt;max-height:40pt;object-fit:contain">`) : '') +
+        at(60, 18, esc(S.company), 'font-weight:700;align-items:flex-start') +
+        at(91, 81, esc(reportTitle()), 'font-weight:700') +
+        at(172, 40, 'C O V E R &nbsp; S H E E T', 'text-decoration:underline;white-space:pre') +
+        at(480, 40, 'C O N F I D E N T I A L', 'font-weight:700;white-space:pre') + '</div>';
+}
+const PDF_CSS = '.fbdoc-rpt-tbl .pp-neg{color:inherit}' +
+    // The cover sheet's page header and footer stay blank (the original's
+    // title page has neither).
+    '.fbdoc-sheet:has(.tps-cover) .fbdoc-header,.fbdoc-sheet:has(.tps-cover) .fbdoc-footer,.fbdoc-sheet:has(.tps-cover) .fbdoc-lastfooter{visibility:hidden}';
+function docSpec() {
+    if (!S.loadedAt) return null;
+    const cs = cols();
+    const table = { newPage: true, head: S.rows.length ? headRow(cs) : '', rows: S.rows.length ? bodyRows(cs) : [], foot: '', empty: emptyText() };
+    // No rows: the "no data" line alone (a cover sheet over nothing is left out).
+    const sections = (F.cover && S.rows.length ? [{ flow: [coverHtml()] }] : []).concat([table]);
+    return {
+        company: S.company, title: reportTitle(), subtitle: rangeText(F), titleEveryPage: true,
+        sections, empty: emptyText(), css: PDF_CSS, fontPt: 10
+    };
+}
+
+// ============================================================================
+//  EXPORT + PRINT
+// ============================================================================
+async function exportWorkbook() {
+    if (!S.rows.length) { showToast('Nothing to export.', 'warn'); return; }
+    const sheet = {
+        name: 'Total product sales', title: reportTitle(), subtitle: [S.company, rangeText(F)].filter(Boolean),
+        cols: [{ key: 'num', label: 'Product #', w: 140, type: 'text' }, { key: 'desc', label: 'Description', w: 300, type: 'text' },
+               { key: 'sales', label: 'Sales', w: 120, type: 'money' }],
+        rows: sorted(), totals: true
+    };
+    try {
+        const name = await FBLib.Export.xlsx({ filename: 'TPS_Report_' + ymd(new Date()), sheets: [sheet] });
+        showToast('Saved ' + esc(name) + '. If nothing appears, the save dialog may be behind Fishbowl: Alt+Tab.', 'success', 6000);
+    } catch (e) {
+        debugLog('Export failed: ' + (e && e.message || e), 'error');
+        showToast('The export failed. The debug console has the details.', 'error', 5000);
+    }
+}
+
+function printReport() {
+    if (PDF) {
+        if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+        PDF.print().catch(e => showToast('Printing failed: ' + esc(e && e.message || e), 'error', 5000));
+        return;
+    }
+    printPlain();
+}
+function printPlain() {
+    if (!S.rows.length) { showToast('Nothing to print.', 'warn'); return; }
+    const cs = cols();
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' + esc(reportTitle()) + '</title><style>' +
+        'body{font-family:Arial,sans-serif;font-size:9pt;margin:0;color:#111}' +
+        '.co{text-align:center;font-size:11pt;font-weight:700}h2{text-align:center;font-size:14pt;margin:2px 0}.sub{text-align:center;font-size:8.5pt;color:#333;margin:0 0 10px}' +
+        'table{border-collapse:collapse;width:100%}th{font-size:9pt;text-align:left;padding:3px 5px;border-bottom:1px solid #000}' +
+        'td{font-size:9pt;padding:2px 5px;vertical-align:top}.num-cell{text-align:right}a{color:#000;text-decoration:none}' +
+        '.tps-cover{break-after:page}@page{size:Letter portrait;margin:.4in}</style></head><body>' +
+        (F.cover ? coverHtml() : '') +
+        '<div class="co">' + esc(S.company) + '</div><h2>' + esc(reportTitle()) + '</h2><p class="sub">' + esc(rangeText(F)) + '</p>' +
+        '<table><thead>' + headRow(cs).replace(/ style="[^"]*"/g, '') + '</thead><tbody>' + bodyRows(cs).join('') + '</tbody></table>' +
+        '<p style="font-size:7.5pt;margin-top:8px">Printed ' + esc(new Date().toLocaleString()) + '</p></body></html>';
+    const w = window.open('', '_blank');
+    if (!w) { showToast('The print window was blocked.', 'warn'); return; }
+    w.document.write(html); w.document.close(); w.focus(); w.print();
+}
+
+// ============================================================================
+//  SETTINGS + DEBUG DRAWER
+// ============================================================================
+let _debugApi = null;
+function applyDebugDrawer(show) {
+    if (!_debugApi) _debugApi = FBLib.Common.mountDebugDrawer && FBLib.Common.mountDebugDrawer();
+    if (!_debugApi) return;
+    if (show) { _debugApi.show(); _debugApi.expand(); } else _debugApi.hide();
+    const el = _debugApi.element;
+    if (!el || el._observed) return;
+    el._observed = true;
+    const apply = () => {
+        const visible = el.classList.contains('is-visible'), open = el.classList.contains('is-open');
+        const h = visible && open ? Math.ceil(el.getBoundingClientRect().height) : (visible ? 40 : 0);
+        document.body.style.setProperty('--debug-drawer-h', h + 'px');
+    };
+    apply();
+    try { new ResizeObserver(apply).observe(el); } catch (_) {}
+    try { new MutationObserver(apply).observe(el, { attributes: true, attributeFilter: ['class'] }); } catch (_) {}
+}
+const isAdmin = () => { try { return !!FBLib.Settings.isAdmin(); } catch (_) { return false; } };
+
+function publishFilters() {
+    if (!isAdmin()) return;
+    if (!confirm('Make the current filters what everyone sees each time this report opens?')) return;
+    try {
+        // publishMaster replaces the whole master record: merge onto it.
+        const ok = FBLib.Settings.publishMaster(Object.assign({}, FBLib.Settings.getMaster() || {}, { filters: F }));
+        if (ok === false) throw new Error('not saved');
+        showToast('Saved as everyone\'s default.', 'success');
+    } catch (e) {
+        debugLog('Publishing the default filters failed: ' + (e && e.message || e), 'error');
+        showToast('That didn\'t save. The debug console has the details.', 'error', 5000);
+    }
+}
+
+// ============================================================================
+//  INIT
+// ============================================================================
+window.addEventListener('DOMContentLoaded', async () => {
+    try {
+        FBLib.Common.registerPanel({ id: 'filtersPanel', triggerId: 'filtersBtn' });
+        FBLib.Common.registerDrawer({ id: 'setOverlay',  triggerId: 'setBtn' });
+        FBLib.Common.registerDrawer({ id: 'helpOverlay', triggerId: 'helpBtn' });
+        applyDebugDrawer(!!_resolve('showDebug', false));
+        debugLog('Build ' + FB_REPORT.build + (isAdmin() ? ' · admin' : ''));
+
+        const fRange = document.getElementById('fRange');
+        fRange.innerHTML = RANGES.map(r => `<option value="${r[0]}">${esc(r[1])}</option>`).join('');
+        // A quick range fills the dates; editing a date makes the range Custom.
+        fRange.onchange = () => {
+            const p = presetDates(fRange.value);
+            if (fRange.value !== 'custom') {
+                document.getElementById('fFrom').value = p ? p[0] : '';
+                document.getElementById('fTo').value = p ? p[1] : '';
+            }
+            applySoon();
+        };
+        ['fFrom', 'fTo'].forEach(id => document.getElementById(id).addEventListener('change', () => { fRange.value = 'custom'; applySoon(); }));
+        document.getElementById('fCover').addEventListener('change', applySoon);
+        const fTitle = document.getElementById('fTitle');
+        fTitle.addEventListener('change', applySoon);
+        fTitle.addEventListener('keydown', e => { if (e.key === 'Enter') applySoon(); });
+        document.getElementById('resetFiltersBtn').onclick = () => { writeFilters(DEFAULT_FILTERS); applySoon(); };
+
+        // Column resize / sort / reorder (fb-lib).
+        if (FBLib.RptCols) COLS = FBLib.RptCols.attach({ table: document.getElementById('rpt'), sortable: SORTABLE,
+                                                         onSort: () => render(), onReorder: () => render() });
+        document.getElementById('resetColsBtn').onclick = () => { if (COLS) { COLS.reset(); render(); } };
+
+        // App / PDF views (needs the fb-doc script; without it the report is App only).
+        if (window.FBDoc && FBDoc.Report) {
+            PDF = FBDoc.Report.view({
+                app: document.getElementById('appView'), toggleBefore: document.getElementById('exportBtn'),
+                page: { size: 'Letter', orientation: 'portrait' },
+                doc: docSpec, title: () => reportTitle()
+            });
+        } else debugLog('fb-doc is not loaded: the PDF view is unavailable.', 'warn');
+
+        document.getElementById('refreshBtn').onclick = () => loadAll();
+        document.getElementById('exportBtn').onclick = exportWorkbook;
+        document.getElementById('printBtn').onclick = printReport;
+        document.getElementById('publishBtn').onclick = publishFilters;
+        document.getElementById('unpublishBtn').onclick = () => {
+            if (!confirm('Stop using company defaults for this report? Everyone goes back to their own last choices.')) return;
+            const ok = FBLib.Settings.clearCompany(['filters', 'opts']) !== false;
+            showToast(ok ? 'This report no longer has company defaults.' : 'That was not saved.', ok ? 'success' : 'error');
+        };
+        document.getElementById('adminGroup').classList.toggle('hidden', !isAdmin());
+        document.getElementById('setRemember').checked = !!_resolve('remember', true);
+        document.getElementById('setRemember').onchange = e => _saveUserKeys(e.target.checked ? { remember: true, filters: F } : { remember: false, filters: null });
+        document.getElementById('setShowDebug').checked = !!_resolve('showDebug', false);
+        document.getElementById('setShowDebug').onchange = e => { _saveUserKeys({ showDebug: e.target.checked }); applyDebugDrawer(e.target.checked); };
+
+        document.getElementById('rpt').addEventListener('click', e => {
+            const a = e.target.closest('[data-open]');
+            if (!a) return;
+            e.preventDefault();
+            try { if (typeof openModule === 'function') openModule(a.dataset.open, a.dataset.num); }
+            catch (err) { debugLog('openModule(' + a.dataset.open + ', ' + a.dataset.num + ') failed: ' + (err && err.message || err), 'error'); }
+        });
+
+        try { S.company = ((await q('Company', 'SELECT name FROM company WHERE id = 1'))[0] || {}).name || ''; } catch (_) {}
+        writeFilters(savedFilters());
+        F = readFilters();
+        if (F.cover) await loadLogo();
+        await loadAll();
+    } catch (e) {
+        console.error('[' + STOCK_TITLE + '] init failed:', e);
+        setStatus('Init failed: ' + ((e && e.message) || 'see the debug console'));
+        debugLog('Init failed: ' + ((e && e.stack) || e), 'error');
+    }
+});
+</script>
+
+</body>
+</html>

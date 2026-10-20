@@ -1,6 +1,6 @@
 # report_btn: module-related BI reports, and the Apps (beta) module
 
-**Status:** proof of concept, version 0.7.3.
+**Status:** proof of concept, version 0.7.4.
 - **0.1.0 works in the client** (2026-10-12): Reports → Apps in Sales Order opens the
   Sales Order paperwork on the open order.
 - **0.3.0** adds module and menu-group keys.
@@ -91,6 +91,7 @@
   in for a module's Jasper document, through new **Print (App)** and **Email (rich)** ribbon
   buttons, and emails open in a rich HTML window. See
   [Documents and email (PoC)](#documents-and-email-poc).
+- **0.7.4:** the email window keeps the stock Compose Email layout, so only the body editor is new: a toolbar with **Send** and **Cancel** (the client's own icons) plus **Email App ▾** (just this once / always), then From, the **To: / Cc: / Bcc:** buttons and Subject, and **Attachments:** with the paperclip at the foot. The buttons open the client's own **Email Address Book** (Customer or Vendor tab, Company tab; double-click a row to add it to To, or to Cc / Bcc once that field is clicked in), filled with the record's address and its account's contacts, and the company's contacts and the Fishbowl users. If that dialog can't open, a copy of it in the same layout does. The template in use shows at the right of the editor bar. Addresses split correctly when a quoted name holds a comma.
 - **0.7.3:** the email window. The To, Cc and Bcc labels are buttons: each opens a list of the record's customer or vendor email contacts (the order's own address first) and the Fishbowl users, ticked where the field already has them; their tooltip says to separate addresses with a semicolon. **Open in my email program ▾** offers *Just this once* or *Always* (remembered; untick it there to stop). The body editor's list, indent, alignment, link and undo / redo buttons are icons (the link button toggles: inside a link it removes it; Ctrl+K), and deleting everything (select all, Delete) starts a plain email without the template's style sheet; Ctrl+Z straight after brings the template back.
 - **0.7.2:** Edit on an app no longer fails with "Comparison method violates its general contract". When two scripts exported the same name, the autocomplete list held a function and a plain entry under one name, and their sort broke; now one entry per name is kept, and a completion failure no longer stops the editor opening. System apps open read-only, ready to duplicate. The App Library's folder chips are strictly A-Z (All first, Unfiled last).
 - **0.7.1:** "Open in my email program" goes to the user's default email app (the one Windows
@@ -208,7 +209,7 @@ window.FB_REPORT = {
 
 - **`name`** is the report's plain name, with no `- Folder -` prefix (dropped
   2026-10-12). Name the file after the report, in the matching repo folder:
-  `Sales Order Summary` is `Custom/SalesOrder/SalesOrderSummary.htm`.
+  `Sales Order Summary` is `iReport_Ports/SalesOrder/SalesOrderSummary.htm`.
 - **The module tag (§1) only drives the Apps menus.** Where an app is filed (the App
   Library and the Apps panel) is its own `<meta name="fb-folder" content="…">` tag:
   one folder name, written once, after the `fb-launch` tag. A page without it is
@@ -565,9 +566,11 @@ Builder reports all qualify. The PDF comes from the native panel's own Save→PD
 window off the screen.
 
 **The email window** (`docs/mail/EmailComposer`)
-- **Fields:** To, Cc, Bcc, Subject, attachments and the body. The **To, Cc and Bcc**
-  buttons list the email contacts of the record's customer (SO, RMA, SO shipment) or vendor
-  (PO, PO shipment), and the active Fishbowl users with an email address.
+- **Layout:** the stock Compose Email window's: Send / Cancel / Email App toolbar, From, To,
+  Cc, Bcc, Subject, the body, and Attachments at the foot. The **To:, Cc: and Bcc:** buttons
+  open the client's Email Address Book (`EmailAddressBookDialog`): its first tab holds the
+  record's customer (SO, RMA, SO shipment) or vendor (PO, PO shipment) email contacts, its
+  Company tab the company's contacts and the active Fishbowl users with an email address.
 - **The body editor is `Composer.htm` in the jar.** It keeps an HTML template's own style
   sheet and shows it as it will arrive. It has formatting, links and an HTML view.
   Deleting everything starts a plain email (the template's style sheet goes too); Ctrl+Z

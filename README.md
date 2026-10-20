@@ -64,6 +64,7 @@ flowchart LR
         CUST["Custom apps and form tools<br/>Custom/*, Form_Tool_Template"]
         CLIENT["Client Reports<br/>Custom/Client Reports/*"]
         MFG["Manufacturing apps<br/>Production Scheduling v1.2,<br/>Custom Supplement WO"]
+        LABELS["Label reports<br/>Part Barcodes"]
         PRICE["Pricing apps<br/>Babor SO Entry,<br/>Customer Price List port"]
         DASH["Dashboards v1.2<br/>Sales, Inventory, Purchasing"]
         TILES["Company Dashboard<br/>and tiles"]
@@ -74,6 +75,7 @@ flowchart LR
         STY["fb-styles<br/>tokens + components"]
         LIB["fb-lib<br/>FBLib runtime"]
         DOC["fb-doc + fb-doc-fonts<br/>App / PDF view, FBDoc.Record"]
+        LBLJS["fb-label<br/>label sheets"]
         MFGJS["fb-mfg<br/>finish, scrap, staging"]
         PRJS["fb-pricing<br/>pricing rules"]
         MODEL["fb-model + fb-report<br/>catalog + runtime"]
@@ -88,6 +90,7 @@ flowchart LR
     REC --> STY & LIB & DOC
     CUST --> STY & LIB
     CLIENT --> STY & LIB
+    LABELS --> STY & LIB & LBLJS
     MFG --> MFGJS
     PRICE --> PRJS
     DASH --> STY & LIB & CDN
@@ -100,6 +103,7 @@ flowchart LR
     DOC --> LIB
     LIB --> FB
     MFGJS --> LIB
+    LBLJS --> DOC
     PRJS --> FB
 
     BTN -. launches with a record .-> REC
@@ -113,6 +117,7 @@ flowchart LR
 | Record documents | `iReport_Ports/SalesOrder`, `Ship`, `PurchaseOrder`, `Picking`, `WorkOrder`, `ManufactureOrder`… | the same | One record at a time through `FBDoc.Record`: picker, launch lock, document output. Only these keep an Apps-menu tag |
 | Custom apps | `Custom/*` | fb-styles, fb-lib (a few older ones include nothing) | Workflow tools; writes go through REST or `runApiRequest` with confirm and verify |
 | Manufacturing | `Custom/Manufacturing`, Custom Supplement WO | + fb-mfg | fb-mfg is generated from `Production_Scheduling_v1.2.htm` |
+| Labels | `iReport_Ports/Labels` | + fb-label (after fb-doc) | One report per label kind; the sheet is a choice ([Labels](iReport_Ports/README.md)) |
 | Pricing | Babor SO Entry, Customer Price List | + fb-pricing | QuickOrder carries its own inline copy |
 | Client reports | `Custom/Client Reports/*` | fb-styles, fb-lib | One client each; same rules as Custom apps |
 | Dashboards v1.2 | `Dashboards/*_v1.2.htm` | fb-styles, fb-lib + CDN | Independent family ([review](docs/dashboards-review.md)) |
@@ -120,7 +125,7 @@ flowchart LR
 | App Builder | builder: `Other_NOT_FOR_PRODUCTION/Report_Builder`; its reports in Fishbowl | fb-model, fb-report (+ fb-builder for the screen) | The report's SQL is compiled at run time ([guide](docs/app-builder-models.md)) |
 
 Deploy order follows the arrows backwards: fb-styles, fb-lib, fb-doc and
-fb-doc-fonts, then fb-mfg / fb-pricing / fb-model, fb-report, fb-builder, then
+fb-doc-fonts, then fb-label / fb-mfg / fb-pricing / fb-model, fb-report, fb-builder, then
 the apps.
 
 ## Report identity and versions

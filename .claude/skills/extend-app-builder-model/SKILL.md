@@ -8,7 +8,7 @@ description: Add fields, measures, formulas, joins or a new subject area to the 
 Read `docs/app-builder-models.md` first (the parts, the spec, the catalog's shape, the gaps).
 
 ## Before writing anything
-- Decide what the user wants to report and **which existing Fishbowl report or dashboard the figure must agree with**. The catalog's measures copy validated SQL; find that SQL (e.g. `Dashboards/Sales_Dashboard_v1.2.htm`, `Custom/SalesOrder/SalesOrderSummary.htm`, an iReport port) and reuse it.
+- Decide what the user wants to report and **which existing Fishbowl report or dashboard the figure must agree with**. The catalog's measures copy validated SQL; find that SQL (e.g. `Dashboards/Sales_Dashboard_v1.2.htm`, `iReport_Ports/SalesOrder/SalesOrderSummary.htm`, an iReport port) and reuse it.
 - New field on an existing subject, or a new subject (a new **grain**: one row per what)? A new subject needs a parity check.
 - Never rename or reuse a field id; retire one with `deprecated: { since, replacedBy, note }`.
 

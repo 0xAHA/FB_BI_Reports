@@ -35,10 +35,13 @@ the page shows each product's own price, marked LIST, under a banner.
 
 ## App and PDF views
 
-Each port has an **App / PDF** icon toggle in its header. So do the three
-older BI reports that moved into the tree without being faithful ports:
+Each port has an **App / PDF** icon toggle in its header. So do the older BI
+reports that moved into the tree without being faithful ports:
 `AvailableToBuild.htm` (2026-10-13), `PartActivity.htm` and
-`InventoryAvailability.htm` (2026-10-14). Their PDF view lays the data they
+`InventoryAvailability.htm` (2026-10-14), and the first BI versions of
+stock reports, the summaries: `PurchaseOrderSummary.htm`,
+`receivingsummary.htm` and `SalesOrderSummary.htm` (moved from
+`Custom/SalesOrder/` on 2026-10-20). Their PDF view lays the data they
 already show out like the stock report.
 
 - **App** is the interactive report.
@@ -155,6 +158,7 @@ are now ports and use this shared copy).
 | [Accounting/AdjustmentReport.htm](Accounting/AdjustmentReport.htm) | `Accounting/AdjustmentReport.jrxml` | Inventory adjustment postings (`post` typeId 50): Add Initial, Scrap, Cycle Count, Cost Change. List view (the original) or By type |
 | [Accounting/ExportSummary.htm](Accounting/ExportSummary.htm) | `Accounting/ExportSummary.jrxml` + `subSOExport`, `subPOExport`, `subWOExport` | One view per subreport; collapsed orders = Show Details off; Print prints all three like the original |
 | [Accounting/COGSByAccountSummary.htm](Accounting/COGSByAccountSummary.htm) | `Accounting/COGSByAccountSummary.jrxml` | Posted COGS per SO line, by the part's COGS account; collapsed accounts = Show Part Details off |
+| [Accounting/DefaultAccountMapping.htm](Accounting/DefaultAccountMapping.htm) | `Accounting/DefaultAccountMapping.jrxml` | Fishbowl's default accounts (`sysproperties` "Acct ID …") and the account each posts to; Fishbowl's camel-case labels reproduced in JS. Options: Account contains, Show defaults with no account, Show account number and type. No RowCap (one row per default, 24 live), no Pivot (no measure), no links (no chart-of-accounts module) |
 
 ### Inventory
 
@@ -303,7 +307,7 @@ Pick Ticket (archived) in the local Fishbowl `Pick Ticket` record.
 **POReport.htm** replaced (2026-10-15) the Paperwork POC's
 Purchase Order Report (archived) in the local Fishbowl `Purchase Order Report`
 record #130. **PurchaseOrderSummary.htm** predates the porting process (an
-extended BI report, not a faithful port) and moved into the tree.
+extended BI report, not a faithful port) and moved into the tree; it stands for both Purchase Order Summary and Purchase Order Summary Export, with the Export's layout one press away (Columns › Export layout).
 
 | Port | Original | Notes |
 |---|---|---|
@@ -311,7 +315,8 @@ extended BI report, not a faithful port) and moved into the tree.
 | [PurchaseOrder/AutoPO.htm](PurchaseOrder/AutoPO.htm) | `PurchaseOrder/AutoPO.jrxml` (`JRAutoPOHelper`) | Rows from Fishbowl's own Auto PO engine through `getAutoPo()`, as the stock's helper; dates sent as `"YYYY-MM-DD HH:MM:SS"`; the "only default vendor parts" option filtered in the page |
 | [PurchaseOrder/AdvancedPurchasingBySoReport.htm](PurchaseOrder/AdvancedPurchasingBySoReport.htm) | `PurchaseOrder/AdvancedPurchasingBySoReport.jrxml` | What each SO still needs against stock at its location group, and when to order. Fixes: Qty Needed is what is left, converted to the part's UOM; closed lines and credit returns need nothing |
 | [PurchaseOrder/AdvancedPurchasingByWoReport.htm](PurchaseOrder/AdvancedPurchasingByWoReport.htm) | `PurchaseOrder/AdvancedPurchasingByWoReport.jrxml` | The same per work order. Fixes as the SO version (finished WOs / MOs and repair outputs need nothing) |
-| [PurchaseOrder/PurchaseOrderSummary.htm](PurchaseOrder/PurchaseOrderSummary.htm) | `PurchaseOrder/PurchaseOrderSummary.jrxml` (extended) | PO line activity in flat, by-PO, by-vendor, by-part and pivot views |
+| [PurchaseOrder/PurchaseOrderSummary.htm](PurchaseOrder/PurchaseOrderSummary.htm) | `PurchaseOrder/PurchaseOrderSummary.jrxml`, `PurchaseOrderSummaryExport.jrxml` (extended) | PO line activity in flat, by-PO, by-vendor, by-part and pivot views; stands for both stock reports (same-name rule). Columns › Export layout lays it out as the Export (its 27 columns in its order, Flat, PO # ascending), off by default |
+| [PurchaseOrder/POBarcode.htm](PurchaseOrder/POBarcode.htm) | `PurchaseOrder/POBarcode.jrxml` | POs of one status (Bid Request / Issued / Partial) with the PO number and every line's part number as Code 128 barcodes ("P" + number when Barcodes have DI), to receive against. Rows identical to the stock query live (18 / 24 / 44 lines for statuses 10 / 20 / 40); ordered by PO then line so a PO never prints twice; limited to the user's location groups |
 
 ### Receiving
 
@@ -358,10 +363,11 @@ the module's Apps menu, a document locks to the open record. Tests:
 
 | Port | Original | Notes |
 |---|---|---|
-| [SalesOrder/SOReport.htm](SalesOrder/SOReport.htm) | `SalesOrder/SOReport.jrxml` | The sales order document (#128) |
+| [SalesOrder/SOReport.htm](SalesOrder/SOReport.htm) | `SalesOrder/SOReport.jrxml` (+ `SOReportSpecialCharacters`, same-name rule) | The sales order document (#128). The SpecialCharacters copy differs only by its font (SansSerif) and by being an older revision of SOReport; the browser prints non-Latin text with the standard font, so nothing extra is needed |
 | [SalesOrder/SOInvoiceReport.htm](SalesOrder/SOInvoiceReport.htm) | `SalesOrder/SOInvoiceReport.jrxml` | SOReport with the Invoice flag on (#129). Must stay identical to SOReport.htm except five lines: `node tools/doc-tests/variant-check.js` |
-| [Ship/PackingList.htm](Ship/PackingList.htm) | `Ship/PackingList.jrxml` (+ the Colorized / Landscape variants, same family) | Packing Slip for SO / PO / TO shipments, the V2 layouts (#132). Not covered: the By Carton layouts and the colour palettes |
-| [Ship/ShippingInvoice.htm](Ship/ShippingInvoice.htm) | `Ship/ShippingInvoice.jrxml` (+ `ShippingInvoiceSpecialCharacters`) | Invoice or pro-forma by ship status, AU / US / CA (#133) |
+| [Ship/PackingList.htm](Ship/PackingList.htm) | `Ship/PackingList.jrxml` (+ `PackingListLandscape`, `PackingListLandscapeColorized`, `PackingListColorizedV1` / `V2` / `V3`, same family) | Packing Slip for SO / PO / TO shipments (#132). Filters › Page picks the family member: Page layout Portrait / Landscape (landscape paper, the Landscape layouts' widths, price columns on) and Colours Standard / Colorized V1 (its own header and info block) / V2 (sage) / V3 (navy); Landscape + V1 = PackingListLandscapeColorized. Company defaults make one the standard. Not covered: the By Carton layouts |
+| [SalesOrder/SalesOrderSummary.htm](SalesOrder/SalesOrderSummary.htm) | `SalesOrder/SalesOrderSummary.jrxml`, `SalesOrderSummaryExport.jrxml` (extended) | SO line activity in flat, by-SO, by-customer, by-product and pivot views; one of the first BI versions of a stock report (an extended report, not a faithful port), moved here from `Custom/SalesOrder/` on 2026-10-20 (record #65, name and key unchanged); stands for both stock reports (same-name rule). Columns › Export layout lays it out as the Export (its columns in its order with one UOM column, custom-field slots off, Flat, SO # ascending), off by default |
+| [Ship/ShippingInvoice.htm](Ship/ShippingInvoice.htm) | `Ship/ShippingInvoice.jrxml` (+ `ShippingInvoiceSpecialCharacters`) | Invoice or pro-forma by ship status, AU / US / CA (#133). The SpecialCharacters copy differs only by its font (SansSerif) and small carton-subreport layout tweaks; non-Latin text prints with the standard font |
 
 ### Vendor
 
@@ -380,6 +386,85 @@ that vendor (locked in Vendor Part List, a starting filter elsewhere).
 | [Vendor/VendorBackOrderReport.htm](Vendor/VendorBackOrderReport.htm) | `Vendor/VendorBackOrderReport.jrxml` | Incoming PO lines past their scheduled date, by vendor / part / PO. 106 = 106 lines live. Fix: the part filter no longer pulls in misc. lines without a part. Optional "leave out lines received in full" and More columns (days late, value…) |
 | [Vendor/VendorFulfillmentHistory.htm](Vendor/VendorFulfillmentHistory.htm) | `Vendor/VendorFulfillmentHistory.jrxml` | Per vendor and part: average lead time from PO issue, qty received, last cost, PO count. Fix: each receipt counts once (the stock repeated it per vendor-part record: Apex Coconuts FOOD187 396,320 → 99,080); parts without a vendor-part record are no longer dropped |
 | [Vendor/VendorPerformanceReport.htm](Vendor/VendorPerformanceReport.htm) | `Vendor/VendorPerformanceReport.jrxml` | PO receipt lines with scheduled vs received dates and quantities. Fix: "late" is a later calendar day (the stock's 864,000 ms divisor marked 1,071 same-day receipts late). New Scorecard view (on-time % per vendor) |
+
+### Other
+
+The `Other` folder's reports. Calendar Report lists calendar events, work orders, sales orders and purchase orders in a date range. Tracking Detail finds every receipt, pick, shipment, work order, SO or RMA a lot, serial or other tracking value was recorded on. Tracking lists every tracking value per receipt, shipment, WO item, pick and RMA item. Reports (the report list) is not ported.
+
+| Port | Original | Notes |
+|---|---|---|
+| [Other/CalEvent.htm](Other/CalEvent.htm) | `Other/CalEvent.jrxml` | Calendar events, WOs, SOs and POs in a date range, as the original's four-part UNION ALL with every parameter as a filter (Include*, ck* statuses, CalendarCategory, MO/SO/PO #, cbOrderBy, ShowTime, ShowCategoryColor, col*, ReportTitle). Additions: Calendar view (month grid, category colours, ‹ › months), Pivot, WO/SO/PO links, Excel. Same rows as the stock SQL live (Oct 2026: 23 WO / 5 SO / 6 PO; All dates: 114 / 241 / 114). Fix: a row without a category no longer hits the stock's calcat NPE |
+| [Other/TrackingDetail.htm](Other/TrackingDetail.htm) | `Other/TrackingDetail.jrxml` + `Other/subTrackingCustom`, `subTrackingWorkOrderCost` | Every tracking record matching Tracking value, one row per record / serial with "… on PO: / Picked for SO: / Item on WO:" and the order link. The WO block (items, costs, tracking) sits under WO rows as in the stock layout. Same 2,172 rows as the stock rules live. Fixes: serials not printed n×n, number tracking types shown, WO header part / qty always filled, wo.partid. Options: WO details every / once / off, include WO picks (off) |
+| [Other/Tracking.htm](Other/Tracking.htm) | `Other/Tracking.jrxml` | Every tracking value per receipt / shipment / WO item / pick / RMA item ("… received for PO:", "… consumed on WO:", "… added to RMA:") with the order link, as the original's five-branch UNION ALL and GROUP BY. Filters: TrackingValue (contains, or exact with SearchForExactValue), partNum / productNum LIKE, Include*, ShowItemDescriptionInHeader, ReportTitle. Count / Skip paging replaced by RowCap + Load all. Same 2,401 rows as the stock SQL live, and identical on 5 filter variants |
+
+### Bill of Materials
+
+The two stock BOM reports, each printing one bill of materials picked like an order (typeahead with Active / Inactive chips, previous / next, launch lock). Bill of Materials rebuilds the server's `JRBomReportHelper` in SQL + JS: staged sub-assemblies nested under their item, costs converted into each line's UOM, Available / Short over the user's location groups.
+
+| Port | Original | Notes |
+|---|---|---|
+| [BillOfMaterials/BillOfMaterials.htm](BillOfMaterials/BillOfMaterials.htm) | `BillOfMaterials/BillOfMaterials.jrxml` | One BOM's Raw Good / Repair lines. Staged items carry their sub-BOM's build cost, with its lines indented under them. Option-group items appear only when they are the group's default. Costing method Average / Standard / FIFO / LIFO. Available = on hand − allocated − not available + drop ship in the user's location groups. Letter landscape. App view: tree that folds, part links, a "no conversion" flag, sort within each level. Costs match an independent SQL total on 5 BOMs and all four methods |
+| [BillOfMaterials/BOMInstructions.htm](BillOfMaterials/BOMInstructions.htm) | `BillOfMaterials/BOMInstructions.jrxml` | One BOM's instruction steps (Order, Name, Description, Details, URL) under the company / title / "BOM Number -" header on every page; Letter portrait. Fix: fetched by id (the stock's default `%` matched nothing). No options, so no company defaults |
+
+### Sales Order
+
+The Sales Order folder's list reports (the paperwork is under Sales Order and Ship (paperwork) above). Ported 2026-10-20. Cost and margin columns need admin or the Sales Order-Cost / Sales Order-Margin rights, as the App Builder gates them.
+
+| Port | Original | Notes |
+|---|---|---|
+| [SalesOrder/MarginsBySalesOrder.htm](SalesOrder/MarginsBySalesOrder.htm) | `SalesOrder/MarginsBySalesOrder.jrxml` | The jrxml's 3-part UNION (charges & credits / shipped at posted cost / unshipped at average cost) kept as written; every option; SO rows or SO + lines; SO and report totals with its Margin % rule; cost/margin columns gated on Sales Order-Cost / -Margin; Pivot (incl. Margin %), Excel (SOs + lines), RowCap by whole SO, PDF Letter landscape |
+| [SalesOrder/SOtoPOMargin.htm](SalesOrder/SOtoPOMargin.htm) | `SalesOrder/SOtoPOMargin.jrxml` | SOs with POs whose Customer SO is the SO number (voids out): sale, each PO's cost, SO total and profit; status / salesperson / SO # / date / sort filters (sort labels honoured, SO kept whole); cost/profit gated on Sales Order-Cost / -Margin; App footer totals, Pivot per SO, Excel (SOs + POs), PDF Letter landscape |
+| [SalesOrder/MarginsReport.htm](SalesOrder/MarginsReport.htm) | `SalesOrder/MarginsReport.jrxml` | Group by Product / Product Tree / Customer (the jrxml's 3 tables, ProductInfo + ProductTreeInfo datasets); product + group totals and Grand Totals with weighted margin %; the 8 column switches, include returns/shipping, date / customer / salesperson / LG / SO# / product# / product-tree filters, stock saved options as presets; cost & margin columns gated on Sales Order-Cost / -Margin; Pivot, Excel, PDF (Letter landscape) |
+| [SalesOrder/PriceDiscrepancy.htm](SalesOrder/PriceDiscrepancy.htm) | `SalesOrder/PriceDiscrepancy.jrxml` | SO lines priced differently from the product's list price (SO price incl. per-unit adjustment, difference red when negative, $0 kit lines hidden); date / customers / salespeople / SO # filters; Pivot (line difference × qty); Letter landscape PDF; no cost, no gating |
+| [SalesOrder/PricingRules.htm](SalesOrder/PricingRules.htm) | `SalesOrder/PricingRules.jrxml` | Every pricing rule in the stock report's sentences: a table in App, the stock two-across rule cards in PDF (Letter portrait); name / Show inactive filters; Pivot (rules by type × customer scope) |
+| [SalesOrder/SalesByMonth.htm](SalesOrder/SalesByMonth.htm) | `SalesOrder/SalesByMonth.jrxml` | Cross-tab of posted sales by product × month (price over qty + product UOM), Part Totals column, Monthly Totals row; date range, product LIKE, 11 item-type checks (default Sale/Drop Ship/Kit). PDF Letter landscape 9pt, months beyond the sheet width continue on following sheets (Jasper column break). Pivot (item type × month default), RowCap by whole product |
+| [SalesOrder/CompareSalesByMonth.htm](SalesOrder/CompareSalesByMonth.htm) | `SalesOrder/CompareSalesByMonth.jrxml` | Every product's posted qty / price in two periods (default Last vs This month), location groups, Show products with no sales. Optional Change columns, App-only price totals; Pivot product × period. PDF Letter portrait, no totals |
+| [SalesOrder/MTDSales.htm](SalesOrder/MTDSales.htm) | `SalesOrder/MTDSales.jrxml` | Bar + line chart of posted sales per day 1–31 of a month, Total to Date, Title override. App adds a daily table with running total; PDF Letter portrait both charts on one page, no footer, optional daily-figures page. No Pivot/RowCap (one dimension, ≤31 rows) |
+| [SalesOrder/SalesByCount.htm](SalesOrder/SalesByCount.htm) | `SalesOrder/SalesByCount.jrxml` | Shipped qty (soitem.qtyFulfilled by dateLastFulfillment, types 10/12/80, product UOM) per product, grouped by Location Group / Class / Sales Person / Customer Group (MAX relation id rule), sorted by number/description/qty; LG, class, sales person, customer-group filters. Collapsible groups, Pivot product × group (column totals off), RowCap by whole group. PDF Letter portrait, no totals |
+| [SalesOrder/DiscountSummary.htm](SalesOrder/DiscountSummary.htm) | `SalesOrder/DiscountSummary.jrxml` | Fulfilled Discount % / Amount lines (soitem 30/31, status 50) by discount name, amount = −unitPrice; Show detail = groups collapsed; customer multi-select. Pivot (discount × month); RowCap at whole discounts + GROUP BY totals keep the Grand Total whole. Live Apr 2026: $372.78 = stock render |
+| [SalesOrder/ReturnedSales.htm](SalesOrder/ReturnedSales.htm) | `SalesOrder/ReturnedSales.jrxml` | Credit Return lines (Inventory parts, qtyFulfilled > 0) on SOs completed in range; stock GROUP BY kept (incl. so.username, so look-alike rows stay; the tooltip names the creator); stock price formula kept. App-only total, no PDF total (as stock). Pivot; RowCap at whole products. Live Jun–Oct 2025: 15 rows identical to stock render |
+| [SalesOrder/GrossSalesBySalespersonGraph.htm](SalesOrder/GrossSalesBySalespersonGraph.htm) | `SalesOrder/GrossSalesBySalespersonGraph.jrxml` | SUM(postsoitem.totalPrice) by so.salesman (must be a sysuser), top N; bar + pie as SVG after the table. No cap (≤ N rows), no pivot (one dimension). Live Apr 2026 = stock render |
+| [SalesOrder/GrossSalesByProductGraph.htm](SalesOrder/GrossSalesByProductGraph.htm) | `SalesOrder/GrossSalesByProductGraph.jrxml` | qtyFulfilled × (unitPrice + adjust/qtyToFulfill) by product on soitem.dateLastFulfillment, top N, HAVING qty > 0, salesman must be a sysuser; Totals line; "By Dollars" / "By Quantity" chart pages (bar + pie). No cap, no pivot. Live Apr 2026 top 10 + Totals 45,028 / $1,068,282.06 = stock |
+| [SalesOrder/GrossSalesByProductTree.htm](SalesOrder/GrossSalesByProductTree.htm) | `SalesOrder/GrossSalesByProductTree.jrxml` + `subGrossSalesByProductTree.jrxml` | Posted lines (both union halves, UOM conversion) summed in SQL per category / product; % of total / % of tree / average price; pie + bar per category; Product Tree Summary + pie. "Show each product once" = lowest producttree.id (matches stock); optional "Include products with no product tree". No cap (bounded by products), no pivot (summary is the roll-up). Live Apr 2026: all 12 category totals + Report Total = stock |
+| [SalesOrder/SalesOrderTaxes.htm](SalesOrder/SalesOrderTaxes.htm) | `SalesOrder/SalesOrderTaxes.jrxml` | Tax worked out from lines: taxRate × totalPrice when taxable OR QBVersion = AU; so.totalTax ignored (as stock). Group by LG / customer / tax rate name; 6 date fields; 6 statuses; Include line item tax; Show SO line items; optional "Show saved order tax" flags stale totals. Pivot (tax rate × month); RowCap at whole SOs + GROUP BY totals. Live 1 Apr 2026 BP $1,085.73 = stock render |
+| [SalesOrder/POSHourlyBreakdown.htm](SalesOrder/POSHourlyBreakdown.htm) | `SalesOrder/POSHourlyBreakdown.jrxml` | POS orders (so.typeId 20) completed per hour of the working day, day by day: Total # and % of Daily Sales (half-even %), the day's Total; weekday boxes (Mon-Fri default), Begin/End hour (7/19, clamped), LG / customer / salesperson / register filters; Average Sales Per Hour bar chart (SVG) under the table and on its own PDF page; hour grid filled on the page (no CREATELIST); Pivot Hour x Weekday, Excel (+ averages sheet), RowCap by whole day, PDF Letter portrait, title first page only, no page footer |
+| [SalesOrder/ZReport.htm](SalesOrder/ZReport.htm) | `SalesOrder/ZReport.jrxml` | Payments taken on SOs (postransaction) by payment method: Date / Customer / SO / Salesperson / Amount, Subtotal per method, Grand Total; date range on the payment date, payment method, register (incl. "No Register"), LG / customer / salesperson / class filters with the stock NULL rules, Sort by (SO default / Date / Customer / Salesperson), Show group headers / totals / timestamp; page header with Register and Grand Total; Pivot method x day, Excel (payments + subtotals), RowCap with whole-method totals, PDF Letter portrait |
+| [SalesOrder/TPSReport.htm](SalesOrder/TPSReport.htm) | `SalesOrder/TPSReport.jrxml` | Total Product Sales: posted sales per product (qty x (unit price + adjustment / GREATEST(1, qty))), greatest first; salesperson must be a user (stock sysuser join); date range (All = to date); Include cover sheet (logo, company, title, C O V E R S H E E T / C O N F I D E N T I A L, no header/footer on that page); App-only total, Excel, PDF Letter portrait, title every page |
+| [SalesOrder/POSReceipt.htm](SalesOrder/POSReceipt.htm) | `SalesOrder/POSReceipt.jrxml`, `SalesOrder/Receipt3in.jrxml`, `SalesOrder/Receipt2in.jrxml` (+ `sub3inReceiptPayments` / `sub2inReceiptPayments`) | Record "POS Receipt": one sales order's point-of-sale receipt, FBDoc.Record (SO picker with an Orders chip: Point of Sale / With payments; launch lock; document output). Receipt › Format = Letter (POS Receipt) / 3 in roll (Receipt 3in) / 2 in roll (Receipt 2in), an option with saveable defaults (each user's own; company default by an admin / Edit Settings user; document output takes the company's). Letter: SO-style own sheets (FBDoc.Report.view), Customer box, Sales Rep line, US/AU/CA item column sets, POS payments table, Subtotal / Tax / Total / Paid / Balance Due (+ home-currency column), SO Notice. Rolls: fb-doc roll paper, one page at 216 / 144 pt as tall as the receipt (the jrxmls' isIgnorePagination), no print inset, @page size W H margin 0; payments PMT / method / amount + change; Subtotal / Tax / TOTAL / Paid / Balance or Change Given; Gift receipt; POS Notice. Options per format; the other format's groups hidden. Excel: lines + payments |
+
+### Ship
+
+The Ship folder's list reports and the bill of lading. Shipment History and Inventory Shipping Summary list shipments and shipped items in a period. Bill Of Lading prints one shipment's straight bill of lading. Packing Slip and Shipping Invoice are the module's paperwork, listed under Sales Order and Ship (paperwork).
+
+| Port | Original | Notes |
+|---|---|---|
+| [Ship/ShipmentHistory.htm](Ship/ShipmentHistory.htm) | `Ship/ShipmentHistory.jrxml` | Shipped shipments (status 30) with order / ship-to / issued / shipped / days to fulfil / carrier. Filters: issued and shipped ranges (default Today), carrier, Include SO / PO / TO (SO on), sort (6 choices), ShowShipNumber, ReportTitle. Pivot (count / days by carrier, type, ship-to, month). Same 164 rows in the same order as the stock SQL live. Fix: Days to Fulfill counted in calendar days |
+| [Ship/InventoryShippingSummary.htm](Ship/InventoryShippingSummary.htm) | `Ship/InventoryShippingSummary.jrxml` | One row per shipped item on SO shipments, with the 14 col* column options (stock defaults) and every filter (date range default This Month, customer, product LIKE, ship-to name / address / city / zip contains, carrier, StateCode, ckShowItemsWithNoState). Letter landscape. Pivot (qty / lines / shipments by product, customer, state, carrier, month). Identical rows, order and qty to the stock SQL live (205 lines / 2,244 qty; 236 / 2,390 with no-state items) |
+| [Ship/billoflading.htm](Ship/billoflading.htm) | `Ship/billoflading.jrxml` | Record document (FBDoc.Record SHIP, no fb-launch): title band, ship from (getCompanyAddress) / ship to / carrier / SCAC / trailer / seal, third-party + PRO frame, special instructions / FOB / freight terms, Customer Order Information, Carrier Information (repeated per page), grand totals, last-page terms and signature footer, page rectangle. Every jrxml option via FBDoc.Options. Code 128 BOL and PRO barcodes |
+
+### User
+
+Ported 2026-10-20 as one report, at the user's request: **User Access Rights**
+and **User Login Log** are the views of a single page.
+
+| Port | Original | Notes |
+|---|---|---|
+| [User/UserAccessRights.htm](User/UserAccessRights.htm) | `User/UserAccessRights.jrxml`, `User/LoginLog.jrxml` | Users (groups, location groups, rights, last login, MFA; click a user for their rights by module and the group granting each), Groups (members, rights), Compare (users and groups side by side: group membership, then every right, differences only), Login log (date range with a calendar and quick ranges, users, sort by date or user). A group has a right when it has the row (as the stock reads it); "Show rights not granted" adds the ones other groups have |
+
+### Labels
+
+Ported 2026-10-20, the first label port. The stock reports are one jrxml per
+sheet; a port is one report for every sheet, on the shared label engine
+[`scripts/fb-label.js`](../scripts/fb-label.js) (FBLabel): the sheet is a
+pill under the header (standard setups for Avery 5160 / 5163, L7160 / L7163
+and 2 × 1, 4 × 2 and 6 × 4 in label printers, plus company setups an admin
+adds and each user's own), Sheet setup edits paper, labels across / down,
+margins and gaps, and the label's fields shrink to fit any size. Test sheet
+prints numbered outlines. Company setups are shared by every label report.
+
+| Port | Original | Notes |
+|---|---|---|
+| [Labels/PartBarcodes.htm](Labels/PartBarcodes.htm) | `Labels/PartBarcodesAvery.jrxml`, `2x4PartBarcodesAvery.jrxml`, `SinglePartBarcodesAvery.jrxml`, `PartBarcodesOneOff.jrxml`, `2x4PartBarcodesOneOff.jrxml`, `4x6PartBarcodesOneOff.jrxml` | Active parts matching a part number (% wildcard), ordered by number / description / date created, Skip, How many (90), or a chosen list with copies per part; Copies of each part. Fields: Code 128-B barcode of the number, part number, description (each: show, height share, size, bold, align, lines, order). Start at label, fill across / down, outlines. Same SQL as the stock (LIMIT / OFFSET); harness-run on the local server (90 parts) |
 
 ### Work Order
 
