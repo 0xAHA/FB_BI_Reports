@@ -46,7 +46,7 @@ const DEPLOYED_NAMES = {
   // New records on first import.
   'Custom/Client Reports/BrightSteel/Bars_To_Kilos.htm':                  ['- Sales - Bright Steel Bars to Kilos', '- Sales - Bright Steel Bars to Kilos'],
   'Custom/Client Reports/BrightSteel/Product_Card.htm':                   ['- Part - Bright Steel Product Card', '- Part - Bright Steel Product Card'],
-  'Dashboards/Dashboard_Combined.htm':                     ['Dashboard - Company', 'Dashboard - Company'],
+  'Dashboards/Company_Dashboard.htm':                     ['Dashboard - Company', 'Dashboard - Company'],
   'Dashboards/Individual Pages/Items_To_Be_Picked.htm':    ['Dashboard - Tiles - Items to be Picked', 'Dashboard - Tiles - Items to be Picked'],
   'Dashboards/Individual Pages/Items_To_Be_Received.htm':  ['Dashboard - Tiles - Items to be Received', 'Dashboard - Tiles - Items to be Received'],
   'Dashboards/Individual Pages/Items_To_Be_Shipped.htm':   ['Dashboard - Tiles - Items to be Shipped', 'Dashboard - Tiles - Items to be Shipped'],

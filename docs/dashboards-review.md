@@ -8,7 +8,7 @@ ports and the other apps use.
 
 User-facing documentation lives beside the pages:
 [dashboards.md](../Dashboards/dashboards.md) (the v1.2 trio),
-[Dashboard Combined - Import Instructions.md](../Dashboards/Dashboard%20Combined%20-%20Import%20Instructions.md)
+[Company Dashboard - Import Instructions.md](../Dashboards/Company%20Dashboard%20-%20Import%20Instructions.md)
 and [Dashboard Tiles.md](../Dashboards/Dashboard%20Tiles.md).
 
 ## Inventory
@@ -20,7 +20,7 @@ Two families, independent of each other and of everything else in the repo.
 | v1.2 analytics | `Sales_Dashboard_v1.2.htm` | Sales Dashboard v1.2 (#158) | `cdx.bi.salesdash` | SALES | fb-lib, fb-styles |
 | v1.2 analytics | `Inventory_Dashboard_v1.2.htm` | Inventory Dashboard v1.2 (#156) | `cdx.bi.invdash` | MATERIALS | fb-lib, fb-styles |
 | v1.2 analytics | `Purchasing_Dashboard_v1.2.htm` | Purchasing Dashboard v1.2 (#157) | `cdx.bi.purchdash` | PURCHASING | fb-lib, fb-styles |
-| Company | `Dashboard_Combined.htm` | Company Dashboard v1.2 (#42) | `cdx.bi.dashboard.combined` | REPORTING | fb-lib |
+| Company | `Company_Dashboard.htm` | Company Dashboard v1.2 (#42) | `cdx.bi.dashboard.combined` | REPORTING | fb-lib |
 | Company tile | `Individual Pages/Open_Sales_Orders.htm` | Open Sales Orders (#50) | `cdx.bi.openSalesOrders` | SALES | fb-lib |
 | Company tile | `Individual Pages/Open_Purchase_Orders.htm` | Open Purchase Orders (#48) | `cdx.bi.openPurchaseOrders` | PURCHASING | fb-lib |
 | Company tile | `Individual Pages/Open_Work_Orders.htm` | Open Work Orders (#52) | `cdx.bi.openWorkOrders` | MANUFACTURING | fb-lib |
@@ -58,7 +58,7 @@ the plain BI Reports viewer, as a dashboard gadget, or inside report_btn.
      settings panel, the admin layout publish/lock, date helpers). A fix in
      one dashboard has to be repeated by hand in the other two.
    - Company family: each tile's query, columns and rendering exist twice,
-     once in its tile page and once inside `Dashboard_Combined.htm`
+     once in its tile page and once inside `Company_Dashboard.htm`
      (5,351 lines). The two copies are kept in step by hand.
 2. **No print path.** None of the twelve pages prints (no print window, no PDF
    view). Every other production app is expected to print.
@@ -82,7 +82,7 @@ These are ideas, not decisions:
 
 - **Share code within a family.** Move the trio's common shell (grid,
   settings, layout publish/lock, KPI badges) into a shared script (for example
-  `fb-dash.js`), and have `Dashboard_Combined.htm` load each tile's renderer
+  `fb-dash.js`), and have `Company_Dashboard.htm` load each tile's renderer
   from one place instead of copying it.
 - **Bundle the CDN libraries** (GridStack, D3, moment) as Script records, as
   fb-lib is, so the dashboards work offline; or replace moment with

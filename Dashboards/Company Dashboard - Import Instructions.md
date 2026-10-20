@@ -16,7 +16,7 @@ sorting, filters and click-through as its standalone report.
 - **Custom-field columns:** add Fishbowl custom fields as columns on any tile
 - **Live data:** every tile queries the Fishbowl database directly
 
-Source file: `Dashboards/Dashboard_Combined.htm`.
+Source file: `Dashboards/Company_Dashboard.htm`.
 
 ## Installation
 

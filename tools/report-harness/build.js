@@ -69,7 +69,7 @@ function build(report, fixture, out, o) {
     'window.currencyLocale = () => ({ locale: "en-AU", symbol: "$" });\n' +
     'window.getProperty = (n, d) => Object.prototype.hasOwnProperty.call(__props, n) ? __props[n] : (n === "DateFormatShort" ? "dd/MM/yyyy" : d);\n' +
     'window.getLocationGroupList = () => [1, 2, 3];\n' +
-    'window.getUser = () => JSON.stringify({ userName: "admin", firstName: "A", lastName: "D" });\n' +
+    'window.getUser = () => JSON.stringify({ id: 1, userName: "admin", firstName: "A", lastName: "D" });\n' +
     'window.hasUserAccess = () => true;\n' +
     'window.saveSettings = (k, v) => { sessionStorage.setItem("s:" + k, v); };\n' +
     'window.loadSettings = k => sessionStorage.getItem("s:" + k) || "";\n' +

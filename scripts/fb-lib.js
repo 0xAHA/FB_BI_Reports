@@ -187,7 +187,7 @@ window.FBLib = (function () {
      * Exposed as FBLib.BUILD so a report can tell which fb-lib the Fishbowl server actually served it.
      * @type {string}
      */
-    const BUILD = '2026.10.20-3a86ced';   // @fb-build
+    const BUILD = '2026.10.21-a5d8310';   // @fb-build
 
     /**
      * Returns the host report's identity block (window.FB_REPORT, set at the top of every report's head).
@@ -2118,7 +2118,7 @@ window.FBLib = (function () {
     //   2. admin master       (masterStorage: reportData|userProperties|none)
     //   3. getProperty(name)  via propFallback map
     //   4. defaults literal
-    // Mirrors the working DashboardSettingsCore in Dashboard_Combined.htm.
+    // Mirrors the working DashboardSettingsCore in Company_Dashboard.htm.
     // ====================================================================
     /** Layered preference resolver: the user's payload, then the admin master, then getProperty, then defaults. */
     const Settings = (function () {

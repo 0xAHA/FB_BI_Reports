@@ -121,7 +121,7 @@ flowchart LR
 | Pricing | Babor SO Entry, Customer Price List | + fb-pricing | QuickOrder carries its own inline copy |
 | Client reports | `Custom/Client Reports/*` | fb-styles, fb-lib | One client each; same rules as Custom apps |
 | Dashboards v1.2 | `Dashboards/*_v1.2.htm` | fb-styles, fb-lib + CDN | Independent family ([review](docs/dashboards-review.md)) |
-| Company Dashboard + tiles | `Dashboards/Dashboard_Combined.htm`, `Individual Pages/` | fb-lib + CDN moment | Published to SharePoint too |
+| Company Dashboard + tiles | `Dashboards/Company_Dashboard.htm`, `Individual Pages/` | fb-lib + CDN moment | Published to SharePoint too |
 | App Builder | builder: `Other_NOT_FOR_PRODUCTION/Report_Builder`; its reports in Fishbowl | fb-model, fb-report (+ fb-builder for the screen) | The report's SQL is compiled at run time ([guide](docs/app-builder-models.md)) |
 
 Deploy order follows the arrows backwards: fb-styles, fb-lib, fb-doc and
