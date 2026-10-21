@@ -14,6 +14,8 @@ public final class SelfCheck {
     public static void main(String[] args) {
         // WorkspaceLink: the openModule('Apps (beta)', item) grammar.
         link("123", "OPEN #123");
+        link("drop:[{\"name\":\"a.htm\",\"text\":\"x\"}]", "DROP \"[{\"name\":\"a.htm\",\"text\":\"x\"}]\"");
+        link("drop:nope", null);
         link("  42 ", "OPEN #42");
         link("tab:123", "OPEN tab #123");
         link("TAB: 7", "OPEN tab #7");

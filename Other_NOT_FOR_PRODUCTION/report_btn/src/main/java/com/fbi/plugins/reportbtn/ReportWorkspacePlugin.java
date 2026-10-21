@@ -303,6 +303,13 @@ public class ReportWorkspacePlugin extends FishbowlPlugin {
                     }
                     break;
                 }
+                case DROP:
+                    if (extension == null) {
+                        error("The app editor isn't part of this build of the Apps (beta) module.");
+                    } else {
+                        extension.dropped(link.name);
+                    }
+                    break;
                 case BUILD:
                     if (extension == null) {
                         error("The App Builder's publishing isn't part of this build of the Apps (beta) module.");

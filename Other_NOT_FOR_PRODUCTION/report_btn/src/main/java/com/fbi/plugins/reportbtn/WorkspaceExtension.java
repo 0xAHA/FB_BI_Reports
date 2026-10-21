@@ -36,4 +36,12 @@ public interface WorkspaceExtension {
     default void build(String verb, String arg) {
         throw new UnsupportedOperationException("The App Builder's publishing isn't part of this build.");
     }
+
+    /**
+     * openModule('Apps (beta)', 'drop:<json>'): files dropped on the App Library, as
+     * [{"name": "x.htm", "text": "..."}, ...] (only .htm, .html, .js, .css and .json).
+     */
+    default void dropped(String json) {
+        throw new UnsupportedOperationException("The app editor isn't part of this build.");
+    }
 }

@@ -1357,17 +1357,25 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
             feature.importDropped(files);   // several exports: the Import dialog, with Publish and access
             return;
         }
+        java.io.File f = files.get(0);
+        applyDropped(DroppedFile.read(f, typeId), f.getName(), files.size());
+    }
+
+    /**
+     * A dropped file's content into this tab (from its own code area, or a file dropped on
+     * the App Library that matches this record): the code, and an export's name and
+     * description. Ctrl+Z undoes the code; nothing is saved.
+     */
+    void applyDropped(DroppedFile d, String fileName, int fileCount) {
         if (!decision.canEdit) {
             info("This can't be changed here: " + decision.reason);
             return;
         }
-        java.io.File f = files.get(0);
-        DroppedFile d = DroppedFile.read(f, typeId);
         if (d.error != null) {
             error(d.error);
             return;
         }
-        if (d.confirm != null && JOptionPane.showConfirmDialog(this, d.confirm, "Load " + f.getName(),
+        if (d.confirm != null && JOptionPane.showConfirmDialog(this, d.confirm, "Load " + fileName,
             JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) {
             return;
         }
@@ -1390,8 +1398,8 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
             fields = true;
         }
         updateTitle();
-        status("Loaded " + f.getName() + (fields ? " (code, name and description)" : "") + ". Not saved yet; Ctrl+Z undoes the code."
-            + (files.size() > 1 ? " Only the first of the " + files.size() + " files was used." : ""));
+        status("Loaded " + fileName + (fields ? " (code, name and description)" : "") + ". Not saved yet; Ctrl+Z undoes the code."
+            + (fileCount > 1 ? " Only the first of the " + fileCount + " files was used." : ""));
     }
 
     private void reloadFromServer() {

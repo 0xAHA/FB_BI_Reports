@@ -14,18 +14,22 @@ import java.util.Locale;
  *   back / forward   step through the selected tab's history
  *   edit:123         open report 123's page in the editor (also edit:&lt;name&gt;),
  *                    when the page editor is part of the build
+ *   drop:[{"name":"x.htm","text":"..."}, ...]
+ *                    files dropped on the App Library, for the page editor
  *
  * Keywords and prefixes ignore case. An empty item only switches to the
  * workspace, so it parses to null, as does anything unusable.
  */
 final class WorkspaceLink {
 
-    enum Action { OPEN, HOME, BACK, FORWARD, EDIT, BUILD }
+    enum Action { OPEN, HOME, BACK, FORWARD, EDIT, BUILD, DROP }
 
     private static final String TAB = "tab:";
     private static final String EDIT = "edit:";
     /** build:<verb>[:<arg>], for the Report Builder (e.g. build:publish:<nonce>). */
     private static final String BUILD = "build:";
+    /** drop:<json>, files dropped on the App Library (the JSON is in name). */
+    private static final String DROP = "drop:";
 
     final Action action;
     final boolean newTab;
@@ -53,6 +57,10 @@ final class WorkspaceLink {
             return null;
         }
         String text = item.trim();
+        if (text.regionMatches(true, 0, DROP, 0, DROP.length())) {
+            String json = text.substring(DROP.length()).trim();
+            return json.startsWith("[") ? new WorkspaceLink(Action.DROP, false, 0, json) : null;
+        }
         boolean newTab = false;
         if (text.regionMatches(true, 0, TAB, 0, TAB.length())) {
             newTab = true;

@@ -1,6 +1,6 @@
 # report_btn: module-related BI reports, and the Apps (beta) module
 
-**Status:** proof of concept, version 0.7.6.
+**Status:** proof of concept, version 0.7.7.
 - **0.1.0 works in the client** (2026-10-12): Reports → Apps in Sales Order opens the
   Sales Order paperwork on the open order.
 - **0.3.0** adds module and menu-group keys.
@@ -91,6 +91,7 @@
   in for a module's Jasper document, through new **Print (App)** and **Email (rich)** ribbon
   buttons, and emails open in a rich HTML window. See
   [Documents and email (PoC)](#documents-and-email-poc).
+- **0.7.7:** files dropped on the **App Library** (in the Apps (beta) workspace, with the editor and BI Editor-Edit) go to the editor: a page, script or style opens in the tab of the record with the same name and type, loaded but not saved (a page is matched by its FB_REPORT name), or as a new record named after it; exports (.json) open the Import dialog pre-filled with Publish ticked. Any other file is ignored, and the page shows a drop outline only for files it takes. The page reads the files and sends them as `drop:<json>` through openModule (WorkspaceLink DROP, WorkspaceExtension.dropped). The email composer ignores dropped files (Attach… adds attachments). fb-lib now stops the browser opening any dropped file in place of an app.
 - **0.7.6:** ready for Fishbowl's BI changes (epic ADV-5903). One jar runs on 26.9 and on the builds after them.
   - **Edit Settings goes (ADV-6032).** The access the editor asks for on a report (to edit its page, change its access or republish a builder report) is Edit Settings while Fishbowl has that level, and View once it doesn't (the upgrade turns every Edit Settings row into View). It's looked up by name at run time (`AccessPolicy.EDIT_LEVEL`), and the messages name whichever level it is.
   - **Saved settings per user (ADV-6029).** An app's saved settings are read through `BiReportFpo.getParams()` looked up at run time; if Fishbowl drops it with `bireport.params`, apps open with their declared values instead of failing. Reading each user's own row comes once that build is out.

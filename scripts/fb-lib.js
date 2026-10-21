@@ -187,7 +187,7 @@ window.FBLib = (function () {
      * Exposed as FBLib.BUILD so a report can tell which fb-lib the Fishbowl server actually served it.
      * @type {string}
      */
-    const BUILD = '2026.10.21-5d26bc1';   // @fb-build
+    const BUILD = '2026.10.21-51ffd99';   // @fb-build
 
     /**
      * Returns the host report's identity block (window.FB_REPORT, set at the top of every report's head).
@@ -201,6 +201,33 @@ window.FBLib = (function () {
     // userproperties.userKey is varchar(41): a longer key is truncated (or
     // rejected) by MySQL, so two keys can silently collide.
     const USERKEY_MAX = 41;
+
+    // A file dragged from Explorer and dropped on a report would otherwise be
+    // opened by the browser in place of the report (a .json shows as raw text,
+    // and the report is gone until it is reopened). This stops that for every
+    // report that includes fb-lib. It only cancels the browser's default: it
+    // never stops other handlers or changes the drop effect, so a page that
+    // takes files (a drop zone, or its own window / document listener) still
+    // gets them. A file input keeps its native drop.
+    (function blockFileDrops() {
+        if (typeof window === 'undefined' || window.__fbFileDropGuard) return;
+        window.__fbFileDropGuard = true;
+        const hasFiles = function (e) {
+            try {
+                const t = e.dataTransfer && e.dataTransfer.types;
+                return !!t && Array.prototype.indexOf.call(t, 'Files') >= 0;
+            } catch (_) { return false; }
+        };
+        const fileInput = function (e) {
+            const el = e.target;
+            return !!(el && el.tagName === 'INPUT' && String(el.type).toLowerCase() === 'file');
+        };
+        ['dragover', 'drop'].forEach(function (type) {
+            window.addEventListener(type, function (e) {
+                if (!e.defaultPrevented && hasFiles(e) && !fileInput(e)) e.preventDefault();
+            });
+        });
+    })();
 
     // ====================================================================
     // FBLib.Common — date / money formatting, debug logger + drawer,

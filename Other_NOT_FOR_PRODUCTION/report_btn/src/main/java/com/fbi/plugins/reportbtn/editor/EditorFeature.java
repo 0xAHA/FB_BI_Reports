@@ -125,6 +125,82 @@ public final class EditorFeature implements WorkspaceExtension {
         }
     }
 
+    /**
+     * Files dropped on the App Library. Exports (.json) go to the Import dialog, pre-filled
+     * with Publish ticked, as when they're dropped on the Apps panel. A page, script or style
+     * file opens in the editor: in the tab of the record with the same name and type when
+     * there is one (loaded, not saved), otherwise as a new record named after it.
+     */
+    @Override
+    public void dropped(String json) {
+        if (!ClientRights.mayEdit(host)) {
+            host.showError("Opening files in the app editor needs the BI Editor-Edit right.");
+            return;
+        }
+        List<DroppedFile.Named> files = DroppedFile.payload(json);
+        if (files.isEmpty()) {
+            return;
+        }
+        List<java.io.File> exports = new ArrayList<>();
+        int opened = 0;
+        try {
+            java.nio.file.Path dir = null;
+            for (DroppedFile.Named n : files) {
+                if (n.isExport()) {
+                    // The Import dialog reads files: each export goes to a temp folder under its own name.
+                    if (dir == null) {
+                        dir = java.nio.file.Files.createTempDirectory("reportbtn-drop");
+                        dir.toFile().deleteOnExit();
+                    }
+                    java.io.File f = dir.resolve(n.safeName()).toFile();
+                    java.nio.file.Files.write(f.toPath(), n.text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    f.deleteOnExit();
+                    exports.add(f);
+                } else if (opened < MAX_IMPORT_TABS) {
+                    openDropped(n);
+                    opened++;
+                }
+            }
+        } catch (java.io.IOException e) {
+            host.showError("Couldn't stage the dropped files for Import: " + e.getMessage());
+            return;
+        }
+        if (!exports.isEmpty()) {
+            importFiles(exports);
+        }
+    }
+
+    private void openDropped(DroppedFile.Named n) {
+        int type = DroppedFile.typeOfExtension(n.ext());
+        DroppedFile d = DroppedFile.parse(n.name, n.text, type);
+        if (d.error != null) {
+            host.showError(d.error);
+            return;
+        }
+        String name = DroppedFile.recordName(n.name, d.text, type);
+        if (catalog == null) {
+            catalog = service.catalog();
+        }
+        for (ScriptService.Entry e : catalog) {
+            if (e.typeId == type && e.name.equalsIgnoreCase(name)) {
+                openById(e.id);
+                EditorTab t = tabFor(e.id);
+                if (t != null) {
+                    t.applyDropped(d, n.name, 1);
+                }
+                return;
+            }
+        }
+        BiScriptFpo fpo = new BiScriptFpo();   // id -1: new
+        fpo.setType(BiScriptTypeConst.getConst(type));
+        fpo.setName(name);
+        fpo.setDescription(DroppedFile.metaDescription(d.text));
+        fpo.setActive(true);
+        fpo.setNote("");
+        fpo.setData(d.text);
+        show(new EditorTab(this, fpo, new ArrayList<>(), 0, null));
+    }
+
     @Override
     public void selectionChanged(Component selected) {
         if (btnEdit != null) {

@@ -255,6 +255,13 @@ load token so an old result can't paint over a newer one, chunked painting of
 long tables, the debug console, Excel through `FBLib.Export.xlsx`, the write
 confirm through `FBLib.Common.confirmModal`.
 
+**Files dropped on a page are ignored** unless the page takes them. fb-lib stops
+the browser opening a file dragged from Explorer in place of the app (a .json
+would show as raw text). It only cancels the browser's default, so a page that
+takes files (a drop zone, or its own `window` / `document` listener) still gets
+them. A page without fb-lib carries the same few lines inline
+(`__fbFileDropGuard`, e.g. `Custom/Audit/Audit_Trail.htm`).
+
 **Don't copy** (found in older pages): `FBLib.Table` for a new report, CSV
 export, Tailwind or moment.js from a CDN, `propFallback` system properties for
 switches (`BI_SHOW_DEBUG`…), `localStorage`, `type="number"` inputs in grids,

@@ -294,6 +294,17 @@ public final class EditorSelfCheck {
         check(DroppedFile.parse("fb-styles-Style.json", json, 20).error != null, "drop: a Style export on a Script tab is refused");
         check(DroppedFile.parse("bad.json", "{ nope", 10).error != null, "drop: broken JSON is refused");
         check(DroppedFile.parse("two.json", "[{\"data\":\"a\"},{\"data\":\"b\"}]", 10).error != null, "drop: a two-record file is left to Import");
+        // Files dropped on the App Library.
+        List<DroppedFile.Named> got = DroppedFile.payload(
+            "[{\"name\":\"Open Orders.htm\",\"text\":\"<p>\"},{\"name\":\"x.png\",\"text\":\"b\"},{\"name\":\"fb-lib-Script.json\",\"text\":\"[]\"}]");
+        check(got.size() == 2 && !got.get(0).isExport() && got.get(1).isExport(), "app library drop: pages and exports kept, others dropped");
+        check(DroppedFile.payload("not json").isEmpty(), "app library drop: a bad payload is nothing");
+        eq(DroppedFile.recordName("Open_Orders.htm", "<script>window.FB_REPORT = {\n key: 'k',\n name:  'Open Orders',\n build: 'x'\n};</script>", 10),
+            "Open Orders", "app library drop: a page is named by its FB_REPORT.name");
+        eq(DroppedFile.recordName("fb-lib.js", "x", 20), "fb-lib", "app library drop: a script is named after its file");
+        eq(DroppedFile.metaDescription("<meta name=\"description\" content=\"Open &amp; issued orders.\">"), "Open & issued orders.",
+            "app library drop: the description meta");
+        eq(new DroppedFile.Named("C:\\x\\a:b.json", "").safeName(), "a_b.json", "app library drop: a safe temp file name");
         // Dropped exports pre-fill the native Import dialog through these private fields.
         try {
             Class<?> dlg = Class.forName("com.evnt.client.modules.biscripteditor.dialog.UploadScriptDialog");

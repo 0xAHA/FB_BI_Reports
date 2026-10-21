@@ -160,6 +160,75 @@ final class DroppedFile {
         return dot < 0 ? "" : file.substring(dot + 1).toLowerCase(Locale.ROOT);
     }
 
+    /** One file dropped on the App Library: its name and text (the page read it). */
+    static final class Named {
+        final String name;
+        final String text;
+
+        Named(String name, String text) {
+            this.name = name;
+            this.text = text;
+        }
+
+        String ext() {
+            return DroppedFile.ext(name);
+        }
+
+        boolean isExport() {
+            return "json".equals(ext());
+        }
+
+        /** The name without folders or characters Windows won't take, for a temp file. */
+        String safeName() {
+            String s = name.replaceAll(".*[\\\\/]", "").replaceAll("[<>:\"|?*\\x00-\\x1f]", "_").trim();
+            return s.isEmpty() ? "dropped.json" : s;
+        }
+    }
+
+    /** The files the App Library sends ([{"name", "text"}, ...]); only .htm, .html, .js, .css and .json are kept. */
+    static List<Named> payload(String json) {
+        List<Named> out = new java.util.ArrayList<>();
+        try {
+            JsonNode root = new ObjectMapper().readTree(json == null ? "" : json);
+            if (root != null && root.isArray()) {
+                for (JsonNode n : root) {
+                    String name = n.path("name").asText("").trim();
+                    if (!name.isEmpty() && n.has("text") && ext(name).matches("html?|js|css|json")) {
+                        out.add(new Named(name, n.get("text").asText("")));
+                    }
+                }
+            }
+        } catch (IOException | RuntimeException ignored) {
+            // nothing usable
+        }
+        return out;
+    }
+
+    /** A page's record name is its FB_REPORT.name when it has one; otherwise the file name without its extension. */
+    static String recordName(String fileName, String text, int type) {
+        if (type == 10 && text != null) {
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("window\\.FB_REPORT\\s*=\\s*\\{[^}]*?\\bname\\s*:\\s*(['\"])(.+?)\\1", java.util.regex.Pattern.DOTALL)
+                .matcher(text);
+            if (m.find() && !m.group(2).trim().isEmpty()) {
+                return m.group(2).trim();
+            }
+        }
+        String base = fileName == null ? "" : fileName.replaceAll(".*[\\\\/]", "");
+        int dot = base.lastIndexOf('.');
+        return (dot > 0 ? base.substring(0, dot) : base).trim();
+    }
+
+    /** A page's description meta content, or "". */
+    static String metaDescription(String text) {
+        if (text == null) {
+            return "";
+        }
+        java.util.regex.Matcher m = java.util.regex.Pattern
+            .compile("<meta\\s+name=\"description\"\\s+content=\"([^\"]*)\"", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(text);
+        return m.find() ? m.group(1).replace("&quot;", "\"").replace("&amp;", "&").trim() : "";
+    }
+
     /**
      * The code area's own handler for text (typing, paste, dragging text), with files dropped
      * from Explorer handed to onFiles. A pasted file list is left to the text handler.
