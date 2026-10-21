@@ -208,7 +208,8 @@ Set the new `FB_REPORT.name` in the file first.
   rather than overwriting the deploy.
 - **New records** look like client-created ones: `active=1`, `note=''`,
   `published=1` for pages and 0 for scripts and styles, and `bireport` with
-  `params='{}'` and `widget=0`. A new page has no access rows, so only admins
+  `params='{}'` (only while that column exists: ADV-6029 moves saved settings
+  to one row per user and drops it) and `widget=0`. A new page has no access rows, so only admins
   see it until `--access` is used.
 - **Descriptions come from the page.** A page's
   `<meta name="description" content="…">` becomes the description of a new

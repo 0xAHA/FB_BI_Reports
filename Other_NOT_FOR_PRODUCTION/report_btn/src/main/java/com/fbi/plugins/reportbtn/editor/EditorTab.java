@@ -6,7 +6,6 @@ import com.fbi.fbdata.bi.BiReportAccessFpo;
 import com.fbi.fbdata.bi.BiScriptFpo;
 import com.fbi.plugins.reportbtn.WorkspaceHost;
 import com.fbi.plugins.reportbtn.WorkspaceTab;
-import com.fbi.sdk.constants.bi.AccessLevelConst;
 import com.fbi.sdk.constants.bi.BiScriptTypeConst;
 import com.fbi.sdk.constants.bi.QueryParamTypeConst;
 import org.fife.ui.rsyntaxtextarea.ErrorStrip;
@@ -65,10 +64,9 @@ import java.util.function.Supplier;
  */
 final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Actions, PreviewPane.Owner {
 
-    /** Where the preview sits, shared by the editor tabs for this session. */
-    private static volatile boolean previewRight;
-
     private final EditorFeature feature;
+    /** Panel sizes and choices, shared by the editor tabs and remembered for the user. */
+    private final EditorLayout layout;
     private final WorkspaceHost host;
     private final ScriptService service;
     private final int typeId;
@@ -124,6 +122,7 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
               List<BiReportAccessFpo> firstAccess) {
         super(new BorderLayout());
         this.feature = feature;
+        this.layout = feature.layout();
         this.host = feature.host();
         this.service = feature.service();
         this.fpo = fpo;
@@ -136,12 +135,14 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
         code.setText(fpo.getData() == null ? "" : fpo.getData());
         code.setCaretPosition(0);
         code.discardAllEdits();
+        // A file dropped from Explorer loads into the code, as in the BI Editor; text drags work as before.
+        code.setTransferHandler(new DroppedFile.Handler(code.getTransferHandler(), this::dropFiles));
         findBar = new FindBar(code);
         completions = new Completions(code);
         directives = new DirectiveParser();
         code.addParser(directives);
         insertPanel = new InsertPanel(this);
-        preview = new PreviewPane(host.plugin(), this, previewRight);
+        preview = new PreviewPane(host.plugin(), this, layout.previewRight);
 
         RTextScrollPane scroll = new RTextScrollPane(code);
         scroll.setFoldIndicatorEnabled(true);
@@ -153,7 +154,7 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
         strip.setShowMarkedOccurrences(true);
         codePanel.add(strip, BorderLayout.EAST);
         codePanel.add(findBar, BorderLayout.SOUTH);
-        codeSplit = new JSplitPane(previewRight ? JSplitPane.HORIZONTAL_SPLIT : JSplitPane.VERTICAL_SPLIT, codePanel, preview);
+        codeSplit = new JSplitPane(layout.previewRight ? JSplitPane.HORIZONTAL_SPLIT : JSplitPane.VERTICAL_SPLIT, codePanel, preview);
         codeSplit.setResizeWeight(0.5);
         codeSplit.setBorder(null);
         preview.setVisible(false);
@@ -163,7 +164,9 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
         explorerSlot.setMinimumSize(new java.awt.Dimension(0, 0));
         outerSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, explorerSlot, mainSplit);
         outerSplit.setResizeWeight(0);
-        outerSplit.setDividerLocation(270);
+        explorerSlot.setVisible(layout.showApps);
+        showApps.setSelected(layout.showApps);
+        outerSplit.setDividerLocation(layout.showApps ? layout.appsWidth : 0);
         outerSplit.setBorder(null);
 
         JPanel north = new JPanel(new BorderLayout());
@@ -198,7 +201,37 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
         decide();
         insertPanel.setIncludables(feature.includables());
         refreshPage();
-        SwingUtilities.invokeLater(() -> mainSplit.setDividerLocation(Math.max(400, mainSplit.getWidth() - 340)));
+        insertPanel.setVisible(layout.showInsert);
+        SwingUtilities.invokeLater(() -> mainSplit.setDividerLocation(layout.showInsert
+            ? Math.max(400, mainSplit.getWidth() - layout.insertWidth) : mainSplit.getWidth()));
+        rememberLayout();
+    }
+
+    /** A divider the user moves is remembered (for every editor tab, and the next session). */
+    private void rememberLayout() {
+        outerSplit.addPropertyChangeListener(JSplitPane.DIVIDER_LOCATION_PROPERTY, e -> {
+            int loc = outerSplit.getDividerLocation();
+            if (outerSplit.isShowing() && showApps.isSelected() && loc > 0) {
+                layout.appsWidth = loc;
+                layout.saveSoon();
+            }
+        });
+        mainSplit.addPropertyChangeListener(JSplitPane.DIVIDER_LOCATION_PROPERTY, e -> {
+            int w = mainSplit.getWidth();
+            int loc = mainSplit.getDividerLocation();
+            if (mainSplit.isShowing() && insertPanel.isVisible() && w > 0 && loc > 0 && loc < w) {
+                layout.insertWidth = w - loc;
+                layout.saveSoon();
+            }
+        });
+        codeSplit.addPropertyChangeListener(JSplitPane.DIVIDER_LOCATION_PROPERTY, e -> {
+            int size = codeSplit.getOrientation() == JSplitPane.HORIZONTAL_SPLIT ? codeSplit.getWidth() : codeSplit.getHeight();
+            int loc = codeSplit.getDividerLocation();
+            if (codeSplit.isShowing() && preview.isVisible() && size > 0 && loc > 0 && loc < size) {
+                layout.codeRatio = Math.max(0.1, Math.min(0.9, loc / (double) size));
+                layout.saveSoon();
+            }
+        });
     }
 
     // ---------------------------------------------------------------- identity
@@ -414,15 +447,20 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
         showApps.setToolTipText("The list of every app, script and style on the left");
         showApps.addActionListener(e -> {
             explorerSlot.setVisible(showApps.isSelected());
-            outerSplit.setDividerLocation(showApps.isSelected() ? 270 : 0);
+            layout.showApps = showApps.isSelected();
+            layout.saveSoon();
+            outerSplit.setDividerLocation(showApps.isSelected() ? layout.appsWidth : 0);
             outerSplit.revalidate();
         });
         t.add(showApps);
-        JCheckBox showInsert = new JCheckBox("Insert panel", true);
-        showInsert.setToolTipText("Includes, report settings, Fishbowl functions and module functions on the right");
+        JCheckBox showInsert = new JCheckBox("Insert panel", layout.showInsert);
+        showInsert.setToolTipText("Includes, app settings, Fishbowl functions and module functions on the right");
         showInsert.addActionListener(e -> {
             insertPanel.setVisible(showInsert.isSelected());
-            mainSplit.setDividerLocation(showInsert.isSelected() ? Math.max(400, mainSplit.getWidth() - 340) : mainSplit.getWidth());
+            layout.showInsert = showInsert.isSelected();
+            layout.saveSoon();
+            mainSplit.setDividerLocation(showInsert.isSelected() ? Math.max(400, mainSplit.getWidth() - layout.insertWidth)
+                : mainSplit.getWidth());
         });
         t.add(showInsert);
         return t;
@@ -706,7 +744,7 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
         p.add(required, c);
         c.gridy = 6;
         p.add(holder, c);
-        if (JOptionPane.showConfirmDialog(this, p, "Add report setting", JOptionPane.OK_CANCEL_OPTION,
+        if (JOptionPane.showConfirmDialog(this, p, "Add app setting", JOptionPane.OK_CANCEL_OPTION,
             JOptionPane.PLAIN_MESSAGE) != JOptionPane.OK_OPTION || title.getText().trim().isEmpty()) {
             return;
         }
@@ -1106,7 +1144,8 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
 
     @Override
     public void dockPreview(boolean right) {
-        previewRight = right;
+        layout.previewRight = right;
+        layout.saveSoon();
         preview.setDock(right);
         int want = right ? JSplitPane.HORIZONTAL_SPLIT : JSplitPane.VERTICAL_SPLIT;
         if (codeSplit.getOrientation() != want) {
@@ -1115,10 +1154,10 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
         }
     }
 
-    /** Code and preview share the space; deferred so the split has its new size. */
+    /** Code and preview share the space as the user last left it; deferred so the split has its new size. */
     private void halfSplit() {
         codeSplit.revalidate();
-        SwingUtilities.invokeLater(() -> codeSplit.setDividerLocation(0.5));
+        SwingUtilities.invokeLater(() -> codeSplit.setDividerLocation(layout.codeRatio));
     }
 
     private void history() {
@@ -1174,7 +1213,8 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
                 }
                 @SuppressWarnings("unchecked")
                 List<BiReportAccessFpo> list = panel.getAccessList();
-                if (!keepsMyEditSettings(list) && JOptionPane.showConfirmDialog(this, "None of your groups would keep Edit Settings "
+                if (!keepsMyEditLevel(list) && JOptionPane.showConfirmDialog(this, "None of your groups would keep "
+                    + AccessPolicy.EDIT_LEVEL.getName() + " "
                     + "on this app, so you couldn't edit it afterwards. Save anyway?", "App access", JOptionPane.YES_NO_OPTION,
                     JOptionPane.WARNING_MESSAGE) != JOptionPane.YES_OPTION) {
                     return true;
@@ -1189,14 +1229,14 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
         });
     }
 
-    private boolean keepsMyEditSettings(List<BiReportAccessFpo> list) {
+    private boolean keepsMyEditLevel(List<BiReportAccessFpo> list) {
         if (ClientRights.isAdmin(host)) {
             return true;
         }
         int uid = host.userId();
         Set<Integer> mine = service.myGroupIds(uid);
         for (BiReportAccessFpo a : list) {
-            if (mine.contains(a.getUserGroupId()) && a.getAccessLevel() == AccessLevelConst.EDIT_SETTINGS) {
+            if (mine.contains(a.getUserGroupId()) && a.getAccessLevel() == AccessPolicy.EDIT_LEVEL) {
                 return true;
             }
         }
@@ -1293,6 +1333,65 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
         } catch (ScriptService.ServiceException e) {
             status(e.getMessage());
         }
+    }
+
+    /** After Import wrote this record: the imported version (asking first when there are unsaved changes). */
+    void reloadImported() {
+        if (isDirty()) {
+            reloadFromServer();
+        } else {
+            reloadQuietly();
+            status("Reloaded the imported version.");
+        }
+    }
+
+    /**
+     * Files dropped on the code: the first one's text replaces the code (Ctrl+Z undoes it). A
+     * Fishbowl export (.json) also fills in the name and description. Nothing is saved.
+     */
+    private void dropFiles(java.util.List<java.io.File> files) {
+        if (files == null || files.isEmpty()) {
+            return;
+        }
+        if (files.size() > 1 && files.stream().allMatch(f -> f.getName().toLowerCase(java.util.Locale.ROOT).endsWith(".json"))) {
+            feature.importDropped(files);   // several exports: the Import dialog, with Publish and access
+            return;
+        }
+        if (!decision.canEdit) {
+            info("This can't be changed here: " + decision.reason);
+            return;
+        }
+        java.io.File f = files.get(0);
+        DroppedFile d = DroppedFile.read(f, typeId);
+        if (d.error != null) {
+            error(d.error);
+            return;
+        }
+        if (d.confirm != null && JOptionPane.showConfirmDialog(this, d.confirm, "Load " + f.getName(),
+            JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) {
+            return;
+        }
+        // The record's own line endings, so only the content shows as changed.
+        String text = d.text.replace("\r\n", "\n").replace('\r', '\n');
+        if (savedText != null && savedText.contains("\r\n")) {
+            text = text.replace("\n", "\r\n");
+        }
+        code.setText(text);
+        code.setCaretPosition(0);
+        boolean fields = false;
+        if (d.name != null && !d.name.isEmpty()) {
+            name.setText(d.name);
+            name.setCaretPosition(0);
+            fields = true;
+        }
+        if (d.description != null) {
+            description.setText(d.description);
+            description.setCaretPosition(0);
+            fields = true;
+        }
+        updateTitle();
+        status("Loaded " + f.getName() + (fields ? " (code, name and description)" : "") + ". Not saved yet; Ctrl+Z undoes the code."
+            + (files.size() > 1 ? " Only the first of the " + files.size() + " files was used." : ""));
     }
 
     private void reloadFromServer() {

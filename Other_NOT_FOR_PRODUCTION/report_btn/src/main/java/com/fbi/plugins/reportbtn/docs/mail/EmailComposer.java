@@ -1,5 +1,6 @@
 package com.fbi.plugins.reportbtn.docs.mail;
 
+import com.evnt.client.common.ClientProperties;
 import com.fbi.gui.button.FBButton;
 import com.fbi.plugins.reportbtn.BrowserFit;
 import com.fbi.util.FishbowlBrowser;
@@ -373,10 +374,30 @@ public final class EmailComposer extends JFrame {
         return all;
     }
 
+    /** The folder Attach… last added from, in client.properties (the BI Report Save keeps its own). */
+    private static final String ATTACH_DIR = "reportbtn.mail.attachDir";
+
     private void addFile() {
         JFileChooser fc = new JFileChooser();
         fc.setMultiSelectionEnabled(true);
+        try {
+            File dir = new File(ClientProperties.getProperty(ATTACH_DIR, ""));
+            if (dir.isDirectory()) {
+                fc.setCurrentDirectory(dir);
+            }
+        } catch (RuntimeException | LinkageError ignored) {
+            // the chooser's default folder
+        }
         if (fc.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
+            try {
+                File dir = fc.getCurrentDirectory();
+                if (dir != null) {
+                    ClientProperties.setProperty(ATTACH_DIR, dir.getAbsolutePath());
+                    ClientProperties.saveProperties();
+                }
+            } catch (RuntimeException | LinkageError ignored) {
+                // not remembered this time
+            }
             for (File f : fc.getSelectedFiles()) {
                 if (!files.contains(f)) {
                     files.add(f);

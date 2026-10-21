@@ -253,6 +253,9 @@ never a user's own saved options.
   data) has been laid out and nothing changes for 300 ms. A page that never calls
   `refresh()` for the record (e.g. the record isn't found) times out on the host.
 - **Printing** is the BI Reports module's Save→PDF: JxBrowser's PDF printer, backgrounds
-  on, no header or footer, at 100%. The sheets are already sized for its 0.4 in margins
+  on, no header or footer, at 100%. The module's Print button makes the same PDF and
+  opens it in the PDF program. Fishbowl sets no paper, margins or scale: the paper is the
+  page's `@page` size, the margins are Chromium's default 0.4 in, and anything wider than
+  the printable area is shrunk. The sheets are already sized for those margins
   (README, *Print geometry*), so a page needs nothing else.
 - Desk tests: `tools/doc-tests/Output.test.js` (SO, SO Invoice, Packing Slip, Shipping Invoice; and a wrong-module launch).

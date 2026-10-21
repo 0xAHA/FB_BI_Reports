@@ -74,7 +74,7 @@ final class ClientRights {
                 return c;
             }
         }
-        return s.toLowerCase().contains("edit") ? AccessLevelConst.EDIT_SETTINGS : AccessLevelConst.VIEW;
+        return s.toLowerCase().contains("edit") ? AccessPolicy.EDIT_LEVEL : AccessLevelConst.VIEW;
     }
 
     private static boolean has(AccessRights right) {

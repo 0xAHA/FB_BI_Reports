@@ -88,8 +88,7 @@ final class ReportLoader {
     /** The report's saved setting values, as BiReportModuleClient.loadQueryParams builds them. */
     static Set<QueryParameter> savedParams(BiReportFpo report) {
         Set<QueryParameter> params = new HashSet<>();
-        SimpleMap saved = report.getParams();
-        Map<?, ?> map = saved != null ? saved.getMap() : null;
+        Map<?, ?> map = savedMap(report);
         if (map != null) {
             for (Map.Entry<?, ?> e : map.entrySet()) {
                 QueryParameter p = new QueryParameter(String.valueOf(e.getKey()));
@@ -98,6 +97,27 @@ final class ReportLoader {
             }
         }
         return params;
+    }
+
+    /**
+     * BiReportFpo.getParams() (bireport.params), looked up at run time. Fishbowl is moving saved
+     * settings from that one shared column to a row per user (ADV-6029); if the getter goes, the
+     * app opens with its declared values instead of failing to open. Once that build is out, read
+     * the user's own row here the way the BI Reports module does.
+     */
+    private static Map<?, ?> savedMap(BiReportFpo report) {
+        try {
+            Object saved = report.getClass().getMethod("getParams").invoke(report);
+            if (saved instanceof SimpleMap) {
+                return ((SimpleMap) saved).getMap();
+            }
+            if (saved instanceof Map) {
+                return (Map<?, ?>) saved;
+            }
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError ignored) {
+            // no saved settings on this build
+        }
+        return null;
     }
 
     static boolean failed(EVEvent response) {

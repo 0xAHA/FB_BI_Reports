@@ -1,6 +1,6 @@
 # report_btn: module-related BI reports, and the Apps (beta) module
 
-**Status:** proof of concept, version 0.7.5.
+**Status:** proof of concept, version 0.7.6.
 - **0.1.0 works in the client** (2026-10-12): Reports → Apps in Sales Order opens the
   Sales Order paperwork on the open order.
 - **0.3.0** adds module and menu-group keys.
@@ -79,7 +79,7 @@
   builder learns the record, so publishing again updates it.
   - **Who may publish:** admin and BI Editor-Edit publish anywhere. The new right
     **Apps (beta)-Build Reports** publishes a new report for the user's own groups only, in the
-    Custom folder and no Apps menu. It republishes a builder report the user has Edit Settings on,
+    Custom folder and no Apps menu. It republishes a builder report the user has Edit Settings (View after ADV-6032) on,
     keeping its access, folder and menus.
   - **Never replaced:** system pages, and pages the builder didn't write.
 - **0.6.1:** an app no longer stays narrower than its tab. Chromium sometimes missed the
@@ -91,6 +91,15 @@
   in for a module's Jasper document, through new **Print (App)** and **Email (rich)** ribbon
   buttons, and emails open in a rich HTML window. See
   [Documents and email (PoC)](#documents-and-email-poc).
+- **0.7.6:** ready for Fishbowl's BI changes (epic ADV-5903). One jar runs on 26.9 and on the builds after them.
+  - **Edit Settings goes (ADV-6032).** The access the editor asks for on a report (to edit its page, change its access or republish a builder report) is Edit Settings while Fishbowl has that level, and View once it doesn't (the upgrade turns every Edit Settings row into View). It's looked up by name at run time (`AccessPolicy.EDIT_LEVEL`), and the messages name whichever level it is.
+  - **Saved settings per user (ADV-6029).** An app's saved settings are read through `BiReportFpo.getParams()` looked up at run time; if Fishbowl drops it with `bireport.params`, apps open with their declared values instead of failing. Reading each user's own row comes once that build is out.
+  - **Import opens what it imported** (as ADV-6010 does in the BI Editor): each record in its own tab, an open tab reloads (asking first when it has unsaved changes), the last one in front and shown in the Apps panel. More than 12 are only shown in the panel.
+  - **The editor remembers its layout per user** (as ADV-6009 does in the BI Editor): the Apps and Insert panel widths, the code / preview split, where the preview docks and which panels show, in client.properties under the user's id.
+  - The email window's **Attach…** opens in the folder it last added from.
+  - **Drop a file on the code** (as in the BI Editor): an .htm, .js, .css or other text file's text replaces the code (Ctrl+Z undoes it; nothing is saved). A Fishbowl export (`<name>-<Type>.json`, from a Download or the SharePoint folder) also fills in the name and description, on a tab of the same kind only (a page and a template take each other's). A file whose extension doesn't match the tab asks first; images, binaries and multi-record files are refused. Text drags inside the code work as before.
+  - **Drop several exports** (`.json`) on the code, or any number on the Apps panel: Fishbowl's own Import dialog opens with the files already chosen and **Publish** ticked, so OK goes on to its access step; then they open as after Import. (The dialog's file chooser and Publish box are private fields, set by reflection; if a Fishbowl build changes them, the dialog opens as the toolbar's Import does and the self-check flags it.)
+  - Wording: the App Builder publishes an *app*, the Insert panel lists *App settings*, and the launch error dialog is titled *Apps*. Names of Fishbowl's own modules (BI Report module, BI Editor) stay until Fishbowl renames them.
 - **0.7.5:** every app can be put in Apps menus, system apps included. A system app's code stays locked (it ships with Fishbowl, and an update replaces it), so its Apps menus are kept as the company's choice in plugin properties (`report_btn.menus`, one per app record name) and win over its own fb-launch tag; a custom app's stay in its code as before. The Apps panel (Add to / Remove from / drag / Apps menus…) and the editor's **Apps menus…** button both do it; a system app's folder stays fixed.
 - **0.7.4:** the email window keeps the stock Compose Email layout, so only the body editor is new: a toolbar with **Send** and **Cancel** (the client's own icons) plus **Email App ▾** (just this once / always), then From, the **To: / Cc: / Bcc:** buttons and Subject, and **Attachments:** with the paperclip at the foot. The buttons open the client's own **Email Address Book** (Customer or Vendor tab, Company tab; double-click a row to add it to To, or to Cc / Bcc once that field is clicked in), filled with the record's address and its account's contacts, and the company's contacts and the Fishbowl users. If that dialog can't open, a copy of it in the same layout does. The template in use shows at the right of the editor bar. Addresses split correctly when a quoted name holds a comma.
 - **0.7.3:** the email window. The To, Cc and Bcc labels are buttons: each opens a list of the record's customer or vendor email contacts (the order's own address first) and the Fishbowl users, ticked where the field already has them; their tooltip says to separate addresses with a semicolon. **Open in my email program ▾** offers *Just this once* or *Always* (remembered; untick it there to stop). The body editor's list, indent, alignment, link and undo / redo buttons are icons (the link button toggles: inside a link it removes it; Ctrl+K), and deleting everything (select all, Delete) starts a plain email without the template's style sheet; Ctrl+Z straight after brings the template back.
@@ -435,7 +444,8 @@ One explorer, shared by the editor tabs (it moves into whichever one shows; unti
   app's access; or a blank **Script**, **Style** or **Template**, named in the tab.
 - **Import** on the toolbar: the BI Editor's own Import dialog (`UploadScriptDialog`,
   with Fishbowl's JSON mapper), for files from a Download or the SharePoint folder. A
-  record with the same name and type is updated; others are created.
+  record with the same name and type is updated; others are created. What it wrote then
+  opens, each in its tab (an open tab reloads), the last one in front.
 - The **Apps panel** on the left of every editor tab (below).
 - Right-click an include in the selector: **Open in the editor** (fb-lib, fb-styles, …).
 
@@ -496,18 +506,18 @@ One explorer, shared by the editor tabs (it moves into whichever one shows; unti
 - **History:** Fishbowl's saved versions. Compare any two, or one with the editor, and
   restore one into the editor (undoable, not saved).
 - **Access…:** Fishbowl's own `BiAccessRightsPanel`, saved with `BI_REPORT_SAVE`. It warns
-  before you remove your own Edit Settings.
+  before you remove your own Edit Settings (View after ADV-6032).
 
 **Who may do what.** The server checks none of these rights on BI saves, so the editor
 does, and re-checks before every save:
 
 | Target | Editable when (admin always) |
 |---|---|
-| A page with reports | BI Editor-Edit **and** Edit Settings on every report that uses it |
+| A page with reports | BI Editor-Edit **and** Edit Settings on every report that uses it (View after ADV-6032 removes Edit Settings) |
 | A new page, or one with no report | BI Editor-Edit |
 | A script, style or template | BI Editor-Edit |
 | An image | never here |
-| Report access | BI Report-Edit and Edit Settings on the report |
+| Report access | BI Report-Edit and Edit Settings on the report (View after ADV-6032) |
 | Unpublishing | page editable, and BI Report-Delete |
 | A system app (`fb-origin` system) | **never** its code, name, description, folder or Apps menus, admin included; Active, Published, gadget and access as above; Delete offers deactivation |
 

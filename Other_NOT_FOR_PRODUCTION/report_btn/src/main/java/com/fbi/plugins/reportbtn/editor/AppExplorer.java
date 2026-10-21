@@ -619,13 +619,38 @@ final class AppExplorer extends JPanel {
             dragging = null;
         }
 
+        /** Files from Explorer (not a drag of apps within the panel): Fishbowl exports to import. */
+        private boolean files(TransferSupport s) {
+            return s.isDrop() && dragging == null && s.isDataFlavorSupported(java.awt.datatransfer.DataFlavor.javaFileListFlavor);
+        }
+
         @Override
         public boolean canImport(TransferSupport s) {
+            if (files(s)) {
+                if ((s.getSourceDropActions() & COPY) != 0) {
+                    s.setDropAction(COPY);
+                }
+                return true;
+            }
             return s.isDrop() && dragging != null && !dragging.isEmpty() && dropFolder(s) != null;
         }
 
         @Override
         public boolean importData(TransferSupport s) {
+            if (files(s)) {
+                try {
+                    @SuppressWarnings("unchecked")
+                    List<java.io.File> list = (List<java.io.File>) s.getTransferable()
+                        .getTransferData(java.awt.datatransfer.DataFlavor.javaFileListFlavor);
+                    if (list != null && !list.isEmpty()) {
+                        SwingUtilities.invokeLater(() -> feature.importDropped(list));
+                        return true;
+                    }
+                } catch (java.awt.datatransfer.UnsupportedFlavorException | java.io.IOException | RuntimeException ignored) {
+                    // nothing to import
+                }
+                return false;
+            }
             Folder f = dropFolder(s);
             if (f == null || dragging == null) {
                 return false;

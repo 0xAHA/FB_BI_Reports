@@ -248,6 +248,45 @@ final class ScriptService {
         return out;
     }
 
+    /**
+     * id -> dateLastModified of every page, script, style and template (only the active ones when
+     * asked). Import reads it before and after the BI Editor's dialog to find what the dialog wrote.
+     */
+    java.util.Map<Integer, String> stamps(boolean activeOnly) {
+        java.util.Map<Integer, String> out = new java.util.HashMap<>();
+        for (Object row : query("SELECT id, CAST(dateLastModified AS CHAR(32)) AS m FROM biscript WHERE typeId IN (10, 20, 30, 40)"
+            + (activeOnly ? " AND active+0 = 1" : ""))) {
+            int id = intOf(host.column(row, "id"));
+            if (id > 0) {
+                out.put(id, nz(host.column(row, "m")));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * The records in after that are new or changed since before, oldest change first (so the last
+     * one is the last imported). Nothing when before is empty: its read failed, and every record
+     * would look new.
+     */
+    static List<Integer> changed(java.util.Map<Integer, String> before, java.util.Map<Integer, String> after) {
+        List<Integer> out = new ArrayList<>();
+        if (before == null || before.isEmpty() || after == null) {
+            return out;
+        }
+        for (java.util.Map.Entry<Integer, String> e : after.entrySet()) {
+            String was = before.get(e.getKey());
+            if (was == null || !was.equals(e.getValue())) {
+                out.add(e.getKey());
+            }
+        }
+        out.sort((a, b) -> {
+            int c = after.get(a).compareTo(after.get(b));
+            return c != 0 ? c : Integer.compare(a, b);
+        });
+        return out;
+    }
+
     /** The folders of Fishbowl's own report tree under Company (Reporting > Reports), A-Z. */
     List<String> nativeFolders() {
         List<String> out = new ArrayList<>();

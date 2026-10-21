@@ -156,6 +156,6 @@ final class AppLauncher {
     }
 
     private static void error(Client client, String text) {
-        JOptionPane.showMessageDialog(client, text, ReportAppsPlugin.MODULE_NAME, JOptionPane.ERROR_MESSAGE);
+        JOptionPane.showMessageDialog(client, text, "Apps", JOptionPane.ERROR_MESSAGE);
     }
 }

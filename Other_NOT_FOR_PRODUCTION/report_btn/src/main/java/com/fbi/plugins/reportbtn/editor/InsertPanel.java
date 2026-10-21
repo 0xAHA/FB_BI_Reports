@@ -62,7 +62,7 @@ final class InsertPanel extends JPanel {
 
     private enum Kind { SECTION, INCLUDE, SETTING_TYPE, SETTING_USED, BRIDGE, MODULE, SYMBOL }
 
-    private static final String SETTINGS = "Report settings";
+    private static final String SETTINGS = "App settings";
     private static final String USED = "In this app";
 
     private static final class Item {
@@ -463,7 +463,7 @@ final class InsertPanel extends JPanel {
     private void showDoc(Item it) {
         String html;
         if (it != null && it.kind == Kind.SECTION && SETTINGS.equals(it.label)) {
-            html = "<b>Report settings</b><br>Values set from the app's Settings button, substituted into the page as tokens."
+            html = "<b>App settings</b><br>Values set from the app's Settings button, substituted into the page as tokens."
                 + "<br><br>Double-click a type to add one, or right-click and <b>Add setting…</b> to choose the type in the dialog.";
         } else if (it == null || it.kind == Kind.SECTION) {
             html = "<i>Select an item to see what it inserts. Double-click or Enter inserts it at the caret.</i>";

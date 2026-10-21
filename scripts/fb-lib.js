@@ -187,7 +187,7 @@ window.FBLib = (function () {
      * Exposed as FBLib.BUILD so a report can tell which fb-lib the Fishbowl server actually served it.
      * @type {string}
      */
-    const BUILD = '2026.10.21-a5d8310';   // @fb-build
+    const BUILD = '2026.10.21-5d26bc1';   // @fb-build
 
     /**
      * Returns the host report's identity block (window.FB_REPORT, set at the top of every report's head).
@@ -2062,10 +2062,14 @@ window.FBLib = (function () {
 
         let _editSettingsCache = null;
         /**
-         * The user names whose group has Edit Settings on this report: the native BI right to change a report's settings.
+         * The user names that may publish this report's company settings besides admin: those whose group has
+         * Edit Settings on the report, and those whose group has any access to the report plus the BI Report-Edit
+         * right. Fishbowl is removing the Edit Settings level (ADV-6032 turns it into View), so the second rule
+         * keeps the editors working after that upgrade. A right is granted when its useraccess row exists.
          * Pass them as alsoTrust to let those users publish (Settings config.company.editors, FilterViews opts.editors).
-         * Read from bireportaccess, so a row written by anyone else is never believed. The report is the one a host
-         * opened (FB_LAUNCH / FB_WORKSPACE reportId), else the bireport named FB_REPORT.name. Cached per load.
+         * Read from bireportaccess and useraccess, so a row written by anyone else is never believed. The report is
+         * the one a host opened (FB_LAUNCH / FB_WORKSPACE reportId), else the bireport named FB_REPORT.name.
+         * Cached per load.
          * @returns {string[]} The user names; empty outside the client or for an unpublished report.
          */
         function editSettingsUsers() {
@@ -2087,7 +2091,8 @@ window.FBLib = (function () {
                             "SELECT DISTINCT su.userName AS username FROM bireportaccess a " +
                             "INNER JOIN usergrouprel r ON r.groupId = a.userGroupId " +
                             "INNER JOIN sysuser su ON su.id = r.userId " +
-                            "WHERE a.accessLevel = 'Edit Settings' AND " + where
+                            "WHERE (a.accessLevel = 'Edit Settings' OR EXISTS (SELECT 1 FROM useraccess ua " +
+                            "WHERE ua.groupId = r.groupId AND ua.moduleName = 'BI Report-Edit')) AND " + where
                         ) || '[]');
                         out = (Array.isArray(rows) ? rows : []).map(function (r) { return String(r.username || ''); }).filter(Boolean);
                     } catch (e) {
@@ -2236,7 +2241,8 @@ window.FBLib = (function () {
          * @param {object} [config.tileToTable] - Tile key to custom-field tableRefName, used by CfCatalog (TILE_TO_TABLE).
          * @param {object} [config.company] - Company defaults (userProperties master only), e.g. { keys: ['filters'], editors: true }.
          *   keys: settings whose company value wins over the user's own, so every open starts from it (until it is cleared).
-         *   editors: users with Edit Settings on this report may publish too (isAdmin() is true for them), and their rows are trusted.
+         *   editors: the report's editors (Edit Settings on it, or access plus BI Report-Edit: SharedData.editSettingsUsers)
+         *            may publish too (isAdmin() is true for them), and their rows are trusted.
          */
         function init(config) {
             config = config || {};
@@ -2383,7 +2389,7 @@ window.FBLib = (function () {
         }
 
         /**
-         * Sets one key of the company (master) settings, keeping the rest. Admin or, with config.company.editors, Edit Settings users.
+         * Sets one key of the company (master) settings, keeping the rest. Admin or, with config.company.editors, the report's editors.
          * For a config.company.keys key, every user then starts from this value each time the report opens.
          * @param {string} key - The setting key, e.g. 'filters' or 'docPaper'.
          * @param {*} value - Any JSON-serialisable value.
@@ -2481,7 +2487,7 @@ window.FBLib = (function () {
             clearCompany: clearCompany,
             hasCompany: hasCompany,
             /**
-             * The user names trusted to publish besides admin: those with Edit Settings on this report (config.company.editors).
+             * The user names trusted to publish besides admin: the report's editors (config.company.editors; SharedData.editSettingsUsers).
              * @returns {string[]} A copy of the list; empty without config.company.editors.
              */
             editors: function () { return _editors.slice(); },
@@ -5106,7 +5112,7 @@ window.FBLib = (function () {
          * @param {Function} [opts.capture] - Custom mode: returns the JSON-able state.
          * @param {Function} [opts.restore] - Custom mode: applies a saved state; may return a Promise.
          * @param {string} [opts.sharedKey] - Company-views SharedData key (default FB_REPORT.key + '.shared.v1').
-         * @param {boolean} [opts.editors] - Users with Edit Settings on this report may publish company views too (see SharedData.editSettingsUsers).
+         * @param {boolean} [opts.editors] - The report's editors may publish company views too (see SharedData.editSettingsUsers).
          * @param {boolean} [opts.companyFirst] - The company default view opens even for users who starred their own.
          * @returns {object} API: beforeLoad(), changed(), detach(), openDefault(), adoptDefault(), open(), close(), activeView.
          */

@@ -46,6 +46,8 @@ public final class EditorFeature implements WorkspaceExtension {
     private List<ScriptService.Includable> includables;
     private AppExplorer explorer;
     private List<ScriptService.Entry> catalog;
+    private EditorLayout layout;
+    private int layoutUser = -1;
 
     public EditorFeature() {
         // found and built by ReportWorkspacePlugin.loadExtension
@@ -195,15 +197,50 @@ public final class EditorFeature implements WorkspaceExtension {
         show(new EditorTab(this, fpo, new ArrayList<>(), 0, null));
     }
 
-    /** The BI Editor's Import dialog (JSON files from a Download or the SharePoint folder), then a refresh. */
+    /** More imported records than this are revealed in the explorer, not each opened in a tab. */
+    private static final int MAX_IMPORT_TABS = 12;
+
+    /**
+     * The BI Editor's Import dialog (JSON files from a Download or the SharePoint folder), then a
+     * refresh, then what it wrote opens: each record in its tab (an open tab reloads), the last
+     * one in front. The dialog doesn't say what it imported, so the records' modified dates are
+     * compared before and after; Cancel or a failed import changes none and opens nothing.
+     */
     private void importFiles() {
+        importFiles(null);
+    }
+
+    /**
+     * Fishbowl exports (.json) dropped on an editor tab or the Apps panel: the same Import
+     * dialog, with the files already chosen and Publish ticked, so OK goes on to the access
+     * step as it does for a published import.
+     */
+    void importDropped(List<java.io.File> files) {
+        List<java.io.File> json = new ArrayList<>();
+        for (java.io.File f : files) {
+            if (f.isFile() && f.getName().toLowerCase(Locale.ROOT).endsWith(".json")) {
+                json.add(f);
+            }
+        }
+        if (json.isEmpty()) {
+            host.showError("Only Fishbowl exports (.json files from a Download or the SharePoint folder) can be imported.");
+            return;
+        }
+        importFiles(json);
+    }
+
+    private void importFiles(List<java.io.File> preset) {
         if (!ClientRights.mayEdit(host)) {
             host.showError("Importing needs the BI Editor-Edit right.");
             return;
         }
+        java.util.Map<Integer, String> before = service.stamps(false);
         try {
             UploadScriptDialog d = new UploadScriptDialog(Exporter.mapper());
             d.setLocationRelativeTo(host.plugin());
+            if (preset != null && !presetImport(d, preset)) {
+                host.log("App editor: couldn't pre-select the dropped files in the Import dialog", null);
+            }
             d.setVisible(true);
         } catch (RuntimeException | LinkageError e) {
             host.log("App editor: the import dialog failed", e);
@@ -216,6 +253,56 @@ public final class EditorFeature implements WorkspaceExtension {
         }
         host.invalidateCatalog();
         reloadCatalog();
+        openImported(ScriptService.changed(before, service.stamps(true)));
+    }
+
+    /**
+     * Chooses the files in the Import dialog's own file chooser and ticks its Publish box
+     * (private fields of the 26.9 dialog, so by reflection). False when this build differs:
+     * the dialog then opens as the toolbar's Import does, for the user to pick the files.
+     */
+    private static boolean presetImport(UploadScriptDialog d, List<java.io.File> files) {
+        try {
+            java.lang.reflect.Field fc = UploadScriptDialog.class.getDeclaredField("importFileChooser");
+            fc.setAccessible(true);
+            javax.swing.JFileChooser chooser = (javax.swing.JFileChooser) fc.get(d);
+            chooser.setMultiSelectionEnabled(true);
+            java.io.File dir = files.get(0).getAbsoluteFile().getParentFile();
+            if (dir != null) {
+                chooser.setCurrentDirectory(dir);
+            }
+            chooser.setSelectedFiles(files.toArray(new java.io.File[0]));
+            java.lang.reflect.Field cp = UploadScriptDialog.class.getDeclaredField("chkPublish");
+            cp.setAccessible(true);
+            ((javax.swing.JCheckBox) cp.get(d)).setSelected(true);
+            return true;
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError e) {
+            return false;
+        }
+    }
+
+    private void openImported(List<Integer> ids) {
+        if (ids.isEmpty()) {
+            return;
+        }
+        int last = ids.get(ids.size() - 1);
+        if (ids.size() <= MAX_IMPORT_TABS) {
+            for (int id : ids) {
+                EditorTab open = tabFor(id);
+                if (open != null) {
+                    open.reloadImported();
+                } else {
+                    openById(id);
+                }
+            }
+            EditorTab front = tabFor(last);
+            if (front != null) {
+                host.select(front);
+            }
+        }
+        if (explorer != null) {
+            explorer.reveal(last);
+        }
     }
 
     private void newPage() {
@@ -286,6 +373,21 @@ public final class EditorFeature implements WorkspaceExtension {
 
     ScriptService service() {
         return service;
+    }
+
+    /** The panel layout the editor tabs share, remembered for the signed-in user. */
+    EditorLayout layout() {
+        int uid = 0;
+        try {
+            uid = host.userId();
+        } catch (RuntimeException ignored) {
+            // user 0: the defaults, still remembered
+        }
+        if (layout == null || layoutUser != uid) {
+            layout = EditorLayout.load(uid);
+            layoutUser = uid;
+        }
+        return layout;
     }
 
     List<ScriptService.Includable> includables() {

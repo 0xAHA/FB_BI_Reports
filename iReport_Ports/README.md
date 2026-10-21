@@ -74,8 +74,9 @@ So business paperwork comes out the same for everyone:
   - **It is the bottom layer.** A user's own choice, a report's company paper and a
     POC document's Page_setup (when changed from its A4 default) all win over it.
 - **Company paper.**
-  - **Who sets it:** admin, or a user whose group has **Edit Settings** on the
-    report. In the PDF view's paper bar they press **Use for everyone**; **Stop using
+  - **Who sets it:** admin, or the report's editors: a user whose group has
+    **Edit Settings** on the report, or has access to it and the **BI Report-Edit**
+    right (Fishbowl is removing Edit Settings, ADV-6032). In the PDF view's paper bar they press **Use for everyone**; **Stop using
     company paper** clears it.
   - **Who gets it:** every user who hasn't picked a paper of their own, and the
     documents a module prints or emails through Print (App) / Email (rich), which
@@ -93,7 +94,7 @@ So business paperwork comes out the same for everyone:
 - **How a port opts in:** `FBLib.Settings.init({ masterStorage: 'userProperties',
   company: { keys: ['filters', 'opts'], editors: true }, … })`.
   - `keys` are the settings whose company value wins.
-  - `editors` trusts the report's Edit Settings users, read from `bireportaccess`, so
+  - `editors` trusts the report's editors (above), read from `bireportaccess` and `useraccess`, so
     nobody else's settings row is believed.
 - **Saved-views ports** (Part Activity, the two Summaries) pass
   `editors: true, companyFirst: true` to `FBLib.FilterViews.attach`, so the company

@@ -75,7 +75,7 @@ label, widthPt, wMm, hMm }`).
 **Paper, first match wins** (the same in every report):
 1. the user's own choice in the paper bar (remembered per user, key `docView`);
 2. the company's paper for this report (`FBLib.Settings` master key `docPaper`,
-   set by an admin or the report's Edit Settings users: *Use for everyone*);
+   set by an admin or the report's editors (`FBLib.SharedData.editSettingsUsers`): *Use for everyone*);
 3. the standard paper: the stock report's `page`, in the size set for every
    report (*Use A4 for all reports*, a SharedData payload `cdx.bi.paper.v1`,
    else by edition: Letter for US / CA, A4 elsewhere) unless the report's

@@ -206,8 +206,13 @@ async function ensureReport(sql, scriptId, name, create) {
         return +r[0].id;
     }
     if (!create) return null;
-    await sql('INSERT INTO bireport (biScriptId, data, params, name, description, widget, dateLastModified) VALUES (' +
-        scriptId + ", '', '{}', " + q(name) + ', ' + q(name) + ', 0, NOW(6))');
+    // bireport.params (the settings shared by every user) goes when Fishbowl moves
+    // saved settings to one row per user (ADV-6029); write it only while it exists.
+    const hasParams = +((await sql("SELECT COUNT(*) AS n FROM information_schema.columns WHERE table_schema = DATABASE() " +
+        "AND table_name = 'bireport' AND column_name = 'params'"))[0] || {}).n > 0;
+    await sql('INSERT INTO bireport (biScriptId, data, ' + (hasParams ? 'params, ' : '') +
+        'name, description, widget, dateLastModified) VALUES (' +
+        scriptId + ", '', " + (hasParams ? "'{}', " : '') + q(name) + ', ' + q(name) + ', 0, NOW(6))');
     const n = await sql('SELECT id FROM bireport WHERE name = ' + q(name));
     if (!n.length) throw new Error('bireport insert reported success but the row is not there');
     return +n[0].id;

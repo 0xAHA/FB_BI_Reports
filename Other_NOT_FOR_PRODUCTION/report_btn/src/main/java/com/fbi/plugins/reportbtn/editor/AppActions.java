@@ -182,7 +182,8 @@ final class AppActions {
         if (chosen == null) {
             return;
         }
-        if (!keepsMyEditSettings(chosen) && JOptionPane.showConfirmDialog(parent, "None of your groups would keep Edit Settings, "
+        if (!keepsMyEditLevel(chosen) && JOptionPane.showConfirmDialog(parent, "None of your groups would keep "
+            + AccessPolicy.EDIT_LEVEL.getName() + ", "
             + "so you couldn't edit these apps afterwards. Save anyway?", "App access", JOptionPane.YES_NO_OPTION,
             JOptionPane.WARNING_MESSAGE) != JOptionPane.YES_OPTION) {
             return;
@@ -817,13 +818,13 @@ final class AppActions {
         return list == null ? new ArrayList<>() : list;
     }
 
-    private boolean keepsMyEditSettings(List<BiReportAccessFpo> list) {
+    private boolean keepsMyEditLevel(List<BiReportAccessFpo> list) {
         if (ClientRights.isAdmin(host)) {
             return true;
         }
         Set<Integer> mine = service.myGroupIds(host.userId());
         for (BiReportAccessFpo a : list) {
-            if (mine.contains(a.getUserGroupId()) && a.getAccessLevel() == AccessLevelConst.EDIT_SETTINGS) {
+            if (mine.contains(a.getUserGroupId()) && a.getAccessLevel() == AccessPolicy.EDIT_LEVEL) {
                 return true;
             }
         }

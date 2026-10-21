@@ -9,11 +9,11 @@ import java.util.function.IntFunction;
  * Who may change what. Fishbowl's server checks none of these rights on BI saves,
  * so this is the gate; it is re-checked immediately before every save.
  *
- *   Page with reports      BI Editor-Edit and Edit Settings on every report using it
+ *   Page with reports      BI Editor-Edit and EDIT_LEVEL on every report using it
  *   Page with no report    BI Editor-Edit
  *   Script/Style/Template  BI Editor-Edit (shared: they change every page that includes them)
  *   Image                  never here (the BI Editor module edits images)
- *   Report access          BI Report-Edit and Edit Settings on that report
+ *   Report access          BI Report-Edit and EDIT_LEVEL on that report
  *   Unpublish              page editable and BI Report-Delete (it deletes the report)
  *   Dashboard gadget       page editable and BI Report-Edit (bireport.widget)
  *   System app             never its code, name, description or folder (it ships
@@ -21,12 +21,29 @@ import java.util.function.IntFunction;
  *                          Published, gadget, access and Apps menus follow the rules
  *                          above (its Apps menus are kept in MenuOverrides, not its code)
  *
+ * EDIT_LEVEL is Edit Settings while Fishbowl has that level, else View.
+ *
  * Admin may do everything except change a system app. Pure: Rights is filled from
  * the client by EditorFeature.
  */
 final class AccessPolicy {
 
     enum Target { PAGE, SCRIPT, STYLE, TEMPLATE, IMAGE }
+
+    /**
+     * The access to a report that lets a user edit its page or change who can open it: Edit
+     * Settings while Fishbowl has that level, View once it is gone (ADV-6032 removes it and turns
+     * every Edit Settings row into View). Looked up by name, so one jar runs on both.
+     */
+    static final AccessLevelConst EDIT_LEVEL = editLevel();
+
+    private static AccessLevelConst editLevel() {
+        try {
+            return AccessLevelConst.valueOf("EDIT_SETTINGS");
+        } catch (IllegalArgumentException e) {
+            return AccessLevelConst.VIEW;
+        }
+    }
 
     /** One report using the page. */
     static final class Report {
@@ -132,9 +149,9 @@ final class AccessPolicy {
         } else if (target == Target.PAGE) {
             for (Report rep : reports) {
                 AccessLevelConst lv = r.level.apply(rep.id);
-                if (lv != AccessLevelConst.EDIT_SETTINGS) {
+                if (lv != EDIT_LEVEL) {
                     String level = lv == null || lv == AccessLevelConst.NONE ? "none" : lv.getName();
-                    edit = "Your access to \"" + rep.name + "\" is " + level + "; editing it needs Edit Settings"
+                    edit = "Your access to \"" + rep.name + "\" is " + level + "; editing it needs " + EDIT_LEVEL.getName()
                         + (reports.size() > 1 ? " on every app that uses this page (" + reports.size() + ")." : ".");
                     break;
                 }
@@ -149,8 +166,8 @@ final class AccessPolicy {
             access = "Changing who can open an app needs the BI Report-Edit right.";
         } else {
             for (Report rep : reports) {
-                if (r.level.apply(rep.id) != AccessLevelConst.EDIT_SETTINGS) {
-                    access = "Changing access to \"" + rep.name + "\" needs Edit Settings on it.";
+                if (r.level.apply(rep.id) != EDIT_LEVEL) {
+                    access = "Changing access to \"" + rep.name + "\" needs " + EDIT_LEVEL.getName() + " on it.";
                     break;
                 }
             }

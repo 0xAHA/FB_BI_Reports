@@ -6,7 +6,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fbi.fbdata.bi.BiReportAccessFpo;
 import com.fbi.fbdata.bi.BiScriptFpo;
 import com.fbi.plugins.reportbtn.WorkspaceHost;
-import com.fbi.sdk.constants.bi.AccessLevelConst;
 import com.fbi.sdk.constants.bi.BiScriptTypeConst;
 
 import javax.swing.BorderFactory;
@@ -42,14 +41,14 @@ import java.util.Map;
  *   admin or BI Editor-Edit       any groups, folder and Apps menus (as the code editor)
  *   Apps (beta)-Build Reports     a new report for their own groups only, in the default
  *                                 folder, in no Apps menu; republishing a builder report
- *                                 they have Edit Settings on keeps its access, folder and menus
+ *                                 they have AccessPolicy.EDIT_LEVEL on keeps its access, folder and menus
  * A system page or a page the builder didn't write is never overwritten.
  */
 final class BuilderPublisher {
 
     static final String OUTBOX = "cdx.bi.reportBuilder.outbox.v1";
     static final String DEFAULT_FOLDER = "Custom";
-    private static final String TITLE = "Publish report";
+    private static final String TITLE = "Publish app";
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private BuilderPublisher() {
@@ -70,7 +69,7 @@ final class BuilderPublisher {
             req = null;
         }
         if (req == null || nonce == null || !nonce.equals(req.path("nonce").asText())) {
-            host.showError("The report to publish wasn't found. Try Publish again.");
+            host.showError("The app to publish wasn't found. Try Publish again.");
             return;
         }
         JsonNode spec = req.path("spec");
@@ -84,7 +83,7 @@ final class BuilderPublisher {
         boolean wide = ClientRights.mayEdit(host);
         boolean build = wide || service.groupsHaveRight(userId, WorkspaceHost.BUILD_RIGHT);
         if (!build) {
-            host.showError("Publishing a report needs the " + WorkspaceHost.BUILD_RIGHT + " or BI Editor-Edit right.");
+            host.showError("Publishing an app needs the " + WorkspaceHost.BUILD_RIGHT + " or BI Editor-Edit right.");
             return;
         }
 
@@ -97,7 +96,7 @@ final class BuilderPublisher {
                 String why = refusal(target, wide, service, host);
                 if (!why.isEmpty()) {
                     if (JOptionPane.showConfirmDialog(parent, "<html><body style='width:380px'>" + Completions.esc(why)
-                        + "<br><br>Publish it as a new report instead?</body></html>", TITLE, JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) {
+                        + "<br><br>Publish it as a new app instead?</body></html>", TITLE, JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) {
                         return;
                     }
                     target = null;
@@ -118,7 +117,7 @@ final class BuilderPublisher {
                     host.showError("Another app is already called \"" + choice.name + "\". " + why + " Choose another name.");
                     return;
                 }
-                if (JOptionPane.showConfirmDialog(parent, "A report called \"" + choice.name + "\" already exists. Replace it with this one?",
+                if (JOptionPane.showConfirmDialog(parent, "An app called \"" + choice.name + "\" already exists. Replace it with this one?",
                     TITLE, JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE) != JOptionPane.YES_OPTION) {
                     return;
                 }
@@ -200,8 +199,8 @@ final class BuilderPublisher {
             return d.canEdit ? "" : d.reason;
         }
         for (AccessPolicy.Report r : reports) {
-            if (!rights.admin && rights.level.apply(r.id) != AccessLevelConst.EDIT_SETTINGS) {
-                return "Replacing \"" + r.name + "\" needs Edit Settings on it.";
+            if (!rights.admin && rights.level.apply(r.id) != AccessPolicy.EDIT_LEVEL) {
+                return "Replacing \"" + r.name + "\" needs " + AccessPolicy.EDIT_LEVEL.getName() + " on it.";
             }
         }
         return "";
@@ -351,7 +350,7 @@ final class BuilderPublisher {
                         if (e.getValue().isSelected()) {
                             BiReportAccessFpo row = new BiReportAccessFpo();
                             row.setUserGroupId(e.getKey());
-                            row.setAccessLevel(AccessLevelConst.EDIT_SETTINGS);
+                            row.setAccessLevel(AccessPolicy.EDIT_LEVEL);
                             ch.access.add(row);
                         }
                     }

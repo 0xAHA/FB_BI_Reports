@@ -61,7 +61,8 @@ and the Excel sheet from that one `cols()` and a rename shows everywhere.
 Column flags: `locked`, `vis: false`, `menu: false`. Hidden columns are saved
 per user with the widths, order and sort; headings are company settings (they
 need `masterStorage: 'userProperties'`; admins and, with `company.editors`,
-Edit Settings users rename). Document output ignores the user's hide / move
+the report's editors rename: Edit Settings on it, or access plus BI Report-Edit,
+since Fishbowl is removing Edit Settings in ADV-6032). Document output ignores the user's hide / move
 and keeps the headings.
 
 **The record template** (`Record_Document_Template.htm`, a transfer order)
@@ -278,6 +279,17 @@ positioning, validation CSS or `.fb-grid` / `.banner` lines; a new page calls
   `FBDoc.printWindow`; without fb-doc, a small page of its own in a new
   window (the plain pattern in `printPlain()` of the list template). Open the
   window during the click, before any `await`.
+- **The module's own Print, Save PDF and Email** make a PDF of the live page in
+  print media (Print then opens it in the PDF program): backgrounds on, no
+  header or footer, Chromium's 0.4 in margins, anything wider than the paper
+  shrunk to fit. There is no hook before it prints. fb-styles §38 is the
+  baseline every page gets there: the content flows over as many pages as it
+  needs (no `100vh` frame or inner scroll box), buttons, drawers and the filter
+  panel are hidden, table headers repeat, colours print. `.no-print` hides an
+  element on paper, `.print-only` shows it only there, and
+  `<body class="no-print-base">` opts a page out. The rules stand aside while
+  fb-doc's PDF view is showing (`body.fbdoc-on`), which prints its sheets.
+  Charts keep their screen width.
 - Check it: `tools/report-harness/run.js <page> --pdf` reports the pages;
   open it in Chrome at `http://127.0.0.1:8733/`.
 

@@ -32,6 +32,9 @@ public final class EditorSelfCheck {
         includes();
         inserts();
         policy();
+        importDiff();
+        layout();
+        dropped();
         template();
         builderPage();
         System.out.println("EditorSelfCheck: " + passed + " checks passed");
@@ -126,14 +129,14 @@ public final class EditorSelfCheck {
         com.fbi.fbdata.bi.BiReportAccessFpo want1 = new com.fbi.fbdata.bi.BiReportAccessFpo();
         want1.setLongId(500);   // another report's row: must not be reused
         want1.setUserGroupId(1);
-        want1.setAccessLevel(AccessLevelConst.EDIT_SETTINGS);
+        want1.setAccessLevel(AccessPolicy.EDIT_LEVEL);
         com.fbi.fbdata.bi.BiReportAccessFpo want3 = new com.fbi.fbdata.bi.BiReportAccessFpo();
         want3.setLongId(501);
         want3.setUserGroupId(3);
         want3.setAccessLevel(AccessLevelConst.VIEW);
         List<com.fbi.fbdata.bi.BiReportAccessFpo> m = AppActions.merged(Arrays.asList(own, gone), Arrays.asList(want1, want3), 9);
         check(m.size() == 3, "access merge: 3 rows (" + m.size() + ")");
-        check(m.get(0).getLongId() == 77 && m.get(0).getAccessLevel() == AccessLevelConst.EDIT_SETTINGS, "merge keeps the report's own row, new level");
+        check(m.get(0).getLongId() == 77 && m.get(0).getAccessLevel() == AccessPolicy.EDIT_LEVEL, "merge keeps the report's own row, new level");
         check(m.get(1).getLongId() == 78 && m.get(1).getAccessLevel() == AccessLevelConst.NONE, "a group not chosen is set to None");
         check(m.get(2).getUserGroupId() == 3 && m.get(2).getLongId() != 501 && m.get(2).getBiReportId() == 9, "a new group gets a new row on this report");
     }
@@ -250,29 +253,85 @@ public final class EditorSelfCheck {
     }
 
     // ------------------------------------------------------------------ policy
+    // ------------------------------------------------------------------ import
+    private static void importDiff() {
+        java.util.Map<Integer, String> before = new java.util.HashMap<>();
+        before.put(1, "2026-10-01 09:00:00");
+        before.put(2, "2026-10-01 09:00:00");
+        java.util.Map<Integer, String> after = new java.util.HashMap<>(before);
+        after.put(2, "2026-10-21 10:00:05");   // re-imported
+        after.put(9, "2026-10-21 10:00:04");   // new, imported first
+        eq(String.valueOf(ScriptService.changed(before, after)), "[9, 2]", "import: new and changed, last imported last");
+        check(ScriptService.changed(before, before).isEmpty(), "import: a cancelled import opens nothing");
+        check(ScriptService.changed(new java.util.HashMap<>(), after).isEmpty(), "import: a failed first read opens nothing");
+    }
+
+    // ------------------------------------------------------------------ layout
+    private static void layout() {
+        EditorLayout d = EditorLayout.of(null);
+        eq(d.format(), "apps=270;insert=340;code=0.5;preview=below;showApps=1;showInsert=1", "layout: the defaults");
+        EditorLayout l = EditorLayout.of("apps=300;insert=420;code=0.65;preview=right;showApps=0;showInsert=1");
+        eq(EditorLayout.of(l.format()).format(), l.format(), "layout: format and parse round-trip");
+        check(l.appsWidth == 300 && l.insertWidth == 420 && l.previewRight && !l.showApps, "layout: parsed");
+        EditorLayout bad = EditorLayout.of("apps=x;insert=5;code=3;junk");
+        check(bad.appsWidth == 270 && bad.insertWidth == 160 && bad.codeRatio == 0.9, "layout: bad values fall back or clamp");
+    }
+
+    // ------------------------------------------------------------------ dropped files
+    private static void dropped() {
+        DroppedFile page = DroppedFile.parse("Open Orders.htm", "\uFEFF<html></html>", 10);
+        check(page.error == null && page.confirm == null && "<html></html>".equals(page.text) && page.name == null,
+            "drop: an .htm on an app loads its text, BOM dropped");
+        check(DroppedFile.parse("x.css", "a{}", 20).confirm != null, "drop: a .css on a script asks first");
+        check(DroppedFile.parse("x.htm", "<p>", 40).confirm == null, "drop: HTML on a template is fine");
+        check(DroppedFile.parse("notes.txt", "hi", 30).confirm == null, "drop: any other text loads");
+        check(DroppedFile.parse("logo.png", "x", 10).error != null, "drop: an image is refused");
+        String json = "[ {\r\n  \"name\" : \"fb-styles\",\r\n  \"description\" : \"Shared CSS\",\r\n"
+            + "  \"data\" : \"a{}\\r\\nb{}\",\r\n  \"active\" : true,\r\n  \"note\" : \"\",\r\n  \"type\" : \"Style\"\r\n} ]";
+        DroppedFile ex = DroppedFile.parse("fb-styles-Style.json", json, 30);
+        check(ex.error == null && "fb-styles".equals(ex.name) && "Shared CSS".equals(ex.description) && "a{}\r\nb{}".equals(ex.text),
+            "drop: an export fills the code, name and description (" + ex.error + ")");
+        check(DroppedFile.parse("fb-styles-Style.json", json, 20).error != null, "drop: a Style export on a Script tab is refused");
+        check(DroppedFile.parse("bad.json", "{ nope", 10).error != null, "drop: broken JSON is refused");
+        check(DroppedFile.parse("two.json", "[{\"data\":\"a\"},{\"data\":\"b\"}]", 10).error != null, "drop: a two-record file is left to Import");
+        // Dropped exports pre-fill the native Import dialog through these private fields.
+        try {
+            Class<?> dlg = Class.forName("com.evnt.client.modules.biscripteditor.dialog.UploadScriptDialog");
+            check(dlg.getDeclaredField("importFileChooser").getType() == javax.swing.JFileChooser.class
+                && dlg.getDeclaredField("chkPublish").getType() == javax.swing.JCheckBox.class,
+                "import dialog: its file chooser and Publish box are where the drop expects them");
+        } catch (ReflectiveOperationException e) {
+            check(false, "import dialog: " + e);
+        }
+    }
+
     private static void policy() {
         List<AccessPolicy.Report> one = Collections.singletonList(new AccessPolicy.Report(5, "Open Orders"));
-        AccessPolicy.Rights editor = new AccessPolicy.Rights(false, true, true, false, id -> AccessLevelConst.EDIT_SETTINGS);
+        AccessPolicy.Rights editor = new AccessPolicy.Rights(false, true, true, false, id -> AccessPolicy.EDIT_LEVEL);
         AccessPolicy.Rights viewer = new AccessPolicy.Rights(false, true, true, true, id -> AccessLevelConst.VIEW);
-        AccessPolicy.Rights noRight = new AccessPolicy.Rights(false, false, false, false, id -> AccessLevelConst.EDIT_SETTINGS);
+        AccessPolicy.Rights noRight = new AccessPolicy.Rights(false, false, false, false, id -> AccessPolicy.EDIT_LEVEL);
         AccessPolicy.Rights admin = new AccessPolicy.Rights(true, false, false, false, id -> AccessLevelConst.NONE);
-        check(AccessPolicy.decide(AccessPolicy.Target.PAGE, one, editor).canEdit, "Edit + Edit Settings may edit the page");
+        // Edit Settings while Fishbowl has it (26.9), else View (after ADV-6032 removes it).
+        check(AccessPolicy.EDIT_LEVEL.getName().equals("Edit Settings") || AccessPolicy.EDIT_LEVEL == AccessLevelConst.VIEW,
+            "edit level resolved by name (" + AccessPolicy.EDIT_LEVEL + ")");
+        boolean levels = AccessPolicy.EDIT_LEVEL != AccessLevelConst.VIEW;
+        check(AccessPolicy.decide(AccessPolicy.Target.PAGE, one, editor).canEdit, "Edit + the edit level may edit the page");
         AccessPolicy.Decision v = AccessPolicy.decide(AccessPolicy.Target.PAGE, one, viewer);
-        check(!v.canEdit && v.reason.contains("View"), "View access is read-only, with the reason (" + v.reason + ")");
+        check(!levels || (!v.canEdit && v.reason.contains("View")), "View access is read-only, with the reason (" + v.reason + ")");
         check(!AccessPolicy.decide(AccessPolicy.Target.SCRIPT, one, noRight).canEdit, "a script needs BI Editor-Edit");
         check(AccessPolicy.decide(AccessPolicy.Target.SCRIPT, Collections.emptyList(), editor).canEdit, "a script needs only the right");
         check(AccessPolicy.decide(AccessPolicy.Target.PAGE, one, admin).canEdit, "admin may edit anything");
         check(!AccessPolicy.decide(AccessPolicy.Target.PAGE, one, editor).canUnpublish, "unpublishing needs BI Report-Delete");
         check(!AccessPolicy.decide(AccessPolicy.Target.IMAGE, one, admin).canEdit, "images are not edited here");
         check(AccessPolicy.decide(AccessPolicy.Target.PAGE, one, editor).canEditGadget, "gadget: page editor with BI Report-Edit");
-        AccessPolicy.Rights noReportEdit = new AccessPolicy.Rights(false, true, false, false, id -> AccessLevelConst.EDIT_SETTINGS);
+        AccessPolicy.Rights noReportEdit = new AccessPolicy.Rights(false, true, false, false, id -> AccessPolicy.EDIT_LEVEL);
         AccessPolicy.Decision ng = AccessPolicy.decide(AccessPolicy.Target.PAGE, one, noReportEdit);
         check(ng.canEdit && !ng.canEditGadget && ng.gadgetReason.contains("BI Report-Edit"), "gadget needs BI Report-Edit");
-        check(!AccessPolicy.decide(AccessPolicy.Target.PAGE, one, viewer).canEditGadget, "gadget needs the page editable");
+        check(!levels || !AccessPolicy.decide(AccessPolicy.Target.PAGE, one, viewer).canEditGadget, "gadget needs the page editable");
         check(!AccessPolicy.decide(AccessPolicy.Target.SCRIPT, one, admin).canEditGadget, "only a page is a gadget");
         List<AccessPolicy.Report> two = Arrays.asList(new AccessPolicy.Report(5, "A"), new AccessPolicy.Report(6, "B"));
-        AccessPolicy.Rights mixed = new AccessPolicy.Rights(false, true, true, false, id -> id == 5 ? AccessLevelConst.EDIT_SETTINGS : AccessLevelConst.VIEW);
-        check(!AccessPolicy.decide(AccessPolicy.Target.PAGE, two, mixed).canEdit, "a shared page needs Edit Settings on every report");
+        AccessPolicy.Rights mixed = new AccessPolicy.Rights(false, true, true, false, id -> id == 5 ? AccessPolicy.EDIT_LEVEL : AccessLevelConst.VIEW);
+        check(!levels || !AccessPolicy.decide(AccessPolicy.Target.PAGE, two, mixed).canEdit, "a shared page needs the edit level on every report");
         // A system app: nobody changes its code; its flags and access follow the rights.
         AccessPolicy.Decision sys = AccessPolicy.decide(AccessPolicy.Target.PAGE, one, admin, true);
         check(!sys.canEdit && sys.reason.equals(AccessPolicy.SYSTEM_REASON), "a system app is locked, for admin too");
