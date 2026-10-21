@@ -25,7 +25,10 @@
                         shows a page at a time)
    FBLabel.preview      several sheets on screen, scaled to the panel
    FBLabel.print        the sheets through a print window, one sheet per page
-   FBLabel.stockBar     the pills + the sheet setup editor
+   FBLabel.stockBar     the pills + the sheet setup editor; a Word label template
+                        dropped on the page (or picked) opens there as a new setup
+   FBLabel.word         reads a Word label template (Avery .doc / .docx) into a
+                        sheet setup, in the browser
    FBLabel.fieldEditor  the label's fields: show, size, bold, align, lines,
                         height share, order
    FBLabel.mergeLayout  saved field settings over a report's field defaults
@@ -51,12 +54,13 @@
  sign + upper-case code + opening brace, or a brace-percent pair).
 
  History: 2026-10-20 first version, for the Part Barcodes port; then barcode
- types, Fixed sizes and the one-page preview.
+ types, Fixed sizes and the one-page preview. 2026-10-21: Word label
+ templates (.doc / .docx) to sheet setups.
 */
 (function (global) {
   'use strict';
   var FBLabel = global.FBLabel = global.FBLabel || {};
-  FBLabel.BUILD = '2026.10.20-86fea41';   // @fb-build
+  FBLabel.BUILD = '2026.10.21-fdb9bea';   // @fb-build
 
   var FONT = '"FB Doc Open Sans", "Open Sans", Arial, sans-serif';
   var COMPANY_KEY = 'cdx.bi.labelStocks.v1';
@@ -95,7 +99,9 @@
     { id: 's:4x2', name: 'Label 4 × 2 in', note: 'One label per page, for a label printer (the 2x4 One Off label)',
       w: 288, h: 144, cols: 1, rows: 1, mt: 0, mb: 0, ml: 0, mr: 0, gx: 0, gy: 0, pad: 6 },
     { id: 's:6x4', name: 'Label 6 × 4 in', note: 'A 4 × 6 in label printed landscape, one per page (the 4x6 One Off label)',
-      w: 432, h: 288, cols: 1, rows: 1, mt: 0, mb: 0, ml: 0, mr: 0, gx: 0, gy: 0, pad: 10 }
+      w: 432, h: 288, cols: 1, rows: 1, mt: 0, mb: 0, ml: 0, mr: 0, gx: 0, gy: 0, pad: 10 },
+    { id: 's:4x6', name: 'Label 4 × 6 in', note: 'A 4 × 6 in label printed portrait, one per page (the Packing Slip 4x6 label)',
+      w: 288, h: 432, cols: 1, rows: 1, mt: 0, mb: 0, ml: 0, mr: 0, gx: 0, gy: 0, pad: 0 }
   ];
   FBLabel.STANDARD = STANDARD;
   FBLabel.PAPERS = PAPERS;
@@ -1034,6 +1040,282 @@
   FBLabel.fieldEditor = fieldEditor;
 
   // ===================================================================
+  //  Word label templates (Avery and the like) -> a sheet setup
+  //  FBLabel.word.read(arrayBuffer, fileName) -> Promise of
+  //    { stock (a new, unsaved setup), label: { w, h } pt, source: 'doc' | 'docx', warnings }
+  //  A label template is one table on the page: its wide columns and tall rows are
+  //  the labels, narrow ones between them the gaps. Read from the file in the
+  //  browser: Word 97-2003 .doc / .dot (compound file, the table's sprmTDefTable
+  //  and row heights, the section's page size and margins) or .docx / .dotx
+  //  (word/document.xml). Lengths in Word are twips (1/20 pt).
+  // ===================================================================
+  var Word = (function () {
+    var TW = 1 / 20;
+
+    // ---- Word 97-2003: the compound file's streams ----
+    function cfb(u8) {
+      var dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+      var u16 = function (o) { return dv.getUint16(o, true); }, u32 = function (o) { return dv.getUint32(o, true); };
+      var ss = 1 << u16(0x1E), mss = 1 << u16(0x20), hdr = ss === 4096 ? 4096 : 512;
+      var secOff = function (n) { return hdr + n * ss; };
+      var END = 0xFFFFFFFA;
+      var difat = [], i, v;
+      for (i = 0; i < 109; i++) { v = u32(0x4C + i * 4); if (v < END) difat.push(v); }
+      var dsec = u32(0x44), nd = u32(0x48);
+      while (nd-- > 0 && dsec < END && secOff(dsec) + ss <= u8.length) {
+        for (i = 0; i < ss / 4 - 1; i++) { v = u32(secOff(dsec) + i * 4); if (v < END) difat.push(v); }
+        dsec = u32(secOff(dsec) + ss - 4);
+      }
+      var fat = [];
+      difat.forEach(function (s) { if (secOff(s) + ss <= u8.length) for (var k = 0; k < ss / 4; k++) fat.push(u32(secOff(s) + k * 4)); });
+      function chain(start, table) {
+        var out = [], s = start, guard = 0;
+        while (s < END && guard++ < 100000) { out.push(s); s = table[s]; }
+        return out;
+      }
+      function read(start, size) {
+        var out = new Uint8Array(size), pos = 0;
+        chain(start, fat).forEach(function (s) {
+          var n = Math.min(ss, size - pos), at = secOff(s);
+          if (n > 0 && at + n <= u8.length) { out.set(u8.subarray(at, at + n), pos); pos += n; }
+        });
+        return out;
+      }
+      var dirStart = u32(0x30), dir = read(dirStart, chain(dirStart, fat).length * ss);
+      var ddv = new DataView(dir.buffer), entries = [];
+      for (var o = 0; o + 128 <= dir.length; o += 128) {
+        var nl = ddv.getUint16(o + 0x40, true), name = '';
+        for (var c = 0; c + 2 < nl; c += 2) name += String.fromCharCode(ddv.getUint16(o + c, true));
+        entries.push({ name: name, type: dir[o + 0x42], start: ddv.getUint32(o + 0x74, true), size: ddv.getUint32(o + 0x78, true) });
+      }
+      var cutoff = u32(0x38), mini = null, minifat = null;
+      return function stream(name) {
+        var e = entries.filter(function (x) { return x.name === name && x.type === 2; })[0];
+        if (!e) return null;
+        if (e.size >= cutoff) return read(e.start, e.size);
+        if (!mini) {
+          mini = read(entries[0].start, entries[0].size);
+          var ms = u32(0x3C), mb = read(ms, chain(ms, fat).length * ss), mdv = new DataView(mb.buffer);
+          minifat = []; for (var k = 0; k + 4 <= mb.length; k += 4) minifat.push(mdv.getUint32(k, true));
+        }
+        var out = new Uint8Array(e.size), pos = 0;
+        chain(e.start, minifat).forEach(function (s) {
+          var n = Math.min(mss, e.size - pos);
+          if (n > 0) { out.set(mini.subarray(s * mss, s * mss + n), pos); pos += n; }
+        });
+        return out;
+      };
+    }
+    // A sprm's operand length (the sprm at g[i]); -1 when it can't be read.
+    function sprmLen(g, i) {
+      var sprm = g[i] | (g[i + 1] << 8);
+      switch (sprm >> 13) {
+        case 0: case 1: return 1;
+        case 2: case 4: case 5: return 2;
+        case 3: return 4;
+        case 7: return 3;
+        case 6:
+          if (sprm === 0xD608 || sprm === 0xD606) return ((g[i + 2] | (g[i + 3] << 8)) - 1) + 2;   // a 2-byte cb, one too many
+          if (sprm === 0xC615) return g[i + 2] === 255 ? -1 : g[i + 2] + 1;
+          return g[i + 2] + 1;
+      }
+      return -1;
+    }
+    function eachSprm(g, from, to, fn) {
+      var i = from;
+      while (i + 2 <= to) {
+        var len = sprmLen(g, i);
+        if (len < 0 || i + 2 + len > to) break;
+        fn(g[i] | (g[i + 1] << 8), i + 2, len);
+        i += 2 + len;
+      }
+    }
+    function fromDoc(u8) {
+      var stream = cfb(u8), wd = stream('WordDocument');
+      if (!wd) throw new Error('it has no Word document inside');
+      var w = new DataView(wd.buffer, wd.byteOffset, wd.byteLength);
+      if (w.getUint16(0, true) !== 0xA5EC) throw new Error('it isn\'t a Word document');
+      var flags = w.getUint16(0x0A, true);
+      if (flags & 0x0100) throw new Error('it is password protected');
+      var tb = stream(flags & 0x0200 ? '1Table' : '0Table');
+      if (!tb) throw new Error('its table stream is missing');
+      var t = new DataView(tb.buffer, tb.byteOffset, tb.byteLength);
+      // FibRgFcLcb97 follows FibBase (32), csw + FibRgW, cslw + FibRgLw, cbRgFcLcb.
+      var o = 34 + w.getUint16(32, true) * 2;
+      o += 2 + w.getUint16(o, true) * 4 + 2;
+      var fcLcb = function (k) { return { fc: w.getUint32(o + k * 8, true), lcb: w.getUint32(o + k * 8 + 4, true) }; };
+      // The first section's page (PlcfSed -> Sepx); Word's defaults when a sprm is absent.
+      var page = { w: 12240, h: 15840, top: 1440, bottom: 1440, left: 1800, right: 1800 };
+      var sed = fcLcb(6);
+      if (sed.lcb >= 16 && sed.fc + sed.lcb <= tb.length) {
+        var n = (sed.lcb - 4) / 16, fcSepx = t.getInt32(sed.fc + (n + 1) * 4 + 2, true);
+        if (fcSepx >= 0 && fcSepx + 2 < wd.length) {
+          var cb = w.getInt16(fcSepx, true);
+          eachSprm(wd, fcSepx + 2, Math.min(wd.length, fcSepx + 2 + cb), function (sprm, at) {
+            var u = w.getUint16(at, true), s = w.getInt16(at, true);
+            if (sprm === 0xB01F) page.w = u; else if (sprm === 0xB020) page.h = u;
+            else if (sprm === 0xB021) page.left = u; else if (sprm === 0xB022) page.right = u;
+            else if (sprm === 0x9023) page.top = Math.abs(s); else if (sprm === 0x9024) page.bottom = Math.abs(s);
+          });
+        }
+      }
+      // Table rows: a row end's PAPX (in the FKPs PlcfBtePapx names) holds its cell
+      // boundaries (sprmTDefTable) and height (sprmTDyaRowHeight; negative = exact).
+      var bte = fcLcb(13), nb = (bte.lcb - 4) / 8, rows = [], seen = {}, gapHalf = null;
+      for (var k = 0; k < nb; k++) {
+        var base = (t.getUint32(bte.fc + (nb + 1) * 4 + k * 4, true) & 0x3FFFFF) * 512;
+        if (base + 512 > wd.length) continue;
+        var crun = wd[base + 511];
+        for (var r = 0; r < crun; r++) {
+          var bOff = wd[base + (crun + 1) * 4 + r * 13];
+          if (!bOff) continue;
+          var at = base + bOff * 2;
+          if (seen[at]) continue;
+          seen[at] = 1;
+          var c1 = wd[at], size;
+          if (c1) { size = 2 * c1 - 1; at += 1; } else { size = 2 * wd[at + 1]; at += 2; }
+          var cells = null, height = null;
+          eachSprm(wd, at + 2, Math.min(wd.length, at + size), function (sprm, p) {
+            if (sprm === 0xD608) {
+              var nc = wd[p + 2]; cells = [];
+              for (var q = 0; q <= nc; q++) cells.push(w.getInt16(p + 3 + q * 2, true));
+            } else if (sprm === 0x9407) height = w.getInt16(p, true);
+            else if (sprm === 0x9602 && gapHalf == null) gapHalf = w.getInt16(p, true);   // sprmTDxaGapHalf: the cells' side margin
+          });
+          if (cells && cells.length > 1) rows.push({ cells: cells, h: Math.abs(height || 0) });
+        }
+      }
+      if (!rows.length) throw new Error('it has no label table');
+      // Rows that share the commonest cell layout are the label table.
+      var count = {}, best = null;
+      rows.forEach(function (x) { var key = x.cells.join(','); count[key] = (count[key] || 0) + 1; if (!best || count[key] > count[best]) best = key; });
+      var cellsOf = best.split(',').map(Number);
+      return {
+        page: page, source: 'doc', jc: '',
+        left: cellsOf[0],                                         // from the left margin; negative: outdented
+        cols: cellsOf.slice(1).map(function (x, i) { return x - cellsOf[i]; }),
+        rows: rows.filter(function (x) { return x.cells.join(',') === best; }).map(function (x) { return x.h; }),
+        cellMargin: gapHalf
+      };
+    }
+
+    // ---- .docx: a zip; word/document.xml and word/settings.xml ----
+    function inflate(data) {
+      if (typeof DecompressionStream !== 'function') return Promise.reject(new Error('this browser can\'t open .docx files; save the template as .doc'));
+      var s = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+      return new Response(s).arrayBuffer().then(function (b) { return new Uint8Array(b); });
+    }
+    function unzip(u8, want) {
+      var dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength), e = u8.length - 22;
+      while (e >= 0 && dv.getUint32(e, true) !== 0x06054B50) e--;
+      if (e < 0) return Promise.reject(new Error('it isn\'t a .docx file'));
+      var n = dv.getUint16(e + 10, true), p = dv.getUint32(e + 16, true), jobs = [], out = {};
+      var dec = new TextDecoder();
+      for (var i = 0; i < n && p + 46 <= u8.length; i++) {
+        var method = dv.getUint16(p + 10, true), csize = dv.getUint32(p + 20, true);
+        var nl = dv.getUint16(p + 28, true), xl = dv.getUint16(p + 30, true), cl = dv.getUint16(p + 32, true), lho = dv.getUint32(p + 42, true);
+        var name = dec.decode(u8.subarray(p + 46, p + 46 + nl));
+        if (want.indexOf(name) >= 0) {
+          var ds = lho + 30 + dv.getUint16(lho + 26, true) + dv.getUint16(lho + 28, true), data = u8.subarray(ds, ds + csize);
+          jobs.push((method === 0 ? Promise.resolve(data) : inflate(data)).then((function (nm) { return function (b) { out[nm] = dec.decode(b); }; })(name)));
+        }
+        p += 46 + nl + xl + cl;
+      }
+      return Promise.all(jobs).then(function () { return out; });
+    }
+    function attr(tag, name) { var m = new RegExp('\\b' + name + '="(-?\\d+)"').exec(tag || ''); return m ? +m[1] : null; }
+    function first(re, s) { var m = re.exec(s || ''); return m ? m[0] : ''; }
+    function fromDocx(u8) {
+      return unzip(u8, ['word/document.xml', 'word/settings.xml']).then(function (f) {
+        var x = f['word/document.xml'];
+        if (!x) throw new Error('it isn\'t a Word document');
+        var pgSz = first(/<w:pgSz\b[^>]*>/, x), pgMar = first(/<w:pgMar\b[^>]*>/, x);
+        var dflt = function (v, d) { return v == null ? d : v; };
+        var page = { w: dflt(attr(pgSz, 'w:w'), 12240), h: dflt(attr(pgSz, 'w:h'), 15840),
+          top: Math.abs(dflt(attr(pgMar, 'w:top'), 1440)), bottom: Math.abs(dflt(attr(pgMar, 'w:bottom'), 1440)),
+          left: dflt(attr(pgMar, 'w:left'), 1800), right: dflt(attr(pgMar, 'w:right'), 1800) };
+        var tbl = first(/<w:tbl>[\s\S]*?<\/w:tbl>/, x);
+        if (!tbl) throw new Error('it has no label table');
+        var cols = (tbl.match(/<w:gridCol\b[^>]*>/g) || []).map(function (g) { return attr(g, 'w:w') || 0; });
+        var rows = (tbl.match(/<w:tr\b[\s\S]*?<\/w:tr>/g) || []).map(function (tr) { return Math.abs(attr(first(/<w:trHeight\b[^>]*>/, tr), 'w:val') || 0); });
+        var tblPr = first(/<w:tblPr>[\s\S]*?<\/w:tblPr>/, tbl);
+        var ind = attr(first(/<w:tblInd\b[^>]*>/, tblPr), 'w:w') || 0;
+        var cellL = attr(first(/<w:tblCellMar>[\s\S]*?<w:(?:left|start)\b[^>]*>/, tblPr), 'w:w');
+        var jc = (/<w:jc w:val="(\w+)"/.exec(tblPr) || [])[1] || '';
+        var compat = +((/w:name="compatibilityMode"[^>]*w:val="(\d+)"/.exec(f['word/settings.xml'] || '') || [])[1] || 0);
+        // Before Word 2013 (compatibility mode < 15) a table's edge sits its left cell
+        // margin outside the indent, so the cell text lines up with the page margin.
+        var cm = cellL == null ? 108 : cellL;
+        return { page: page, source: 'docx', jc: jc, left: ind - (compat < 15 ? cm : 0), cols: cols, rows: rows, cellMargin: cellL };
+      });
+    }
+
+    // ---- the table -> a sheet setup ----
+    function avg(a) { return a.length ? a.reduce(function (x, y) { return x + y; }, 0) / a.length : 0; }
+    function toStock(t, fileName) {
+      var p = t.page, W = p.w * TW, H = p.h * TW, warnings = [];
+      if (!t.cols.length || !t.rows.length) throw new Error('its table has no labels');
+      // Columns: the wide ones are labels; narrow ones between them are the gaps.
+      var widest = Math.max.apply(null, t.cols), x0 = (p.left + t.left) * TW;
+      if (t.jc === 'center') x0 = (W - avg(t.cols) * t.cols.length * TW) / 2;
+      var starts = [], gaps = [], lw = [], run = 0, cx = x0;
+      t.cols.forEach(function (c) {
+        if (c >= widest * 0.5) { if (starts.length) gaps.push(run * TW); starts.push(cx + (starts.length ? 0 : 0)); lw.push(c * TW); run = 0; }
+        else if (starts.length) run += c;
+        else x0 += c * TW;
+        cx += c * TW;
+      });
+      // Rows: tall ones are labels; short ones between them the gaps; leading short ones move the top.
+      var tallest = Math.max.apply(null, t.rows);
+      if (!tallest) throw new Error('its rows have no height set, so the label height isn\'t known');
+      var top = p.top * TW, nRows = 0, lh = [], gy = [], rr = 0;
+      t.rows.forEach(function (h) {
+        if (h >= tallest * 0.5) { if (nRows) gy.push(rr * TW); nRows++; lh.push(h * TW); rr = 0; }
+        else if (nRows) rr += h;
+        else top += h * TW;
+      });
+      var LW = avg(lw), LH = avg(lh), GX = avg(gaps), GY = avg(gy);
+      if (lw.some(function (v) { return Math.abs(v - LW) > 1; })) warnings.push('the label columns differ in width; the setup uses their average');
+      if (lh.some(function (v) { return Math.abs(v - LH) > 1; })) warnings.push('the label rows differ in height; the setup uses their average');
+      // Only the rows that fit on the page (a template's table can run past it).
+      while (nRows > 1 && top + nRows * LH + (nRows - 1) * GY > H + 1) nRows--;
+      var cols = starts.length, ml = starts[0];
+      var r2 = function (v) { return Math.round(v * 100) / 100; };
+      var base = String(fileName || '').replace(/^.*[\\/]/, '').replace(/\.(docx?|dotx?)$/i, '').replace(/[_-]?(word)?[_-]?template$/i, '').replace(/[_]+/g, ' ').trim();
+      var stock = {
+        name: (base || 'Word template').slice(0, 60),
+        note: 'From ' + String(fileName || 'a Word template').replace(/^.*[\\/]/, '') + ': ' + r2(LW / UNITS.mm) + ' × ' + r2(LH / UNITS.mm) + ' mm labels',
+        w: r2(W), h: r2(H), cols: cols, rows: nRows,
+        mt: r2(top), mb: r2(Math.max(0, H - top - nRows * LH - (nRows - 1) * GY)),
+        ml: r2(ml), mr: r2(Math.max(0, W - ml - cols * LW - (cols - 1) * GX)),
+        gx: r2(GX), gy: r2(GY),
+        pad: t.cellMargin != null ? r2(Math.max(2, Math.min(12, t.cellMargin * TW))) : 4
+      };
+      // Snap a page within a point of a standard size to it exactly.
+      Object.keys(PAPERS).forEach(function (k) {
+        var pp = PAPERS[k];
+        if (Math.abs(stock.w - pp[0]) < 1 && Math.abs(stock.h - pp[1]) < 1) { stock.w = pp[0]; stock.h = pp[1]; }
+        if (Math.abs(stock.w - pp[1]) < 1 && Math.abs(stock.h - pp[0]) < 1) { stock.w = pp[1]; stock.h = pp[0]; }
+      });
+      return { stock: stock, label: { w: r2(LW), h: r2(LH) }, source: t.source, warnings: warnings };
+    }
+
+    /** Reads a Word label template (ArrayBuffer or Uint8Array) into a new sheet setup. */
+    function read(buf, fileName) {
+      return Promise.resolve().then(function () {
+        var u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+        if (u8.length < 512) throw new Error('the file is empty or too short');
+        var dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+        if (dv.getUint32(0, true) === 0xE011CFD0 && dv.getUint32(4, true) === 0xE11AB1A1) return fromDoc(u8);
+        if (u8[0] === 0x50 && u8[1] === 0x4B) return fromDocx(u8);
+        throw new Error('it isn\'t a Word file (.doc or .docx)');
+      }).then(function (t) { return toStock(t, fileName); });
+    }
+    return { read: read, toStock: toStock };
+  })();
+  FBLabel.word = Word;
+
+  // ===================================================================
   //  Sheet setup pills + editor
   // ===================================================================
   var UI_CSS = [
@@ -1080,6 +1362,12 @@
     '.fbl-fig figcaption{font-size:11px;color:var(--c-secondary,#6b7b83)}',
     '.fbl-frame{position:relative;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,.25);background:#fff}',
     '.fbl-scaler{transform-origin:0 0;position:absolute;left:0;top:0}',
+    '.fbl-ed-src{font-size:12px;color:#1a6fa3;background:#eef6fc;border:1px solid #cbe5fb;border-radius:6px;padding:6px 9px;margin-bottom:8px}',
+    '.fbl-ed-src.hidden{display:none}',
+    '.fbl-drop{position:fixed;inset:0;z-index:10040;display:none;align-items:center;justify-content:center;background:rgba(45,156,219,.12);pointer-events:none}',
+    '.fbl-drop.on{display:flex}',
+    '.fbl-drop>div{border:2px dashed #2d9cdb;border-radius:12px;background:#fff;padding:22px 30px;font-size:14px;color:#1a6fa3;font-weight:600;text-align:center;box-shadow:0 6px 24px rgba(0,0,0,.12)}',
+    '.fbl-drop small{display:block;font-weight:400;color:#6b7b83;margin-top:4px;font-size:12px}',
     '.fbl-msg{font-size:12.5px;color:var(--c-secondary,#6b7b83);text-align:center;padding:10px}',
     '.fbl-msg-err{color:#8A1E30}'
   ].join('\n');
@@ -1087,8 +1375,13 @@
   /**
    * The row of sheet-setup pills, and the editor behind "Sheet setup".
    * @param {object} o - { mount, editMount (where the editor opens; default after the bar), selected (id),
-   *   units ('in' | 'mm'), onSelect(stock), onDraft(stock | null) (live preview while editing) }
-   * @returns {{ current(), select(id), refresh(), units(u) }}
+   *   units ('in' | 'mm'), onSelect(stock), onDraft(stock | null) (live preview while editing),
+   *   onMessage(text, kind), drop (default true: a Word label template dropped anywhere on the
+   *   page opens in the editor as a new setup; false: only the editor's button),
+   *   filter(stock) (only the setups that suit this report get a pill, e.g. one label per page;
+   *   the setups are still shared by every label report), filterNote (the editor's hint when a
+   *   draft doesn't pass the filter) }
+   * @returns {{ current(), select(id), refresh(), units(u), editing(), importWord(file) }}
    */
   function stockBar(o) {
     injectCss();
@@ -1113,13 +1406,60 @@
       };
       bar.innerHTML = '<div class="fbl-pills">' + shared.map(pill).join('') + (mine.length ? '<span class="fbl-pill-sep"></span>' + mine.map(pill).join('') : '') + '</div>' +
         '<button type="button" class="hdr-btn fbl-editbtn" data-edit="1" title="Change this sheet\'s margins, gaps and label count, or make a new setup">' +
-        '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" width="14" height="14"><path d="M4 20h4L18.5 9.5a2.1 2.1 0 00-3-3L5 17v3z"/></svg> Sheet setup</button>';
+        '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" width="14" height="14"><path d="M4 20h4L18.5 9.5a2.1 2.1 0 00-3-3L5 17v3z"/></svg> Sheet setup</button>' +
+        '<button type="button" class="hdr-btn fbl-editbtn" data-word="1" title="Make a setup from a Word label template (Avery and the like, .doc or .docx). You can also drop the file anywhere on this page.">' +
+        '<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" width="14" height="14"><path d="M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8z"/><path d="M14 3v5h5M12 17v-6M9 14l3 3 3-3"/></svg> From a Word template</button>';
     }
+    // The Word template button's file picker (one per bar).
+    var picker = document.createElement('input');
+    picker.type = 'file'; picker.accept = '.doc,.docx,.dot,.dotx'; picker.style.display = 'none';
+    host.appendChild(picker);
+    picker.addEventListener('change', function () { var f = picker.files && picker.files[0]; picker.value = ''; if (f) importWord(f); });
     bar.addEventListener('click', function (e) {
       var p = e.target.closest('[data-id]');
       if (p) { select(p.dataset.id, true); return; }
+      if (e.target.closest('[data-word]')) { picker.click(); return; }
       if (e.target.closest('[data-edit]')) { if (ed.classList.contains('hidden')) openEditor(cur); else closeEditor(); }
     });
+
+    // ---- a Word label template -> a new setup in the editor ----
+    function say(text, kind) { if (o.onMessage) o.onMessage(text, kind); else log(text, kind); }
+    function importWord(file) {
+      if (!file) return Promise.resolve(null);
+      if (!/\.(docx?|dotx?)$/i.test(file.name || '')) { say('"' + (file.name || 'That file') + '" isn\'t a Word file: drop a .doc or .docx label template.', 'error'); return Promise.resolve(null); }
+      return file.arrayBuffer().then(function (b) { return Word.read(b, file.name); }).then(function (r) {
+        var s = Object.assign(normStock(r.stock), { id: null, origin: 'new', note: r.stock.note });
+        openEditor(s);
+        var src = ed.querySelector('[data-src]'), f = UNITS[units], d = units === 'mm' ? 1 : 2;
+        src.textContent = 'Read from ' + file.name + ': ' + s.cols + ' × ' + s.rows + ' labels of ' + (r.label.w / f).toFixed(d) + ' × ' + (r.label.h / f).toFixed(d) + ' ' + units +
+          ' on ' + paperOf(s).size + '. Check it with a Test sheet, then save it.' + (r.warnings.length ? ' Note: ' + r.warnings.join('; ') + '.' : '');
+        src.classList.remove('hidden');
+        say('Read the label template ' + file.name + '.', 'success');
+        return s;
+      }).catch(function (e) {
+        say('That label template couldn\'t be read: ' + (e && e.message || e) + '.', 'error');
+        return null;
+      });
+    }
+    // Dropping a file anywhere on the page (while one is dragged over it, a hint shows).
+    if (o.drop !== false && typeof document !== 'undefined' && !document.__fblDrop) {
+      document.__fblDrop = true;
+      var hint = document.createElement('div');
+      hint.className = 'fbl-drop';
+      hint.innerHTML = '<div>Drop a Word label template here<small>An Avery .doc or .docx: it becomes a new sheet setup.</small></div>';
+      document.body.appendChild(hint);
+      var depth = 0;
+      var hasFiles = function (e) { var t = e.dataTransfer && e.dataTransfer.types; return !!t && Array.prototype.indexOf.call(t, 'Files') >= 0; };
+      document.addEventListener('dragenter', function (e) { if (!hasFiles(e)) return; depth++; hint.classList.add('on'); });
+      document.addEventListener('dragleave', function (e) { if (!hasFiles(e)) return; depth = Math.max(0, depth - 1); if (!depth) hint.classList.remove('on'); });
+      document.addEventListener('dragover', function (e) { if (!hasFiles(e)) return; e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+      document.addEventListener('drop', function (e) {
+        if (!hasFiles(e)) return;
+        e.preventDefault(); depth = 0; hint.classList.remove('on');
+        var f = e.dataTransfer.files && e.dataTransfer.files[0];
+        if (f) importWord(f);
+      });
+    }
     function select(id, user) {
       var s = null;
       all.forEach(function (x) { if (x.id === id) s = x; });
@@ -1129,18 +1469,22 @@
       if (!ed.classList.contains('hidden')) openEditor(cur);
       if (o.onSelect && s) o.onSelect(clone(s), !!user);
     }
-    function refresh(fresh) { all = Stocks.list(fresh); }
+    function refresh(fresh) {
+      all = Stocks.list(fresh);
+      if (typeof o.filter === 'function') all = all.filter(function (s) { try { return !!o.filter(s); } catch (_) { return true; } });
+    }
 
     // ---- editor ----
     var LEN = [['mt', 'Top'], ['mb', 'Bottom'], ['ml', 'Left'], ['mr', 'Right']];
     function v(pt) { var f = UNITS[units]; return String(Math.round(pt / f * 1000) / 1000); }
     function openEditor(s) {
       editing = clone(s); draft = clone(s);
-      var p = paperOf(s), admin = isAdmin(), mine = s.origin === 'mine', co = s.origin === 'company', std = s.origin === 'standard';
+      var p = paperOf(s), admin = isAdmin(), mine = s.origin === 'mine', co = s.origin === 'company', std = s.origin === 'standard', fresh = s.origin === 'new';
       var inp = function (k, label) { return '<label>' + label + '<input type="text" inputmode="decimal" data-len="' + k + '" value="' + v(s[k]) + '"></label>'; };
       ed.innerHTML =
+        '<div class="fbl-ed-src hidden" data-src></div>' +
         '<div class="fbl-ed-grid">' +
-          '<div class="fbl-ed-grp"><b>Name</b><input type="text" class="fbl-name" data-k="name" value="' + esc(mine || co ? s.name : s.name + ' (copy)') + '" maxlength="60">' +
+          '<div class="fbl-ed-grp"><b>Name</b><input type="text" class="fbl-name" data-k="name" value="' + esc(mine || co || fresh ? s.name : s.name + ' (copy)') + '" maxlength="60">' +
             '<div class="fbl-ed-row"><label>Units<select data-k="units">' + ['in', 'mm'].map(function (u) { return '<option value="' + u + '"' + (u === units ? ' selected' : '') + '>' + (u === 'in' ? 'inches' : 'mm') + '</option>'; }).join('') + '</select></label></div></div>' +
           '<div class="fbl-ed-grp"><b>Paper</b><div class="fbl-ed-row">' +
             '<label>Size<select data-k="paper">' + Object.keys(PAPERS).concat(['Custom']).map(function (n) { return '<option' + (n === p.size ? ' selected' : '') + '>' + n + '</option>'; }).join('') + '</select></label>' +
@@ -1191,8 +1535,10 @@
       draft = readDraft();
       var g = geometry(draft), el = ed.querySelector('[data-info]');
       el.classList.toggle('err', !g.ok);
-      el.textContent = g.ok ? 'Each label is ' + sizeText(draft) + '; ' + g.per + ' per sheet. The preview shows this setup while the editor is open.'
-                            : 'The labels have no room: make the margins or gaps smaller, or fewer labels across or down.';
+      var suits = typeof o.filter !== 'function' || !!o.filter(draft);
+      el.textContent = (g.ok ? 'Each label is ' + sizeText(draft) + '; ' + g.per + ' per sheet. The preview shows this setup while the editor is open.'
+                             : 'The labels have no room: make the margins or gaps smaller, or fewer labels across or down.') +
+        (g.ok && !suits ? ' ' + (o.filterNote || 'This report doesn\'t print on this setup: it won\'t get a pill here (other label reports can use it).') : '');
       ed.querySelectorAll('[data-act="mine"],[data-act="mineNew"],[data-act="publish"]').forEach(function (b) { b.disabled = !g.ok; });
       if (o.onDraft) o.onDraft(clone(Object.assign({}, draft, { id: editing.id, origin: editing.origin })));
     }
@@ -1262,7 +1608,8 @@
       select: function (id) { select(id, false); },
       refresh: function () { var id = cur && cur.id; refresh(true); select(id, false); },
       units: function () { return units; },
-      editing: function () { return !ed.classList.contains('hidden'); }
+      editing: function () { return !ed.classList.contains('hidden'); },
+      importWord: importWord
     };
   }
   FBLabel.stockBar = stockBar;

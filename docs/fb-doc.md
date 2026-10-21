@@ -139,6 +139,31 @@ for `FBDoc.paginate`):
 
 `iReport_Ports/SalesOrder/POSReceipt.htm` (3 in / 2 in rolls) is the example.
 
+### Label printers (a fixed label size)
+
+A report whose own paper is a label printer's size (`FBDoc.page.LABEL_PAPERS`:
+`'4x6'`, `'4x8'`, `'4x4'`, `'4x3'`, inches, portrait sizes) is a **label
+document**: pages of a fixed size, as many as the content needs. It is not a
+label sheet: a document that repeats one label across a sheet uses fb-label.
+Name the size as `page: { size: '4x6' }` (or in the Page_setup setting:
+`FBDoc.Record.paper('set-print', { size: '4x6' })`). Then:
+
+- the paper bar offers only the label sizes (`4 × 6 in label`…), with
+  orientation; `page.papers` (a list) overrides which sizes it offers;
+- the size set for all reports (A4 / Letter by edition or by an admin) never
+  applies, and the "Use … for all reports" button is hidden; a company paper
+  ("Use for everyone") or a user's own choice still applies, from the label
+  sizes only;
+- **no print inset and no page margin**: the sheet is the whole label
+  (`@page { margin: 0 }`); the document places everything itself;
+- document output reports `paper: { name: '4x6', …, labelPrinter: true,
+  insetMm: 0 }`.
+
+Print through the page's Print button (its print window prints at the label's
+size, margin 0). The BI Report toolbar's Print / Save adds Chromium's 0.4 in
+margins and shrinks the page to fit, so it doesn't suit a label printer.
+`iReport_Ports/Labels/PackingSlip4x6.htm` is the example.
+
 ### Report spec (`doc`)
 
 ```js

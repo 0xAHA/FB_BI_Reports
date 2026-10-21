@@ -20,7 +20,9 @@
  take one user's own choices. Later on 2026-10-20: FBDoc.printPages (lay
  out and print HTML off-screen in one call), the picker follows a scrolling
  page and searches a retyped label, and the company logo comes without line
- breaks (a CSS url() takes it).
+ breaks (a CSS url() takes it). 2026-10-21: label printers (4x6, 4x8, 4x4,
+ 4x3 in): a report whose paper is one is a label document (only label sizes
+ in the paper bar, never the size for all reports, no print inset or margin).
 
  Replaces JasperReports output with HTML that prints and saves as PDF from the
  BI Report module's own Print / Save / Email buttons. The page IS the paper, so
@@ -67,7 +69,7 @@
   'use strict';
 
   var FBDoc = {};
-  FBDoc.BUILD = '2026.10.20-6da4628';   // @fb-build
+  FBDoc.BUILD = '2026.10.21-d30bf67';   // @fb-build
   FBDoc.VERSION = FBDoc.BUILD;
 
   // ===================================================================
@@ -206,8 +208,13 @@
     A3: [297, 420], A4: [210, 297], A5: [148, 210],
     B3: [353, 500], B4: [250, 353], B5: [176, 250],
     LETTER: [215.9, 279.4], LEGAL: [215.9, 355.6], TABLOID: [279.4, 431.8], LEDGER: [279.4, 431.8],
-    EXECUTIVE: [184.15, 266.7]
+    EXECUTIVE: [184.15, 266.7],
+    // Label printers (one label per page): a report whose own paper is one of these
+    // is a label document (Report.view offers only these sizes; no print inset).
+    '4X6': [101.6, 152.4], '4X8': [101.6, 203.2], '4X4': [101.6, 101.6], '4X3': [101.6, 76.2]
   };
+  var LABEL_PAPERS = ['4x6', '4x8', '4x4', '4x3'];
+  function isLabelSize(name) { return LABEL_PAPERS.indexOf(String(name || '').toLowerCase()) >= 0; }
   // Jasper SOReport margins: top/bottom 20pt, left/right 30pt.
   var JASPER_MARGIN_MM = { t: 20 / PT_PER_MM, r: 30 / PT_PER_MM, b: 20 / PT_PER_MM, l: 30 / PT_PER_MM };
 
@@ -244,8 +251,10 @@
     function setNamed(name, orient) {
       var k = String(name).toUpperCase();
       if (!SIZES[k]) return false;
-      spec.name = k === 'LETTER' ? 'Letter' : k === 'LEGAL' ? 'Legal' : k === 'TABLOID' ? 'Tabloid' : k === 'LEDGER' ? 'Ledger' : k === 'EXECUTIVE' ? 'Executive' : k;
+      spec.name = k === 'LETTER' ? 'Letter' : k === 'LEGAL' ? 'Legal' : k === 'TABLOID' ? 'Tabloid' : k === 'LEDGER' ? 'Ledger' : k === 'EXECUTIVE' ? 'Executive'
+        : isLabelSize(k) ? k.toLowerCase() : k;
       spec.wMm = SIZES[k][0]; spec.hMm = SIZES[k][1];
+      spec.label = isLabelSize(k);
       if (k === 'LEDGER') orient = orient || 'landscape';
       if (orient) spec.orientation = orient.toLowerCase();
       return true;
@@ -306,7 +315,8 @@
     if (spec.wMm < 50 || spec.hMm < 50 || spec.wMm > 1500 || spec.hMm > 1500) {
       warnings.push('page size out of range — using A4'); setNamed('A4'); spec.orientation = 'portrait';
     }
-    if (!spec.margin || opts.margin === 'document') spec.margin = Object.assign({}, opts.documentMargin || JASPER_MARGIN_MM);
+    // A label printer's page has no margin of its own: the label document places everything.
+    if (!spec.margin || opts.margin === 'document') spec.margin = Object.assign({}, opts.documentMargin || (spec.label ? { t: 0, r: 0, b: 0, l: 0 } : JASPER_MARGIN_MM));
     ['t', 'r', 'b', 'l'].forEach(function (k) {
       spec.margin[k] = Math.max(0, Math.min(spec.margin[k], (k === 't' || k === 'b' ? spec.hMm : spec.wMm) / 3));
     });
@@ -327,11 +337,12 @@
   // preview frame); W/H = the printable sheet. H is floored to Chromium's layout
   // unit (1/64 px) and shortened by `shortPx`, so accumulated rounding can never
   // push a sheet onto an extra (blank) printed page.
-  // A roll (spec.roll) has no print inset: its page is the paper, margin 0.
+  // A roll (spec.roll) or a label (spec.label: a label printer's page) has no print
+  // inset: its page is the paper, margin 0.
   function geometry(spec, opts) {
     opts = opts || {};
     var floor64 = function (px) { return Math.floor(px * 64) / 64; };
-    var insetMm = opts.printInsetMm != null ? opts.printInsetMm : spec.roll ? 0 : PRINT_INSET_MM;
+    var insetMm = opts.printInsetMm != null ? opts.printInsetMm : spec.roll || spec.label ? 0 : PRINT_INSET_MM;
     var inset = insetMm * PX_PER_MM;
     var paperW = floor64(spec.wMm * PX_PER_MM), paperH = floor64(spec.hMm * PX_PER_MM);
     var W = floor64(paperW - 2 * inset);
@@ -366,7 +377,8 @@
              margin: margin, source: 'roll', raw: null, warnings: warnings };
   }
 
-  FBDoc.page = { resolve: resolvePage, geometry: geometry, roll: rollPage, SIZES: SIZES, JASPER_MARGIN_MM: JASPER_MARGIN_MM, PRINT_INSET_MM: PRINT_INSET_MM, ROLL_MAX_MM: ROLL_MAX_MM };
+  FBDoc.page = { resolve: resolvePage, geometry: geometry, roll: rollPage, SIZES: SIZES, LABEL_PAPERS: LABEL_PAPERS, isLabel: isLabelSize,
+                 JASPER_MARGIN_MM: JASPER_MARGIN_MM, PRINT_INSET_MM: PRINT_INSET_MM, ROLL_MAX_MM: ROLL_MAX_MM };
   FBDoc.units = { PX_PER_MM: PX_PER_MM, PX_PER_PT: PX_PER_PT, PT_PER_MM: PT_PER_MM };
 
   // ===================================================================
@@ -2003,12 +2015,16 @@
   var PREF_KEY = 'docView';
   // The company's paper for a report: FBLib.Settings master key, { size, orientation }.
   var COMPANY_PAPER = 'docPaper';
-  function validPaper(p) {
-    return p && typeof p === 'object' && PAPERS.indexOf(p.size) >= 0 && (p.orientation === 'portrait' || p.orientation === 'landscape')
+  // Every size a report can name (office paper, then the label printers' sizes).
+  var ALL_PAPERS = PAPERS.concat(LABEL_PAPERS);
+  function paperName(size) { return isLabelSize(size) ? size.replace('x', ' × ') + ' in label' : size; }
+  // A saved paper, when its size is one of `list` (the report's own sizes; default office paper).
+  function validPaper(p, list) {
+    return p && typeof p === 'object' && (list || PAPERS).indexOf(p.size) >= 0 && (p.orientation === 'portrait' || p.orientation === 'landscape')
       ? { size: p.size, orientation: p.orientation } : null;
   }
-  function companyPaper() {
-    try { var m = global.FBLib && global.FBLib.Settings && global.FBLib.Settings.getMaster(); return validPaper(m && m[COMPANY_PAPER]); }
+  function companyPaper(list) {
+    try { var m = global.FBLib && global.FBLib.Settings && global.FBLib.Settings.getMaster(); return validPaper(m && m[COMPANY_PAPER], list); }
     catch (_) { return null; }
   }
   // The paper SIZE for every report (each keeps its own orientation): the admin's choice,
@@ -2056,6 +2072,11 @@
    *                 { roll: true, widthPt: 216, marginPt?: 0, label?: '3 in roll' }
    *                 (FBDoc.page.roll): one page at the roll's width, as tall as
    *                 the content; the paper bar then shows the roll only.
+   *                 A label printer's size (FBDoc.page.LABEL_PAPERS: '4x6', '4x8',
+   *                 '4x4', '4x3' in) makes it a label document: the paper bar
+   *                 offers only those sizes, the size for all reports never
+   *                 applies, and the pages have no print inset (as a roll).
+   *                 page.papers (a list of sizes) overrides the bar's list.
    *   doc():        the report spec (above), built from the current state
    *   pages(geom, page): instead of doc(), a document that lays out its own
    *                 sheets (a paperwork document): returns an FBDoc.paginate
@@ -2102,7 +2123,14 @@
     var need = null;
     // The standard paper: the size set for all reports (or the edition's), in this report's
     // own orientation; a Page_setup setting changed on purpose wins over it.
+    // The sizes this report offers: office paper, or (a label document) the label sizes.
+    var papers = (p0.papers || (isLabelSize(original.size) ? LABEL_PAPERS : PAPERS)).filter(function (x) { return ALL_PAPERS.indexOf(x) >= 0; });
+    if (!papers.length) papers = PAPERS;
+    if (papers.indexOf(original.size) < 0) original.size = papers[0];
+    var office = papers.every(function (x) { return PAPERS.indexOf(x) >= 0; });
+    // The size for all reports is office paper: it never applies to a label document.
     var all = allReportsPaper(), std;
+    if (all && papers.indexOf(all.size) < 0) all = null;
     function standard() {
       std = all && !settingChosen ? { size: all.size, orientation: original.orientation } : { size: original.size, orientation: original.orientation };
     }
@@ -2118,9 +2146,9 @@
     // Document output always uses the company's (or the original's) paper.
     // The orientation the layout needs (setPaper) wins over all three; roll paper
     // replaces them all.
-    var company = companyPaper();
+    var company = companyPaper(papers);
     var base = company || std;
-    var own = saved.paperChosen ? validPaper(saved) : null;
+    var own = saved.paperChosen ? validPaper(saved, papers) : null;
     var start = output ? base : (own || base);
     var chosen = !output && !!own;
     var state = {
@@ -2164,7 +2192,7 @@
     wrap.innerHTML =
       '<div class="fbdoc-view-bar">' +
         '<span>Paper</span><select class="fbdoc-vb-paper" title="Paper size">' +
-          PAPERS.map(function (p) { return '<option value="' + p + '">' + p + '</option>'; }).join('') + '</select>' +
+          papers.map(function (p) { return '<option value="' + p + '">' + esc(paperName(p)) + '</option>'; }).join('') + '</select>' +
         '<span class="split-btn fbdoc-vb-orient">' +
           '<button type="button" class="hdr-btn hdr-btn-icon" data-orient="portrait" title="Portrait">' + ICON.portrait + '</button>' +
           '<button type="button" class="hdr-btn hdr-btn-icon" data-orient="landscape" title="Landscape">' + ICON.landscape + '</button>' +
@@ -2217,7 +2245,7 @@
       allBtn.textContent = 'Use ' + state.size + ' for all reports';
       allBtn.title = 'Make ' + state.size + ' the paper size of every report that has no paper of its own. Each report keeps its orientation'
         + (all ? ' (now ' + all.size + (all.set ? ', set for all reports' : ', by the ' + all.edition + ' edition') + ')' : '') + '.';
-      allBtn.style.display = mayPublishAllReports && !(all && all.set && all.size === state.size) ? '' : 'none';
+      allBtn.style.display = office && mayPublishAllReports && !(all && all.set && all.size === state.size) ? '' : 'none';
     }
     function publishAllReports() {
       var size = state.size;
@@ -2271,10 +2299,11 @@
     function paperOf(page) {
       var p = { name: page.name, orientation: page.orientation, wMm: page.wMm, hMm: page.hMm };
       if (page.roll) { p.roll = true; p.label = page.label; p.insetMm = 0; }
+      else if (page.label) { p.labelPrinter = true; p.insetMm = 0; }
       return p;
     }
     function paperText(page) {
-      if (!page.roll) return state.size + ' ' + orient();
+      if (!page.roll) return paperName(state.size) + ' ' + orient();
       var hPt = Math.round(page.hMm * PT_PER_MM);
       return page.label + ' · ' + Math.round(page.widthPt * 100) / 100 + ' × ' + hPt + ' pt (' + Math.round(page.wMm) + ' × ' + Math.round(page.hMm) + ' mm), as tall as the content';
     }
@@ -2343,7 +2372,7 @@
       if (p.roll) setRoll(p);
       else if (p.roll === false) roll = null;
       if (p.size != null) {
-        var size = PAPERS.filter(function (x) { return x.toLowerCase() === String(p.size).toLowerCase(); })[0];
+        var size = papers.filter(function (x) { return x.toLowerCase() === String(p.size).toLowerCase(); })[0];
         if (!size) log('setPaper: unknown paper size "' + p.size + '"', 'warn');
         else {
           original.size = size;
@@ -2657,7 +2686,7 @@
       name = Object.keys(SIZES).filter(function (k) { return Math.abs(SIZES[k][0] - w) < 2 && Math.abs(SIZES[k][1] - h) < 2; })[0] || null;
     }
     if (p.warnings && p.warnings.length) log('Page_setup setting: ' + p.warnings.join('; '), 'warn');
-    var hit = PAPERS.filter(function (x) { return x.toLowerCase() === String(name || '').toLowerCase(); })[0];
+    var hit = ALL_PAPERS.filter(function (x) { return x.toLowerCase() === String(name || '').toLowerCase(); })[0];
     if (!hit) return original;
     var dflt = String((el && el.getAttribute('data-default')) || original.size).trim().toLowerCase();
     return { size: hit, orientation: p.orientation === 'landscape' ? 'landscape' : 'portrait', chosen: raw.toLowerCase() !== dflt };
