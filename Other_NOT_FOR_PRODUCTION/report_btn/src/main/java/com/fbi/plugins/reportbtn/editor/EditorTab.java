@@ -294,6 +294,10 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
     }
 
     private void chooseMenus() {
+        if (savedSystem && fpo.getId() > 0) {
+            chooseSystemMenus();
+            return;
+        }
         if (!editableNow()) {
             return;
         }
@@ -305,6 +309,38 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
         }
     }
 
+    /**
+     * A system app's Apps menus: its code is locked, so the choice is saved at once as
+     * the company's (MenuOverrides), and wins over the app's own fb-launch tag.
+     */
+    private void chooseSystemMenus() {
+        if (!decision.canEditFlags) {
+            JOptionPane.showMessageDialog(this, "Read only: " + decision.reason, "App editor", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        String now = systemMenus();
+        String content = ModulePicker.ask(this, "Apps menus: " + savedName, now);
+        if (content == null || content.equals(now)) {
+            return;
+        }
+        try {
+            com.fbi.plugins.reportbtn.MenuOverrides.save(savedName, content);
+        } catch (Exception e) {
+            JOptionPane.showMessageDialog(this, e.getMessage(), "App editor", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        host.invalidateCatalog();
+        feature.reloadCatalog();
+        syncPlacement();
+        status("Apps menus: " + (content.isEmpty() ? "none" : AppGroups.describe(content)) + ". Saved.");
+    }
+
+    /** A system app's Apps menus now: the company's stored choice, else its own tag. */
+    private String systemMenus() {
+        String stored = com.fbi.plugins.reportbtn.MenuOverrides.of(com.fbi.plugins.reportbtn.MenuOverrides.read(host.plugin()), savedName);
+        return stored != null ? stored : AppGroups.launchContent(savedText);
+    }
+
     /** The buttons' tooltips say where the app is now (the code's tags are the truth). */
     private void syncPlacement() {
         if (folderButton == null) {
@@ -314,7 +350,7 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
         String folder = AppGroups.folderContent(text);
         folderButton.setToolTipText("<html>Folder: <b>" + Completions.esc(folder.isEmpty() ? AppGroups.UNFILED : folder)
             + "</b><br>Where the app sits in the Apps panel and the App Library</html>");
-        String launch = AppGroups.launchContent(text);
+        String launch = savedSystem && fpo.getId() > 0 ? systemMenus() : AppGroups.launchContent(text);
         menusButton.setToolTipText("<html>Apps menus: <b>" + Completions.esc(launch.isEmpty() ? "none" : AppGroups.describe(launch))
             + "</b><br>Which modules' Reports › Apps menus list this app</html>");
     }
@@ -485,10 +521,13 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
         for (JComponent c : flagsOnly) {
             c.setEnabled(decision.canEditFlags);
         }
+        if (menusButton != null && savedSystem) {
+            menusButton.setEnabled(decision.canEditFlags);   // a system app's Apps menus are the company's choice, not its code
+        }
         insertPanel.setEditable(can);
         gadgetEnabled();
         banner.setText(can ? "" : "Read only: " + decision.reason + (decision.canEditFlags && typeId == 10
-            ? " Active, Published and Access can still be changed." : ""));
+            ? " Active, Published, Apps menus and Access can still be changed." : ""));
         banner.setVisible(!can);
         updateTitle();
     }

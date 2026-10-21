@@ -1,6 +1,6 @@
 # report_btn: module-related BI reports, and the Apps (beta) module
 
-**Status:** proof of concept, version 0.7.4.
+**Status:** proof of concept, version 0.7.5.
 - **0.1.0 works in the client** (2026-10-12): Reports → Apps in Sales Order opens the
   Sales Order paperwork on the open order.
 - **0.3.0** adds module and menu-group keys.
@@ -91,6 +91,7 @@
   in for a module's Jasper document, through new **Print (App)** and **Email (rich)** ribbon
   buttons, and emails open in a rich HTML window. See
   [Documents and email (PoC)](#documents-and-email-poc).
+- **0.7.5:** every app can be put in Apps menus, system apps included. A system app's code stays locked (it ships with Fishbowl, and an update replaces it), so its Apps menus are kept as the company's choice in plugin properties (`report_btn.menus`, one per app record name) and win over its own fb-launch tag; a custom app's stay in its code as before. The Apps panel (Add to / Remove from / drag / Apps menus…) and the editor's **Apps menus…** button both do it; a system app's folder stays fixed.
 - **0.7.4:** the email window keeps the stock Compose Email layout, so only the body editor is new: a toolbar with **Send** and **Cancel** (the client's own icons) plus **Email App ▾** (just this once / always), then From, the **To: / Cc: / Bcc:** buttons and Subject, and **Attachments:** with the paperclip at the foot. The buttons open the client's own **Email Address Book** (Customer or Vendor tab, Company tab; double-click a row to add it to To, or to Cc / Bcc once that field is clicked in), filled with the record's address and its account's contacts, and the company's contacts and the Fishbowl users. If that dialog can't open, a copy of it in the same layout does. The template in use shows at the right of the editor bar. Addresses split correctly when a quoted name holds a comma.
 - **0.7.3:** the email window. The To, Cc and Bcc labels are buttons: each opens a list of the record's customer or vendor email contacts (the order's own address first) and the Fishbowl users, ticked where the field already has them; their tooltip says to separate addresses with a semicolon. **Open in my email program ▾** offers *Just this once* or *Always* (remembered; untick it there to stop). The body editor's list, indent, alignment, link and undo / redo buttons are icons (the link button toggles: inside a link it removes it; Ctrl+K), and deleting everything (select all, Delete) starts a plain email without the template's style sheet; Ctrl+Z straight after brings the template back.
 - **0.7.2:** Edit on an app no longer fails with "Comparison method violates its general contract". When two scripts exported the same name, the autocomplete list held a function and a plain entry under one name, and their sort broke; now one entry per name is kept, and a completion failure no longer stops the editor opening. System apps open read-only, ready to duplicate. The App Library's folder chips are strictly A-Z (All first, Unfiled last).

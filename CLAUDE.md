@@ -85,10 +85,12 @@ description and an identity block:
   `Dashboards/` page (including Individual Pages) and the Paperwork POC
   replicas. Anything else is custom, and needs no tag (`content="custom"`
   says it explicitly, and is what a copy of a system app gets). The App
-  editor locks a system app's code, name, description, folder and Apps
-  menus, even for admin. Users duplicate it to change it, and Delete offers
-  to deactivate it instead; Active, Published, gadget and access stay
-  changeable. The Apps panel draws system apps black and custom ones green,
+  editor locks a system app's code, name, description and folder, even for
+  admin. Users duplicate it to change it, and Delete offers to deactivate it
+  instead; Active, Published, gadget, access and Apps menus stay changeable
+  (every app can be put in Apps menus: a system app's are kept as the
+  company's choice in plugin properties, `report_btn.menus`, and win over its
+  `fb-launch` tag, so its code stays as shipped). The Apps panel draws system apps black and custom ones green,
   as Fishbowl's report tree does. The editor won't save a page newly marked
   system (it offers to save it as custom), so system apps reach Fishbowl
   only through this repo's deploy. The same write-once rule applies; it goes

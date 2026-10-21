@@ -61,6 +61,13 @@ public final class SelfCheck {
         // fb-launch tag parsing (Apps menu).
         Set<String> keys = AppCatalog.launchModules("<meta content=\"so, purchasing\" name=\"fb-launch\">");
         eq(String.join(",", keys), "SO,PURCHASING", "launchModules");
+        // A system app's stored Apps menus (MenuOverrides): the same keys as a tag's content.
+        eq(String.join(",", MenuOverrides.keys("so, Pick  ship")), "SO,PICK,SHIP", "stored Apps menus keys");
+        eq(String.valueOf(MenuOverrides.keys("").isEmpty()), "true", "stored no Apps menu");
+        java.util.Map<String, String> stored = new java.util.HashMap<>();
+        stored.put("packing slip 4x6", "SHIP");
+        eq(String.valueOf(MenuOverrides.of(stored, " Packing Slip 4x6 ")), "SHIP", "stored menus by record name, any case");
+        eq(String.valueOf(MenuOverrides.of(stored, "Part Barcodes")), "null", "no stored menus: the tag applies");
 
         // The built-in App Library: only its page is in the jar; the server expands its includes.
         String library = AppLibrary.page();

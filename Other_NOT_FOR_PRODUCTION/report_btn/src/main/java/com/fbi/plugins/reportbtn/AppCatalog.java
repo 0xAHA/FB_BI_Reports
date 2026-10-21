@@ -220,6 +220,31 @@ final class AppCatalog {
                 }
             }
         }
+        // A system app's Apps menus stored by the company (MenuOverrides) win over its tag.
+        Map<String, String> stored = MenuOverrides.read(plugin);
+        if (!stored.isEmpty()) {
+            List<?> named = plugin.runQuery("SELECT b.id AS id, LOWER(s.name) AS n FROM bireport b JOIN biscript s ON s.id = b.biScriptId "
+                + "WHERE s.active+0 = 1 AND s.published+0 = 1");
+            if (named != null) {
+                for (Object row : named) {
+                    String content = stored.get(column(row, "n"));
+                    if (content == null) {
+                        continue;
+                    }
+                    try {
+                        int id = Integer.parseInt(String.valueOf(column(row, "id")).trim());
+                        Set<String> keys = MenuOverrides.keys(content);
+                        if (keys.isEmpty()) {
+                            out.remove(id);
+                        } else {
+                            out.put(id, keys);
+                        }
+                    } catch (NumberFormatException ignored) {
+                        // skip the row
+                    }
+                }
+            }
+        }
         return out;
     }
 

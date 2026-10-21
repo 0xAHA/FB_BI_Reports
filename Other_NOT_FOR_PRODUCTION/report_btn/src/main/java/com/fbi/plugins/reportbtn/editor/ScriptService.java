@@ -222,6 +222,8 @@ final class ScriptService {
         String fo = "LOCATE('name=\"fb-folder\"', data)";
         String or = "LOCATE('name=\"fb-origin\"', data)";
         List<Entry> out = new ArrayList<>();
+        // A system app's Apps menus are the company's stored choice when there is one (its code is locked).
+        java.util.Map<String, String> menus = com.fbi.plugins.reportbtn.MenuOverrides.read(host.plugin());
         for (Object row : query("SELECT id, name, typeId AS t, LEFT(COALESCE(description, ''), 300) AS d, active+0 AS a, "
             + "published+0 AS p, COALESCE(fbName <> '', 0) AS b, "
             + "CASE WHEN typeId = 10 AND " + at + " > 0 THEN SUBSTRING(data, GREATEST(1, " + at + " - 120), 360) "
@@ -236,10 +238,12 @@ final class ScriptService {
                 continue;
             }
             List<AccessPolicy.Report> mine = reports.getOrDefault(id, new ArrayList<>());
+            boolean system = AppGroups.isSystem(host.column(row, "orig"));
+            String stored = system ? com.fbi.plugins.reportbtn.MenuOverrides.of(menus, name) : null;
             out.add(new Entry(id, name, intOf(host.column(row, "t")), nz(host.column(row, "d")),
                 intOf(host.column(row, "a")) == 1, intOf(host.column(row, "p")) == 1, intOf(host.column(row, "b")) == 1,
-                AppGroups.launchContent(host.column(row, "tag")), AppGroups.folderContent(host.column(row, "fold")),
-                AppGroups.isSystem(host.column(row, "orig")), mine));
+                stored != null ? stored : AppGroups.launchContent(host.column(row, "tag")), AppGroups.folderContent(host.column(row, "fold")),
+                system, mine));
         }
         return out;
     }

@@ -16,9 +16,10 @@ import java.util.function.IntFunction;
  *   Report access          BI Report-Edit and Edit Settings on that report
  *   Unpublish              page editable and BI Report-Delete (it deletes the report)
  *   Dashboard gadget       page editable and BI Report-Edit (bireport.widget)
- *   System app             never its code, name, description, folder or Apps menus
- *                          (it ships with Fishbowl: duplicate it to change it); its
- *                          Active, Published, gadget and access follow the rules above
+ *   System app             never its code, name, description or folder (it ships
+ *                          with Fishbowl: duplicate it to change it); its Active,
+ *                          Published, gadget, access and Apps menus follow the rules
+ *                          above (its Apps menus are kept in MenuOverrides, not its code)
  *
  * Admin may do everything except change a system app. Pure: Rights is filled from
  * the client by EditorFeature.

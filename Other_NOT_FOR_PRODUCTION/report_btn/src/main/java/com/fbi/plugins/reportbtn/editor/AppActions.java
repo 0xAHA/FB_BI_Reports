@@ -246,7 +246,7 @@ final class AppActions {
      */
     void moveToFolder(Component parent, List<ScriptService.Entry> list, String folder) {
         String label = folder == null ? AppGroups.UNFILED : folder;
-        List<ScriptService.Entry> go = editablePages(list, e -> !(folder == null ? e.folder.isEmpty() : folder.equalsIgnoreCase(e.folder)));
+        List<ScriptService.Entry> go = editablePages(list, e -> !(folder == null ? e.folder.isEmpty() : folder.equalsIgnoreCase(e.folder)), false);
         quietly(parent, go, lastSkips, e -> savePage(e, data -> AppGroups.setFolder(data, folder)),
             done -> subject(done) + " moved to " + label + ".");
     }
@@ -275,18 +275,16 @@ final class AppActions {
             }
         }
         String where = keys.size() == 1 ? AppGroups.keyLabel(keys.iterator().next()) : "their Apps menus";
-        List<ScriptService.Entry> go = editablePages(list, e -> true);
-        quietly(parent, go, lastSkips, e -> savePage(e, data -> AppGroups.rewrite(data,
-                AppGroups.retag(AppGroups.launchContent(data), keyOf.get(e.id), null))),
+        List<ScriptService.Entry> go = editablePages(list, e -> true, true);
+        quietly(parent, go, lastSkips, e -> saveMenus(e, now -> AppGroups.retag(now, keyOf.get(e.id), null)),
             done -> subject(done) + " removed from " + where + ".");
     }
 
     /** Adds the apps to one Apps menu (a module key, or a menu-group key for every module in it). */
     void addToModule(Component parent, List<ScriptService.Entry> list, String key) {
         List<ScriptService.Entry> go = editablePages(list,
-            e -> AppGroups.keys(e.launchTag).stream().noneMatch(k -> k.equalsIgnoreCase(key)));
-        quietly(parent, go, lastSkips, e -> savePage(e, data -> AppGroups.rewrite(data,
-                AppGroups.retag(AppGroups.launchContent(data), null, key))),
+            e -> AppGroups.keys(e.launchTag).stream().noneMatch(k -> k.equalsIgnoreCase(key)), true);
+        quietly(parent, go, lastSkips, e -> saveMenus(e, now -> AppGroups.retag(now, null, key)),
             done -> subject(done) + " added to " + AppGroups.keyLabel(key) + ".");
     }
 
@@ -301,9 +299,8 @@ final class AppActions {
         List<ScriptService.Entry> go = editablePages(list, e -> {
             String next = AppGroups.retag(e.launchTag, keyOf.get(e.id), toKey);
             return !next.equalsIgnoreCase(AppGroups.retag(e.launchTag, null, null));
-        });
-        quietly(parent, go, lastSkips, e -> savePage(e, data -> AppGroups.rewrite(data,
-                AppGroups.retag(AppGroups.launchContent(data), keyOf.get(e.id), toKey))),
+        }, true);
+        quietly(parent, go, lastSkips, e -> saveMenus(e, now -> AppGroups.retag(now, keyOf.get(e.id), toKey)),
             done -> toKey == null ? subject(done) + " taken out of that Apps menu."
                 : subject(done) + (copy ? " added to " : " moved to ") + AppGroups.keyLabel(toKey) + ".");
     }
@@ -325,8 +322,8 @@ final class AppActions {
         if (content == null) {
             return;
         }
-        List<ScriptService.Entry> go = editablePages(pages, e -> !AppGroups.retag(e.launchTag, null, null).equalsIgnoreCase(content));
-        quietly(parent, go, lastSkips, e -> savePage(e, data -> AppGroups.rewrite(data, content)),
+        List<ScriptService.Entry> go = editablePages(pages, e -> !AppGroups.retag(e.launchTag, null, null).equalsIgnoreCase(content), true);
+        quietly(parent, go, lastSkips, e -> saveMenus(e, now -> content),
             done -> (done.size() == 1 ? "\"" + done.get(0).name + "\" now shows in " : done.size() + " apps now show in ")
                 + (content.isEmpty() ? "no Apps menu" : AppGroups.describe(content)) + ".");
     }
@@ -483,8 +480,13 @@ final class AppActions {
         feature.reloadCatalog();
     }
 
-    /** The pages in list that need the change and may be changed; the rest land in lastSkips. */
-    private List<ScriptService.Entry> editablePages(List<ScriptService.Entry> list, java.util.function.Predicate<ScriptService.Entry> needs) {
+    /**
+     * The pages in list that need the change and may be changed; the rest land in lastSkips.
+     * menus: an Apps-menus change, which a system app takes too (MenuOverrides keeps it;
+     * its code stays as shipped); its folder stays fixed.
+     */
+    private List<ScriptService.Entry> editablePages(List<ScriptService.Entry> list, java.util.function.Predicate<ScriptService.Entry> needs,
+                                                    boolean menus) {
         AccessPolicy.Rights rights = ClientRights.current(host, service);
         List<ScriptService.Entry> go = new ArrayList<>();
         lastSkips = new ArrayList<>();
@@ -492,7 +494,8 @@ final class AppActions {
             if (e.typeId != 10 || !needs.test(e)) {
                 continue;
             }
-            String why = e.system ? "It's a Fishbowl system app, so its folder and Apps menus are fixed."
+            String why = e.system && !menus ? "It's a Fishbowl system app, so its folder is fixed (its Apps menus can be changed)."
+                : e.system ? refusal(e, rights)
                 : e.builtIn ? "It's one of Fishbowl's own apps: change it in the editor, which keeps the original."
                 : refusal(e, rights);
             if (why.isEmpty()) {
@@ -508,6 +511,26 @@ final class AppActions {
 
     private interface Rewrite {
         String apply(String data);
+    }
+
+    private interface MenuChange {
+        String apply(String current);
+    }
+
+    /**
+     * Sets an app's Apps menus from its current ones: a system app's in MenuOverrides
+     * (its code is locked), any other app's fb-launch tag in its code.
+     */
+    private void saveMenus(ScriptService.Entry e, MenuChange change) throws ScriptService.ServiceException {
+        if (e.system) {
+            try {
+                com.fbi.plugins.reportbtn.MenuOverrides.save(e.name, change.apply(e.launchTag));
+            } catch (Exception ex) {
+                throw new ScriptService.ServiceException(ex.getMessage());
+            }
+            return;
+        }
+        savePage(e, data -> AppGroups.rewrite(data, change.apply(AppGroups.launchContent(data))));
     }
 
     /** Reads the page fresh, rewrites its code and saves it. */
