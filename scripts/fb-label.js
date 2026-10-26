@@ -60,7 +60,7 @@
 (function (global) {
   'use strict';
   var FBLabel = global.FBLabel = global.FBLabel || {};
-  FBLabel.BUILD = '2026.10.21-fdb9bea';   // @fb-build
+  FBLabel.BUILD = '2026.10.23-fb08ee6';   // @fb-build
 
   var FONT = '"FB Doc Open Sans", "Open Sans", Arial, sans-serif';
   var COMPANY_KEY = 'cdx.bi.labelStocks.v1';
@@ -968,8 +968,14 @@
   var SHARES = [0.5, 1, 1.5, 2, 3, 4, 5, 6];
   var ALIGNS = [['left', '⯇', 'Left'], ['center', '≡', 'Centre'], ['right', '⯈', 'Right']];
 
+  // The drag handle that reorders a row (three lines, on the row's left), as every list of
+  // fields in the label reports: drag it, or focus it and press the up / down arrow keys.
+  var GRIP = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">' +
+    '<line x1="3" y1="4.5" x2="13" y2="4.5"/><line x1="3" y1="8" x2="13" y2="8"/><line x1="3" y1="11.5" x2="13" y2="11.5"/></svg>';
+
   /**
-   * The label's fields as a small table: show, height share, size, bold, align, lines, order.
+   * The label's fields as a small table: order (a drag handle on the left), show, height share,
+   * size, bold, align, lines.
    * @param {object} o - { mount, fields, onChange(fields) }
    * @returns {{ set(fields), get() }}
    */
@@ -979,14 +985,15 @@
     var fields = clone(o.fields || []);
     var opt = function (v, cur, label) { return '<option value="' + v + '"' + (String(v) === String(cur) ? ' selected' : '') + '>' + (label || v) + '</option>'; };
     function draw() {
-      host.innerHTML = '<table class="fbl-fe"><thead><tr><th></th><th>Field</th><th title="The field\'s share of the label\'s height">Height</th>' +
+      host.innerHTML = '<table class="fbl-fe"><thead><tr><th></th><th></th><th>Field</th><th title="The field\'s share of the label\'s height">Height</th>' +
         '<th title="Auto: as large as its lines allow. A size is the largest it may be: long text shrinks to fit, unless Fixed.">Size</th>' +
-        '<th title="Fixed: always this size; text that doesn\'t fit is cut short with …">Fixed</th><th title="Bold">B</th><th>Align</th><th title="Most lines the text may wrap onto">Lines</th><th></th></tr></thead><tbody>' +
+        '<th title="Fixed: always this size; text that doesn\'t fit is cut short with …">Fixed</th><th title="Bold">B</th><th>Align</th><th title="Most lines the text may wrap onto">Lines</th></tr></thead><tbody>' +
         fields.map(function (f, i) {
           var text = f.kind !== 'barcode', off = f.show === false;
           return '<tr data-i="' + i + '" class="' + (off ? 'fbl-off' : '') + '">' +
+            '<td class="fbl-fe-grip" draggable="true" tabindex="0" role="button" aria-label="Move ' + esc(f.label) + ' (drag, or the up / down arrow keys)" title="Drag to change the order">' + GRIP + '</td>' +
             '<td><input type="checkbox" data-k="show"' + (off ? '' : ' checked') + ' title="Print this field"></td>' +
-            '<td class="fbl-fe-name">' + esc(f.label) + '</td>' +
+            '<td class="fbl-fe-name"><span title="' + esc(f.label) + '">' + esc(f.label) + '</span></td>' +
             '<td><select data-k="share">' + SHARES.map(function (v) { return opt(v, share(f)); }).join('') + '</select></td>' +
             (text
               ? '<td><select data-k="size">' + SIZES.map(function (v) { return opt(v, f.size == null ? 'auto' : f.size, v === 'auto' ? 'Auto' : v + ' pt'); }).join('') + '</select></td>' +
@@ -998,12 +1005,62 @@
             '<td><span class="fbl-seg">' + ALIGNS.map(function (a) {
               return '<button type="button" data-k="align" data-v="' + a[0] + '" title="' + a[2] + '" class="' + ((f.align || 'center') === a[0] ? 'on' : '') + '">' + alignIcon(a[0]) + '</button>';
             }).join('') + '</span></td>' +
-            '<td>' + (text ? '<select data-k="lines">' + [1, 2, 3, 4].map(function (v) { return opt(v, f.lines || 1); }).join('') + '</select>' : '<span class="fbl-na">–</span>') + '</td>' +
-            '<td class="fbl-fe-mv"><button type="button" data-mv="-1" title="Move up"' + (i === 0 ? ' disabled' : '') + '>▲</button>' +
-            '<button type="button" data-mv="1" title="Move down"' + (i === fields.length - 1 ? ' disabled' : '') + '>▼</button></td></tr>';
+            '<td>' + (text ? '<select data-k="lines">' + [1, 2, 3, 4].map(function (v) { return opt(v, f.lines || 1); }).join('') + '</select>' : '<span class="fbl-na">–</span>') + '</td></tr>';
         }).join('') + '</tbody></table>';
     }
     function changed() { draw(); if (o.onChange) o.onChange(clone(fields)); }
+    // Field i moves to position j (in the list without it).
+    function move(i, j) {
+      if (i === j || i < 0 || i >= fields.length) return;
+      var f = fields.splice(i, 1)[0];
+      fields.splice(Math.max(0, Math.min(fields.length, j)), 0, f);
+      changed();
+    }
+
+    // Reordering: drag a row by its handle; the drop goes before or after the row under the pointer.
+    var dragFrom = -1;
+    var clearMarks = function () {
+      host.querySelectorAll('tr.fbl-drop-before, tr.fbl-drop-after, tr.fbl-dragging').forEach(function (r) {
+        r.classList.remove('fbl-drop-before', 'fbl-drop-after', 'fbl-dragging');
+      });
+    };
+    host.addEventListener('dragstart', function (e) {
+      var g = e.target.closest && e.target.closest('.fbl-fe-grip'), tr = g && g.closest('tr[data-i]');
+      if (!tr) return;
+      dragFrom = +tr.dataset.i;
+      tr.classList.add('fbl-dragging');
+      try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', 'fbl-field'); e.dataTransfer.setDragImage(tr, 12, 12); } catch (_) {}
+    });
+    host.addEventListener('dragover', function (e) {
+      var tr = dragFrom >= 0 && e.target.closest && e.target.closest('tr[data-i]');
+      if (!tr) return;
+      e.preventDefault();
+      try { e.dataTransfer.dropEffect = 'move'; } catch (_) {}
+      var r = tr.getBoundingClientRect(), after = e.clientY > r.top + r.height / 2;
+      host.querySelectorAll('tr[data-i]').forEach(function (x) { if (x !== tr) x.classList.remove('fbl-drop-before', 'fbl-drop-after'); });
+      tr.classList.toggle('fbl-drop-before', !after);
+      tr.classList.toggle('fbl-drop-after', after);
+    });
+    host.addEventListener('drop', function (e) {
+      var tr = dragFrom >= 0 && e.target.closest && e.target.closest('tr[data-i]');
+      if (!tr) return;
+      e.preventDefault();
+      var to = +tr.dataset.i + (tr.classList.contains('fbl-drop-after') ? 1 : 0), from = dragFrom;
+      dragFrom = -1;
+      clearMarks();
+      move(from, to > from ? to - 1 : to);
+    });
+    host.addEventListener('dragend', function () { dragFrom = -1; clearMarks(); });
+    host.addEventListener('keydown', function (e) {
+      var g = e.target.closest && e.target.closest('.fbl-fe-grip'), tr = g && g.closest('tr[data-i]');
+      if (!tr || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
+      e.preventDefault();
+      var i = +tr.dataset.i, j = i + (e.key === 'ArrowUp' ? -1 : 1);
+      if (j < 0 || j >= fields.length) return;
+      move(i, j);
+      var again = host.querySelector('tr[data-i="' + j + '"] .fbl-fe-grip');
+      if (again) again.focus();
+    });
     host.addEventListener('change', function (e) {
       var tr = e.target.closest('tr[data-i]'), k = e.target.dataset.k;
       if (!tr || !k) return;
@@ -1019,15 +1076,108 @@
       if (!tr) return;
       var i = +tr.dataset.i;
       if (b.dataset.k === 'align') { fields[i].align = b.dataset.v; changed(); }
-      else if (b.dataset.mv) {
-        var j = i + (+b.dataset.mv);
-        if (j < 0 || j >= fields.length) return;
-        var t = fields[i]; fields[i] = fields[j]; fields[j] = t; changed();
-      }
     });
     draw();
     return { set: function (f) { fields = clone(f || []); draw(); }, get: function () { return clone(fields); } };
   }
+  /**
+   * The settings panel on the left of a label report: as wide as its content needs (within
+   * limits) until the user drags its edge, then the width they chose (double-click the edge to
+   * fit again). A drag edge goes between the panel and the preview; the arrow keys move it too.
+   * @param {object} o - { panel (element or id), width (saved px, or null = fit), min (340), base (the CSS width),
+   *   onChange(width or null) } — save the width with the report's own settings.
+   * @returns {{ fit(), width() }}
+   */
+  function sidePanel(o) {
+    injectCss();
+    var panel = typeof o.panel === 'string' ? document.getElementById(o.panel) : o.panel;
+    if (!panel || !panel.parentNode) return { fit: function () {}, width: function () { return 0; } };
+    // The page's own width for the panel (its CSS) is where fitting starts.
+    var BASE = o.base || Math.round(panel.getBoundingClientRect().width) || 480;
+    var MIN = o.min || 340, chosen = +o.width > 0 ? +o.width : 0, fitting = !chosen;
+    var edge = document.createElement('div');
+    edge.className = 'fbl-split';
+    edge.tabIndex = 0;
+    edge.setAttribute('role', 'separator');
+    edge.setAttribute('aria-orientation', 'vertical');
+    edge.title = 'Drag to make the panel wider or narrower (double-click: fit it to its content)';
+    panel.parentNode.insertBefore(edge, panel.nextSibling);
+    var max = function () { return Math.max(MIN, Math.min(900, (panel.parentNode.clientWidth || 1200) - 360)); };
+    var clamp = function (w) { return Math.round(Math.max(MIN, Math.min(max(), w))); };
+    // The page re-fits its preview on a window resize; a new panel width needs the same, so
+    // one is sent (once per frame) after the width changes. Our own listener ignores it.
+    var sending = false, queued = false;
+    var tell = function () {
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(function () { queued = false; sending = true; try { window.dispatchEvent(new Event('resize')); } finally { sending = false; } });
+    };
+    var set = function (w) {
+      var v = '0 0 ' + clamp(w) + 'px';
+      if (panel.style.flex !== v) { panel.style.flex = v; tell(); }
+    };
+    var now = function () { return panel.getBoundingClientRect().width; };
+    // What the content needs: the current width plus whatever overflows it (a table wider
+    // than its card, a row that doesn't wrap). Wrapping text never counts.
+    function need() {
+      var over = 0;
+      panel.querySelectorAll('.lbl-body, .lbl-body > *, .lbl-body table').forEach(function (el) {
+        var d = el.scrollWidth - el.clientWidth;
+        if (d > over) over = d;
+      });
+      return now() + over + (over ? 4 : 0);
+    }
+    // From the base width, so a fit can also make the panel narrower again.
+    function fit() {
+      fitting = true;
+      set(BASE);
+      set(Math.max(BASE, need()));
+    }
+    set(chosen || BASE);
+    if (fitting) {
+      requestAnimationFrame(fit);
+      // The content arrives later (fields, lists): fit again until the user picks a width.
+      var mo = new MutationObserver(function () { if (fitting) requestAnimationFrame(fit); });
+      mo.observe(panel, { childList: true, subtree: true });
+      setTimeout(function () { mo.disconnect(); }, 15000);
+    }
+    var startX = 0, startW = 0;
+    edge.addEventListener('pointerdown', function (e) {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      startX = e.clientX; startW = now();
+      edge.setPointerCapture(e.pointerId);
+      edge.classList.add('on');
+      document.body.classList.add('fbl-resizing');
+    });
+    edge.addEventListener('pointermove', function (e) {
+      if (!edge.hasPointerCapture(e.pointerId)) return;
+      fitting = false;
+      set(startW + e.clientX - startX);
+    });
+    var done = function (e) {
+      if (!edge.hasPointerCapture(e.pointerId)) return;
+      edge.releasePointerCapture(e.pointerId);
+      edge.classList.remove('on');
+      document.body.classList.remove('fbl-resizing');
+      if (!fitting && o.onChange) o.onChange(Math.round(now()));
+    };
+    edge.addEventListener('pointerup', done);
+    edge.addEventListener('pointercancel', done);
+    edge.addEventListener('dblclick', function () { fit(); if (o.onChange) o.onChange(null); });
+    edge.addEventListener('keydown', function (e) {
+      var d = e.key === 'ArrowLeft' ? -16 : e.key === 'ArrowRight' ? 16 : 0;
+      if (!d) return;
+      e.preventDefault();
+      fitting = false;
+      set(now() + d);
+      if (o.onChange) o.onChange(Math.round(now()));
+    });
+    window.addEventListener('resize', function () { if (sending) return; if (fitting) fit(); else set(now()); });
+    return { fit: fit, width: function () { return Math.round(now()); } };
+  }
+  FBLabel.sidePanel = sidePanel;
+
   function auto(f) { return f.size === 'auto' || f.size == null; }
   function alignIcon(a) {
     var y = [6, 10, 14, 18], w = [16, 10, 16, 10];
@@ -1344,17 +1494,25 @@
     '.fbl-fe{border-collapse:collapse;font-size:12px;width:100%}',
     '.fbl-fe th{font-size:10.5px;text-transform:uppercase;letter-spacing:.03em;color:var(--c-secondary,#6b7b83);text-align:left;padding:3px 4px;font-weight:600}',
     '.fbl-fe td{padding:3px 4px;border-top:1px solid #eef1f2;vertical-align:middle}',
-    '.fbl-fe tr.fbl-off td:not(:first-child){opacity:.45}',
+    '.fbl-fe tr.fbl-off td:nth-child(n+3){opacity:.45}',   /* not the handle or the show box */
     '.fbl-fe select{padding:2px 3px;font:inherit;font-size:12px;border:1px solid var(--border,#d5dde1);border-radius:4px}',
     '.fbl-fe-name{font-weight:600;white-space:nowrap}',
+    '.fbl-fe-name span{display:block;max-width:150px;overflow:hidden;text-overflow:ellipsis}',
+    '.fbl-split{flex:0 0 8px;margin:0 -12px 0 -12px;align-self:stretch;cursor:col-resize;position:relative;z-index:2;outline:none}',
+    '.fbl-split::after{content:"";position:absolute;top:0;bottom:0;left:3px;width:2px;border-radius:1px;background:transparent;transition:background .15s}',
+    '.fbl-split:hover::after,.fbl-split:focus::after,.fbl-split.on::after{background:var(--link,#2d9cdb)}',
+    'body.fbl-resizing{cursor:col-resize;user-select:none}',
     '.fbl-na{color:#b0bbc0}',
     '.fbl-seg{display:inline-flex;border:1px solid var(--border,#d5dde1);border-radius:5px;overflow:hidden}',
     '.fbl-seg button{border:0;background:#fff;padding:2px 4px;cursor:pointer;color:#6b7b83;display:flex}',
     '.fbl-seg button+button{border-left:1px solid var(--border,#d5dde1)}',
     '.fbl-seg button.on{background:#e3f1fb;color:#1a6fa3}',
-    '.fbl-fe-mv{white-space:nowrap}',
-    '.fbl-fe-mv button{border:1px solid var(--border,#d5dde1);background:#fff;border-radius:4px;font-size:9px;padding:2px 4px;cursor:pointer;color:#6b7b83}',
-    '.fbl-fe-mv button:disabled{opacity:.3;cursor:default}',
+    '.fbl-fe td.fbl-fe-grip{width:18px;padding:3px 2px;color:#9aa7ad;cursor:grab;text-align:center;line-height:0;border-radius:4px}',
+    '.fbl-fe td.fbl-fe-grip:hover,.fbl-fe td.fbl-fe-grip:focus{color:var(--c-primary,#0B3140);background:#eef1f2;outline:none}',
+    '.fbl-fe td.fbl-fe-grip:active{cursor:grabbing}',
+    '.fbl-fe tr.fbl-dragging td{opacity:.4}',
+    '.fbl-fe tr.fbl-drop-before td{box-shadow:inset 0 2px 0 var(--link,#2d9cdb)}',
+    '.fbl-fe tr.fbl-drop-after td{box-shadow:inset 0 -2px 0 var(--link,#2d9cdb)}',
     '.fbl-figs{display:flex;flex-direction:column;align-items:center;gap:6px}',
     '.fbl-figs-page{width:max-content;min-width:100%;margin:0 auto}',
     '.fbl-figs-wrap{flex-direction:row;flex-wrap:wrap;justify-content:center;gap:14px}',

@@ -187,7 +187,7 @@ window.FBLib = (function () {
      * Exposed as FBLib.BUILD so a report can tell which fb-lib the Fishbowl server actually served it.
      * @type {string}
      */
-    const BUILD = '2026.10.21-51ffd99';   // @fb-build
+    const BUILD = '2026.10.23-90ab1e1';   // @fb-build
 
     /**
      * Returns the host report's identity block (window.FB_REPORT, set at the top of every report's head).
@@ -210,7 +210,7 @@ window.FBLib = (function () {
     // takes files (a drop zone, or its own window / document listener) still
     // gets them. A file input keeps its native drop.
     (function blockFileDrops() {
-        if (typeof window === 'undefined' || window.__fbFileDropGuard) return;
+        if (typeof window === 'undefined' || typeof window.addEventListener !== 'function' || window.__fbFileDropGuard) return;
         window.__fbFileDropGuard = true;
         const hasFiles = function (e) {
             try {
@@ -1543,6 +1543,20 @@ window.FBLib = (function () {
          * @param {number} [ms=3500] - How long it stays; 0 = until dismissed.
          * @returns {?HTMLElement} The toast element, or null when nothing was shown.
          */
+        // The toast's own look (fb-styles §14) for a page without fb-styles (a Tailwind page): the same
+        // rules, added once. Pages with fb-styles have them already. Keep this in step with §14.
+        const TOAST_CSS = ".toast-container { position: fixed; bottom: 1rem; right: 1rem; top: 1rem; z-index: 10020; display: flex; flex-direction: column; justify-content: flex-end; gap: 0.5rem; overflow-y: auto; pointer-events: none; } .toast-container .toast { pointer-events: auto; } .toast { min-width: 280px; max-width: 380px; padding: 12px 14px; background: #fff; border-radius: 10px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.2); border-left: none !important; display: flex; align-items: flex-start; gap: 10px; animation: toastSlideIn 0.25s ease-out; transition: opacity 0.25s ease; } .toast .toast-icon { flex: none; position: relative; width: 20px; height: 20px; margin-top: -1px; font-size: 0 !important; color: transparent !important; overflow: visible; background: url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 145 140'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%231E6BEE'/%3E%3Cstop offset='1' stop-color='%230533EF'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath fill='url(%23g)' d='M64.5 0.93A72 69.5 0 0 0 64.5 139.07L64.5 125Q64.5 110.99 50 105.69A43.5 41.7 0 0 1 50 34.31Q64.5 29.01 64.5 15ZM80.5 0.93A72 69.5 0 0 1 80.5 139.07L80.5 125Q80.5 110.99 95 105.69A43.5 41.7 0 0 0 95 34.31Q80.5 29.01 80.5 15Z'/%3E%3C/svg%3E\") center / contain no-repeat; } .toast .toast-icon::after { position: absolute; right: -5px; bottom: -4px; width: 11px; height: 11px; border-radius: 50%; border: 1.5px solid #fff; box-sizing: content-box; color: #fff; font: 700 8px/11px -apple-system, 'Segoe UI', Arial, sans-serif; text-align: center; } .toast.success .toast-icon::after { content: \"\\2713\"; background: #1B7A46; } .toast.error .toast-icon::after { content: \"\\2715\"; background: #C43046; } .toast.warn .toast-icon::after { content: \"!\"; background: #F69133; } .toast .toast-msg { font-size: 12.5px; color: #415157; font-weight: 500; flex: 1; min-width: 0; line-height: 1.4; word-break: break-word; overflow-wrap: anywhere; max-height: 40vh; overflow-y: auto; } .toast .toast-x { background: none; border: none; color: #8FA1A7; cursor: pointer; font-size: 18px; line-height: 1; padding: 2px 4px; margin: -2px -4px 0 0; flex-shrink: 0; align-self: flex-start; } .toast .toast-x:hover { color: #506872; } @keyframes toastSlideIn { from { transform: translateX(400px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }";
+        function ensureToastCss() {
+            try {
+                if (document.getElementById('fblib-toast-css')) return;
+                if (getComputedStyle(document.documentElement).getPropertyValue('--fb-styles-build').trim()) return;
+                const st = document.createElement('style');
+                st.id = 'fblib-toast-css';
+                st.textContent = TOAST_CSS;
+                (document.head || document.documentElement).appendChild(st);
+            } catch (_) {}
+        }
+
         function toast(html, type, ms) {
             type = type === 'warning' ? 'warn' : (type || 'info');
             if (isOutput()) {
@@ -1557,6 +1571,7 @@ window.FBLib = (function () {
                 host.className = 'toast-container';
                 document.body.appendChild(host);
             }
+            ensureToastCss();
             const el = document.createElement('div');
             el.className = 'toast ' + type;
             const icon = type === 'success' ? '✓' : type === 'error' ? '✕' : type === 'warn' ? '!' : 'ℹ';

@@ -17,7 +17,7 @@
 (function (global) {
     'use strict';
 
-    const BUILD = '2026.10.15-f3725b4';   // @fb-build
+    const BUILD = '2026.10.23-ab194bb';   // @fb-build
     const R = () => global.FBReport;
     const L = () => global.FBLib || {};
     const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -948,17 +948,11 @@
 
         // ================================================================ messages
         function say(text) {
-            let el = host.querySelector('.fbb-say');
-            if (!el) {
-                el = document.createElement('div');
-                el.className = 'toast info fbb-say';
-                el.style.cssText = 'position:fixed;right:18px;bottom:18px;z-index:600;max-width:420px';
-                document.body.appendChild(el);
-            }
-            el.textContent = text;
-            el.style.opacity = '1';
-            clearTimeout(el._t);
-            el._t = setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 5000);
+            // One builder message at a time, as a common toast (FBLib.Common.toast, fb-styles §14).
+            const old = host.querySelector('.fbb-say') || document.querySelector('.toast.fbb-say');
+            if (old) old.remove();
+            const el = window.FBLib && FBLib.Common && FBLib.Common.toast(FBLib.Common.escHtml(String(text ?? '')), 'info', 5000);
+            if (el) el.classList.add('fbb-say');
         }
 
         // ================================================================ drag and drop, clicks, keys

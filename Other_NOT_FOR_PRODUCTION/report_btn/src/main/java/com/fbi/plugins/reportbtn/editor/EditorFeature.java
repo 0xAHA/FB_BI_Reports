@@ -111,6 +111,11 @@ public final class EditorFeature implements WorkspaceExtension {
     public Map<String, Boolean> workspaceFlags(int reportId) {
         Map<String, Boolean> flags = new LinkedHashMap<>();
         flags.put("edit", ClientRights.mayEdit(host));
+        // The App Library lists every app only for admin (as the Apps menus and the BI Reports
+        // module do), and shows the editor's pencil by the editor's own rule: Edit Settings on
+        // the report while Fishbowl has that level, else any access (ADV-6032).
+        flags.put("admin", ClientRights.isAdmin(host));
+        flags.put("editsettings", AccessPolicy.EDIT_LEVEL != com.fbi.sdk.constants.bi.AccessLevelConst.VIEW);
         // The Report Builder may publish from this host.
         flags.put("publish", true);
         return flags;

@@ -18,7 +18,7 @@
 (function (global) {
     'use strict';
 
-    const BUILD = '2026.10.15-c7fd0a0';   // @fb-build
+    const BUILD = '2026.10.23-2275ab6';   // @fb-build
     const SPEC_VERSION = 1;
 
     // ================================================================ helpers
@@ -1906,13 +1906,8 @@
                 }
             }
             function toast(html, type, ms) {
-                const hostEl = $('toasts');
-                const el = document.createElement('div');
-                el.className = 'toast ' + (type || 'info');
-                el.innerHTML = '<span class="toast-msg">' + html + '</span><button type="button" class="toast-x" aria-label="Dismiss">&times;</button>';
-                el.querySelector('.toast-x').onclick = () => el.remove();
-                hostEl.appendChild(el);
-                setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, ms || 4000);
+                // The common toast (FBLib.Common.toast: fb-styles §14, the Fishbowl icon and status badge).
+                return FBLib.Common.toast(html, type || 'info', ms || 4000);
             }
 
             // ---- start
