@@ -2,8 +2,9 @@
 
 **Client:** TKMS Sonotech · **Users:** Nick Wright; Saxon Fiori / Elena Jiang's weekly managers' meeting
 **Brief:** `BRIEF_Project_Procurement_Status.md` (Yana Belichenka; rules agreed 9 Oct 2026)
-**Scoped:** 9 Oct 2026 · **Status:** built 9 Oct 2026 and desk-tested on demodb (§11). **Not yet run
-on the TKMS database or tested by the client.**
+**Scoped:** 9 Oct 2026 · **Status:** built 9 Oct 2026 and desk-tested on demodb (§11). Reworked
+27 Oct 2026 for MO-only projects, with no sales order (§12). **Not yet run on the TKMS database or
+tested by the client.**
 
 ---
 
@@ -309,3 +310,33 @@ fb-lib saved under those names.
   FilterViews publishing, and the admin Save.
 - The TKMS database itself. Run the §9 checks there first. Then check job P2515 part by part against
   Nick's spreadsheet.
+
+---
+
+## 12. Change, 27 Oct 2026: projects are MOs, with no sales order
+
+TKMS now runs a project as an MO with no SO, so the customer → SO → MO path in §2 of the brief no
+longer exists. **The MO number is the project number.**
+
+- **A project is a non-void MO.** The picker lists MO numbers; open = MO Entered, Issued or
+  Partial, and *Finished projects* adds the rest. Requirements, open demand and every view key on
+  `mo.id`; `so` and `customer`-via-SO are gone from every query and column (SO Number and the
+  separate MO Number column are dropped; the Project column opens the MO).
+- **PO lines still belong to a project through the line-level Customer Job (R5),** because it is
+  the only job link a PO line has. The customer is matched to the MO by name: Customer Job
+  *P2410110* ↔ MO *P2410110* (`JOIN customer c ON c.id = poitem.customerId JOIN mo ON mo.num =
+  c.name`). Summary shows the matched Customer Job.
+- **Exceptions changed.** *MO not linked to an SO* and *SO with no MO* are gone. New:
+  *No customer for this project* (no customer is named as the MO, so nothing on it can show
+  Ordered/Received), *Customer Job matches no MO* (a PO line for a needed part whose Customer Job
+  isn't any MO number), and *MO not issued yet* (MO still Entered).
+- **Saved selections reset.** Old selections and saved views held customer ids, so the user key
+  is now `projects` and the saved-views tile `PROJECTS`; users pick their projects once again.
+- **Tested** on the local Fishbowl (Chrome, live SQL): 95 MOs, 20 open; MO 117 (no SO) loads
+  11 parts / 13 MO lines, self-check OK. With customer 123 mapped to MO 117 in the harness, its 7
+  Customer Job lines attribute to the project (PO 167 counts as Received; 6 flagged not on the
+  BOM). Excel export and the MO link work; no page errors.
+
+**To confirm with TKMS:** that every project keeps a customer named exactly as its MO number and
+that buyers set it as Customer Job (the report can't attribute a PO line otherwise); and whether
+stock-build MOs should be kept out of the project list (today every non-void MO is a project).

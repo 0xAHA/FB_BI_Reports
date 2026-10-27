@@ -55,7 +55,7 @@
         window.FB_REPORT = {
             key:   'cdx.bi.productionsched',
             name:  'Production Scheduling w AI',
-            build: '2026.10.23-c740a58'     // @fb-build
+            build: '2026.10.27-0303019'     // @fb-build
         };
     </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -5169,6 +5169,39 @@ function psPoTaxRates(vendorId, partIds){
     return out;
 }
 
+// The vendor's order currency and contact details, as the PO module fills them
+// when the vendor is picked. The REST create fills the remit-to address, carrier
+// and terms itself, but leaves email and phone blank.
+// Currency: the vendor's own currency when Multi Currency is on and it isn't the
+// home one. vendorparts.lastCost is in that currency, so the drawer's unit costs
+// are too; the create then needs mcTotalCost (vendor currency) beside totalCost
+// (home = mc × rate).
+// Contacts: Email (60) and the first phone of Main (50), Work (20), Mobile (30),
+// Home (10), preferring the vendor's default address, then the default contact.
+function psPoVendorInfo(vendorId){
+    const out={ currency:null, email:'', phone:'' };
+    const vid=parseInt(vendorId,10); if(!vid) return out;
+    try {
+        const mc=JSON.parse(runQuery("SELECT sysvalue FROM sysproperties WHERE syskey = 'Multi Currency'"))||[];
+        if(mc.length && String(mc[0].sysvalue).toLowerCase()==='true'){
+            const c=JSON.parse(runQuery('SELECT c.id, c.code, c.rate, c.homecurrency+0 AS home FROM vendor v JOIN currency c ON c.id = v.currencyid WHERE v.id = '+vid))||[];
+            if(c.length && Number(c[0].home)!==1 && Number(c[0].rate)>0)
+                out.currency={ id:parseInt(c[0].id,10), code:String(c[0].code||''), rate:Number(c[0].rate) };
+        }
+    } catch(e){ debugLog('warn','Vendor currency lookup failed: '+(e&&e.message)); }
+    try {
+        const rows=JSON.parse(runQuery(
+            'SELECT c.typeid, c.datus FROM vendor v JOIN contact c ON c.accountid = v.accountid '+
+            'LEFT JOIN address a ON a.id = c.addressid '+
+            'WHERE v.id = '+vid+' AND c.typeid IN (60,50,20,30,10) AND c.datus IS NOT NULL AND c.datus <> \'\' '+
+            'ORDER BY COALESCE(a.defaultflag+0,0) DESC, COALESCE(c.defaultflag+0,0) DESC, FIELD(c.typeid,60,50,20,30,10), c.id'))||[];
+        const em=rows.find(r=>Number(r.typeid)===60), ph=rows.find(r=>Number(r.typeid)!==60);
+        if(em) out.email=String(em.datus).trim();
+        if(ph) out.phone=String(ph.datus).trim();
+    } catch(e){ debugLog('warn','Vendor contact lookup failed: '+(e&&e.message)); }
+    return out;
+}
+
 // ── Materials tab — at-risk work orders (read-only) ──────────
 // WO-centric complement to the part-centric Procurement tab: lists the work
 // orders whose raw goods are Unmet (genuine shortage) or Contested (stock exists
@@ -5441,43 +5474,49 @@ function psBlkToggle(td){
 function psProcureToggleSel(id){ id=String(id); if(psProcureSel.has(id)) psProcureSel.delete(id); else psProcureSel.add(id); renderProcure(); }
 function psProcureSelectAll(on){ const { make }=psProcureData(); psProcureSel.clear(); if(on) make.forEach(r=>psProcureSel.add(String(r.partId))); renderProcure(); }
 
-// Lazy-load MO custom-field definitions. The schema dump has no tableId→module
-// catalog, so infer the MO custom-field set from the names present on recent MO
-// customFields JSON, then read each field's type/list/required from customfield.
-// (Never-used MO CFs won't surface — acceptable; the section is optional.)
+// Custom-field definitions for one table (tableRefName 'MO', 'PO', …), read from
+// the catalog (customfield ⋈ tablereference) so a required field that has never
+// been filled still surfaces. The REST creates take customFields as [{id, value}]:
+// the id is customfield.id, and a field sent by name alone fails with "Custom
+// field not found".
+function psLoadCfCatalog(tableRef){
+    const defs = JSON.parse(runQuery(
+        "SELECT cf.id AS id, cf.name AS name, cf.required+0 AS required, cf.listid AS listid, cf.sortorder AS sortorder, cft.name AS type_name "+
+        "FROM customfield cf "+
+        "JOIN tablereference tr ON tr.tableid = cf.tableid "+
+        "LEFT JOIN customfieldtype cft ON cft.id = cf.customfieldtypeid "+
+        "WHERE cf.activeflag = 1 AND tr.tablerefname = '"+tableRef+"' ORDER BY cf.sortorder, cf.name")) || [];
+    const listIds = [...new Set(defs.map(d=>d.listid).filter(v=>v!=null))];
+    const optByList = new Map();
+    if(listIds.length){
+        JSON.parse(runQuery("SELECT listid, name FROM customlistitem WHERE listid IN ("+listIds.join(',')+") ORDER BY name"))
+          .forEach(r=>{ const key=String(r.listid); if(!optByList.has(key)) optByList.set(key,[]); optByList.get(key).push(r.name); });
+    }
+    return defs.map(d=>({
+        id: parseInt(d.id,10),
+        name: d.name,
+        required: Number(d.required)===1,
+        type: String(d.type_name||'').toLowerCase(),
+        options: d.listid!=null ? (optByList.get(String(d.listid))||[]) : []
+    }));
+}
+// Drawer values -> the REST customFields list. Date fields go as
+// "YYYY-MM-DD 00:00:00", the form Fishbowl itself stores and returns.
+function psCfPayload(defs, values){
+    return defs.map(c=>{
+        let v = values ? values[c.name] : null;
+        if(v==null || !String(v).length) return null;
+        v = String(v);
+        if(c.type.indexOf('date')>=0 && /^\d{4}-\d{2}-\d{2}$/.test(v)) v += ' 00:00:00';
+        return { id:c.id, value:v };
+    }).filter(Boolean);
+}
 function psLoadMoCustomFields(){
     if(psMoCfDefs) return psMoCfDefs;
     psMoCfDefs = [];
     if(typeof runQuery!=='function') return psMoCfDefs;
     try {
-        const names = new Set();
-        JSON.parse(runQuery("SELECT customFields FROM mo WHERE customFields IS NOT NULL AND customFields <> 'null' AND customFields <> '' ORDER BY id DESC LIMIT 200"))
-          .forEach(row=>{
-              const raw = row.customfields != null ? row.customfields : row.customFields;
-              try {
-                  const o = JSON.parse(raw||'null');
-                  if(Array.isArray(o)) o.forEach(e=>{ const nm=(e&&(e.name||e.Name))||''; if(nm) names.add(nm); });
-                  else if(o && typeof o==='object') Object.keys(o).forEach(k=>{ if(k) names.add(k); });
-              } catch(_){}
-          });
-        if(!names.size) return psMoCfDefs;
-        const inList = Array.from(names).map(n=>"'"+String(n).replace(/'/g,"''")+"'").join(',');
-        const defs = JSON.parse(runQuery(
-            "SELECT cf.name AS name, cf.required AS required, cf.listid AS listid, cf.sortorder AS sortorder, cft.name AS type_name "+
-            "FROM customfield cf LEFT JOIN customfieldtype cft ON cft.id = cf.customfieldtypeid "+
-            "WHERE cf.activeflag = 1 AND cf.name IN ("+inList+") ORDER BY cf.sortorder, cf.name"));
-        const listIds = [...new Set(defs.map(d=>d.listid).filter(v=>v!=null))];
-        const optByList = new Map();
-        if(listIds.length){
-            JSON.parse(runQuery("SELECT listid, name FROM customlistitem WHERE listid IN ("+listIds.join(',')+") ORDER BY name"))
-              .forEach(r=>{ const key=String(r.listid); if(!optByList.has(key)) optByList.set(key,[]); optByList.get(key).push(r.name); });
-        }
-        psMoCfDefs = defs.map(d=>({
-            name: d.name,
-            required: (d.required===1 || d.required===true || d.required==='1'),
-            type: String(d.type_name||'').toLowerCase(),
-            options: d.listid!=null ? (optByList.get(String(d.listid))||[]) : []
-        }));
+        psMoCfDefs = psLoadCfCatalog('MO');
         debugLog('success', 'MO custom fields discovered: '+psMoCfDefs.length);
     } catch(e){ debugLog('warn','MO custom-field discovery failed: '+(e&&e.message)); psMoCfDefs=[]; }
     return psMoCfDefs;
@@ -5693,7 +5732,7 @@ async function psSubmitMo(){
     try { FBLib.Settings.setUserKey('moCreateStatus', moStatus); FBLib.Settings.saveUser(); } catch(_){}
     const payload={ status:moStatus, locationGroup:{ id:d.lgId }, dateScheduled:d.dateScheduled+'T00:00:00', configurations:configs };
     if(d.note && d.note.trim()) payload.note=d.note.trim();
-    const cfArr=cfs.map(c=>{ const v=d.cf[c.name]; return (v!=null && String(v).length)?{ name:c.name, value:String(v) }:null; }).filter(Boolean);
+    const cfArr=psCfPayload(cfs, d.cf);
     if(cfArr.length) payload.customFields=cfArr;
     d.status='submitting'; d.error=null; psRenderMoDrawer();
     try {
@@ -5792,8 +5831,11 @@ function psOpenCreatePo(vendorKey){
     let poLg = psInitialLg(lgList);
     const poEr = groupRows.slice().sort((a,b)=>{ const av=a.earliest?a.earliest.valueOf():Infinity, bv=b.earliest?b.earliest.valueOf():Infinity; return av-bv; })[0];
     if(poEr && poEr.lgId && lgList.some(l=>String(l.id)===String(poEr.lgId))) poLg = String(poEr.lgId);
+    const vInfo = psPoVendorInfo(vRow.vendorId);
     psPoDraft = {
         vendorId: vRow.vendorId, vendorName: (vendorKey==='__NOVENDOR__'?'':vendorKey),
+        currency: vInfo.currency,   // null = home currency
+        email: vInfo.email, phone: vInfo.phone,
         parts, lgList, lgId:poLg,
         vendorTax: tax.vendor,  // vendor's own purchase rate (null = lines use the part's)
         poStatus:poStatus0,   // 'Bid Request' | 'Issued' — default from the Procurement setting
@@ -5831,6 +5873,10 @@ function psRenderPoDrawer(){
     const submitting = d.state==='submitting';
     // Home-currency symbol for the unit-cost field (falls back to "$").
     let poSym='$'; try{ const _loc=(typeof currencyLocale==='function')?currencyLocale():null; if(_loc&&_loc.symbol) poSym=_loc.symbol; }catch(_){}
+    // A foreign-currency vendor's costs are in its own currency: show the code.
+    const fx=d.currency;
+    if(fx) poSym=fx.code;
+    const poMoney=v=>fx ? fx.code+' '+(Number(v)||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}) : psPoMoney(v);
     let grand=0;
     const partRows=d.parts.map(p=>{
         const q=parseFloat(p.qty)||0, c=parseFloat(p.unitCost)||0, line=q*c; grand+=line;
@@ -5859,7 +5905,7 @@ function psRenderPoDrawer(){
             '<td class="mono" style="font-size:12px">'+psEsc(p.vendorPartNum||'—')+'</td>'+
             '<td class="num" style="white-space:nowrap"><input type="number" min="0" step="'+(isEach?'1':'0.001')+'" value="'+psEsc(String(p.qty))+'" onchange="psPoQty(\''+p.partId+'\',this.value)"> <span style="color:var(--c-secondary)">'+psEsc(p.uom||'')+'</span>'+uomNote+moqNote+'</td>'+
             '<td class="num"><span style="display:inline-flex;align-items:center;gap:3px;justify-content:flex-end" title="'+(p.uom?'Per '+psEsc(p.uom):'')+'"><span style="color:var(--c-tertiary)">'+psEsc(poSym)+'</span><input type="number" min="0" step="0.01" value="'+psEsc(Number(c).toFixed(2))+'" onchange="psPoCost(\''+p.partId+'\',this.value)"></span></td>'+
-            '<td class="num">'+psEsc(psPoMoney(line))+'</td></tr>';
+            '<td class="num">'+psEsc(poMoney(line))+'</td></tr>';
     }).join('');
     const lgOpts=(d.lgList||[]).map(l=>'<option value="'+l.id+'"'+(String(l.id)===String(d.lgId)?' selected':'')+'>'+psEsc(l.name)+'</option>').join('') || '<option value="">(no accessible location groups)</option>';
     const statusOpts=['Bid Request','Issued'].map(s=>'<option'+(s===d.poStatus?' selected':'')+'>'+s+'</option>').join('');
@@ -5867,12 +5913,16 @@ function psRenderPoDrawer(){
         (d.error?'<div class="pf-banner late"><span class="pf-summary">'+psSpill('critical', d.error)+'</span></div>':'')+
         sendNote+
         '<div class="dsec"><h4>Line items</h4><div class="pf-tablewrap"><table class="pf-table"><thead><tr><th>Part</th><th>Vendor part #</th><th class="num">Qty</th><th class="num">Unit cost</th><th class="num">Line total</th></tr></thead><tbody>'+partRows+
-          '<tr><td colspan="4" class="num" style="font-weight:700">Total</td><td class="num" style="font-weight:700">'+psEsc(psPoMoney(grand))+'</td></tr>'+
+          '<tr><td colspan="4" class="num" style="font-weight:700">Total</td><td class="num" style="font-weight:700">'+psEsc(poMoney(grand))+
+            (fx?'<div style="font-size:10px;font-weight:400;color:var(--c-tertiary)" title="At the '+psEsc(fx.code)+' rate of '+psEsc(String(fx.rate))+'">= '+psEsc(psPoMoney(grand*fx.rate))+' home</div>':'')+'</td></tr>'+
         '</tbody></table></div></div>'+
         '<div class="dsec"><h4>Order details</h4><div class="mo-form">'+
           '<label><span>Location group</span><select onchange="psPoField(\'lgId\',this.value)">'+lgOpts+'</select></label>'+
           '<label><span>Scheduled date</span><input type="date" value="'+psEsc(d.dateScheduled||'')+'" onchange="psPoField(\'dateScheduled\',this.value)"></label>'+
           '<label><span>Order status</span><select onchange="psPoField(\'poStatus\',this.value)">'+statusOpts+'</select></label>'+
+          '<label><span>Vendor email</span><input type="text" value="'+psEsc(d.email||'')+'" oninput="psPoField(\'email\',this.value)"></label>'+
+          '<label><span>Vendor phone</span><input type="text" value="'+psEsc(d.phone||'')+'" oninput="psPoField(\'phone\',this.value)"></label>'+
+          (fx?'<label><span>Currency</span><input type="text" value="'+psEsc(fx.code+' · rate '+fx.rate)+'" disabled title="The vendor\'s currency. Unit costs are in '+psEsc(fx.code)+'."></label>':'')+
           '<label><span>Note</span><textarea rows="2" oninput="psPoField(\'note\',this.value)">'+psEsc(d.note||'')+'</textarea></label>'+
         '</div></div>'+
         '<div class="dsec" style="display:flex;gap:8px;justify-content:flex-end">'+
@@ -5901,8 +5951,11 @@ async function psSubmitPo(){
         const qty=parseFloat(p.qty)||0, unit=parseFloat(p.unitCost)||0;
         const partRef={ id:parseInt(p.partId,10), name:p.partNum };
         if(p.partDesc) partRef.description=p.partDesc;
-        const it={ part:partRef, type:{ id:10 },
-                   quantity:qty, totalCost:Number((qty*unit).toFixed(4)) };
+        // A foreign-currency order needs mcTotalCost (the vendor-currency line total,
+        // which is what the drawer shows) and totalCost in home currency.
+        const line=Number((qty*unit).toFixed(4));
+        const it={ part:partRef, type:{ id:10 }, quantity:qty, totalCost:line };
+        if(d.currency){ it.mcTotalCost=line; it.totalCost=Number((line*d.currency.rate).toFixed(4)); }
         if(p.uomId) it.uom={ id:parseInt(p.uomId,10) };
         if(p.taxRate) it.taxRate={ id:p.taxRate.id };
         if(p.vendorPartNum) it.vendorPartNumber=p.vendorPartNum;
@@ -5915,6 +5968,9 @@ async function psSubmitPo(){
     // Remember the chosen status as the user's Create-PO default for next time.
     try { FBLib.Settings.setUserKey('poCreateStatus', d.poStatus === 'Bid Request' ? 'Bid Request' : 'Issued'); FBLib.Settings.saveUser(); } catch(_){}
     const payload={ vendor:{ id:d.vendorId }, status:d.poStatus, locationGroup:{ id:d.lgId }, poItems:items };
+    if(d.currency) payload.currency={ id:d.currency.id, rate:d.currency.rate };
+    if(d.email && d.email.trim()) payload.email=d.email.trim();
+    if(d.phone && d.phone.trim()) payload.phone=d.phone.trim();
     if(d.vendorTax) payload.taxRate={ id:d.vendorTax.id };
     if(d.note && d.note.trim()) payload.note=d.note.trim();
     debugLog('info','POST /api/purchase-orders '+JSON.stringify(payload));
