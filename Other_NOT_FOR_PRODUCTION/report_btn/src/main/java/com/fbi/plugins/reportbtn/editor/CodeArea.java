@@ -57,6 +57,15 @@ final class CodeArea {
         return a;
     }
 
+    /**
+     * Long lines wrap at the editor's width (on by default; the toolbar's Wrap toggle),
+     * breaking between words where it can rather than mid-identifier.
+     */
+    static void wrap(RSyntaxTextArea a, boolean on) {
+        a.setLineWrap(on);
+        a.setWrapStyleWord(on);
+    }
+
     /** How far the embedded-language shading fades towards the background (0 = the theme's, 1 = none). */
     private static final double SHADE_FADE = 0.6;
 

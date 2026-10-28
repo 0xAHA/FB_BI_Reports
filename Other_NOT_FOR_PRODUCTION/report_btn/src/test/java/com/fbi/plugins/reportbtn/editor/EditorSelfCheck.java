@@ -269,10 +269,12 @@ public final class EditorSelfCheck {
     // ------------------------------------------------------------------ layout
     private static void layout() {
         EditorLayout d = EditorLayout.of(null);
-        eq(d.format(), "apps=270;insert=340;code=0.5;preview=below;showApps=1;showInsert=1", "layout: the defaults");
-        EditorLayout l = EditorLayout.of("apps=300;insert=420;code=0.65;preview=right;showApps=0;showInsert=1");
+        eq(d.format(), "apps=270;insert=340;code=0.5;preview=below;showApps=1;showInsert=1;wrap=1", "layout: the defaults");
+        check(d.wrap && EditorLayout.of("apps=300").wrap, "layout: long lines wrap unless turned off");
+        check(!EditorLayout.of("wrap=0").wrap && EditorLayout.of("wrap=x").wrap, "layout: wrap=0 turns wrap off");
+        EditorLayout l = EditorLayout.of("apps=300;insert=420;code=0.65;preview=right;showApps=0;showInsert=1;wrap=0");
         eq(EditorLayout.of(l.format()).format(), l.format(), "layout: format and parse round-trip");
-        check(l.appsWidth == 300 && l.insertWidth == 420 && l.previewRight && !l.showApps, "layout: parsed");
+        check(l.appsWidth == 300 && l.insertWidth == 420 && l.previewRight && !l.showApps && !l.wrap, "layout: parsed");
         EditorLayout bad = EditorLayout.of("apps=x;insert=5;code=3;junk");
         check(bad.appsWidth == 270 && bad.insertWidth == 160 && bad.codeRatio == 0.9, "layout: bad values fall back or clamp");
     }

@@ -27,6 +27,7 @@ import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JSplitPane;
 import javax.swing.JTextField;
+import javax.swing.JToggleButton;
 import javax.swing.JToolBar;
 import javax.swing.KeyStroke;
 import javax.swing.SwingUtilities;
@@ -98,7 +99,7 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
     /** The explorer (shared by every editor tab) on the left. */
     private final JPanel explorerSlot = new JPanel(new BorderLayout());
     private final JSplitPane outerSplit;
-    private final JCheckBox showApps = new JCheckBox("Apps panel", true);
+    private final JToggleButton showApps = viewToggle(ToolIcon.Kind.APPS_PANEL, null, true);
     private final Completions completions;
     private final DirectiveParser directives;
     private final JTextField name = new JTextField(24);
@@ -132,6 +133,7 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
         this.firstAccess = firstAccess;
 
         code = CodeArea.create(typeId);
+        CodeArea.wrap(code, layout.wrap);
         code.setText(fpo.getData() == null ? "" : fpo.getData());
         code.setCaretPosition(0);
         code.discardAllEdits();
@@ -443,8 +445,17 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
             sandbox.setToolTipText("Preview without the app's id and settings, as the native editor does");
             t.add(sandbox);
         }
-        // In the order of the panels on screen: Apps on the left, Insert on the right.
-        showApps.setToolTipText("The list of every app, script and style on the left");
+        // View toggles, icons only: Wrap, then the panels in their order on screen (Apps left, Insert right).
+        JToggleButton wrap = viewToggle(ToolIcon.Kind.WRAP, "<html><b>Wrap long lines</b><br>"
+            + "On: a line longer than the editor is wide continues on the next row</html>", layout.wrap);
+        wrap.addActionListener(e -> {
+            CodeArea.wrap(code, wrap.isSelected());
+            layout.wrap = wrap.isSelected();
+            layout.saveSoon();
+        });
+        t.add(wrap);
+        separator(t);
+        showApps.setToolTipText("<html><b>Apps panel</b><br>The list of every app, script and style on the left</html>");
         showApps.addActionListener(e -> {
             explorerSlot.setVisible(showApps.isSelected());
             layout.showApps = showApps.isSelected();
@@ -453,8 +464,9 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
             outerSplit.revalidate();
         });
         t.add(showApps);
-        JCheckBox showInsert = new JCheckBox("Insert panel", layout.showInsert);
-        showInsert.setToolTipText("Includes, app settings, Fishbowl functions and module functions on the right");
+        JToggleButton showInsert = viewToggle(ToolIcon.Kind.INSERT_PANEL, null, layout.showInsert);
+        showInsert.setToolTipText("<html><b>Insert panel</b><br>Includes, app settings, Fishbowl functions and module "
+            + "functions on the right</html>");
         showInsert.addActionListener(e -> {
             insertPanel.setVisible(showInsert.isSelected());
             layout.showInsert = showInsert.isSelected();
@@ -463,7 +475,25 @@ final class EditorTab extends JPanel implements WorkspaceTab, InsertPanel.Action
                 : mainSplit.getWidth());
         });
         t.add(showInsert);
+        // As tall as the text buttons beside them, and square.
+        int h = save.getPreferredSize().height;
+        for (JToggleButton b : new JToggleButton[]{wrap, showApps, showInsert}) {
+            java.awt.Dimension d = new java.awt.Dimension(Math.max(h, b.getPreferredSize().width), h);
+            b.setPreferredSize(d);
+            b.setMaximumSize(d);
+        }
         return t;
+    }
+
+    /** An icon-only on/off button: grey when off, blue when on; the tooltip names it. */
+    private static JToggleButton viewToggle(ToolIcon.Kind kind, String tip, boolean on) {
+        JToggleButton b = new JToggleButton(ToolIcon.off(kind), on);
+        b.setSelectedIcon(ToolIcon.on(kind));
+        b.setDisabledIcon(ToolIcon.disabled(kind));
+        b.setToolTipText(tip);
+        b.setFocusable(false);
+        b.setMargin(new java.awt.Insets(2, 4, 2, 4));
+        return b;
     }
 
     /** A visible divider between groups of buttons (the client's toolbar buttons have no borders). */

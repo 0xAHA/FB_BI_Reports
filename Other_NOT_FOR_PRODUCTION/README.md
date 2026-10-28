@@ -47,6 +47,14 @@ its menu group (e.g. PURCHASING), and opens one in its own window on the module'
 record (`window.FB_LAUNCH`). First user: the Sales Order paperwork. Format in
 `docs/launch-context.md`; build, install and client test in its README.
 
+## SQL Studio plugin (`sql_studio/`)
+
+Fishbowl client plugin (Java shell, HTML page; in development): a **SQL Studio** module
+under Reporting in place of the Data module, with a schema browser, completion, a
+formatter and linter, styled results, and the schema diagram (pop-out, Ctrl+click to
+write a JOIN). Its SQL and schema logic is ported from fb-api-tool. Build, install and
+design in its README.
+
 ## Prototypes (`prototypes/`)
 
 Early tools kept for reference.

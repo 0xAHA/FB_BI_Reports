@@ -51,7 +51,7 @@
       window.FB_REPORT = {
           key:   'cdx.bi.invdash',
           name:  'Inventory Dashboard v1.2',
-          build: '2026.10.23-fa8bbae'     // @fb-build
+          build: '2026.10.27-0578742'     // @fb-build
       };
   </script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -1465,20 +1465,41 @@ const Q = {
   }),
 
   // ── old getStockMovements — DATED (daily net change from inventorylog) ──
+  // Value is the cost each movement actually carried, not qty × today's
+  // average cost. inventorylog.cost can't be used on its own (ADV-5870):
+  // a receipt logs the running average, not what was paid, and on FIFO /
+  // LIFO an outflow logs the last cost, not its layers'. So a row linked
+  // to cost layers (inventorylogtocostlayer, qty signed like changeQty) is
+  // valued at those layers' unit cost when it brings stock in, or when it
+  // takes stock out on a FIFO/LIFO database. An average/standard-cost
+  // outflow, and an unlinked row, use changeQty × inventorylog.cost (the
+  // cost the GL posted: scrap ties to POST.amount on demodb).
+  // typeId 40 (yld) rows are location moves, not stock in or out: left out.
   stockMovements: () => qget('stockMovements', () => {
     const sql = `
       SELECT
           DATE(INVENTORYLOG.eventDate) as date,
           INVENTORYLOGTYPE.DESCRIPTION as event_type,
           SUM(INVENTORYLOG.CHANGEQTY) as total_change,
-          SUM(INVENTORYLOG.CHANGEQTY * COALESCE(pc.avgCost, 0)) as total_value,
+          SUM(CASE WHEN lk.value IS NOT NULL AND (INVENTORYLOG.CHANGEQTY > 0 OR cm.layered = 1)
+                   THEN lk.value
+                   ELSE INVENTORYLOG.CHANGEQTY * COALESCE(INVENTORYLOG.COST, 0) END) as total_value,
           COUNT(*) as transaction_count
       FROM INVENTORYLOG
       INNER JOIN LOCATIONGROUP LOCGRP ON INVENTORYLOG.LOCATIONGROUPID = LOCGRP.ID
       INNER JOIN INVENTORYLOGTYPE ON INVENTORYLOG.TYPEID = INVENTORYLOGTYPE.ID
       INNER JOIN PART ON INVENTORYLOG.PARTID = PART.ID
-      LEFT JOIN partcost pc ON pc.partid = PART.id
+      CROSS JOIN (SELECT COALESCE(MAX(sp.sysValue REGEXP 'FIFO|LIFO'), 0) AS layered
+                  FROM sysproperties sp WHERE sp.sysKey = 'Acct Costing Method') cm
+      LEFT JOIN (SELECT x.inventoryLogId,
+                        SUM(x.qty * cl.orgTotalCost / NULLIF(cl.orgQty, 0)) AS value
+                 FROM inventorylogtocostlayer x
+                 INNER JOIN costlayer cl ON cl.id = x.costLayerId
+                 INNER JOIN inventorylog il2 ON il2.id = x.inventoryLogId
+                 WHERE ${dateCond('il2.eventDate')}
+                 GROUP BY x.inventoryLogId) lk ON lk.inventoryLogId = INVENTORYLOG.ID
       WHERE ${dateCond('INVENTORYLOG.eventDate')}
+          AND INVENTORYLOG.TYPEID <> 40
           AND PART.activeflag = 1
           AND PART.typeid = 10
           ${lgCond('LOCGRP.id')}
@@ -2426,7 +2447,7 @@ const WIDGET_REGISTRY = {
     })
   },
   'movement-trend': {
-    title:'Stock Movement Trend', description:'Dated — net daily change from the inventory log inside the selected date range. Toggle bar/line and metric # (net qty) or $ (net value).', category:'chart',
+    title:'Stock Movement Trend', description:'Dated — net daily stock in/out from the inventory log inside the selected date range (location moves excluded), valued at the cost each movement carried (cost layers on FIFO/LIFO). Toggle bar/line and metric # (net qty) or $ (net value).', category:'chart',
     icon:'<path stroke-linecap="round" stroke-linejoin="round" d="M7 12l3-3 3 3 4-4"/>',
     defaultW:8, defaultH:10, hasChartToggle:true, toggleModes:['bar','line'],
     optToggles:[{key:'metric',modes:[{v:'qty',label:'#'},{v:'value',label:'$'}]}],

@@ -47,6 +47,9 @@
 //                          status indicators, debug drawer, drop-down
 //                          drawer helpers, multi-select widget, and
 //                          toast / confirmModal / tooltips / fdrop.
+//   FBLib.Uom            — unit conversion over uom / uomconversion, with
+//                          lengths, weights and volumes anchored on SI
+//                          codes (load, create, ratio, toMetres, toKg).
 //   FBLib.SharedData     — one org-wide payload per key, written by an
 //                          admin and read by everyone (userproperties,
 //                          admin-owned rows only).
@@ -187,7 +190,7 @@ window.FBLib = (function () {
      * Exposed as FBLib.BUILD so a report can tell which fb-lib the Fishbowl server actually served it.
      * @type {string}
      */
-    const BUILD = '2026.10.23-90ab1e1';   // @fb-build
+    const BUILD = '2026.10.28-2aed358';   // @fb-build
 
     /**
      * Returns the host report's identity block (window.FB_REPORT, set at the top of every report's head).
@@ -4690,10 +4693,26 @@ window.FBLib = (function () {
                 '</styleSheet>';
         }
 
+        // Excel's limit on one cell. A longer string (a BI page's code, a memo)
+        // makes Excel refuse the file, or "repair" it by dropping the sheet's
+        // strings, so it is cut, and ends with an ellipsis to say so.
+        const XL_CELL_MAX = 32767;
+        function cellText(text) {
+            let t = String(text);
+            // A lone surrogate half is not well-formed XML either.
+            if (typeof t.toWellFormed === 'function') t = t.toWellFormed();
+            if (t.length > XL_CELL_MAX) {
+                t = t.slice(0, XL_CELL_MAX - 1);
+                const last = t.charCodeAt(t.length - 1);
+                if (last >= 0xD800 && last <= 0xDBFF) t = t.slice(0, -1);   // don't split a pair
+                t += '…';
+            }
+            return t;
+        }
         function inlineStrCell(ref, style, text) {
             if (text == null || text === '') return '<c r="' + ref + '" s="' + style + '"/>';
             return '<c r="' + ref + '" s="' + style + '" t="inlineStr"><is><t xml:space="preserve">' +
-                xesc(text) + '</t></is></c>';
+                xesc(cellText(text)) + '</t></is></c>';
         }
         function numCell(ref, style, n) {
             return '<c r="' + ref + '" s="' + style + '"><v>' + n + '</v></c>';
@@ -6682,8 +6701,175 @@ window.FBLib = (function () {
         return { mount: mount, bucketDate: bucketDate };
     })();
 
+    // ====================================================================
+    // FBLib.Uom — unit conversion over Fishbowl's uom / uomconversion tables
+    //
+    //   const U = await FBLib.Uom.load();            // two SELECTs, cached per load
+    //   U.toMetres(12, part.sizeuomid)               // null when the unit can't be resolved
+    //   U.toKg(3.5, part.weightuomid)
+    //   U.ratio(fromUomId, toUomId)                  // qty in FROM x ratio = qty in TO, or null
+    //   U.convert(qty, fromUomId, toUomId)
+    //   FBLib.Uom.create(uomRows, convRows)          // the same engine from rows you already have
+    //
+    // uomconversion: value_in_TO = value_in_FROM * multiply / factor, walkable
+    // both ways. Rows only exist for pairs someone created (there may be no
+    // in -> m row at all), so lengths and weights are anchored on SI codes
+    // (mm, cm, m, in, ft... / g, kg, lb...) and resolved outward through the
+    // conversion graph. A unit that reaches no anchor gives null, never 0.
+    // Lifted from Custom/Receiving/Landed_Cost_Calculator.htm and
+    // Custom/Inventory/Auto_PO_Inventory_Watchlist.htm (which keep their own
+    // copies for now).
+    // ====================================================================
+    /** Unit conversion: Fishbowl UOMs and their conversions, with lengths and weights anchored on SI codes. */
+    const Uom = (function () {
+        const TYPE = { COUNT: 1, WEIGHT: 2, LENGTH: 3, AREA: 4, VOLUME: 5, TIME: 6 };
+        /** Base units (metres, kilograms, cubic metres) per one of each code, by lower-case code. */
+        const SI = {
+            length: { mm: 0.001, cm: 0.01, m: 1, km: 1000, 'in': 0.0254, ft: 0.3048, yd: 0.9144, mi: 1609.344 },
+            weight: { mg: 0.000001, g: 0.001, kg: 1, t: 1000, tonne: 1000, oz: 0.028349523125, lb: 0.45359237, lbs: 0.45359237, ton: 907.18474 },
+            volume: { m3: 1, l: 0.001, ml: 0.000001, cm3: 0.000001, ft3: 0.028316846592, in3: 0.000016387064, yd3: 0.764554857984, gal: 0.003785411784 }
+        };
+        const num = v => { const n = parseFloat(v); return isFinite(n) ? n : NaN; };
+
+        /**
+         * Builds a conversion engine from uom and uomconversion rows (runQuery shape: lower-case keys).
+         * @param {object[]} uomRows - { id, code, name, uomtype, activeflag? }.
+         * @param {object[]} convRows - { fromuomid, touomid, multiply, factor }.
+         * @returns {object} The engine: byId, ratio, convert, toMetres, toKg, lenToM, wtToKg, code, ofType.
+         */
+        function create(uomRows, convRows) {
+            const byId = {}, conv = {}, ratioCache = {};
+            (uomRows || []).forEach(function (u) {
+                const id = parseInt(u.id, 10);
+                if (!id) return;
+                const act = u.activeflag != null ? u.activeflag : u.active;
+                byId[id] = { id: id, code: String(u.code || '').trim(), name: u.name || '', type: parseInt(u.uomtype, 10) || 0,
+                             active: act == null ? true : (typeof act === 'string' && act.length === 1 ? act.charCodeAt(0) === 1 || act === '1' : Number(act) === 1 || act === true) };
+            });
+            const edge = function (f, t, r) { (conv[f] = conv[f] || []).push({ to: t, r: r }); };
+            (convRows || []).forEach(function (c) {
+                const f = parseInt(c.fromuomid, 10), t = parseInt(c.touomid, 10);
+                const mul = num(c.multiply), fac = num(c.factor);
+                if (!f || !t || !(mul > 0) || !(fac > 0)) return;
+                edge(f, t, mul / fac); edge(t, f, fac / mul);
+            });
+            // Base units per one unit of each UOM of a type: anchored on SI codes, then
+            // breadth-first through the conversions (value_T = value_F * r: one T is base(F) / r).
+            function seedAndWalk(type, si) {
+                const out = {}, queue = [];
+                Object.keys(byId).forEach(function (k) {
+                    const u = byId[k];
+                    if (u.type !== type) return;
+                    const f = si[u.code.toLowerCase()];
+                    if (f !== undefined) { out[u.id] = f; queue.push(u.id); }
+                });
+                for (let guard = 0; queue.length && guard < 20000; guard++) {
+                    const from = queue.shift();
+                    (conv[from] || []).forEach(function (e) {
+                        if (out[e.to] !== undefined || !e.r) return;
+                        const tu = byId[e.to];
+                        if (!tu || tu.type !== type) return;
+                        out[e.to] = out[from] / e.r;
+                        queue.push(e.to);
+                    });
+                }
+                return out;
+            }
+            const lenToM = seedAndWalk(TYPE.LENGTH, SI.length);
+            const wtToKg = seedAndWalk(TYPE.WEIGHT, SI.weight);
+            const volToM3 = seedAndWalk(TYPE.VOLUME, SI.volume);
+            /** The factor turning a quantity in `from` into one in `to` (breadth-first over the conversions), or null. */
+            function ratio(from, to) {
+                from = parseInt(from, 10); to = parseInt(to, 10);
+                if (!from || !to) return null;
+                if (from === to) return 1;
+                const key = from + '>' + to;
+                if (key in ratioCache) return ratioCache[key];
+                let found = null;
+                // Same-type SI-anchored units convert through their base even without a stored pair.
+                [[lenToM], [wtToKg], [volToM3]].forEach(function (m) {
+                    if (found === null && m[0][from] !== undefined && m[0][to] !== undefined) found = m[0][from] / m[0][to];
+                });
+                const seen = {}; seen[from] = true;
+                const queue = [{ id: from, r: 1 }];
+                for (let guard = 0; found === null && queue.length && guard < 5000; guard++) {
+                    const cur = queue.shift();
+                    const edges = conv[cur.id] || [];
+                    for (let i = 0; i < edges.length; i++) {
+                        const e = edges[i], r = cur.r * e.r;
+                        if (e.to === to) { found = r; break; }
+                        if (seen[e.to]) continue;
+                        seen[e.to] = true;
+                        queue.push({ id: e.to, r: r });
+                    }
+                }
+                ratioCache[key] = found;
+                return found;
+            }
+            const scaled = function (map) {
+                return function (v, id) {
+                    const f = map[parseInt(id, 10)], n = num(v);
+                    return f === undefined || !isFinite(n) ? null : n * f;
+                };
+            };
+            return {
+                byId: byId,
+                lenToM: lenToM,
+                wtToKg: wtToKg,
+                volToM3: volToM3,
+                ratio: ratio,
+                /** qty in `from` as a qty in `to`, or null when there is no path. */
+                convert: function (v, from, to) { const r = ratio(from, to), n = num(v); return r === null || !isFinite(n) ? null : n * r; },
+                /** A length in metres, or null when the unit doesn't resolve. */
+                toMetres: scaled(lenToM),
+                /** A weight in kilograms, or null when the unit doesn't resolve. */
+                toKg: scaled(wtToKg),
+                /** A volume in cubic metres, or null when the unit doesn't resolve. */
+                toM3: scaled(volToM3),
+                /** The UOM's code, or ''. */
+                code: function (id) { const u = byId[parseInt(id, 10)]; return u ? u.code : ''; },
+                /** The UOMs of a type (Uom.TYPE), resolved ones first for length and weight. */
+                ofType: function (type) { return Object.keys(byId).map(function (k) { return byId[k]; }).filter(function (u) { return u.type === type; }); }
+            };
+        }
+
+        let _loaded = null;
+        /**
+         * Reads uom and uomconversion and builds the engine (cached for the page's life; force re-reads).
+         * @param {object} [opts] - { force, query: async (name, sql) => rows } (default runQueryAsync / runQuery).
+         * @returns {Promise<object>} The engine (create()).
+         */
+        async function load(opts) {
+            opts = opts || {};
+            if (_loaded && !opts.force) return _loaded;
+            const q = typeof opts.query === 'function' ? opts.query : async function (name, sql) {
+                if (typeof runQueryAsync === 'function') { const r = await runQueryAsync(sql); return Array.isArray(r) ? r : []; }
+                if (typeof runQuery === 'function') { try { const p = JSON.parse(runQuery(sql) || '[]'); return Array.isArray(p) ? p : []; } catch (_) { return []; } }
+                return [];
+            };
+            const res = await Promise.all([
+                q('UOMs', 'SELECT id, code, name, uomtype, activeflag+0 AS activeflag FROM uom'),
+                q('UOM conversions', 'SELECT fromuomid, touomid, multiply, factor FROM uomconversion')
+            ]);
+            _loaded = create(res[0], res[1]);
+            return _loaded;
+        }
+
+        /**
+         * Converts a value between two SI codes of one kind ('length', 'weight', 'volume'), e.g. ('volume', 2, 'ft3', 'm3').
+         * @returns {?number} The value, or null for an unknown code.
+         */
+        function convertSI(kind, v, fromCode, toCode) {
+            const t = SI[kind] || {}, a = t[String(fromCode || '').toLowerCase()], b = t[String(toCode || '').toLowerCase()], n = num(v);
+            return a === undefined || b === undefined || !isFinite(n) ? null : n * a / b;
+        }
+
+        return { TYPE: TYPE, SI: SI, create: create, load: load, convertSI: convertSI };
+    })();
+
     return {
         BUILD: BUILD,
+        Uom: Uom,
         report: report,
         Common: Common,
         SharedData: SharedData,

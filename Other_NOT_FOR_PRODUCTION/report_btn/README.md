@@ -91,6 +91,7 @@
   in for a module's Jasper document, through new **Print (App)** and **Email (rich)** ribbon
   buttons, and emails open in a rich HTML window. See
   [Documents and email (PoC)](#documents-and-email-poc).
+- **0.7.9:** the editor's code wraps long lines at the editor's width (breaking between words), with a **Wrap** toggle on the toolbar to turn it off; the choice is remembered per user with the rest of the editor's layout (`wrap=` in `reportbtn.editor.layout.<user id>`, client.properties). The toolbar's **Apps panel** and **Insert panel** check boxes are now icon toggle buttons beside it, with the same tooltips: a window with its side panel on the left (Apps) or right (Insert), and a line running round onto the next for Wrap, grey when off and blue when on.
 - **0.7.8:** the **App Library** lets each user hide apps (the eye on a tile; saved in the user's own settings) and has a **Show hidden (N)** toggle at the top that brings them back faded, with *Unhide every app* in Settings. It lists only the apps the user has View access to (bireportaccess for their groups; only the admin user sees every app), and shows an app's edit pencil only where the user may edit it: Edit Settings access while that level exists, otherwise any access (the editor's own rule, ADV-6032); a system app opens read-only there. The workspace sends `admin` and `editsettings` in FB_WORKSPACE for this.
 - **0.7.7:** files dropped on the **App Library** (in the Apps (beta) workspace, with the editor and BI Editor-Edit) go to the editor: a page, script or style opens in the tab of the record with the same name and type, loaded but not saved (a page is matched by its FB_REPORT name), or as a new record named after it; exports (.json) open the Import dialog pre-filled with Publish ticked. Any other file is ignored, and the page shows a drop outline only for files it takes. The page reads the files and sends them as `drop:<json>` through openModule (WorkspaceLink DROP, WorkspaceExtension.dropped). The email composer ignores dropped files (Attach… adds attachments). fb-lib now stops the browser opening any dropped file in place of an app.
 - **0.7.6:** ready for Fishbowl's BI changes (epic ADV-5903). One jar runs on 26.9 and on the builds after them.
@@ -391,8 +392,9 @@ changed beside the report itself instead of in the BI Editor module.
 
 **The Apps panel**
 
-One explorer, shared by the editor tabs (it moves into whichever one shows; untick
-**Apps panel** to hide it):
+One explorer, shared by the editor tabs (it moves into whichever one shows; the
+**Apps panel** toggle on the toolbar, a window with its side panel on the left, hides it;
+the **Insert panel** toggle beside it, the panel on the right, hides the selector):
 - **Folders:** one level, from each page's `fb-folder` tag: Fishbowl's own Company
   report folders (read from `reporttree`, shown even when empty so apps can be dropped
   in; untick *Empty folders* to hide those), the folders apps use, and folders created
@@ -454,7 +456,9 @@ One explorer, shared by the editor tabs (it moves into whichever one shows; unti
 **In the tab**
 - **The code:** RSyntaxTextArea (already in the client's `lib/`). It highlights HTML with
   embedded JS and CSS, and JS or CSS for scripts and styles, with folding and bracket
-  matching. Find/replace uses Ctrl+F / Ctrl+H / F3, and Ctrl+G goes to a line.
+  matching. Find/replace uses Ctrl+F / Ctrl+H / F3, and Ctrl+G goes to a line. Long lines
+  wrap at the editor's width; the **Wrap** toggle on the toolbar turns that off (remembered
+  per user).
 - **The selector** (right):
   - *Modules in this page:* the functions of every script the page includes, indexed from
     the saved script (`JsIndex`: IIFE return maps, `global.X = {}`, `X.a = …`

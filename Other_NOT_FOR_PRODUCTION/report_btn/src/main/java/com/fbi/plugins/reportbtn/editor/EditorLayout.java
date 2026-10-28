@@ -6,8 +6,8 @@ import javax.swing.Timer;
 
 /**
  * The editor's panel layout, remembered per user across sessions: the Apps panel's width,
- * the Insert panel's width, the code / preview split, where the preview docks and which
- * panels show. Kept in client.properties under a key per user id (the BI Editor keeps its
+ * the Insert panel's width, the code / preview split, where the preview docks, which
+ * panels show and whether long lines wrap. Kept in client.properties under a key per user id (the BI Editor keeps its
  * own layout per user too), so a second user on the PC starts from the defaults. One
  * instance is shared by the open editor tabs; a change is written once dragging stops.
  */
@@ -24,6 +24,8 @@ final class EditorLayout {
     boolean previewRight;
     boolean showApps = true;
     boolean showInsert = true;
+    /** Long lines wrap in the code (the Wrap toggle). */
+    boolean wrap = true;
 
     private final String key;
     private Timer pending;
@@ -49,7 +51,7 @@ final class EditorLayout {
         return l;
     }
 
-    /** "apps=270;insert=340;code=0.5;preview=right;showApps=1;showInsert=1"; unknown or bad parts are ignored. */
+    /** "apps=270;insert=340;code=0.5;preview=right;showApps=1;showInsert=1;wrap=1"; unknown or bad parts are ignored. */
     void parse(String text) {
         if (text == null) {
             return;
@@ -69,6 +71,7 @@ final class EditorLayout {
                     case "preview": previewRight = "right".equals(v); break;
                     case "showApps": showApps = !"0".equals(v); break;
                     case "showInsert": showInsert = !"0".equals(v); break;
+                    case "wrap": wrap = !"0".equals(v); break;
                     default: break;
                 }
             } catch (NumberFormatException ignored) {
@@ -80,7 +83,7 @@ final class EditorLayout {
     String format() {
         return "apps=" + appsWidth + ";insert=" + insertWidth + ";code=" + (Math.round(codeRatio * 1000) / 1000.0)
             + ";preview=" + (previewRight ? "right" : "below") + ";showApps=" + (showApps ? 1 : 0)
-            + ";showInsert=" + (showInsert ? 1 : 0);
+            + ";showInsert=" + (showInsert ? 1 : 0) + ";wrap=" + (wrap ? 1 : 0);
     }
 
     /** Writes the layout after a short pause, so a drag is written once. */
